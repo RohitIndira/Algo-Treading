@@ -1,0 +1,307 @@
+syntax = "proto3";
+
+package trade_execution;
+
+import "api/proto/common/common.proto";
+
+option go_package = "github.com/yourusername/trading-system/api/proto/trade_execution";
+
+// Trade Execution Service
+// Handles order execution via Odin API and order management
+service TradeExecutionService {
+  // Get order status by order ID
+  rpc GetOrderStatus(GetOrderStatusRequest) returns (GetOrderStatusResponse);
+  
+  // Get all orders for a user with filters
+  rpc GetUserOrders(GetUserOrdersRequest) returns (GetUserOrdersResponse);
+  
+  // Cancel a pending order
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+  
+  // Modify a pending order
+  rpc ModifyOrder(ModifyOrderRequest) returns (ModifyOrderResponse);
+  
+  // Get order history with pagination
+  rpc GetOrderHistory(GetOrderHistoryRequest) returns (GetOrderHistoryResponse);
+  
+  // Get order statistics for a user
+  rpc GetOrderStatistics(GetOrderStatisticsRequest) returns (GetOrderStatisticsResponse);
+  
+  // Health check
+  rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+}
+
+// Order details
+message Order {
+  // Internal order ID
+  string order_id = 1;
+  
+  // User and strategy information
+  string user_id = 2;
+  string strategy_id = 3;
+  string event_id = 4;  // Market event that triggered this order
+  
+  // Stock information
+  int64 stock_code = 5;
+  common.Exchange exchange = 6;
+  string symbol = 7;
+  
+  // Order details
+  common.OrderType order_type = 8;
+  common.OrderSide order_side = 9;
+  int32 quantity = 10;
+  double price = 11;  // For LIMIT orders
+  
+  // Stop loss and take profit
+  double stop_loss = 12;
+  double take_profit = 13;
+  
+  // Order validity
+  string validity = 14;  // DAY, IOC, GTD, etc.
+  
+  // Order status
+  common.OrderStatus status = 15;
+  
+  // Odin API integration
+  string odin_order_id = 16;  // Order ID from Odin API
+  string odin_response = 17;  // Raw response from Odin
+  
+  // Execution details
+  int32 filled_quantity = 18;
+  double filled_price = 19;
+  double commission = 20;
+  double total_cost = 21;
+  
+  // Timestamps
+  common.Timestamp created_at = 22;
+  common.Timestamp updated_at = 23;
+  common.Timestamp submitted_at = 24;  // When submitted to Odin
+  common.Timestamp executed_at = 25;   // When filled
+  
+  // Error information
+  string error_message = 26;
+  string rejection_reason = 27;
+  
+  // Metadata
+  map<string, string> metadata = 28;
+}
+
+// Order request message (published to RabbitMQ by Rules Engine)
+message OrderRequest {
+  // Request ID for idempotency
+  string request_id = 1;
+  
+  // User and strategy
+  string user_id = 2;
+  string strategy_id = 3;
+  string event_id = 4;
+  
+  // Stock information
+  int64 stock_code = 5;
+  common.Exchange exchange = 6;
+  string symbol = 7;
+  
+  // Order details
+  common.OrderType order_type = 8;
+  common.OrderSide order_side = 9;
+  int32 quantity = 10;
+  double price = 11;
+  
+  // Stop loss and take profit
+  double stop_loss = 12;
+  double take_profit = 13;
+  
+  // Order validity
+  string validity = 14;
+  
+  // Risk check results
+  bool risk_approved = 15;
+  double risk_score = 16;
+  
+  // Timestamp
+  common.Timestamp timestamp = 17;
+  
+  // Retry information
+  int32 retry_count = 18;
+}
+
+// Get order status request
+message GetOrderStatusRequest {
+  string order_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message GetOrderStatusResponse {
+  bool success = 1;
+  Order order = 2;
+  common.Error error = 3;
+}
+
+// Order filter options
+message OrderFilter {
+  // Status filters
+  repeated common.OrderStatus statuses = 1;
+  
+  // Exchange filters
+  repeated common.Exchange exchanges = 2;
+  
+  // Date range
+  common.Timestamp start_date = 3;
+  common.Timestamp end_date = 4;
+  
+  // Stock filter
+  repeated int64 stock_codes = 5;
+  
+  // Strategy filter
+  repeated string strategy_ids = 6;
+  
+  // Order side filter
+  repeated common.OrderSide order_sides = 7;
+}
+
+// Get user orders request
+message GetUserOrdersRequest {
+  string user_id = 1;
+  OrderFilter filter = 2;
+  common.PaginationRequest pagination = 3;
+}
+
+message GetUserOrdersResponse {
+  bool success = 1;
+  repeated Order orders = 2;
+  common.PaginationResponse pagination = 3;
+  common.Error error = 4;
+}
+
+// Cancel order request
+message CancelOrderRequest {
+  string order_id = 1;
+  string user_id = 2;  // For authorization
+  string reason = 3;   // Cancellation reason
+}
+
+message CancelOrderResponse {
+  bool success = 1;
+  Order order = 2;
+  string message = 3;
+  common.Error error = 4;
+}
+
+// Modify order request
+message ModifyOrderRequest {
+  string order_id = 1;
+  string user_id = 2;  // For authorization
+  
+  // Fields that can be modified
+  optional int32 new_quantity = 3;
+  optional double new_price = 4;
+  optional common.OrderType new_order_type = 5;
+  optional string new_validity = 6;
+}
+
+message ModifyOrderResponse {
+  bool success = 1;
+  Order order = 2;
+  string message = 3;
+  common.Error error = 4;
+}
+
+// Get order history request
+message GetOrderHistoryRequest {
+  string user_id = 1;
+  OrderFilter filter = 2;
+  common.PaginationRequest pagination = 3;
+  bool include_cancelled = 4;  // Include cancelled orders
+}
+
+message GetOrderHistoryResponse {
+  bool success = 1;
+  repeated Order orders = 2;
+  common.PaginationResponse pagination = 3;
+  common.Error error = 4;
+}
+
+// Order statistics
+message OrderStatistics {
+  string user_id = 1;
+  
+  // Overall statistics
+  int32 total_orders = 2;
+  int32 filled_orders = 3;
+  int32 pending_orders = 4;
+  int32 rejected_orders = 5;
+  int32 cancelled_orders = 6;
+  
+  // Success rate
+  double fill_rate_pct = 7;
+  double rejection_rate_pct = 8;
+  
+  // Trading volume
+  double total_traded_value = 9;
+  double avg_order_value = 10;
+  
+  // Timing statistics
+  double avg_execution_time_ms = 11;  // Average time from submission to fill
+  double p95_execution_time_ms = 12;
+  
+  // By exchange
+  map<string, int32> orders_by_exchange = 13;
+  
+  // By order type
+  map<string, int32> orders_by_type = 14;
+  
+  // By strategy
+  map<string, int32> orders_by_strategy = 15;
+  
+  // Date range
+  common.Timestamp start_date = 16;
+  common.Timestamp end_date = 17;
+}
+
+// Get order statistics request
+message GetOrderStatisticsRequest {
+  string user_id = 1;
+  common.Timestamp start_date = 2;
+  common.Timestamp end_date = 3;
+  repeated string strategy_ids = 4;  // Filter by strategies
+}
+
+message GetOrderStatisticsResponse {
+  bool success = 1;
+  OrderStatistics statistics = 2;
+  common.Error error = 3;
+}
+
+// Execution report (for internal use and streaming)
+message ExecutionReport {
+  string order_id = 1;
+  string user_id = 2;
+  string strategy_id = 3;
+  
+  // Execution details
+  common.OrderStatus status = 4;
+  int32 filled_quantity = 5;
+  double filled_price = 6;
+  double commission = 7;
+  
+  // Stock info
+  int64 stock_code = 8;
+  string symbol = 9;
+  common.Exchange exchange = 10;
+  
+  // Timestamp
+  common.Timestamp executed_at = 11;
+  
+  // Message
+  string message = 12;
+}
+
+// Odin API response (internal data structure)
+message OdinOrderResponse {
+  bool success = 1;
+  string order_id = 2;
+  string status = 3;
+  string message = 4;
+  map<string, string> details = 5;
+  string raw_response = 6;
+}

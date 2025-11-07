@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package common;
+
+option go_package = "github.com/yourusername/trading-system/api/proto/common";
+
+// Timestamp message for consistent time representation
+message Timestamp {
+  int64 seconds = 1;      // Seconds since epoch
+  int32 nanos = 2;        // Nanoseconds component
+}
+
+// Pagination request parameters
+message PaginationRequest {
+  int32 page = 1;         // Page number (1-indexed)
+  int32 page_size = 2;    // Items per page (default: 10, max: 100)
+  string sort_by = 3;     // Field to sort by
+  string sort_order = 4;  // "asc" or "desc"
+}
+
+// Pagination response metadata
+message PaginationResponse {
+  int32 page = 1;
+  int32 page_size = 2;
+  int64 total_items = 3;
+  int32 total_pages = 4;
+  bool has_next = 5;
+  bool has_previous = 6;
+}
+
+// Generic error details
+message Error {
+  string code = 1;        // Error code (e.g., "INVALID_INPUT", "NOT_FOUND")
+  string message = 2;     // Human-readable error message
+  repeated string details = 3;  // Additional error details
+  Timestamp timestamp = 4;
+}
+
+// Generic status response
+message StatusResponse {
+  bool success = 1;
+  string message = 2;
+  Error error = 3;
+}
+
+// Empty message for void returns
+message Empty {}
+
+// Stock information
+message Stock {
+  int64 stock_code = 1;   // Stock code (e.g., 517170)
+  string exchange = 2;    // Exchange (NSE/BSE)
+  string symbol = 3;      // Trading symbol (e.g., "EDVENSWA")
+  string isin = 4;        // ISIN code (e.g., "INE125G01014")
+  string company_name = 5;
+}
+
+// Price range filter
+message PriceRange {
+  double min_price = 1;
+  double max_price = 2;
+}
+
+// Order types
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_MARKET = 1;
+  ORDER_TYPE_LIMIT = 2;
+  ORDER_TYPE_STOP_LOSS = 3;
+  ORDER_TYPE_STOP_LOSS_MARKET = 4;
+}
+
+// Order side
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  ORDER_SIDE_BUY = 1;
+  ORDER_SIDE_SELL = 2;
+}
+
+// Order status
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_RECEIVED = 1;
+  ORDER_STATUS_VALIDATED = 2;
+  ORDER_STATUS_PENDING = 3;
+  ORDER_STATUS_SUBMITTED = 4;
+  ORDER_STATUS_FILLED = 5;
+  ORDER_STATUS_PARTIAL_FILLED = 6;
+  ORDER_STATUS_REJECTED = 7;
+  ORDER_STATUS_CANCELLED = 8;
+  ORDER_STATUS_FAILED = 9;
+}
+
+// Sentiment types
+enum Sentiment {
+  SENTIMENT_UNSPECIFIED = 0;
+  SENTIMENT_POSITIVE = 1;
+  SENTIMENT_NEUTRAL = 2;
+  SENTIMENT_NEGATIVE = 3;
+}
+
+// Exchange types
+enum Exchange {
+  EXCHANGE_UNSPECIFIED = 0;
+  EXCHANGE_NSE = 1;
+  EXCHANGE_BSE = 2;
+}
+
+// Position sizing strategy
+enum PositionSizing {
+  POSITION_SIZING_UNSPECIFIED = 0;
+  POSITION_SIZING_FIXED = 1;        // Fixed quantity
+  POSITION_SIZING_PERCENTAGE = 2;   // Percentage of capital
+  POSITION_SIZING_RISK_BASED = 3;   // Based on risk amount
+}
+
+// Health check message
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string service = 2;
+  string version = 3;
+  Timestamp timestamp = 4;
+  map<string, string> dependencies = 5;  // Dependency health status
+}

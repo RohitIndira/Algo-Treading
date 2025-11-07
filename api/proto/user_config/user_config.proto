@@ -1,0 +1,264 @@
+syntax = "proto3";
+
+package user_config;
+
+import "api/proto/common/common.proto";
+
+option go_package = "github.com/yourusername/trading-system/api/proto/user_config";
+
+// User Configuration Service
+// Manages user trading strategies and preferences
+service UserConfigService {
+  // Create a new trading strategy
+  rpc CreateStrategy(CreateStrategyRequest) returns (CreateStrategyResponse);
+  
+  // Update an existing strategy
+  rpc UpdateStrategy(UpdateStrategyRequest) returns (UpdateStrategyResponse);
+  
+  // Delete a strategy
+  rpc DeleteStrategy(DeleteStrategyRequest) returns (DeleteStrategyResponse);
+  
+  // Get a specific strategy
+  rpc GetStrategy(GetStrategyRequest) returns (GetStrategyResponse);
+  
+  // List all strategies for a user
+  rpc ListUserStrategies(ListUserStrategiesRequest) returns (ListUserStrategiesResponse);
+  
+  // Activate a strategy
+  rpc ActivateStrategy(ActivateStrategyRequest) returns (ActivateStrategyResponse);
+  
+  // Deactivate a strategy
+  rpc DeactivateStrategy(DeactivateStrategyRequest) returns (DeactivateStrategyResponse);
+  
+  // Get user strategies in bulk (for internal services)
+  rpc GetStrategiesByIDs(GetStrategiesByIDsRequest) returns (GetStrategiesByIDsResponse);
+  
+  // Health check
+  rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+}
+
+// Strategy condition filters
+message StrategyConditions {
+  // Impact score threshold (1-10)
+  int32 impact_score_threshold = 1;
+  
+  // Sentiment filters (positive, neutral, negative)
+  repeated common.Sentiment sentiments = 2;
+  
+  // News categories to monitor
+  repeated string categories = 3;
+  
+  // Specific stocks to monitor (stock codes)
+  repeated int64 stock_codes = 4;
+  
+  // Price range filter
+  common.PriceRange price_range = 5;
+  
+  // Minimum trading volume threshold
+  int64 volume_threshold = 6;
+  
+  // Percentage change threshold (trigger if stock moves by this %)
+  double pct_change_threshold = 7;
+  
+  // Exchanges to monitor
+  repeated common.Exchange exchanges = 8;
+}
+
+// Trade execution configuration
+message TradeConfig {
+  // Order type (MARKET, LIMIT, etc.)
+  common.OrderType order_type = 1;
+  
+  // Fixed quantity to trade
+  int32 quantity = 2;
+  
+  // Maximum position size (in rupees)
+  double max_position_size = 3;
+  
+  // Stop loss percentage
+  double stop_loss_pct = 4;
+  
+  // Take profit percentage
+  double take_profit_pct = 5;
+  
+  // Primary exchange for execution
+  common.Exchange exchange = 6;
+  
+  // Order side (BUY/SELL)
+  common.OrderSide order_side = 7;
+  
+  // Limit price (for LIMIT orders, optional)
+  double limit_price = 8;
+  
+  // Validity (DAY, IOC, etc.)
+  string validity = 9;
+}
+
+// Risk management limits
+message RiskLimits {
+  // Maximum number of trades per day
+  int32 max_daily_trades = 1;
+  
+  // Maximum loss allowed per day (in rupees)
+  double max_loss_per_day = 2;
+  
+  // Position sizing strategy
+  common.PositionSizing position_sizing = 3;
+  
+  // Maximum portfolio exposure percentage
+  double max_portfolio_exposure_pct = 4;
+  
+  // Maximum per-trade risk (in rupees)
+  double max_per_trade_risk = 5;
+  
+  // Enable risk checks
+  bool enable_risk_checks = 6;
+}
+
+// Trading strategy definition
+message Strategy {
+  // Unique strategy ID
+  string strategy_id = 1;
+  
+  // User ID who owns this strategy
+  string user_id = 2;
+  
+  // Strategy name
+  string strategy_name = 3;
+  
+  // Strategy description
+  string description = 4;
+  
+  // Is strategy active
+  bool active = 5;
+  
+  // Strategy conditions
+  StrategyConditions conditions = 6;
+  
+  // Trade configuration
+  TradeConfig trade_config = 7;
+  
+  // Risk limits
+  RiskLimits risk_limits = 8;
+  
+  // Creation timestamp
+  common.Timestamp created_at = 9;
+  
+  // Last update timestamp
+  common.Timestamp updated_at = 10;
+  
+  // Version for optimistic locking
+  int32 version = 11;
+}
+
+// Create strategy request
+message CreateStrategyRequest {
+  string user_id = 1;
+  string strategy_name = 2;
+  string description = 3;
+  StrategyConditions conditions = 4;
+  TradeConfig trade_config = 5;
+  RiskLimits risk_limits = 6;
+  bool activate_immediately = 7;  // Activate strategy upon creation
+}
+
+message CreateStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// Update strategy request
+message UpdateStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;
+  
+  // Optional fields - only provided fields will be updated
+  optional string strategy_name = 3;
+  optional string description = 4;
+  optional StrategyConditions conditions = 5;
+  optional TradeConfig trade_config = 6;
+  optional RiskLimits risk_limits = 7;
+  
+  // Version for optimistic locking
+  int32 version = 8;
+}
+
+message UpdateStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// Delete strategy request
+message DeleteStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message DeleteStrategyResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+// Get strategy request
+message GetStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message GetStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// List user strategies request
+message ListUserStrategiesRequest {
+  string user_id = 1;
+  bool active_only = 2;  // Filter to only active strategies
+  common.PaginationRequest pagination = 3;
+}
+
+message ListUserStrategiesResponse {
+  bool success = 1;
+  repeated Strategy strategies = 2;
+  common.PaginationResponse pagination = 3;
+  common.Error error = 4;
+}
+
+// Activate strategy request
+message ActivateStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message ActivateStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// Deactivate strategy request
+message DeactivateStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message DeactivateStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// Get strategies by IDs (for internal services)
+message GetStrategiesByIDsRequest {
+  repeated string strategy_ids = 1;
+}
+
+message GetStrategiesByIDsResponse {
+  bool success = 1;
+  repeated Strategy strategies = 2;
+  common.Error error = 3;
+}
