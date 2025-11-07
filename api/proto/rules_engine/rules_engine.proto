@@ -1,0 +1,219 @@
+syntax = "proto3";
+
+package rules_engine;
+
+import "api/proto/common/common.proto";
+
+option go_package = "github.com/yourusername/trading-system/api/proto/rules_engine";
+
+// Rules Engine Service
+// Internal service for rule evaluation and management
+service RulesEngineService {
+  // Manually trigger rule evaluation for a specific event (for testing/debugging)
+  rpc EvaluateEvent(EvaluateEventRequest) returns (EvaluateEventResponse);
+  
+  // Reload rules for specific users (cache refresh)
+  rpc ReloadUserRules(ReloadUserRulesRequest) returns (ReloadUserRulesResponse);
+  
+  // Get matching statistics
+  rpc GetMatchingStats(GetMatchingStatsRequest) returns (GetMatchingStatsResponse);
+  
+  // Get active rules count
+  rpc GetActiveRulesCount(GetActiveRulesCountRequest) returns (GetActiveRulesCountResponse);
+  
+  // Health check
+  rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+}
+
+// Market event data structure (from Kafka)
+message MarketEvent {
+  // Event identification
+  string event_id = 1;
+  string event_type = 2;  // e.g., "NEWS_UPDATE"
+  common.Timestamp timestamp = 3;
+  
+  // Stock information
+  message StockData {
+    int64 stock_code = 1;
+    string exchange = 2;
+    string symbol = 3;
+    string isin = 4;
+    string company_name = 5;
+  }
+  StockData stock_data = 4;
+  
+  // News information
+  message NewsData {
+    string news_id = 1;
+    string news_link = 2;
+    string category = 3;
+    string short_summary = 4;
+    common.Timestamp document_date = 5;
+  }
+  NewsData news_data = 5;
+  
+  // Sentiment analysis
+  message Analysis {
+    common.Sentiment sentiment = 1;
+    string impact = 2;
+    int32 impact_score = 3;
+  }
+  Analysis analysis = 6;
+  
+  // Market data
+  message MarketData {
+    double last_traded_price = 1;
+    double pct_change = 2;
+    double news_first_price = 3;
+    double news_pct_change = 4;
+    
+    message PriceMap {
+      double open = 1;
+      double high = 2;
+      double low = 3;
+      int64 volume = 4;
+    }
+    PriceMap price_map = 5;
+  }
+  MarketData market_data = 7;
+}
+
+// Rule match result
+message RuleMatch {
+  string user_id = 1;
+  string strategy_id = 2;
+  string strategy_name = 3;
+  double match_score = 4;  // How well the event matches the strategy (0-100)
+  repeated string matched_conditions = 5;  // List of conditions that matched
+  bool approved_by_risk = 6;
+  string order_request_id = 7;  // ID of generated order request
+}
+
+// Evaluate event request (for manual testing)
+message EvaluateEventRequest {
+  MarketEvent event = 1;
+  bool dry_run = 2;  // If true, don't publish orders, just return matches
+}
+
+message EvaluateEventResponse {
+  bool success = 1;
+  repeated RuleMatch matches = 2;
+  int32 total_rules_evaluated = 3;
+  int32 total_matches = 4;
+  double evaluation_time_ms = 5;
+  common.Error error = 6;
+}
+
+// Reload user rules request
+message ReloadUserRulesRequest {
+  repeated string user_ids = 1;  // If empty, reload all users
+  bool force_refresh = 2;  // Force refresh from MongoDB even if cached
+}
+
+message ReloadUserRulesResponse {
+  bool success = 1;
+  int32 users_reloaded = 2;
+  int32 rules_reloaded = 3;
+  repeated string failed_user_ids = 4;
+  common.Error error = 5;
+}
+
+// Matching statistics
+message MatchingStats {
+  // Overall statistics
+  int64 total_events_processed = 1;
+  int64 total_matches_found = 2;
+  int64 total_orders_generated = 3;
+  
+  // Performance metrics
+  double avg_evaluation_time_ms = 4;
+  double p95_evaluation_time_ms = 5;
+  double p99_evaluation_time_ms = 6;
+  
+  // Match rate
+  double match_rate_pct = 7;  // Percentage of events that resulted in matches
+  
+  // Active rules
+  int32 active_users = 8;
+  int32 active_strategies = 9;
+  
+  // Cache statistics
+  int32 cache_hits = 10;
+  int32 cache_misses = 11;
+  double cache_hit_rate_pct = 12;
+  
+  // Elasticsearch statistics
+  int32 es_queries = 13;
+  double avg_es_query_time_ms = 14;
+  
+  // Error statistics
+  int32 evaluation_errors = 15;
+  int32 kafka_errors = 16;
+  int32 rabbitmq_errors = 17;
+  
+  // Time range
+  common.Timestamp start_time = 18;
+  common.Timestamp end_time = 19;
+  
+  // Top matched strategies
+  message TopStrategy {
+    string strategy_id = 1;
+    string strategy_name = 2;
+    int32 match_count = 3;
+  }
+  repeated TopStrategy top_strategies = 20;
+  
+  // Top matched stocks
+  message TopStock {
+    int64 stock_code = 1;
+    string symbol = 2;
+    int32 match_count = 3;
+  }
+  repeated TopStock top_stocks = 21;
+}
+
+// Get matching statistics request
+message GetMatchingStatsRequest {
+  common.Timestamp start_time = 1;
+  common.Timestamp end_time = 2;
+  repeated string user_ids = 3;  // Filter by specific users (optional)
+  int32 top_n = 4;  // Number of top strategies/stocks to return (default: 10)
+}
+
+message GetMatchingStatsResponse {
+  bool success = 1;
+  MatchingStats stats = 2;
+  common.Error error = 3;
+}
+
+// Get active rules count request
+message GetActiveRulesCountRequest {
+  string user_id = 1;  // Optional: get count for specific user
+}
+
+message GetActiveRulesCountResponse {
+  bool success = 1;
+  int32 total_active_strategies = 2;
+  int32 total_users_with_active_strategies = 3;
+  
+  // Breakdown by condition type
+  map<string, int32> rules_by_sentiment = 4;  // e.g., {"positive": 100, "neutral": 50}
+  map<string, int32> rules_by_category = 5;   // e.g., {"Financial Results": 75}
+  map<string, int32> rules_by_exchange = 6;   // e.g., {"NSE": 120, "BSE": 80}
+  
+  common.Error error = 7;
+}
+
+// Internal evaluation request (used between components)
+message InternalEvaluateRequest {
+  string user_id = 1;
+  string strategy_id = 2;
+  MarketEvent event = 3;
+}
+
+message InternalEvaluateResponse {
+  bool matched = 1;
+  double match_score = 2;
+  repeated string matched_conditions = 3;
+  repeated string failed_conditions = 4;
+}
