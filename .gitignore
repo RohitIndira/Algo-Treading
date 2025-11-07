@@ -1,0 +1,51 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+*.test
+*.out
+vendor/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+*.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Generated code
+api/proto/**/*.pb.go
+api/proto/**/*_grpc.pb.go
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+
+# Temporary files
+tmp/
+temp/
+
+# Coverage reports
+coverage.out
+coverage.html
+*.coverprofile
+
+# Documentation builds
+docs/_build/
+site/
