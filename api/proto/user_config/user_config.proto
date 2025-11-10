@@ -4,7 +4,7 @@ package user_config;
 
 import "api/proto/common/common.proto";
 
-option go_package = "github.com/yourusername/trading-system/api/proto/user_config";
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/user_config";
 
 // User Configuration Service
 // Manages user trading strategies and preferences

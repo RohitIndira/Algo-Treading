@@ -4,7 +4,7 @@ package risk_management;
 
 import "api/proto/common/common.proto";
 
-option go_package = "github.com/yourusername/trading-system/api/proto/risk_management";
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/risk_management";
 
 // Risk Management Service
 // Provides pre-trade risk checks and post-trade monitoring

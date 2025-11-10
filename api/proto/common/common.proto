@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package common;
 
-option go_package = "github.com/yourusername/trading-system/api/proto/common";
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/common";
 
 // Timestamp message for consistent time representation
 message Timestamp {

@@ -4,7 +4,7 @@ package rules_engine;
 
 import "api/proto/common/common.proto";
 
-option go_package = "github.com/yourusername/trading-system/api/proto/rules_engine";
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/rules_engine";
 
 // Rules Engine Service
 // Internal service for rule evaluation and management

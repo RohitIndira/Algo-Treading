@@ -4,7 +4,7 @@ package trade_execution;
 
 import "api/proto/common/common.proto";
 
-option go_package = "github.com/yourusername/trading-system/api/proto/trade_execution";
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/trade_execution";
 
 // Trade Execution Service
 // Handles order execution via Odin API and order management
