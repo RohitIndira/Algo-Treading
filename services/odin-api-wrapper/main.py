@@ -12,6 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import logging
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Import the Odin SDK
 import sys
@@ -175,9 +179,9 @@ async def login(request: LoginRequest):
                 detail="Missing required credentials. Provide in request or configure in .env file"
             )
         
-        # Generate TOTP
+        # Generate TOTP (same as working b2c_bridge.py)
         totp = pyotp.TOTP(totp_secret).now()
-        logger.info(f"Generated TOTP for user {user_id}")
+        logger.info(f"🔐 Generated TOTP for user {user_id}: {totp}")
         
         # Create client with proper configuration
         client = IBTConnect(params={
@@ -186,19 +190,17 @@ async def login(request: LoginRequest):
             "debug": True
         })
         
-        # Login with all parameters
+        # Login with simple parameters (matching example.py and b2c_bridge.py)
         login_params = {
             "userId": user_id,
             "password": password,
-            "clientId": client_id,
-            "source": source,
-            "loginType": login_type,
-            "secondAuthType": second_auth_type,
-            "secondAuth": totp
+            "totp": totp
         }
         
-        logger.info(f"Attempting login for user {user_id}")
+        logger.info(f"🔐 Attempting login for user {user_id}")
         response = client.login(params=login_params)
+        
+        logger.info(f"🔐 Login response status: {response.get('status', 'Unknown')}")
         
         if response.get("data"):
             # Store client
