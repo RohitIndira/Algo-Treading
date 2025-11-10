@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS trade_configs (
     stop_loss_pct DECIMAL(10,2),
     take_profit_pct DECIMAL(10,2),
     exchange VARCHAR(50) NOT NULL,
-    order_side VARCHAR(10) NOT NULL DEFAULT 'BUY',
+    order_side VARCHAR(50) NOT NULL DEFAULT 'BUY',
     limit_price DECIMAL(15,2),
     validity VARCHAR(50) DEFAULT 'DAY',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
