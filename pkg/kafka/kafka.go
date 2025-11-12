@@ -189,3 +189,36 @@ func ListTopics(brokers []string) ([]string, error) {
 
 	return topics, nil
 }
+
+// EnsureTopicExists checks if the topic exists; if not, creates it.
+func EnsureTopicExists(brokers []string, topic string, numPartitions, replicationFactor int) error {
+	conn, err := kafka.Dial("tcp", brokers[0])
+	if err != nil {
+		return fmt.Errorf("failed to dial Kafka: %w", err)
+	}
+	defer conn.Close()
+
+	partitions, err := conn.ReadPartitions()
+	if err != nil {
+		return fmt.Errorf("failed to read partitions: %w", err)
+	}
+
+	// Check if topic already exists
+	for _, p := range partitions {
+		if p.Topic == topic {
+			return nil // already exists
+		}
+	}
+
+	// Create topic if missing
+	topicConfig := kafka.TopicConfig{
+		Topic:             topic,
+		NumPartitions:     numPartitions,
+		ReplicationFactor: replicationFactor,
+	}
+	if err := conn.CreateTopics(topicConfig); err != nil {
+		return fmt.Errorf("failed to create topic: %w", err)
+	}
+
+	return nil
+}
