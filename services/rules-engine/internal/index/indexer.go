@@ -321,3 +321,8 @@ func (i *Indexer) Close() error {
 	i.logger.Info("Elasticsearch indexer closed")
 	return nil
 }
+
+// GetClient returns the Elasticsearch client
+func (i *Indexer) GetClient() *elasticsearch.Client {
+	return i.client
+}

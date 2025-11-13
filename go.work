@@ -1,0 +1,12 @@
+go 1.25.4
+
+use (
+	.
+	./api/proto/common
+	./pkg/logger
+	./services/data-ingestion
+	./services/risk-management
+	./services/rules-engine
+	./services/trade-execution
+	./services/user-config
+)
