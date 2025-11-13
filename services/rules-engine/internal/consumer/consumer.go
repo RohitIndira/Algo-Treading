@@ -82,10 +82,10 @@ func (c *Consumer) processMessage(ctx context.Context) error {
 		zap.Int64("offset", msg.Offset),
 		zap.Time("time", msg.Time))
 
-	// Deserialize event
-	var event models.MarketEvent
-	if err := json.Unmarshal(msg.Value, &event); err != nil {
-		c.logger.Error("Failed to unmarshal event",
+	// First, try to unmarshal as MongoDB event
+	var mongoEvent models.MongoDBEvent
+	if err := json.Unmarshal(msg.Value, &mongoEvent); err != nil {
+		c.logger.Error("Failed to unmarshal MongoDB event",
 			zap.Error(err),
 			zap.ByteString("message", msg.Value))
 
@@ -94,10 +94,25 @@ func (c *Consumer) processMessage(ctx context.Context) error {
 			c.logger.Error("Failed to commit malformed message", zap.Error(commitErr))
 		}
 
-		return fmt.Errorf("failed to unmarshal event: %w", err)
+		return fmt.Errorf("failed to unmarshal MongoDB event: %w", err)
 	}
 
-	// Validate event
+	// Convert MongoDB event to MarketEvent
+	event, err := mongoEvent.ToMarketEvent()
+	if err != nil {
+		c.logger.Error("Failed to convert MongoDB event",
+			zap.Error(err),
+			zap.String("news_id", mongoEvent.NewsID))
+
+		// Commit to skip unconvertible events
+		if commitErr := c.reader.CommitMessages(ctx, msg); commitErr != nil {
+			c.logger.Error("Failed to commit unconvertible message", zap.Error(commitErr))
+		}
+
+		return fmt.Errorf("failed to convert event: %w", err)
+	}
+
+	// Validate converted event
 	if err := event.Validate(); err != nil {
 		c.logger.Warn("Invalid event received",
 			zap.Error(err),
@@ -113,7 +128,7 @@ func (c *Consumer) processMessage(ctx context.Context) error {
 
 	// Handle event
 	startTime := time.Now()
-	if err := c.handler.HandleEvent(ctx, &event); err != nil {
+	if err := c.handler.HandleEvent(ctx, event); err != nil {
 		c.logger.Error("Failed to handle event",
 			zap.Error(err),
 			zap.String("event_id", event.EventID))

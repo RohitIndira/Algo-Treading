@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
@@ -20,6 +21,11 @@ import (
 )
 
 func main() {
+	// Load .env file
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	}
+
 	log.Println("========================================")
 	log.Println("Starting Trade Execution Service...")
 	log.Println("========================================")
