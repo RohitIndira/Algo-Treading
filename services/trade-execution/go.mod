@@ -15,6 +15,7 @@ require (
 	github.com/RohitIndira/Algo-Treading/api/proto/common v0.0.0
 	github.com/RohitIndira/Algo-Treading/api/proto/trade_execution v0.0.0
 	github.com/RohitIndira/Algo-Treading/pkg/odin v0.0.0
+	github.com/joho/godotenv v1.5.1
 )
 
 require (

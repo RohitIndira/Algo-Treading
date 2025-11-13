@@ -1,10 +1,20 @@
 package config
 
 import (
+	"log"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
+
+func init() {
+	// Load .env file if it exists
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	}
+}
 
 // Config holds data-ingestion configuration
 type Config struct {

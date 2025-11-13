@@ -39,9 +39,9 @@ fi
 
 echo ""
 
-echo "${YELLOW}Step 2: Stopping existing Kafka containers...${NC}"
-$DOCKER_COMPOSE_CMD -f docker-compose-kafka.yml down 2>/dev/null
-echo "${GREEN}✓ Cleanup complete${NC}"
+echo "${YELLOW}Step 2: Stopping existing Kafka containers and removing old data...${NC}"
+$DOCKER_COMPOSE_CMD -f docker-compose-kafka.yml down -v 2>/dev/null
+echo "${GREEN}✓ Cleanup complete (volumes removed)${NC}"
 echo ""
 
 echo "${YELLOW}Step 3: Starting Kafka services...${NC}"
@@ -81,24 +81,34 @@ if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
 fi
 
 echo ""
-echo "${YELLOW}Step 5: Creating required topics...${NC}"
+echo "${YELLOW}Step 5: Creating required topics for all services...${NC}"
 
-# Array of topics to create
-topics=("user-configs" "news-events" "trade-signals" "trade-executions")
+# Comprehensive array of all topics needed for the trading system
+topics=(
+    "user-configs"          # User Config Service - strategy updates
+    "news-events"           # Data Ingestion - incoming market news
+    "trade-signals"         # Rules Engine - matched trading signals
+    "trade-executions"      # Trade Execution - execution results
+    "risk-approvals"        # Risk Management - approved trades
+    "order-updates"         # Trade Execution - order status updates
+)
 
 for topic in "${topics[@]}"; do
-    echo "Creating topic: $topic"
+    # Extract topic name (before the comment)
+    topic_name=$(echo "$topic" | awk '{print $1}')
+    
+    echo "Creating topic: $topic_name"
     docker exec trading-kafka kafka-topics --create \
         --bootstrap-server localhost:9092 \
         --replication-factor 1 \
         --partitions 3 \
-        --topic "$topic" \
+        --topic "$topic_name" \
         --if-not-exists 2>/dev/null
     
     if [ $? -eq 0 ]; then
-        echo "${GREEN}✓ Topic $topic created${NC}"
+        echo "${GREEN}✓ Topic $topic_name created${NC}"
     else
-        echo "${YELLOW}! Topic $topic might already exist${NC}"
+        echo "${YELLOW}! Topic $topic_name might already exist${NC}"
     fi
 done
 

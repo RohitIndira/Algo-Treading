@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -13,6 +14,42 @@ type MarketEvent struct {
 	NewsData   NewsData   `json:"news_data"`
 	Analysis   Analysis   `json:"analysis"`
 	MarketData MarketData `json:"market_data"`
+}
+
+// MongoDBID represents MongoDB's _id field structure
+type MongoDBID struct {
+	OID string `json:"$oid"`
+}
+
+// UnmarshalJSON custom unmarshaling to handle both event_id and MongoDB's _id
+func (e *MarketEvent) UnmarshalJSON(data []byte) error {
+	// Create a temporary struct with all possible field mappings
+	type Alias MarketEvent
+	aux := &struct {
+		MongoID interface{} `json:"_id"` // Can be string or object
+		*Alias
+	}{
+		Alias: (*Alias)(e),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	// If EventID is empty, try to get it from MongoDB's _id
+	if e.EventID == "" && aux.MongoID != nil {
+		switch v := aux.MongoID.(type) {
+		case string:
+			e.EventID = v
+		case map[string]interface{}:
+			// Handle {"$oid": "..."}
+			if oid, ok := v["$oid"].(string); ok {
+				e.EventID = oid
+			}
+		}
+	}
+
+	return nil
 }
 
 // StockData contains stock information
@@ -62,8 +99,9 @@ func (e *MarketEvent) Validate() error {
 	if e.EventID == "" {
 		return ErrInvalidEventID
 	}
+	// Auto-set event_type if missing (MongoDB doesn't have this field)
 	if e.EventType == "" {
-		return ErrInvalidEventType
+		e.EventType = "news" // Default for MongoDB news events
 	}
 	if e.StockData.StockCode <= 0 {
 		return ErrInvalidStockCode

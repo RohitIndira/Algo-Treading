@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
 	commonpb "github.com/RohitIndira/Algo-Treading/api/proto/common"
@@ -44,6 +45,9 @@ func (s *Server) Start() error {
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterTradeExecutionServiceServer(grpcServer, s)
+
+	// Register reflection service for grpcurl
+	reflection.Register(grpcServer)
 
 	log.Printf("gRPC server listening on port %d", s.port)
 	return grpcServer.Serve(lis)
