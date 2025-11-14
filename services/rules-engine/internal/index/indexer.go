@@ -132,6 +132,7 @@ func (i *Indexer) getIndexMapping() string {
 				"user_id": {"type": "keyword"},
 				"strategy_name": {"type": "text"},
 				"active": {"type": "boolean"},
+				"match_all_news": {"type": "boolean"},
 				"impact_score_min": {"type": "integer"},
 				"sentiments": {"type": "keyword"},
 				"categories": {"type": "keyword"},

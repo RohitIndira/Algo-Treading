@@ -34,7 +34,13 @@ func (e *Evaluator) Evaluate(event *models.MarketEvent, strategy *models.Strateg
 		ConditionScores:   make(map[string]float64),
 	}
 
-	// Evaluate each condition
+	// Check if this is a match-all strategy (e.g., user sent "/all")
+	if strategy.Conditions.MatchAllNews {
+		e.evaluateMatchAllStrategy(event, strategy, result)
+		return result
+	}
+
+	// Evaluate each condition normally
 	e.evaluateImpactScore(event, strategy, result)
 	e.evaluateSentiment(event, strategy, result)
 	e.evaluateCategory(event, strategy, result)
@@ -45,6 +51,39 @@ func (e *Evaluator) Evaluate(event *models.MarketEvent, strategy *models.Strateg
 	e.evaluateExchange(event, strategy, result)
 
 	return result
+}
+
+// evaluateMatchAllStrategy evaluates a match-all strategy
+// When match_all_news=true, only impact score is checked, all other conditions are auto-matched
+func (e *Evaluator) evaluateMatchAllStrategy(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
+	e.logger.Debug("Evaluating match-all strategy",
+		zap.String("strategy_id", strategy.StrategyID),
+		zap.String("event_id", event.EventID))
+
+	// Still check impact score threshold
+	e.evaluateImpactScore(event, strategy, result)
+
+	// Auto-match all other conditions
+	result.MatchedConditions = append(result.MatchedConditions,
+		"match_all_news",
+		"sentiment",
+		"category",
+		"stock",
+		"price_range",
+		"volume",
+		"pct_change",
+		"exchange",
+	)
+
+	// Set perfect scores for all auto-matched conditions
+	result.ConditionScores["match_all_news"] = 100.0
+	result.ConditionScores["sentiment"] = 100.0
+	result.ConditionScores["category"] = 100.0
+	result.ConditionScores["stock"] = 100.0
+	result.ConditionScores["price_range"] = 100.0
+	result.ConditionScores["volume"] = 100.0
+	result.ConditionScores["pct_change"] = 100.0
+	result.ConditionScores["exchange"] = 100.0
 }
 
 // evaluateImpactScore evaluates impact score condition

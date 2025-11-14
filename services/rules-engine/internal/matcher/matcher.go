@@ -213,6 +213,7 @@ func (m *Matcher) reconstructStrategy(esStrategy *models.ElasticsearchStrategy) 
 		StrategyName: esStrategy.StrategyName,
 		Active:       esStrategy.Active,
 		Conditions: models.Conditions{
+			MatchAllNews:         esStrategy.MatchAllNews,
 			ImpactScoreThreshold: esStrategy.ImpactScoreMin,
 			Sentiments:           esStrategy.Sentiments,
 			Categories:           esStrategy.Categories,
@@ -225,7 +226,7 @@ func (m *Matcher) reconstructStrategy(esStrategy *models.ElasticsearchStrategy) 
 			PctChangeThreshold: esStrategy.PctChangeMin,
 		},
 		TradeConfig: models.TradeConfig{
-			Exchange: esStrategy.Exchange,
+			Exchange: esStrategy.Exchange, // Already normalized in Elasticsearch
 			// Note: Some fields may not be available in ES index
 			// They should be fetched from cache or User Config Service
 		},

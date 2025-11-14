@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,7 @@ type Strategy struct {
 
 // Conditions represents the conditions for a strategy
 type Conditions struct {
+	MatchAllNews         bool       `json:"match_all_news" bson:"match_all_news"`
 	ImpactScoreThreshold int32      `json:"impact_score_threshold" bson:"impact_score_threshold"`
 	Sentiments           []string   `json:"sentiments" bson:"sentiments"`
 	Categories           []string   `json:"categories" bson:"categories"`
@@ -57,6 +59,7 @@ type ElasticsearchStrategy struct {
 	UserID         string   `json:"user_id"`
 	StrategyName   string   `json:"strategy_name"`
 	Active         bool     `json:"active"`
+	MatchAllNews   bool     `json:"match_all_news"`
 	ImpactScoreMin int32    `json:"impact_score_min"`
 	Sentiments     []string `json:"sentiments"`
 	Categories     []string `json:"categories"`
@@ -78,6 +81,7 @@ func (s *Strategy) ToElasticsearchStrategy() *ElasticsearchStrategy {
 		UserID:         s.UserID,
 		StrategyName:   s.StrategyName,
 		Active:         s.Active,
+		MatchAllNews:   s.Conditions.MatchAllNews,
 		ImpactScoreMin: s.Conditions.ImpactScoreThreshold,
 		Sentiments:     s.Conditions.Sentiments,
 		Categories:     s.Conditions.Categories,
@@ -86,11 +90,18 @@ func (s *Strategy) ToElasticsearchStrategy() *ElasticsearchStrategy {
 		PriceMax:       s.Conditions.PriceRange.MaxPrice,
 		VolumeMin:      s.Conditions.VolumeThreshold,
 		PctChangeMin:   s.Conditions.PctChangeThreshold,
-		Exchange:       s.TradeConfig.Exchange,
+		Exchange:       normalizeExchange(s.TradeConfig.Exchange),
 		MaxDailyTrades: s.RiskLimits.MaxDailyTrades,
 		MaxLossPerDay:  s.RiskLimits.MaxLossPerDay,
 		UpdatedAt:      s.UpdatedAt.Unix(),
 	}
+}
+
+// normalizeExchange removes the EXCHANGE_ prefix if present
+// Converts "EXCHANGE_NSE" -> "NSE", "EXCHANGE_BSE" -> "BSE"
+// Leaves "NSE" and "BSE" as-is
+func normalizeExchange(exchange string) string {
+	return strings.TrimPrefix(exchange, "EXCHANGE_")
 }
 
 // Validate validates a strategy
