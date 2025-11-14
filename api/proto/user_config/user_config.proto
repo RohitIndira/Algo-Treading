@@ -39,29 +39,42 @@ service UserConfigService {
 
 // Strategy condition filters
 message StrategyConditions {
+  // Match ALL news events (overrides all other conditions except impact_score_threshold)
+  // Set this to true to create a catch-all strategy
+  // Example: User sends "/all" to match every news event
+  bool match_all_news = 1;
+  
   // Impact score threshold (1-10)
-  int32 impact_score_threshold = 1;
+  // Even with match_all_news=true, news must meet minimum impact score
+  int32 impact_score_threshold = 2;
   
   // Sentiment filters (positive, neutral, negative)
-  repeated common.Sentiment sentiments = 2;
+  // Ignored if match_all_news=true
+  repeated common.Sentiment sentiments = 3;
   
   // News categories to monitor
-  repeated string categories = 3;
+  // Ignored if match_all_news=true
+  repeated string categories = 4;
   
   // Specific stocks to monitor (stock codes)
-  repeated int64 stock_codes = 4;
+  // Ignored if match_all_news=true
+  repeated int64 stock_codes = 5;
   
   // Price range filter
-  common.PriceRange price_range = 5;
+  // Ignored if match_all_news=true
+  common.PriceRange price_range = 6;
   
   // Minimum trading volume threshold
-  int64 volume_threshold = 6;
+  // Ignored if match_all_news=true
+  int64 volume_threshold = 7;
   
   // Percentage change threshold (trigger if stock moves by this %)
-  double pct_change_threshold = 7;
+  // Ignored if match_all_news=true
+  double pct_change_threshold = 8;
   
   // Exchanges to monitor
-  repeated common.Exchange exchanges = 8;
+  // Ignored if match_all_news=true
+  repeated common.Exchange exchanges = 9;
 }
 
 // Trade execution configuration

@@ -239,9 +239,11 @@ func (q *QueryEngine) buildQuery(event *models.MarketEvent) map[string]interface
 
 	boolQuery["should"] = shouldClauses
 
-	// Require at least one match from should clauses for relevance
-	// But don't make it mandatory as we want to be inclusive in candidate selection
-	boolQuery["minimum_should_match"] = 1
+	// Changed from 1 to 0: Allow strategies with empty conditions (catch-all strategies)
+	// to be selected as candidates. The evaluator will handle precise matching.
+	// This fixes the issue where strategies with empty stock_codes, sentiments, etc.
+	// were not being selected as candidates even though they should match all events.
+	boolQuery["minimum_should_match"] = 0
 
 	return query
 }
