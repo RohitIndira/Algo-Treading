@@ -176,10 +176,13 @@ func (m *Matcher) evaluateStrategy(ctx context.Context, event *models.MarketEven
 
 	// Check if score meets minimum threshold
 	if score < m.minMatchScore {
-		m.logger.Debug("Strategy score below threshold",
+		m.logger.Warn("Strategy score below threshold",
 			zap.String("strategy_id", strategy.StrategyID),
+			zap.String("strategy_name", strategy.StrategyName),
 			zap.Float64("score", score),
-			zap.Float64("threshold", m.minMatchScore))
+			zap.Float64("threshold", m.minMatchScore),
+			zap.Strings("matched", result.MatchedConditions),
+			zap.Strings("failed", result.FailedConditions))
 		return nil
 	}
 

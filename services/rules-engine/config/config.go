@@ -20,6 +20,9 @@ type Config struct {
 	// Kafka Configuration
 	Kafka KafkaConfig
 
+	// PostgreSQL Configuration (for loading strategies)
+	PostgreSQL PostgreSQLConfig
+
 	// Elasticsearch Configuration
 	Elasticsearch ElasticsearchConfig
 
@@ -50,6 +53,16 @@ type KafkaConfig struct {
 	SessionTimeout    time.Duration
 	HeartbeatInterval time.Duration
 	RebalanceTimeout  time.Duration
+}
+
+// PostgreSQLConfig holds PostgreSQL-specific configuration
+type PostgreSQLConfig struct {
+	Host     string
+	Port     string
+	User     string
+	Password string
+	Database string
+	SSLMode  string
 }
 
 // ElasticsearchConfig holds Elasticsearch-specific configuration
@@ -152,6 +165,15 @@ func LoadConfig() (*Config, error) {
 			SessionTimeout:    getEnvAsDuration("KAFKA_SESSION_TIMEOUT", 10*time.Second),
 			HeartbeatInterval: getEnvAsDuration("KAFKA_HEARTBEAT_INTERVAL", 3*time.Second),
 			RebalanceTimeout:  getEnvAsDuration("KAFKA_REBALANCE_TIMEOUT", 60*time.Second),
+		},
+
+		PostgreSQL: PostgreSQLConfig{
+			Host:     getEnv("POSTGRES_HOST", "localhost"),
+			Port:     getEnv("POSTGRES_PORT", "5432"),
+			User:     getEnv("POSTGRES_USER", "postgres"),
+			Password: getEnv("POSTGRES_PASSWORD", "postgres"),
+			Database: getEnv("POSTGRES_DB", "trading_db"),
+			SSLMode:  getEnv("POSTGRES_SSLMODE", "disable"),
 		},
 
 		Elasticsearch: ElasticsearchConfig{
