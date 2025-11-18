@@ -15,6 +15,8 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/sync"
 
 	"go.uber.org/zap"
 )
@@ -40,6 +42,26 @@ func main() {
 
 	// Initialize matching statistics
 	stats := models.NewMatchingStats()
+
+	// Initialize PostgreSQL repository for trade signal tracking
+	logger.Info("Initializing PostgreSQL trade signal repository...")
+	signalRepo, err := repository.NewTradeSignalRepository(
+		cfg.PostgreSQL.Host,
+		cfg.PostgreSQL.Port,
+		cfg.PostgreSQL.User,
+		cfg.PostgreSQL.Password,
+		cfg.PostgreSQL.Database,
+		cfg.PostgreSQL.SSLMode,
+		logger,
+	)
+	if err != nil {
+		logger.Warn("Failed to initialize trade signal repository - orders won't be tracked in DB",
+			zap.Error(err))
+		signalRepo = nil // Continue without DB tracking
+	} else {
+		defer signalRepo.Close()
+		logger.Info("Trade signal repository initialized successfully")
+	}
 
 	// Initialize Redis cache
 	logger.Info("Initializing Redis cache...")
@@ -76,6 +98,18 @@ func main() {
 	defer indexer.Close()
 	logger.Info("Elasticsearch indexer initialized successfully")
 
+	// Initialize strategy syncer (loads strategies from Kafka user-configs topic)
+	logger.Info("Initializing strategy syncer...")
+	strategySyncer := sync.NewStrategySyncer(
+		cfg.Kafka.Brokers,
+		"user-configs", // Topic where user-config service publishes strategy events
+		"rules-engine-strategy-sync-group",
+		indexer,
+		logger,
+	)
+	defer strategySyncer.Close()
+	logger.Info("Strategy syncer initialized successfully")
+
 	// Initialize query engine
 	queryEngine := index.NewQueryEngine(
 		indexer.GetClient(),
@@ -97,15 +131,25 @@ func main() {
 
 	// Initialize RabbitMQ publisher
 	logger.Info("Initializing RabbitMQ publisher...")
-	pub, err := publisher.NewPublisher(&cfg.RabbitMQ, logger)
+	rabbitPub, err := publisher.NewPublisher(&cfg.RabbitMQ, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize RabbitMQ publisher", zap.Error(err))
 	}
-	defer pub.Close()
+	defer rabbitPub.Close()
 	logger.Info("RabbitMQ publisher initialized successfully")
 
+	// Initialize Kafka publisher for trade-signals topic
+	logger.Info("Initializing Kafka publisher for trade-signals...")
+	kafkaPub := publisher.NewKafkaPublisher(
+		cfg.Kafka.Brokers,
+		"trade-signals", // Topic for order signals
+		logger,
+	)
+	defer kafkaPub.Close()
+	logger.Info("Kafka trade-signals publisher initialized successfully")
+
 	// Initialize event handler
-	handler := consumer.NewHandler(matcherEngine, pub, stats, logger)
+	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, stats, logger)
 
 	// Initialize Kafka consumer
 	logger.Info("Initializing Kafka consumer...")
@@ -120,12 +164,20 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start consuming messages
+	// Start strategy syncer (loads from Kafka user-configs topic)
 	go func() {
-		logger.Info("Starting to consume messages from Kafka",
+		logger.Info("Starting strategy syncer from Kafka user-configs topic...")
+		if err := strategySyncer.Start(ctx); err != nil {
+			logger.Error("Strategy syncer error", zap.Error(err))
+		}
+	}()
+
+	// Start consuming market events from Kafka
+	go func() {
+		logger.Info("Starting to consume market events from Kafka",
 			zap.String("topic", cfg.Kafka.Topic),
 			zap.String("consumer_group", cfg.Kafka.ConsumerGroup))
-		
+
 		if err := kafkaConsumer.Start(ctx); err != nil {
 			logger.Error("Kafka consumer error", zap.Error(err))
 		}
@@ -139,12 +191,19 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
+				syncStats := strategySyncer.GetStats()
 				logger.Info("Matching statistics",
 					zap.Int64("events_processed", stats.TotalEventsProcessed),
 					zap.Int64("matches_found", stats.TotalMatchesFound),
 					zap.Int64("orders_generated", stats.TotalOrdersGenerated),
 					zap.Int64("cache_hits", stats.CacheHits),
 					zap.Int64("cache_misses", stats.CacheMisses))
+				logger.Info("Strategy sync statistics",
+					zap.Int64("strategies_synced", syncStats.TotalProcessed),
+					zap.Int64("created", syncStats.Created),
+					zap.Int64("updated", syncStats.Updated),
+					zap.Int64("deleted", syncStats.Deleted),
+					zap.Int64("sync_errors", syncStats.Errors))
 			case <-ctx.Done():
 				return
 			}
@@ -160,7 +219,7 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	<-sigCh
-	logger.Info("Received shutdown signal, starting graceful shutdown...")	// Cancel context to stop all goroutines
+	logger.Info("Received shutdown signal, starting graceful shutdown...") // Cancel context to stop all goroutines
 	cancel()
 
 	// Give some time for graceful shutdown
