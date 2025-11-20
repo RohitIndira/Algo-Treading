@@ -26,6 +26,11 @@ type OrderRequest struct {
 	ImpactScore  int32     `json:"impact_score"`
 	Sentiment    string    `json:"sentiment"`
 	NewsCategory string    `json:"news_category"`
+	RiskApproved bool      `json:"risk_approved"` // Temporary: Set to true until risk-management integration
+	RiskScore    float64   `json:"risk_score"`
+	RetryCount   int       `json:"retry_count"`
+	OrderSide    string    `json:"order_side"` // BUY, SELL
+	Validity     string    `json:"validity"`   // DAY, IOC, etc.
 }
 
 // RuleMatch represents a successful rule match
@@ -61,15 +66,20 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		Symbol:       event.StockData.Symbol,
 		Exchange:     event.StockData.Exchange,
 		OrderType:    strategy.TradeConfig.OrderType,
+		OrderSide:    "BUY", // Default to BUY
 		Quantity:     strategy.TradeConfig.Quantity,
 		Price:        price,
 		StopLoss:     stopLoss,
 		TakeProfit:   takeProfit,
+		Validity:     "DAY", // Default to DAY order
 		Timestamp:    time.Now(),
 		MatchScore:   match.MatchScore,
 		ImpactScore:  event.Analysis.ImpactScore,
 		Sentiment:    event.Analysis.Sentiment,
 		NewsCategory: event.NewsData.Category,
+		RiskApproved: true, // TODO: Integrate with risk-management service
+		RiskScore:    0.0,  // TODO: Get from risk-management service
+		RetryCount:   0,
 	}
 }
 
