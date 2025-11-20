@@ -1,0 +1,33 @@
+{
+  "user_id": "user-123",
+  "strategy_name": "GOLDEN-STRATEGY",
+  "description": "Trade everything - no restrictions",
+  "activate_immediately": true,
+  "conditions": {
+    "match_all_news": false,
+    "impact_score_threshold": 1,
+    "sentiments": [],
+    "categories": [],
+    "stock_codes": [],
+    "exchanges": [],
+    "price_range": {
+      "min_price": 0,
+      "max_price": 999999999
+    },
+    "volume_threshold": 0,
+    "pct_change_threshold": 0
+  },
+  "trade_config": {
+    "order_type": "ORDER_TYPE_MARKET",
+    "order_side": "ORDER_SIDE_BUY",
+    "quantity": 1,
+    "exchange": "EXCHANGE_NSE",
+    "validity": "DAY"
+  },
+  "risk_limits": {
+    "max_daily_trades": 100,
+    "max_loss_per_day": 50000.0,
+    "enable_risk_checks": true,
+    "position_sizing": "POSITION_SIZING_FIXED"
+  }
+}
