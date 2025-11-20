@@ -309,6 +309,116 @@ async def cancel_order(
         logger.error(f"Cancel order error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/orders/cover")
+async def place_cover_order(
+    order: OrderRequest,
+    client: IBTConnect = Depends(get_client)
+):
+    """Place a cover order"""
+    try:
+        response = client.place_cover_order(order.dict())
+        return handle_api_response(response)
+    except Exception as e:
+        logger.error(f"Place cover order error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/orders/cover")
+async def modify_cover_order(
+    order: ModifyOrderRequest,
+    client: IBTConnect = Depends(get_client)
+):
+    """Modify a cover order"""
+    try:
+        params = {k: v for k, v in order.dict().items() if v is not None}
+        response = client.modify_cover_order(params)
+        return handle_api_response(response)
+    except Exception as e:
+        logger.error(f"Modify cover order error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/orders/cover")
+async def cancel_cover_order(
+    order: CancelOrderRequest,
+    client: IBTConnect = Depends(get_client)
+):
+    """Cancel a cover order"""
+    try:
+        response = client.cancel_cover_order(order.dict())
+        return handle_api_response(response)
+    except Exception as e:
+        logger.error(f"Cancel cover order error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/orders/bracket")
+async def place_bracket_order(
+    order: OrderRequest,
+    client: IBTConnect = Depends(get_client)
+):
+    """Place a bracket order"""
+    try:
+        response = client.place_bracket_order(order.dict())
+        return handle_api_response(response)
+    except Exception as e:
+        logger.error(f"Place bracket order error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/orders/bracket")
+async def modify_bracket_order(
+    order: ModifyOrderRequest,
+    client: IBTConnect = Depends(get_client)
+):
+    """Modify a bracket order"""
+    try:
+        params = {k: v for k, v in order.dict().items() if v is not None}
+        response = client.modify_bracket_order(params)
+        return handle_api_response(response)
+    except Exception as e:
+        logger.error(f"Modify bracket order error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/orders/bracket")
+async def delete_bracket_order(
+    order: CancelOrderRequest,
+    client: IBTConnect = Depends(get_client)
+):
+    """Delete a bracket order"""
+    try:
+        response = client.delete_bracket_order(order.dict())
+        return handle_api_response(response)
+    except Exception as e:
+        logger.error(f"Delete bracket order error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/orders/multileg")
+async def place_multileg_order(
+    order: Dict[str, Any],
+    client: IBTConnect = Depends(get_client)
+):
+    """Place a multileg order"""
+    try:
+        response = client.place_multileg_order(order)
+        return handle_api_response(response)
+    except Exception as e:
+        logger.error(f"Place multileg order error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/orders/multileg/{order_flag}/{gateway_order_no}")
+async def cancel_multileg_order(
+    order_flag: str,
+    gateway_order_no: str,
+    client: IBTConnect = Depends(get_client)
+):
+    """Cancel a multileg order"""
+    try:
+        response = client.cancel_multileg_order({
+            "order_flag": order_flag,
+            "gateway_order_no": gateway_order_no
+        })
+        return handle_api_response(response)
+    except Exception as e:
+        logger.error(f"Cancel multileg order error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/orders/book")
 async def get_order_book(
     offset: int = 1,
