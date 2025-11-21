@@ -16,6 +16,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/sync"
 
 	"go.uber.org/zap"
@@ -129,6 +130,25 @@ func main() {
 	)
 	logger.Info("Matcher engine initialized successfully")
 
+	// Initialize risk management client
+	logger.Info("Initializing risk management client...")
+	riskClient, err := risk.NewClient(risk.Config{
+		Address:          cfg.GRPCClients.RiskManagement.Address,
+		Timeout:          cfg.GRPCClients.RiskManagement.Timeout,
+		MaxRetries:       cfg.GRPCClients.RiskManagement.MaxRetries,
+		RetryBackoff:     cfg.GRPCClients.RiskManagement.RetryBackoff,
+		KeepAlive:        cfg.GRPCClients.RiskManagement.KeepAlive,
+		KeepAliveTimeout: cfg.GRPCClients.RiskManagement.KeepAliveTimeout,
+	}, logger)
+	if err != nil {
+		logger.Warn("Failed to initialize risk management client - orders will be auto-approved",
+			zap.Error(err))
+		riskClient = nil // Continue without risk checks
+	} else {
+		defer riskClient.Close()
+		logger.Info("Risk management client initialized successfully")
+	}
+
 	// Initialize RabbitMQ publisher
 	logger.Info("Initializing RabbitMQ publisher...")
 	rabbitPub, err := publisher.NewPublisher(&cfg.RabbitMQ, logger)
@@ -149,7 +169,7 @@ func main() {
 	logger.Info("Kafka trade-signals publisher initialized successfully")
 
 	// Initialize event handler
-	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, stats, logger)
+	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, stats, logger)
 
 	// Initialize Kafka consumer
 	logger.Info("Initializing Kafka consumer...")

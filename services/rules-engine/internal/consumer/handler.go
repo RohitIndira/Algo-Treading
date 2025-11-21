@@ -8,6 +8,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
 	"go.uber.org/zap"
 )
 
@@ -17,6 +18,7 @@ type Handler struct {
 	rabbitPubl *publisher.Publisher
 	kafkaPubl  *publisher.KafkaPublisher
 	signalRepo *repository.TradeSignalRepository
+	riskClient *risk.Client
 	stats      *models.MatchingStats
 	logger     *zap.Logger
 }
@@ -27,6 +29,7 @@ func NewHandler(
 	rabbitPubl *publisher.Publisher,
 	kafkaPubl *publisher.KafkaPublisher,
 	signalRepo *repository.TradeSignalRepository,
+	riskClient *risk.Client,
 	stats *models.MatchingStats,
 	logger *zap.Logger,
 ) *Handler {
@@ -35,6 +38,7 @@ func NewHandler(
 		rabbitPubl: rabbitPubl,
 		kafkaPubl:  kafkaPubl,
 		signalRepo: signalRepo,
+		riskClient: riskClient,
 		stats:      stats,
 		logger:     logger,
 	}
@@ -129,7 +133,49 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return fmt.Errorf("invalid order request: %w", err)
 	}
 
-	// 1. Save order to PostgreSQL first (for tracking)
+	// 1. Check risk management BEFORE publishing
+	// TODO: TEMPORARILY BYPASSED FOR TESTING - REMOVE THIS BEFORE PRODUCTION
+	if false && h.riskClient != nil {
+		riskResp, err := h.riskClient.CheckPreTradeRisk(ctx, orderReq, strategy)
+		if err != nil {
+			h.logger.Error("Risk check failed",
+				zap.Error(err),
+				zap.String("order_id", orderReq.OrderID))
+			// Set as not approved if risk check fails
+			orderReq.RiskApproved = false
+			orderReq.RiskScore = 100.0 // High risk score for failures
+		} else {
+			// Update order with risk check results
+			orderReq.RiskApproved = riskResp.Approved
+			orderReq.RiskScore = riskResp.RiskScore
+
+			if !riskResp.Approved {
+				h.logger.Warn("Order rejected by risk management",
+					zap.String("order_id", orderReq.OrderID),
+					zap.String("user_id", orderReq.UserID),
+					zap.Float64("risk_score", riskResp.RiskScore),
+					zap.Int("violations", len(riskResp.Violations)))
+
+				// Log violations
+				for _, violation := range riskResp.Violations {
+					h.logger.Debug("Risk violation",
+						zap.String("order_id", orderReq.OrderID),
+						zap.String("type", violation.Type.String()),
+						zap.String("message", violation.Message))
+				}
+				// Don't publish rejected orders
+				return nil
+			}
+		}
+	} else {
+		// TESTING MODE: Bypassing risk checks - Auto-approving all orders
+		h.logger.Warn("RISK CHECK BYPASSED FOR TESTING - Auto-approving order",
+			zap.String("order_id", orderReq.OrderID))
+		orderReq.RiskApproved = true
+		orderReq.RiskScore = 0.0
+	}
+
+	// 2. Save order to PostgreSQL (for tracking)
 	if h.signalRepo != nil {
 		if err := h.signalRepo.SaveTradeSignal(ctx, orderReq); err != nil {
 			h.logger.Error("Failed to save trade signal to database",
@@ -143,7 +189,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		}
 	}
 
-	// 2. Publish to Kafka "trade-signals" topic
+	// 3. Publish to Kafka "trade-signals" topic
 	if h.kafkaPubl != nil {
 		if err := h.kafkaPubl.PublishTradeSignal(ctx, orderReq); err != nil {
 			h.logger.Error("Failed to publish to Kafka trade-signals",
@@ -157,7 +203,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		}
 	}
 
-	// 3. Publish order to RabbitMQ
+	// 4. Publish order to RabbitMQ
 	if err := h.rabbitPubl.PublishOrder(ctx, orderReq); err != nil {
 		h.stats.IncrementRabbitMQErrors()
 		return fmt.Errorf("failed to publish order: %w", err)

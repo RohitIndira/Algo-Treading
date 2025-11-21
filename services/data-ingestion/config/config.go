@@ -58,7 +58,7 @@ func Load() *Config {
 	maxRetries := 3
 
 	return &Config{
-		MongoURI:            getEnv("MONGO_URI", ""),
+		MongoURI:            getEnv("MONGO_URI", "mongodb+srv://newsimpact:zTVHWieqVsONp8Wr@stockgpt.fryqpbi.mongodb.net/"),
 		MongoDatabase:       db,
 		MongoCollection:     coll,
 		KafkaBrokers:        strings.Split(brokers, ","),

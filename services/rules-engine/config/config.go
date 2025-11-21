@@ -203,11 +203,11 @@ func LoadConfig() (*Config, error) {
 		},
 
 		RabbitMQ: RabbitMQConfig{
-			URL:                  getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+			URL:                  getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
 			Exchange:             getEnv("RABBITMQ_EXCHANGE", "orders"),
 			ExchangeType:         getEnv("RABBITMQ_EXCHANGE_TYPE", "direct"),
-			Queue:                getEnv("RABBITMQ_QUEUE", "order.execution.queue"),
-			RoutingKey:           getEnv("RABBITMQ_ROUTING_KEY", "order.execution"),
+			Queue:                getEnv("RABBITMQ_QUEUE", "trade_signals"),
+			RoutingKey:           getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
 			Durable:              getEnvAsBool("RABBITMQ_DURABLE", true),
 			AutoDelete:           getEnvAsBool("RABBITMQ_AUTO_DELETE", false),
 			Exclusive:            getEnvAsBool("RABBITMQ_EXCLUSIVE", false),
@@ -245,7 +245,7 @@ func LoadConfig() (*Config, error) {
 			CacheRefreshInterval:    getEnvAsDuration("CACHE_REFRESH_INTERVAL", 1*time.Minute),
 			CircuitBreakerThreshold: getEnvAsInt("CIRCUIT_BREAKER_THRESHOLD", 5),
 			CircuitBreakerTimeout:   getEnvAsDuration("CIRCUIT_BREAKER_TIMEOUT", 60*time.Second),
-			MinMatchScore:           getEnvAsFloat("MIN_MATCH_SCORE", 80.0),
+			MinMatchScore:           getEnvAsFloat("MIN_MATCH_SCORE", 20.0),
 		},
 
 		Logging: LoggingConfig{
