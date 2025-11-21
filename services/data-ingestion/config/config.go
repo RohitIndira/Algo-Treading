@@ -58,7 +58,7 @@ func Load() *Config {
 	maxRetries := 3
 
 	return &Config{
-		MongoURI:            getEnv("MONGO_URI", ""),
+		MongoURI:            getEnv("MONGO_URI", "mongodb://localhost:27017"),
 		MongoDatabase:       db,
 		MongoCollection:     coll,
 		KafkaBrokers:        strings.Split(brokers, ","),

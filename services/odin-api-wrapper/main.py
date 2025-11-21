@@ -7,6 +7,7 @@ import os
 import asyncio
 import pyotp
 from typing import Optional, Dict, Any, List
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -14,8 +15,9 @@ from contextlib import asynccontextmanager
 import logging
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file in the same directory as this script
+env_path = Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 # Import the Odin SDK
 import sys
@@ -47,6 +49,11 @@ TOTP_SECRET = os.getenv("ODIN_TOTP_SECRET", "")
 async def lifespan(app: FastAPI):
     """Manage application lifespan"""
     logger.info("Starting Odin API Wrapper Service")
+    logger.info(f"Loaded .env from: {env_path}")
+    logger.info(f"API URL configured: {bool(API_URL)}")
+    logger.info(f"API Key configured: {bool(API_KEY)}")
+    logger.info(f"User ID: {USER_ID if USER_ID else 'Not configured'}")
+    logger.info(f"TOTP Secret configured: {bool(TOTP_SECRET)} (length: {len(TOTP_SECRET) if TOTP_SECRET else 0})")
     yield
     logger.info("Shutting down Odin API Wrapper Service")
     # Clean up all client connections
@@ -79,10 +86,12 @@ class LoginRequest(BaseModel):
     user_id: Optional[str] = Field(None, description="User ID (optional, uses env var if not provided)")
     password: Optional[str] = Field(None, description="Password (optional, uses env var if not provided)")
     client_id: Optional[str] = Field(None, description="Client ID (optional, uses env var if not provided)")
+    api_key: Optional[str] = Field(None, description="API Key (optional, uses env var if not provided)")
     source: Optional[str] = Field(None, description="Source (optional, uses env var if not provided)")
     login_type: Optional[str] = Field(None, description="Login type (optional, uses env var if not provided)")
     second_auth_type: Optional[str] = Field(None, description="Second auth type (optional, uses env var if not provided)")
     totp_secret: Optional[str] = Field(None, description="TOTP secret (optional, uses env var if not provided)")
+    totp_code: Optional[str] = Field(None, description="TOTP code directly (6-digit code from authenticator app)")
 
 class LoginResponse(BaseModel):
     success: bool
@@ -167,26 +176,53 @@ async def login(request: LoginRequest):
         user_id = request.user_id or USER_ID
         password = request.password or PASSWORD
         client_id = request.client_id or CLIENT_ID
+        api_key = request.api_key or API_KEY
         source = request.source or SOURCE
         login_type = request.login_type or LOGIN_TYPE
         second_auth_type = request.second_auth_type or SECOND_AUTH_TYPE
         totp_secret = request.totp_secret or TOTP_SECRET
         
         # Validate required fields
-        if not all([user_id, password, totp_secret]):
+        if not all([user_id, password]):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Missing required credentials. Provide in request or configure in .env file"
+                detail="Missing required credentials (user_id, password)"
             )
         
-        # Generate TOTP (same as working b2c_bridge.py)
-        totp = pyotp.TOTP(totp_secret).now()
-        logger.info(f"🔐 Generated TOTP for user {user_id}: {totp}")
+        # Generate or use provided TOTP
+        if request.totp_code:
+            # Use TOTP code directly if provided
+            totp = request.totp_code
+            logger.info(f"🔐 Using provided TOTP code for user {user_id}")
+        elif totp_secret:
+            # Clean and validate TOTP secret
+            totp_secret = totp_secret.strip().upper()  # Remove whitespace and ensure uppercase
+            logger.info(f"🔐 TOTP secret (cleaned): '{totp_secret}' (length: {len(totp_secret)})")
+            
+            # Validate TOTP secret format
+            try:
+                # Try to validate the TOTP secret is valid base32
+                totp_generator = pyotp.TOTP(totp_secret)
+                totp = totp_generator.now()
+                logger.info(f"🔐 Generated TOTP for user {user_id}: {totp}")
+            except Exception as e:
+                logger.error(f"❌ Invalid TOTP secret format: {str(e)}")
+                logger.error(f"❌ TOTP secret value: '{totp_secret}'")
+                logger.error(f"❌ TOTP secret bytes: {totp_secret.encode()}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid TOTP secret. Must be a valid base32-encoded string (A-Z, 2-7 only). Error: {str(e)}"
+                )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Either totp_secret or totp_code must be provided"
+            )
         
         # Create client with proper configuration
         client = IBTConnect(params={
             "baseurl": API_URL,
-            "api_key": API_KEY,
+            "api_key": api_key,
             "debug": True
         })
         
@@ -275,8 +311,46 @@ async def place_order(
 ):
     """Place a regular order"""
     try:
+        logger.info(f"📤 Placing order: {order.dict()}")
         response = client.place_order(order.dict())
-        return handle_api_response(response)
+        logger.info(f"📥 Broker response: {response}")
+        
+        # Handle response - the broker returns order details directly
+        if isinstance(response, dict):
+            if "error" in response:
+                logger.error(f"❌ Order placement failed: {response.get('message', 'Unknown error')}")
+                return StandardResponse(
+                    success=False,
+                    error=response["error"],
+                    message=response.get("message", "Order placement failed")
+                )
+            
+            # Extract order_id from response
+            # Odin API typically returns: {"data": {"orderId": "..."}} or {"orderId": "..."}
+            order_id = None
+            if "data" in response and isinstance(response["data"], dict):
+                order_id = response["data"].get("orderId") or response["data"].get("order_id")
+            else:
+                order_id = response.get("orderId") or response.get("order_id")
+            
+            if order_id:
+                logger.info(f"✓ Order placed successfully: {order_id}")
+                return StandardResponse(
+                    success=True,
+                    data={"order_id": order_id, "orderId": order_id},
+                    message="Order placed successfully"
+                )
+            else:
+                logger.warning(f"⚠️ Order placed but no order_id in response: {response}")
+                return StandardResponse(
+                    success=True,
+                    data=response,
+                    message="Order placed (full response returned)"
+                )
+        
+        logger.error(f"❌ Unexpected response type: {type(response)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected response type: {type(response)}")
+        
     except Exception as e:
         logger.error(f"Place order error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

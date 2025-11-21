@@ -3,6 +3,9 @@ package odin
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"sync"
 
 	"github.com/RohitIndira/Algo-Treading/pkg/odin"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -10,7 +13,9 @@ import (
 
 // ExecutionClient wraps Odin API for trade execution
 type ExecutionClient struct {
-	client *odin.Client
+	client       *odin.Client
+	loggedInUser string
+	loginMutex   sync.Mutex
 }
 
 // NewExecutionClient creates a new execution client
@@ -20,13 +25,59 @@ func NewExecutionClient(baseURL string) *ExecutionClient {
 	}
 }
 
+// ensureLogin ensures user is logged in before placing orders
+func (c *ExecutionClient) ensureLogin(ctx context.Context, userID string) error {
+	c.loginMutex.Lock()
+	defer c.loginMutex.Unlock()
+
+	// If already logged in for this user, skip
+	if c.loggedInUser == userID {
+		return nil
+	}
+
+	// Get credentials from environment
+	odinUserID := os.Getenv("ODIN_USER_ID")
+	odinPassword := os.Getenv("ODIN_PASSWORD")
+	odinTOTPSecret := os.Getenv("ODIN_TOTP_SECRET")
+
+	if odinUserID == "" || odinPassword == "" || odinTOTPSecret == "" {
+		return fmt.Errorf("missing Odin credentials in environment")
+	}
+
+	// Login
+	loginReq := &odin.LoginRequest{
+		UserID:     odinUserID,
+		Password:   odinPassword,
+		TOTPSecret: odinTOTPSecret,
+	}
+
+	log.Printf("Logging in user %s to Odin API...", odinUserID)
+	err := c.client.Login(ctx, loginReq)
+	if err != nil {
+		return fmt.Errorf("failed to login: %w", err)
+	}
+
+	c.loggedInUser = odinUserID
+	log.Printf("✓ Successfully logged in user %s", odinUserID)
+	return nil
+}
+
 // PlaceOrder places order via Odin API
 func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, userID string) (string, error) {
+	// Ensure user is logged in first
+	if err := c.ensureLogin(ctx, userID); err != nil {
+		return "", fmt.Errorf("login failed: %w", err)
+	}
+
 	// Convert internal order model to Odin API request
 	orderReq := c.convertToOdinRequest(order)
+	fmt.Printf("----------- %v\n", orderReq)
+
+	// Use the logged-in user ID (from env) instead of the order's user ID
+	odinUserID := os.Getenv("ODIN_USER_ID")
 
 	// Call Odin API
-	orderID, err := c.client.PlaceOrder(ctx, userID, &orderReq)
+	orderID, err := c.client.PlaceOrder(ctx, odinUserID, &orderReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to place order: %w", err)
 	}
@@ -56,9 +107,12 @@ func (c *ExecutionClient) ModifyOrder(ctx context.Context, modifyReq odin.Modify
 }
 
 func (c *ExecutionClient) convertToOdinRequest(order *models.Order) odin.OrderRequest {
+	// Convert exchange format: "EXCHANGE_NSE" -> "NSE_EQ", "NSE" -> "NSE_EQ"
+	exchange := c.formatExchange(string(order.Exchange))
+
 	req := odin.OrderRequest{
 		ScripInfo: odin.ScripInfo{
-			Exchange:   string(order.Exchange),
+			Exchange:   exchange,
 			ScripToken: int(order.StockCode),
 			Symbol:     order.Symbol,
 			Series:     "EQ", // Default to equity
@@ -70,29 +124,48 @@ func (c *ExecutionClient) convertToOdinRequest(order *models.Order) odin.OrderRe
 		Validity:          order.Validity,
 		DisclosedQuantity: 0,
 		IsAMO:             false,
+		TriggerPrice:      0, // Default to 0
 	}
 
+	// Set price for limit orders
 	if order.Price != nil {
 		req.Price = *order.Price
 	}
 
-	if order.StopLoss != nil {
+	// Only set trigger price for stop loss orders (SL/SL-MKT)
+	if order.OrderType == models.OrderTypeStopLoss && order.StopLoss != nil {
 		req.TriggerPrice = *order.StopLoss
 	}
 
 	return req
 }
 
+func (c *ExecutionClient) formatExchange(exchange string) string {
+	// Handle various exchange formats and convert to broker format
+	// "EXCHANGE_NSE" -> "NSE_EQ"
+	// "NSE" -> "NSE_EQ"
+	// "EXCHANGE_BSE" -> "BSE_EQ"
+	// "BSE" -> "BSE_EQ"
+
+	// Strip "EXCHANGE_" prefix if present
+	if len(exchange) > 9 && exchange[:9] == "EXCHANGE_" {
+		exchange = exchange[9:]
+	}
+
+	// Append "_EQ" for equity segment
+	return exchange + "_EQ"
+}
+
 func (c *ExecutionClient) mapOrderType(orderType models.OrderType) string {
 	switch orderType {
 	case models.OrderTypeMarket:
-		return "MKT"
+		return "RL-MKT" // Regular market order
 	case models.OrderTypeLimit:
-		return "RL"
+		return "RL" // Regular limit order
 	case models.OrderTypeStopLoss:
-		return "SL"
+		return "SL-MKT" // Stop loss market order
 	default:
-		return "MKT"
+		return "RL-MKT" // Default to market order
 	}
 }
 

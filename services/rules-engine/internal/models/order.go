@@ -77,8 +77,8 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		ImpactScore:  event.Analysis.ImpactScore,
 		Sentiment:    event.Analysis.Sentiment,
 		NewsCategory: event.NewsData.Category,
-		RiskApproved: true, // TODO: Integrate with risk-management service
-		RiskScore:    0.0,  // TODO: Get from risk-management service
+		RiskApproved: false, // Will be set by risk management service
+		RiskScore:    0.0,   // Will be set by risk management service
 		RetryCount:   0,
 	}
 }

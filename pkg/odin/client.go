@@ -276,12 +276,29 @@ func (c *Client) PlaceOrder(ctx context.Context, userID string, req *OrderReques
 		return "", err
 	}
 
-	orderID, ok := resp.Data.(string)
-	if !ok {
-		return "", fmt.Errorf("invalid order ID in response")
+	// The response data can be either a string or a map containing order_id
+	switch data := resp.Data.(type) {
+	case string:
+		// Direct order ID string
+		return data, nil
+	case map[string]interface{}:
+		// Check if this is an error response
+		if status, ok := data["status"].(string); ok && status == "error" {
+			message := data["message"]
+			code := data["code"]
+			return "", fmt.Errorf("broker error [%v]: %v", code, message)
+		}
+		// Map containing order_id field
+		if orderID, ok := data["order_id"].(string); ok {
+			return orderID, nil
+		}
+		if orderID, ok := data["orderId"].(string); ok {
+			return orderID, nil
+		}
+		return "", fmt.Errorf("order_id not found in response map: %+v", data)
+	default:
+		return "", fmt.Errorf("unexpected response data type: %T, value: %+v", data, data)
 	}
-
-	return orderID, nil
 }
 
 // ModifyOrder modifies an existing order

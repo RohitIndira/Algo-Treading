@@ -48,9 +48,11 @@ type TradeConfig struct {
 
 // RiskLimits represents risk limits
 type RiskLimits struct {
-	MaxDailyTrades int32   `json:"max_daily_trades" bson:"max_daily_trades"`
-	MaxLossPerDay  float64 `json:"max_loss_per_day" bson:"max_loss_per_day"`
-	PositionSizing string  `json:"position_sizing" bson:"position_sizing"` // FIXED, PERCENTAGE
+	MaxDailyTrades  int32   `json:"max_daily_trades" bson:"max_daily_trades"`
+	MaxLossPerDay   float64 `json:"max_loss_per_day" bson:"max_loss_per_day"`
+	MaxPositionSize float64 `json:"max_position_size" bson:"max_position_size"`
+	MaxPerTradeRisk float64 `json:"max_per_trade_risk" bson:"max_per_trade_risk"`
+	PositionSizing  string  `json:"position_sizing" bson:"position_sizing"` // FIXED, PERCENTAGE
 }
 
 // ElasticsearchStrategy represents a strategy indexed in Elasticsearch

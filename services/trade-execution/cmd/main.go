@@ -161,7 +161,6 @@ func loadConfig() Config {
 }
 
 func initPostgres(cfg Config) (*sqlx.DB, error) {
-	println("postgres", cfg.PostgresURL)
 	db, err := sqlx.Connect("postgres", cfg.PostgresURL)
 	if err != nil {
 		return nil, err
