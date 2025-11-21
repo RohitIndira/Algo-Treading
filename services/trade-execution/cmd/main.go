@@ -147,7 +147,7 @@ type Config struct {
 func loadConfig() Config {
 	return Config{
 		GRPCPort:      getEnvInt("SERVICE_PORT", 9004),
-		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://guest:guest123@localhost:5672/"),
 		QueueName:     getEnv("RABBITMQ_QUEUE", "order.execution.queue"),
 		Exchange:      getEnv("RABBITMQ_EXCHANGE", "order.execution.exchange"),
 		RoutingKey:    getEnv("RABBITMQ_ROUTING_KEY", "order.execution"),
@@ -184,9 +184,9 @@ func buildPostgresURL() string {
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		getEnv("POSTGRES_HOST", "localhost"),
 		getEnv("POSTGRES_PORT", "5432"),
-		getEnv("POSTGRES_USER", "trading_user"),
-		getEnv("POSTGRES_PASSWORD", ""),
-		getEnv("POSTGRES_DB", "trading_execution"),
+		getEnv("POSTGRES_USER", "postgres"),
+		getEnv("POSTGRES_PASSWORD", "postgres"),
+		getEnv("POSTGRES_DB", "trading_db"),
 		getEnv("POSTGRES_SSL_MODE", "disable"),
 	)
 }
