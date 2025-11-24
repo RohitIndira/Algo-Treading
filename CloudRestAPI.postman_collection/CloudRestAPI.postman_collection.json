@@ -1,0 +1,2843 @@
+{
+	"info": {
+		"_postman_id": "58d8af95-1981-4d38-8c12-0d908cb42540",
+		"name": "CloudRestAPI",
+		"description": "Cloud Rest API allows the developer to create a custom trading application for Web or Mobile communicating with ODIN Order Management System (OMS). This REST based API allows user to develop the following functionalities for  \nTrading Application / Portal.\n\nSalient Features:\n\n<ul><li><p>User Authentication and Profile management</p></li><li><p>Order Management</p></li><li><p>Portfolio information management</p></li></ul>\n\nThis step-by-step guide will assist you through the entire flow of API implementation; right from authentication, to handle the request and response structure of the API.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "48066373"
+	},
+	"item": [
+		{
+			"name": "User",
+			"item": [
+				{
+					"name": "Send OTP (Password-TOTP)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n\t\"user_id\": \"{{user_id}}\",\n\t\"api_key\": \"{{api_key}}\",\n\t\"source\": \"{{source}}\"\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/password/reset/send-otp",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"password",
+								"reset",
+								"send-otp"
+							]
+						},
+						"description": "This call can be used in case if the client has forgotten the password or he wants to register TOTP and OTP is to be sent on the registered mobile number."
+					},
+					"response": [
+						{
+							"name": "Send OTP (Password-TOTP)",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n\t\"user_id\": \"{{user_id}}\",\n\t\"api_key\": \"{{api_key}}\",\n\t\"source\": \"{{source}}\"\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/password/reset/send-otp",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"password",
+										"reset",
+										"send-otp"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 04 Mar 2022 10:48:53 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "75"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "b42661e0-ec2f-4769-8c67-559f95617767"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "75"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OdI3ZGZehcwFhUw="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"4b-pPueuSLLvVs63SWKu2vELpiGg00\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 04 Mar 2022 10:48:53 GMT"
+								}
+							],
+							"cookie": [
+								{
+									"expires": "Invalid Date",
+									"domain": "",
+									"path": ""
+								}
+							],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"OTP sent to reset Password.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"let res = pm.response.json();",
+									"if (pm.response.code == 200) {",
+									"    pm.environment.set(\"access_token\", \"Bearer \" + res.data.access_token);",
+									"    pm.environment.set(\"register_token\", res.data.register_token);",
+									"}",
+									""
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"user_id\": \"{{user_id}}\",\n    \"login_type\": \"PASSWORD\",\n    \"password\": \"{{password}}\",\n    \"second_auth_type\": \"REGISTER\",\n    \"second_auth\": \"\",\n    \"api_key\": \"{{api_key}}\",\n    \"source\": \"{{source}}\",\n    \"UDID\": \"a1b23cd4e5f6g78h\",\n    \"version\": \"2.0.0\",\n    \"iosversion\": \"\",\n    \"build_version\": \"22.11.01\",\n    \"deviceinfo\": {\n        \"UDID\": \"4ad3f8a8-c90c-4359-9f78-4e8311f77eb2\",\n        \"DeviceModel\": \"SM-G955U\",\n        \"DeviceSerialNo\": \"\",\n        \"DeviceManufacturer\": \"Google Inc.\",\n        \"DevicePlatform\": \"web\",\n        \"DevicePlatformVer\": \"Android 8.0.0\",\n        \"Longitude\": \"\",\n        \"Latitude\": \"\",\n        \"AppName\": \"Wave 2.0\",\n        \"AppVersion\": \"8.2.21\",\n        \"AppVersionCode\": \"2000000\",\n        \"AppPackageName\": \"com.wave.dev\",\n        \"FCMRegKey\": \"172.25.90.82:8100\",\n        \"IP\": \"\",\n        \"SDKVersion\": \"\"\n    }\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/session",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"session"
+							]
+						},
+						"description": "This API needs to be used for signing-in to the application using login  \ncredentials. A successful sign-in would return an ‘access token’ and a  \n'broadcast_access_token' in the response.  \n'access_token' needs to  \nbe included in all subsequent API invocations as part of http header  \n'Authorization' token.  \n'broadcast_access_token' would be required  \nfor establishing a connection with the feed endpoint ('broadCastSocket'  \nreceived in the response). Kindly refer\n\n<a href=\"#pricefeedapi\">Price<br>Feed API</a>\n\nfor further details.  \nThe response will also  \nhave the details like exchanges allowed, product types allowed and other  \nkey information required for trading.\n\n| **login_type** | **password** | **second_auth_type** | **second_auth** |\n| --- | --- | --- | --- |\n| PASSWORD | Password | REGISTER | Not Required |\n| TOKEN | Register_token | OTP/TOTP/FINGERPRINT | OTP/TOTP/Registered UDID |\n| PASSWORD | Password | OTP/TOTP/FINGERPRINT | OTP/TOTP/Registered UDID |\n| MPIN | MPIN Registered | OTP/TOTP/FINGERPRINT | OTP/TOTP/Registered UDID |\n| TP_TOKEN | SSO TOKEN | Not Required | Not Required |\n\nTo get second factor authentication details of user, \"REGISTER\" can be used in second_auth_type field, which validates password field and return register_token that can be used as \"TOKEN\" login type with second factor after registration."
+					},
+					"response": [
+						{
+							"name": "Login",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"user_id\": \"{{user_id}}\",\n    \"login_type\": \"PASSWORD\",\n    \"password\": \"{{password}}\",\n    \"second_auth_type\":\"REGISTER\",\n    \"second_auth\": \"{{second_auth}}\",\n    \"api_key\": \"{{api_key}}\",\n    \"source\": \"{{source}}\",\n    \"UDID\": \"a1b23cd4e5f6g78h\",\n    \"version\": \"2.0.0\",\n    \"iosversion\":\"\",\n    \"build_version\": \"22.11.01\"\n}"
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/session",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"session"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Tue, 20 Sep 2022 14:45:21 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "517"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "bb3ecd09-7717-438f-aa25-640c3545bd3a"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "517"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "Yw3ALEU8hcwFhOQ="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"205-79zoh1IlbWrDV4GmtE9NJLMf77s\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Tue, 20 Sep 2022 14:45:21 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"User logged in Successfully.\",\n    \"data\": {\n        \"register_token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJDdXN0b21lcklkIjoiMTQwNCIsInVzZXJJZCI6IkFQSVRFU1QiLCJncm91cElkIjoiSE8iLCJ1ZGlkIjoiYTFiMjNjZDRlNWY2Zzc4aCIsInNvdXJjZSI6Ik1PQklMRUFQSSIsIm9jVG9rZW4iOiIweDAxNDUzOTg0RDlCMzdEQTAyNzVGRDhCOERGM0ZCMiIsImV4cCI6MTY2MzY4NjAyMSwiaWF0IjoxNjYzNjg1MTIxfQ.kNSl7ZNuNetTg0qhcnk24jMGm193P_M8WQtE4kOPnDQ\",\n        \"ptnType\": \"TOTP_OPT\",\n        \"mpin_enabled\": true,\n        \"fingerprint_enabled\": true,\n        \"totp_enabled\": false\n    }\n}"
+						},
+						{
+							"name": "Login",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"user_id\": \"{{user_id}}\",\n    \"login_type\": \"PASSWORD\",\n    \"password\": \"{{password}}\",\n    \"second_auth_type\": \"OTP\",\n    \"second_auth\": \"123456\",\n    \"api_key\": \"{{api_key}}\",\n    \"source\": \"{{source}}\",\n    \"UDID\": \"a1b23cd4e5f6g78h\",\n    \"version\": \"2.0.0\",\n    \"iosversion\": \"\",\n    \"build_version\": \"22.11.01\",\n    \"deviceinfo\": {\n        \"UDID\": \"4ad3f8a8-c90c-4359-9f78-4e8311f77eb2\",\n        \"DeviceModel\": \"SM-G955U\",\n        \"DeviceSerialNo\": \"\",\n        \"DeviceManufacturer\": \"Google Inc.\",\n        \"DevicePlatform\": \"web\",\n        \"DevicePlatformVer\": \"Android 8.0.0\",\n        \"Longitude\": \"\",\n        \"Latitude\": \"\",\n        \"AppName\": \"Wave 2.0\",\n        \"AppVersion\": \"8.2.21\",\n        \"AppVersionCode\": \"2000000\",\n        \"AppPackageName\": \"com.wave.dev\",\n        \"FCMRegKey\": \"172.25.90.82:8100\",\n        \"IP\": \"\",\n        \"SDKVersion\": \"\"\n    }\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/session",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"session"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Wed, 20 Sep 2023 08:45:02 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "1326"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "5cf6b52f-5e0a-4b8f-8e14-795b09ca0b31"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "Content-Encoding",
+									"value": "gzip"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "LjCaQFbkBcwFT1g="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"9ef-OYFtIXR1tH7So9yPQwV6Z4m/3Vo\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Wed, 20 Sep 2023 08:45:02 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"User logged in Successfully.\",\n    \"data\": {\n        \"access_token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJtZW1iZXJJZCI6NzA3MDcwLCJ1c2VyaWQiOjcwNzA3MCwidGVuYW50aWQiOjcwNzA3MCwibWVtYmVySW5mbyI6eyJ0ZW5hbnRJZCI6IjE0MDQiLCJncm91cElkIjoiSE8iLCJ1c2VySWQiOiJBUElURVNUIiwidGVtcGxhdGVJZCI6IlNUQVRJQzEiLCJ1ZElkIjoiNWMzNDBiZDctNWJkMy00YWFmLTlkMDMtYjI2NjI2YjE2ODU4Iiwib2NUb2tlbiI6IjB4MDFDMURCRDUyNEZCRjNDOTA0QTZCQ0Y2NUQyOURDIiwidXNlckNvZGUiOiJOV1NZRiIsImdyb3VwQ29kZSI6IkFBQUFBIiwiYXBpa2V5RGF0YSI6eyJDdXN0b21lcklkIjoiMTQwNCIsImV4cCI6MTc3NTQ2MDkwMCwiaWF0IjoxNjg5MDYwOTMxfSwic291cmNlIjoiTU9CSUxFQVBJIn0sImV4cCI6MTY5NTIzNDU5OSwiaWF0IjoxNjk1MTk5NTAyfQ.aYf0d7JrYCOXY51JZ3vaaRNT1SgUp7Rq6Rp9y_HuZO8\",\n        \"user_name\": \"API TEST\",\n        \"login_time\": \"2023-Sep-20 14:15:02\",\n        \"exchanges\": [\n            \"NSE_EQ\",\n            \"NSE_FO\",\n            \"BSE_EQ\",\n            \"MCX_FO\",\n            \"NCDEX_FO\",\n            \"NSE_CUR\",\n            \"BSE_CUR\",\n            \"NSE_OTS\",\n            \"ICEX_FO\",\n            \"MUTUAL_FUND\"\n        ],\n        \"bcastExchanges\": [\n            \"NSE_EQ\",\n            \"NSE_FO\",\n            \"BSE_EQ\",\n            \"BSE_FO\",\n            \"MCX_FO\",\n            \"NCDEX_FO\",\n            \"\",\n            \"BSE_COMM\",\n            \"NSE_CUR\",\n            \"BSE_CUR\",\n            \"NSE_OTS\",\n            \"ICEX_FO\",\n            \"NSE_COMM\"\n        ],\n        \"product_types\": [\n            \"INTRADAY\",\n            \"DELIVERY\",\n            \"COVER\",\n            \"BRACKET\",\n            \"MTF\",\n            \"BTST\"\n        ],\n        \"product_types_exchange\": {\n            \"NSE_FO\": [\n                \"INTRADAY\",\n                \"DELIVERY\",\n                \"COVER\",\n                \"BRACKET\"\n            ],\n            \"NSE_EQ\": [\n                \"INTRADAY\",\n                \"DELIVERY\",\n                \"COVER\",\n                \"MTF\",\n                \"BTST\",\n                \"BRACKET\"\n            ],\n            \"NSE_CUR\": [\n                \"INTRADAY\"\n            ],\n            \"MUTUAL_FUND\": [\n                \"DELIVERY\"\n            ],\n            \"MCX_FO\": [\n                \"INTRADAY\",\n                \"DELIVERY\",\n                \"COVER\",\n                \"BRACKET\"\n            ],\n            \"NCDEX_FO\": [\n                \"INTRADAY\",\n                \"DELIVERY\",\n                \"COVER\",\n                \"BRACKET\"\n            ],\n            \"BSE_EQ\": [\n                \"INTRADAY\",\n                \"DELIVERY\",\n                \"COVER\",\n                \"MTF\",\n                \"BTST\",\n                \"BRACKET\"\n            ]\n        },\n        \"mpin_enabled\": true,\n        \"fingerprint_enabled\": false,\n        \"totp_enabled\": true,\n        \"ptnType\": \"TOTP_OPT\",\n        \"others\": {\n            \"userCode\": \"NWSYF\",\n            \"groupId\": \"HO\",\n            \"groupCode\": \"AAAAA\",\n            \"newsCategories\": \"25051,25039,25038,25048,25028,25000,25042,25043,25030,25037,25041,25047,\",\n            \"messageSocket\": \"wss://socketio-uat.odinwave.com:8443\",\n            \"broadCastSocket\": \"wss://odindemo.63moons.com:4510\",\n            \"secondBroadCastSocket\": [\n                \"ws://Odindemo.63moons.com:4509\"\n            ],\n            \"POA\": \"0\",\n            \"nGTDDefault\": 2,\n            \"nGTDMaxDays\": 365,\n            \"sGTDConfigDetails\": \"2|9\",\n            \"ocToken\": \"0x01C1DBD524FBF3C904A6BCF65D29DC\",\n            \"managerIP\": \"Odindemo.63moons.com\",\n            \"participantCode\": \"\",\n            \"dervParticipantCode\": \"\",\n            \"tslAllowed\": [\n                \"NSE_EQ\",\n                \"NSE_FO\",\n                \"BSE_EQ\",\n                \"BSE_FO\",\n                \"MCX_FO\",\n                \"NCDEX_FO\",\n                \"BSE_CUR\"\n            ],\n            \"edisForMTF\": false,\n            \"showJumpPriceBothLtpAndTriggerPrice\": false,\n            \"CFT\": \"HEATMAP|1$DERIVATIVEWATCH|1$FILTERWATCH|1$OPTIONWATCH|1$BULKORDER|1$ALERT|1$POSCONV|1$STOCKWATCH|1$GREEKWATCH|1$ADVCHARTS|1$MULTILEG|1$PREVTRADES|1$NETPOSITION|1$FUNDSVIEW|1$SIPORSWP|1$IPO|1$ODINCONNECTOR|1\",\n            \"passExpDays\": \"Your password will expire in 845 Day(s).\",\n            \"bAMOAllowedForUser\": true\n        },\n        \"user_id\": \"APITEST\",\n        \"alias_id\": \"\"\n    }\n}"
+						}
+					]
+				},
+				{
+					"name": "Logout",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "{{access_token}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/session",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"session"
+							]
+						},
+						"description": "This call would logout the user from the system."
+					},
+					"response": [
+						{
+							"name": "Logout",
+							"originalRequest": {
+								"method": "DELETE",
+								"header": [
+									{
+										"key": "Authorization",
+										"value": "{{access_token}}"
+									},
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/session",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"session"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 04 Mar 2022 10:44:45 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "72"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "304b8aac-4fb7-4d1e-b124-de0b8a6c899a"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "72"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OdIQmHB8BcwFoXw="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"48-ZEuekHw8aNCyGDhDWYXGXGW9bLY\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 04 Mar 2022 10:44:45 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"Successfully Logged out.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Forgot User ID",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									""
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							},
+							{
+								"key": "api_key",
+								"value": "{{api_key}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/details?pan=ABCDE1234F",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"details"
+							],
+							"query": [
+								{
+									"key": "pan",
+									"value": "ABCDE1234F"
+								}
+							]
+						},
+						"description": "This call would allow the user to fetch his user id by giving his pan."
+					},
+					"response": [
+						{
+							"name": "Forgot User ID",
+							"originalRequest": {
+								"method": "GET",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									},
+									{
+										"key": "api_key",
+										"value": "{{api_key}}",
+										"type": "text"
+									}
+								],
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/details?pan=ABCDE1234F",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"details"
+									],
+									"query": [
+										{
+											"key": "pan",
+											"value": "ABCDE1234F"
+										}
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Wed, 20 Sep 2023 09:22:13 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "1154"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "cc202d08-4a52-4213-aabf-a5e208d1da17"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "Content-Encoding",
+									"value": "gzip"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "LjH22HzchcwFcBA="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"16be-B1I0wtKNT+DkWVszZtoLw2DGjW4\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Wed, 20 Sep 2023 09:22:13 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"UserId fetched successfully.\",\n    \"data\": [\n        {\n            \"user_id\": \"APITEST\",\n            \"groupId\": \"HO\",\n            \"dob\": \"01-06-1990\",\n            \"pan\": \"ABCDE1234F\",\n            \"mobile_no\": \"OTk5OTk5OTk5OQ==\",\n            \"email\": \"YXBpdGVzdEB0ZXN0LmNvbQ==\"\n        }\n    ]\n}"
+						}
+					]
+				},
+				{
+					"name": "Register MPIN",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "{{access_token}}"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"mpin\": \"1234\",\n    \"mobile_udid\": \"a1b23cd4e5f6g78h\"\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/mpin",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"mpin"
+							]
+						},
+						"description": "This call would allow the user to set in MPIN which would help him for an ease of login for the day."
+					},
+					"response": [
+						{
+							"name": "Register MPIN",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "Authorization",
+										"value": "{{access_token}}"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"mpin\": \"1234\",\n    \"mobile_udid\": \"a1b23cd4e5f6g78h\"\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/mpin",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"mpin"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 04 Mar 2022 10:45:44 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "89"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "fd49beac-054f-44c3-8d61-21cdfa41a022"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "89"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OdIZqHjtBcwFohw="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"59-jpb0tR/g0BC8Bz1qsBYf4Dccxas\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 04 Mar 2022 10:45:44 GMT"
+								}
+							],
+							"cookie": [
+								{
+									"expires": "Invalid Date",
+									"domain": "",
+									"path": ""
+								}
+							],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"MPIN/Fingerprint registered successfully.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Change Password",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"let res = pm.response.json();\r",
+									"if (pm.response.code == 200) {\r",
+									"    let req = JSON.parse(pm.request.body.raw);\r",
+									"    pm.environment.set(\"password\", req.new_password);\r",
+									"}\r",
+									""
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n    \"user_id\": \"{{user_id}}\",\r\n    \"api_key\": \"{{api_key}}\",\r\n    \"new_password\": \"a00000000000\",\r\n    \"old_password\": \"{{password}}\",\r\n    \"source\": \"{{source}}\"\r\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/password",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"password"
+							]
+						},
+						"description": "This call would allow the user to change the password, the input params would be the old password, new password and confirm new password."
+					},
+					"response": [
+						{
+							"name": "Password",
+							"originalRequest": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "He55zrpvWn9ml0fkGv1Zq5GljGVBxUv5NFieVGAa",
+										"type": "text"
+									},
+									{
+										"key": "Authorization",
+										"value": "Bearer"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\r\n\"user_id\": \"AJAYIBT\",\r\n\"api_key\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJDdXN0b21lcklkIjoiMTQwNCIsImV4cCI6MTY1NzM2MTQwMCwiaWF0IjoxNjI1ODI1NDU2fQ.QYENFd6uCQM-oiglroQ6K6I6F...\",\r\n\"new_password\": \"a00000000000\",\r\n\"old_password\": \"a00000000000\",\r\n\"source\": \"MOBILEAPI\"\r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "https://uatwaveapi.odinwave.com/authentication/v1/user/password",
+									"protocol": "https",
+									"host": [
+										"uatwaveapi",
+										"odinwave",
+										"com"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"password"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Wed, 02 Mar 2022 10:52:17 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "78"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "d6114c0c-7b6e-46aa-8430-c27d6563d452"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "78"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OWjfNE0GhcwFXcg="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"4e-qhFRQfaney5DuOgNYyAGwgdIwYM\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Wed, 02 Mar 2022 10:52:17 GMT"
+								}
+							],
+							"cookie": [
+								{
+									"expires": "Invalid Date",
+									"domain": "",
+									"path": ""
+								}
+							],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"Password changed successfully.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Change MPIN",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"user_id\": \"{{user_id}}\",\n    \"source\": \"{{source}}\",\n    \"api_key\": \"{{api_key}}\",\n    \"old_mpin\": \"{{mpin}}\",\n    \"new_mpin\": \"2222\"\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/mpin",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"mpin"
+							]
+						},
+						"description": "This call would allow the user to change the MPIN, the input params would be the old MPIN, new MPIN and confirm new MPIN."
+					},
+					"response": [
+						{
+							"name": "MPIN",
+							"originalRequest": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "He55zrpvWn9ml0fkGv1Zq5GljGVBxUv5NFieVGAa",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"user_id\": \"AJAYIBT\",\n    \"source\": \"MOBILEAPI\",\n    \"api_key\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJDdXN0b21lcklkIjoiMTQwNCIsImV4cCI6MTY1NzM2MTQwMCwiaWF0IjoxNjI1ODI1NDU2fQ.QYENFd6uCQM-oiglroQ6K6I6F...\",\n    \"old_mpin\": \"2222\",\n    \"new_mpin\": \"2222\"\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "https://uatwaveapi.odinwave.com/authentication/v1/user/mpin",
+									"protocol": "https",
+									"host": [
+										"uatwaveapi",
+										"odinwave",
+										"com"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"mpin"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Wed, 02 Mar 2022 10:58:58 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "74"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "f560113e-e601-4118-abb3-32ca692bcba2"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "74"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OWkd3E_jhcwFpVA="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"4a-yxPVdwwNFlq4m1d42PLDtkyiF2A\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Wed, 02 Mar 2022 10:58:58 GMT"
+								}
+							],
+							"cookie": [
+								{
+									"expires": "Invalid Date",
+									"domain": "",
+									"path": ""
+								}
+							],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"MPIN changed successfully.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "GetUserDetails",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "api_key",
+								"value": "{{api_key}}",
+								"type": "text"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/getUserDetails/{{user_id}}",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"getUserDetails",
+								"{{user_id}}"
+							]
+						},
+						"description": "This call would return back the mobile and eMail details of the client, which will be used to send an OTP."
+					},
+					"response": [
+						{
+							"name": "GetUserDetails",
+							"originalRequest": {
+								"method": "GET",
+								"header": [
+									{
+										"key": "api_key",
+										"value": "{{api_key}}",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/getUserDetails/{{user_id}}",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"getUserDetails",
+										"{{user_id}}"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 04 Mar 2022 11:27:43 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "89"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "f3215cfe-f9f7-4bc4-850a-8f0ddd4b7ecb"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "89"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OdOjfFMsBcwFvPw="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"59-vB0Ti+cbHQOA+6iWUjBPTRsa7U4\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 04 Mar 2022 11:27:43 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": true,\n    \"result\": {\n        \"mobile\": \"MTIzNDU2Nzg5MA==\",\n        \"email\": \"YXBpdGVzdEB0ZXN0LmNvbQ==\"\n    }\n}"
+						}
+					]
+				},
+				{
+					"name": "Verify OTP",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"let res = pm.response.json();\r",
+									"if (pm.response.code == 200) {\r",
+									"    pm.environment.set(\"forgot_password_token\", res.data);\r",
+									"}\r",
+									""
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n\t\"user_id\": \"{{user_id}}\",\n\t\"api_key\": \"{{api_key}}\",\n\t\"source\": \"{{source}}\",\n\t\"otp\": \"123456\"\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/otp/verify",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"otp",
+								"verify"
+							]
+						},
+						"description": "This call would be used to validate the OTP sent in the previous call."
+					},
+					"response": [
+						{
+							"name": "Verify OTP",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n\t\"user_id\": \"{{user_id}}\",\n\t\"api_key\": \"{{api_key}}\",\n\t\"source\": \"{{source}}\",\n\t\"otp\": \"123456\"\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/otp/verify",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"otp",
+										"verify"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 04 Mar 2022 11:06:46 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "273"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "b8b6bbdb-589f-4695-886f-6964ac7a96d0"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "273"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OdLe7HcEhcwFTuQ="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"111-5j+694D4IlzEMJS2jJ+1X84il1I\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 04 Mar 2022 11:06:46 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"OTP verified successfully.\",\n    \"data\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7InRlbmFudElkIjoiMTQwNCIsInVzZXJJZCI6IkFQSVRFU1QifSwiZXhwIjoxNjQ2MzkyMzA2LCJpYXQiOjE2NDYzOTIwMDZ9.K4SQ3nj7hBCXhRugKbgIg-JhbWQe7uSE0xRwuohG7_Y\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Set Password",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"let res = pm.response.json();\r",
+									"if (pm.response.code == 200) {\r",
+									"    let req = JSON.parse(pm.request.body.raw);\r",
+									"    pm.environment.set(\"password\", req.new_password);\r",
+									"}\r",
+									""
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n\t\"user_id\": \"{{user_id}}\",\r\n\t\"api_key\": \"{{api_key}}\",\r\n\t\"source\": \"{{source}}\",\r\n\t\"otp\": \"{{forgot_password_token}}\",\r\n    \"new_password\": \"a11111111111\"\r\n}\r\n"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/password/reset",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"password",
+								"reset"
+							]
+						},
+						"description": "On successful validation of OTP, this call would allow the user to set a new password for login."
+					},
+					"response": [
+						{
+							"name": "Set Password",
+							"originalRequest": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\r\n\t\"user_id\": \"{{user_id}}\",\r\n\t\"api_key\": \"{{api_key}}\",\r\n\t\"source\": \"{{source}}\",\r\n\t\"otp\": \"{{forgot_password_token}}\",\r\n    \"new_password\": \"a11111111111\"\r\n}\r\n",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/password/reset",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"password",
+										"reset"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 04 Mar 2022 11:07:38 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "78"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "80214366-6bfd-4992-aaa7-fe418644e146"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "78"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OdLm8FxQhcwFuuw="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"4e-qhFRQfaney5DuOgNYyAGwgdIwYM\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 04 Mar 2022 11:07:38 GMT"
+								}
+							],
+							"cookie": [
+								{
+									"expires": "Invalid Date",
+									"domain": "",
+									"path": ""
+								}
+							],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"Password changed successfully.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Forgot MPIN Send OTP",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n\t\"user_id\": \"{{user_id}}\",\n\t\"api_key\": \"{{api_key}}\",\n\t\"source\": \"{{source}}\"\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/mpin/reset/send-otp",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"mpin",
+								"reset",
+								"send-otp"
+							]
+						},
+						"description": "This call is will allow the user to send an OTP on his registered mobile number in case if the MPIN is forgotten."
+					},
+					"response": [
+						{
+							"name": "Forgot MPIN Send OTP",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n\t\"user_id\": \"{{user_id}}\",\n\t\"api_key\": \"{{api_key}}\",\n\t\"source\": \"{{source}}\"\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/mpin/reset/send-otp",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"mpin",
+										"reset",
+										"send-otp"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 04 Mar 2022 11:09:49 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "85"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "cfdce9fc-f242-4ec9-ba92-b7273384beb5"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "85"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OdL7oEinhcwFjow="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"55-Ray2NOCz3xwKF7GXbv33+8oaKCs\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 04 Mar 2022 11:09:49 GMT"
+								}
+							],
+							"cookie": [
+								{
+									"expires": "Invalid Date",
+									"domain": "",
+									"path": ""
+								}
+							],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"OTP sent to reset MPIN & Fingerprint.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Set MPIN",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									""
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n\t\"user_id\": \"{{user_id}}\",\r\n\t\"api_key\": \"{{api_key}}\",\r\n\t\"source\": \"{{source}}\",\r\n\t\"otp\": \"{{forgot_password_token}}\",\r\n    \"mpin\": \"1111\",\r\n    \"mobile_udid\": \"a1b23cd4e5f6g78h\"\r\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/mpin/reset/verify-otp",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"mpin",
+								"reset",
+								"verify-otp"
+							]
+						},
+						"description": "This call would allow the user to set a new MPIN, the pre-requisite in this case would be to call the \"Verify OTP\" call to ensure that the OTP is validated correctly."
+					},
+					"response": [
+						{
+							"name": "Set MPIN",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"name": "Content-Type",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\r\n\t\"user_id\": \"{{user_id}}\",\r\n\t\"api_key\": \"{{api_key}}\",\r\n\t\"source\": \"{{source}}\",\r\n\t\"otp\": \"{{forgot_password_token}}\",\r\n    \"mpin\": \"1111\",\r\n    \"mobile_udid\": \"a1b23cd4e5f6g78h\"\r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/mpin/reset/verify-otp",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"mpin",
+										"reset",
+										"verify-otp"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 04 Mar 2022 11:11:04 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "86"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "2e0ee090-1244-48e0-97cc-246eab5d7a80"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "86"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "OdMG1FZdhcwFWhg="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"56-47BUsTglKt29dG0Y+rXsOr0PyVI\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 04 Mar 2022 11:11:04 GMT"
+								}
+							],
+							"cookie": [
+								{
+									"expires": "Invalid Date",
+									"domain": "",
+									"path": ""
+								}
+							],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"MPIN & Fingerprint reset successfully.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Set Fingerprint",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									""
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n    \"userId\": \"{{user_id}}\",\r\n    \"api_key\": \"{{api_key}}\",\r\n    \"source\": \"{{source}}\",\r\n    \"otp\": \"{{forgot_password_token}}\",\r\n    \"type\": \"fng\",\r\n    \"udid\": \"5c340bd7-5bd3-4aaf-9d03-b26626b16858\"\r\n}"
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/{{tenantid}}/v1/setMPIN",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"{{tenantid}}",
+								"v1",
+								"setMPIN"
+							]
+						},
+						"description": "This call would allow the user to set a new device for FINGERPRINT, the pre-requisite in this case would be to call the \"Verify OTP\" call to ensure that the OTP is validated correctly."
+					},
+					"response": [
+						{
+							"name": "Set Fingerprint",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\r\n    \"userId\": \"{{user_id}}\",\r\n    \"api_key\": \"{{api_key}}\",\r\n    \"source\": \"{{source}}\",\r\n    \"otp\": \"{{forgot_password_token}}\",\r\n    \"type\": \"fng\",\r\n    \"udid\": \"5c340bd7-5bd3-4aaf-9d03-b26626b16858\"\r\n}"
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/{{tenantid}}/v1/setMPIN",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"{{tenantid}}",
+										"v1",
+										"setMPIN"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Fri, 17 Feb 2023 15:05:53 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "171"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "3234a260-985a-4920-95f3-1974237c8e01"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "171"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "AfSo0E23BcwFW_Q="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"ab-wyXkrZBxlxcgjIPH8Mi8+sEq9do\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Fri, 17 Feb 2023 15:05:53 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": true,\n    \"result\": [\n        {\n            \"Valid\": null,\n            \"sMPIN\": \"GXAvzXx++xw=\",\n            \"nMPINInvalidAttempt\": 0,\n            \"ExpiryDaysRem\": 17,\n            \"nMPINSkipped\": 0,\n            \"sUDID\": \"5c340bd7-5bd3-4aaf-9d03-b26626b16858\"\n        }\n    ]\n}"
+						}
+					]
+				},
+				{
+					"name": "User Profile",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "{{access_token}}"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/profile",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"profile"
+							]
+						},
+						"description": "This call will fetch the basic details like user_name, email, mobile_no, pan, address including bank and DP details of the client."
+					},
+					"response": [
+						{
+							"name": "User Profile",
+							"originalRequest": {
+								"method": "GET",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									},
+									{
+										"key": "Authorization",
+										"value": "{{access_token}}"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/profile",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"profile"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Wed, 20 Sep 2023 08:57:29 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "591"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "c4d0a16a-5942-4eb9-978d-6c37d16eef63"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "591"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "LjEPBGl0hcwFfww="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"24f-yMqHTPgOM0yur8Knst4vgyGcxIM\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Wed, 20 Sep 2023 08:57:29 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"Success Message\",\n    \"data\": {\n        \"user_name\": \"APITEST\",\n        \"email\": \"apitest@test.com\",\n        \"mobile_no\": \"9999999999\",\n        \"pan\": \"ABCDE1234F\",\n        \"address\": \"1 2 3\",\n        \"mpin_enabled\": true,\n        \"fingerprint_enabled\": true,\n        \"dob\": \"01-06-1990\",\n        \"gender\": \"\",\n        \"productAllowed\": 4,\n        \"bank_details\": [\n            {\n                \"bank_name\": \"Axis Bank\",\n                \"branch_name\": \"ANDHERI\",\n                \"branch_city\": \"MUMBAI\",\n                \"account_no\": \"9874563210\",\n                \"account_type\": 2,\n                \"is_default\": false\n            }\n        ],\n        \"dp_details\": [\n            {\n                \"dpId\": \"12345678\",\n                \"clientBeneficiaryId\": \"1234567887654410\",\n                \"holdingType\": \"1\",\n                \"dpType\": \"CDSL\",\n                \"defaultDP\": true,\n                \"dpName\": \"TEST\"\n            }\n        ],\n        \"mf_details\": {}\n    }\n}"
+						}
+					]
+				},
+				{
+					"name": "User Profile v2",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "{{access_token}}"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{hosturl}}/authentication/v2/user/profile",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v2",
+								"user",
+								"profile"
+							]
+						},
+						"description": "This call will fetch the basic details like user_name, email, mobile_no, pan, address including bank and DP details of the client."
+					},
+					"response": [
+						{
+							"name": "User Profile v2",
+							"originalRequest": {
+								"method": "GET",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									},
+									{
+										"key": "Authorization",
+										"value": "{{access_token}}"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"url": {
+									"raw": "{{hosturl}}/authentication/v2/user/profile",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v2",
+										"user",
+										"profile"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "*"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "673"
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "Date",
+									"value": "Fri, 04 Oct 2024 08:17:31 GMT"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "Keep-Alive",
+									"value": "timeout=5"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"Success Message\",\n    \"data\": \"cjyTd8p7bVtpMMZxiphu3HeoAolTXTir0+78DNVwf5OH1hcBD/WoKTYLOaXsydnC6/u4ONx08qfwtEKRzK0xpn1R716N8UEHEa7FQ6PS0UpWzrK4qbcVNqsDqBv1SUob3FjOuOeT4ARRvkYSvmdBqsjBT8HlYQBQL9RdUeTsm6jsav2am2lD6Pe6gOFjArdUGk7IB1owF/EprVSarPtZwEEjN7CRfYXBC/tgTECSMlN6y2PYZJxwF3w00vdu8Eq0p0mE9Ub7JoHz5CiE2Ki1sx3JnQ0YWG2IRIts0Je19QZ0fowGh5I4yT/wyy25eeKnN/i4JoZ2ajoFiVPjZ4UNV1L7BbPf40Fv5hJPRVDQtVHypGLh6/KmH0hWOgnV2l4GGGIn4gRlT2Gc0t+4D0RRZYoDJzegNiPEI0ouDLbK3YzHLyw+YfngzbDqY9hxQEbVKm9q5M4zGPxdmlNvcjsxUfDzFiGnwRzqkATXwEvvheu/TecFh1V0V3yt63ZXQz2DyuxHX4NLf042xePrWRNfaMbME40HNaslLkfffuIHBmEYR5FypWWejDzgewunMB7Z31zmn392c8p4mqXbm5EdVg==\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Validate Session",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "{{access_token}}",
+								"type": "default"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "default"
+							}
+						],
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/session",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"session"
+							]
+						},
+						"description": "This call would validate the access token."
+					},
+					"response": [
+						{
+							"name": "Validate Session",
+							"originalRequest": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Authorization",
+										"value": "{{access_token}}",
+										"type": "default"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "default"
+									}
+								],
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/session",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"session"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "139"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"8b-Nz7dKj+inS5tZzmf5g/+2sPq9Sc\""
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "Date",
+									"value": "Fri, 22 Apr 2022 15:14:25 GMT"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "Keep-Alive",
+									"value": "timeout=5"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"Session verified.\",\n    \"data\": \"{\\\"status\\\":\\\"false\\\",\\\"message\\\":\\\"TRUE\\\",\\\"dropped\\\":\\\"true\\\"}\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Register TOTP",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n    \"user_id\": \"{{user_id}}\",\r\n    \"source\": \"{{source}}\",\r\n    \"app_name\":\"Wave2.0\",\r\n    \"api_key\": \"{{api_key}}\",\r\n    \"otp\": \"{{forgot_password_token}}\"\r\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/registertotp",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"registertotp"
+							]
+						},
+						"description": "This call would allow the user to fetch the details required to register for TOTP as second factor authentication."
+					},
+					"response": [
+						{
+							"name": "Register TOTP",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\r\n    \"user_id\": \"{{user_id}}\",\r\n    \"source\": \"{{source}}\",\r\n    \"app_name\":\"Wave2.0\",\r\n    \"api_key\": \"{{api_key}}\",\r\n    \"otp\": \"{{forgot_password_token}}\"\r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/registertotp",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"registertotp"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Tue, 20 Sep 2022 17:06:58 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "1810"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "b0e968be-1f41-4cc2-a295-f26f19a0e9ef"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "Content-Encoding",
+									"value": "gzip"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "YxLv4Ez8hcwFTKA="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"cd3-mUjs3Fke2MV68bZyR0enU8nw/9w\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Tue, 20 Sep 2022 17:06:58 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"QR code generated.\",\n    \"data\": {\n        \"qrImg\": \"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAMQAAADECAYAAADApo5rAAAAAklEQVR4AewaftIAAAjeSURBVO3BQY4kyZEAQdVA/f/Lug0eHHZyIJBZzeGsidgfrLX+42GtdTystY6HtdbxsNY6HtZax8Na63hYax0Pa63jYa11PKy1joe11vGw1joe1lrHw1rreFhrHT98SOVvqrhRuamYVKaKSeWmYlKZKm5UbireUJkqblSmikllqphUpopJ5W+q+MTDWut4WGsdD2ut44cvq/gmld9U8QmVN1SmikllUvlNFZPKVHFT8UbFN6l808Na63hYax0Pa63jh1+m8kbFGyo3FZPKN1VMKpPKVDGp3FS8ofJNKlPFN6m8UfGbHtZax8Na63hYax0//MtUTCqfqLhRmSreqJhUJpVvUnmj4kZlqvhf9rDWOh7WWsfDWuv44V9GZap4Q2VS+YTKN1V8omJSuVGZKqaKf5OHtdbxsNY6HtZaxw+/rOJvqphUPlExqUwVk8pUMal8QuWm4psqJpWbijcq/kke1lrHw1rreFhrHT98mco/WcWkMlVMKlPFpDJVTCpTxaQyVUwqU8WkcqMyVdxUTCpTxaTyhso/2cNa63hYax0Pa63jhw9V/JuovFFxU/GGyjdVfKLipuKm4n/Jw1rreFhrHQ9rrcP+4AMqU8Wk8k0VNypTxY3KVHGj8kbFN6m8UTGpfFPFjco3Vfymh7XW8bDWOh7WWscPH6qYVKaKG5Wp4kZlqpgqJpWpYqqYVKaKT6hMFd9U8UbFpDJVTCpvqEwVk8pUMam8oTJVfOJhrXU8rLWOh7XWYX/wAZWbijdUPlFxozJVTCpvVNyovFExqUwVk8onKr5JZap4Q+Wm4jc9rLWOh7XW8bDWOn74y1RuKm5UpopJZaqYKiaVm4oblanipmJSmVRuVKaKN1QmlZuKSWWquFG5qbipmFRuKj7xsNY6HtZax8Na6/jhQxVvVEwqNypvVEwqNxWTyhsVk8pU8UbFGyrfVPGJijdUblT+poe11vGw1joe1lqH/cEHVKaK36Ty31QxqUwVk8pUcaMyVUwqU8WkMlXcqNxUTCrfVDGpTBWTylTxTQ9rreNhrXU8rLWOH/5hVN6oeENlqvgmlTdUpoqbikllqrhRmSo+UfGGyqRyozJVTCpTxSce1lrHw1rreFhrHT98mcobFVPFGyo3FVPFjcpU8Zsq3lC5UZkqblT+myomlaliUpkqvulhrXU8rLWOh7XW8cOHKiaVm4o3VG4qblSmiknlN1W8ofJNKm9U/H/2sNY6HtZax8Na67A/+CKVb6qYVG4q3lCZKm5UpooblTcqJpWp4kZlqphUbiomlTcqJpU3KiaVNyo+8bDWOh7WWsfDWuv44csq3lCZKiaVm4oblaliqphUbiomlanijYpJ5Q2VG5Wp4kZlqvgnq/imh7XW8bDWOh7WWof9wS9Suan4hMpUcaNyU3GjMlW8ofJGxRsqU8WNyjdVvKHyRsVvelhrHQ9rreNhrXXYH3xAZaq4UbmpmFRuKm5UpopJZaqYVKaKSWWqmFRuKm5UbipuVKaKG5Wp4g2Vm4pJZaqYVN6o+MTDWut4WGsdD2utw/7gAyo3FZPKTcWNyk3FjcpUMalMFZPKGxWTyhsVk8obFZPKVDGp3FRMKlPFN6m8UfGJh7XW8bDWOh7WWscPX1YxqbyhclNxozJVTBU3FZPKTcUbFZPKb1L5RMWkcqNyUzGpTBU3Fb/pYa11PKy1joe11vHDP0zFGyqfUJkqpooblZuKb6qYVKaKSWWquKm4qZhUbip+k8pU8YmHtdbxsNY6HtZah/3BB1SmihuVm4pJZaqYVN6oeENlqrhReaNiUrmpeEPlExWTyk3FjcpNxaRyU/FND2ut42GtdTystY4fPlRxo/KJipuKG5UblU+oTBWTylTxCZWpYlK5qZhUpoo3Km5Ubiomlanib3pYax0Pa63jYa112B98kcpUcaMyVUwqU8Wk8omKN1Q+UfGGylTxhsobFZPKVHGjMlX8JpWp4hMPa63jYa11PKy1jh8+pPKJipuKNypuVCaVT1TcqNyo3FTcqNxU3KhMKt+kMlVMKjcVk8pU8U0Pa63jYa11PKy1DvuDD6jcVEwqU8Wk8kbFJ1SmiknljYpvUpkqJpWpYlKZKm5UpopJ5abiRmWqmFTeqPimh7XW8bDWOh7WWof9wQdUbip+k8onKj6h8kbFpDJVTCpTxTep3FTcqNxUTCpTxRsqNxWfeFhrHQ9rreNhrXXYH3xAZaqYVN6omFTeqPhNKjcVk8pNxaQyVUwqn6h4Q+Wm4hMqU8UbKlPFJx7WWsfDWut4WGsdP/yyihuVm4pJZaqYVG4q3lCZKiaVSeUNlanipuI3qdxUTCo3Fd+kMlV808Na63hYax0Pa63jh1+mMlVMFTcqU8VNxaRyo3JT8UbFjcqNym+quKm4UXlD5RMqU8WkMlV84mGtdTystY6HtdZhf/A/TGWqeEPlpmJSmSomlaniRuWmYlKZKm5UPlFxozJVvKFyUzGp3FR84mGtdTystY6Htdbxw4dU/qaKqWJS+UTFpDJVfEJlqphUbiomlZuKN1QmlU+oTBU3Ff9ND2ut42GtdTystY4fvqzim1RuVKaKG5VvUrlRuVF5Q+V/ScUbKjcVk8o3Pay1joe11vGw1jp++GUqb1R8QmWq+CaVqeINlW+qmFQmlZuKqeINlUnlmyomlanimx7WWsfDWut4WGsdP/zLVEwqU8WkMqncVNyo3FRMKlPFTcWkMlXcqLyhMlXcVHxC5abiNz2stY6HtdbxsNY6fviXUblRmSreULmpmFRuKiaVqeKmYlK5qXij4g2VT1RMKjcV3/Sw1joe1lrHw1rr+OGXVfymihuVqeJGZap4Q+UTFZ+omFQmlZuKSWWqmCo+ofJP8rDWOh7WWsfDWuv44ctU/iaVm4pJZaq4UZkqfpPKVHGj8omKSWWquFGZKj6hMlX8TQ9rreNhrXU8rLUO+4O11n88rLWOh7XW8bDWOh7WWsfDWut4WGsdD2ut42GtdTystY6HtdbxsNY6HtZax8Na63hYax0Pa63j/wAtzsyOMD5O3AAAAABJRU5ErkJggg==\",\n        \"authSecret\": \"BERQOP22IIRF23I5\",\n        \"userId\": \"APITEST\"\n    }\n}"
+						}
+					]
+				},
+				{
+					"name": "Delete TOTP",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "{{access_token}}",
+								"type": "text"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/registertotp",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"registertotp"
+							]
+						},
+						"description": "This call would allow the user to disable TOTP as second factor authentication."
+					},
+					"response": [
+						{
+							"name": "Delete TOTP",
+							"originalRequest": {
+								"method": "DELETE",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"type": "text"
+									},
+									{
+										"key": "Authorization",
+										"value": "{{access_token}}",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/registertotp",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"registertotp"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Tue, 20 Sep 2022 17:10:30 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "103"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "950233f5-e7aa-4986-be7d-96a21afad4b5"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "103"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "YxMRAGoEhcwFWeg="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"67-j/VNWucaPprnzQUkAE9SQ1bOFQ0\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Tue, 20 Sep 2022 17:10:30 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"TOTP disabled successfully.\",\n    \"data\": {\n        \"userId\": \"APITEST\"\n    }\n}"
+						}
+					]
+				},
+				{
+					"name": "Verify TOTP",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							},
+							{
+								"key": "Authorization",
+								"value": "{{access_token}}",
+								"type": "text"
+							},
+							{
+								"key": "x-api-key",
+								"value": "{{x-api-key}}",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n   \"second_auth\":\"684771\" \r\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{hosturl}}/authentication/v1/user/verifytotp",
+							"host": [
+								"{{hosturl}}"
+							],
+							"path": [
+								"authentication",
+								"v1",
+								"user",
+								"verifytotp"
+							]
+						},
+						"description": "This call would be used to enable TOTP after login by verifying the TOTP entered by the user as second factor authentication."
+					},
+					"response": [
+						{
+							"name": "Verify TOTP",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json",
+										"type": "text"
+									},
+									{
+										"key": "Authorization",
+										"value": "{{access_token}}",
+										"type": "text"
+									},
+									{
+										"key": "x-api-key",
+										"value": "{{x-api-key}}",
+										"type": "text"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\r\n   \"second_auth\":\"684771\" \r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "{{hosturl}}/authentication/v1/user/verifytotp",
+									"host": [
+										"{{hosturl}}"
+									],
+									"path": [
+										"authentication",
+										"v1",
+										"user",
+										"verifytotp"
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "json",
+							"header": [
+								{
+									"key": "Date",
+									"value": "Wed, 21 Sep 2022 09:57:53 GMT"
+								},
+								{
+									"key": "Content-Type",
+									"value": "application/json; charset=utf-8"
+								},
+								{
+									"key": "Content-Length",
+									"value": "103"
+								},
+								{
+									"key": "Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amzn-RequestId",
+									"value": "ebbaacf3-821e-4f8a-92b2-d75199d52015"
+								},
+								{
+									"key": "Access-Control-Allow-Origin",
+									"value": "*"
+								},
+								{
+									"key": "x-amzn-Remapped-Content-Length",
+									"value": "103"
+								},
+								{
+									"key": "x-amzn-Remapped-Connection",
+									"value": "keep-alive"
+								},
+								{
+									"key": "x-amz-apigw-id",
+									"value": "Yzf1MHdABcwFsUA="
+								},
+								{
+									"key": "Vary",
+									"value": "Accept-Encoding"
+								},
+								{
+									"key": "X-Powered-By",
+									"value": "Express"
+								},
+								{
+									"key": "ETag",
+									"value": "W/\"67-v6WKtfV+u/M6eGQ/Iu/8ReINm1E\""
+								},
+								{
+									"key": "Access-Control-Expose-Headers",
+									"value": "sessionId"
+								},
+								{
+									"key": "x-amzn-Remapped-Date",
+									"value": "Wed, 21 Sep 2022 09:57:53 GMT"
+								}
+							],
+							"cookie": [],
+							"body": "{\n    \"status\": \"success\",\n    \"code\": \"s-101\",\n    \"message\": \"TOTP verified successfully.\",\n    \"data\": {\n        \"userId\": \"APITEST\"\n    }\n}"
+						}
+					]
+				}
+			],
+			"description": "This collection of API's would help in user authentication flow including password/MPIN validation, forget & reset etc."
+		}
+		
+	]
+}
