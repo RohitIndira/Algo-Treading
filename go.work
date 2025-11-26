@@ -2,6 +2,7 @@ go 1.25.4
 
 use (
 	.
+	./api/gateway
 	./api/proto/common
 	./pkg/logger
 	./services/data-ingestion

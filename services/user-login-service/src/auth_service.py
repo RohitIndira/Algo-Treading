@@ -8,9 +8,9 @@ import uuid
 import pyotp
 import json
 
-from models import UserCredentials, UserSession, LoginHistory, LoginRequest
-from repository import Repository
-from odin_client import OdinClient
+from .models import UserCredentials, UserSession, LoginHistory, LoginRequest
+from .repository import Repository
+from .odin_client import OdinClient
 
 # Try to import Kafka, but make it optional
 try:
@@ -69,7 +69,14 @@ class AuthService:
         creds = self.repo.get_user_credentials(request.user_id)
         
         if not creds:
-            error_msg = f"No credentials found for user: {request.user_id}"
+            error_msg = f"No credentials found for user_id '{request.user_id}'. Please register your credentials first using /api/v1/credentials/register."
+            self._log_login_attempt(request, "FAILED", error_msg)
+            raise Exception(error_msg)
+        
+        # Use stored password if not provided in request
+        password = request.password if request.password else creds.password_encrypted
+        if not password:
+            error_msg = f"No password available for user: {request.user_id}"
             self._log_login_attempt(request, "FAILED", error_msg)
             raise Exception(error_msg)
         
@@ -89,7 +96,7 @@ class AuthService:
                 user_id=request.user_id,
                 api_key=creds.api_key,
                 login_type=request.login_type,
-                password=request.password,
+                password=password,
                 second_auth_type=request.second_auth_type,
                 second_auth=second_auth,
                 source=request.source,

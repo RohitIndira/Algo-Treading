@@ -169,7 +169,7 @@ func main() {
 	logger.Info("Kafka trade-signals publisher initialized successfully")
 
 	// Initialize event handler
-	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, stats, logger)
+	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, redisCache, stats, logger)
 
 	// Initialize Kafka consumer
 	logger.Info("Initializing Kafka consumer...")

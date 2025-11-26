@@ -203,7 +203,7 @@ func LoadConfig() (*Config, error) {
 		},
 
 		RabbitMQ: RabbitMQConfig{
-			URL:                  getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
+			URL:                  getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 			Exchange:             getEnv("RABBITMQ_EXCHANGE", "orders"),
 			ExchangeType:         getEnv("RABBITMQ_EXCHANGE_TYPE", "direct"),
 			Queue:                getEnv("RABBITMQ_QUEUE", "trade_signals"),

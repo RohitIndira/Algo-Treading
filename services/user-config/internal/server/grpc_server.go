@@ -194,9 +194,13 @@ func (s *UserConfigServer) ListUserStrategies(ctx context.Context, req *pb.ListU
 		}, nil
 	}
 
-	protoStrategies := make([]*pb.Strategy, len(strategies))
-	for i, strategy := range strategies {
-		protoStrategies[i] = modelStrategyToProto(strategy)
+	// Initialize empty slice to ensure JSON returns [] instead of null
+	protoStrategies := make([]*pb.Strategy, 0)
+	if len(strategies) > 0 {
+		protoStrategies = make([]*pb.Strategy, len(strategies))
+		for i, strategy := range strategies {
+			protoStrategies[i] = modelStrategyToProto(strategy)
+		}
 	}
 
 	totalPages := int32((int64(total) + int64(pageSize) - 1) / int64(pageSize))

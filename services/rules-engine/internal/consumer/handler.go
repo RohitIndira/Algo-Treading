@@ -2,8 +2,12 @@ package consumer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
@@ -19,6 +23,7 @@ type Handler struct {
 	kafkaPubl  *publisher.KafkaPublisher
 	signalRepo *repository.TradeSignalRepository
 	riskClient *risk.Client
+	redisCache *cache.RedisCache
 	stats      *models.MatchingStats
 	logger     *zap.Logger
 }
@@ -30,6 +35,7 @@ func NewHandler(
 	kafkaPubl *publisher.KafkaPublisher,
 	signalRepo *repository.TradeSignalRepository,
 	riskClient *risk.Client,
+	redisCache *cache.RedisCache,
 	stats *models.MatchingStats,
 	logger *zap.Logger,
 ) *Handler {
@@ -39,6 +45,7 @@ func NewHandler(
 		kafkaPubl:  kafkaPubl,
 		signalRepo: signalRepo,
 		riskClient: riskClient,
+		redisCache: redisCache,
 		stats:      stats,
 		logger:     logger,
 	}
@@ -91,6 +98,75 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 	return nil
 }
 
+// getLTPFromRedis retrieves Last Traded Price from Redis
+// Redis key pattern: market:{exchange}:{token}
+// Example: market:nse:10227 or market:bse:532259
+func (h *Handler) getLTPFromRedis(ctx context.Context, stockCode int64, exchange string) (float64, error) {
+	// Normalize exchange to lowercase
+	exchangeLower := strings.ToLower(exchange)
+
+	// Always try both NSE and BSE to maximize chances of finding the stock
+	// Priority order: specified exchange first, then the other one
+	exchanges := []string{"nse", "bse"}
+	if exchangeLower == "bse" {
+		exchanges = []string{"bse", "nse"}
+	}
+
+	var lastErr error
+	for _, exch := range exchanges {
+		// Construct Redis key: market:{exchange}:{token}
+		key := fmt.Sprintf("market:%s:%d", exch, stockCode)
+
+		// Get value from Redis
+		jsonData, err := h.redisCache.Get(ctx, key)
+		if err != nil {
+			// If it's a cache miss, try the next exchange
+			if err == models.ErrCacheMiss {
+				h.logger.Debug("LTP not found in Redis for exchange, trying next",
+					zap.String("key", key),
+					zap.String("exchange", exch))
+				lastErr = err
+				continue
+			}
+			lastErr = fmt.Errorf("redis get error for key %s: %w", key, err)
+			continue
+		}
+
+		// Parse JSON to extract LTP
+		var marketData struct {
+			LTP float64 `json:"ltp"`
+		}
+
+		if err := json.Unmarshal([]byte(jsonData), &marketData); err != nil {
+			lastErr = fmt.Errorf("failed to parse market data JSON for key %s: %w", key, err)
+			continue
+		}
+
+		if marketData.LTP <= 0 {
+			lastErr = fmt.Errorf("invalid LTP value %.2f for stock %d on %s", marketData.LTP, stockCode, exch)
+			continue
+		}
+
+		h.logger.Debug("Successfully retrieved LTP from Redis",
+			zap.String("key", key),
+			zap.Int64("stock_code", stockCode),
+			zap.String("exchange", exch),
+			zap.Float64("ltp", marketData.LTP))
+
+		return marketData.LTP, nil
+	}
+
+	// If we get here, stock not found on either exchange
+	h.logger.Warn("Stock not found in Redis on any exchange",
+		zap.Int64("stock_code", stockCode),
+		zap.Strings("tried_exchanges", exchanges))
+
+	if lastErr != nil {
+		return 0, fmt.Errorf("LTP not found in Redis for stock %d (tried exchanges: %v): %w", stockCode, exchanges, lastErr)
+	}
+	return 0, fmt.Errorf("LTP not found in Redis for stock %d (tried exchanges: %v)", stockCode, exchanges)
+}
+
 // processMatch processes a single match
 func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, event *models.MarketEvent) error {
 	// Note: In production, you would fetch the full strategy here
@@ -112,15 +188,28 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 	// For MARKET orders, ensure we have a valid price from the event
 	if orderReq.Price <= 0 {
-		// Use price from market data
+		// Priority 1: Use price from event market data
 		if event.MarketData.LastTradedPrice > 0 {
 			orderReq.Price = event.MarketData.LastTradedPrice
+			h.logger.Debug("Using LTP from event data",
+				zap.Int64("stock_code", event.StockData.StockCode),
+				zap.Float64("price", orderReq.Price))
 		} else {
-			// Fallback: use a nominal price of 100 for testing
-			orderReq.Price = 100.0
-			h.logger.Warn("No price available in event, using fallback",
-				zap.String("event_id", event.EventID),
-				zap.Int64("stock_code", event.StockData.StockCode))
+			// Priority 2: Query Redis for LTP
+			price, err := h.getLTPFromRedis(ctx, event.StockData.StockCode, event.StockData.Exchange)
+			if err != nil {
+				h.logger.Error("Failed to get LTP from Redis, skipping order",
+					zap.String("event_id", event.EventID),
+					zap.Int64("stock_code", event.StockData.StockCode),
+					zap.String("exchange", event.StockData.Exchange),
+					zap.Error(err))
+				return fmt.Errorf("no price available for stock %d", event.StockData.StockCode)
+			}
+			orderReq.Price = price
+			h.logger.Info("Using LTP from Redis",
+				zap.Int64("stock_code", event.StockData.StockCode),
+				zap.String("exchange", event.StockData.Exchange),
+				zap.Float64("price", price))
 		}
 
 		// Recalculate stop loss and take profit with the correct price
@@ -218,6 +307,62 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		zap.Int64("stock_code", orderReq.StockCode),
 		zap.Float64("match_score", orderReq.MatchScore),
 		zap.Float64("price", orderReq.Price))
+
+	// Publish match event to Redis for real-time WebSocket updates
+	if err := h.publishMatchEvent(ctx, orderReq, event, match); err != nil {
+		h.logger.Error("Failed to publish match event to Redis",
+			zap.Error(err),
+			zap.String("user_id", orderReq.UserID))
+		// Don't fail the order, just log the error
+	}
+
+	return nil
+}
+
+// publishMatchEvent publishes match event to Redis Pub/Sub for real-time updates
+func (h *Handler) publishMatchEvent(ctx context.Context, orderReq *models.OrderRequest, event *models.MarketEvent, match *models.RuleMatch) error {
+	// Create match event payload
+	matchEvent := map[string]interface{}{
+		"order_id":      orderReq.OrderID,
+		"user_id":       orderReq.UserID,
+		"strategy_id":   orderReq.StrategyID,
+		"strategy_name": match.StrategyName,
+		"event_id":      event.EventID,
+		"stock_code":    orderReq.StockCode,
+		"symbol":        orderReq.Symbol,
+		"exchange":      orderReq.Exchange,
+		"match_score":   orderReq.MatchScore,
+		"impact_score":  orderReq.ImpactScore,
+		"sentiment":     orderReq.Sentiment,
+		"news_category": orderReq.NewsCategory,
+		"news_title":    event.NewsData.ShortSummary,
+		"news_content":  event.NewsData.ShortSummary,
+		"news_link":     event.NewsData.NewsLink,
+		"order_price":   orderReq.Price,
+		"stop_loss":     orderReq.StopLoss,
+		"take_profit":   orderReq.TakeProfit,
+		"order_status":  "PENDING",
+		"risk_approved": orderReq.RiskApproved,
+		"timestamp":     time.Now().Unix(),
+		"time_ago":      "just now",
+	}
+
+	// Convert to JSON
+	jsonData, err := json.Marshal(matchEvent)
+	if err != nil {
+		return fmt.Errorf("failed to marshal match event: %w", err)
+	}
+
+	// Publish to Redis channel: user:{user_id}:matches
+	channel := fmt.Sprintf("user:%s:matches", orderReq.UserID)
+	err = h.redisCache.Publish(ctx, channel, string(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to publish to Redis channel %s: %w", channel, err)
+	}
+
+	h.logger.Debug("Published match event to Redis",
+		zap.String("channel", channel),
+		zap.String("order_id", orderReq.OrderID))
 
 	return nil
 }
