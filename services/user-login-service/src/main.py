@@ -463,13 +463,16 @@ async def login(request_body: LoginRequestModel, request: Request):
     """
     Login user and create session
     
-    - Automatically finds correct user_id from stored credentials
-    - Uses stored credentials if password is not provided
-    - Auto-generates TOTP if secret is stored
+    **Frontend sends ONLY**: user_id and password
+    
+    **Backend automatically handles**:
+    - Uses stored API credentials from DB
+    - Auto-generates TOTP from stored totp_secret
+    - Sets second_auth_type to "TOTP" (always)
     - Creates 24-hour session
     - Publishes Kafka events
     
-    **Smart Login**: Backend automatically matches user_id with stored credentials
+    **Smart Login**: One-click login with just user_id and password!
     """
     try:
         import jwt as jwt_lib
@@ -538,12 +541,21 @@ async def login(request_body: LoginRequestModel, request: Request):
                 # Continue with stored user_id
                 actual_user_id = creds.user_id
         
+        # Use stored preferences if not provided in request
+        login_type = request_body.login_type if request_body.login_type else creds.preferred_login_type
+        second_auth_type = request_body.second_auth_type if request_body.second_auth_type else creds.preferred_second_auth
+        
+        # Default to TOTP if still not set
+        if not second_auth_type or second_auth_type == "":
+            second_auth_type = "TOTP"
+            logger.info(f"Defaulting second_auth_type to TOTP for user: {actual_user_id}")
+        
         # Create login request with the correct user_id
         login_req = LoginRequest(
             user_id=actual_user_id,
-            login_type=request_body.login_type,
+            login_type=login_type,
             password=request_body.password,
-            second_auth_type=request_body.second_auth_type,
+            second_auth_type=second_auth_type,
             second_auth=request_body.second_auth,
             source=request_body.source,
             udid=request_body.udid,

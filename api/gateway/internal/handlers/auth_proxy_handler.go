@@ -60,9 +60,9 @@ func (h *AuthProxyHandler) ProxyRequest(w http.ResponseWriter, r *http.Request) 
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
+	// Copy response headers (excluding CORS headers to avoid duplicates)
 	for key, values := range resp.Header {
-		if isHopByHopHeader(key) {
+		if isHopByHopHeader(key) || isCORSHeader(key) {
 			continue
 		}
 		for _, value := range values {
@@ -92,6 +92,26 @@ func isHopByHopHeader(header string) bool {
 
 	headerLower := strings.ToLower(header)
 	for _, h := range hopByHopHeaders {
+		if strings.ToLower(h) == headerLower {
+			return true
+		}
+	}
+	return false
+}
+
+// isCORSHeader checks if a header is a CORS header
+func isCORSHeader(header string) bool {
+	corsHeaders := []string{
+		"Access-Control-Allow-Origin",
+		"Access-Control-Allow-Methods",
+		"Access-Control-Allow-Headers",
+		"Access-Control-Allow-Credentials",
+		"Access-Control-Max-Age",
+		"Access-Control-Expose-Headers",
+	}
+
+	headerLower := strings.ToLower(header)
+	for _, h := range corsHeaders {
 		if strings.ToLower(h) == headerLower {
 			return true
 		}
