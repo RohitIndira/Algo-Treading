@@ -236,3 +236,17 @@ func (c *RedisCache) GetStats(ctx context.Context) (*redis.PoolStats, error) {
 	stats := c.client.PoolStats()
 	return stats, nil
 }
+
+// Publish publishes a message to a Redis Pub/Sub channel
+func (c *RedisCache) Publish(ctx context.Context, channel string, message string) error {
+	err := c.client.Publish(ctx, channel, message).Err()
+	if err != nil {
+		return fmt.Errorf("redis publish error: %w", err)
+	}
+	return nil
+}
+
+// GetClient returns the underlying Redis client for advanced operations
+func (c *RedisCache) GetClient() redis.UniversalClient {
+	return c.client
+}

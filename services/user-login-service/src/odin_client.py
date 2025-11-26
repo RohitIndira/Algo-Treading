@@ -62,6 +62,12 @@ class OdinClient:
         """
         url = f"{self.base_url}/authentication/v1/user/session"
         
+        # Validate that second_auth has a value when required
+        if not second_auth or second_auth.strip() == "":
+            error_msg = f"second_auth is required for second_auth_type={second_auth_type}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+        
         # Build request body
         body = {
             "user_id": user_id,
@@ -88,7 +94,10 @@ class OdinClient:
             "x-api-key": self.x_api_key
         }
         
-        logger.info(f"Calling ODIN login API for user: {user_id}")
+        logger.info(f"Calling ODIN login API for user: {user_id} with login_type: {login_type}, second_auth_type: {second_auth_type}")
+        logger.info(f"Request URL: {url}")
+        logger.info(f"Request body: {body}")
+        logger.info(f"Request headers (x-api-key hidden): Content-Type={headers['Content-Type']}")
         
         try:
             response = self.session.post(
@@ -97,6 +106,14 @@ class OdinClient:
                 headers=headers,
                 timeout=self.timeout
             )
+            
+            # Log response details for debugging
+            logger.info(f"Response status: {response.status_code}")
+            try:
+                response_json = response.json()
+                logger.info(f"Response body: {response_json}")
+            except:
+                logger.info(f"Response text: {response.text}")
             
             response.raise_for_status()
             return response.json()

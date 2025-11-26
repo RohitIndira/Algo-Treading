@@ -16,6 +16,7 @@ type Strategy struct {
 	StrategyName string             `db:"strategy_name" json:"strategy_name"`
 	Description  string             `db:"description" json:"description"`
 	Active       bool               `db:"active" json:"active"`
+	MatchAllNews bool               `db:"match_all_news" json:"match_all_news"`
 	Version      int32              `db:"version" json:"version"`
 	CreatedAt    time.Time          `db:"created_at" json:"created_at"`
 	UpdatedAt    time.Time          `db:"updated_at" json:"updated_at"`

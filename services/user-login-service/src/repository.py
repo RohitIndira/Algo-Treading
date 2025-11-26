@@ -7,7 +7,7 @@ from typing import Optional, List
 from datetime import datetime
 import json
 
-from models import UserCredentials, UserSession, LoginHistory
+from .models import UserCredentials, UserSession, LoginHistory
 
 
 class Repository:

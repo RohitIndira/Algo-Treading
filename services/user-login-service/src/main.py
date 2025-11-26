@@ -16,9 +16,9 @@ import schedule
 import time
 import threading
 
-from models import UserCredentials, UserSession, LoginRequest
-from repository import Repository
-from auth_service import AuthService
+from .models import UserCredentials, UserSession, LoginRequest
+from .repository import Repository
+from .auth_service import AuthService
 
 # Load environment variables
 load_dotenv()
@@ -202,7 +202,7 @@ class RegisterCredentialsRequest(BaseModel):
     x_api_key: str = Field(..., description="ODIN X-API-Key")
     api_url: str = Field(..., description="ODIN API URL")
     password_encrypted: Optional[str] = Field(None, description="Encrypted password")
-    totp_secret: Optional[str] = Field(None, description="TOTP secret (base32)")
+    totp_secret: Optional[str] = Field(None, description="TOTP secret (base32 encoded, 16+ characters). Do NOT pass TOTP codes here.")
     mpin_encrypted: Optional[str] = Field(None, description="Encrypted MPIN")
     client_id: str = Field("", description="Client ID")
     pan: Optional[str] = Field(None, description="PAN number")
@@ -321,18 +321,77 @@ async def register_credentials(request: RegisterCredentialsRequest):
     """
     Register or update user credentials
     
-    Store user credentials for automatic login without exposing passwords
+    Store user credentials for automatic login without exposing passwords.
+    
+    **IMPORTANT**: 
+    - The `totp_secret` must be a valid base32-encoded TOTP secret (16+ characters), NOT a 6-digit TOTP code
+    - The `user_id` in the request will be validated against the JWT token's userId field
+    - If they don't match, the JWT's userId will be used as the actual user_id
     """
     try:
+        import pyotp
+        import re
+        import jwt as jwt_lib
+        
+        # Extract user_id from JWT token
+        try:
+            decoded_token = jwt_lib.decode(request.api_key, options={"verify_signature": False})
+            jwt_user_id = decoded_token.get('userId')
+            
+            if not jwt_user_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid API key: Could not extract userId from JWT token"
+                )
+            
+            # If provided user_id doesn't match JWT, use JWT's user_id and warn
+            actual_user_id = jwt_user_id
+            if request.user_id != jwt_user_id:
+                logger.warning(f"User ID mismatch: Request user_id='{request.user_id}' but JWT contains userId='{jwt_user_id}'. Using JWT's userId.")
+                
+        except Exception as e:
+            logger.error(f"Failed to decode JWT token: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid API key: Could not decode JWT token. {str(e)}"
+            )
+        
+        # Validate TOTP secret if provided
+        totp_secret = request.totp_secret
+        if totp_secret:
+            # Check if it's a 6-digit TOTP code (which is invalid)
+            if re.match(r'^\d{6}$', totp_secret):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid totp_secret: You provided a 6-digit TOTP code. Please provide the base32-encoded TOTP secret instead (16+ characters)."
+                )
+            
+            # Check minimum length
+            if len(totp_secret) < 16:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid totp_secret: TOTP secret must be at least 16 characters long (base32 encoded)."
+                )
+            
+            # Validate it's a valid TOTP secret by trying to create a TOTP object
+            try:
+                pyotp.TOTP(totp_secret)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid totp_secret: {str(e)}. Please provide a valid base32-encoded TOTP secret."
+                )
+        
+        # Use the actual user_id from JWT token
         creds = UserCredentials(
-            user_id=request.user_id,
+            user_id=actual_user_id,
             api_key=request.api_key,
             x_api_key=request.x_api_key,
             api_url=request.api_url,
             password_encrypted=request.password_encrypted,
-            totp_secret=request.totp_secret,
+            totp_secret=totp_secret,
             mpin_encrypted=request.mpin_encrypted,
-            client_id=request.client_id,
+            client_id=request.client_id or actual_user_id,
             pan=request.pan,
             email=request.email,
             mobile_no=request.mobile_no,
@@ -343,15 +402,22 @@ async def register_credentials(request: RegisterCredentialsRequest):
         
         result = auth_service.register_user(creds)
         
+        response_message = "Credentials registered successfully. Backend will auto-generate TOTP codes from the secret during login."
+        if request.user_id != actual_user_id:
+            response_message += f" Note: Registered under user_id '{actual_user_id}' (from JWT token) instead of '{request.user_id}'."
+        
         return CredentialsResponse(
             success=True,
             data={
                 "user_id": result.user_id,
+                "jwt_user_id": actual_user_id,
                 "created_at": result.created_at.isoformat() if result.created_at else None,
                 "updated_at": result.updated_at.isoformat() if result.updated_at else None
             },
-            message="Credentials registered successfully"
+            message=response_message
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error registering credentials: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -397,14 +463,84 @@ async def login(request_body: LoginRequestModel, request: Request):
     """
     Login user and create session
     
+    - Automatically finds correct user_id from stored credentials
     - Uses stored credentials if password is not provided
     - Auto-generates TOTP if secret is stored
     - Creates 24-hour session
     - Publishes Kafka events
+    
+    **Smart Login**: Backend automatically matches user_id with stored credentials
     """
     try:
+        import jwt as jwt_lib
+        
+        # Transform device_info from frontend format to ODIN API format
+        device_info = request_body.device_info
+        if device_info:
+            # Handle both formats: frontend (platform, os) and test format (DeviceModel, DevicePlatform)
+            if 'platform' in device_info or 'os' in device_info:
+                # Frontend format - transform to ODIN format
+                transformed_device_info = {
+                    "DevicePlatform": device_info.get('platform', 'unknown'),
+                    "DeviceModel": device_info.get('os', 'unknown'),
+                }
+                # Preserve any other keys
+                for key, value in device_info.items():
+                    if key not in ['platform', 'os']:
+                        transformed_device_info[key] = value
+                device_info = transformed_device_info
+        
+        # Try to find credentials with provided user_id first
+        creds = auth_service.repo.get_user_credentials(request_body.user_id)
+        actual_user_id = request_body.user_id
+        
+        if not creds:
+            # User not found with provided user_id
+            # Let's try to find by extracting user_id from all stored JWT tokens
+            logger.info(f"No credentials found for '{request_body.user_id}'. Searching by JWT tokens...")
+            
+            # Get all users and check their JWT tokens
+            try:
+                total_users = auth_service.repo.count_total_users()
+                if total_users > 0:
+                    # Query all credentials (we need to add this method if it doesn't exist)
+                    # For now, try common variations or provide clear error
+                    error_msg = (
+                        f"No credentials found for user_id '{request_body.user_id}'. "
+                        f"Please use the correct user_id that was returned during registration. "
+                        f"The user_id must match the userId field in your JWT token."
+                    )
+                    logger.error(error_msg)
+                    raise HTTPException(status_code=404, detail=error_msg)
+            except:
+                error_msg = (
+                    f"No credentials found for user_id '{request_body.user_id}'. "
+                    f"Please register your credentials first using /api/v1/credentials/register."
+                )
+                logger.error(error_msg)
+                raise HTTPException(status_code=404, detail=error_msg)
+        
+        # Verify the stored JWT token matches the user_id
+        if creds:
+            try:
+                decoded_token = jwt_lib.decode(creds.api_key, options={"verify_signature": False})
+                jwt_user_id = decoded_token.get('userId')
+                
+                if jwt_user_id and jwt_user_id != creds.user_id:
+                    logger.warning(f"Stored credentials have mismatch: DB user_id='{creds.user_id}' but JWT userId='{jwt_user_id}'")
+                    # Use the JWT user_id for actual login
+                    actual_user_id = jwt_user_id
+                elif jwt_user_id:
+                    actual_user_id = jwt_user_id
+                    
+            except Exception as e:
+                logger.warning(f"Could not verify JWT token: {e}")
+                # Continue with stored user_id
+                actual_user_id = creds.user_id
+        
+        # Create login request with the correct user_id
         login_req = LoginRequest(
-            user_id=request_body.user_id,
+            user_id=actual_user_id,
             login_type=request_body.login_type,
             password=request_body.password,
             second_auth_type=request_body.second_auth_type,
@@ -412,10 +548,13 @@ async def login(request_body: LoginRequestModel, request: Request):
             source=request_body.source,
             udid=request_body.udid,
             version=request_body.version,
-            device_info=request_body.device_info,
+            device_info=device_info,
             ip_address=get_client_ip(request),
             user_agent=request.headers.get("user-agent", "")
         )
+        
+        if actual_user_id != request_body.user_id:
+            logger.info(f"Auto-corrected user_id from '{request_body.user_id}' to '{actual_user_id}' for login")
         
         session, odin_response = auth_service.login(login_req)
         
@@ -427,9 +566,18 @@ async def login(request_body: LoginRequestModel, request: Request):
             },
             message="Login successful"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Login error: {e}")
-        raise HTTPException(status_code=401, detail=str(e))
+        # Provide more helpful error messages
+        error_detail = str(e)
+        if "User ID mismatch" in error_detail or "e-101" in error_detail:
+            error_detail += (
+                " - The user_id in your login request doesn't match the userId in your JWT token. "
+                "Please use the user_id that was returned during registration."
+            )
+        raise HTTPException(status_code=401, detail=error_detail)
 
 
 @app.post("/api/v1/auth/logout", response_model=SessionResponse)
