@@ -61,8 +61,7 @@ func NewRouter(
 
 	r := mux.NewRouter()
 
-	// CORS middleware
-	r.Use(mux.CORSMethodMiddleware(r))
+	// CORS middleware (single source)
 	r.Use(middleware.CORS(corsConfig))
 
 	// /api/v1 prefix
