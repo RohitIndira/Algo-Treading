@@ -31,9 +31,11 @@ type Config struct {
 	URL           string
 	QueueName     string
 	Exchange      string
+	ExchangeType  string
 	RoutingKey    string
 	PrefetchCount int
 	WorkerCount   int
+	Durable       bool
 }
 
 // NewRabbitMQConsumer creates a new RabbitMQ consumer
@@ -48,6 +50,66 @@ func NewRabbitMQConsumer(cfg Config, exec *executor.OrderExecutor, repo reposito
 		conn.Close()
 		return nil, fmt.Errorf("failed to open channel: %w", err)
 	}
+
+	// Set default values if not provided
+	exchangeType := cfg.ExchangeType
+	if exchangeType == "" {
+		exchangeType = "topic"
+	}
+	durable := cfg.Durable
+	if !durable {
+		durable = true
+	}
+
+	// Declare exchange (idempotent)
+	log.Printf("Declaring exchange: %s (type: %s, durable: %v)", cfg.Exchange, exchangeType, durable)
+	err = channel.ExchangeDeclare(
+		cfg.Exchange, // name
+		exchangeType, // type
+		durable,      // durable
+		false,        // auto-deleted
+		false,        // internal
+		false,        // no-wait
+		nil,          // arguments
+	)
+	if err != nil {
+		channel.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to declare exchange: %w", err)
+	}
+
+	// Declare queue (idempotent)
+	log.Printf("Declaring queue: %s (durable: %v)", cfg.QueueName, durable)
+	_, err = channel.QueueDeclare(
+		cfg.QueueName, // name
+		durable,       // durable
+		false,         // delete when unused
+		false,         // exclusive
+		false,         // no-wait
+		nil,           // arguments
+	)
+	if err != nil {
+		channel.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to declare queue: %w", err)
+	}
+
+	// Bind queue to exchange with routing key
+	log.Printf("Binding queue '%s' to exchange '%s' with routing key '%s'", cfg.QueueName, cfg.Exchange, cfg.RoutingKey)
+	err = channel.QueueBind(
+		cfg.QueueName,  // queue name
+		cfg.RoutingKey, // routing key
+		cfg.Exchange,   // exchange
+		false,          // no-wait
+		nil,            // arguments
+	)
+	if err != nil {
+		channel.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to bind queue to exchange: %w", err)
+	}
+
+	log.Println("✓ RabbitMQ exchange, queue, and binding configured successfully")
 
 	// Set QoS (prefetch count)
 	err = channel.Qos(cfg.PrefetchCount, 0, false)

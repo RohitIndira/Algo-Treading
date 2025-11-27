@@ -14,15 +14,17 @@ import (
 // OrderExecutor handles order execution logic
 type OrderExecutor struct {
 	repo       repository.OrderRepository
+	credsRepo  repository.CredentialsRepository
 	odinClient *odin.ExecutionClient
 	maxRetries int
 	retryDelay time.Duration
 }
 
 // NewOrderExecutor creates a new order executor
-func NewOrderExecutor(repo repository.OrderRepository, odinClient *odin.ExecutionClient, maxRetries int, retryDelay time.Duration) *OrderExecutor {
+func NewOrderExecutor(repo repository.OrderRepository, credsRepo repository.CredentialsRepository, odinClient *odin.ExecutionClient, maxRetries int, retryDelay time.Duration) *OrderExecutor {
 	return &OrderExecutor{
 		repo:       repo,
+		credsRepo:  credsRepo,
 		odinClient: odinClient,
 		maxRetries: maxRetries,
 		retryDelay: retryDelay,
@@ -45,6 +47,14 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 		return fmt.Errorf("failed to update order status to PENDING: %w", err)
 	}
 
+	// Fetch user credentials from database
+	creds, err := e.credsRepo.GetUserCredentials(ctx, order.UserID)
+	if err != nil {
+		return e.failOrder(ctx, order, fmt.Sprintf("Failed to fetch user credentials: %v", err))
+	}
+
+	log.Printf("Retrieved credentials for user %s (Odin ID: %s)", order.UserID, creds.APIKEY)
+
 	// Execute order with retries
 	var lastErr error
 	for attempt := 0; attempt <= e.maxRetries; attempt++ {
@@ -55,8 +65,8 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 			time.Sleep(delay)
 		}
 
-		// Place order via Odin
-		orderID, err := e.odinClient.PlaceOrder(ctx, order, order.UserID)
+		// Place order via Odin with user's credentials
+		orderID, err := e.odinClient.PlaceOrderWithCredentials(ctx, order, creds.APIKEY, creds.PasswordEncrypted, creds.TOTPSecret)
 		if err != nil {
 			lastErr = err
 			order.RetryCount++

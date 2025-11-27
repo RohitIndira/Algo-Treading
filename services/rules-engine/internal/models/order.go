@@ -14,6 +14,7 @@ type OrderRequest struct {
 	StrategyName string    `json:"strategy_name"`
 	EventID      string    `json:"event_id"`
 	StockCode    int64     `json:"stock_code"`
+	Token        int64     `json:"token"` // Trading token (same as stock_code for compatibility)
 	Symbol       string    `json:"symbol"`
 	Exchange     string    `json:"exchange"`
 	OrderType    string    `json:"order_type"` // MARKET, LIMIT
@@ -63,6 +64,7 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		StrategyName: strategy.StrategyName,
 		EventID:      event.EventID,
 		StockCode:    event.StockData.StockCode,
+		Token:        event.StockData.StockCode, // Token is same as stock_code
 		Symbol:       event.StockData.Symbol,
 		Exchange:     event.StockData.Exchange,
 		OrderType:    strategy.TradeConfig.OrderType,
