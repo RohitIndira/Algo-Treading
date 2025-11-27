@@ -3,6 +3,8 @@ package watcher
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/pkg/database/mongodb"
@@ -137,15 +139,14 @@ func (w *MongoWatcher) validateNewsDocument(ctx context.Context, doc bson.M) (bo
 		return false, fmt.Sprintf("mcap %.2f <= 250", mcapValue)
 	}
 
-	// 4. Check co_code field exists (stock code validation)
-	coCode, hasCoCode := companyDetails["co_code"]
-	if !hasCoCode || coCode == nil {
-		return false, "company co_code is null or missing"
+	// 4. Check code field exists (stock code validation)
+	code, hasCode := companyDetails["code"]
+	if !hasCode || code == nil {
+		return false, "company code is null or missing"
 	}
 
-	// Enrich document with company details (co_code, symbol, mcap, etc.)
-	doc["co_code"] = coCode
-	doc["code"] = coCode // Also set as 'code' for compatibility
+	// Enrich document with company details (code, symbol, mcap, etc.)
+	doc["code"] = code
 
 	// Set symbol based on listing status
 	if nseSym, ok := companyDetails["nsesymbol"]; ok && nseSym != nil {
@@ -166,6 +167,80 @@ func (w *MongoWatcher) validateNewsDocument(ctx context.Context, doc bson.M) (bo
 		doc["companyname"] = companyName
 	}
 	doc["mcap"] = mcapValue
+
+	// Determine exchange based on listing status. Rules:
+	// - If both NSE and BSE are Active -> prefer NSE with code field as token
+	// - If only NSE is Active -> NSE with code field as token
+	// - If only BSE is Active -> BSE with bsecode field as token
+	// - If both Delisted -> DELISTED
+	// - Otherwise -> UNLISTED
+	var bseStatusStr, nseStatusStr string
+	if v, ok := companyDetails["BSEStatus"].(string); ok {
+		bseStatusStr = v
+	}
+	if v, ok := companyDetails["NSEStatus"].(string); ok {
+		nseStatusStr = v
+	}
+
+	nseActive := strings.EqualFold(strings.TrimSpace(nseStatusStr), "Active")
+	bseActive := strings.EqualFold(strings.TrimSpace(bseStatusStr), "Active")
+
+	// Provide both a short exchange value (NSE/BSE) and broker format used by other services (NSE_EQ/BSE_EQ)
+	exchangeShort := "UNLISTED"
+	exchangeBroker := "UNLISTED"
+	var rawToken interface{}
+
+	if nseActive {
+		// NSE is active (with or without BSE) - use NSE and code field as token
+		exchangeShort = "NSE"
+		exchangeBroker = "NSE_EQ"
+		// Token should be the code field for NSE
+		if tok, ok := companyDetails["code"]; ok && tok != nil {
+			rawToken = tok
+		}
+	} else if bseActive {
+		// Only BSE is active - use BSE and bsecode field as token
+		exchangeShort = "BSE"
+		exchangeBroker = "BSE_EQ"
+		// Token should be the bsecode field for BSE
+		if bseCode, ok := companyDetails["bsecode"]; ok && bseCode != nil {
+			rawToken = bseCode
+			doc["bsecode"] = bseCode
+		}
+	} else if strings.EqualFold(strings.TrimSpace(nseStatusStr), "Delisted") && strings.EqualFold(strings.TrimSpace(bseStatusStr), "Delisted") {
+		exchangeShort = "DELISTED"
+		exchangeBroker = "DELISTED"
+	}
+
+	// Set both fields so downstream consumers can use whichever format they expect
+	doc["exchange"] = exchangeShort
+	doc["exchange_broker"] = exchangeBroker
+
+	// Normalize token to an integer (int64) if possible so consumers expecting numeric tokens will find it
+	if rawToken != nil {
+		switch v := rawToken.(type) {
+		case int64:
+			doc["token"] = v
+		case int32:
+			doc["token"] = int64(v)
+		case int:
+			doc["token"] = int64(v)
+		case float64:
+			doc["token"] = int64(v)
+		case float32:
+			doc["token"] = int64(v)
+		case string:
+			if iv, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+				doc["token"] = iv
+			} else {
+				// fallback to raw string if it can't be parsed
+				doc["token"] = v
+			}
+		default:
+			// keep raw value as last resort
+			doc["token"] = v
+		}
+	}
 
 	return true, ""
 }

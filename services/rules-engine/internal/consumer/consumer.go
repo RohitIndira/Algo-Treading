@@ -27,6 +27,13 @@ type EventHandler interface {
 
 // NewConsumer creates a new Kafka consumer
 func NewConsumer(cfg *config.KafkaConfig, handler EventHandler, stats *models.MatchingStats, logger *zap.Logger) (*Consumer, error) {
+	// Convert config StartOffset string to kafka offset constant
+	// cfg.StartOffset comes from KAFKA_START_OFFSET env variable
+	startOffset := kafka.LastOffset // default
+	if cfg.StartOffset == "earliest" {
+		startOffset = kafka.FirstOffset
+	}
+
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        cfg.Brokers,
 		Topic:          cfg.Topic,
@@ -34,14 +41,15 @@ func NewConsumer(cfg *config.KafkaConfig, handler EventHandler, stats *models.Ma
 		MinBytes:       1,
 		MaxBytes:       cfg.MaxBytes,
 		CommitInterval: cfg.CommitInterval,
-		StartOffset:    kafka.LastOffset,
+		StartOffset:    startOffset, // Now uses env variable value
 		MaxWait:        1 * time.Second,
 	})
 
 	logger.Info("Kafka consumer created",
 		zap.Strings("brokers", cfg.Brokers),
 		zap.String("topic", cfg.Topic),
-		zap.String("group", cfg.ConsumerGroup))
+		zap.String("group", cfg.ConsumerGroup),
+		zap.String("start_offset", cfg.StartOffset))
 
 	return &Consumer{
 		reader:  reader,

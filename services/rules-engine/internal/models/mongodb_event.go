@@ -9,7 +9,12 @@ import (
 // MongoDBEvent represents the actual MongoDB document structure
 type MongoDBEvent struct {
 	ID            interface{}            `json:"_id"`
-	Stock         interface{}            `json:"stock"` // Can be string or number
+	Stock         interface{}            `json:"stock"`    // Can be string or number
+	Code          interface{}            `json:"code"`     // NSE stock code (when NSE is active)
+	BSECode       interface{}            `json:"bsecode"`  // BSE stock code (when only BSE is active)
+	Token         interface{}            `json:"token"`    // Token field set by data-ingestion (code for NSE, bsecode for BSE)
+	Symbol        string                 `json:"symbol"`   // Stock symbol
+	Exchange      string                 `json:"exchange"` // Exchange (NSE/BSE)
 	NewsID        string                 `json:"news_id"`
 	NewsLink      string                 `json:"news link"` // Note: space in field name
 	Impact        string                 `json:"impact"`
@@ -18,7 +23,8 @@ type MongoDBEvent struct {
 	Category      string                 `json:"category"`
 	ShortSummary  string                 `json:"short summary"` // Note: space in field name
 	DtTm          interface{}            `json:"dt_tm"`
-	Company       string                 `json:"company"` // ISIN
+	Company       string                 `json:"company"`     // ISIN
+	CompanyName   string                 `json:"companyname"` // Company name
 	SymbolMap     map[string]interface{} `json:"symbolmap"`
 	LastTraded    interface{}            `json:"LastTradedPrice"`
 	PctChange     interface{}            `json:"pct_change"`
@@ -98,36 +104,65 @@ func (m *MongoDBEvent) extractTimestamp() time.Time {
 
 func (m *MongoDBEvent) mapStockData() StockData {
 	sd := StockData{
-		Symbol:      m.extractStockSymbol(),
 		ISIN:        m.Company,
-		CompanyName: m.extractCompanyName(),
+		CompanyName: m.CompanyName,
 	}
 
-	// Extract stock code from symbolmap.BSE or stock field
-	if m.SymbolMap != nil {
-		if bse, ok := m.SymbolMap["BSE"]; ok {
-			sd.StockCode = m.toInt64(bse)
-		}
-
-		// Determine exchange (prefer NSE if available)
-		if nse, ok := m.SymbolMap["NSE"]; ok && nse != nil && nse != "" {
-			sd.Exchange = "NSE"
-			if nseStr, ok := nse.(string); ok && nseStr != "" {
-				sd.Symbol = nseStr
+	// Use the exchange field directly from the event (set by data-ingestion service)
+	if m.Exchange != "" {
+		sd.Exchange = m.Exchange
+	} else {
+		// Fallback: determine exchange from symbolmap (backward compatibility)
+		if m.SymbolMap != nil {
+			if nse, ok := m.SymbolMap["NSE"]; ok && nse != nil && nse != "" {
+				sd.Exchange = "NSE"
+			} else {
+				sd.Exchange = "BSE"
 			}
 		} else {
-			sd.Exchange = "BSE"
+			sd.Exchange = "NSE" // Default
 		}
 	}
 
-	// If no stock code yet, try stock field directly
-	if sd.StockCode == 0 {
-		sd.StockCode = m.toInt64(m.Stock)
+	// Use the symbol field directly from the event
+	if m.Symbol != "" {
+		sd.Symbol = m.Symbol
+	} else {
+		// Fallback: extract symbol from symbolmap or stock field
+		sd.Symbol = m.extractStockSymbol()
 	}
 
-	// Fallback: use stock field value as exchange if no symbolmap
-	if sd.Exchange == "" {
-		sd.Exchange = "NSE" // Default
+	// Priority 1: Use the token field directly (set by data-ingestion service)
+	// This field contains the correct code for NSE or bsecode for BSE
+	if m.Token != nil {
+		sd.StockCode = m.toInt64(m.Token)
+	}
+
+	// Fallback: Priority-based stock code extraction for backward compatibility
+	if sd.StockCode == 0 {
+		if sd.Exchange == "NSE" || sd.Exchange == "NSE_EQ" {
+			// For NSE, use 'code' field
+			if m.Code != nil {
+				sd.StockCode = m.toInt64(m.Code)
+			}
+		} else if sd.Exchange == "BSE" || sd.Exchange == "BSE_EQ" {
+			// For BSE-only, use 'bsecode' field
+			if m.BSECode != nil {
+				sd.StockCode = m.toInt64(m.BSECode)
+			}
+		}
+
+		// Last resort fallback: try symbolmap or stock field
+		if sd.StockCode == 0 {
+			if m.SymbolMap != nil {
+				if bse, ok := m.SymbolMap["BSE"]; ok {
+					sd.StockCode = m.toInt64(bse)
+				}
+			}
+			if sd.StockCode == 0 {
+				sd.StockCode = m.toInt64(m.Stock)
+			}
+		}
 	}
 
 	return sd

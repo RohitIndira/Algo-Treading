@@ -42,17 +42,19 @@ func main() {
 	defer db.Close()
 	log.Println("✓ Connected to PostgreSQL")
 
-	// Initialize repository
+	// Initialize repositories
 	orderRepo := repository.NewOrderRepository(db)
+	credsRepo := repository.NewCredentialsRepository(db)
 	log.Println("✓ Repository layer initialized")
 
 	// Initialize Odin client
 	odinClient := odin.NewExecutionClient(cfg.OdinBaseURL)
 	log.Println("✓ Odin API client initialized")
 
-	// Initialize executor
+	// Initialize executor with credentials repository
 	orderExecutor := executor.NewOrderExecutor(
 		orderRepo,
+		credsRepo,
 		odinClient,
 		cfg.MaxRetries,
 		cfg.RetryDelay,
@@ -65,9 +67,11 @@ func main() {
 		URL:           cfg.RabbitMQURL,
 		QueueName:     cfg.QueueName,
 		Exchange:      cfg.Exchange,
+		ExchangeType:  "topic",
 		RoutingKey:    cfg.RoutingKey,
 		PrefetchCount: cfg.PrefetchCount,
 		WorkerCount:   cfg.WorkerCount,
+		Durable:       true,
 	}
 
 	rabbitConsumer, err := consumer.NewRabbitMQConsumer(consumerCfg, orderExecutor, orderRepo)
@@ -147,10 +151,10 @@ type Config struct {
 func loadConfig() Config {
 	return Config{
 		GRPCPort:      getEnvInt("SERVICE_PORT", 9004),
-		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://guest:guest123@localhost:5672/"),
-		QueueName:     getEnv("RABBITMQ_QUEUE", "order.execution.queue"),
-		Exchange:      getEnv("RABBITMQ_EXCHANGE", "order.execution.exchange"),
-		RoutingKey:    getEnv("RABBITMQ_ROUTING_KEY", "order.execution"),
+		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+		QueueName:     getEnv("RABBITMQ_QUEUE", "trade.executions"),
+		Exchange:      getEnv("RABBITMQ_EXCHANGE", "trade.execution"),
+		RoutingKey:    getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
 		PrefetchCount: getEnvInt("RABBITMQ_PREFETCH", 10),
 		WorkerCount:   getEnvInt("WORKER_COUNT", 10),
 		OdinBaseURL:   getEnv("ODIN_BASE_URL", ""),

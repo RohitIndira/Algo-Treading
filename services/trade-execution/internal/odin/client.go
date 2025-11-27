@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"sync"
 
 	"github.com/RohitIndira/Algo-Treading/pkg/odin"
@@ -25,30 +24,26 @@ func NewExecutionClient(baseURL string) *ExecutionClient {
 	}
 }
 
-// ensureLogin ensures user is logged in before placing orders
-func (c *ExecutionClient) ensureLogin(ctx context.Context, userID string) error {
+// ensureLoginWithCredentials ensures user is logged in with provided credentials
+func (c *ExecutionClient) ensureLoginWithCredentials(ctx context.Context, odinUserID, password, totpSecret string) error {
 	c.loginMutex.Lock()
 	defer c.loginMutex.Unlock()
 
 	// If already logged in for this user, skip
-	if c.loggedInUser == userID {
+	if c.loggedInUser == odinUserID {
 		return nil
 	}
 
-	// Get credentials from environment
-	odinUserID := os.Getenv("ODIN_USER_ID")
-	odinPassword := os.Getenv("ODIN_PASSWORD")
-	odinTOTPSecret := os.Getenv("ODIN_TOTP_SECRET")
-
-	if odinUserID == "" || odinPassword == "" || odinTOTPSecret == "" {
-		return fmt.Errorf("missing Odin credentials in environment")
+	// Validate credentials
+	if odinUserID == "" || password == "" || totpSecret == "" {
+		return fmt.Errorf("missing Odin credentials for user")
 	}
 
 	// Login
 	loginReq := &odin.LoginRequest{
 		UserID:     odinUserID,
-		Password:   odinPassword,
-		TOTPSecret: odinTOTPSecret,
+		Password:   password,
+		TOTPSecret: totpSecret,
 	}
 
 	log.Printf("Logging in user %s to Odin API...", odinUserID)
@@ -62,21 +57,18 @@ func (c *ExecutionClient) ensureLogin(ctx context.Context, userID string) error 
 	return nil
 }
 
-// PlaceOrder places order via Odin API
-func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, userID string) (string, error) {
-	// Ensure user is logged in first
-	if err := c.ensureLogin(ctx, userID); err != nil {
+// PlaceOrderWithCredentials places order via Odin API using provided credentials
+func (c *ExecutionClient) PlaceOrderWithCredentials(ctx context.Context, order *models.Order, odinUserID, password, totpSecret string) (string, error) {
+	// Ensure user is logged in first with their credentials
+	if err := c.ensureLoginWithCredentials(ctx, odinUserID, password, totpSecret); err != nil {
 		return "", fmt.Errorf("login failed: %w", err)
 	}
 
 	// Convert internal order model to Odin API request
 	orderReq := c.convertToOdinRequest(order)
-	fmt.Printf("----------- %v\n", orderReq)
+	log.Printf("Placing order for user %s: %+v", odinUserID, orderReq)
 
-	// Use the logged-in user ID (from env) instead of the order's user ID
-	odinUserID := os.Getenv("ODIN_USER_ID")
-
-	// Call Odin API
+	// Call Odin API with the logged-in user's ID
 	orderID, err := c.client.PlaceOrder(ctx, odinUserID, &orderReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to place order: %w", err)

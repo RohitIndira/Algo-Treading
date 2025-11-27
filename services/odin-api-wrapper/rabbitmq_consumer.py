@@ -42,7 +42,7 @@ class DatabaseHelper:
         self.db_port = os.getenv("DB_PORT", "5432")
         self.db_name = os.getenv("DB_NAME", "trading_system")
         self.db_user = os.getenv("DB_USER", "trading_user")
-        self.db_password = os.getenv("DB_PASSWORD", "")
+        self.db_password = os.getenv("DB_PASSWORD", "postgres")
         
     def get_user_credentials(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Fetch user credentials from PostgreSQL"""
@@ -195,24 +195,39 @@ class OdinOrderExecutor:
         """
         
         # Map order type
-        odin_order_type = "MKT" if order_req.get("order_type") == "MARKET" else "RL"
+        odin_order_type = "RL-MKT" if order_req.get("order_type") == "MARKET" else "RL-MKT"
         
-        # Map exchange (normalize to uppercase)
-        exchange = order_req.get("exchange", "NSE").upper()
+        # Map exchange - ensure proper format (e.g., NSE -> NSE_EQ)
+        exchange = order_req.get("exchange", "NSE_EQ").upper()
+        
+        # Exchange mapping: if just "NSE" or "BSE", append "_EQ" for equity
+        exchange_mapping = {
+            "NSE": "NSE_EQ",
+            "BSE": "BSE_EQ",
+            "MCX": "MCX_FO",
+            "NCDEX": "NCDEX_FO",
+        }
+        
+        # Apply mapping if exchange is in our map, otherwise use as-is
+        exchange = exchange_mapping.get(exchange, exchange)
         
         # Build scrip_info
+        # Note: Odin API expects 'scrip_token' not 'token'
         scrip_info = {
             "exchange": exchange,
-            "token": str(order_req.get("stock_code")),  # Token is the stock_code
+            "scrip_token": int(order_req.get("token")),  # Must be integer, not string
             "symbol": order_req.get("symbol"),
             "series": "EQ",  # Equity series
             "expiry_date": "",
-            "strike_price": "0",
-            "option_type": "",
-            "lot_size": 1
+            "strike_price": "",
+            "option_type": ""
         }
-        
+        print("scrip_info:", scrip_info)
         # Build order request
+        # Note: order_identifier must be 8 characters or less per Odin API requirements
+        order_id = order_req.get("order_id", "")
+        order_identifier = order_id[-8:] if len(order_id) > 8 else order_id
+        
         odin_order = {
             "scrip_info": scrip_info,
             "transaction_type": order_req.get("order_side", "BUY"),  # BUY or SELL
@@ -224,8 +239,8 @@ class OdinOrderExecutor:
             "disclosed_quantity": 0,
             "validity": order_req.get("validity", "DAY"),
             "validity_days": 0,
-            "is_amo": False,
-            "order_identifier": order_req.get("order_id", ""),  # Track our order ID
+            "is_amo": True,  # Set to True to allow orders outside market hours
+            "order_identifier": order_identifier,  # Truncated to max 8 chars
             "strategy_id": order_req.get("strategy_id", ""),
         }
         
