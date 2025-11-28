@@ -19,6 +19,8 @@ require (
 )
 
 require (
+	github.com/RohitIndira/Algo-Treading/api/proto/common v0.0.0
+	github.com/RohitIndira/Algo-Treading/api/proto/trade_execution v0.0.0
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/pierrec/lz4/v4 v4.1.19 // indirect
