@@ -52,8 +52,7 @@ func main() {
 		lgr.Fatal("failed to create kafka producer", zap.Error(err))
 	}
 	defer producer.Close()
-	// ✅ Ensure Kafka topic exists (auto-create if missing)
-	// ✅ Ensure Kafka topic exists (auto-create if missing)
+	// Ensure Kafka topic exists (auto-create if missing)
 	if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopic, 1, 1); err != nil {
 		lgr.Fatal("failed to ensure topic exists", zap.Error(err))
 	}

@@ -40,7 +40,7 @@ func Load() (*Config, error) {
 	// Load .env file if it exists
 	_ = godotenv.Load()
 
-	httpPort, _ := strconv.Atoi(getEnv("HTTP_PORT", "8080"))
+	httpPort, _ := strconv.Atoi(getEnv("HTTP_PORT", "8081"))
 	grpcTimeout, _ := time.ParseDuration(getEnv("GRPC_TIMEOUT", "30s"))
 
 	return &Config{

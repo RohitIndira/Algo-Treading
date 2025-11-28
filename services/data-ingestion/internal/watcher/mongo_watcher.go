@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/pkg/database/mongodb"
@@ -14,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.uber.org/zap"
 )
 
@@ -25,6 +27,9 @@ type MongoWatcher struct {
 	companiesCollection string
 	pub                 publisher.Publisher
 	lgr                 *logger.Logger
+	resumeToken         bson.Raw
+	mu                  sync.RWMutex
+	processedIDs        map[string]time.Time // Track processed document IDs to prevent duplicates
 }
 
 // NewMongoWatcher creates a new watcher
@@ -39,6 +44,7 @@ func NewMongoWatcher(client *mongodb.Client, collection string, pub publisher.Pu
 		companiesCollection: "CompanyMaster",
 		pub:                 pub,
 		lgr:                 lgr,
+		processedIDs:        make(map[string]time.Time),
 	}, nil
 }
 
@@ -248,16 +254,42 @@ func (w *MongoWatcher) validateNewsDocument(ctx context.Context, doc bson.M) (bo
 // Run starts the change stream and blocks until context is done
 func (w *MongoWatcher) Run(ctx context.Context) error {
 	pipeline := mongo.Pipeline{
-		{{"$match", bson.D{{"operationType", "insert"}}}},
+		bson.D{{Key: "$match", Value: bson.D{{Key: "operationType", Value: "insert"}}}},
 	}
 
-	cs, err := w.client.WatchCollection(ctx, w.collection, pipeline)
+	// Configure change stream options
+	opts := options.ChangeStream().
+		SetFullDocument(options.UpdateLookup) // Ensure we get full document for inserts
+
+	// If we have a resume token, use it to prevent reprocessing
+	w.mu.RLock()
+	if w.resumeToken != nil {
+		opts.SetResumeAfter(w.resumeToken)
+		w.lgr.Info("resuming change stream from saved token")
+	}
+	w.mu.RUnlock()
+
+	cs, err := w.client.WatchCollection(ctx, w.collection, pipeline, opts)
 	if err != nil {
 		return fmt.Errorf("failed to watch collection: %w", err)
 	}
 	defer cs.Close(ctx)
 
 	w.lgr.Info("started mongo watcher with filters", zap.String("collection", w.collection))
+
+	// Start a goroutine to periodically clean old processed IDs (older than 1 hour)
+	cleanupTicker := time.NewTicker(10 * time.Minute)
+	defer cleanupTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-cleanupTicker.C:
+				w.cleanupOldProcessedIDs()
+			}
+		}
+	}()
 
 	for cs.Next(ctx) {
 		var event bson.M
@@ -277,6 +309,18 @@ func (w *MongoWatcher) Run(ctx context.Context) error {
 		doc, ok := full.(bson.M)
 		if !ok {
 			w.lgr.Error("fullDocument is not bson.M")
+			continue
+		}
+
+		// Get document ID for deduplication
+		docID := ""
+		if id, exists := doc["_id"]; exists {
+			docID = fmt.Sprintf("%v", id)
+		}
+
+		// Check if we've already processed this document
+		if docID != "" && w.isDuplicate(docID) {
+			w.lgr.Debug("skipping duplicate document", zap.String("docID", docID))
 			continue
 		}
 
@@ -311,12 +355,24 @@ func (w *MongoWatcher) Run(ctx context.Context) error {
 		if err := w.pub.Publish(pctx, key, payload); err != nil {
 			w.lgr.Error("failed to publish message", zap.Error(err))
 		} else {
+			// Mark as processed after successful publish
+			if docID != "" {
+				w.markAsProcessed(docID)
+			}
+
 			w.lgr.Info("published news to kafka",
 				zap.String("company", doc["company"].(string)),
 				zap.Float64("mcap", doc["mcap"].(float64)),
 			)
 		}
 		cancel()
+
+		// Save resume token after successful processing
+		if resumeToken := cs.ResumeToken(); resumeToken != nil {
+			w.mu.Lock()
+			w.resumeToken = resumeToken
+			w.mu.Unlock()
+		}
 	}
 
 	if err := cs.Err(); err != nil {
@@ -325,4 +381,34 @@ func (w *MongoWatcher) Run(ctx context.Context) error {
 
 	w.lgr.Info("mongo watcher stopped")
 	return nil
+}
+
+// isDuplicate checks if a document ID has been processed recently
+func (w *MongoWatcher) isDuplicate(docID string) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	_, exists := w.processedIDs[docID]
+	return exists
+}
+
+// markAsProcessed marks a document ID as processed
+func (w *MongoWatcher) markAsProcessed(docID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.processedIDs[docID] = time.Now()
+}
+
+// cleanupOldProcessedIDs removes processed IDs older than 1 hour to prevent memory growth
+func (w *MongoWatcher) cleanupOldProcessedIDs() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	cutoff := time.Now().Add(-1 * time.Hour)
+	for id, timestamp := range w.processedIDs {
+		if timestamp.Before(cutoff) {
+			delete(w.processedIDs, id)
+		}
+	}
+
+	w.lgr.Debug("cleaned up old processed IDs", zap.Int("remaining", len(w.processedIDs)))
 }

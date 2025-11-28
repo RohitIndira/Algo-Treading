@@ -94,9 +94,9 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 }
 
 // WatchCollection creates a change stream for a collection
-func (c *Client) WatchCollection(ctx context.Context, collectionName string, pipeline interface{}) (*mongo.ChangeStream, error) {
+func (c *Client) WatchCollection(ctx context.Context, collectionName string, pipeline interface{}, opts ...*options.ChangeStreamOptions) (*mongo.ChangeStream, error) {
 	collection := c.Collection(collectionName)
-	return collection.Watch(ctx, pipeline)
+	return collection.Watch(ctx, pipeline, opts...)
 }
 
 // GetDatabaseName returns the configured database name
