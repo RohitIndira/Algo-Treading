@@ -4,6 +4,10 @@ use (
 	.
 	./api/gateway
 	./api/proto/common
+	./api/proto/risk_management
+	./api/proto/rules_engine
+	./api/proto/trade_execution
+	./api/proto/user_config
 	./pkg/logger
 	./services/data-ingestion
 	./services/risk-management

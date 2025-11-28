@@ -151,7 +151,7 @@ type Config struct {
 func loadConfig() Config {
 	return Config{
 		GRPCPort:      getEnvInt("SERVICE_PORT", 9004),
-		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
 		QueueName:     getEnv("RABBITMQ_QUEUE", "trade.executions"),
 		Exchange:      getEnv("RABBITMQ_EXCHANGE", "trade.execution"),
 		RoutingKey:    getEnv("RABBITMQ_ROUTING_KEY", "order.new"),

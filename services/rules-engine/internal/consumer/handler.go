@@ -101,9 +101,9 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 // getLTPFromRedis retrieves Last Traded Price from Redis
 // Redis key pattern: market:{exchange}:{token}
 // Example: market:nse:10227 or market:bse:532259
-func (h *Handler) getLTPFromRedis(ctx context.Context, token int64, exchange string) (float64, error) {
+func (h *Handler) getLTPFromRedis(ctx context.Context, stockData models.StockData) (float64, error) {
 	// Normalize exchange to lowercase for Redis key
-	exchangeLower := strings.ToLower(exchange)
+	exchangeLower := strings.ToLower(stockData.Exchange)
 
 	// Remove _EQ suffix if present (NSE_EQ -> nse, BSE_EQ -> bse)
 	exchangeLower = strings.TrimSuffix(exchangeLower, "_eq")
@@ -117,6 +117,22 @@ func (h *Handler) getLTPFromRedis(ctx context.Context, token int64, exchange str
 
 	var lastErr error
 	for _, exch := range exchanges {
+		// Use the correct exchange-specific code
+		var token int64
+		if exch == "nse" {
+			token = stockData.NSECode
+		} else {
+			token = stockData.BSECode
+		}
+
+		// Skip if this exchange doesn't have a valid code
+		if token <= 0 {
+			h.logger.Debug("No valid code for exchange, skipping",
+				zap.String("exchange", exch),
+				zap.Int64("stock_code", stockData.StockCode))
+			continue
+		}
+
 		// Construct Redis key: market:{exchange}:{token}
 		key := fmt.Sprintf("market:%s:%d", exch, token)
 
@@ -154,6 +170,8 @@ func (h *Handler) getLTPFromRedis(ctx context.Context, token int64, exchange str
 			zap.String("key", key),
 			zap.Int64("token", token),
 			zap.String("exchange", exch),
+			zap.Int64("nse_code", stockData.NSECode),
+			zap.Int64("bse_code", stockData.BSECode),
 			zap.Float64("ltp", marketData.LTP))
 
 		return marketData.LTP, nil
@@ -161,13 +179,16 @@ func (h *Handler) getLTPFromRedis(ctx context.Context, token int64, exchange str
 
 	// If we get here, stock not found on either exchange
 	h.logger.Warn("Stock not found in Redis on any exchange",
-		zap.Int64("token", token),
+		zap.Int64("stock_code", stockData.StockCode),
+		zap.Int64("nse_code", stockData.NSECode),
+		zap.Int64("bse_code", stockData.BSECode),
+		zap.String("symbol", stockData.Symbol),
 		zap.Strings("tried_exchanges", exchanges))
 
 	if lastErr != nil {
-		return 0, fmt.Errorf("LTP not found in Redis for token %d (tried exchanges: %v): %w", token, exchanges, lastErr)
+		return 0, fmt.Errorf("LTP not found in Redis for stock %s (NSE:%d, BSE:%d) (tried exchanges: %v): %w", stockData.Symbol, stockData.NSECode, stockData.BSECode, exchanges, lastErr)
 	}
-	return 0, fmt.Errorf("LTP not found in Redis for token %d (tried exchanges: %v)", token, exchanges)
+	return 0, fmt.Errorf("LTP not found in Redis for stock %s (NSE:%d, BSE:%d) (tried exchanges: %v)", stockData.Symbol, stockData.NSECode, stockData.BSECode, exchanges)
 }
 
 // processMatch processes a single match
@@ -200,22 +221,26 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 				zap.String("exchange", event.StockData.Exchange),
 				zap.Float64("price", orderReq.Price))
 		} else {
-			// Priority 2: Query Redis for LTP using token from MongoDB event
+			// Priority 2: Query Redis for LTP using exchange-specific codes
 			// Redis key format: market:{exchange}:{token}
-			price, err := h.getLTPFromRedis(ctx, orderReq.Token, event.StockData.Exchange)
+			price, err := h.getLTPFromRedis(ctx, event.StockData)
 			if err != nil {
 				h.logger.Error("Failed to get LTP from Redis, skipping order",
 					zap.String("event_id", event.EventID),
-					zap.Int64("token", orderReq.Token),
 					zap.Int64("stock_code", event.StockData.StockCode),
+					zap.Int64("nse_code", event.StockData.NSECode),
+					zap.Int64("bse_code", event.StockData.BSECode),
+					zap.String("symbol", event.StockData.Symbol),
 					zap.String("exchange", event.StockData.Exchange),
 					zap.Error(err))
-				return fmt.Errorf("no price available for token %d", orderReq.Token)
+				return fmt.Errorf("no price available for stock %s", event.StockData.Symbol)
 			}
 			orderReq.Price = price
 			h.logger.Info("Using LTP from Redis",
-				zap.Int64("token", orderReq.Token),
 				zap.Int64("stock_code", event.StockData.StockCode),
+				zap.Int64("nse_code", event.StockData.NSECode),
+				zap.Int64("bse_code", event.StockData.BSECode),
+				zap.String("symbol", event.StockData.Symbol),
 				zap.String("exchange", event.StockData.Exchange),
 				zap.Float64("price", price))
 		}

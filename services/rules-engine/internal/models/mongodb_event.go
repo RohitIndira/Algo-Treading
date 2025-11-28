@@ -132,6 +132,17 @@ func (m *MongoDBEvent) mapStockData() StockData {
 		sd.Symbol = m.extractStockSymbol()
 	}
 
+	// Extract BOTH NSE code and BSE code for Redis lookup
+	// NSE code from 'code' field
+	if m.Code != nil {
+		sd.NSECode = m.toInt64(m.Code)
+	}
+
+	// BSE code from 'bsecode' field
+	if m.BSECode != nil {
+		sd.BSECode = m.toInt64(m.BSECode)
+	}
+
 	// Priority 1: Use the token field directly (set by data-ingestion service)
 	// This field contains the correct code for NSE or bsecode for BSE
 	if m.Token != nil {
@@ -142,14 +153,10 @@ func (m *MongoDBEvent) mapStockData() StockData {
 	if sd.StockCode == 0 {
 		if sd.Exchange == "NSE" || sd.Exchange == "NSE_EQ" {
 			// For NSE, use 'code' field
-			if m.Code != nil {
-				sd.StockCode = m.toInt64(m.Code)
-			}
+			sd.StockCode = sd.NSECode
 		} else if sd.Exchange == "BSE" || sd.Exchange == "BSE_EQ" {
 			// For BSE-only, use 'bsecode' field
-			if m.BSECode != nil {
-				sd.StockCode = m.toInt64(m.BSECode)
-			}
+			sd.StockCode = sd.BSECode
 		}
 
 		// Last resort fallback: try symbolmap or stock field

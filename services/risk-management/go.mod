@@ -5,10 +5,10 @@ go 1.23.0
 toolchain go1.24.6
 
 require (
-	github.com/RohitIndira/Algo-Treading v0.0.0
+	github.com/RohitIndira/Algo-Treading/api/proto/common v0.0.0
+	github.com/RohitIndira/Algo-Treading/api/proto/risk_management v0.0.0-00010101000000-000000000000
 	github.com/go-redis/redis/v8 v8.11.5
 	google.golang.org/grpc v1.68.1
-	google.golang.org/protobuf v1.34.2
 )
 
 require (
@@ -18,6 +18,11 @@ require (
 	golang.org/x/sys v0.31.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240903143218-8af14fe29dc1 // indirect
+	google.golang.org/protobuf v1.34.2 // indirect
 )
 
 replace github.com/RohitIndira/Algo-Treading => ../..
+
+replace github.com/RohitIndira/Algo-Treading/api/proto/common => ../../api/proto/common
+
+replace github.com/RohitIndira/Algo-Treading/api/proto/risk_management => ../../api/proto/risk_management
