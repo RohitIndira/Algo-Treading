@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/index"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/segmentio/kafka-go"
@@ -32,12 +33,13 @@ type StrategyPayload struct {
 	UpdatedAt    time.Time       `json:"updated_at"`
 }
 
-// StrategySync syncs strategies from Kafka to Elasticsearch
+// StrategySync syncs strategies from Kafka to Elasticsearch and Redis cache
 type StrategySyncer struct {
-	reader  *kafka.Reader
-	indexer *index.Indexer
-	logger  *zap.Logger
-	stats   *SyncStats
+	reader        *kafka.Reader
+	indexer       *index.Indexer
+	strategyCache *cache.StrategyCache
+	logger        *zap.Logger
+	stats         *SyncStats
 }
 
 // SyncStats tracks sync statistics
@@ -52,7 +54,7 @@ type SyncStats struct {
 }
 
 // NewStrategySyncer creates a new strategy syncer
-func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *index.Indexer, logger *zap.Logger) *StrategySyncer {
+func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *index.Indexer, strategyCache *cache.StrategyCache, logger *zap.Logger) *StrategySyncer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
 		Topic:          topic,
@@ -65,10 +67,11 @@ func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *
 	})
 
 	return &StrategySyncer{
-		reader:  reader,
-		indexer: indexer,
-		logger:  logger,
-		stats:   &SyncStats{},
+		reader:        reader,
+		indexer:       indexer,
+		strategyCache: strategyCache,
+		logger:        logger,
+		stats:         &SyncStats{},
 	}
 }
 
@@ -128,8 +131,22 @@ func (ss *StrategySyncer) processMessage(ctx context.Context, msg *kafka.Message
 			return fmt.Errorf("failed to convert strategy: %w", err)
 		}
 
+		// Index in Elasticsearch for matching
 		if err := ss.indexer.IndexStrategy(ctx, strategy); err != nil {
 			return fmt.Errorf("failed to index strategy: %w", err)
+		}
+
+		// Cache in Redis for full strategy retrieval with trade_config
+		if ss.strategyCache != nil {
+			if err := ss.strategyCache.SetStrategy(ctx, strategy); err != nil {
+				ss.logger.Warn("Failed to cache strategy in Redis",
+					zap.String("strategy_id", strategy.StrategyID),
+					zap.Error(err))
+			} else {
+				ss.logger.Debug("Strategy cached in Redis",
+					zap.String("strategy_id", strategy.StrategyID),
+					zap.Int32("quantity", strategy.TradeConfig.Quantity))
+			}
 		}
 
 		switch event.EventType {
@@ -143,7 +160,7 @@ func (ss *StrategySyncer) processMessage(ctx context.Context, msg *kafka.Message
 			ss.stats.Deactivated++
 		}
 
-		ss.logger.Info("Strategy indexed",
+		ss.logger.Info("Strategy indexed and cached",
 			zap.String("event_type", event.EventType),
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("user_id", strategy.UserID),
@@ -154,8 +171,17 @@ func (ss *StrategySyncer) processMessage(ctx context.Context, msg *kafka.Message
 			return fmt.Errorf("failed to delete strategy: %w", err)
 		}
 
+		// Delete from cache too
+		if ss.strategyCache != nil {
+			if err := ss.strategyCache.DeleteStrategy(ctx, event.Strategy.StrategyID); err != nil {
+				ss.logger.Warn("Failed to delete strategy from cache",
+					zap.String("strategy_id", event.Strategy.StrategyID),
+					zap.Error(err))
+			}
+		}
+
 		ss.stats.Deleted++
-		ss.logger.Info("Strategy deleted from index",
+		ss.logger.Info("Strategy deleted from index and cache",
 			zap.String("strategy_id", event.Strategy.StrategyID))
 
 	default:
@@ -182,6 +208,10 @@ func (ss *StrategySyncer) convertToStrategy(payload *StrategyPayload) (*models.S
 		return nil, fmt.Errorf("failed to unmarshal risk_limits: %w", err)
 	}
 
+	// Normalize Kafka field values to match internal format
+	tradeConfig.OrderType = normalizeOrderType(tradeConfig.OrderType)
+	tradeConfig.Exchange = normalizeExchange(tradeConfig.Exchange)
+
 	return &models.Strategy{
 		StrategyID:   payload.StrategyID,
 		UserID:       payload.UserID,
@@ -193,6 +223,32 @@ func (ss *StrategySyncer) convertToStrategy(payload *StrategyPayload) (*models.S
 		CreatedAt:    payload.CreatedAt,
 		UpdatedAt:    payload.UpdatedAt,
 	}, nil
+}
+
+// normalizeOrderType converts Kafka order type format to internal format
+// "ORDER_TYPE_MARKET" -> "MARKET", "ORDER_TYPE_LIMIT" -> "LIMIT"
+func normalizeOrderType(orderType string) string {
+	switch orderType {
+	case "ORDER_TYPE_MARKET":
+		return "MARKET"
+	case "ORDER_TYPE_LIMIT":
+		return "LIMIT"
+	default:
+		return orderType // Return as-is if already normalized
+	}
+}
+
+// normalizeExchange converts Kafka exchange format to internal format
+// "EXCHANGE_NSE" -> "NSE", "EXCHANGE_BSE" -> "BSE"
+func normalizeExchange(exchange string) string {
+	switch exchange {
+	case "EXCHANGE_NSE":
+		return "NSE"
+	case "EXCHANGE_BSE":
+		return "BSE"
+	default:
+		return exchange // Return as-is if already normalized
+	}
 }
 
 // GetStats returns sync statistics

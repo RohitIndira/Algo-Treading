@@ -1,0 +1,116 @@
+package executor
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/google/uuid"
+)
+
+// SignalProcessor processes trade signals from Kafka
+type SignalProcessor struct {
+	executor  *OrderExecutor
+	orderRepo repository.OrderRepository
+}
+
+// NewSignalProcessor creates a new trade signal processor
+func NewSignalProcessor(executor *OrderExecutor, orderRepo repository.OrderRepository) *SignalProcessor {
+	return &SignalProcessor{
+		executor:  executor,
+		orderRepo: orderRepo,
+	}
+}
+
+// ProcessTradeSignal processes a trade signal from Kafka
+func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models.TradeSignal) error {
+	log.Printf("Processing trade signal: OrderID=%s, UserID=%s, Symbol=%s, Price=%.2f",
+		signal.OrderID, signal.UserID, signal.Symbol, signal.Price)
+
+	// Convert TradeSignal to Order
+	order, err := p.convertSignalToOrder(signal)
+	if err != nil {
+		return fmt.Errorf("failed to convert signal to order: %w", err)
+	}
+
+	// Save order to database
+	if err := p.orderRepo.Create(ctx, order); err != nil {
+		return fmt.Errorf("failed to save order: %w", err)
+	}
+
+	log.Printf("Order %s saved to database with status %s", order.OrderID, order.Status)
+
+	// Execute the order
+	if err := p.executor.ExecuteOrder(ctx, order); err != nil {
+		log.Printf("Failed to execute order %s: %v", order.OrderID, err)
+		return fmt.Errorf("failed to execute order: %w", err)
+	}
+
+	log.Printf("✓ Successfully processed and executed trade signal: OrderID=%s, Symbol=%s",
+		signal.OrderID, signal.Symbol)
+	return nil
+}
+
+// convertSignalToOrder converts a TradeSignal from Kafka to an Order model
+func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*models.Order, error) {
+	// Parse UUIDs
+	orderID, err := uuid.Parse(signal.OrderID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid order_id: %w", err)
+	}
+
+	eventID := uuid.Nil
+	if signal.EventID != "" {
+		eventID, err = uuid.Parse(signal.EventID)
+		if err != nil {
+			log.Printf("Warning: invalid event_id %s, using nil UUID", signal.EventID)
+			eventID = uuid.Nil
+		}
+	}
+
+	now := time.Now()
+
+	// Determine order side based on sentiment or default to BUY
+	orderSide := models.OrderSideBuy
+	if signal.Sentiment == "BEARISH" || signal.Sentiment == "NEGATIVE" {
+		orderSide = models.OrderSideSell
+	}
+
+	// Convert float64 values to pointers
+	price := signal.Price
+	stopLoss := signal.StopLoss
+	takeProfit := signal.TakeProfit
+	riskScore := 0.0
+
+	// Create Order model
+	order := &models.Order{
+		OrderID:      orderID,
+		UserID:       signal.UserID,
+		StrategyID:   signal.StrategyID,
+		EventID:      eventID,
+		StockCode:    signal.StockCode,
+		Exchange:     models.Exchange(signal.Exchange),
+		Symbol:       signal.Symbol,
+		OrderType:    models.OrderType(signal.OrderType),
+		OrderSide:    orderSide,
+		Quantity:     signal.Quantity,
+		Price:        &price,
+		StopLoss:     &stopLoss,
+		TakeProfit:   &takeProfit,
+		Validity:     "DAY", // Default validity
+		Status:       models.StatusReceived,
+		RiskApproved: true, // Signals from rules-engine are already risk-approved
+		RiskScore:    &riskScore,
+		RetryCount:   0,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	log.Printf("Converted signal to order: ID=%s, Side=%s, Qty=%d, Price=%.2f",
+		order.OrderID, order.OrderSide, order.Quantity, order.Price)
+
+	return order, nil
+}

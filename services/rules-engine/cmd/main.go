@@ -114,6 +114,7 @@ func main() {
 		"user-configs", // Topic where user-config service publishes strategy events
 		"rules-engine-strategy-sync-group",
 		indexer,
+		strategyCache,
 		logger,
 	)
 	defer strategySyncer.Close()
@@ -177,7 +178,7 @@ func main() {
 	logger.Info("Kafka trade-signals publisher initialized successfully")
 
 	// Initialize event handler
-	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, redisCache, stats, logger)
+	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, redisCache, strategyCache, stats, logger)
 
 	// Initialize Kafka consumer
 	logger.Info("Initializing Kafka consumer...")

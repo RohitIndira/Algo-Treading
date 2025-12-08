@@ -39,6 +39,7 @@ type RuleMatch struct {
 	UserID            string    `json:"user_id"`
 	StrategyID        string    `json:"strategy_id"`
 	StrategyName      string    `json:"strategy_name"`
+	Strategy          *Strategy `json:"strategy"` // Full strategy including trade_config from Kafka
 	MatchScore        float64   `json:"match_score"`
 	MatchedConditions []string  `json:"matched_conditions"`
 	FailedConditions  []string  `json:"failed_conditions"`

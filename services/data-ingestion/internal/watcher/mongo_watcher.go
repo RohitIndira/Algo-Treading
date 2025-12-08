@@ -145,14 +145,36 @@ func (w *MongoWatcher) validateNewsDocument(ctx context.Context, doc bson.M) (bo
 		return false, fmt.Sprintf("mcap %.2f <= 250", mcapValue)
 	}
 
-	// 4. Check code field exists (stock code validation)
-	code, hasCode := companyDetails["code"]
-	if !hasCode || code == nil {
-		return false, "company code is null or missing"
+	// 4. Determine exchange status first to know which token field to validate
+	var bseStatusStr, nseStatusStr string
+	if v, ok := companyDetails["BSEStatus"].(string); ok {
+		bseStatusStr = v
+	}
+	if v, ok := companyDetails["NSEStatus"].(string); ok {
+		nseStatusStr = v
 	}
 
-	// Enrich document with company details (code, symbol, mcap, etc.)
-	doc["code"] = code
+	nseActive := strings.EqualFold(strings.TrimSpace(nseStatusStr), "Active")
+	bseActive := strings.EqualFold(strings.TrimSpace(bseStatusStr), "Active")
+
+	// Validate appropriate token field exists based on which exchange is active
+	if nseActive {
+		// NSE is active - need code field for token
+		code, hasCode := companyDetails["code"]
+		if !hasCode || code == nil {
+			return false, "NSE is active but code field is null or missing"
+		}
+		doc["code"] = code
+	} else if bseActive {
+		// BSE only is active - need bsecode field for token
+		bseCode, hasBseCode := companyDetails["bsecode"]
+		if !hasBseCode || bseCode == nil {
+			return false, "BSE is active but bsecode field is null or missing"
+		}
+		// Note: bsecode will be added to doc later when setting token
+	} else {
+		// For DELISTED or UNLISTED, we don't require token fields
+	}
 
 	// Set symbol based on listing status
 	if nseSym, ok := companyDetails["nsesymbol"]; ok && nseSym != nil {
@@ -174,24 +196,12 @@ func (w *MongoWatcher) validateNewsDocument(ctx context.Context, doc bson.M) (bo
 	}
 	doc["mcap"] = mcapValue
 
-	// Determine exchange based on listing status. Rules:
-	// - If both NSE and BSE are Active -> prefer NSE with code field as token
-	// - If only NSE is Active -> NSE with code field as token
+	// Now set exchange and token fields based on active exchange
+	// Rules:
+	// - If NSE is Active (with or without BSE) -> NSE with code field as token
 	// - If only BSE is Active -> BSE with bsecode field as token
-	// - If both Delisted -> DELISTED
-	// - Otherwise -> UNLISTED
-	var bseStatusStr, nseStatusStr string
-	if v, ok := companyDetails["BSEStatus"].(string); ok {
-		bseStatusStr = v
-	}
-	if v, ok := companyDetails["NSEStatus"].(string); ok {
-		nseStatusStr = v
-	}
-
-	nseActive := strings.EqualFold(strings.TrimSpace(nseStatusStr), "Active")
-	bseActive := strings.EqualFold(strings.TrimSpace(bseStatusStr), "Active")
-
-	// Provide both a short exchange value (NSE/BSE) and broker format used by other services (NSE_EQ/BSE_EQ)
+	// - If both Delisted -> DELISTED (no token)
+	// - Otherwise -> UNLISTED (no token)
 	exchangeShort := "UNLISTED"
 	exchangeBroker := "UNLISTED"
 	var rawToken interface{}
@@ -320,9 +330,16 @@ func (w *MongoWatcher) Run(ctx context.Context) error {
 
 		// Check if we've already processed this document
 		if docID != "" && w.isDuplicate(docID) {
-			w.lgr.Debug("skipping duplicate document", zap.String("docID", docID))
+			w.lgr.Warn("skipping duplicate document from change stream", zap.String("docID", docID))
 			continue
 		}
+
+		// Mark as processing IMMEDIATELY to prevent race condition with duplicate events
+		if docID != "" {
+			w.markAsProcessed(docID)
+		}
+
+		w.lgr.Info("processing new document", zap.String("docID", docID))
 
 		// Validate document against all filtering criteria
 		vctx, vcancel := context.WithTimeout(ctx, 3*time.Second)
@@ -330,7 +347,24 @@ func (w *MongoWatcher) Run(ctx context.Context) error {
 		vcancel()
 
 		if !valid {
-			w.lgr.Debug("document filtered out", zap.String("reason", reason))
+			w.lgr.Info("document filtered out", zap.String("reason", reason), zap.String("docID", docID))
+			continue
+		}
+
+		// CRITICAL: Verify document has ALL required fields before publishing
+		// This prevents publishing incomplete documents if validation didn't set all fields
+		_, hasExchange := doc["exchange"]
+		_, hasToken := doc["token"]
+		_, hasMcap := doc["mcap"]
+		_, hasCompany := doc["company"]
+
+		if !hasExchange || !hasToken || !hasMcap || !hasCompany {
+			w.lgr.Warn("skipping publish - missing required fields",
+				zap.String("docID", docID),
+				zap.Bool("hasExchange", hasExchange),
+				zap.Bool("hasToken", hasToken),
+				zap.Bool("hasMcap", hasMcap),
+				zap.Bool("hasCompany", hasCompany))
 			continue
 		}
 
@@ -355,13 +389,24 @@ func (w *MongoWatcher) Run(ctx context.Context) error {
 		if err := w.pub.Publish(pctx, key, payload); err != nil {
 			w.lgr.Error("failed to publish message", zap.Error(err))
 		} else {
-			// Mark as processed after successful publish
-			if docID != "" {
-				w.markAsProcessed(docID)
+			// Log published document details
+			exchange := "UNKNOWN"
+			if ex, ok := doc["exchange"].(string); ok {
+				exchange = ex
+			}
+			token := "UNKNOWN"
+			if tok, ok := doc["token"]; ok {
+				token = fmt.Sprintf("%v", tok)
+			}
+			company := "UNKNOWN"
+			if comp, ok := doc["company"].(string); ok {
+				company = comp
 			}
 
 			w.lgr.Info("published news to kafka",
-				zap.String("company", doc["company"].(string)),
+				zap.String("company", company),
+				zap.String("exchange", exchange),
+				zap.String("token", token),
 				zap.Float64("mcap", doc["mcap"].(float64)),
 			)
 		}

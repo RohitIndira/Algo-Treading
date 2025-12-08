@@ -18,14 +18,15 @@ import (
 
 // Handler handles market events
 type Handler struct {
-	matcher    *matcher.Matcher
-	rabbitPubl *publisher.Publisher
-	kafkaPubl  *publisher.KafkaPublisher
-	signalRepo *repository.TradeSignalRepository
-	riskClient *risk.Client
-	redisCache *cache.RedisCache
-	stats      *models.MatchingStats
-	logger     *zap.Logger
+	matcher       *matcher.Matcher
+	rabbitPubl    *publisher.Publisher
+	kafkaPubl     *publisher.KafkaPublisher
+	signalRepo    *repository.TradeSignalRepository
+	riskClient    *risk.Client
+	redisCache    *cache.RedisCache
+	strategyCache *cache.StrategyCache
+	stats         *models.MatchingStats
+	logger        *zap.Logger
 }
 
 // NewHandler creates a new event handler
@@ -36,18 +37,20 @@ func NewHandler(
 	signalRepo *repository.TradeSignalRepository,
 	riskClient *risk.Client,
 	redisCache *cache.RedisCache,
+	strategyCache *cache.StrategyCache,
 	stats *models.MatchingStats,
 	logger *zap.Logger,
 ) *Handler {
 	return &Handler{
-		matcher:    matcher,
-		rabbitPubl: rabbitPubl,
-		kafkaPubl:  kafkaPubl,
-		signalRepo: signalRepo,
-		riskClient: riskClient,
-		redisCache: redisCache,
-		stats:      stats,
-		logger:     logger,
+		matcher:       matcher,
+		rabbitPubl:    rabbitPubl,
+		kafkaPubl:     kafkaPubl,
+		signalRepo:    signalRepo,
+		riskClient:    riskClient,
+		redisCache:    redisCache,
+		strategyCache: strategyCache,
+		stats:         stats,
+		logger:        logger,
 	}
 }
 
@@ -193,19 +196,25 @@ func (h *Handler) getLTPFromRedis(ctx context.Context, stockData models.StockDat
 
 // processMatch processes a single match
 func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, event *models.MarketEvent) error {
-	// Note: In production, you would fetch the full strategy here
-	// For now, we'll create a basic strategy from available data
-	strategy := &models.Strategy{
-		StrategyID:   match.StrategyID,
-		UserID:       match.UserID,
-		StrategyName: match.StrategyName,
-		TradeConfig: models.TradeConfig{
-			OrderType:     "MARKET",
-			Quantity:      1,
-			StopLossPct:   2.0, // Default 2% stop loss
-			TakeProfitPct: 5.0, // Default 5% take profit
-		},
+	// Use the full strategy from the match (already includes trade_config from Kafka user-configs topic)
+	strategy := match.Strategy
+	if strategy == nil {
+		h.logger.Error("Strategy is nil in match, cannot generate order",
+			zap.String("strategy_id", match.StrategyID),
+			zap.String("user_id", match.UserID))
+		return fmt.Errorf("strategy is nil in match")
 	}
+
+	// Log strategy configuration being used from Kafka
+	h.logger.Info("Using strategy configuration from Kafka user-configs",
+		zap.String("strategy_id", strategy.StrategyID),
+		zap.String("user_id", strategy.UserID),
+		zap.Int32("quantity", strategy.TradeConfig.Quantity),
+		zap.String("order_type", strategy.TradeConfig.OrderType),
+		zap.String("order_side", "BUY"),
+		zap.String("exchange", strategy.TradeConfig.Exchange),
+		zap.Float64("stop_loss_pct", strategy.TradeConfig.StopLossPct),
+		zap.Float64("take_profit_pct", strategy.TradeConfig.TakeProfitPct))
 
 	// Create order request
 	orderReq := models.NewOrderRequest(match, event, strategy)

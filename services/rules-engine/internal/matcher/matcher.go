@@ -191,6 +191,7 @@ func (m *Matcher) evaluateStrategy(ctx context.Context, event *models.MarketEven
 		UserID:            strategy.UserID,
 		StrategyID:        strategy.StrategyID,
 		StrategyName:      strategy.StrategyName,
+		Strategy:          strategy, // Include full strategy with trade_config from Kafka
 		MatchScore:        score,
 		MatchedConditions: result.MatchedConditions,
 		FailedConditions:  result.FailedConditions,
