@@ -14,6 +14,7 @@ require (
 	github.com/lib/pq v1.10.9
 	github.com/segmentio/kafka-go v0.4.49
 	go.uber.org/zap v1.27.0
+	go.uber.org/zap v1.27.0
 	google.golang.org/grpc v1.68.1
 )
 
@@ -35,3 +36,7 @@ replace github.com/RohitIndira/Algo-Treading/api/proto/common => ../../api/proto
 replace github.com/RohitIndira/Algo-Treading/api/proto/user_config => ../../api/proto/user_config
 
 replace github.com/RohitIndira/Algo-Treading/pkg/logger => ../../pkg/logger
+
+replace github.com/RohitIndira/Algo-Treading/api/proto/common => ../../api/proto/common
+
+replace github.com/RohitIndira/Algo-Treading/api/proto/user_config => ../../api/proto/user_config
