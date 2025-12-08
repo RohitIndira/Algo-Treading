@@ -12,6 +12,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
@@ -81,6 +82,14 @@ func main() {
 	defer rabbitConsumer.Shutdown()
 	log.Println("✓ RabbitMQ consumer initialized")
 
+	// Initialize Kafka consumer for trade-signals
+	log.Println("Initializing Kafka consumer...")
+	logger, _ := initLogger()
+	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo)
+	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger)
+	defer kafkaConsumer.Close()
+	log.Println("✓ Kafka consumer initialized")
+
 	// Initialize gRPC server
 	grpcServer := server.NewServer(orderRepo, orderExecutor, cfg.GRPCPort)
 	log.Println("✓ gRPC server initialized")
@@ -88,6 +97,14 @@ func main() {
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start Kafka consumer for trade-signals
+	go func() {
+		log.Println("Starting Kafka consumer...")
+		if err := kafkaConsumer.Start(ctx); err != nil {
+			log.Printf("Kafka consumer error: %v", err)
+		}
+	}()
 
 	// Start RabbitMQ consumer
 	go func() {
@@ -112,6 +129,7 @@ func main() {
 	log.Println("✓ Trade Execution Service Started")
 	log.Printf("  - gRPC Server: localhost:%d", cfg.GRPCPort)
 	log.Printf("  - RabbitMQ Queue: %s", cfg.QueueName)
+	log.Printf("  - Kafka Topic: %s (Group: %s)", cfg.KafkaTopic, cfg.KafkaGroupID)
 	log.Printf("  - Workers: %d", cfg.WorkerCount)
 	log.Println("========================================")
 
@@ -142,6 +160,9 @@ type Config struct {
 	RoutingKey    string
 	PrefetchCount int
 	WorkerCount   int
+	KafkaBrokers  []string
+	KafkaGroupID  string
+	KafkaTopic    string
 	OdinBaseURL   string
 	MaxRetries    int
 	RetryDelay    time.Duration
@@ -149,6 +170,14 @@ type Config struct {
 }
 
 func loadConfig() Config {
+	kafkaBrokersStr := getEnv("KAFKA_BROKERS", "localhost:9092")
+	kafkaBrokers := []string{}
+	for _, broker := range splitAndTrim(kafkaBrokersStr, ",") {
+		if broker != "" {
+			kafkaBrokers = append(kafkaBrokers, broker)
+		}
+	}
+
 	return Config{
 		GRPCPort:      getEnvInt("SERVICE_PORT", 9004),
 		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
@@ -157,6 +186,9 @@ func loadConfig() Config {
 		RoutingKey:    getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
 		PrefetchCount: getEnvInt("RABBITMQ_PREFETCH", 10),
 		WorkerCount:   getEnvInt("WORKER_COUNT", 10),
+		KafkaBrokers:  kafkaBrokers,
+		KafkaGroupID:  getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
+		KafkaTopic:    getEnv("KAFKA_TOPIC", "trade-signals"),
 		OdinBaseURL:   getEnv("ODIN_BASE_URL", ""),
 		MaxRetries:    getEnvInt("MAX_RETRIES", 3),
 		RetryDelay:    time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
@@ -210,4 +242,49 @@ func getEnvInt(key string, defaultValue int) int {
 		}
 	}
 	return defaultValue
+}
+
+func splitAndTrim(s, sep string) []string {
+	if s == "" {
+		return []string{}
+	}
+	parts := []string{}
+	for _, part := range split(s, sep) {
+		trimmed := trim(part)
+		if trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return parts
+}
+
+func split(s, sep string) []string {
+	result := []string{}
+	current := ""
+	for _, char := range s {
+		if string(char) == sep {
+			result = append(result, current)
+			current = ""
+		} else {
+			current += string(char)
+		}
+	}
+	result = append(result, current)
+	return result
+}
+
+func trim(s string) string {
+	start := 0
+	end := len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}
+
+func initLogger() (*zap.Logger, error) {
+	return zap.NewProduction()
 }
