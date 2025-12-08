@@ -5,6 +5,15 @@ bin/
 *.so
 *.dylib
 
+# Compiled service binaries
+services/*/rules-engine
+services/*/data-ingestion
+services/*/trade-execution
+services/*/user-config
+services/*/risk-management
+services/*/gateway
+api/gateway/gateway
+
 # Go
 *.test
 *.out
