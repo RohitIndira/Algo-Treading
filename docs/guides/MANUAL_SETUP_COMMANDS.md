@@ -289,8 +289,8 @@ docker exec trading-kafka kafka-topics.sh --list --bootstrap-server localhost:90
 # This would be done by external team
 # You can manually test by inserting a document in MongoDB
 mongosh --eval '
-use CAG_CHATBOT
-db.NewsImpactDashboard.insertOne({
+use trading_system
+db.news_impact_dashboard.insertOne({
   "headline": "Test News",
   "sentiment": "positive",
   "impact_score": 0.8,

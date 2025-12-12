@@ -134,6 +134,7 @@ func (m *Matcher) evaluateStrategiesConcurrent(
 			}
 
 			// Get full strategy from cache (required for complete trade_config)
+			// Get full strategy (from cache or reconstruct)
 			var strategy *models.Strategy
 			if cached, exists := cachedStrategies[esStrategy.StrategyID]; exists {
 				strategy = cached

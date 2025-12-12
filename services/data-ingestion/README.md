@@ -55,9 +55,9 @@ Create `.env` file (already configured):
 
 ```bash
 # MongoDB Configuration
-MONGO_URI=mongodb+srv://newsimpact:zTVHWieqVsONp8Wr@stockgpt.fryqpbi.mongodb.net/
-MONGO_DATABASE=CAG_CHATBOT
-MONGO_NEWS_COLLECTION=NewsImpactDashboard
+MONGO_URI=mongodb://localhost:27017
+MONGO_DATABASE=trading_system
+MONGO_NEWS_COLLECTION=news_impact_dashboard
 
 # Kafka Configuration
 KAFKA_BROKERS=localhost:9092
@@ -113,9 +113,9 @@ go run cmd/main.go
 
 ```
 INFO    Starting data-ingestion service
-INFO    Connected to MongoDB    {"database": "CAG_CHATBOT", "collection": "NewsImpactDashboard"}
+INFO    Connected to MongoDB    {"database": "trading_system", "collection": "news_impact_dashboard"}
 INFO    Connected to Kafka      {"brokers": ["localhost:9092"], "topic": "news-events"}
-INFO    started mongo watcher   {"collection": "NewsImpactDashboard"}
+INFO    started mongo watcher   {"collection": "news_impact_dashboard"}
 ```
 
 ## 🧪 Testing the Service
@@ -124,10 +124,10 @@ INFO    started mongo watcher   {"collection": "NewsImpactDashboard"}
 
 ```javascript
 // Connect to your MongoDB
-use CAG_CHATBOT
+use trading_system
 
 // Insert test news
-db.NewsImpactDashboard.insertOne({
+db.news_impact_dashboard.insertOne({
   "title": "Test: Reliance Industries announces merger",
   "content": "Reliance Industries today announced...",
   "sentiment": "positive",
@@ -235,7 +235,7 @@ go run cmd/main.go
 cat .env | grep MONGO_URI
 
 # Test connection
-mongosh "mongodb+srv://newsimpact:zTVHWieqVsONp8Wr@stockgpt.fryqpbi.mongodb.net/"
+mongosh "mongodb://localhost:27017"
 ```
 
 #### 2. Kafka Connection Failed

@@ -122,6 +122,7 @@ func (sc *StrategyCache) GetStrategies(ctx context.Context, strategyIDs []string
 }
 
 // SetStrategies stores multiple strategies in cache with TTL until midnight
+// SetStrategies stores multiple strategies in cache
 func (sc *StrategyCache) SetStrategies(ctx context.Context, strategies []*models.Strategy) error {
 	if len(strategies) == 0 {
 		return nil

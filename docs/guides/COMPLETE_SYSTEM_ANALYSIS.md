@@ -17,8 +17,8 @@
 │                          EXTERNAL DATA SOURCE                                    │
 │                                                                                  │
 │   MongoDB Cloud (StockGPT.fryqpbi.mongodb.net)                                 │
-│   Database: CAG_CHATBOT                                                         │
-│   Collection: NewsImpactDashboard                                               │
+│   Database: trading_system                                                         │
+│   Collection: news_impact_dashboard                                               │
 │   - Stock news & events                                                         │
 │   - Sentiment analysis                                                          │
 │   - Impact scores (0-10)                                                        │

@@ -5,8 +5,11 @@ go 1.23.0
 toolchain go1.24.6
 
 require (
+<<<<<<< HEAD
 	github.com/RohitIndira/Algo-Treading/api/proto/common v0.0.0
 	github.com/RohitIndira/Algo-Treading/api/proto/user_config v0.0.0-00010101000000-000000000000
+=======
+>>>>>>> bd5fcc654ce28667544a6438717669dd97a30fc1
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.0
