@@ -53,6 +53,18 @@ func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, 
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
+	// Log the exact JSON being published for debugging
+	fmt.Printf("[USER-CONFIG] Publishing to Kafka: event_type=%s, strategy_id=%s, user_id=%s\n",
+		eventType, strategy.StrategyID.String(), strategy.UserID)
+	if strategy.TradeConfig != nil {
+		fmt.Printf("[USER-CONFIG] TradeConfig: order_type=%s, quantity=%d, exchange=%s, stop_loss=%.2f, take_profit=%.2f\n",
+			strategy.TradeConfig.OrderType, strategy.TradeConfig.Quantity, strategy.TradeConfig.Exchange,
+			valueOrZero(strategy.TradeConfig.StopLossPct), valueOrZero(strategy.TradeConfig.TakeProfitPct))
+	} else {
+		fmt.Printf("[USER-CONFIG] WARNING: TradeConfig is nil!\n")
+	}
+	fmt.Printf("[USER-CONFIG] JSON payload (first 500 chars): %s\n", string(eventBytes[:min(500, len(eventBytes))]))
+
 	msg := kafka.Message{
 		Key:   []byte(strategy.StrategyID.String()),
 		Value: eventBytes,
@@ -68,6 +80,21 @@ func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, 
 	}
 
 	return nil
+}
+
+// Helper function to safely get float pointer value
+func valueOrZero(ptr *float64) float64 {
+	if ptr == nil {
+		return 0.0
+	}
+	return *ptr
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // CreateStrategy creates a new strategy

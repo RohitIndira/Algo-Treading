@@ -40,6 +40,9 @@ type Config struct {
 
 	// Logging Configuration
 	Logging LoggingConfig
+
+	// Market Hours Configuration
+	MarketHours MarketHoursConfig
 }
 
 // KafkaConfig holds Kafka-specific configuration
@@ -144,6 +147,16 @@ type LoggingConfig struct {
 	Format     string // "json" or "console"
 	OutputPath string
 	ErrorPath  string
+}
+
+// MarketHoursConfig holds market trading hours configuration
+type MarketHoursConfig struct {
+	OpenHour     int    // Market opening hour (0-23)
+	OpenMinute   int    // Market opening minute (0-59)
+	CloseHour    int    // Market closing hour (0-23)
+	CloseMinute  int    // Market closing minute (0-59)
+	Timezone     string // Timezone (e.g., "Asia/Kolkata")
+	EnforceHours bool   // Whether to enforce market hours check
 }
 
 // LoadConfig loads configuration from environment variables
@@ -253,6 +266,15 @@ func LoadConfig() (*Config, error) {
 			Format:     getEnv("LOG_FORMAT", "json"),
 			OutputPath: getEnv("LOG_OUTPUT_PATH", "stdout"),
 			ErrorPath:  getEnv("LOG_ERROR_PATH", "stderr"),
+		},
+
+		MarketHours: MarketHoursConfig{
+			OpenHour:     getEnvAsInt("MARKET_OPEN_HOUR", 9),
+			OpenMinute:   getEnvAsInt("MARKET_OPEN_MINUTE", 15),
+			CloseHour:    getEnvAsInt("MARKET_CLOSE_HOUR", 15),
+			CloseMinute:  getEnvAsInt("MARKET_CLOSE_MINUTE", 30),
+			Timezone:     getEnv("MARKET_TIMEZONE", "Asia/Kolkata"),
+			EnforceHours: getEnvAsBool("MARKET_ENFORCE_HOURS", true),
 		},
 	}
 

@@ -20,6 +20,8 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/sync"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/userconfig"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/utils"
 
 	"go.uber.org/zap"
 )
@@ -111,8 +113,8 @@ func main() {
 	logger.Info("Initializing strategy syncer...")
 	strategySyncer := sync.NewStrategySyncer(
 		cfg.Kafka.Brokers,
-		"user-configs", // Topic where user-config service publishes strategy events
-		"rules-engine-strategy-sync-group",
+		"user-configs",                  // Topic where user-config service publishes strategy events
+		"rules-engine-strategy-sync-v2", // Changed group to avoid replaying old DELETE events
 		indexer,
 		strategyCache,
 		logger,
@@ -128,11 +130,31 @@ func main() {
 		logger,
 	)
 
+	// Initialize user-config client for fetching strategies
+	logger.Info("Initializing user-config client...")
+	userConfigClient, err := userconfig.NewClient(userconfig.Config{
+		Address:          cfg.GRPCClients.UserConfigService.Address,
+		Timeout:          cfg.GRPCClients.UserConfigService.Timeout,
+		MaxRetries:       cfg.GRPCClients.UserConfigService.MaxRetries,
+		RetryBackoff:     cfg.GRPCClients.UserConfigService.RetryBackoff,
+		KeepAlive:        cfg.GRPCClients.UserConfigService.KeepAlive,
+		KeepAliveTimeout: cfg.GRPCClients.UserConfigService.KeepAliveTimeout,
+	}, logger)
+	if err != nil {
+		logger.Warn("Failed to initialize user-config client - will rely only on cache",
+			zap.Error(err))
+		userConfigClient = nil
+	} else {
+		defer userConfigClient.Close()
+		logger.Info("User-config client initialized successfully")
+	}
+
 	// Initialize matcher
 	logger.Info("Initializing matcher engine...")
 	matcherEngine := matcher.NewMatcher(
 		queryEngine,
 		strategyCache,
+		userConfigClient,
 		cfg.Performance.MinMatchScore,
 		cfg.Performance.MaxConcurrentMatches,
 		logger,
@@ -177,8 +199,27 @@ func main() {
 	defer kafkaPub.Close()
 	logger.Info("Kafka trade-signals publisher initialized successfully")
 
+	// Initialize market hours from configuration
+	logger.Info("Initializing market hours configuration...",
+		zap.Int("open_hour", cfg.MarketHours.OpenHour),
+		zap.Int("open_minute", cfg.MarketHours.OpenMinute),
+		zap.Int("close_hour", cfg.MarketHours.CloseHour),
+		zap.Int("close_minute", cfg.MarketHours.CloseMinute),
+		zap.String("timezone", cfg.MarketHours.Timezone),
+		zap.Bool("enforce_hours", cfg.MarketHours.EnforceHours))
+
+	marketHours := utils.NewMarketHours(
+		cfg.MarketHours.OpenHour,
+		cfg.MarketHours.OpenMinute,
+		cfg.MarketHours.CloseHour,
+		cfg.MarketHours.CloseMinute,
+		cfg.MarketHours.Timezone,
+	)
+	logger.Info("Market hours initialized",
+		zap.String("status", marketHours.GetMarketStatus()))
+
 	// Initialize event handler
-	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, redisCache, strategyCache, stats, logger)
+	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, redisCache, strategyCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours)
 
 	// Initialize Kafka consumer
 	logger.Info("Initializing Kafka consumer...")

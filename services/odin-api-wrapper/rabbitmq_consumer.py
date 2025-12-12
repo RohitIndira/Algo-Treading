@@ -239,7 +239,7 @@ class OdinOrderExecutor:
             "disclosed_quantity": 0,
             "validity": order_req.get("validity", "DAY"),
             "validity_days": 0,
-            "is_amo": True,  # Set to True to allow orders outside market hours
+            "is_amo": "false",  # Set to True to allow orders outside market hours
             "order_identifier": order_identifier,  # Truncated to max 8 chars
             "strategy_id": order_req.get("strategy_id", ""),
         }

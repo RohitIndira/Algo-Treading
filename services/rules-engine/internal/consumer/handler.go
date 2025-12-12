@@ -13,6 +13,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/utils"
 	"go.uber.org/zap"
 )
 
@@ -27,6 +28,8 @@ type Handler struct {
 	strategyCache *cache.StrategyCache
 	stats         *models.MatchingStats
 	logger        *zap.Logger
+	marketHours   *utils.MarketHours
+	enforceHours  bool
 }
 
 // NewHandler creates a new event handler
@@ -40,6 +43,8 @@ func NewHandler(
 	strategyCache *cache.StrategyCache,
 	stats *models.MatchingStats,
 	logger *zap.Logger,
+	marketHours *utils.MarketHours,
+	enforceHours bool,
 ) *Handler {
 	return &Handler{
 		matcher:       matcher,
@@ -51,11 +56,23 @@ func NewHandler(
 		strategyCache: strategyCache,
 		stats:         stats,
 		logger:        logger,
+		marketHours:   marketHours,
+		enforceHours:  enforceHours,
 	}
 }
 
 // HandleEvent processes a market event
 func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) error {
+	// Check if market is open before generating trade signals (only if enforcement is enabled)
+	if h.enforceHours && !h.marketHours.IsMarketOpen() {
+		status := h.marketHours.GetMarketStatus()
+		h.logger.Debug("Skipping trade signal generation - market is closed",
+			zap.String("event_id", event.EventID),
+			zap.String("market_status", status),
+			zap.Time("event_timestamp", event.Timestamp))
+		return nil
+	}
+
 	h.logger.Debug("Handling event",
 		zap.String("event_id", event.EventID),
 		zap.Int64("stock_code", event.StockData.StockCode),
@@ -203,6 +220,15 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			zap.String("strategy_id", match.StrategyID),
 			zap.String("user_id", match.UserID))
 		return fmt.Errorf("strategy is nil in match")
+	}
+
+	// Validate strategy has complete trade configuration
+	if strategy.TradeConfig.Quantity <= 0 {
+		h.logger.Error("Strategy has invalid quantity in trade_config",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.String("user_id", strategy.UserID),
+			zap.Int32("quantity", strategy.TradeConfig.Quantity))
+		return fmt.Errorf("strategy %s has invalid quantity: %d", strategy.StrategyID, strategy.TradeConfig.Quantity)
 	}
 
 	// Log strategy configuration being used from Kafka

@@ -59,9 +59,9 @@ func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *
 		Brokers:        brokers,
 		Topic:          topic,
 		GroupID:        groupID,
-		StartOffset:    kafka.FirstOffset, // Start from beginning to load all strategies
-		MinBytes:       10e3,              // 10KB
-		MaxBytes:       10e6,              // 10MB
+		StartOffset:    kafka.LastOffset, // Use last offset to avoid replaying old DELETE events
+		MinBytes:       10e3,             // 10KB
+		MaxBytes:       10e6,             // 10MB
 		CommitInterval: time.Second,
 		MaxWait:        500 * time.Millisecond,
 	})
@@ -129,6 +129,21 @@ func (ss *StrategySyncer) processMessage(ctx context.Context, msg *kafka.Message
 		strategy, err := ss.convertToStrategy(event.Strategy)
 		if err != nil {
 			return fmt.Errorf("failed to convert strategy: %w", err)
+		}
+
+		// Validate strategy before indexing and caching
+		// This prevents incomplete strategies (especially missing trade_config) from being cached
+		if err := strategy.Validate(); err != nil {
+			ss.logger.Error("Received invalid strategy from Kafka, skipping cache update",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("user_id", strategy.UserID),
+				zap.String("event_type", event.EventType),
+				zap.Int32("quantity", strategy.TradeConfig.Quantity),
+				zap.String("order_type", strategy.TradeConfig.OrderType),
+				zap.Error(err))
+			// Don't return error - just skip this invalid strategy
+			// This prevents overwriting good cached data with incomplete data
+			return nil
 		}
 
 		// Index in Elasticsearch for matching
@@ -202,6 +217,16 @@ func (ss *StrategySyncer) convertToStrategy(payload *StrategyPayload) (*models.S
 	if err := json.Unmarshal(payload.TradeConfig, &tradeConfig); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal trade_config: %w", err)
 	}
+
+	// Log the raw trade_config for debugging incomplete data issues
+	ss.logger.Debug("Processing strategy trade_config",
+		zap.String("strategy_id", payload.StrategyID),
+		zap.String("user_id", payload.UserID),
+		zap.Int32("quantity", tradeConfig.Quantity),
+		zap.String("order_type", tradeConfig.OrderType),
+		zap.String("exchange", tradeConfig.Exchange),
+		zap.Float64("stop_loss_pct", tradeConfig.StopLossPct),
+		zap.Float64("take_profit_pct", tradeConfig.TakeProfitPct))
 
 	var riskLimits models.RiskLimits
 	if err := json.Unmarshal(payload.RiskLimits, &riskLimits); err != nil {

@@ -31,7 +31,7 @@ func LoadConfig() *Config {
 	return &Config{
 		GRPCPort: getEnv("GRPC_PORT", "9005"),
 
-		RedisHost: getEnv("REDIS_HOST", "localhost"),
+		RedisHost: getEnv("REDIS_HOST", "65.20.83.31"),
 		RedisPort: getEnv("REDIS_PORT", "6379"),
 
 		DBHost: getEnv("DB_HOST", "localhost"),

@@ -9,36 +9,40 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/index"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/userconfig"
 	"go.uber.org/zap"
 )
 
 // Matcher is responsible for matching events against strategies
 type Matcher struct {
-	queryEngine   *index.QueryEngine
-	strategyCache *cache.StrategyCache
-	evaluator     *Evaluator
-	scorer        *Scorer
-	logger        *zap.Logger
-	minMatchScore float64
-	maxConcurrent int
+	queryEngine      *index.QueryEngine
+	strategyCache    *cache.StrategyCache
+	userConfigClient *userconfig.Client
+	evaluator        *Evaluator
+	scorer           *Scorer
+	logger           *zap.Logger
+	minMatchScore    float64
+	maxConcurrent    int
 }
 
 // NewMatcher creates a new matcher instance
 func NewMatcher(
 	queryEngine *index.QueryEngine,
 	strategyCache *cache.StrategyCache,
+	userConfigClient *userconfig.Client,
 	minMatchScore float64,
 	maxConcurrent int,
 	logger *zap.Logger,
 ) *Matcher {
 	return &Matcher{
-		queryEngine:   queryEngine,
-		strategyCache: strategyCache,
-		evaluator:     NewEvaluator(logger),
-		scorer:        NewScorer(),
-		logger:        logger,
-		minMatchScore: minMatchScore,
-		maxConcurrent: maxConcurrent,
+		queryEngine:      queryEngine,
+		strategyCache:    strategyCache,
+		userConfigClient: userConfigClient,
+		evaluator:        NewEvaluator(logger),
+		scorer:           NewScorer(),
+		logger:           logger,
+		minMatchScore:    minMatchScore,
+		maxConcurrent:    maxConcurrent,
 	}
 }
 
@@ -129,13 +133,43 @@ func (m *Matcher) evaluateStrategiesConcurrent(
 			default:
 			}
 
-			// Get full strategy (from cache or reconstruct)
+			// Get full strategy from cache (required for complete trade_config)
 			var strategy *models.Strategy
 			if cached, exists := cachedStrategies[esStrategy.StrategyID]; exists {
 				strategy = cached
 			} else {
-				// Reconstruct strategy from ES data
-				strategy = m.reconstructStrategy(esStrategy)
+				// Fallback: Try fetching from user-config service via gRPC
+				m.logger.Info("Strategy not in cache, attempting to fetch from user-config service",
+					zap.String("strategy_id", esStrategy.StrategyID),
+					zap.String("user_id", esStrategy.UserID))
+
+				if m.userConfigClient != nil {
+					fetchedStrategy, err := m.userConfigClient.GetStrategy(ctx, esStrategy.StrategyID, esStrategy.UserID)
+					if err != nil {
+						m.logger.Warn("Failed to fetch strategy from user-config service, skipping",
+							zap.String("strategy_id", esStrategy.StrategyID),
+							zap.String("user_id", esStrategy.UserID),
+							zap.Error(err))
+						return
+					}
+					strategy = fetchedStrategy
+
+					// Cache the fetched strategy for future use
+					if err := m.strategyCache.SetStrategy(ctx, strategy); err != nil {
+						m.logger.Warn("Failed to cache fetched strategy",
+							zap.String("strategy_id", strategy.StrategyID),
+							zap.Error(err))
+					} else {
+						m.logger.Info("Strategy fetched and cached successfully",
+							zap.String("strategy_id", strategy.StrategyID))
+					}
+				} else {
+					m.logger.Warn("Strategy not found in cache and no user-config client available",
+						zap.String("strategy_id", esStrategy.StrategyID),
+						zap.String("user_id", esStrategy.UserID),
+						zap.String("strategy_name", esStrategy.StrategyName))
+					return
+				}
 			}
 
 			// Evaluate strategy against event

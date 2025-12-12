@@ -7,21 +7,24 @@ import (
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/google/uuid"
 )
 
 // SignalProcessor processes trade signals from Kafka
 type SignalProcessor struct {
-	executor  *OrderExecutor
-	orderRepo repository.OrderRepository
+	executor        *OrderExecutor
+	orderRepo       repository.OrderRepository
+	rabbitPublisher *publisher.RabbitMQPublisher
 }
 
 // NewSignalProcessor creates a new trade signal processor
-func NewSignalProcessor(executor *OrderExecutor, orderRepo repository.OrderRepository) *SignalProcessor {
+func NewSignalProcessor(executor *OrderExecutor, orderRepo repository.OrderRepository, rabbitPublisher *publisher.RabbitMQPublisher) *SignalProcessor {
 	return &SignalProcessor{
-		executor:  executor,
-		orderRepo: orderRepo,
+		executor:        executor,
+		orderRepo:       orderRepo,
+		rabbitPublisher: rabbitPublisher,
 	}
 }
 
@@ -43,10 +46,20 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 
 	log.Printf("Order %s saved to database with status %s", order.OrderID, order.Status)
 
-	// Execute the order
-	if err := p.executor.ExecuteOrder(ctx, order); err != nil {
-		log.Printf("Failed to execute order %s: %v", order.OrderID, err)
-		return fmt.Errorf("failed to execute order: %w", err)
+	// Publish order to RabbitMQ for odin-api-wrapper to execute
+	if p.rabbitPublisher != nil {
+		if err := p.rabbitPublisher.PublishOrder(ctx, order); err != nil {
+			log.Printf("Failed to publish order %s to RabbitMQ: %v", order.OrderID, err)
+			return fmt.Errorf("failed to publish order to RabbitMQ: %w", err)
+		}
+		log.Printf("✓ Order %s published to RabbitMQ for execution", order.OrderID)
+	} else {
+		log.Printf("⚠️ RabbitMQ publisher not configured, executing order directly")
+		// Fallback to direct execution if RabbitMQ publisher is not configured
+		if err := p.executor.ExecuteOrder(ctx, order); err != nil {
+			log.Printf("Failed to execute order %s: %v", order.OrderID, err)
+			return fmt.Errorf("failed to execute order: %w", err)
+		}
 	}
 
 	log.Printf("✓ Successfully processed and executed trade signal: OrderID=%s, Symbol=%s",
@@ -110,7 +123,7 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 	}
 
 	log.Printf("Converted signal to order: ID=%s, Side=%s, Qty=%d, Price=%.2f",
-		order.OrderID, order.OrderSide, order.Quantity, order.Price)
+		order.OrderID, order.OrderSide, order.Quantity, *order.Price)
 
 	return order, nil
 }

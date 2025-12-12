@@ -50,20 +50,36 @@ func (sc *StrategyCache) GetStrategy(ctx context.Context, strategyID string) (*m
 	return &strategy, nil
 }
 
-// SetStrategy stores a strategy in cache
+// calculateTTLUntilMidnight calculates the duration until next midnight (12 AM)
+func (sc *StrategyCache) calculateTTLUntilMidnight() time.Duration {
+	now := time.Now()
+	// Get next midnight: tomorrow at 00:00:00
+	nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	ttl := nextMidnight.Sub(now)
+
+	sc.logger.Debug("Calculated TTL until midnight",
+		zap.Duration("ttl", ttl),
+		zap.Time("next_midnight", nextMidnight))
+
+	return ttl
+}
+
+// SetStrategy stores a strategy in cache with TTL until midnight
 func (sc *StrategyCache) SetStrategy(ctx context.Context, strategy *models.Strategy) error {
 	key := sc.strategyKey(strategy.StrategyID)
+	ttl := sc.calculateTTLUntilMidnight()
 
-	if err := sc.cache.Set(ctx, key, strategy, sc.ttl); err != nil {
+	if err := sc.cache.Set(ctx, key, strategy, ttl); err != nil {
 		sc.logger.Error("Failed to cache strategy",
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.Error(err))
 		return err
 	}
 
-	sc.logger.Debug("Strategy cached",
+	sc.logger.Debug("Strategy cached until midnight",
 		zap.String("strategy_id", strategy.StrategyID),
-		zap.String("user_id", strategy.UserID))
+		zap.String("user_id", strategy.UserID),
+		zap.Duration("ttl", ttl))
 
 	return nil
 }
@@ -105,7 +121,7 @@ func (sc *StrategyCache) GetStrategies(ctx context.Context, strategyIDs []string
 	return strategies, nil
 }
 
-// SetStrategies stores multiple strategies in cache
+// SetStrategies stores multiple strategies in cache with TTL until midnight
 func (sc *StrategyCache) SetStrategies(ctx context.Context, strategies []*models.Strategy) error {
 	if len(strategies) == 0 {
 		return nil
@@ -117,14 +133,17 @@ func (sc *StrategyCache) SetStrategies(ctx context.Context, strategies []*models
 		items[key] = strategy
 	}
 
-	if err := sc.cache.SetMulti(ctx, items, sc.ttl); err != nil {
+	ttl := sc.calculateTTLUntilMidnight()
+	if err := sc.cache.SetMulti(ctx, items, ttl); err != nil {
 		sc.logger.Error("Failed to cache strategies",
 			zap.Int("count", len(strategies)),
 			zap.Error(err))
 		return err
 	}
 
-	sc.logger.Debug("Strategies cached", zap.Int("count", len(strategies)))
+	sc.logger.Debug("Strategies cached until midnight",
+		zap.Int("count", len(strategies)),
+		zap.Duration("ttl", ttl))
 	return nil
 }
 

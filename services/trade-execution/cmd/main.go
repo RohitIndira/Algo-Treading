@@ -17,6 +17,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/odin"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
 )
@@ -82,10 +83,24 @@ func main() {
 	defer rabbitConsumer.Shutdown()
 	log.Println("✓ RabbitMQ consumer initialized")
 
+	// Initialize RabbitMQ publisher for odin-api-wrapper
+	log.Println("Initializing RabbitMQ publisher for odin-api-wrapper...")
+	logger, _ := initLogger()
+	rabbitPublisher, err := publisher.NewRabbitMQPublisher(
+		cfg.RabbitMQURL,
+		cfg.Exchange,
+		cfg.RoutingKey,
+		logger,
+	)
+	if err != nil {
+		log.Fatalf("Failed to initialize RabbitMQ publisher: %v", err)
+	}
+	defer rabbitPublisher.Close()
+	log.Println("✓ RabbitMQ publisher initialized")
+
 	// Initialize Kafka consumer for trade-signals
 	log.Println("Initializing Kafka consumer...")
-	logger, _ := initLogger()
-	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo)
+	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, rabbitPublisher)
 	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger)
 	defer kafkaConsumer.Close()
 	log.Println("✓ Kafka consumer initialized")
