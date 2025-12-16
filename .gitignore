@@ -71,3 +71,6 @@ coverage.html
 # Documentation builds
 docs/_build/
 site/
+*.pdf
+*.json
+test.js

@@ -172,4 +172,16 @@ type TradeSignal struct {
 	Sentiment    string    `json:"sentiment"`
 	NewsCategory string    `json:"news_category"`
 	Timestamp    time.Time `json:"timestamp"`
+
+	// Frontend authentication data (passed from user credentials)
+	BearerToken string `json:"bearer_token"` // JWT bearer token from frontend
+	AppId       string `json:"app_id"`       // Application ID from frontend
+	Source      string `json:"source"`       // Source platform (IOS, AND, WEB)
+
+	// Stop loss configuration
+	StopLossType  string  `json:"stop_loss_type"`  // "FIXED" or "TRAILING"
+	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing stop loss percentage
+
+	// Product type
+	ProductType string `json:"product_type"` // INTRADAY, DELIVERY, CASH
 }

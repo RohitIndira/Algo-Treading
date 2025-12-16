@@ -36,6 +36,9 @@ func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStr
 		TradeConfig:         protoTradeConfigToModel(req.TradeConfig),
 		RiskLimits:          protoRiskLimitsToModel(req.RiskLimits),
 		ActivateImmediately: req.ActivateImmediately,
+		BearerToken:         req.BearerToken,
+		AppId:               req.AppId,
+		Source:              req.Source,
 	}
 
 	// Create strategy
@@ -364,6 +367,11 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 		cond.PriceRangeMax = &proto.PriceRange.MaxPrice
 	}
 
+	if proto.MarketCapRange != nil {
+		cond.MinMarketCap = &proto.MarketCapRange.MinMcap
+		cond.MaxMarketCap = &proto.MarketCapRange.MaxMcap
+	}
+
 	return cond
 }
 
@@ -382,6 +390,9 @@ func protoTradeConfigToModel(proto *pb.TradeConfig) *models.TradeConfig {
 		OrderSide:       proto.OrderSide.String(),
 		LimitPrice:      &proto.LimitPrice,
 		Validity:        proto.Validity,
+		StopLossType:    proto.StopLossType.String(),
+		TrailingSLPct:   &proto.TrailingSlPct,
+		ProductType:     proto.ProductType,
 	}
 
 	return config
@@ -399,6 +410,8 @@ func protoRiskLimitsToModel(proto *pb.RiskLimits) *models.RiskLimits {
 		MaxPortfolioExposurePct: &proto.MaxPortfolioExposurePct,
 		MaxPerTradeRisk:         &proto.MaxPerTradeRisk,
 		EnableRiskChecks:        proto.EnableRiskChecks,
+		EnableAutoSquareOff:     proto.EnableAutoSquareOff,
+		AutoSquareOffTime:       proto.AutoSquareOffTime,
 	}
 
 	return limits
@@ -484,11 +497,12 @@ func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
 	}
 
 	config := &pb.TradeConfig{
-		OrderType: common.OrderType(common.OrderType_value[model.OrderType]),
-		Quantity:  model.Quantity,
-		Exchange:  common.Exchange(common.Exchange_value[model.Exchange]),
-		OrderSide: common.OrderSide(common.OrderSide_value[model.OrderSide]),
-		Validity:  model.Validity,
+		OrderType:   common.OrderType(common.OrderType_value[model.OrderType]),
+		Quantity:    model.Quantity,
+		Exchange:    common.Exchange(common.Exchange_value[model.Exchange]),
+		OrderSide:   common.OrderSide(common.OrderSide_value[model.OrderSide]),
+		Validity:    model.Validity,
+		ProductType: model.ProductType,
 	}
 
 	if model.MaxPositionSize != nil {
@@ -503,6 +517,12 @@ func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
 	if model.LimitPrice != nil {
 		config.LimitPrice = *model.LimitPrice
 	}
+	if model.StopLossType != "" {
+		config.StopLossType = pb.StopLossType(pb.StopLossType_value[model.StopLossType])
+	}
+	if model.TrailingSLPct != nil {
+		config.TrailingSlPct = *model.TrailingSLPct
+	}
 
 	return config
 }
@@ -513,8 +533,10 @@ func modelRiskLimitsToProto(model *models.RiskLimits) *pb.RiskLimits {
 	}
 
 	limits := &pb.RiskLimits{
-		PositionSizing:   common.PositionSizing(common.PositionSizing_value[model.PositionSizing]),
-		EnableRiskChecks: model.EnableRiskChecks,
+		PositionSizing:      common.PositionSizing(common.PositionSizing_value[model.PositionSizing]),
+		EnableRiskChecks:    model.EnableRiskChecks,
+		EnableAutoSquareOff: model.EnableAutoSquareOff,
+		AutoSquareOffTime:   model.AutoSquareOffTime,
 	}
 
 	if model.MaxDailyTrades != nil {

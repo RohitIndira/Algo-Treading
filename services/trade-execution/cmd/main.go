@@ -16,7 +16,7 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/odin"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
@@ -49,15 +49,15 @@ func main() {
 	credsRepo := repository.NewCredentialsRepository(db)
 	log.Println("✓ Repository layer initialized")
 
-	// Initialize Odin client
-	odinClient := odin.NewExecutionClient(cfg.OdinBaseURL)
-	log.Println("✓ Odin API client initialized")
+	// Initialize Indira client (stateless, supports multiple users)
+	indiraClient := indira.NewExecutionClient()
+	log.Println("✓ Indira API client initialized")
 
 	// Initialize executor with credentials repository
 	orderExecutor := executor.NewOrderExecutor(
 		orderRepo,
 		credsRepo,
-		odinClient,
+		indiraClient,
 		cfg.MaxRetries,
 		cfg.RetryDelay,
 	)
@@ -178,7 +178,6 @@ type Config struct {
 	KafkaBrokers  []string
 	KafkaGroupID  string
 	KafkaTopic    string
-	OdinBaseURL   string
 	MaxRetries    int
 	RetryDelay    time.Duration
 	PostgresURL   string
@@ -204,7 +203,6 @@ func loadConfig() Config {
 		KafkaBrokers:  kafkaBrokers,
 		KafkaGroupID:  getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
 		KafkaTopic:    getEnv("KAFKA_TOPIC", "trade-signals"),
-		OdinBaseURL:   getEnv("ODIN_BASE_URL", ""),
 		MaxRetries:    getEnvInt("MAX_RETRIES", 3),
 		RetryDelay:    time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
 		PostgresURL:   buildPostgresURL(),
@@ -227,6 +225,11 @@ func initPostgres(cfg Config) (*sqlx.DB, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
+	// Verify required tables exist and give actionable errors if migrations haven't been applied
+	if err := checkRequiredTables(db); err != nil {
+		return nil, err
+	}
+
 	return db, nil
 }
 
@@ -237,7 +240,7 @@ func buildPostgresURL() string {
 		getEnv("POSTGRES_PORT", "5432"),
 		getEnv("POSTGRES_USER", "postgres"),
 		getEnv("POSTGRES_PASSWORD", "postgres"),
-		getEnv("POSTGRES_DB", "trading_db"),
+		getEnv("POSTGRES_DB", "trading_execution"),
 		getEnv("POSTGRES_SSL_MODE", "disable"),
 	)
 }
@@ -302,4 +305,27 @@ func trim(s string) string {
 
 func initLogger() (*zap.Logger, error) {
 	return zap.NewProduction()
+}
+
+// checkRequiredTables ensures critical tables for this service exist.
+// If they don't, return a helpful error message explaining how to run migrations.
+func checkRequiredTables(db *sqlx.DB) error {
+	var exists bool
+	query := `SELECT EXISTS (
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'orders'
+	)`
+
+	if err := db.Get(&exists, query); err != nil {
+		return fmt.Errorf("failed to check database schema: %w", err)
+	}
+
+	if !exists {
+		// Give an actionable error pointing to migration SQL and setup script
+		return fmt.Errorf("required table 'orders' does not exist in the database. " +
+			"Run the migration: `psql -h <host> -U <user> -d <db> -f services/trade-execution/migrations/001_create_orders_table.sql` " +
+			"or run `scripts/setup_all_databases.sh` to create databases and run migrations.")
+	}
+
+	return nil
 }

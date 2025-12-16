@@ -23,6 +23,11 @@ type Strategy struct {
 	Conditions   *StrategyCondition `json:"conditions,omitempty"`
 	TradeConfig  *TradeConfig       `json:"trade_config,omitempty"`
 	RiskLimits   *RiskLimits        `json:"risk_limits,omitempty"`
+
+	// Frontend authentication data (stored with strategy for order execution)
+	BearerToken string `db:"bearer_token" json:"bearer_token,omitempty"` // JWT bearer token
+	AppId       string `db:"app_id" json:"app_id,omitempty"`             // Application ID
+	Source      string `db:"source" json:"source,omitempty"`             // Source platform
 }
 
 // StrategyCondition represents the conditions for triggering a strategy
@@ -38,6 +43,8 @@ type StrategyCondition struct {
 	VolumeThreshold      *int64         `db:"volume_threshold" json:"volume_threshold,omitempty"`
 	PctChangeThreshold   *float64       `db:"pct_change_threshold" json:"pct_change_threshold,omitempty"`
 	Exchanges            pq.StringArray `db:"exchanges" json:"exchanges"`
+	MinMarketCap         *float64       `db:"min_market_cap" json:"min_market_cap,omitempty"` // Market cap filter in crores
+	MaxMarketCap         *float64       `db:"max_market_cap" json:"max_market_cap,omitempty"` // Market cap filter in crores
 	CreatedAt            time.Time      `db:"created_at" json:"created_at"`
 }
 
@@ -54,6 +61,9 @@ type TradeConfig struct {
 	OrderSide       string    `db:"order_side" json:"order_side"`
 	LimitPrice      *float64  `db:"limit_price" json:"limit_price,omitempty"`
 	Validity        string    `db:"validity" json:"validity"`
+	StopLossType    string    `db:"stop_loss_type" json:"stop_loss_type"`             // FIXED or TRAILING
+	TrailingSLPct   *float64  `db:"trailing_sl_pct" json:"trailing_sl_pct,omitempty"` // Trailing SL percentage
+	ProductType     string    `db:"product_type" json:"product_type"`                 // INTRADAY, DELIVERY, CASH
 	CreatedAt       time.Time `db:"created_at" json:"created_at"`
 }
 
@@ -67,6 +77,8 @@ type RiskLimits struct {
 	MaxPortfolioExposurePct *float64  `db:"max_portfolio_exposure_pct" json:"max_portfolio_exposure_pct,omitempty"`
 	MaxPerTradeRisk         *float64  `db:"max_per_trade_risk" json:"max_per_trade_risk,omitempty"`
 	EnableRiskChecks        bool      `db:"enable_risk_checks" json:"enable_risk_checks"`
+	EnableAutoSquareOff     bool      `db:"enable_auto_square_off" json:"enable_auto_square_off"` // Auto square-off at market close
+	AutoSquareOffTime       string    `db:"auto_square_off_time" json:"auto_square_off_time"`     // Time in HH:MM format (e.g., "15:05")
 	CreatedAt               time.Time `db:"created_at" json:"created_at"`
 }
 
@@ -79,6 +91,16 @@ type CreateStrategyRequest struct {
 	TradeConfig         *TradeConfig       `json:"trade_config" validate:"required"`
 	RiskLimits          *RiskLimits        `json:"risk_limits" validate:"required"`
 	ActivateImmediately bool               `json:"activate_immediately"`
+
+	// Frontend authentication data (from HTTP headers, stored with strategy)
+	BearerToken string `json:"bearer_token,omitempty"`
+	AppId       string `json:"app_id,omitempty"`
+	Source      string `json:"source,omitempty"`
+
+	IndiraUserID  string `json:"indira_user_id"`  // e.g., "ISPL19122"
+    IndiraAppID   string `json:"indira_app_id"`   // Application ID from frontend
+    IndiraSource  string `json:"indira_source"`   // "IOS", "AND", or "WEB"
+    IndiraToken   string `json:"indira_token"`    // JWT bearer token
 }
 
 // UpdateStrategyRequest represents a request to update a strategy

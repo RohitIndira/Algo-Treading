@@ -1,50 +1,3 @@
-// package middleware
-
-// import (
-// 	"net/http"
-// 	"strings"
-// )
-
-// type CORSConfig struct {
-// 	AllowedOrigins []string
-// 	AllowedMethods []string
-// 	AllowedHeaders []string
-// }
-
-// func CORS(config CORSConfig) func(http.Handler) http.Handler {
-// 	return func(next http.Handler) http.Handler {
-// 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-// 			origin := r.Header.Get("Origin")
-
-// 			// Check if origin is allowed
-// 			allowed := false
-// 			for _, allowedOrigin := range config.AllowedOrigins {
-// 				if allowedOrigin == "*" || allowedOrigin == origin {
-// 					allowed = true
-// 					break
-// 				}
-// 			}
-
-// 			if allowed {
-// 				w.Header().Set("Access-Control-Allow-Origin", origin)
-// 			}
-
-// 			w.Header().Set("Access-Control-Allow-Methods", strings.Join(config.AllowedMethods, ", "))
-// 			w.Header().Set("Access-Control-Allow-Headers", strings.Join(config.AllowedHeaders, ", "))
-// 			w.Header().Set("Access-Control-Allow-Credentials", "true")
-// 			w.Header().Set("Access-Control-Max-Age", "3600")
-
-// 			// Handle preflight request
-// 			if r.Method == http.MethodOptions {
-// 				w.WriteHeader(http.StatusNoContent)
-// 				return
-// 			}
-
-// 			next.ServeHTTP(w, r)
-// 		})
-// 	}
-// }
-
 package middleware
 
 import (
@@ -102,7 +55,6 @@ func CORS(config CORSConfig) func(http.Handler) http.Handler {
 				}
 			}
 
-<<<<<<< HEAD
 			if allowedOrigin == "" && origin != "" {
 				log.Printf("CORS: origin not allowed: %s (configured origins: %v)", origin, config.AllowedOrigins)
 			}
@@ -111,15 +63,10 @@ func CORS(config CORSConfig) func(http.Handler) http.Handler {
 			if allowedOrigin != "" {
 				w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
-=======
-			if allowedOrigin != "" {
-				w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
->>>>>>> bd5fcc654ce28667544a6438717669dd97a30fc1
 			}
 
 			w.Header().Set("Access-Control-Allow-Methods", strings.Join(config.AllowedMethods, ", "))
 			w.Header().Set("Access-Control-Allow-Headers", strings.Join(config.AllowedHeaders, ", "))
-<<<<<<< HEAD
 			w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 
@@ -130,14 +77,6 @@ func CORS(config CORSConfig) func(http.Handler) http.Handler {
 				} else {
 					w.WriteHeader(http.StatusForbidden)
 				}
-=======
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-			w.Header().Set("Access-Control-Max-Age", "3600")
-
-			// Preflight request (OPTIONS)
-			if r.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusNoContent)
->>>>>>> bd5fcc654ce28667544a6438717669dd97a30fc1
 				return
 			}
 

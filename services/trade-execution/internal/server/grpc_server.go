@@ -279,8 +279,8 @@ func (s *Server) convertToProtoOrder(order *models.Order) *pb.Order {
 	if order.FilledPrice != nil {
 		protoOrder.FilledPrice = *order.FilledPrice
 	}
-	if order.OdinOrderID != nil {
-		protoOrder.OdinOrderId = *order.OdinOrderID
+	if order.IndiraOrderID != nil {
+		protoOrder.IndiraOrderId = *order.IndiraOrderID
 	}
 	if order.Commission != nil {
 		protoOrder.Commission = *order.Commission

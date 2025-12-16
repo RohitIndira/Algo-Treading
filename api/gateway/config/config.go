@@ -22,8 +22,7 @@ type ServerConfig struct {
 }
 
 type ServicesConfig struct {
-	UserConfigAddr      string
-	UserLoginServiceURL string
+	UserConfigAddr string
 }
 
 type CORSConfig struct {
@@ -49,8 +48,7 @@ func Load() (*Config, error) {
 			GRPCTimeout: grpcTimeout,
 		},
 		Services: ServicesConfig{
-			UserConfigAddr:      getEnv("USER_CONFIG_GRPC_ADDR", "localhost:50051"),
-			UserLoginServiceURL: getEnv("USER_LOGIN_SERVICE_URL", "http://localhost:8002"),
+			UserConfigAddr: getEnv("USER_CONFIG_GRPC_ADDR", "localhost:50051"),
 		},
 		CORS: CORSConfig{
 			AllowedOrigins: strings.Split(getEnv("CORS_ALLOWED_ORIGINS", "*"), ","),

@@ -6,32 +6,35 @@ import (
 	"log"
 	"time"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/odin"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 )
 
 // OrderExecutor handles order execution logic
 type OrderExecutor struct {
-	repo       repository.OrderRepository
-	credsRepo  repository.CredentialsRepository
-	odinClient *odin.ExecutionClient
-	maxRetries int
-	retryDelay time.Duration
+	repo         repository.OrderRepository
+	credsRepo    repository.CredentialsRepository
+	indiraClient *indira.ExecutionClient
+	maxRetries   int
+	retryDelay   time.Duration
 }
 
 // NewOrderExecutor creates a new order executor
-func NewOrderExecutor(repo repository.OrderRepository, credsRepo repository.CredentialsRepository, odinClient *odin.ExecutionClient, maxRetries int, retryDelay time.Duration) *OrderExecutor {
+func NewOrderExecutor(repo repository.OrderRepository, credsRepo repository.CredentialsRepository, indiraClient *indira.ExecutionClient, maxRetries int, retryDelay time.Duration) *OrderExecutor {
 	return &OrderExecutor{
-		repo:       repo,
-		credsRepo:  credsRepo,
-		odinClient: odinClient,
-		maxRetries: maxRetries,
-		retryDelay: retryDelay,
+		repo:         repo,
+		credsRepo:    credsRepo,
+		indiraClient: indiraClient,
+		maxRetries:   maxRetries,
+		retryDelay:   retryDelay,
 	}
 }
 
 // ExecuteOrder processes and executes an order
+// In services/trade-execution/internal/executor/executor.go
+
 func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) error {
 	log.Printf("Executing order %s for user %s", order.OrderID, order.UserID)
 
@@ -47,13 +50,18 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 		return fmt.Errorf("failed to update order status to PENDING: %w", err)
 	}
 
-	// Fetch user credentials from database
-	creds, err := e.credsRepo.GetUserCredentials(ctx, order.UserID)
-	if err != nil {
-		return e.failOrder(ctx, order, fmt.Sprintf("Failed to fetch user credentials: %v", err))
+	// Get Indira credentials from the order (passed from frontend)
+	// Note: UserID is a non-pointer string on the Order model
+	if order.UserID == "" || order.AppId == nil || order.Source == nil || order.BearerToken == nil {
+		return e.failOrder(ctx, order, "Missing Indira Securities authentication data")
 	}
 
-	log.Printf("Retrieved credentials for user %s (Odin ID: %s)", order.UserID, creds.APIKEY)
+	auth := &indiraClient.AuthContext{
+		UserId:      order.UserID,
+		AppId:       *order.AppId,
+		Source:      *order.Source,
+		BearerToken: *order.BearerToken,
+	}
 
 	// Execute order with retries
 	var lastErr error
@@ -65,8 +73,8 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 			time.Sleep(delay)
 		}
 
-		// Place order via Odin with user's credentials
-		orderID, err := e.odinClient.PlaceOrderWithCredentials(ctx, order, creds.APIKEY, creds.PasswordEncrypted, creds.TOTPSecret)
+		// Place order via Indira API
+		orderID, err := e.indiraClient.PlaceOrder(ctx, order, auth)
 		if err != nil {
 			lastErr = err
 			order.RetryCount++
@@ -74,8 +82,8 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 			continue
 		}
 
-		// Order placed successfully - store the Odin order ID
-		order.OdinOrderID = &orderID
+		// Order placed successfully - store the Indira order ID
+		order.IndiraOrderID = &orderID
 		return e.handleSuccessfulPlacement(ctx, order, orderID)
 	}
 
@@ -84,13 +92,13 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 	return e.failOrder(ctx, order, fmt.Sprintf("Max retries exceeded: %v", lastErr))
 }
 
-func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *models.Order, odinOrderID string) error {
+func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *models.Order, indiraOrderID string) error {
 	now := time.Now()
 	order.Status = models.StatusSubmitted
 	order.SubmittedAt = &now
 
-	// Store the Odin order ID returned from API
-	order.OdinOrderID = &odinOrderID
+	// Store the Indira order ID returned from API
+	order.IndiraOrderID = &indiraOrderID
 
 	if err := e.repo.Update(ctx, order); err != nil {
 		return fmt.Errorf("failed to update order after placement: %w", err)
@@ -98,11 +106,11 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 
 	// Record execution event
 	e.repo.RecordExecutionEvent(ctx, order.OrderID, "SUBMITTED", map[string]interface{}{
-		"odin_order_id": odinOrderID,
-		"timestamp":     now,
+		"indira_order_id": indiraOrderID,
+		"timestamp":       now,
 	})
 
-	log.Printf("Order %s submitted successfully with odin_order_id: %s", order.OrderID, odinOrderID)
+	log.Printf("Order %s submitted successfully with indira_order_id: %s", order.OrderID, indiraOrderID)
 	return nil
 }
 
@@ -122,7 +130,7 @@ func (e *OrderExecutor) rejectOrder(ctx context.Context, order *models.Order, re
 		"timestamp": time.Now(),
 	})
 
-	return nil
+	return fmt.Errorf("order rejected: %s", reason)
 }
 
 func (e *OrderExecutor) failOrder(ctx context.Context, order *models.Order, errorMsg string) error {
@@ -141,26 +149,38 @@ func (e *OrderExecutor) failOrder(ctx context.Context, order *models.Order, erro
 		"timestamp": time.Now(),
 	})
 
-	return nil
+	return fmt.Errorf("order failed: %s", errorMsg)
 }
 
-// PollOrderStatus polls Odin for order status updates
+// PollOrderStatus polls Indira for order status updates
 func (e *OrderExecutor) PollOrderStatus(ctx context.Context, order *models.Order) error {
-	if order.OdinOrderID == nil {
-		return fmt.Errorf("no Odin order ID for order %s", order.OrderID)
+	if order.IndiraOrderID == nil {
+		return fmt.Errorf("no Indira order ID for order %s", order.OrderID)
 	}
 
-	log.Printf("Polling status for order %s (odin_order_id: %s)", order.OrderID, *order.OdinOrderID)
+	log.Printf("Polling status for order %s (indira_order_id: %s)", order.OrderID, *order.IndiraOrderID)
 
-	_, err := e.odinClient.GetOrderStatus(ctx, string(order.Exchange), *order.OdinOrderID, order.UserID)
+	// Need AuthContext to poll status
+	if order.BearerToken == nil || order.AppId == nil || order.Source == nil {
+		return fmt.Errorf("missing authentication data for status polling")
+	}
+
+	auth := &indiraClient.AuthContext{
+		UserId:      order.UserID,
+		BearerToken: *order.BearerToken,
+		AppId:       *order.AppId,
+		Source:      *order.Source,
+	}
+
+	_, err := e.indiraClient.GetOrderStatus(ctx, *order.IndiraOrderID, auth)
 	if err != nil {
 		return fmt.Errorf("failed to get order status: %w", err)
 	}
 
 	// TODO: Parse response and update order based on status
-	// This depends on the actual Odin API response structure
+	// This depends on the actual Indira API response structure
 
-	log.Printf("Order %s status updated from Odin API", order.OrderID)
+	log.Printf("Order %s status updated from Indira API", order.OrderID)
 	return e.repo.Update(ctx, order)
 }
 
@@ -173,12 +193,24 @@ func (e *OrderExecutor) CancelOrder(ctx context.Context, order *models.Order, re
 		return fmt.Errorf("order cannot be cancelled (status: %s)", order.Status)
 	}
 
-	// If order has been submitted to Odin, cancel it there too
-	if order.OdinOrderID != nil {
-		err := e.odinClient.CancelOrder(ctx, string(order.Exchange), *order.OdinOrderID, order.UserID)
-		if err != nil {
-			log.Printf("Failed to cancel order on Odin: %v", err)
-			// Continue with local cancellation even if Odin fails
+	// If order has been submitted to Indira, cancel it there too
+	if order.IndiraOrderID != nil {
+		// Need AuthContext to cancel
+		if order.BearerToken != nil && order.AppId != nil && order.Source != nil {
+			auth := &indiraClient.AuthContext{
+				UserId:      order.UserID,
+				BearerToken: *order.BearerToken,
+				AppId:       *order.AppId,
+				Source:      *order.Source,
+			}
+
+			err := e.indiraClient.CancelOrder(ctx, string(order.Exchange), *order.IndiraOrderID, order.Symbol, auth)
+			if err != nil {
+				log.Printf("Failed to cancel order on Indira: %v", err)
+				// Continue with local cancellation even if Indira fails
+			}
+		} else {
+			log.Printf("Warning: Cannot cancel order on Indira - missing auth data")
 		}
 	}
 

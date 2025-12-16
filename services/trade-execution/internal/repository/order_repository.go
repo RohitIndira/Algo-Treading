@@ -22,6 +22,8 @@ type OrderRepository interface {
 	GetOrdersByStatus(ctx context.Context, status models.OrderStatus, limit int) ([]*models.Order, error)
 	UpdateStatus(ctx context.Context, orderID uuid.UUID, status models.OrderStatus) error
 	RecordExecutionEvent(ctx context.Context, orderID uuid.UUID, eventType string, eventData map[string]interface{}) error
+	GetOpenOrders(ctx context.Context) ([]*models.Order, error)
+	GetTrailingStopLossOrders(ctx context.Context) ([]*models.Order, error)
 }
 
 type orderRepository struct {
@@ -78,7 +80,7 @@ func (r *orderRepository) Update(ctx context.Context, order *models.Order) error
 	`
 
 	result, err := r.db.ExecContext(ctx, query,
-		order.Status, order.OdinOrderID, order.OdinResponse,
+		order.Status, order.IndiraOrderID, order.IndiraResponse,
 		order.FilledQuantity, order.FilledPrice, order.Commission,
 		order.TotalCost, order.SubmittedAt, order.ExecutedAt,
 		order.ErrorMessage, order.RejectionReason, order.RetryCount,
@@ -208,4 +210,42 @@ func (r *orderRepository) RecordExecutionEvent(ctx context.Context, orderID uuid
 	}
 
 	return nil
+}
+
+// GetOpenOrders retrieves all FILLED or PARTIALLY_FILLED INTRADAY orders
+func (r *orderRepository) GetOpenOrders(ctx context.Context) ([]*models.Order, error) {
+	var orders []*models.Order
+	query := `
+		SELECT * FROM orders 
+		WHERE status IN ('FILLED', 'PARTIALLY_FILLED')
+		AND product_type = 'INTRADAY'
+		AND is_square_off_order = false
+		ORDER BY created_at ASC
+	`
+
+	err := r.db.SelectContext(ctx, &orders, query)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get open orders: %w", err)
+	}
+
+	return orders, nil
+}
+
+// GetTrailingStopLossOrders retrieves all orders with trailing stop loss enabled
+func (r *orderRepository) GetTrailingStopLossOrders(ctx context.Context) ([]*models.Order, error) {
+	var orders []*models.Order
+	query := `
+		SELECT * FROM orders 
+		WHERE status IN ('FILLED', 'PARTIALLY_FILLED')
+		AND stop_loss_type = 'TRAILING'
+		AND trailing_sl_pct > 0
+		ORDER BY created_at ASC
+	`
+
+	err := r.db.SelectContext(ctx, &orders, query)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get trailing stop loss orders: %w", err)
+	}
+
+	return orders, nil
 }

@@ -36,16 +36,20 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		Description:  req.Description,
 		Active:       req.ActivateImmediately,
 		Version:      1,
+		BearerToken:  req.BearerToken,
+		AppId:        req.AppId,
+		Source:       req.Source,
 	}
 
 	query := `
-		INSERT INTO strategies (strategy_id, user_id, strategy_name, description, active, version)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO strategies (strategy_id, user_id, strategy_name, description, active, version, bearer_token, app_id, source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING created_at, updated_at`
 
 	err = tx.QueryRowxContext(ctx, query,
 		strategy.StrategyID, strategy.UserID, strategy.StrategyName,
 		strategy.Description, strategy.Active, strategy.Version,
+		strategy.BearerToken, strategy.AppId, strategy.Source,
 	).Scan(&strategy.CreatedAt, &strategy.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert strategy: %w", err)
@@ -58,8 +62,8 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			INSERT INTO strategy_conditions (
 				condition_id, strategy_id, impact_score_threshold, sentiments, categories,
 				stock_codes, price_range_min, price_range_max, volume_threshold,
-				pct_change_threshold, exchanges
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				pct_change_threshold, exchanges, min_market_cap, max_market_cap
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, condQuery,
@@ -67,7 +71,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
 			req.Conditions.PriceRangeMin, req.Conditions.PriceRangeMax,
 			req.Conditions.VolumeThreshold, req.Conditions.PctChangeThreshold,
-			req.Conditions.Exchanges,
+			req.Conditions.Exchanges, req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap,
 		).Scan(&req.Conditions.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert conditions: %w", err)
@@ -83,8 +87,9 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		tradeQuery := `
 			INSERT INTO trade_configs (
 				trade_config_id, strategy_id, order_type, quantity, max_position_size,
-				stop_loss_pct, take_profit_pct, exchange, order_side, limit_price, validity
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				stop_loss_pct, take_profit_pct, exchange, order_side, limit_price, validity,
+				stop_loss_type, trailing_sl_pct, product_type
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, tradeQuery,
@@ -93,6 +98,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
 			req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
 			req.TradeConfig.LimitPrice, req.TradeConfig.Validity,
+			req.TradeConfig.StopLossType, req.TradeConfig.TrailingSLPct, req.TradeConfig.ProductType,
 		).Scan(&req.TradeConfig.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert trade config: %w", err)
@@ -108,15 +114,16 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		riskQuery := `
 			INSERT INTO risk_limits (
 				risk_limit_id, strategy_id, max_daily_trades, max_loss_per_day,
-				position_sizing, max_portfolio_exposure_pct, max_per_trade_risk, enable_risk_checks
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				position_sizing, max_portfolio_exposure_pct, max_per_trade_risk, enable_risk_checks,
+				enable_auto_square_off, auto_square_off_time
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, riskQuery,
 			riskLimitID, strategy.StrategyID, req.RiskLimits.MaxDailyTrades,
 			req.RiskLimits.MaxLossPerDay, req.RiskLimits.PositionSizing,
 			req.RiskLimits.MaxPortfolioExposurePct, req.RiskLimits.MaxPerTradeRisk,
-			req.RiskLimits.EnableRiskChecks,
+			req.RiskLimits.EnableRiskChecks, req.RiskLimits.EnableAutoSquareOff, req.RiskLimits.AutoSquareOffTime,
 		).Scan(&req.RiskLimits.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert risk limits: %w", err)
@@ -151,7 +158,7 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 	condition := &models.StrategyCondition{}
 	condQuery := `SELECT condition_id, strategy_id, impact_score_threshold, sentiments, categories, 
 		stock_codes, price_range_min, price_range_max, volume_threshold, pct_change_threshold, 
-		exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
+		exchanges, min_market_cap, max_market_cap, created_at FROM strategy_conditions WHERE strategy_id = $1`
 	err = r.db.QueryRowContext(ctx, condQuery, strategyID).Scan(
 		&condition.ConditionID,
 		&condition.StrategyID,
@@ -164,6 +171,8 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 		&condition.VolumeThreshold,
 		&condition.PctChangeThreshold,
 		&condition.Exchanges,
+		&condition.MinMarketCap,
+		&condition.MaxMarketCap,
 		&condition.CreatedAt,
 	)
 	if err != nil && err != sql.ErrNoRows {
@@ -176,7 +185,8 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 	// Get trade config
 	tradeConfig := &models.TradeConfig{}
 	tradeQuery := `SELECT trade_config_id, strategy_id, order_type, quantity, max_position_size, 
-		stop_loss_pct, take_profit_pct, exchange, order_side, limit_price, validity, created_at 
+		stop_loss_pct, take_profit_pct, exchange, order_side, limit_price, validity, 
+		stop_loss_type, trailing_sl_pct, product_type, created_at 
 		FROM trade_configs WHERE strategy_id = $1`
 	err = r.db.QueryRowContext(ctx, tradeQuery, strategyID).Scan(
 		&tradeConfig.TradeConfigID,
@@ -190,6 +200,9 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 		&tradeConfig.OrderSide,
 		&tradeConfig.LimitPrice,
 		&tradeConfig.Validity,
+		&tradeConfig.StopLossType,
+		&tradeConfig.TrailingSLPct,
+		&tradeConfig.ProductType,
 		&tradeConfig.CreatedAt,
 	)
 	if err != nil && err != sql.ErrNoRows {
@@ -202,7 +215,8 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 	// Get risk limits
 	riskLimits := &models.RiskLimits{}
 	riskQuery := `SELECT risk_limit_id, strategy_id, max_daily_trades, max_loss_per_day, 
-		position_sizing, max_portfolio_exposure_pct, max_per_trade_risk, enable_risk_checks, created_at 
+		position_sizing, max_portfolio_exposure_pct, max_per_trade_risk, enable_risk_checks, 
+		enable_auto_square_off, auto_square_off_time, created_at 
 		FROM risk_limits WHERE strategy_id = $1`
 	err = r.db.QueryRowContext(ctx, riskQuery, strategyID).Scan(
 		&riskLimits.RiskLimitID,
@@ -213,6 +227,8 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 		&riskLimits.MaxPortfolioExposurePct,
 		&riskLimits.MaxPerTradeRisk,
 		&riskLimits.EnableRiskChecks,
+		&riskLimits.EnableAutoSquareOff,
+		&riskLimits.AutoSquareOffTime,
 		&riskLimits.CreatedAt,
 	)
 	if err != nil && err != sql.ErrNoRows {
@@ -262,7 +278,7 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 		condition := &models.StrategyCondition{}
 		condQuery := `SELECT condition_id, strategy_id, impact_score_threshold, sentiments, categories, 
 			stock_codes, price_range_min, price_range_max, volume_threshold, pct_change_threshold, 
-			exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
+			exchanges, min_market_cap, max_market_cap, created_at FROM strategy_conditions WHERE strategy_id = $1`
 		err = r.db.QueryRowContext(ctx, condQuery, strategy.StrategyID).Scan(
 			&condition.ConditionID,
 			&condition.StrategyID,
@@ -275,6 +291,8 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 			&condition.VolumeThreshold,
 			&condition.PctChangeThreshold,
 			&condition.Exchanges,
+			&condition.MinMarketCap,
+			&condition.MaxMarketCap,
 			&condition.CreatedAt,
 		)
 		if err == nil {
@@ -284,7 +302,8 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 		// Load trade config
 		tradeConfig := &models.TradeConfig{}
 		tradeQuery := `SELECT trade_config_id, strategy_id, order_type, quantity, max_position_size, 
-			stop_loss_pct, take_profit_pct, exchange, order_side, limit_price, validity, created_at 
+			stop_loss_pct, take_profit_pct, exchange, order_side, limit_price, validity, 
+			stop_loss_type, trailing_sl_pct, product_type, created_at 
 			FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.QueryRowContext(ctx, tradeQuery, strategy.StrategyID).Scan(
 			&tradeConfig.TradeConfigID,
@@ -298,6 +317,9 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 			&tradeConfig.OrderSide,
 			&tradeConfig.LimitPrice,
 			&tradeConfig.Validity,
+			&tradeConfig.StopLossType,
+			&tradeConfig.TrailingSLPct,
+			&tradeConfig.ProductType,
 			&tradeConfig.CreatedAt,
 		)
 		if err == nil {
@@ -307,7 +329,8 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 		// Load risk limits
 		riskLimits := &models.RiskLimits{}
 		riskQuery := `SELECT risk_limit_id, strategy_id, max_daily_trades, max_loss_per_day, 
-			position_sizing, max_portfolio_exposure_pct, max_per_trade_risk, enable_risk_checks, created_at 
+			position_sizing, max_portfolio_exposure_pct, max_per_trade_risk, enable_risk_checks, 
+			enable_auto_square_off, auto_square_off_time, created_at 
 			FROM risk_limits WHERE strategy_id = $1`
 		err = r.db.QueryRowContext(ctx, riskQuery, strategy.StrategyID).Scan(
 			&riskLimits.RiskLimitID,
@@ -318,6 +341,8 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 			&riskLimits.MaxPortfolioExposurePct,
 			&riskLimits.MaxPerTradeRisk,
 			&riskLimits.EnableRiskChecks,
+			&riskLimits.EnableAutoSquareOff,
+			&riskLimits.AutoSquareOffTime,
 			&riskLimits.CreatedAt,
 		)
 		if err == nil {
@@ -506,7 +531,7 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 		condition := &models.StrategyCondition{}
 		condQuery := `SELECT condition_id, strategy_id, impact_score_threshold, sentiments, categories, 
 			stock_codes, price_range_min, price_range_max, volume_threshold, pct_change_threshold, 
-			exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
+			exchanges, min_market_cap, max_market_cap, created_at FROM strategy_conditions WHERE strategy_id = $1`
 		err = r.db.QueryRowContext(ctx, condQuery, strategy.StrategyID).Scan(
 			&condition.ConditionID,
 			&condition.StrategyID,
@@ -519,6 +544,8 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 			&condition.VolumeThreshold,
 			&condition.PctChangeThreshold,
 			&condition.Exchanges,
+			&condition.MinMarketCap,
+			&condition.MaxMarketCap,
 			&condition.CreatedAt,
 		)
 		if err == nil {
@@ -528,7 +555,8 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 		// Load trade config
 		tradeConfig := &models.TradeConfig{}
 		tradeQuery := `SELECT trade_config_id, strategy_id, order_type, quantity, max_position_size, 
-			stop_loss_pct, take_profit_pct, exchange, order_side, limit_price, validity, created_at 
+			stop_loss_pct, take_profit_pct, exchange, order_side, limit_price, validity, 
+			stop_loss_type, trailing_sl_pct, product_type, created_at 
 			FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.QueryRowContext(ctx, tradeQuery, strategy.StrategyID).Scan(
 			&tradeConfig.TradeConfigID,
@@ -542,6 +570,9 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 			&tradeConfig.OrderSide,
 			&tradeConfig.LimitPrice,
 			&tradeConfig.Validity,
+			&tradeConfig.StopLossType,
+			&tradeConfig.TrailingSLPct,
+			&tradeConfig.ProductType,
 			&tradeConfig.CreatedAt,
 		)
 		if err == nil {
@@ -551,7 +582,8 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 		// Load risk limits
 		riskLimits := &models.RiskLimits{}
 		riskQuery := `SELECT risk_limit_id, strategy_id, max_daily_trades, max_loss_per_day, 
-			position_sizing, max_portfolio_exposure_pct, max_per_trade_risk, enable_risk_checks, created_at 
+			position_sizing, max_portfolio_exposure_pct, max_per_trade_risk, enable_risk_checks, 
+			enable_auto_square_off, auto_square_off_time, created_at 
 			FROM risk_limits WHERE strategy_id = $1`
 		err = r.db.QueryRowContext(ctx, riskQuery, strategy.StrategyID).Scan(
 			&riskLimits.RiskLimitID,
@@ -562,6 +594,8 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 			&riskLimits.MaxPortfolioExposurePct,
 			&riskLimits.MaxPerTradeRisk,
 			&riskLimits.EnableRiskChecks,
+			&riskLimits.EnableAutoSquareOff,
+			&riskLimits.AutoSquareOffTime,
 			&riskLimits.CreatedAt,
 		)
 		if err == nil {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
@@ -26,6 +27,30 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 	var req pb.CreateStrategyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	// Extract authentication headers from frontend
+	bearerToken := r.Header.Get("Authorization")
+	if bearerToken != "" {
+		// Remove "Bearer " prefix if present
+		bearerToken = strings.TrimPrefix(bearerToken, "Bearer ")
+		req.BearerToken = bearerToken
+	}
+
+	appId := r.Header.Get("appId")
+	if appId != "" {
+		req.AppId = appId
+	}
+
+	source := r.Header.Get("source")
+	if source != "" {
+		req.Source = source
+	}
+
+	// Validate authentication data
+	if req.BearerToken == "" || req.AppId == "" || req.Source == "" {
+		respondWithError(w, http.StatusBadRequest, "Missing authentication headers: Authorization, appId, and source are required")
 		return
 	}
 

@@ -25,9 +25,10 @@ const (
 type OrderType string
 
 const (
-	OrderTypeMarket   OrderType = "MARKET"
-	OrderTypeLimit    OrderType = "LIMIT"
-	OrderTypeStopLoss OrderType = "STOP_LOSS"
+	OrderTypeMarket         OrderType = "MARKET"
+	OrderTypeLimit          OrderType = "LIMIT"
+	OrderTypeStopLoss       OrderType = "STOP_LOSS"
+	OrderTypeStopLossMarket OrderType = "SL-M" // Stop Loss Market
 )
 
 // OrderSide represents buy or sell
@@ -69,14 +70,31 @@ type Order struct {
 	TakeProfit *float64 `json:"take_profit,omitempty" db:"take_profit"`
 
 	// Order validity
-	Validity string `json:"validity" db:"validity"`
+	Validity    string `json:"validity" db:"validity"`
+	ProductType string `json:"product_type" db:"product_type"` // INTRADAY, DELIVERY, CASH
+
+	// Additional order parameters
+	TargetPrice *float64 `json:"target_price,omitempty" db:"target_price"` // For bracket orders
 
 	// Order status
 	Status OrderStatus `json:"status" db:"status"`
 
-	// Odin API integration
-	OdinOrderID  *string `json:"odin_order_id,omitempty" db:"odin_order_id"`
-	OdinResponse *string `json:"odin_response,omitempty" db:"odin_response"`
+	// Broker API integration (Indira Securities)
+	IndiraOrderID  *string `json:"indira_order_id,omitempty" db:"indira_order_id"` // Indira API order ID
+	IndiraResponse *string `json:"indira_response,omitempty" db:"indira_response"` // Indira API response
+
+	// Frontend auth data (passed from frontend for Indira API calls)
+	BearerToken *string `json:"bearer_token,omitempty" db:"bearer_token"` // JWT bearer token from frontend
+	AppId       *string `json:"app_id,omitempty" db:"app_id"`             // Application ID from frontend
+	Source      *string `json:"source,omitempty" db:"source"`             // Source platform (IOS, AND, WEB)
+
+	// Stop loss configuration
+	StopLossType  *string  `json:"stop_loss_type,omitempty" db:"stop_loss_type"`   // FIXED or TRAILING
+	TrailingSLPct *float64 `json:"trailing_sl_pct,omitempty" db:"trailing_sl_pct"` // Trailing SL percentage
+	HighestPrice  *float64 `json:"highest_price,omitempty" db:"highest_price"`     // Highest price for trailing SL
+
+	// Auto square-off flag
+	IsSquareOffOrder bool `json:"is_square_off_order" db:"is_square_off_order"` // Flag for auto square-off orders
 
 	// Execution details
 	FilledQuantity int32    `json:"filled_quantity" db:"filled_quantity"`
@@ -121,6 +139,16 @@ type OrderRequest struct {
 	RiskScore    *float64  `json:"risk_score,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
 	RetryCount   int32     `json:"retry_count"`
+
+	// Frontend authentication data (from user credentials/strategy)
+	BearerToken string `json:"bearer_token"` // JWT bearer token
+	AppId       string `json:"app_id"`       // Application ID
+	Source      string `json:"source"`       // Source platform (IOS, AND, WEB)
+
+	// Additional fields from strategy
+	StopLossType  string  `json:"stop_loss_type"`  // "FIXED" or "TRAILING"
+	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing stop loss percentage
+	ProductType   string  `json:"product_type"`    // INTRADAY, DELIVERY, CASH
 }
 
 // ExecutionEvent represents an order execution event

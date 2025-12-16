@@ -16,24 +16,36 @@ type Strategy struct {
 	RiskLimits   RiskLimits  `json:"risk_limits" bson:"risk_limits"`
 	CreatedAt    time.Time   `json:"created_at" bson:"created_at"`
 	UpdatedAt    time.Time   `json:"updated_at" bson:"updated_at"`
+
+	// Frontend authentication data (stored with strategy)
+	BearerToken string `json:"bearer_token" bson:"bearer_token"` // JWT bearer token
+	AppId       string `json:"app_id" bson:"app_id"`             // Application ID
+	Source      string `json:"source" bson:"source"`             // Source platform
 }
 
 // Conditions represents the conditions for a strategy
 type Conditions struct {
-	MatchAllNews         bool       `json:"match_all_news" bson:"match_all_news"`
-	ImpactScoreThreshold int32      `json:"impact_score_threshold" bson:"impact_score_threshold"`
-	Sentiments           []string   `json:"sentiments" bson:"sentiments"`
-	Categories           []string   `json:"categories" bson:"categories"`
-	Stocks               []int64    `json:"stocks" bson:"stocks"`
-	PriceRange           PriceRange `json:"price_range" bson:"price_range"`
-	VolumeThreshold      int64      `json:"volume_threshold" bson:"volume_threshold"`
-	PctChangeThreshold   float64    `json:"pct_change_threshold" bson:"pct_change_threshold"`
+	MatchAllNews         bool           `json:"match_all_news" bson:"match_all_news"`
+	ImpactScoreThreshold int32          `json:"impact_score_threshold" bson:"impact_score_threshold"`
+	Sentiments           []string       `json:"sentiments" bson:"sentiments"`
+	Categories           []string       `json:"categories" bson:"categories"`
+	Stocks               []int64        `json:"stocks" bson:"stocks"`
+	PriceRange           PriceRange     `json:"price_range" bson:"price_range"`
+	VolumeThreshold      int64          `json:"volume_threshold" bson:"volume_threshold"`
+	PctChangeThreshold   float64        `json:"pct_change_threshold" bson:"pct_change_threshold"`
+	MarketCapRange       MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
 }
 
 // PriceRange represents price range filter
 type PriceRange struct {
 	MinPrice float64 `json:"min_price" bson:"min_price"`
 	MaxPrice float64 `json:"max_price" bson:"max_price"`
+}
+
+// MarketCapRange represents market cap range filter (in crores)
+type MarketCapRange struct {
+	MinMcap float64 `json:"min_mcap" bson:"min_mcap"` // Minimum market cap in crores
+	MaxMcap float64 `json:"max_mcap" bson:"max_mcap"` // Maximum market cap in crores
 }
 
 // TradeConfig represents trade configuration
@@ -44,15 +56,20 @@ type TradeConfig struct {
 	StopLossPct     float64 `json:"stop_loss_pct" bson:"stop_loss_pct"`
 	TakeProfitPct   float64 `json:"take_profit_pct" bson:"take_profit_pct"`
 	Exchange        string  `json:"exchange" bson:"exchange"`
+	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING
+	TrailingSLPct   float64 `json:"trailing_sl_pct" bson:"trailing_sl_pct"` // Trailing SL percentage
+	ProductType     string  `json:"product_type" bson:"product_type"`       // INTRADAY, DELIVERY, CASH
 }
 
 // RiskLimits represents risk limits
 type RiskLimits struct {
-	MaxDailyTrades  int32   `json:"max_daily_trades" bson:"max_daily_trades"`
-	MaxLossPerDay   float64 `json:"max_loss_per_day" bson:"max_loss_per_day"`
-	MaxPositionSize float64 `json:"max_position_size" bson:"max_position_size"`
-	MaxPerTradeRisk float64 `json:"max_per_trade_risk" bson:"max_per_trade_risk"`
-	PositionSizing  string  `json:"position_sizing" bson:"position_sizing"` // FIXED, PERCENTAGE
+	MaxDailyTrades      int32   `json:"max_daily_trades" bson:"max_daily_trades"`
+	MaxLossPerDay       float64 `json:"max_loss_per_day" bson:"max_loss_per_day"`
+	MaxPositionSize     float64 `json:"max_position_size" bson:"max_position_size"`
+	MaxPerTradeRisk     float64 `json:"max_per_trade_risk" bson:"max_per_trade_risk"`
+	PositionSizing      string  `json:"position_sizing" bson:"position_sizing"` // FIXED, PERCENTAGE
+	EnableAutoSquareOff bool    `json:"enable_auto_square_off" bson:"enable_auto_square_off"`
+	AutoSquareOffTime   string  `json:"auto_square_off_time" bson:"auto_square_off_time"` // "15:05" format
 }
 
 // ElasticsearchStrategy represents a strategy indexed in Elasticsearch

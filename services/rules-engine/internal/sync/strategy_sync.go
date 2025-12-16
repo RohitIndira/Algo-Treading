@@ -31,6 +31,11 @@ type StrategyPayload struct {
 	RiskLimits   json.RawMessage `json:"risk_limits"`
 	CreatedAt    time.Time       `json:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at"`
+
+	// Frontend authentication data (from user credentials)
+	BearerToken string `json:"bearer_token"` // JWT bearer token
+	AppId       string `json:"app_id"`       // Application ID
+	Source      string `json:"source"`       // Source platform (IOS, AND, WEB)
 }
 
 // StrategySync syncs strategies from Kafka to Elasticsearch and Redis cache
@@ -247,6 +252,10 @@ func (ss *StrategySyncer) convertToStrategy(payload *StrategyPayload) (*models.S
 		RiskLimits:   riskLimits,
 		CreatedAt:    payload.CreatedAt,
 		UpdatedAt:    payload.UpdatedAt,
+		// Authentication data from user-config service
+		BearerToken: payload.BearerToken,
+		AppId:       payload.AppId,
+		Source:      payload.Source,
 	}, nil
 }
 

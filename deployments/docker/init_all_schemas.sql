@@ -70,35 +70,17 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 -- User Authentication Credentials Table
 CREATE TABLE IF NOT EXISTS user_credentials (
     id SERIAL PRIMARY KEY,
-    user_id VARCHAR(50) UNIQUE NOT NULL,
-    
-    -- ODIN API Configuration
-    api_key TEXT NOT NULL,
-    x_api_key TEXT NOT NULL,
-    api_url VARCHAR(500) NOT NULL,
-    
-    -- User authentication details
-    password_encrypted TEXT, -- Encrypted password (optional - for auto-login scenarios)
-    totp_secret VARCHAR(100), -- TOTP secret for generating codes
-    mpin_encrypted TEXT, -- Encrypted MPIN
-    
-    -- User profile
-    client_id VARCHAR(50),
-    pan VARCHAR(10),
-    email VARCHAR(255),
-    mobile_no VARCHAR(20),
-    
-    -- Configuration
-    source VARCHAR(50) DEFAULT 'MOBILEAPI',
-    preferred_login_type VARCHAR(20) DEFAULT 'PASSWORD',
-    preferred_second_auth VARCHAR(20) DEFAULT 'TOTP',
-    
-    -- Status
-    is_active BOOLEAN DEFAULT TRUE,
-    last_login TIMESTAMP,
-    
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    user_id VARCHAR(255) NOT NULL UNIQUE,
+    indira_user_id VARCHAR(50),
+    indira_app_id VARCHAR(100),
+    indira_source VARCHAR(10),
+    indira_bearer_token TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_user
+        FOREIGN KEY(user_id) 
+        REFERENCES users(id)
+        ON DELETE CASCADE
 );
 
 -- Login History Table
@@ -138,6 +120,10 @@ CREATE TABLE IF NOT EXISTS strategies (
     active BOOLEAN DEFAULT false,
     version INTEGER DEFAULT 1,
     match_all_news BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Frontend authentication data (stored with strategy for order execution)
+    bearer_token TEXT,
+    app_id VARCHAR(100),
+    source VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT unique_user_strategy_name UNIQUE(user_id, strategy_name)
@@ -156,6 +142,8 @@ CREATE TABLE IF NOT EXISTS strategy_conditions (
     volume_threshold BIGINT,
     pct_change_threshold DECIMAL(10,2),
     exchanges VARCHAR[] DEFAULT '{}',
+    min_market_cap DECIMAL(15,2),
+    max_market_cap DECIMAL(15,2),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -172,6 +160,9 @@ CREATE TABLE IF NOT EXISTS trade_configs (
     order_side VARCHAR(50) NOT NULL DEFAULT 'BUY',
     limit_price DECIMAL(15,2),
     validity VARCHAR(50) DEFAULT 'DAY',
+    stop_loss_type VARCHAR(20) DEFAULT 'FIXED',
+    trailing_sl_pct DECIMAL(10,2),
+    product_type VARCHAR(20) DEFAULT 'INTRADAY',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -185,6 +176,8 @@ CREATE TABLE IF NOT EXISTS risk_limits (
     max_portfolio_exposure_pct DECIMAL(10,2),
     max_per_trade_risk DECIMAL(15,2),
     enable_risk_checks BOOLEAN DEFAULT true,
+    enable_auto_square_off BOOLEAN DEFAULT false,
+    auto_square_off_time VARCHAR(10) DEFAULT '15:05',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -410,8 +403,11 @@ CREATE TRIGGER update_user_credentials_updated_at BEFORE UPDATE ON user_credenti
 
 -- User Login Service
 COMMENT ON TABLE user_sessions IS 'Active user sessions with authentication tokens';
-COMMENT ON TABLE user_credentials IS 'User authentication credentials and ODIN API configuration';
+-- COMMENT ON TABLE user_credentials IS 'User authentication credentials and ODIN API configuration';
 COMMENT ON TABLE login_history IS 'Login attempt history for analytics and security';
+
+-- Create an index on user_id for faster lookups
+CREATE INDEX IF NOT EXISTS idx_user_credentials_user_id ON user_credentials(user_id);
 
 -- User Config Service
 COMMENT ON TABLE strategies IS 'User trading strategies configuration';

@@ -98,6 +98,18 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 	takeProfit := signal.TakeProfit
 	riskScore := 0.0
 
+	// Default product type to INTRADAY if not specified
+	productType := signal.ProductType
+	if productType == "" {
+		productType = "INTRADAY"
+	}
+
+	// Default stop loss type to FIXED if not specified
+	stopLossType := signal.StopLossType
+	if stopLossType == "" {
+		stopLossType = "FIXED"
+	}
+
 	// Create Order model
 	order := &models.Order{
 		OrderID:      orderID,
@@ -114,16 +126,31 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 		StopLoss:     &stopLoss,
 		TakeProfit:   &takeProfit,
 		Validity:     "DAY", // Default validity
+		ProductType:  productType,
 		Status:       models.StatusReceived,
 		RiskApproved: true, // Signals from rules-engine are already risk-approved
 		RiskScore:    &riskScore,
 		RetryCount:   0,
 		CreatedAt:    now,
 		UpdatedAt:    now,
+
+		// Authentication data from signal (originally from strategy)
+		BearerToken: stringPtr(signal.BearerToken),
+		AppId:       stringPtr(signal.AppId),
+		Source:      stringPtr(signal.Source),
 	}
 
-	log.Printf("Converted signal to order: ID=%s, Side=%s, Qty=%d, Price=%.2f",
-		order.OrderID, order.OrderSide, order.Quantity, *order.Price)
+	log.Printf("Converted signal to order: ID=%s, Side=%s, Qty=%d, Price=%.2f, Auth=%v",
+		order.OrderID, order.OrderSide, order.Quantity, *order.Price,
+		signal.BearerToken != "" && signal.AppId != "" && signal.Source != "")
 
 	return order, nil
+}
+
+// stringPtr converts a string to a pointer
+func stringPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

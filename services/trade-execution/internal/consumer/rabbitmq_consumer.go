@@ -235,7 +235,14 @@ func (c *RabbitMQConsumer) processMessage(ctx context.Context, msg amqp.Delivery
 	if err := c.executor.ExecuteOrder(ctx, order); err != nil {
 		log.Printf("Worker %d: failed to execute order %s: %v", workerID, order.OrderID, err)
 
-		// Check if we should retry
+		// If order was explicitly rejected or failed (permanent), send to DLQ
+		if order.Status == models.StatusRejected || order.Status == models.StatusFailed {
+			log.Printf("Worker %d: Order %s is %s, sending to DLQ", workerID, order.OrderID, order.Status)
+			msg.Nack(false, false) // Send to DLQ
+			return
+		}
+
+		// Otherwise, respect retry count from original request
 		if orderReq.RetryCount < 3 {
 			log.Printf("Worker %d: Requeueing order (retry count: %d)", workerID, orderReq.RetryCount)
 			msg.Nack(false, true) // Requeue
@@ -266,6 +273,16 @@ func (c *RabbitMQConsumer) validateOrderRequest(req *models.OrderRequest) error 
 	if req.Symbol == "" {
 		return fmt.Errorf("symbol is required")
 	}
+	// Authentication data validation - these are now required for Indira API calls
+	if req.BearerToken == "" {
+		return fmt.Errorf("bearer_token is required for Indira Securities authentication")
+	}
+	if req.AppId == "" {
+		return fmt.Errorf("app_id is required for Indira Securities authentication")
+	}
+	if req.Source == "" {
+		return fmt.Errorf("source is required for Indira Securities authentication")
+	}
 	if !req.RiskApproved {
 		return fmt.Errorf("order not approved by risk management")
 	}
@@ -280,6 +297,28 @@ func (c *RabbitMQConsumer) convertToOrder(req *models.OrderRequest) *models.Orde
 	}
 
 	now := time.Now()
+
+	// Store authentication data as pointers
+	var bearerToken *string
+	if req.BearerToken != "" {
+		bearerToken = &req.BearerToken
+	}
+
+	var appId *string
+	if req.AppId != "" {
+		appId = &req.AppId
+	}
+
+	var source *string
+	if req.Source != "" {
+		source = &req.Source
+	}
+
+	// Store product type (default to INTRADAY if not set)
+	productType := req.ProductType
+	if productType == "" {
+		productType = "INTRADAY"
+	}
 
 	return &models.Order{
 		OrderID:      orderID,
@@ -296,12 +335,23 @@ func (c *RabbitMQConsumer) convertToOrder(req *models.OrderRequest) *models.Orde
 		StopLoss:     req.StopLoss,
 		TakeProfit:   req.TakeProfit,
 		Validity:     req.Validity,
+		ProductType:  productType,
 		Status:       models.StatusReceived,
 		RiskApproved: req.RiskApproved,
 		RiskScore:    req.RiskScore,
 		RetryCount:   req.RetryCount,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+
+		// Authentication data from strategy
+		BearerToken: bearerToken,
+		AppId:       appId,
+		Source:      source,
+
+		// Stop loss configuration
+		StopLossType:  &req.StopLossType,
+		TrailingSLPct: &req.TrailingSLPct,
+
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 }
 

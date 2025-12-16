@@ -33,6 +33,12 @@ service UserConfigService {
   // Get user strategies in bulk (for internal services)
   rpc GetStrategiesByIDs(GetStrategiesByIDsRequest) returns (GetStrategiesByIDsResponse);
   
+  // Update user credentials (bearer token, app_id, source)
+  rpc UpdateUserCredentials(UpdateUserCredentialsRequest) returns (UpdateUserCredentialsResponse);
+  
+  // Get user credentials for order execution
+  rpc GetUserCredentials(GetUserCredentialsRequest) returns (GetUserCredentialsResponse);
+  
   // Health check
   rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
 }
@@ -75,6 +81,21 @@ message StrategyConditions {
   // Exchanges to monitor
   // Ignored if match_all_news=true
   repeated common.Exchange exchanges = 9;
+  
+  // Market cap range filter (in crores)
+  // Ignored if match_all_news=true
+  message MarketCapRange {
+    double min_mcap = 1; // Minimum market cap in crores
+    double max_mcap = 2; // Maximum market cap in crores
+  }
+  MarketCapRange market_cap_range = 10;
+}
+
+// Stop loss type enumeration
+enum StopLossType {
+  STOP_LOSS_TYPE_UNSPECIFIED = 0;
+  FIXED = 1;     // Fixed stop loss percentage
+  TRAILING = 2;  // Trailing stop loss that moves with profit
 }
 
 // Trade execution configuration
@@ -105,6 +126,16 @@ message TradeConfig {
   
   // Validity (DAY, IOC, etc.)
   string validity = 9;
+  
+  // Stop loss type (FIXED or TRAILING)
+  StopLossType stop_loss_type = 10;
+  
+  // Trailing stop loss percentage (only applies when stop_loss_type=TRAILING)
+  // Example: 1.0 means trail by 1% as price moves in favorable direction
+  double trailing_sl_pct = 11;
+  
+  // Product type (INTRADAY, DELIVERY, CASH)
+  string product_type = 12;
 }
 
 // Risk management limits
@@ -126,6 +157,12 @@ message RiskLimits {
   
   // Enable risk checks
   bool enable_risk_checks = 6;
+  
+  // Enable auto square-off at market close
+  bool enable_auto_square_off = 7;
+  
+  // Auto square-off time (format: "15:05" for 3:05 PM)
+  string auto_square_off_time = 8;
 }
 
 // Trading strategy definition
@@ -164,15 +201,23 @@ message Strategy {
   int32 version = 11;
 }
 
-// Create strategy request
 message CreateStrategyRequest {
-  string user_id = 1;
-  string strategy_name = 2;
-  string description = 3;
-  StrategyConditions conditions = 4;
-  TradeConfig trade_config = 5;
-  RiskLimits risk_limits = 6;
-  bool activate_immediately = 7;  // Activate strategy upon creation
+    string user_id = 1;
+    string strategy_name = 2;
+    string description = 3;
+    StrategyConditions conditions = 4;
+    TradeConfig trade_config = 5;
+    RiskLimits risk_limits = 6;
+    bool activate_immediately = 7;
+    string bearer_token = 8;
+    string app_id = 9;
+    string source = 10;
+    
+    // Add these new fields for Indira Securities
+    string indira_user_id = 11;  // e.g., "ISPL19122"
+    string indira_app_id = 12;   // Application ID from frontend
+    string indira_source = 13;   // "IOS", "AND", or "WEB"
+    string indira_token = 14;    // JWT bearer token
 }
 
 message CreateStrategyResponse {
@@ -274,4 +319,48 @@ message GetStrategiesByIDsResponse {
   bool success = 1;
   repeated Strategy strategies = 2;
   common.Error error = 3;
+}
+
+message UpdateUserCredentialsRequest {
+    string user_id = 1;
+    string bearer_token = 2;
+    string app_id = 3;
+    string source = 4;
+    
+    // Add these new fields for Indira Securities
+    string indira_user_id = 5;  // e.g., "ISPL19122"
+    string indira_app_id = 6;   // Application ID from frontend
+    string indira_source = 7;   // "IOS", "AND", or "WEB"
+    string indira_token = 8;    // JWT bearer token
+}
+
+message GetUserCredentialsResponse {
+    bool success = 1;
+    string bearer_token = 2;
+    string app_id = 3;
+    string source = 4;
+    common.Error error = 5;
+    
+    // Add these new fields for Indira Securities
+    string indira_user_id = 6;  // e.g., "ISPL19122"
+    string indira_app_id = 7;   // Application ID from frontend
+    string indira_source = 8;   // "IOS", "AND", or "WEB"
+    string indira_token = 9;    // JWT bearer token
+}
+
+message UpdateUserCredentialsResponse {
+  bool success = 1;
+  common.Error error = 2;
+}
+
+message GetUserCredentialsRequest {
+  string user_id = 1;
+}
+
+message GetUserCredentialsResponse {
+  bool success = 1;
+  string bearer_token = 2;
+  string app_id = 3;
+  string source = 4;
+  common.Error error = 5;
 }

@@ -62,9 +62,9 @@ message Order {
   // Order status
   common.OrderStatus status = 15;
   
-  // Odin API integration
-  string odin_order_id = 16;  // Order ID from Odin API
-  string odin_response = 17;  // Raw response from Odin
+  // Indira API integration
+  string indira_order_id = 16;  // Order ID from Indira Securities API
+  string indira_response = 17;  // Raw response from Indira API
   
   // Execution details
   int32 filled_quantity = 18;

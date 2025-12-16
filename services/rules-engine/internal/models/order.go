@@ -32,6 +32,18 @@ type OrderRequest struct {
 	RetryCount   int       `json:"retry_count"`
 	OrderSide    string    `json:"order_side"` // BUY, SELL
 	Validity     string    `json:"validity"`   // DAY, IOC, etc.
+
+	// Frontend authentication data (from user credentials)
+	BearerToken string `json:"bearer_token"` // JWT bearer token
+	AppId       string `json:"app_id"`       // Application ID
+	Source      string `json:"source"`       // Source platform (IOS, AND, WEB)
+
+	// Stop loss configuration
+	StopLossType  string  `json:"stop_loss_type"`  // "FIXED" or "TRAILING"
+	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing stop loss percentage
+
+	// Product type
+	ProductType string `json:"product_type"` // INTRADAY, DELIVERY, CASH
 }
 
 // RuleMatch represents a successful rule match
@@ -58,6 +70,18 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 	stopLoss := price * (1 - strategy.TradeConfig.StopLossPct/100)
 	takeProfit := price * (1 + strategy.TradeConfig.TakeProfitPct/100)
 
+	// Default product type to INTRADAY if not specified
+	productType := strategy.TradeConfig.ProductType
+	if productType == "" {
+		productType = "INTRADAY"
+	}
+
+	// Default stop loss type to FIXED if not specified
+	stopLossType := strategy.TradeConfig.StopLossType
+	if stopLossType == "" {
+		stopLossType = "FIXED"
+	}
+
 	return &OrderRequest{
 		OrderID:      orderID,
 		UserID:       strategy.UserID,
@@ -83,6 +107,18 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		RiskApproved: false, // Will be set by risk management service
 		RiskScore:    0.0,   // Will be set by risk management service
 		RetryCount:   0,
+
+		// Authentication data from strategy
+		BearerToken: strategy.BearerToken,
+		AppId:       strategy.AppId,
+		Source:      strategy.Source,
+
+		// Stop loss configuration
+		StopLossType:  stopLossType,
+		TrailingSLPct: strategy.TradeConfig.TrailingSLPct,
+
+		// Product type
+		ProductType: productType,
 	}
 }
 

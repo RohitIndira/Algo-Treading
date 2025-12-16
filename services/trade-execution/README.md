@@ -212,6 +212,32 @@ createdb trading_execution
 # Run migrations
 psql -d trading_execution -f migrations/001_create_orders_table.sql
 
+Troubleshooting
+---------------
+
+If you see an error like:
+
+   pq: relation "orders" does not exist
+
+It means the `orders` table hasn't been created in the database you're connecting to.
+
+Quick fixes:
+
+- Ensure your `POSTGRES_DB` environment variable points to `trading_execution` for this service (see `.env` in this folder).
+- Run the migration directly:
+
+```bash
+PGPASSWORD=postgres psql -h localhost -U postgres -d trading_execution -f services/trade-execution/migrations/001_create_orders_table.sql
+```
+
+- Or run the helper that creates DBs and runs all migrations:
+
+```bash
+./scripts/setup_all_databases.sh
+```
+
+After the migration runs, restart the trade-execution service and the error should be resolved.
+
 # Check tables
 psql -d trading_execution -c "\dt"
 
