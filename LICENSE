@@ -1,0 +1,89 @@
+INDIRA SECURITIES LIMITED - PROPRIETARY LICENSE
+
+Version 1.0
+Effective Date: December 29, 2025
+
+TERMS AND CONDITIONS
+
+1. RESTRICTED LICENSE GRANT
+   This software is proprietary and confidential, and is licensed exclusively for use by authorized Indira Securities Limited customers and their employees. All rights reserved.
+
+2. PERMITTED USE
+   You are granted a limited, non-exclusive, non-transferable license to use this software solely for:
+   - Trading operations on Indian stock markets
+   - Algorithmic strategy execution authorized by Indira Securities
+   - Internal risk management and monitoring
+   - Authorized customer support and training purposes
+
+3. RESTRICTIONS
+   You may NOT:
+   - Copy, modify, or create derivative works of this software
+   - Distribute, sell, lease, or transfer this software to third parties
+   - Reverse engineer, decompile, or attempt to discover the source code
+   - Use this software with any non-Indira broker or trading platform
+   - Sublicense or allow others to use this software
+   - Remove or modify any proprietary notices, labels, or marks
+   - Use this software for any unauthorized trading or market activities
+   - Share login credentials or API keys with unauthorized users
+
+4. INTELLECTUAL PROPERTY RIGHTS
+   All intellectual property rights, including but not limited to copyrights, trademarks, patents, and trade secrets, remain the exclusive property of Indira Securities Limited. No rights are granted except as expressly stated herein.
+
+5. INDIRA SECURITIES SERVICES INTEGRATION
+   This software is designed to work exclusively with:
+   - Indira Securities Odin API
+   - Indira Securities trading terminals
+   - Indira Securities authorized data feeds
+   
+   Use with any third-party broker or trading platform is strictly prohibited.
+
+6. AUTHORIZATION AND COMPLIANCE
+   By using this software, you confirm that:
+   - You are an authorized Indira Securities customer
+   - You have complied with all KYC (Know Your Customer) requirements
+   - You understand and accept all risks associated with algorithmic trading
+   - You are responsible for your trading decisions and market activities
+   - You will comply with all applicable securities laws and regulations
+
+7. DATA SECURITY AND CONFIDENTIALITY
+   - All trading data, strategies, and configurations are confidential
+   - You must implement appropriate security measures to protect this software
+   - You must report any unauthorized access or security breaches immediately
+   - Upon termination, you must destroy all copies of this software
+
+8. DISCLAIMER OF WARRANTIES
+   THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT.
+
+9. LIMITATION OF LIABILITY
+   In no event shall Indira Securities Limited be liable for any indirect, incidental, special, consequential, or punitive damages, or loss of profits, even if advised of the possibility of such damages.
+
+10. TERMINATION
+    Indira Securities Limited reserves the right to terminate this license immediately if:
+    - You violate any terms of this agreement
+    - Your account with Indira Securities is closed or suspended
+    - You attempt unauthorized modifications or distribution
+    - You use this software with unauthorized brokers or platforms
+
+11. INDEMNIFICATION
+    You agree to indemnify and hold harmless Indira Securities Limited from any claims, damages, or expenses arising from:
+    - Your use of this software in violation of this agreement
+    - Your trading decisions and market activities
+    - Your failure to comply with applicable laws and regulations
+    - Unauthorized access to your systems or credentials
+
+12. GOVERNING LAW
+    This license is governed by the laws of India and the jurisdiction of the courts in India.
+
+13. ENTIRE AGREEMENT
+    This license constitutes the entire agreement between you and Indira Securities Limited regarding this software and supersedes all prior agreements and understandings.
+
+14. CONTACT AND SUPPORT
+    For license inquiries, compliance questions, or to verify your authorization:
+    - Contact: support@indiraonline.com
+    - Web: https://www.indiraonline.com
+    - Phone: [Insert Indira Securities contact number]
+
+---
+© 2025 Indira Securities Limited. All Rights Reserved.
+
+By downloading, installing, or using this software, you acknowledge that you have read, understood, and agree to be bound by all terms and conditions of this license.

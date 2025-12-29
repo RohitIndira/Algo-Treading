@@ -1,3 +1,8 @@
+// Copyright (c) 2025 Indira Securities Limited.
+// Licensed exclusively for authorized Indira Securities customers.
+// Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+// See LICENSE file for full terms and conditions.
+
 package main
 
 import (

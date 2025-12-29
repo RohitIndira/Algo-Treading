@@ -596,7 +596,20 @@ redis-cli info stats | grep hit
 
 ## 📄 License
 
-Copyright (c) 2025 Trading System
+**⚠️ PROPRIETARY SOFTWARE - INDIRA SECURITIES LIMITED ONLY**
+
+This software is proprietary and confidential. It is licensed exclusively for authorized Indira Securities Limited customers. Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+
+**License Details:**
+- See [LICENSE](LICENSE) for complete terms and conditions
+- **Authorized Use Only**: Indira Securities customers
+- **Restricted Activities**: Modification, distribution, sharing, or use with third-party brokers is prohibited
+- **Data Security**: You are responsible for protecting trading data and credentials
+- **Compliance**: Use only in compliance with applicable securities laws and regulations
+
+By using this software, you confirm you are an authorized Indira Securities customer and accept all terms in the LICENSE file.
+
+Copyright (c) 2025 Indira Securities Limited. All Rights Reserved.
 
 ---
 

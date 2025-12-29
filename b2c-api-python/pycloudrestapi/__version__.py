@@ -1,0 +1,8 @@
+__title__ = "Cloud Rest API"
+__description__ = "The official Python client for the Cloud Rest API"
+__url__ = "https://brokeragetechnologysolutions.63moons.com/"
+__download_url__ = ""
+__version__ = "1.0.0"
+__author__ = "63 moons technologies limited"
+__author_email__ = ""
+__license__ = ""

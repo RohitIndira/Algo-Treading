@@ -1,0 +1,89 @@
+// LICENSE HEADER TEMPLATE FOR NEW FILES
+
+========== FOR GO FILES (.go) ==========
+
+// Copyright (c) 2025 Indira Securities Limited.
+// Licensed exclusively for authorized Indira Securities customers.
+// Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+// See LICENSE file for full terms and conditions.
+
+package [packagename]
+
+
+========== FOR JAVASCRIPT/TYPESCRIPT FILES (.js, .ts) ==========
+
+/*
+ * Copyright (c) 2025 Indira Securities Limited.
+ * Licensed exclusively for authorized Indira Securities customers.
+ * Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+ * See LICENSE file for full terms and conditions.
+ */
+
+[your code here]
+
+
+========== FOR PYTHON FILES (.py) ==========
+
+# Copyright (c) 2025 Indira Securities Limited.
+# Licensed exclusively for authorized Indira Securities customers.
+# Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+# See LICENSE file for full terms and conditions.
+
+[your code here]
+
+
+========== FOR YAML/DOCKER FILES (.yaml, .yml, Dockerfile) ==========
+
+# Copyright (c) 2025 Indira Securities Limited.
+# Licensed exclusively for authorized Indira Securities customers.
+# Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+# See LICENSE file for full terms and conditions.
+
+[your content here]
+
+
+========== FOR SQL FILES (.sql) ==========
+
+-- Copyright (c) 2025 Indira Securities Limited.
+-- Licensed exclusively for authorized Indira Securities customers.
+-- Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+-- See LICENSE file for full terms and conditions.
+
+[your SQL here]
+
+
+========== FOR SHELL SCRIPTS (.sh) ==========
+
+#!/bin/bash
+
+# Copyright (c) 2025 Indira Securities Limited.
+# Licensed exclusively for authorized Indira Securities customers.
+# Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+# See LICENSE file for full terms and conditions.
+
+[your script here]
+
+
+========== FOR PROTO FILES (.proto) ==========
+
+// Copyright (c) 2025 Indira Securities Limited.
+// Licensed exclusively for authorized Indira Securities customers.
+// Unauthorized use, distribution, modification, or reverse engineering is strictly prohibited.
+// See LICENSE file for full terms and conditions.
+
+syntax = "proto3";
+
+[your proto definitions here]
+
+
+========== IMPORTANT NOTES ==========
+
+1. ADD THIS HEADER TO ALL NEW FILES created in this repository
+2. DO NOT remove existing license headers from files
+3. DO NOT modify the copyright statement
+4. Keep the header concise but complete
+5. Place the header at the very top of the file, before any other content
+6. See LICENSE file for complete terms and conditions
+7. For questions, contact: development-team@indiraonline.com
+
+© 2025 Indira Securities Limited. All Rights Reserved.

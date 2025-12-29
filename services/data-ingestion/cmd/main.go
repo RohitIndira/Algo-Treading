@@ -7,7 +7,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RohitIndira/Algo-Treading/pkg/database/mongodb"
 	kafkapkg "github.com/RohitIndira/Algo-Treading/pkg/kafka"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/config"
@@ -26,19 +25,7 @@ func main() {
 	}
 	defer lgr.Sync()
 
-	lgr.Info("Starting data-ingestion service")
-
-	// Initialize MongoDB client
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
-	defer cancel()
-
-	mongoClient, err := mongodb.New(ctx, mongodb.Config{URI: cfg.MongoURI, Database: cfg.MongoDatabase, ConnectTimeout: cfg.MongoConnectTimeout})
-	if err != nil {
-		lgr.Fatal("failed to connect to mongodb", zap.Error(err))
-	}
-	defer mongoClient.Close(context.Background())
-
-	lgr.Info("Connected to MongoDB", zap.String("database", cfg.MongoDatabase), zap.String("collection", cfg.MongoCollection))
+	lgr.Info("Starting data-ingestion service (B2C Market Data)")
 
 	// Initialize Kafka producer
 	prodCfg := kafkapkg.ProducerConfig{
@@ -52,6 +39,7 @@ func main() {
 		lgr.Fatal("failed to create kafka producer", zap.Error(err))
 	}
 	defer producer.Close()
+
 	// Ensure Kafka topic exists (auto-create if missing)
 	if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopic, 1, 1); err != nil {
 		lgr.Fatal("failed to ensure topic exists", zap.Error(err))
@@ -61,13 +49,26 @@ func main() {
 	// Create publisher wrapper
 	pub := publisher.NewKafkaPublisher(producer, cfg.KafkaTopic)
 
+	// Validate B2C configuration
+	if cfg.B2CBridgePath == "" {
+		lgr.Fatal("B2C_BRIDGE_PATH environment variable is not set")
+	}
+	if len(cfg.B2CTokens) == 0 {
+		lgr.Fatal("B2C_TOKENS environment variable is not set (comma-separated list of tokens)")
+	}
+
+	lgr.Info("B2C Configuration loaded",
+		zap.String("bridge_path", cfg.B2CBridgePath),
+		zap.Strings("tokens", cfg.B2CTokens),
+	)
+
 	// Start watcher
 	ctxRun, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
 
-	w, err := watcher.NewMongoWatcher(mongoClient, cfg.MongoCollection, pub, lgr)
+	w, err := watcher.NewB2CWatcher(cfg.B2CBridgePath, cfg.B2CTokens, pub, lgr)
 	if err != nil {
-		lgr.Fatal("failed to create watcher", zap.Error(err))
+		lgr.Fatal("failed to create B2C watcher", zap.Error(err))
 	}
 
 	go func() {
