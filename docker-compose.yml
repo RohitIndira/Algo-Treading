@@ -1,0 +1,389 @@
+version: '3.9'
+
+services:
+  # ===== INFRASTRUCTURE SERVICES =====
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: trading-postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trading_db
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deployments/docker/init_all_schemas.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7-alpine
+    container_name: trading-mongodb
+    hostname: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin
+      MONGO_INITDB_DATABASE: trading_db
+    volumes:
+      - mongodb-data:/data/db
+      - mongodb-config:/data/configdb
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: trading-redis
+    hostname: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - trading-network
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
+    container_name: trading-elasticsearch
+    hostname: elasticsearch
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: trading-kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    depends_on:
+      - zookeeper
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: trading-zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: trading-rabbitmq
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ===== APPLICATION SERVICES =====
+
+  api-gateway:
+    build:
+      context: ./api/gateway
+      dockerfile: Dockerfile
+    container_name: trading-api-gateway
+    hostname: api-gateway
+    ports:
+      - "8081:8081"
+    environment:
+      # Database
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: trading_db
+      
+      # gRPC service endpoints
+      USER_CONFIG_SERVICE: user-config:50051
+      DATA_INGESTION_SERVICE: data-ingestion:50052
+      RULES_ENGINE_SERVICE: rules-engine:50053
+      TRADE_EXECUTION_SERVICE: trade-execution:50054
+      RISK_MANAGEMENT_SERVICE: risk-management:50055
+      
+      # Cache
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      
+      # Logging
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      user-config:
+        condition: service_started
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  user-config:
+    build:
+      context: ./services/user-config
+      dockerfile: Dockerfile
+    container_name: trading-user-config
+    hostname: user-config
+    ports:
+      - "50051:50051"
+    environment:
+      # Database
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: trading_db
+      
+      # gRPC
+      GRPC_PORT: 50051
+      
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      
+      # Logging
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  data-ingestion:
+    build:
+      context: ./services/data-ingestion
+      dockerfile: Dockerfile
+    container_name: trading-data-ingestion
+    hostname: data-ingestion
+    ports:
+      - "50052:50052"
+    environment:
+      # MongoDB
+      MONGODB_URI: mongodb://admin:admin@mongodb:27017/trading_db?authSource=admin
+      
+      # Kafka
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: market.data.news
+      
+      # gRPC
+      GRPC_PORT: 50052
+      
+      # Logging
+      LOG_LEVEL: info
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  rules-engine:
+    build:
+      context: ./services/rules-engine
+      dockerfile: Dockerfile
+    container_name: trading-rules-engine
+    hostname: rules-engine
+    ports:
+      - "50053:50053"
+    environment:
+      # Elasticsearch
+      ELASTICSEARCH_HOST: elasticsearch:9200
+      
+      # Kafka
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC_INPUT: market.data.news
+      KAFKA_TOPIC_OUTPUT: order.execution.queue
+      
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      
+      # gRPC
+      GRPC_PORT: 50053
+      
+      # Logging
+      LOG_LEVEL: info
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  trade-execution:
+    build:
+      context: ./services/trade-execution
+      dockerfile: Dockerfile
+    container_name: trading-trade-execution
+    hostname: trade-execution
+    ports:
+      - "50054:50054"
+    environment:
+      # Database
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: trading_db
+      
+      # Message Queue
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      RABBITMQ_QUEUE: order.execution.queue
+      
+      # gRPC
+      GRPC_PORT: 50054
+      
+      # Logging
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      risk-management:
+        condition: service_started
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  risk-management:
+    build:
+      context: ./services/risk-management
+      dockerfile: Dockerfile
+    container_name: trading-risk-management
+    hostname: risk-management
+    ports:
+      - "50055:50055"
+    environment:
+      # Database
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: trading_db
+      
+      # Redis (for risk counters)
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      
+      # gRPC
+      GRPC_PORT: 50055
+      
+      # Logging
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+networks:
+  trading-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  mongodb-data:
+    driver: local
+  mongodb-config:
+    driver: local
+  redis-data:
+    driver: local
+  elasticsearch-data:
+    driver: local
+  zookeeper-data:
+    driver: local
+  zookeeper-logs:
+    driver: local
+  rabbitmq-data:
+    driver: local
