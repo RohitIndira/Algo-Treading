@@ -1,0 +1,307 @@
+version: '3.8'
+
+# Development docker-compose for the algorithmic trading system
+# Goal: one command to bring up infra + core services for local dev.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Core infrastructure
+  # ---------------------------------------------------------------------------
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: trading-postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trading_system
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # Map Postgres to a non-default host port to avoid conflict with any local PostgreSQL
+    # Inside docker network, services still use host "postgres" on port 5432.
+    ports:
+      - "55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Unified schema init for all services
+      - ./deployments/docker/init_all_schemas.sql:/docker-entrypoint-initdb.d/00_init_all_schemas.sql:ro
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_system"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: trading-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: trading-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: trading-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8082:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: trading-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - trading-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: trading-redis
+    command: redis-server --appendonly yes --requirepass ""
+    ports:
+      # Map Redis to a non-default valid host port (<65535) to avoid conflict with any local Redis
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - trading-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: trading-rabbitmq
+    hostname: rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=admin123
+      - RABBITMQ_DEFAULT_VHOST=/
+    ports:
+      - "5672:5672"    # AMQP protocol
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - rabbitmq-logs:/var/log/rabbitmq
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: trading-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - cluster.name=trading-cluster
+      - node.name=trading-node
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: trading-kibana
+    depends_on:
+      - elasticsearch
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Core Go services
+  # ---------------------------------------------------------------------------
+
+  user-config:
+    build:
+      context: .
+      dockerfile: services/user-config/Dockerfile
+    container_name: user-config
+    env_file:
+      - ./services/user-config/.env.example
+    environment:
+      # Override DB host/name to use dockerised Postgres + unified DB
+      DB_HOST: postgres
+      DB_NAME: trading_system
+      # Use dockerised Kafka
+      KAFKA_BROKERS: kafka:29092
+    depends_on:
+      - postgres
+      - kafka
+    networks:
+      - trading-network
+
+  risk-management:
+    build:
+      context: .
+      dockerfile: services/risk-management/Dockerfile
+    container_name: risk-management
+    env_file:
+      - ./services/risk-management/.env.example
+    environment:
+      # Ensure Redis host is correct inside docker network
+      REDIS_HOST: redis
+    depends_on:
+      - redis
+    networks:
+      - trading-network
+
+  rules-engine:
+    build:
+      context: .
+      dockerfile: services/rules-engine/Dockerfile
+    container_name: rules-engine
+    env_file:
+      - ./services/rules-engine/.env.example
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      ELASTICSEARCH_URLS: http://elasticsearch:9200
+      # Use single-instance Redis
+      REDIS_ADDRS: redis:6379
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/
+      USER_CONFIG_SERVICE_ADDR: user-config:50051
+      RISK_MANAGEMENT_SERVICE_ADDR: risk-management:9005
+    depends_on:
+      - kafka
+      - elasticsearch
+      - redis
+      - rabbitmq
+      - user-config
+      - risk-management
+    networks:
+      - trading-network
+
+  trade-execution:
+    build:
+      context: .
+      dockerfile: services/trade-execution/Dockerfile
+    container_name: trade-execution
+    env_file:
+      - ./services/trade-execution/.env.example
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: trading_system
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/
+      REDIS_HOST: redis
+      # Keep gRPC port as defined in env (9004)
+    depends_on:
+      - postgres
+      - rabbitmq
+      - redis
+      - risk-management
+    networks:
+      - trading-network
+
+  data-ingestion:
+    build:
+      context: .
+      dockerfile: services/data-ingestion/Dockerfile
+    container_name: data-ingestion
+    env_file:
+      - ./services/data-ingestion/.env.example
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      # MONGO_URI is left as-is; for full E2E you must point to your MongoDB
+    depends_on:
+      - kafka
+    networks:
+      - trading-network
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api/gateway/Dockerfile
+    container_name: api-gateway
+    env_file:
+      - ./api/gateway/.env.example
+    environment:
+      # Route gRPC calls to dockerised services
+      USER_CONFIG_GRPC_ADDR: user-config:50051
+      HTTP_PORT: 8081
+    ports:
+      - "8081:8081"  # Expose gateway to host
+    depends_on:
+      - user-config
+    networks:
+      - trading-network
+
+networks:
+  trading-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  kafka-data:
+  redis-data:
+  rabbitmq-data:
+  rabbitmq-logs:
+  elasticsearch-data:

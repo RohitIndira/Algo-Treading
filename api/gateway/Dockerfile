@@ -1,19 +1,16 @@
-# Multi-stage build for API Gateway
-FROM golang:1.24.6-alpine AS builder
+## Multi-stage build for API Gateway
+FROM golang:1.25.4-alpine AS builder
 
 WORKDIR /app
 
-# Copy go mod files
-COPY go.mod go.sum ./
-
-# Download dependencies
-RUN go mod download
-
-# Copy source code
+## Build from monorepo root so go.work and replace directives work
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -o bin/gateway ./cmd/main.go
+WORKDIR /app/api/gateway
+
+RUN go mod download
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/gateway ./cmd/main.go
 
 # Final stage
 FROM alpine:latest
@@ -24,10 +21,10 @@ WORKDIR /app
 RUN apk --no-cache add ca-certificates
 
 # Copy binary from builder
-COPY --from=builder /app/bin/gateway .
+COPY --from=builder /app/bin/gateway ./gateway
 
-# Copy config files if they exist
-COPY --from=builder /app/config ./config
+# Copy config files if they exist (service-specific)
+COPY --from=builder /app/api/gateway/config ./config
 
 # Expose port (adjust based on your gateway port)
 EXPOSE 8081

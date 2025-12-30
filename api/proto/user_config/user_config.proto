@@ -335,17 +335,17 @@ message UpdateUserCredentialsRequest {
 }
 
 message GetUserCredentialsResponse {
-    bool success = 1;
-    string bearer_token = 2;
-    string app_id = 3;
-    string source = 4;
-    common.Error error = 5;
-    
-    // Add these new fields for Indira Securities
-    string indira_user_id = 6;  // e.g., "ISPL19122"
-    string indira_app_id = 7;   // Application ID from frontend
-    string indira_source = 8;   // "IOS", "AND", or "WEB"
-    string indira_token = 9;    // JWT bearer token
+  bool success = 1;
+  string bearer_token = 2;
+  string app_id = 3;
+  string source = 4;
+  common.Error error = 5;
+  
+  // Add these new fields for Indira Securities
+  string indira_user_id = 6;  // e.g., "ISPL19122"
+  string indira_app_id = 7;   // Application ID from frontend
+  string indira_source = 8;   // "IOS", "AND", or "WEB"
+  string indira_token = 9;    // JWT bearer token
 }
 
 message UpdateUserCredentialsResponse {
@@ -355,12 +355,4 @@ message UpdateUserCredentialsResponse {
 
 message GetUserCredentialsRequest {
   string user_id = 1;
-}
-
-message GetUserCredentialsResponse {
-  bool success = 1;
-  string bearer_token = 2;
-  string app_id = 3;
-  string source = 4;
-  common.Error error = 5;
 }

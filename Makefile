@@ -9,9 +9,15 @@ help: ## Display this help message
 	@echo "Available targets:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-proto: ## Generate protobuf code
+proto: ## Generate protobuf code (uses api/proto/Makefile)
 	@echo "Generating protobuf code..."
-	@./scripts/proto-gen.sh
+	@cd $(PROTO_DIR) && \
+		$(MAKE) generate-all
+
+proto-tools: ## Install protoc-gen-go and protoc-gen-go-grpc
+	@echo "Installing protobuf tools..."
+	@cd $(PROTO_DIR) && \
+		$(MAKE) install-tools
 
 build: ## Build all services
 	@echo "Building all services..."
@@ -59,3 +65,12 @@ fmt: ## Format code
 	@go fmt ./...
 	@gofmt -s -w .
 
+dev-up: ## Generate protos and start full dev stack (infra + services) via docker-compose.dev.yml
+	@echo "Generating protobuf code..."
+	@$(MAKE) proto
+	@echo "Starting dev stack with docker-compose.dev.yml..."
+	@docker compose -f docker-compose.dev.yml up --build
+
+dev-down: ## Stop dev docker-compose stack
+	@echo "Stopping dev stack..."
+	@docker compose -f docker-compose.dev.yml down
