@@ -89,6 +89,12 @@ message StrategyConditions {
     double max_mcap = 2; // Maximum market cap in crores
   }
   MarketCapRange market_cap_range = 10;
+  // Depth-based filters
+  int64 min_bid_quantity = 11;
+  int64 min_ask_quantity = 12;
+  double max_spread_pct = 13;
+  bool depth_only = 14;
+  bool require_ltp_between_spread = 15;
 }
 
 // Stop loss type enumeration

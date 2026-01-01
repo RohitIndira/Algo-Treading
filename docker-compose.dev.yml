@@ -267,7 +267,7 @@ services:
       dockerfile: services/data-ingestion/Dockerfile
     container_name: data-ingestion
     env_file:
-      - ./services/data-ingestion/.env.example
+      - ./services/data-ingestion/.env
     environment:
       KAFKA_BROKERS: kafka:29092
       # MONGO_URI is left as-is; for full E2E you must point to your MongoDB
@@ -282,7 +282,7 @@ services:
       dockerfile: api/gateway/Dockerfile
     container_name: api-gateway
     env_file:
-      - ./api/gateway/.env.example
+      - ./api/gateway/.env
     environment:
       # Route gRPC calls to dockerised services
       USER_CONFIG_GRPC_ADDR: user-config:50051

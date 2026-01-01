@@ -237,7 +237,7 @@ func buildPostgresURL() string {
 	return fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		getEnv("POSTGRES_HOST", "localhost"),
-		getEnv("POSTGRES_PORT", "5432"),
+		getEnv("POSTGRES_PORT", "55432"),
 		getEnv("POSTGRES_USER", "postgres"),
 		getEnv("POSTGRES_PASSWORD", "postgres"),
 		getEnv("POSTGRES_DB", "trading_execution"),

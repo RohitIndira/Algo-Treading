@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -65,8 +66,32 @@ type RuleMatch struct {
 func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *OrderRequest {
 	orderID := uuid.New().String()
 
-	// Calculate stop loss and take profit
+	// Calculate price, stop loss and take profit
+	// Prefer bid/ask depth if available: use best ask for BUY, best bid for SELL
 	price := event.MarketData.LastTradedPrice
+	// Determine order side from strategy trade config if present
+	orderSide := "BUY"
+	if strategy != nil && strategy.TradeConfig != (TradeConfig{}) {
+		if s := strings.ToUpper(strategy.TradeConfig.OrderType); s != "" {
+			// OrderType is MARKET/LIMIT; OrderSide holds BUY/SELL in TradeConfig.OrderSide
+		}
+	}
+	if strategy != nil && strategy.TradeConfig != (TradeConfig{}) && strategy.TradeConfig.OrderSide != "" {
+		orderSide = strings.ToUpper(strategy.TradeConfig.OrderSide)
+	}
+
+	if len(event.MarketData.BidPrices) > 0 || len(event.MarketData.AskPrices) > 0 {
+		if strings.ToUpper(orderSide) == "SELL" {
+			if len(event.MarketData.BidPrices) > 0 && event.MarketData.BidPrices[0] > 0 {
+				price = event.MarketData.BidPrices[0]
+			}
+		} else {
+			if len(event.MarketData.AskPrices) > 0 && event.MarketData.AskPrices[0] > 0 {
+				price = event.MarketData.AskPrices[0]
+			}
+		}
+	}
+
 	stopLoss := price * (1 - strategy.TradeConfig.StopLossPct/100)
 	takeProfit := price * (1 + strategy.TradeConfig.TakeProfitPct/100)
 
@@ -93,7 +118,7 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		Symbol:       event.StockData.Symbol,
 		Exchange:     event.StockData.Exchange,
 		OrderType:    strategy.TradeConfig.OrderType,
-		OrderSide:    "BUY", // Default to BUY
+		OrderSide:    orderSide,
 		Quantity:     strategy.TradeConfig.Quantity,
 		Price:        price,
 		StopLoss:     stopLoss,

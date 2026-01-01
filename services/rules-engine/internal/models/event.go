@@ -86,6 +86,11 @@ type MarketData struct {
 	NewsFirstPrice  float64  `json:"news_first_price"`
 	NewsPctChange   float64  `json:"news_pct_change"`
 	PriceMap        PriceMap `json:"price_map"`
+	// Best bid/ask depth (optional - provided by data-ingestion)
+	BidPrices     []float64 `json:"bid_prices"`
+	BidQuantities []int     `json:"bid_quantities"`
+	AskPrices     []float64 `json:"ask_prices"`
+	AskQuantities []int     `json:"ask_quantities"`
 }
 
 // PriceMap contains OHLCV data

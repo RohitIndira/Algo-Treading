@@ -43,6 +43,12 @@ type StrategyCondition struct {
 	VolumeThreshold      *int64         `db:"volume_threshold" json:"volume_threshold,omitempty"`
 	PctChangeThreshold   *float64       `db:"pct_change_threshold" json:"pct_change_threshold,omitempty"`
 	Exchanges            pq.StringArray `db:"exchanges" json:"exchanges"`
+	// Depth-based filters
+	MinBidQuantity      *int64   `db:"min_bid_quantity" json:"min_bid_quantity,omitempty"`
+	MinAskQuantity      *int64   `db:"min_ask_quantity" json:"min_ask_quantity,omitempty"`
+	MaxSpreadPct        *float64 `db:"max_spread_pct" json:"max_spread_pct,omitempty"`
+	DepthOnly           bool     `db:"depth_only" json:"depth_only"`
+	RequireLTPBetweenSpread *bool `db:"require_ltp_between_spread" json:"require_ltp_between_spread,omitempty"`
 	MinMarketCap         *float64       `db:"min_market_cap" json:"min_market_cap,omitempty"` // Market cap filter in crores
 	MaxMarketCap         *float64       `db:"max_market_cap" json:"max_market_cap,omitempty"` // Market cap filter in crores
 	CreatedAt            time.Time      `db:"created_at" json:"created_at"`

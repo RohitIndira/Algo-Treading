@@ -372,6 +372,22 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 		cond.MaxMarketCap = &proto.MarketCapRange.MaxMcap
 	}
 
+	// Depth-related fields
+	if proto.MinBidQuantity != 0 {
+		cond.MinBidQuantity = &proto.MinBidQuantity
+	}
+	if proto.MinAskQuantity != 0 {
+		cond.MinAskQuantity = &proto.MinAskQuantity
+	}
+	if proto.MaxSpreadPct != 0 {
+		cond.MaxSpreadPct = &proto.MaxSpreadPct
+	}
+	cond.DepthOnly = proto.DepthOnly
+	if proto.RequireLtpBetweenSpread {
+		v := true
+		cond.RequireLTPBetweenSpread = &v
+	}
+
 	return cond
 }
 
@@ -486,6 +502,21 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 	}
 	if model.PctChangeThreshold != nil {
 		cond.PctChangeThreshold = *model.PctChangeThreshold
+	}
+
+	// Depth-related fields
+	if model.MinBidQuantity != nil {
+		cond.MinBidQuantity = *model.MinBidQuantity
+	}
+	if model.MinAskQuantity != nil {
+		cond.MinAskQuantity = *model.MinAskQuantity
+	}
+	if model.MaxSpreadPct != nil {
+		cond.MaxSpreadPct = *model.MaxSpreadPct
+	}
+	cond.DepthOnly = model.DepthOnly
+	if model.RequireLTPBetweenSpread != nil {
+		cond.RequireLtpBetweenSpread = *model.RequireLTPBetweenSpread
 	}
 
 	return cond

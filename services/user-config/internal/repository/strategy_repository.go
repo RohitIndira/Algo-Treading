@@ -62,8 +62,9 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			INSERT INTO strategy_conditions (
 				condition_id, strategy_id, impact_score_threshold, sentiments, categories,
 				stock_codes, price_range_min, price_range_max, volume_threshold,
-				pct_change_threshold, exchanges, min_market_cap, max_market_cap
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				pct_change_threshold, exchanges, min_bid_quantity, min_ask_quantity,
+				max_spread_pct, depth_only, require_ltp_between_spread, min_market_cap, max_market_cap
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, condQuery,
@@ -71,7 +72,10 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
 			req.Conditions.PriceRangeMin, req.Conditions.PriceRangeMax,
 			req.Conditions.VolumeThreshold, req.Conditions.PctChangeThreshold,
-			req.Conditions.Exchanges, req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap,
+			req.Conditions.Exchanges,
+			req.Conditions.MinBidQuantity, req.Conditions.MinAskQuantity,
+			req.Conditions.MaxSpreadPct, req.Conditions.DepthOnly, req.Conditions.RequireLTPBetweenSpread,
+			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap,
 		).Scan(&req.Conditions.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert conditions: %w", err)
@@ -158,7 +162,8 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 	condition := &models.StrategyCondition{}
 	condQuery := `SELECT condition_id, strategy_id, impact_score_threshold, sentiments, categories, 
 		stock_codes, price_range_min, price_range_max, volume_threshold, pct_change_threshold, 
-		exchanges, min_market_cap, max_market_cap, created_at FROM strategy_conditions WHERE strategy_id = $1`
+		exchanges, min_bid_quantity, min_ask_quantity, max_spread_pct, depth_only, require_ltp_between_spread, 
+		min_market_cap, max_market_cap, created_at FROM strategy_conditions WHERE strategy_id = $1`
 	err = r.db.QueryRowContext(ctx, condQuery, strategyID).Scan(
 		&condition.ConditionID,
 		&condition.StrategyID,
@@ -171,6 +176,11 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 		&condition.VolumeThreshold,
 		&condition.PctChangeThreshold,
 		&condition.Exchanges,
+		&condition.MinBidQuantity,
+		&condition.MinAskQuantity,
+		&condition.MaxSpreadPct,
+		&condition.DepthOnly,
+		&condition.RequireLTPBetweenSpread,
 		&condition.MinMarketCap,
 		&condition.MaxMarketCap,
 		&condition.CreatedAt,
@@ -278,7 +288,8 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 		condition := &models.StrategyCondition{}
 		condQuery := `SELECT condition_id, strategy_id, impact_score_threshold, sentiments, categories, 
 			stock_codes, price_range_min, price_range_max, volume_threshold, pct_change_threshold, 
-			exchanges, min_market_cap, max_market_cap, created_at FROM strategy_conditions WHERE strategy_id = $1`
+			exchanges, min_bid_quantity, min_ask_quantity, max_spread_pct, depth_only, require_ltp_between_spread, 
+			min_market_cap, max_market_cap, created_at FROM strategy_conditions WHERE strategy_id = $1`
 		err = r.db.QueryRowContext(ctx, condQuery, strategy.StrategyID).Scan(
 			&condition.ConditionID,
 			&condition.StrategyID,
@@ -291,6 +302,11 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 			&condition.VolumeThreshold,
 			&condition.PctChangeThreshold,
 			&condition.Exchanges,
+			&condition.MinBidQuantity,
+			&condition.MinAskQuantity,
+			&condition.MaxSpreadPct,
+			&condition.DepthOnly,
+			&condition.RequireLTPBetweenSpread,
 			&condition.MinMarketCap,
 			&condition.MaxMarketCap,
 			&condition.CreatedAt,

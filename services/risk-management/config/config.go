@@ -35,7 +35,7 @@ func LoadConfig() *Config {
 		RedisPort: getEnv("REDIS_PORT", "6379"),
 
 		DBHost: getEnv("DB_HOST", "localhost"),
-		DBPort: getEnv("DB_PORT", "5432"),
+		DBPort: getEnv("DB_PORT", "55432"),
 		DBName: getEnv("DB_NAME", "trading_db"),
 		DBUser: getEnv("DB_USER", "postgres"),
 

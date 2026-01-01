@@ -33,6 +33,11 @@ type Conditions struct {
 	PriceRange           PriceRange     `json:"price_range" bson:"price_range"`
 	VolumeThreshold      int64          `json:"volume_threshold" bson:"volume_threshold"`
 	PctChangeThreshold   float64        `json:"pct_change_threshold" bson:"pct_change_threshold"`
+	// Depth-based conditions (optional)
+	MinBidQuantity int64   `json:"min_bid_quantity" bson:"min_bid_quantity"`
+	MinAskQuantity int64   `json:"min_ask_quantity" bson:"min_ask_quantity"`
+	MaxSpreadPct   float64 `json:"max_spread_pct" bson:"max_spread_pct"`
+	DepthOnly      bool    `json:"depth_only" bson:"depth_only"`
 	MarketCapRange       MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
 }
 
@@ -51,6 +56,7 @@ type MarketCapRange struct {
 // TradeConfig represents trade configuration
 type TradeConfig struct {
 	OrderType       string  `json:"order_type" bson:"order_type"` // MARKET, LIMIT
+	OrderSide       string  `json:"order_side" bson:"order_side"` // BUY, SELL
 	Quantity        int32   `json:"quantity" bson:"quantity"`
 	MaxPositionSize float64 `json:"max_position_size" bson:"max_position_size"`
 	StopLossPct     float64 `json:"stop_loss_pct" bson:"stop_loss_pct"`

@@ -44,12 +44,12 @@ func Load() *Config {
 	bridgePath := os.Getenv("B2C_BRIDGE_PATH")
 	if bridgePath == "" {
 		// Get the directory where this service is running from
-		serviceDir := filepath.Join("..", "..", "b2c-api-python", "b2c_bridge.py")
+		serviceDir := filepath.Join("..","..", "..", "b2c-api-python", "b2c_bridge.py")
 		bridgePath = serviceDir
 	}
 
 	// B2C tokens as comma-separated list
-	tokensStr := getEnv("B2C_TOKENS", "22,2475,26000") // default tokens for testing
+	tokensStr := getEnv("B2C_TOKENS", "22,2475,25,14366") // default tokens for testing
 	var tokens []string
 	if tokensStr != "" {
 		tokens = strings.Split(tokensStr, ",")

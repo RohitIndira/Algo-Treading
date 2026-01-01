@@ -40,6 +40,16 @@ func (e *Evaluator) Evaluate(event *models.MarketEvent, strategy *models.Strateg
 		return result
 	}
 
+	// If strategy requests depth-only matching, evaluate only stock/exchange/price/volume and depth
+	if strategy.Conditions.DepthOnly {
+		e.evaluateStock(event, strategy, result)
+		e.evaluateExchange(event, strategy, result)
+		e.evaluatePriceRange(event, strategy, result)
+		e.evaluateVolume(event, strategy, result)
+		e.evaluateDepthLTP(event, strategy, result)
+		return result
+	}
+
 	// Evaluate each condition normally
 	e.evaluateImpactScore(event, strategy, result)
 	e.evaluateSentiment(event, strategy, result)
@@ -277,6 +287,84 @@ func (e *Evaluator) evaluateExchange(event *models.MarketEvent, strategy *models
 		result.FailedConditions = append(result.FailedConditions, condition)
 		result.ConditionScores[condition] = 0
 	}
+}
+
+// evaluateDepthLTP evaluates depth and LTP based conditions
+func (e *Evaluator) evaluateDepthLTP(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
+	condition := "depth_and_ltp"
+
+	md := event.MarketData
+	ltp := md.LastTradedPrice
+
+	// If no depth data present, fail only if strategy requires thresholds
+	if len(md.BidPrices) == 0 || len(md.AskPrices) == 0 || len(md.BidQuantities) == 0 || len(md.AskQuantities) == 0 {
+		// If strategy has no depth thresholds configured, consider it matched
+		if strategy.Conditions.MinBidQuantity == 0 && strategy.Conditions.MinAskQuantity == 0 && strategy.Conditions.MaxSpreadPct == 0 {
+			result.MatchedConditions = append(result.MatchedConditions, condition)
+			result.ConditionScores[condition] = 100.0
+			return
+		}
+		// Depth data required but missing
+		result.FailedConditions = append(result.FailedConditions, condition)
+		result.ConditionScores[condition] = 0
+		return
+	}
+
+	bestBid := md.BidPrices[0]
+	bestAsk := md.AskPrices[0]
+	bestBidQty := int64(0)
+	bestAskQty := int64(0)
+	if len(md.BidQuantities) > 0 {
+		bestBidQty = int64(md.BidQuantities[0])
+	}
+	if len(md.AskQuantities) > 0 {
+		bestAskQty = int64(md.AskQuantities[0])
+	}
+
+	// Check min bid qty
+	if strategy.Conditions.MinBidQuantity > 0 {
+		if bestBidQty < strategy.Conditions.MinBidQuantity {
+			result.FailedConditions = append(result.FailedConditions, condition)
+			result.ConditionScores[condition] = 0
+			return
+		}
+	}
+
+	// Check min ask qty
+	if strategy.Conditions.MinAskQuantity > 0 {
+		if bestAskQty < strategy.Conditions.MinAskQuantity {
+			result.FailedConditions = append(result.FailedConditions, condition)
+			result.ConditionScores[condition] = 0
+			return
+		}
+	}
+
+	// Check spread pct
+	if strategy.Conditions.MaxSpreadPct > 0 && ltp > 0 {
+		spread := bestAsk - bestBid
+		spreadPct := (spread / ltp) * 100.0
+		if spreadPct > strategy.Conditions.MaxSpreadPct {
+			result.FailedConditions = append(result.FailedConditions, condition)
+			result.ConditionScores[condition] = 0
+			return
+		}
+	}
+
+	// Optionally check that LTP lies between best bid and best ask
+	if ltp > 0 {
+		if !(ltp >= bestBid && ltp <= bestAsk) {
+			// If LTP outside spread, still allow if no strict spread configured
+			if strategy.Conditions.MaxSpreadPct > 0 {
+				result.FailedConditions = append(result.FailedConditions, condition)
+				result.ConditionScores[condition] = 0
+				return
+			}
+		}
+	}
+
+	// Passed all configured depth checks
+	result.MatchedConditions = append(result.MatchedConditions, condition)
+	result.ConditionScores[condition] = 100.0
 }
 
 // GetMatchedConditionCount returns the number of matched conditions
