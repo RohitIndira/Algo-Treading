@@ -56,10 +56,15 @@ type ExecutionResult struct {
 	BrokerTimestamp time.Time `json:"broker_timestamp,omitempty"`
 
 	// Related Information
-	EventID      string  `json:"event_id,omitempty"`
-	NewsCategory string  `json:"news_category,omitempty"`
-	ImpactScore  int32   `json:"impact_score,omitempty"`
-	MatchScore   float64 `json:"match_score,omitempty"`
+	EventID       string    `json:"event_id,omitempty"`
+	MatchScore    float64   `json:"match_score,omitempty"`
+	LTP           float64   `json:"ltp,omitempty"`
+	BidPrices     []float64 `json:"bid_prices,omitempty"`
+	AskPrices     []float64 `json:"ask_prices,omitempty"`
+	BidQuantities []int64   `json:"bid_quantities,omitempty"`
+	AskQuantities []int64   `json:"ask_quantities,omitempty"`
+	SpreadPct     float64   `json:"spread_pct,omitempty"`
+	BidAskRatio   float64   `json:"bid_ask_ratio,omitempty"`
 
 	// Error Information
 	ErrorCode       string `json:"error_code,omitempty"`
@@ -168,10 +173,16 @@ type TradeSignal struct {
 	StopLoss     float64   `json:"stop_loss"`
 	TakeProfit   float64   `json:"take_profit"`
 	MatchScore   float64   `json:"match_score"`
-	ImpactScore  int32     `json:"impact_score"`
-	Sentiment    string    `json:"sentiment"`
-	NewsCategory string    `json:"news_category"`
 	Timestamp    time.Time `json:"timestamp"`
+
+	// Market depth data
+	LTP           float64   `json:"ltp"`
+	BidPrices     []float64 `json:"bid_prices"`
+	AskPrices     []float64 `json:"ask_prices"`
+	BidQuantities []int64   `json:"bid_quantities"`
+	AskQuantities []int64   `json:"ask_quantities"`
+	SpreadPct     float64   `json:"spread_pct"`
+	BidAskRatio   float64   `json:"bid_ask_ratio"`
 
 	// Frontend authentication data (passed from user credentials)
 	BearerToken string `json:"bearer_token"` // JWT bearer token from frontend

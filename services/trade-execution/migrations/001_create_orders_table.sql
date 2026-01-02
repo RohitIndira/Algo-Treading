@@ -11,12 +11,12 @@ CREATE TABLE IF NOT EXISTS orders (
     
     -- Stock information
     stock_code BIGINT NOT NULL,
-    exchange VARCHAR(10) NOT NULL,
+    exchange VARCHAR(20) NOT NULL,
     symbol VARCHAR(50) NOT NULL,
     
     -- Order details
-    order_type VARCHAR(10) NOT NULL,
-    order_side VARCHAR(10) NOT NULL,
+    order_type VARCHAR(20) NOT NULL,
+    order_side VARCHAR(20) NOT NULL,
     quantity INT NOT NULL,
     price DECIMAL(15,2),
     
@@ -24,15 +24,30 @@ CREATE TABLE IF NOT EXISTS orders (
     stop_loss DECIMAL(15,2),
     take_profit DECIMAL(15,2),
     
-    -- Order validity
-    validity VARCHAR(10) DEFAULT 'DAY',
+    -- Order validity and type
+    validity VARCHAR(20) DEFAULT 'DAY',
+    product_type VARCHAR(20) DEFAULT 'INTRADAY',
     
     -- Order status
     status VARCHAR(20) NOT NULL DEFAULT 'RECEIVED',
     
-    -- Odin API integration
-    odin_order_id VARCHAR(50),
-    odin_response TEXT,
+    -- Indira API integration
+    indira_order_id VARCHAR(50),
+    indira_response TEXT,
+    
+    -- Authentication and frontend data
+    bearer_token TEXT,
+    app_id VARCHAR(100),
+    source VARCHAR(20),
+    
+    -- Stop loss configuration
+    stop_loss_type VARCHAR(20),
+    trailing_sl_pct DECIMAL(5,2),
+    highest_price DECIMAL(15,2),
+    target_price DECIMAL(15,2),
+    
+    -- Auto square-off flag
+    is_square_off_order BOOLEAN DEFAULT false,
     
     -- Execution details
     filled_quantity INT DEFAULT 0,
@@ -74,7 +89,7 @@ CREATE TABLE IF NOT EXISTS execution_events (
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_event_id ON orders(event_id);
-CREATE INDEX IF NOT EXISTS idx_orders_odin_id ON orders(odin_order_id) WHERE odin_order_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_indira_id ON orders(indira_order_id) WHERE indira_order_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_strategy_id ON orders(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_orders_stock_code ON orders(stock_code);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC);

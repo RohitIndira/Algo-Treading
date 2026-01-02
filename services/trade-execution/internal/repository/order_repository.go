@@ -17,7 +17,7 @@ type OrderRepository interface {
 	Create(ctx context.Context, order *models.Order) error
 	Update(ctx context.Context, order *models.Order) error
 	GetByID(ctx context.Context, orderID uuid.UUID) (*models.Order, error)
-	GetByOdinOrderID(ctx context.Context, odinOrderID string) (*models.Order, error)
+	GetByIndiraOrderID(ctx context.Context, indiraOrderID string) (*models.Order, error)
 	GetUserOrders(ctx context.Context, userID string, limit, offset int) ([]*models.Order, error)
 	GetOrdersByStatus(ctx context.Context, status models.OrderStatus, limit int) ([]*models.Order, error)
 	UpdateStatus(ctx context.Context, orderID uuid.UUID, status models.OrderStatus) error
@@ -42,12 +42,16 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			order_id, user_id, strategy_id, event_id,
 			stock_code, exchange, symbol,
 			order_type, order_side, quantity, price,
-			stop_loss, take_profit, validity,
+			stop_loss, take_profit, validity, product_type,
 			status, risk_approved, risk_score,
+			bearer_token, app_id, source,
+			stop_loss_type, trailing_sl_pct, highest_price, target_price,
+			is_square_off_order,
 			retry_count, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-			$12, $13, $14, $15, $16, $17, $18, $19, $20
+			$12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
+			$22, $23, $24, $25, $26, $27, $28, $29
 		)
 	`
 
@@ -55,8 +59,11 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 		order.OrderID, order.UserID, order.StrategyID, order.EventID,
 		order.StockCode, order.Exchange, order.Symbol,
 		order.OrderType, order.OrderSide, order.Quantity, order.Price,
-		order.StopLoss, order.TakeProfit, order.Validity,
+		order.StopLoss, order.TakeProfit, order.Validity, order.ProductType,
 		order.Status, order.RiskApproved, order.RiskScore,
+		order.BearerToken, order.AppId, order.Source,
+		order.StopLossType, order.TrailingSLPct, order.HighestPrice, order.TargetPrice,
+		order.IsSquareOffOrder,
 		order.RetryCount, order.CreatedAt, order.UpdatedAt,
 	)
 
@@ -71,7 +78,7 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 func (r *orderRepository) Update(ctx context.Context, order *models.Order) error {
 	query := `
 		UPDATE orders SET
-			status = $1, odin_order_id = $2, odin_response = $3,
+			status = $1, indira_order_id = $2, indira_response = $3,
 			filled_quantity = $4, filled_price = $5, commission = $6,
 			total_cost = $7, submitted_at = $8, executed_at = $9,
 			error_message = $10, rejection_reason = $11, retry_count = $12,
@@ -119,17 +126,17 @@ func (r *orderRepository) GetByID(ctx context.Context, orderID uuid.UUID) (*mode
 	return &order, nil
 }
 
-// GetByOdinOrderID retrieves an order by Odin order ID
-func (r *orderRepository) GetByOdinOrderID(ctx context.Context, odinOrderID string) (*models.Order, error) {
+// GetByIndiraOrderID retrieves an order by Indira order ID
+func (r *orderRepository) GetByIndiraOrderID(ctx context.Context, indiraOrderID string) (*models.Order, error) {
 	var order models.Order
-	query := `SELECT * FROM orders WHERE odin_order_id = $1`
+	query := `SELECT * FROM orders WHERE indira_order_id = $1`
 
-	err := r.db.GetContext(ctx, &order, query, odinOrderID)
+	err := r.db.GetContext(ctx, &order, query, indiraOrderID)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("order not found with odin_order_id: %s", odinOrderID)
+		return nil, fmt.Errorf("order not found with indira_order_id: %s", indiraOrderID)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get order by odin_order_id: %w", err)
+		return nil, fmt.Errorf("failed to get order by indira_order_id: %w", err)
 	}
 
 	return &order, nil

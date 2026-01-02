@@ -224,7 +224,7 @@ func (c *RabbitMQConsumer) processMessage(ctx context.Context, msg amqp.Delivery
 
 	// Save order to database
 	if err := c.repo.Create(ctx, order); err != nil {
-		log.Printf("Worker %d: failed to save order: %v", workerID, err)
+		log.Printf("Worker %d: failed to save order: %v", order, err)
 		msg.Nack(false, true) // Requeue
 		return
 	}

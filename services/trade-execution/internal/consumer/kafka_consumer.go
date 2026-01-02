@@ -3,7 +3,9 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -18,9 +20,12 @@ type TradeSignalProcessor interface {
 
 // KafkaConsumer consumes trade signals from Kafka
 type KafkaConsumer struct {
-	reader    *kafka.Reader
-	processor TradeSignalProcessor
-	logger    *zap.Logger
+	reader           *kafka.Reader
+	processor        TradeSignalProcessor
+	logger           *zap.Logger
+	retryAttempts    int
+	initialRetryWait time.Duration
+	maxRetryWait     time.Duration
 }
 
 // NewKafkaConsumer creates a new Kafka consumer for trade signals
@@ -33,6 +38,9 @@ func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalPro
 		MaxBytes:       10e6, // 10MB
 		CommitInterval: time.Second,
 		StartOffset:    kafka.LastOffset,
+		ReadBackoffMin: 100 * time.Millisecond,
+		ReadBackoffMax: 1 * time.Second,
+		MaxWait:        500 * time.Millisecond,
 	})
 
 	logger.Info("Kafka consumer initialized",
@@ -41,9 +49,12 @@ func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalPro
 		zap.String("group_id", groupID))
 
 	return &KafkaConsumer{
-		reader:    reader,
-		processor: processor,
-		logger:    logger,
+		reader:           reader,
+		processor:        processor,
+		logger:           logger,
+		retryAttempts:    0,
+		initialRetryWait: 100 * time.Millisecond,
+		maxRetryWait:     30 * time.Second,
 	}
 }
 
@@ -64,10 +75,22 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 					// Context cancelled, exit gracefully
 					return nil
 				}
-				c.logger.Error("Failed to fetch message", zap.Error(err))
-				time.Sleep(time.Second)
+
+				// Handle EOF gracefully - this is normal when no messages are available
+				if errors.Is(err, io.EOF) {
+					c.logger.Debug("No messages available, waiting for new messages")
+					c.resetRetry()
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+
+				// Handle other Kafka-specific errors with exponential backoff
+				c.handleFetchError(ctx, err)
 				continue
 			}
+
+			// Successfully fetched a message, reset retry counter
+			c.resetRetry()
 
 			// Process message
 			if err := c.processMessage(ctx, msg); err != nil {
@@ -85,6 +108,42 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 				c.logger.Error("Failed to commit message", zap.Error(err))
 			}
 		}
+	}
+}
+
+// handleFetchError handles fetch errors with exponential backoff
+func (c *KafkaConsumer) handleFetchError(ctx context.Context, err error) {
+	c.retryAttempts++
+
+	// Calculate backoff duration with exponential increase
+	backoffDuration := c.initialRetryWait
+	for i := 0; i < c.retryAttempts-1; i++ {
+		backoffDuration *= 2
+		if backoffDuration > c.maxRetryWait {
+			backoffDuration = c.maxRetryWait
+			break
+		}
+	}
+
+	c.logger.Warn("Kafka fetch error, applying exponential backoff",
+		zap.Error(err),
+		zap.Int("attempt", c.retryAttempts),
+		zap.Duration("backoff", backoffDuration))
+
+	select {
+	case <-time.After(backoffDuration):
+		// Backoff completed, continue
+	case <-ctx.Done():
+		// Context cancelled during backoff
+	}
+}
+
+// resetRetry resets the retry counter after successful message fetch
+func (c *KafkaConsumer) resetRetry() {
+	if c.retryAttempts > 0 {
+		c.logger.Debug("Kafka connection recovered, resetting retry counter",
+			zap.Int("previous_attempts", c.retryAttempts))
+		c.retryAttempts = 0
 	}
 }
 

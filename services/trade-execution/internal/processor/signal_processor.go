@@ -105,8 +105,13 @@ func (p *SignalProcessor) handleExecutionSuccess(ctx context.Context, signal *mo
 		ExecutionTime:     brokerResult.Timestamp,
 		BrokerTimestamp:   brokerResult.Timestamp,
 		EventID:           signal.EventID,
-		NewsCategory:      signal.NewsCategory,
-		ImpactScore:       signal.ImpactScore,
+		LTP:               signal.LTP,
+		BidPrices:         signal.BidPrices,
+		AskPrices:         signal.AskPrices,
+		BidQuantities:     signal.BidQuantities,
+		AskQuantities:     signal.AskQuantities,
+		SpreadPct:         signal.SpreadPct,
+		BidAskRatio:       signal.BidAskRatio,
 		MatchScore:        signal.MatchScore,
 	}
 
@@ -199,7 +204,7 @@ func (p *SignalProcessor) createOrderUpdate(signal *models.TradeSignal, result *
 		Strategy: models.StrategyContext{
 			ID:      signal.StrategyID,
 			Name:    signal.StrategyName,
-			Trigger: fmt.Sprintf("%s news detected", signal.NewsCategory),
+			Trigger: fmt.Sprintf("Market depth signal (spread: %.2f%%, ratio: %.2f)", signal.SpreadPct, signal.BidAskRatio),
 		},
 		Actions: []models.ActionItem{
 			{

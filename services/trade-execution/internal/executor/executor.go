@@ -32,6 +32,33 @@ func NewOrderExecutor(repo repository.OrderRepository, credsRepo repository.Cred
 	}
 }
 
+func (e *OrderExecutor) ExecuteOrderDirectly(ctx context.Context, order *models.Order) error {
+    log.Printf("Directly executing order %s for user %s", order.OrderID, order.UserID)
+    // Verify risk approval
+    if !order.RiskApproved {
+        log.Printf("Order %s not approved by risk management", order.OrderID)
+        return fmt.Errorf("order not approved by risk management")
+    }
+    // Get Indira credentials from the order
+    if order.UserID == "" || order.AppId == nil || order.Source == nil || order.BearerToken == nil {
+        return fmt.Errorf("missing Indira Securities authentication data")
+    }
+    auth := &indiraClient.AuthContext{
+        UserId:      order.UserID,
+        AppId:       *order.AppId,
+        Source:      *order.Source,
+        BearerToken: *order.BearerToken,
+    }
+    // Place order via Indira API
+    orderID, err := e.indiraClient.PlaceOrder(ctx, order, auth)
+    if err != nil {
+        log.Printf("Failed to place order %s: %v", order.OrderID, err)
+        return fmt.Errorf("failed to place order: %w", err)
+    }
+    log.Printf("✓ Order %s placed successfully with indira_order_id: %s", order.OrderID, orderID)
+    return nil
+}
+
 // ExecuteOrder processes and executes an order
 // In services/trade-execution/internal/executor/executor.go
 

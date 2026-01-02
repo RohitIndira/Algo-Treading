@@ -17,7 +17,7 @@ func (m *mockRepo) Update(ctx context.Context, order *models.Order) error { retu
 func (m *mockRepo) GetByID(ctx context.Context, orderID uuid.UUID) (*models.Order, error) {
 	return nil, nil
 }
-func (m *mockRepo) GetByOdinOrderID(ctx context.Context, odinOrderID string) (*models.Order, error) {
+func (m *mockRepo) GetByIndiraOrderID(ctx context.Context, indiraOrderID string) (*models.Order, error) {
 	return nil, nil
 }
 func (m *mockRepo) GetUserOrders(ctx context.Context, userID string, limit, offset int) ([]*models.Order, error) {

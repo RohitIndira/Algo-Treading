@@ -100,7 +100,7 @@ func main() {
 
 	// Initialize Kafka consumer for trade-signals
 	log.Println("Initializing Kafka consumer...")
-	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, rabbitPublisher)
+	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, rabbitPublisher, cfg.SkipDBSave)
 	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger)
 	defer kafkaConsumer.Close()
 	log.Println("✓ Kafka consumer initialized")
@@ -181,6 +181,7 @@ type Config struct {
 	MaxRetries    int
 	RetryDelay    time.Duration
 	PostgresURL   string
+	SkipDBSave    bool `env:"SKIP_DB_SAVE" envDefault:"true"`
 }
 
 func loadConfig() Config {
