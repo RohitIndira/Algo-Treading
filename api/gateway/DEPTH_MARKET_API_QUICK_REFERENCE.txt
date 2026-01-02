@@ -1,0 +1,469 @@
+DEPTH MARKET STRATEGY API - QUICK REFERENCE
+
+================================================================================
+ENDPOINT
+================================================================================
+
+POST /api/v1/strategies/depth-market/create
+
+Base URL: http://localhost:8080 (or your production URL)
+Full URL: http://localhost:8080/api/v1/strategies/depth-market/create
+
+================================================================================
+REQUIRED HEADERS
+================================================================================
+
+Content-Type: application/json
+Authorization: Bearer <JWT_TOKEN>
+appId: <APP_ID>
+source: <PLATFORM>
+
+Example:
+  Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+  appId: trading-app-v1
+  source: WEB
+
+================================================================================
+REQUIRED BODY FIELDS
+================================================================================
+
+user_id (string)
+  → Unique user identifier
+  → Cannot be empty
+
+strategy_name (string)
+  → Name for the strategy
+  → Cannot be empty
+
+stock_codes (array of integers)
+  → Stock codes to trade
+  → Must have at least 1 element
+  → Example: [1, 2, 3]
+
+exchanges (array of strings)
+  → Trading exchanges
+  → Must have at least 1 element
+  → Values: NSE, BSE, MCX, NCDEX, etc.
+
+order_type (string)
+  → LIMIT: Place limit orders
+  → MARKET: Place market orders
+  → Required for execution
+
+order_side (string)
+  → BUY: Buy orders
+  → SELL: Sell orders
+  → Required for execution
+
+quantity (integer)
+  → Number of shares/units to trade
+  → Must be > 0
+  → Integer only
+
+exchange (string)
+  → Primary execution exchange
+  → Required for execution
+
+position_sizing (string)
+  → FIXED: Use fixed quantity
+  → PERCENTAGE: Use percentage of portfolio
+  → Required
+
+================================================================================
+OPTIONAL BODY FIELDS
+================================================================================
+
+DEPTH MARKET PARAMETERS:
+  min_bid_quantity (integer)
+    → Minimum bid quantity at depth
+    → Default: No limit
+  
+  min_ask_quantity (integer)
+    → Minimum ask quantity at depth
+    → Default: No limit
+  
+  max_spread_pct (float)
+    → Maximum bid-ask spread percentage
+    → Example: 0.3 = 0.3%
+    → Default: No limit
+  
+  require_ltp_between_spread (boolean)
+    → Ensure LTP is between bid-ask
+    → Default: false
+
+PRICE & VOLUME FILTERS:
+  price_range_min (float)
+    → Minimum stock price
+    → Example: 100.0
+  
+  price_range_max (float)
+    → Maximum stock price
+    → Example: 5000.0
+  
+  volume_threshold (integer)
+    → Minimum daily volume
+    → Example: 1000000
+  
+  min_market_cap (float)
+    → Minimum market cap in crores
+    → Example: 100.0
+  
+  max_market_cap (float)
+    → Maximum market cap in crores
+    → Example: 100000.0
+
+TRADE CONFIGURATION:
+  limit_price (float)
+    → Price for limit orders
+    → Example: 245.50
+  
+  max_position_size (float)
+    → Maximum position value in Rs
+    → Example: 100000.0
+  
+  validity (string)
+    → DAY: Valid for current day
+    → GTC: Good till cancelled
+    → IOC: Immediate or cancel
+  
+  product_type (string)
+    → INTRADAY: Intraday trading
+    → DELIVERY: Delivery trading
+    → CASH: Cash market
+
+STOP LOSS & TAKE PROFIT:
+  stop_loss_pct (float)
+    → Stop loss percentage
+    → Example: 2.0 = 2%
+  
+  take_profit_pct (float)
+    → Take profit percentage
+    → Example: 3.0 = 3%
+  
+  stop_loss_type (string)
+    → FIXED: Fixed stop loss
+    → TRAILING: Trailing stop loss
+    → Default: FIXED
+  
+  trailing_sl_pct (float)
+    → Trailing stop loss percentage
+    → Used only if stop_loss_type = TRAILING
+    → Example: 1.5 = 1.5%
+
+RISK MANAGEMENT:
+  max_daily_trades (integer)
+    → Maximum trades per day
+    → Example: 20
+  
+  max_loss_per_day (float)
+    → Maximum daily loss in Rs
+    → Example: 10000.0
+  
+  max_portfolio_exposure_pct (float)
+    → Max portfolio exposure percentage
+    → Example: 10.0 = 10%
+  
+  max_per_trade_risk (float)
+    → Maximum risk per trade in Rs
+    → Example: 1000.0
+  
+  enable_risk_checks (boolean)
+    → Enable risk validations
+    → Default: true
+  
+  enable_auto_square_off (boolean)
+    → Auto square-off at market close
+    → Default: true for INTRADAY
+  
+  auto_square_off_time (string)
+    → Square-off time in HH:MM format
+    → Example: "15:05"
+    → Default: "15:30"
+
+DESCRIPTION & ACTIVATION:
+  description (string)
+    → Strategy description
+    → Optional
+  
+  activate_immediately (boolean)
+    → Activate after creation
+    → Default: false
+    → Recommended: Test first, then activate
+
+AUTHENTICATION OVERRIDE (optional):
+  bearer_token (string)
+    → Override Authorization header
+  
+  app_id (string)
+    → Override appId header
+  
+  source (string)
+    → Override source header
+
+================================================================================
+RESPONSE (SUCCESS - 201 Created)
+================================================================================
+
+{
+  "success": true,
+  "strategy": {
+    "strategy_id": "uuid",
+    "user_id": "string",
+    "strategy_name": "string",
+    "description": "string",
+    "active": boolean,
+    "version": integer,
+    "created_at": "2025-01-02T10:30:00Z",
+    "updated_at": "2025-01-02T10:30:00Z",
+    "conditions": { /* depth market conditions */ },
+    "trade_config": { /* trade configuration */ },
+    "risk_limits": { /* risk management */ }
+  }
+}
+
+================================================================================
+RESPONSE (ERROR - 400)
+================================================================================
+
+{
+  "error": "error message describing what went wrong"
+}
+
+Common errors:
+- "stock_codes and exchanges are required"
+- "quantity must be greater than 0"
+- "order_type, order_side, and exchange are required"
+- "bearer_token, app_id, and source are required"
+
+================================================================================
+RESPONSE STATUS CODES
+================================================================================
+
+201 Created
+  → Strategy created successfully
+
+400 Bad Request
+  → Missing or invalid required fields
+  → Check error message for details
+
+401 Unauthorized
+  → Invalid authentication credentials
+  → Check Authorization, appId, source headers
+
+500 Internal Server Error
+  → Server-side error
+  → Check server logs
+  → Retry after fixing the issue
+
+503 Service Unavailable
+  → Backend service not reachable
+  → Verify backend is running
+
+================================================================================
+CURL QUICK COMMAND
+================================================================================
+
+curl -X POST http://localhost:8080/api/v1/strategies/depth-market/create \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "appId: YOUR_APP_ID" \
+  -H "source: WEB" \
+  -d '{
+    "user_id": "user_123",
+    "strategy_name": "My Strategy",
+    "stock_codes": [1, 2, 3],
+    "exchanges": ["NSE"],
+    "order_type": "LIMIT",
+    "order_side": "BUY",
+    "quantity": 100,
+    "exchange": "NSE",
+    "position_sizing": "FIXED"
+  }'
+
+================================================================================
+JAVASCRIPT FETCH EXAMPLE
+================================================================================
+
+const response = await fetch(
+  'http://localhost:8080/api/v1/strategies/depth-market/create',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer YOUR_TOKEN',
+      'appId': 'YOUR_APP_ID',
+      'source': 'WEB'
+    },
+    body: JSON.stringify({
+      user_id: 'user_123',
+      strategy_name: 'My Strategy',
+      stock_codes: [1, 2, 3],
+      exchanges: ['NSE'],
+      order_type: 'LIMIT',
+      order_side: 'BUY',
+      quantity: 100,
+      exchange: 'NSE',
+      position_sizing: 'FIXED'
+    })
+  }
+);
+
+const data = await response.json();
+console.log(data);
+
+================================================================================
+PYTHON REQUESTS EXAMPLE
+================================================================================
+
+import requests
+import json
+
+url = 'http://localhost:8080/api/v1/strategies/depth-market/create'
+headers = {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer YOUR_TOKEN',
+    'appId': 'YOUR_APP_ID',
+    'source': 'WEB'
+}
+
+payload = {
+    'user_id': 'user_123',
+    'strategy_name': 'My Strategy',
+    'stock_codes': [1, 2, 3],
+    'exchanges': ['NSE'],
+    'order_type': 'LIMIT',
+    'order_side': 'BUY',
+    'quantity': 100,
+    'exchange': 'NSE',
+    'position_sizing': 'FIXED'
+}
+
+response = requests.post(url, headers=headers, json=payload)
+data = response.json()
+print(json.dumps(data, indent=2))
+
+================================================================================
+PARAMETER PRESETS
+================================================================================
+
+CONSERVATIVE:
+  min_bid_quantity: 500
+  min_ask_quantity: 500
+  max_spread_pct: 0.25
+  stop_loss_pct: 2.0
+  take_profit_pct: 2.5
+  max_daily_trades: 10
+  enable_risk_checks: true
+
+BALANCED:
+  min_bid_quantity: 200
+  min_ask_quantity: 200
+  max_spread_pct: 0.4
+  stop_loss_pct: 2.0
+  take_profit_pct: 3.0
+  max_daily_trades: 20
+  enable_risk_checks: true
+
+AGGRESSIVE:
+  min_bid_quantity: 100
+  min_ask_quantity: 100
+  max_spread_pct: 0.7
+  stop_loss_pct: 1.5
+  take_profit_pct: 5.0
+  max_daily_trades: 50
+  enable_risk_checks: true
+
+SCALPING:
+  min_bid_quantity: 50
+  min_ask_quantity: 50
+  max_spread_pct: 0.1
+  stop_loss_pct: 0.5
+  take_profit_pct: 0.75
+  max_daily_trades: 100
+  enable_risk_checks: true
+
+================================================================================
+VALIDATION CHECKLIST
+================================================================================
+
+Before making the API call:
+
+[ ] user_id is not empty
+[ ] strategy_name is not empty
+[ ] stock_codes array has at least 1 code
+[ ] exchanges array has at least 1 exchange
+[ ] order_type is LIMIT or MARKET
+[ ] order_side is BUY or SELL
+[ ] quantity is > 0
+[ ] exchange is valid (NSE, BSE, etc.)
+[ ] position_sizing is FIXED or PERCENTAGE
+[ ] bearer_token is provided (header or body)
+[ ] app_id is provided (header or body)
+[ ] source is provided (header or body)
+[ ] If order_type=LIMIT, limit_price is provided
+[ ] If stop_loss_type=TRAILING, trailing_sl_pct is provided
+[ ] take_profit_pct > stop_loss_pct (good risk:reward)
+
+Optional checks:
+[ ] max_spread_pct is between 0.1 and 2.0
+[ ] price_range_min < price_range_max
+[ ] min_market_cap < max_market_cap
+[ ] auto_square_off_time < "15:30" for INTRADAY
+
+================================================================================
+RELATED ENDPOINTS
+================================================================================
+
+GET /api/v1/strategies/{strategy_id}
+  → Get strategy details
+
+PUT /api/v1/strategies/{strategy_id}
+  → Update strategy
+
+DELETE /api/v1/strategies/{strategy_id}
+  → Delete strategy
+
+POST /api/v1/strategies/{strategy_id}/activate
+  → Activate strategy
+
+POST /api/v1/strategies/{strategy_id}/deactivate
+  → Deactivate strategy
+
+GET /api/v1/users/{user_id}/strategies
+  → List user's strategies
+
+POST /api/v1/strategies
+  → Create generic strategy (not depth-specific)
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Issue: 400 - stock_codes and exchanges are required
+  → Add stock_codes array with at least one code
+  → Add exchanges array with at least one exchange
+
+Issue: 400 - quantity must be greater than 0
+  → Ensure quantity is an integer > 0
+
+Issue: 400 - bearer_token, app_id, and source are required
+  → Add Authorization header with Bearer token
+  → Add appId header
+  → Add source header
+
+Issue: 401 - Invalid authentication token
+  → Verify JWT token is not expired
+  → Request new token
+  → Check token is in correct format
+
+Issue: 500 - Failed to create depth market strategy
+  → Check API server logs
+  → Verify database connection
+  → Try again with valid parameters
+
+Issue: 503 - Service Unavailable
+  → Verify backend service is running
+  → Check service URL is correct
+  → Try again in a few moments
+
+================================================================================

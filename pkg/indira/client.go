@@ -16,10 +16,10 @@ const (
 	DefaultTimeout = 30 * time.Second
 
 	// Environment variable names
-	EnvIndiraBaseURL = "INDIRA_BASE_URL"
+	EnvIndiraBaseURL = ""
 
 	// Fallback base URL if environment variable is not set
-	FallbackBaseURL = "https://localhost:8000"
+	FallbackBaseURL = ""
 )
 
 // getDefaultBaseURL returns the base URL from environment or uses fallback

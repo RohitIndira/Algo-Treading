@@ -1,0 +1,423 @@
+DEPTH MARKET STRATEGY API - IMPLEMENTATION GUIDE
+
+================================================================================
+QUICK START
+================================================================================
+
+ENDPOINT: POST /api/v1/strategies/depth-market/create
+
+The API creates trading strategies optimized for market depth analysis. It handles
+the complexity of depth-based trading by providing a simplified interface with
+sensible defaults for risk management and execution parameters.
+
+================================================================================
+MINIMAL REQUEST EXAMPLE
+================================================================================
+
+curl -X POST http://localhost:8080/api/v1/strategies/depth-market/create \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+  -H "appId: trading-app-v1" \
+  -H "source: WEB" \
+  -d '{
+    "user_id": "user_123",
+    "strategy_name": "Quick Depth Strategy",
+    "stock_codes": [1, 2, 3],
+    "exchanges": ["NSE"],
+    "order_type": "LIMIT",
+    "order_side": "BUY",
+    "quantity": 100,
+    "exchange": "NSE",
+    "position_sizing": "FIXED"
+  }'
+
+RESPONSE:
+{
+  "success": true,
+  "strategy": {
+    "strategy_id": "550e8400-e29b-41d4-a716-446655440000",
+    "user_id": "user_123",
+    "strategy_name": "Quick Depth Strategy",
+    "active": false,
+    "version": 1,
+    "created_at": "2025-01-02T10:30:00Z"
+  }
+}
+
+================================================================================
+COMPREHENSIVE REQUEST EXAMPLE
+================================================================================
+
+curl -X POST http://localhost:8080/api/v1/strategies/depth-market/create \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+  -H "appId: trading-app-v1" \
+  -H "source: WEB" \
+  -d '{
+    "user_id": "user_123",
+    "strategy_name": "Premium Depth Trading Strategy",
+    "description": "High-liquidity stock trading using market depth indicators",
+    
+    "stock_codes": [1, 2, 3, 4, 5],
+    "exchanges": ["NSE", "BSE"],
+    "min_bid_quantity": 200,
+    "min_ask_quantity": 200,
+    "max_spread_pct": 0.3,
+    "require_ltp_between_spread": true,
+    "price_range_min": 100.0,
+    "price_range_max": 5000.0,
+    "volume_threshold": 1000000,
+    "min_market_cap": 100.0,
+    "max_market_cap": 100000.0,
+    
+    "order_type": "LIMIT",
+    "order_side": "BUY",
+    "quantity": 100,
+    "exchange": "NSE",
+    "limit_price": 245.50,
+    "max_position_size": 100000.0,
+    "validity": "DAY",
+    "product_type": "INTRADAY",
+    
+    "stop_loss_pct": 2.0,
+    "take_profit_pct": 3.0,
+    "stop_loss_type": "FIXED",
+    "trailing_sl_pct": 0.0,
+    
+    "max_daily_trades": 20,
+    "max_loss_per_day": 10000.0,
+    "position_sizing": "FIXED",
+    "max_portfolio_exposure_pct": 10.0,
+    "max_per_trade_risk": 1000.0,
+    "enable_risk_checks": true,
+    "enable_auto_square_off": true,
+    "auto_square_off_time": "15:05",
+    
+    "activate_immediately": false
+  }'
+
+RESPONSE:
+{
+  "success": true,
+  "strategy": {
+    "strategy_id": "550e8400-e29b-41d4-a716-446655440000",
+    "user_id": "user_123",
+    "strategy_name": "Premium Depth Trading Strategy",
+    "description": "High-liquidity stock trading using market depth indicators",
+    "active": false,
+    "match_all_news": false,
+    "version": 1,
+    "created_at": "2025-01-02T10:45:00Z",
+    "updated_at": "2025-01-02T10:45:00Z",
+    "conditions": {
+      "condition_id": "550e8400-e29b-41d4-a716-446655440001",
+      "strategy_id": "550e8400-e29b-41d4-a716-446655440000",
+      "stock_codes": [1, 2, 3, 4, 5],
+      "exchanges": ["NSE", "BSE"],
+      "min_bid_quantity": 200,
+      "min_ask_quantity": 200,
+      "max_spread_pct": 0.3,
+      "require_ltp_between_spread": true,
+      "price_range_min": 100.0,
+      "price_range_max": 5000.0,
+      "volume_threshold": 1000000,
+      "min_market_cap": 100.0,
+      "max_market_cap": 100000.0,
+      "depth_only": true,
+      "created_at": "2025-01-02T10:45:00Z"
+    },
+    "trade_config": {
+      "trade_config_id": "550e8400-e29b-41d4-a716-446655440002",
+      "strategy_id": "550e8400-e29b-41d4-a716-446655440000",
+      "order_type": "LIMIT",
+      "order_side": "BUY",
+      "quantity": 100,
+      "exchange": "NSE",
+      "limit_price": 245.50,
+      "max_position_size": 100000.0,
+      "stop_loss_pct": 2.0,
+      "take_profit_pct": 3.0,
+      "validity": "DAY",
+      "stop_loss_type": "FIXED",
+      "trailing_sl_pct": 0.0,
+      "product_type": "INTRADAY",
+      "created_at": "2025-01-02T10:45:00Z"
+    },
+    "risk_limits": {
+      "risk_limit_id": "550e8400-e29b-41d4-a716-446655440003",
+      "strategy_id": "550e8400-e29b-41d4-a716-446655440000",
+      "max_daily_trades": 20,
+      "max_loss_per_day": 10000.0,
+      "position_sizing": "FIXED",
+      "max_portfolio_exposure_pct": 10.0,
+      "max_per_trade_risk": 1000.0,
+      "enable_risk_checks": true,
+      "enable_auto_square_off": true,
+      "auto_square_off_time": "15:05",
+      "created_at": "2025-01-02T10:45:00Z"
+    }
+  }
+}
+
+================================================================================
+STRATEGY TYPE TEMPLATES
+================================================================================
+
+1. AGGRESSIVE GROWTH STRATEGY
+   - Higher max_daily_trades (30+)
+   - Larger quantities
+   - Higher take_profit_pct (5-10%)
+   - Shorter stop_loss_pct (1-2%)
+   - Frequent rebalancing
+
+2. CONSERVATIVE STRATEGY
+   - Lower max_daily_trades (5-10)
+   - Smaller quantities
+   - Moderate take_profit_pct (2-3%)
+   - Larger stop_loss_pct (3-5%)
+   - Strong risk_checks enabled
+
+3. MOMENTUM TRADING STRATEGY
+   - TRAILING stop_loss_type
+   - Higher position_sizes
+   - volume_threshold important
+   - max_spread_pct strict
+   - Fast order execution (LIMIT)
+
+4. SCALPING STRATEGY
+   - Very small quantities
+   - Multiple daily_trades
+   - Tight take_profit_pct (0.5-1%)
+   - Tight stop_loss_pct (0.3-0.5%)
+   - HIGH frequency trading
+
+5. MARKET MAKER STRATEGY
+   - Alternating BUY/SELL orders
+   - Tight max_spread_pct
+   - High min_bid/ask_quantity
+   - Multiple exchange participation
+   - Risk checks mandatory
+
+================================================================================
+PARAMETER GUIDELINES
+================================================================================
+
+DEPTH MARKET SPECIFIC:
+- min_bid_quantity: 50-1000 (shares)
+  → Lower values: More liquidity options
+  → Higher values: Only premium liquidity
+  
+- min_ask_quantity: 50-1000 (shares)
+  → Same logic as min_bid_quantity
+  
+- max_spread_pct: 0.1-2.0 (percentage)
+  → 0.1-0.3: Premium liquidity required
+  → 0.3-0.7: Good liquidity
+  → 0.7-2.0: Any liquidity acceptable
+
+PRICE & VOLUME:
+- volume_threshold: 100k-10M (daily volume)
+  → Lower: Smaller cap stocks
+  → Higher: Blue-chip stocks only
+  
+- price_range_min/max: (stock price in Rs)
+  → Typical: 100-5000 Rs range
+
+TRADE EXECUTION:
+- quantity: 1-10000 (shares)
+  → Adjust based on capital and risk
+  
+- limit_price: > 0
+  → Used only if order_type is LIMIT
+  → Typically near current bid price
+
+RISK MANAGEMENT:
+- max_daily_trades: 5-50
+  → Limits trading frequency and risk
+  
+- max_loss_per_day: Amount in Rs
+  → Example: 10000 = Rs 10,000 daily loss limit
+  
+- max_per_trade_risk: Amount in Rs
+  → Per-trade risk cap for position sizing
+  
+- max_portfolio_exposure_pct: 5-30%
+  → % of total portfolio in single strategy
+
+STOP LOSS & TAKE PROFIT:
+- stop_loss_pct: 0.5-10%
+  → Small SL: Tight risk control (scalping)
+  → Large SL: Wide risk tolerance (swing trading)
+  
+- take_profit_pct: 1-20%
+  → Should be at least 2x stop_loss for good reward:risk
+  
+- trailing_sl_pct: 0.5-5%
+  → Used only if stop_loss_type = TRAILING
+
+AUTO SQUARE OFF:
+- enable_auto_square_off: true/false
+  → INTRADAY: Usually true
+  → DELIVERY: Usually false
+  
+- auto_square_off_time: HH:MM format
+  → Typical: "15:00" or "15:30" (before market close at 15:30)
+
+================================================================================
+ACTIVATION STRATEGIES
+================================================================================
+
+Option 1: CREATE & ACTIVATE LATER
+- Set activate_immediately: false
+- Test the strategy on paper trading first
+- Activate via POST /api/v1/strategies/{strategy_id}/activate
+
+Option 2: CREATE & ACTIVATE IMMEDIATELY
+- Set activate_immediately: true
+- Strategy starts trading immediately
+- Better for time-sensitive strategies
+
+RECOMMENDED APPROACH:
+1. Create with activate_immediately: false
+2. Verify strategy configuration
+3. Monitor paper trading results
+4. Activate when confident
+
+================================================================================
+ERROR HANDLING
+================================================================================
+
+STATUS 400 - BAD REQUEST:
+{
+  "error": "stock_codes and exchanges are required"
+}
+→ Missing required arrays
+
+{
+  "error": "quantity must be greater than 0"
+}
+→ Invalid quantity value
+
+{
+  "error": "bearer_token, app_id, and source are required"
+}
+→ Missing authentication credentials
+
+STATUS 401 - UNAUTHORIZED:
+{
+  "error": "Invalid authentication token"
+}
+→ JWT token expired or invalid
+→ Solution: Refresh token and retry
+
+STATUS 500 - INTERNAL SERVER ERROR:
+{
+  "error": "Failed to create depth market strategy: [database error]"
+}
+→ Server-side issue
+→ Check server logs
+→ Retry with exponential backoff
+
+================================================================================
+BEST PRACTICES
+================================================================================
+
+1. VALIDATE LOCALLY FIRST:
+   - Check all required fields before sending
+   - Validate numeric ranges
+   - Ensure stock_codes exist in market
+
+2. USE REASONABLE DEFAULTS:
+   - Don't set extreme values
+   - Start conservative, increase gradually
+   - Test on small quantities first
+
+3. MONITOR AFTER CREATION:
+   - Check strategy status via GET endpoint
+   - Monitor daily P&L
+   - Adjust parameters based on performance
+
+4. RISK MANAGEMENT:
+   - Always set max_daily_trades
+   - Always set max_loss_per_day
+   - Always enable_risk_checks for first deployment
+   - Use auto_square_off for intraday strategies
+
+5. AUTHENTICATION:
+   - Keep bearer_token secure
+   - Rotate tokens regularly
+   - Use HTTPS in production
+   - Never commit tokens to version control
+
+6. OPTIMIZATION:
+   - Monitor fill rates
+   - Adjust limit_price if fills are poor
+   - Monitor spread: reduce max_spread_pct if possible
+   - Review execution quality regularly
+
+================================================================================
+INTEGRATION EXAMPLES
+================================================================================
+
+PYTHON EXAMPLE:
+import requests
+import json
+
+url = "http://localhost:8080/api/v1/strategies/depth-market/create"
+headers = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer your_token",
+    "appId": "your_app_id",
+    "source": "WEB"
+}
+
+payload = {
+    "user_id": "user_123",
+    "strategy_name": "Python API Strategy",
+    "stock_codes": [1, 2, 3],
+    "exchanges": ["NSE"],
+    "order_type": "LIMIT",
+    "order_side": "BUY",
+    "quantity": 100,
+    "exchange": "NSE",
+    "position_sizing": "FIXED"
+}
+
+response = requests.post(url, headers=headers, json=payload)
+data = response.json()
+print(f"Strategy ID: {data['strategy']['strategy_id']}")
+
+NODEJS EXAMPLE:
+const axios = require('axios');
+
+const config = {
+  method: 'post',
+  url: 'http://localhost:8080/api/v1/strategies/depth-market/create',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer your_token',
+    'appId': 'your_app_id',
+    'source': 'WEB'
+  },
+  data: {
+    user_id: 'user_123',
+    strategy_name: 'Node API Strategy',
+    stock_codes: [1, 2, 3],
+    exchanges: ['NSE'],
+    order_type: 'LIMIT',
+    order_side: 'BUY',
+    quantity: 100,
+    exchange: 'NSE',
+    position_sizing: 'FIXED'
+  }
+};
+
+axios(config)
+  .then(response => {
+    console.log(`Strategy ID: ${response.data.strategy.strategy_id}`);
+  })
+  .catch(error => {
+    console.error(`Error: ${error.message}`);
+  });
+
+================================================================================

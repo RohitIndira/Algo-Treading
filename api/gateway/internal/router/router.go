@@ -32,6 +32,7 @@ func NewRouter(
 
 	// Strategy CRUD
 	api.HandleFunc("/strategies", userConfigHandler.CreateStrategy).Methods("POST")
+	api.HandleFunc("/strategies/depth-market/create", userConfigHandler.CreateDepthMarketStrategy).Methods("POST")
 	api.HandleFunc("/strategies/{strategy_id}", userConfigHandler.GetStrategy).Methods("GET")
 	api.HandleFunc("/strategies/{strategy_id}", userConfigHandler.UpdateStrategy).Methods("PUT")
 	api.HandleFunc("/strategies/{strategy_id}", userConfigHandler.DeleteStrategy).Methods("DELETE")

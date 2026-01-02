@@ -43,58 +43,52 @@ service UserConfigService {
   rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
 }
 
-// Strategy condition filters
+// Strategy condition filters - Market Depth Based Trading
 message StrategyConditions {
-  // Match ALL news events (overrides all other conditions except impact_score_threshold)
-  // Set this to true to create a catch-all strategy
-  // Example: User sends "/all" to match every news event
-  bool match_all_news = 1;
+  // Specific stocks to monitor (stock codes) - empty means all stocks
+  repeated int64 stock_codes = 1;
   
-  // Impact score threshold (1-10)
-  // Even with match_all_news=true, news must meet minimum impact score
-  int32 impact_score_threshold = 2;
-  
-  // Sentiment filters (positive, neutral, negative)
-  // Ignored if match_all_news=true
-  repeated common.Sentiment sentiments = 3;
-  
-  // News categories to monitor
-  // Ignored if match_all_news=true
-  repeated string categories = 4;
-  
-  // Specific stocks to monitor (stock codes)
-  // Ignored if match_all_news=true
-  repeated int64 stock_codes = 5;
+  // Exchanges to monitor - empty means all exchanges
+  repeated string exchanges = 2;
   
   // Price range filter
-  // Ignored if match_all_news=true
-  common.PriceRange price_range = 6;
+  common.PriceRange price_range = 3;
   
-  // Minimum trading volume threshold
-  // Ignored if match_all_news=true
-  int64 volume_threshold = 7;
+  // Minimum trading volume threshold (0 = no filter)
+  int64 volume_threshold = 4;
   
-  // Percentage change threshold (trigger if stock moves by this %)
-  // Ignored if match_all_news=true
-  double pct_change_threshold = 8;
+  // Percentage change threshold (0 = no filter)
+  double pct_change_threshold = 5;
   
-  // Exchanges to monitor
-  // Ignored if match_all_news=true
-  repeated common.Exchange exchanges = 9;
+  // Market depth conditions (primary triggers for orders)
   
-  // Market cap range filter (in crores)
-  // Ignored if match_all_news=true
+  // Minimum bid quantity at best price level
+  int64 min_bid_quantity = 6;
+  
+  // Minimum ask quantity at best price level
+  int64 min_ask_quantity = 7;
+  
+  // Maximum spread percentage (e.g., 0.5 = 0.5%)
+  double max_spread_pct = 8;
+  
+  // Minimum ratio of bid to ask quantity
+  double min_bid_ask_ratio = 9;
+  
+  // Maximum ratio of bid to ask quantity
+  double max_bid_ask_ratio = 10;
+  
+  // Minimum total depth quantity (bid + ask at best price)
+  int64 min_total_depth_qty = 11;
+  
+  // Require LTP to be between best bid and ask
+  bool require_ltp_between_spread = 12;
+  
+  // Market cap range filter (in crores) - optional
   message MarketCapRange {
     double min_mcap = 1; // Minimum market cap in crores
     double max_mcap = 2; // Maximum market cap in crores
   }
-  MarketCapRange market_cap_range = 10;
-  // Depth-based filters
-  int64 min_bid_quantity = 11;
-  int64 min_ask_quantity = 12;
-  double max_spread_pct = 13;
-  bool depth_only = 14;
-  bool require_ltp_between_spread = 15;
+  MarketCapRange market_cap_range = 13;
 }
 
 // Stop loss type enumeration

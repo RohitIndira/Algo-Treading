@@ -68,6 +68,241 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 	respondWithJSON(w, http.StatusCreated, resp)
 }
 
+// CreateDepthMarketStrategy handles POST /api/v1/strategies/depth-market/create
+// Specialized endpoint for creating depth market trading strategies
+func (h *UserConfigHandler) CreateDepthMarketStrategy(w http.ResponseWriter, r *http.Request) {
+	type DepthMarketRequest struct {
+		UserID                  string   `json:"user_id"`
+		StrategyName            string   `json:"strategy_name"`
+		Description             string   `json:"description"`
+		StockCodes              []int64  `json:"stock_codes"`
+		Exchanges               []string `json:"exchanges"`
+		ImpactScoreThreshold    int32    `json:"impact_score_threshold"`
+		MinBidQuantity          int64    `json:"min_bid_quantity,omitempty"`
+		MinAskQuantity          int64    `json:"min_ask_quantity,omitempty"`
+		MaxSpreadPct            float64  `json:"max_spread_pct,omitempty"`
+		RequireLTPBetweenSpread bool     `json:"require_ltp_between_spread,omitempty"`
+		PriceRangeMin           float64  `json:"price_range_min,omitempty"`
+		PriceRangeMax           float64  `json:"price_range_max,omitempty"`
+		VolumeThreshold         int64    `json:"volume_threshold,omitempty"`
+		MinMarketCap            float64  `json:"min_market_cap,omitempty"`
+		MaxMarketCap            float64  `json:"max_market_cap,omitempty"`
+		OrderType               string   `json:"order_type"`
+		OrderSide               string   `json:"order_side"`
+		Quantity                int32    `json:"quantity"`
+		Exchange                string   `json:"exchange"`
+		LimitPrice              float64  `json:"limit_price,omitempty"`
+		MaxPositionSize         float64  `json:"max_position_size,omitempty"`
+		StopLossPct             float64  `json:"stop_loss_pct,omitempty"`
+		TakeProfitPct           float64  `json:"take_profit_pct,omitempty"`
+		Validity                string   `json:"validity"`
+		StopLossType            string   `json:"stop_loss_type"`
+		TrailingSlPct           float64  `json:"trailing_sl_pct,omitempty"`
+		ProductType             string   `json:"product_type"`
+		MaxDailyTrades          int32    `json:"max_daily_trades,omitempty"`
+		MaxLossPerDay           float64  `json:"max_loss_per_day,omitempty"`
+		PositionSizing          string   `json:"position_sizing"`
+		MaxPortfolioExposurePct float64  `json:"max_portfolio_exposure_pct,omitempty"`
+		MaxPerTradeRisk         float64  `json:"max_per_trade_risk,omitempty"`
+		EnableRiskChecks        bool     `json:"enable_risk_checks"`
+		EnableAutoSquareOff     bool     `json:"enable_auto_square_off"`
+		AutoSquareOffTime       string   `json:"auto_square_off_time,omitempty"`
+		ActivateImmediately     bool     `json:"activate_immediately"`
+		BearerToken             string   `json:"bearer_token"`
+		AppId                   string   `json:"app_id"`
+		Source                  string   `json:"source"`
+	}
+
+	var depthReq DepthMarketRequest
+	if err := json.NewDecoder(r.Body).Decode(&depthReq); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	// Validate required fields
+	if depthReq.UserID == "" || depthReq.StrategyName == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id and strategy_name are required")
+		return
+	}
+
+	if len(depthReq.StockCodes) == 0 || len(depthReq.Exchanges) == 0 {
+		respondWithError(w, http.StatusBadRequest, "stock_codes and exchanges are required")
+		return
+	}
+
+	if depthReq.OrderType == "" || depthReq.OrderSide == "" || depthReq.Exchange == "" {
+		respondWithError(w, http.StatusBadRequest, "order_type, order_side, and exchange are required")
+		return
+	}
+
+	if depthReq.Quantity <= 0 {
+		respondWithError(w, http.StatusBadRequest, "quantity must be greater than 0")
+		return
+	}
+
+	// Extract from headers if not in body
+	bearerToken := depthReq.BearerToken
+	if bearerToken == "" {
+		bearerToken = r.Header.Get("Authorization")
+		if bearerToken != "" {
+			bearerToken = strings.TrimPrefix(bearerToken, "Bearer ")
+		}
+	}
+
+	appId := depthReq.AppId
+	if appId == "" {
+		appId = r.Header.Get("appId")
+	}
+
+	source := depthReq.Source
+	if source == "" {
+		source = r.Header.Get("source")
+	}
+
+	// Validate authentication
+	if bearerToken == "" || appId == "" || source == "" {
+		respondWithError(w, http.StatusBadRequest, "bearer_token, app_id, and source are required")
+		return
+	}
+
+	// Convert string enums to proto enums
+	orderType := parseOrderType(depthReq.OrderType)
+	orderSide := parseOrderSide(depthReq.OrderSide)
+	exchange := parseExchange(depthReq.Exchange)
+	positionSizing := parsePositionSizing(depthReq.PositionSizing)
+	stopLossType := parseStopLossType(depthReq.StopLossType)
+
+	// Build price range if provided
+	var priceRange *common.PriceRange
+	if depthReq.PriceRangeMin > 0 || depthReq.PriceRangeMax > 0 {
+		priceRange = &common.PriceRange{
+			MinPrice: depthReq.PriceRangeMin,
+			MaxPrice: depthReq.PriceRangeMax,
+		}
+	}
+
+	// Build the proto request
+	req := &pb.CreateStrategyRequest{
+		UserId:              depthReq.UserID,
+		StrategyName:        depthReq.StrategyName,
+		Description:         depthReq.Description,
+		ActivateImmediately: depthReq.ActivateImmediately,
+		BearerToken:         bearerToken,
+		AppId:               appId,
+		Source:              source,
+		Conditions: &pb.StrategyConditions{
+			StockCodes:              depthReq.StockCodes,
+			Exchanges:               depthReq.Exchanges,
+			PriceRange:              priceRange,
+			VolumeThreshold:         depthReq.VolumeThreshold,
+			PctChangeThreshold:      0,
+			MinBidQuantity:          depthReq.MinBidQuantity,
+			MinAskQuantity:          depthReq.MinAskQuantity,
+			MaxSpreadPct:            depthReq.MaxSpreadPct,
+			RequireLtpBetweenSpread: depthReq.RequireLTPBetweenSpread,
+		},
+		TradeConfig: &pb.TradeConfig{
+			OrderType:       orderType,
+			OrderSide:       orderSide,
+			Quantity:        depthReq.Quantity,
+			Exchange:        exchange,
+			LimitPrice:      depthReq.LimitPrice,
+			MaxPositionSize: depthReq.MaxPositionSize,
+			StopLossPct:     depthReq.StopLossPct,
+			TakeProfitPct:   depthReq.TakeProfitPct,
+			Validity:        depthReq.Validity,
+			StopLossType:    stopLossType,
+			TrailingSlPct:   depthReq.TrailingSlPct,
+			ProductType:     depthReq.ProductType,
+		},
+		RiskLimits: &pb.RiskLimits{
+			MaxDailyTrades:          depthReq.MaxDailyTrades,
+			MaxLossPerDay:           depthReq.MaxLossPerDay,
+			PositionSizing:          positionSizing,
+			MaxPortfolioExposurePct: depthReq.MaxPortfolioExposurePct,
+			MaxPerTradeRisk:         depthReq.MaxPerTradeRisk,
+			EnableRiskChecks:        depthReq.EnableRiskChecks,
+			EnableAutoSquareOff:     depthReq.EnableAutoSquareOff,
+			AutoSquareOffTime:       depthReq.AutoSquareOffTime,
+		},
+	}
+
+	resp, err := h.client.CreateStrategy(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to create depth market strategy: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, resp)
+}
+
+// Helper functions to parse string enums to proto enums
+func parseOrderType(s string) common.OrderType {
+	switch strings.ToUpper(s) {
+	case "MARKET":
+		return common.OrderType_ORDER_TYPE_MARKET
+	case "LIMIT":
+		return common.OrderType_ORDER_TYPE_LIMIT
+	case "STOP_LOSS":
+		return common.OrderType_ORDER_TYPE_STOP_LOSS
+	case "STOP_LOSS_MARKET":
+		return common.OrderType_ORDER_TYPE_STOP_LOSS_MARKET
+	default:
+		return common.OrderType_ORDER_TYPE_UNSPECIFIED
+	}
+}
+
+func parseOrderSide(s string) common.OrderSide {
+	switch strings.ToUpper(s) {
+	case "BUY":
+		return common.OrderSide_ORDER_SIDE_BUY
+	case "SELL":
+		return common.OrderSide_ORDER_SIDE_SELL
+	default:
+		return common.OrderSide_ORDER_SIDE_UNSPECIFIED
+	}
+}
+
+func parseExchange(s string) common.Exchange {
+	switch strings.ToUpper(s) {
+	case "NSE":
+		return common.Exchange_EXCHANGE_NSE
+	case "BSE":
+		return common.Exchange_EXCHANGE_BSE
+	default:
+		return common.Exchange_EXCHANGE_UNSPECIFIED
+	}
+}
+
+func parsePositionSizing(s string) common.PositionSizing {
+	switch strings.ToUpper(s) {
+	case "FIXED":
+		return common.PositionSizing_POSITION_SIZING_FIXED
+	case "PERCENTAGE":
+		return common.PositionSizing_POSITION_SIZING_PERCENTAGE
+	case "RISK_BASED":
+		return common.PositionSizing_POSITION_SIZING_RISK_BASED
+	default:
+		return common.PositionSizing_POSITION_SIZING_UNSPECIFIED
+	}
+}
+
+func parseStopLossType(s string) pb.StopLossType {
+	switch strings.ToUpper(s) {
+	case "FIXED":
+		return pb.StopLossType_FIXED
+	case "TRAILING":
+		return pb.StopLossType_TRAILING
+	default:
+		return pb.StopLossType_STOP_LOSS_TYPE_UNSPECIFIED
+	}
+}
+
 // UpdateStrategy handles PUT /api/v1/strategies/{strategy_id}
 func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
