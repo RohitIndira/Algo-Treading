@@ -92,10 +92,8 @@ func (q *QueryEngine) FindMatchingStrategies(ctx context.Context, event *models.
 	return strategies, nil
 }
 
-// buildQuery builds the Elasticsearch query for matching strategies
+// buildQuery builds the Elasticsearch query for matching market depth strategies
 func (q *QueryEngine) buildQuery(event *models.MarketEvent) map[string]interface{} {
-	sentiment := event.Analysis.GetSentimentValue()
-
 	// Build bool query with multiple conditions
 	query := map[string]interface{}{
 		"query": map[string]interface{}{
@@ -108,16 +106,7 @@ func (q *QueryEngine) buildQuery(event *models.MarketEvent) map[string]interface
 						},
 					},
 				},
-				"filter": []interface{}{
-					// Impact score: strategy's min threshold should be <= event's impact score
-					map[string]interface{}{
-						"range": map[string]interface{}{
-							"impact_score_min": map[string]interface{}{
-								"lte": event.Analysis.ImpactScore,
-							},
-						},
-					},
-				},
+				"filter":               []interface{}{},
 				"should":               []interface{}{},
 				"minimum_should_match": 0,
 			},
@@ -125,27 +114,10 @@ func (q *QueryEngine) buildQuery(event *models.MarketEvent) map[string]interface
 	}
 
 	boolQuery := query["query"].(map[string]interface{})["bool"].(map[string]interface{})
+	filterClauses := []interface{}(boolQuery["filter"].([]interface{}))
 	shouldClauses := []interface{}{}
 
-	// Add sentiment match (optional but boosts score)
-	shouldClauses = append(shouldClauses, map[string]interface{}{
-		"terms": map[string]interface{}{
-			"sentiments": []string{sentiment},
-			"boost":      2.0,
-		},
-	})
-
-	// Add category match (optional but boosts score)
-	if event.NewsData.Category != "" {
-		shouldClauses = append(shouldClauses, map[string]interface{}{
-			"terms": map[string]interface{}{
-				"categories": []string{event.NewsData.Category},
-				"boost":      2.0,
-			},
-		})
-	}
-
-	// Add stock match (optional but boosts score)
+	// Add stock match (higher priority)
 	shouldClauses = append(shouldClauses, map[string]interface{}{
 		"terms": map[string]interface{}{
 			"stocks": []int64{event.StockData.StockCode},
@@ -153,21 +125,18 @@ func (q *QueryEngine) buildQuery(event *models.MarketEvent) map[string]interface
 		},
 	})
 
-	// Add exchange match (optional but boosts score)
+	// Add exchange match (optional)
 	if event.StockData.Exchange != "" {
 		shouldClauses = append(shouldClauses, map[string]interface{}{
-			"term": map[string]interface{}{
-				"exchange": map[string]interface{}{
-					"value": event.StockData.Exchange,
-					"boost": 1.5,
-				},
+			"terms": map[string]interface{}{
+				"exchanges": []string{event.StockData.Exchange},
+				"boost":     1.5,
 			},
 		})
 	}
 
-	// Add price range filter (if price is available)
+	// Add price range filter (if price is available and strategy has price constraints)
 	if event.MarketData.LastTradedPrice > 0 {
-		// Find strategies where price is within range OR range is not set (0,0)
 		shouldClauses = append(shouldClauses, map[string]interface{}{
 			"bool": map[string]interface{}{
 				"should": []interface{}{
@@ -225,6 +194,29 @@ func (q *QueryEngine) buildQuery(event *models.MarketEvent) map[string]interface
 		})
 	}
 
+	// Add market depth filters (most important for market depth trading)
+	// Strategies with market depth conditions will match if their conditions are compatible
+	shouldClauses = append(shouldClauses, map[string]interface{}{
+		"bool": map[string]interface{}{
+			"should": []interface{}{
+				// Strategies with no min bid/ask quantity requirement
+				map[string]interface{}{
+					"term": map[string]interface{}{
+						"min_bid_qty": 0,
+					},
+				},
+				// Strategies where event's bid quantity meets minimum
+				map[string]interface{}{
+					"range": map[string]interface{}{
+						"min_bid_qty": map[string]interface{}{
+							"lte": int64(0),
+						},
+					},
+				},
+			},
+		},
+	})
+
 	// Add percent change filter (if available)
 	absPctChange := math.Abs(event.MarketData.PctChange)
 	if absPctChange > 0 {
@@ -237,12 +229,8 @@ func (q *QueryEngine) buildQuery(event *models.MarketEvent) map[string]interface
 		})
 	}
 
+	boolQuery["filter"] = filterClauses
 	boolQuery["should"] = shouldClauses
-
-	// Changed from 1 to 0: Allow strategies with empty conditions (catch-all strategies)
-	// to be selected as candidates. The evaluator will handle precise matching.
-	// This fixes the issue where strategies with empty stock_codes, sentiments, etc.
-	// were not being selected as candidates even though they should match all events.
 	boolQuery["minimum_should_match"] = 0
 
 	return query

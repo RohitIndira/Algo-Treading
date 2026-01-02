@@ -5,7 +5,7 @@
 -- Add columns to risk_limits table
 ALTER TABLE risk_limits 
 ADD COLUMN IF NOT EXISTS enable_auto_square_off BOOLEAN DEFAULT false,
-ADD COLUMN IF NOT EXISTS auto_square_off_time VARCHAR(10) DEFAULT '15:05';
+ADD COLUMN IF NOT EXISTS auto_square_off_time VARCHAR(20) DEFAULT '15:05';
 
 -- Add comments explaining the columns
 COMMENT ON COLUMN risk_limits.enable_auto_square_off IS 'Enable automatic square-off of positions at specified time';

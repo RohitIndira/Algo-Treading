@@ -27,139 +27,30 @@ func NewEvaluator(logger *zap.Logger) *Evaluator {
 }
 
 // Evaluate evaluates a strategy against an event
+// Uses market depth-based evaluation
 func (e *Evaluator) Evaluate(event *models.MarketEvent, strategy *models.Strategy) *EvaluationResult {
+	// Use depth-based evaluation for all strategies
+	return e.EvaluateDepthBased(event, strategy)
+}
+
+// EvaluateDepthBased evaluates a strategy based on market depth metrics
+func (e *Evaluator) EvaluateDepthBased(event *models.MarketEvent, strategy *models.Strategy) *EvaluationResult {
 	result := &EvaluationResult{
 		MatchedConditions: make([]string, 0),
 		FailedConditions:  make([]string, 0),
 		ConditionScores:   make(map[string]float64),
 	}
 
-	// Check if this is a match-all strategy (e.g., user sent "/all")
-	if strategy.Conditions.MatchAllNews {
-		e.evaluateMatchAllStrategy(event, strategy, result)
-		return result
-	}
-
-	// If strategy requests depth-only matching, evaluate only stock/exchange/price/volume and depth
-	if strategy.Conditions.DepthOnly {
-		e.evaluateStock(event, strategy, result)
-		e.evaluateExchange(event, strategy, result)
-		e.evaluatePriceRange(event, strategy, result)
-		e.evaluateVolume(event, strategy, result)
-		e.evaluateDepthLTP(event, strategy, result)
-		return result
-	}
-
-	// Evaluate each condition normally
-	e.evaluateImpactScore(event, strategy, result)
-	e.evaluateSentiment(event, strategy, result)
-	e.evaluateCategory(event, strategy, result)
+	// Evaluate basic stock/exchange/price/volume conditions
 	e.evaluateStock(event, strategy, result)
+	e.evaluateExchange(event, strategy, result)
 	e.evaluatePriceRange(event, strategy, result)
 	e.evaluateVolume(event, strategy, result)
-	e.evaluatePctChange(event, strategy, result)
-	e.evaluateExchange(event, strategy, result)
+
+	// Evaluate depth metrics - the core of market depth trading
+	e.evaluateDepthLTP(event, strategy, result)
 
 	return result
-}
-
-// evaluateMatchAllStrategy evaluates a match-all strategy
-// When match_all_news=true, only impact score is checked, all other conditions are auto-matched
-func (e *Evaluator) evaluateMatchAllStrategy(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
-	e.logger.Debug("Evaluating match-all strategy",
-		zap.String("strategy_id", strategy.StrategyID),
-		zap.String("event_id", event.EventID))
-
-	// Still check impact score threshold
-	e.evaluateImpactScore(event, strategy, result)
-
-	// Auto-match all other conditions
-	result.MatchedConditions = append(result.MatchedConditions,
-		"match_all_news",
-		"sentiment",
-		"category",
-		"stock",
-		"price_range",
-		"volume",
-		"pct_change",
-		"exchange",
-	)
-
-	// Set perfect scores for all auto-matched conditions
-	result.ConditionScores["match_all_news"] = 100.0
-	result.ConditionScores["sentiment"] = 100.0
-	result.ConditionScores["category"] = 100.0
-	result.ConditionScores["stock"] = 100.0
-	result.ConditionScores["price_range"] = 100.0
-	result.ConditionScores["volume"] = 100.0
-	result.ConditionScores["pct_change"] = 100.0
-	result.ConditionScores["exchange"] = 100.0
-}
-
-// evaluateImpactScore evaluates impact score condition
-func (e *Evaluator) evaluateImpactScore(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
-	condition := "impact_score"
-
-	// Event impact score must be >= strategy threshold
-	if event.Analysis.ImpactScore >= strategy.Conditions.ImpactScoreThreshold {
-		result.MatchedConditions = append(result.MatchedConditions, condition)
-
-		// Score based on how much the impact exceeds threshold
-		// Max score if impact is at maximum (10)
-		score := float64(event.Analysis.ImpactScore) / 10.0 * 100.0
-		result.ConditionScores[condition] = score
-	} else {
-		result.FailedConditions = append(result.FailedConditions, condition)
-		result.ConditionScores[condition] = 0
-	}
-}
-
-// evaluateSentiment evaluates sentiment condition
-func (e *Evaluator) evaluateSentiment(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
-	condition := "sentiment"
-
-	// Empty sentiments list means accept all sentiments
-	if len(strategy.Conditions.Sentiments) == 0 {
-		result.MatchedConditions = append(result.MatchedConditions, condition)
-		result.ConditionScores[condition] = 100.0
-		return
-	}
-
-	eventSentiment := event.Analysis.GetSentimentValue()
-
-	for _, sentiment := range strategy.Conditions.Sentiments {
-		if sentiment == eventSentiment {
-			result.MatchedConditions = append(result.MatchedConditions, condition)
-			result.ConditionScores[condition] = 100.0
-			return
-		}
-	}
-
-	result.FailedConditions = append(result.FailedConditions, condition)
-	result.ConditionScores[condition] = 0
-}
-
-// evaluateCategory evaluates category condition
-func (e *Evaluator) evaluateCategory(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
-	condition := "category"
-
-	// Empty categories list means accept all categories
-	if len(strategy.Conditions.Categories) == 0 {
-		result.MatchedConditions = append(result.MatchedConditions, condition)
-		result.ConditionScores[condition] = 100.0
-		return
-	}
-
-	for _, category := range strategy.Conditions.Categories {
-		if category == event.NewsData.Category {
-			result.MatchedConditions = append(result.MatchedConditions, condition)
-			result.ConditionScores[condition] = 100.0
-			return
-		}
-	}
-
-	result.FailedConditions = append(result.FailedConditions, condition)
-	result.ConditionScores[condition] = 0
 }
 
 // evaluateStock evaluates stock condition
@@ -272,21 +163,23 @@ func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *model
 func (e *Evaluator) evaluateExchange(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
 	condition := "exchange"
 
-	// If strategy has no exchange preference, accept all
-	if strategy.TradeConfig.Exchange == "" {
+	// Empty exchanges list means accept all exchanges
+	if len(strategy.Conditions.Exchanges) == 0 {
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 		result.ConditionScores[condition] = 100.0
 		return
 	}
 
-	// Check if exchange matches
-	if event.StockData.Exchange == strategy.TradeConfig.Exchange {
-		result.MatchedConditions = append(result.MatchedConditions, condition)
-		result.ConditionScores[condition] = 100.0
-	} else {
-		result.FailedConditions = append(result.FailedConditions, condition)
-		result.ConditionScores[condition] = 0
+	for _, exchange := range strategy.Conditions.Exchanges {
+		if event.StockData.Exchange == exchange {
+			result.MatchedConditions = append(result.MatchedConditions, condition)
+			result.ConditionScores[condition] = 100.0
+			return
+		}
 	}
+
+	result.FailedConditions = append(result.FailedConditions, condition)
+	result.ConditionScores[condition] = 0
 }
 
 // evaluateDepthLTP evaluates depth and LTP based conditions

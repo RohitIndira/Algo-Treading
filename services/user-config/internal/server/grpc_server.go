@@ -337,14 +337,9 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 		return nil
 	}
 
-	sentiments := make(pq.StringArray, len(proto.Sentiments))
-	for i, s := range proto.Sentiments {
-		sentiments[i] = s.String()
-	}
-
 	exchanges := make(pq.StringArray, len(proto.Exchanges))
 	for i, e := range proto.Exchanges {
-		exchanges[i] = e.String()
+		exchanges[i] = e
 	}
 
 	stockCodes := make(pq.Int64Array, len(proto.StockCodes))
@@ -353,13 +348,9 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 	}
 
 	cond := &models.StrategyCondition{
-		ImpactScoreThreshold: proto.ImpactScoreThreshold,
-		Sentiments:           sentiments,
-		Categories:           pq.StringArray(proto.Categories),
 		StockCodes:           stockCodes,
-		VolumeThreshold:      &proto.VolumeThreshold,
-		PctChangeThreshold:   &proto.PctChangeThreshold,
 		Exchanges:            exchanges,
+		ImpactScoreThreshold: 5, // Default value for depth-based trading
 	}
 
 	if proto.PriceRange != nil {
@@ -372,7 +363,7 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 		cond.MaxMarketCap = &proto.MarketCapRange.MaxMcap
 	}
 
-	// Depth-related fields
+	// Depth-related fields (market depth based trading)
 	if proto.MinBidQuantity != 0 {
 		cond.MinBidQuantity = &proto.MinBidQuantity
 	}
@@ -382,7 +373,12 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 	if proto.MaxSpreadPct != 0 {
 		cond.MaxSpreadPct = &proto.MaxSpreadPct
 	}
-	cond.DepthOnly = proto.DepthOnly
+	if proto.VolumeThreshold != 0 {
+		cond.VolumeThreshold = &proto.VolumeThreshold
+	}
+	if proto.PctChangeThreshold != 0 {
+		cond.PctChangeThreshold = &proto.PctChangeThreshold
+	}
 	if proto.RequireLtpBetweenSpread {
 		v := true
 		cond.RequireLTPBetweenSpread = &v
@@ -467,14 +463,9 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 		return nil
 	}
 
-	sentiments := make([]common.Sentiment, len(model.Sentiments))
-	for i, s := range model.Sentiments {
-		sentiments[i] = common.Sentiment(common.Sentiment_value[s])
-	}
-
-	exchanges := make([]common.Exchange, len(model.Exchanges))
+	exchanges := make([]string, len(model.Exchanges))
 	for i, e := range model.Exchanges {
-		exchanges[i] = common.Exchange(common.Exchange_value[e])
+		exchanges[i] = e
 	}
 
 	stockCodes := make([]int64, len(model.StockCodes))
@@ -483,11 +474,8 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 	}
 
 	cond := &pb.StrategyConditions{
-		ImpactScoreThreshold: model.ImpactScoreThreshold,
-		Sentiments:           sentiments,
-		Categories:           []string(model.Categories),
-		StockCodes:           stockCodes,
-		Exchanges:            exchanges,
+		StockCodes: stockCodes,
+		Exchanges:  exchanges,
 	}
 
 	if model.PriceRangeMin != nil && model.PriceRangeMax != nil {
@@ -504,7 +492,7 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 		cond.PctChangeThreshold = *model.PctChangeThreshold
 	}
 
-	// Depth-related fields
+	// Depth-related fields (market depth based trading)
 	if model.MinBidQuantity != nil {
 		cond.MinBidQuantity = *model.MinBidQuantity
 	}
@@ -514,7 +502,6 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 	if model.MaxSpreadPct != nil {
 		cond.MaxSpreadPct = *model.MaxSpreadPct
 	}
-	cond.DepthOnly = model.DepthOnly
 	if model.RequireLTPBetweenSpread != nil {
 		cond.RequireLtpBetweenSpread = *model.RequireLTPBetweenSpread
 	}

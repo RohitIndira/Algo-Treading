@@ -45,19 +45,13 @@ func (m *MongoDBEvent) ToMarketEvent() (*MarketEvent, error) {
 	}
 
 	// Set default event type
-	event.EventType = "news"
+	event.EventType = "market_depth"
 
 	// Parse timestamp
 	event.Timestamp = m.extractTimestamp()
 
 	// Map stock data
 	event.StockData = m.mapStockData()
-
-	// Map news data
-	event.NewsData = m.mapNewsData()
-
-	// Map analysis
-	event.Analysis = m.mapAnalysis()
 
 	// Map market data
 	event.MarketData = m.mapMarketData()
@@ -199,47 +193,10 @@ func (m *MongoDBEvent) extractCompanyName() string {
 	return ""
 }
 
-func (m *MongoDBEvent) mapNewsData() NewsData {
-	// Parse document date
-	var docDate time.Time
-	if m.DocumentDate != "" {
-		// Try multiple formats
-		formats := []string{
-			"2006-01-02 15:04:05",
-			time.RFC3339,
-			"2006-01-02T15:04:05Z",
-		}
-		for _, format := range formats {
-			if t, err := time.Parse(format, m.DocumentDate); err == nil {
-				docDate = t
-				break
-			}
-		}
-	}
-
-	return NewsData{
-		NewsID:       m.NewsID,
-		NewsLink:     m.NewsLink,
-		Category:     m.Category,
-		ShortSummary: m.ShortSummary,
-		DocumentDate: docDate,
-	}
-}
-
-func (m *MongoDBEvent) mapAnalysis() Analysis {
-	return Analysis{
-		Sentiment:   m.Sentiment,
-		Impact:      m.Impact,
-		ImpactScore: int32(m.toInt64(m.ImpactScore)),
-	}
-}
-
 func (m *MongoDBEvent) mapMarketData() MarketData {
 	md := MarketData{
 		LastTradedPrice: m.toFloat64(m.LastTraded),
 		PctChange:       m.toFloat64(m.PctChange),
-		NewsFirstPrice:  m.toFloat64(m.NewsFirst),
-		NewsPctChange:   m.toFloat64(m.NewsPctChange),
 	}
 
 	// Map price map

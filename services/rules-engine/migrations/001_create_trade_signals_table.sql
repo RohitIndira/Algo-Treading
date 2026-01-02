@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS trade_signals (
     
     -- Order details
     order_type VARCHAR(20) NOT NULL, -- MARKET, LIMIT
-    order_side VARCHAR(10) NOT NULL, -- BUY, SELL
+    order_side VARCHAR(20) NOT NULL, -- BUY, SELL
     quantity INTEGER NOT NULL,
     price DECIMAL(15, 2) NOT NULL,
     stop_loss DECIMAL(15, 2),

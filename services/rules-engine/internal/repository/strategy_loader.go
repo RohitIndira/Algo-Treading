@@ -164,11 +164,7 @@ func (sl *StrategyLoader) LoadAllStrategies(ctx context.Context) ([]*models.Stra
 			CreatedAt:    createdAt,
 			UpdatedAt:    updatedAt,
 			Conditions: models.Conditions{
-				MatchAllNews:         matchAllNews.Bool,
-				ImpactScoreThreshold: int32(impactScoreThreshold.Int64),
-				Sentiments:           parseJSONArray(sentimentsJSON.String),
-				Categories:           parseJSONArray(categoriesJSON.String),
-				Stocks:               parseJSONInt64Array(stockCodesJSON.String),
+				Stocks: parseJSONInt64Array(stockCodesJSON.String),
 				PriceRange: models.PriceRange{
 					MinPrice: priceRangeMin.Float64,
 					MaxPrice: priceRangeMax.Float64,

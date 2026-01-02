@@ -25,9 +25,6 @@ type OrderRequest struct {
 	TakeProfit   float64   `json:"take_profit"`
 	Timestamp    time.Time `json:"timestamp"`
 	MatchScore   float64   `json:"match_score"`
-	ImpactScore  int32     `json:"impact_score"`
-	Sentiment    string    `json:"sentiment"`
-	NewsCategory string    `json:"news_category"`
 	RiskApproved bool      `json:"risk_approved"` // Temporary: Set to true until risk-management integration
 	RiskScore    float64   `json:"risk_score"`
 	RetryCount   int       `json:"retry_count"`
@@ -107,6 +104,28 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		stopLossType = "FIXED"
 	}
 
+	// Ensure symbol is populated - use from event if available, fallback to IDEA
+	symbol := event.StockData.Symbol
+	if symbol == "" {
+		// Fallback: use IDEA as default symbol if not available
+		symbol = "IDEA"
+	}
+
+	// Normalize exchange to remove "EXCHANGE_" prefix if present
+	exchange := event.StockData.Exchange
+	if strings.HasPrefix(exchange, "EXCHANGE_") {
+		exchange = strings.TrimPrefix(exchange, "EXCHANGE_")
+	}
+
+	// Normalize order type to remove prefixes and handle case
+	orderType := strings.ToUpper(strategy.TradeConfig.OrderType)
+	if strings.HasPrefix(orderType, "ORDER_TYPE_") {
+		orderType = strings.TrimPrefix(orderType, "ORDER_TYPE_")
+	}
+	if orderType == "" {
+		orderType = "MARKET"
+	}
+
 	return &OrderRequest{
 		OrderID:      orderID,
 		UserID:       strategy.UserID,
@@ -115,9 +134,9 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		EventID:      event.EventID,
 		StockCode:    event.StockData.StockCode,
 		Token:        event.StockData.StockCode, // Token is same as stock_code
-		Symbol:       event.StockData.Symbol,
-		Exchange:     event.StockData.Exchange,
-		OrderType:    strategy.TradeConfig.OrderType,
+		Symbol:       symbol,
+		Exchange:     exchange,
+		OrderType:    orderType,
 		OrderSide:    orderSide,
 		Quantity:     strategy.TradeConfig.Quantity,
 		Price:        price,
@@ -126,9 +145,6 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		Validity:     "DAY", // Default to DAY order
 		Timestamp:    time.Now(),
 		MatchScore:   match.MatchScore,
-		ImpactScore:  event.Analysis.ImpactScore,
-		Sentiment:    event.Analysis.Sentiment,
-		NewsCategory: event.NewsData.Category,
 		RiskApproved: false, // Will be set by risk management service
 		RiskScore:    0.0,   // Will be set by risk management service
 		RetryCount:   0,

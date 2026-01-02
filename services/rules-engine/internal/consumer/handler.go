@@ -73,28 +73,37 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 		return nil
 	}
 
-	h.logger.Debug("Handling event",
+	h.logger.Debug("Handling market depth event",
 		zap.String("event_id", event.EventID),
 		zap.Int64("stock_code", event.StockData.StockCode),
 		zap.String("symbol", event.StockData.Symbol),
-		zap.Int32("impact_score", event.Analysis.ImpactScore))
+		zap.Float64("ltp", event.MarketData.LastTradedPrice),
+		zap.Float64("spread_pct", event.MarketData.DepthMetrics.SpreadPct))
 
 	// Match event against strategies
 	matches, err := h.matcher.MatchEvent(ctx, event)
 	if err != nil {
 		h.stats.IncrementEvaluationErrors()
+		h.logger.Error("Failed to match event",
+			zap.Error(err),
+			zap.String("event_id", event.EventID),
+			zap.Int64("stock_code", event.StockData.StockCode))
 		return fmt.Errorf("failed to match event: %w", err)
 	}
 
 	if len(matches) == 0 {
-		h.logger.Debug("No matches found for event",
-			zap.String("event_id", event.EventID))
+		h.logger.Debug("No strategy matches found for event",
+			zap.String("event_id", event.EventID),
+			zap.Int64("stock_code", event.StockData.StockCode),
+			zap.String("exchange", event.StockData.Exchange),
+			zap.Float64("ltp", event.MarketData.LastTradedPrice))
 		return nil
 	}
 
-	h.logger.Info("Event matched strategies",
+	h.logger.Info("Event matched strategies - processing matches",
 		zap.String("event_id", event.EventID),
-		zap.Int("match_count", len(matches)))
+		zap.Int("match_count", len(matches)),
+		zap.Int64("stock_code", event.StockData.StockCode))
 
 	// Record statistics
 	h.stats.IncrementMatchesFound()
@@ -222,12 +231,23 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return fmt.Errorf("strategy is nil in match")
 	}
 
+	// Log strategy configuration for debugging
+	h.logger.Info("Processing matched strategy",
+		zap.String("strategy_id", strategy.StrategyID),
+		zap.String("strategy_name", strategy.StrategyName),
+		zap.String("user_id", strategy.UserID),
+		zap.Int32("quantity", strategy.TradeConfig.Quantity),
+		zap.String("order_type", strategy.TradeConfig.OrderType),
+		zap.String("order_side", strategy.TradeConfig.OrderSide),
+		zap.String("exchange", strategy.TradeConfig.Exchange))
+
 	// Validate strategy has complete trade configuration
 	if strategy.TradeConfig.Quantity <= 0 {
 		h.logger.Error("Strategy has invalid quantity in trade_config",
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("user_id", strategy.UserID),
-			zap.Int32("quantity", strategy.TradeConfig.Quantity))
+			zap.Int32("quantity", strategy.TradeConfig.Quantity),
+			zap.String("trade_config_json", fmt.Sprintf("%+v", strategy.TradeConfig)))
 		return fmt.Errorf("strategy %s has invalid quantity: %d", strategy.StrategyID, strategy.TradeConfig.Quantity)
 	}
 
@@ -242,8 +262,32 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		zap.Float64("stop_loss_pct", strategy.TradeConfig.StopLossPct),
 		zap.Float64("take_profit_pct", strategy.TradeConfig.TakeProfitPct))
 
+	// Ensure symbol is present in the event (for data quality)
+	if event.StockData.Symbol == "" {
+		h.logger.Warn("Missing symbol in market event - enriching with fallback",
+			zap.String("event_id", event.EventID),
+			zap.Int64("stock_code", event.StockData.StockCode),
+			zap.String("exchange", event.StockData.Exchange))
+		// Symbol will be enriched in NewOrderRequest with fallback logic
+	}
+
 	// Create order request
 	orderReq := models.NewOrderRequest(match, event, strategy)
+
+	// Log order request for debugging
+	h.logger.Info("Order request created from match",
+		zap.String("order_id", orderReq.OrderID),
+		zap.String("user_id", orderReq.UserID),
+		zap.String("strategy_id", orderReq.StrategyID),
+		zap.Int64("stock_code", orderReq.StockCode),
+		zap.Int32("quantity", orderReq.Quantity),
+		zap.Float64("price", orderReq.Price),
+		zap.Float64("stop_loss", orderReq.StopLoss),
+		zap.Float64("take_profit", orderReq.TakeProfit),
+		zap.String("exchange", orderReq.Exchange),
+		zap.String("order_type", orderReq.OrderType),
+		zap.String("order_side", orderReq.OrderSide),
+		zap.String("symbol", orderReq.Symbol))
 
 	// For MARKET orders, ensure we have a valid price from the event
 	if orderReq.Price <= 0 {
@@ -287,6 +331,14 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 	// Validate order request
 	if err := orderReq.Validate(); err != nil {
+		h.logger.Error("Order request validation failed",
+			zap.Error(err),
+			zap.String("order_id", orderReq.OrderID),
+			zap.String("user_id", orderReq.UserID),
+			zap.String("strategy_id", orderReq.StrategyID),
+			zap.String("stock_code", fmt.Sprintf("%d", orderReq.StockCode)),
+			zap.String("quantity", fmt.Sprintf("%d", orderReq.Quantity)),
+			zap.String("price", fmt.Sprintf("%.2f", orderReq.Price)))
 		return fmt.Errorf("invalid order request: %w", err)
 	}
 
@@ -361,10 +413,28 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	}
 
 	// 4. Publish order to RabbitMQ
+	h.logger.Debug("About to publish order to RabbitMQ",
+		zap.String("order_id", orderReq.OrderID),
+		zap.String("user_id", orderReq.UserID),
+		zap.String("strategy_id", orderReq.StrategyID),
+		zap.String("circuit_breaker_state", h.rabbitPubl.GetCircuitBreakerState()))
+
 	if err := h.rabbitPubl.PublishOrder(ctx, orderReq); err != nil {
 		h.stats.IncrementRabbitMQErrors()
+		h.logger.Error("Failed to publish order to RabbitMQ",
+			zap.Error(err),
+			zap.String("order_id", orderReq.OrderID),
+			zap.String("user_id", orderReq.UserID),
+			zap.String("strategy_id", orderReq.StrategyID),
+			zap.Bool("publisher_healthy", h.rabbitPubl.IsHealthy()),
+			zap.String("circuit_breaker_state", h.rabbitPubl.GetCircuitBreakerState()))
 		return fmt.Errorf("failed to publish order: %w", err)
 	}
+
+	h.logger.Info("Order successfully published to RabbitMQ",
+		zap.String("order_id", orderReq.OrderID),
+		zap.String("user_id", orderReq.UserID),
+		zap.String("strategy_id", orderReq.StrategyID))
 
 	h.stats.IncrementOrdersGenerated()
 
@@ -389,31 +459,33 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 // publishMatchEvent publishes match event to Redis Pub/Sub for real-time updates
 func (h *Handler) publishMatchEvent(ctx context.Context, orderReq *models.OrderRequest, event *models.MarketEvent, match *models.RuleMatch) error {
-	// Create match event payload
+	// Create match event payload with depth metrics instead of news
 	matchEvent := map[string]interface{}{
-		"order_id":      orderReq.OrderID,
-		"user_id":       orderReq.UserID,
-		"strategy_id":   orderReq.StrategyID,
-		"strategy_name": match.StrategyName,
-		"event_id":      event.EventID,
-		"stock_code":    orderReq.StockCode,
-		"token":         orderReq.Token,
-		"symbol":        orderReq.Symbol,
-		"exchange":      orderReq.Exchange,
-		"match_score":   orderReq.MatchScore,
-		"impact_score":  orderReq.ImpactScore,
-		"sentiment":     orderReq.Sentiment,
-		"news_category": orderReq.NewsCategory,
-		"news_title":    event.NewsData.ShortSummary,
-		"news_content":  event.NewsData.ShortSummary,
-		"news_link":     event.NewsData.NewsLink,
-		"order_price":   orderReq.Price,
-		"stop_loss":     orderReq.StopLoss,
-		"take_profit":   orderReq.TakeProfit,
-		"order_status":  "PENDING",
-		"risk_approved": orderReq.RiskApproved,
-		"timestamp":     time.Now().Unix(),
-		"time_ago":      "just now",
+		"order_id":        orderReq.OrderID,
+		"user_id":         orderReq.UserID,
+		"strategy_id":     orderReq.StrategyID,
+		"strategy_name":   match.StrategyName,
+		"event_id":        event.EventID,
+		"stock_code":      orderReq.StockCode,
+		"token":           orderReq.Token,
+		"symbol":          orderReq.Symbol,
+		"exchange":        orderReq.Exchange,
+		"match_score":     orderReq.MatchScore,
+		"ltp":             event.MarketData.LastTradedPrice,
+		"bid_prices":      event.MarketData.BidPrices,
+		"bid_quantities":  event.MarketData.BidQuantities,
+		"ask_prices":      event.MarketData.AskPrices,
+		"ask_quantities":  event.MarketData.AskQuantities,
+		"spread_pct":      event.MarketData.DepthMetrics.SpreadPct,
+		"bid_ask_ratio":   event.MarketData.DepthMetrics.BidAskRatio,
+		"imbalance_ratio": event.MarketData.DepthMetrics.ImbalanceRatio,
+		"order_price":     orderReq.Price,
+		"stop_loss":       orderReq.StopLoss,
+		"take_profit":     orderReq.TakeProfit,
+		"order_status":    "PENDING",
+		"risk_approved":   orderReq.RiskApproved,
+		"timestamp":       time.Now().Unix(),
+		"time_ago":        "just now",
 	}
 
 	// Convert to JSON

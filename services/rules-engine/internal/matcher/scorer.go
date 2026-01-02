@@ -8,18 +8,16 @@ type Scorer struct {
 	weights map[string]float64
 }
 
-// NewScorer creates a new scorer with default weights
+// NewScorer creates a new scorer with default weights for market depth trading
 func NewScorer() *Scorer {
 	return &Scorer{
 		weights: map[string]float64{
-			"impact_score": 25.0, // Most important
-			"stock":        20.0, // Stock-specific signals are critical
-			"sentiment":    15.0, // Sentiment alignment
-			"category":     15.0, // News category relevance
-			"price_range":  10.0, // Price within acceptable range
-			"volume":       7.5,  // Trading volume
-			"pct_change":   5.0,  // Percent change magnitude
-			"exchange":     2.5,  // Exchange preference
+			"market_depth": 40.0, // Primary signal - market depth conditions
+			"stock":        20.0, // Stock selection
+			"price_range":  15.0, // Price must be in range
+			"volume":       10.0, // Volume threshold
+			"exchange":     10.0, // Exchange preference
+			"pct_change":   5.0,  // Optional percent change filter
 		},
 	}
 }

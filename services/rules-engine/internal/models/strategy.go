@@ -25,20 +25,26 @@ type Strategy struct {
 
 // Conditions represents the conditions for a strategy
 type Conditions struct {
-	MatchAllNews         bool           `json:"match_all_news" bson:"match_all_news"`
-	ImpactScoreThreshold int32          `json:"impact_score_threshold" bson:"impact_score_threshold"`
-	Sentiments           []string       `json:"sentiments" bson:"sentiments"`
-	Categories           []string       `json:"categories" bson:"categories"`
-	Stocks               []int64        `json:"stocks" bson:"stocks"`
-	PriceRange           PriceRange     `json:"price_range" bson:"price_range"`
-	VolumeThreshold      int64          `json:"volume_threshold" bson:"volume_threshold"`
-	PctChangeThreshold   float64        `json:"pct_change_threshold" bson:"pct_change_threshold"`
-	// Depth-based conditions (optional)
-	MinBidQuantity int64   `json:"min_bid_quantity" bson:"min_bid_quantity"`
-	MinAskQuantity int64   `json:"min_ask_quantity" bson:"min_ask_quantity"`
-	MaxSpreadPct   float64 `json:"max_spread_pct" bson:"max_spread_pct"`
-	DepthOnly      bool    `json:"depth_only" bson:"depth_only"`
-	MarketCapRange       MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
+	// Stock selection
+	Stocks    []int64  `json:"stocks" bson:"stocks"`
+	Exchanges []string `json:"exchanges" bson:"exchanges"`
+
+	// Price-based conditions
+	PriceRange         PriceRange `json:"price_range" bson:"price_range"`
+	VolumeThreshold    int64      `json:"volume_threshold" bson:"volume_threshold"`
+	PctChangeThreshold float64    `json:"pct_change_threshold" bson:"pct_change_threshold"`
+
+	// Market depth conditions (primary triggers)
+	MinBidQuantity          int64   `json:"min_bid_quantity" bson:"min_bid_quantity"`                     // Minimum bid quantity at best price
+	MinAskQuantity          int64   `json:"min_ask_quantity" bson:"min_ask_quantity"`                     // Minimum ask quantity at best price
+	MaxSpreadPct            float64 `json:"max_spread_pct" bson:"max_spread_pct"`                         // Maximum spread percentage
+	MinBidAskRatio          float64 `json:"min_bid_ask_ratio" bson:"min_bid_ask_ratio"`                   // Min ratio of bid/ask quantity
+	MaxBidAskRatio          float64 `json:"max_bid_ask_ratio" bson:"max_bid_ask_ratio"`                   // Max ratio of bid/ask quantity
+	MinTotalDepthQty        int64   `json:"min_total_depth_qty" bson:"min_total_depth_qty"`               // Min total bid+ask quantity
+	RequireLTPBetweenSpread bool    `json:"require_ltp_between_spread" bson:"require_ltp_between_spread"` // LTP must be between best bid/ask
+
+	// Market cap filter (optional)
+	MarketCapRange MarketCapRange `json:"market_cap_range" bson:"market_cap_range"`
 }
 
 // PriceRange represents price range filter
@@ -80,45 +86,49 @@ type RiskLimits struct {
 
 // ElasticsearchStrategy represents a strategy indexed in Elasticsearch
 type ElasticsearchStrategy struct {
-	StrategyID     string   `json:"strategy_id"`
-	UserID         string   `json:"user_id"`
-	StrategyName   string   `json:"strategy_name"`
-	Active         bool     `json:"active"`
-	MatchAllNews   bool     `json:"match_all_news"`
-	ImpactScoreMin int32    `json:"impact_score_min"`
-	Sentiments     []string `json:"sentiments"`
-	Categories     []string `json:"categories"`
-	Stocks         []int64  `json:"stocks"`
-	PriceMin       float64  `json:"price_min"`
-	PriceMax       float64  `json:"price_max"`
-	VolumeMin      int64    `json:"volume_min"`
-	PctChangeMin   float64  `json:"pct_change_min"`
-	Exchange       string   `json:"exchange"`
-	MaxDailyTrades int32    `json:"max_daily_trades"`
-	MaxLossPerDay  float64  `json:"max_loss_per_day"`
-	UpdatedAt      int64    `json:"updated_at"` // Unix timestamp
+	StrategyID       string   `json:"strategy_id"`
+	UserID           string   `json:"user_id"`
+	StrategyName     string   `json:"strategy_name"`
+	Active           bool     `json:"active"`
+	Stocks           []int64  `json:"stocks"`
+	Exchanges        []string `json:"exchanges"`
+	PriceMin         float64  `json:"price_min"`
+	PriceMax         float64  `json:"price_max"`
+	VolumeMin        int64    `json:"volume_min"`
+	PctChangeMin     float64  `json:"pct_change_min"`
+	MinBidQty        int64    `json:"min_bid_qty"`
+	MinAskQty        int64    `json:"min_ask_qty"`
+	MaxSpreadPct     float64  `json:"max_spread_pct"`
+	MinBidAskRatio   float64  `json:"min_bid_ask_ratio"`
+	MaxBidAskRatio   float64  `json:"max_bid_ask_ratio"`
+	MinTotalDepthQty int64    `json:"min_total_depth_qty"`
+	MaxDailyTrades   int32    `json:"max_daily_trades"`
+	MaxLossPerDay    float64  `json:"max_loss_per_day"`
+	UpdatedAt        int64    `json:"updated_at"` // Unix timestamp
 }
 
 // ToElasticsearchStrategy converts Strategy to ElasticsearchStrategy
 func (s *Strategy) ToElasticsearchStrategy() *ElasticsearchStrategy {
 	return &ElasticsearchStrategy{
-		StrategyID:     s.StrategyID,
-		UserID:         s.UserID,
-		StrategyName:   s.StrategyName,
-		Active:         s.Active,
-		MatchAllNews:   s.Conditions.MatchAllNews,
-		ImpactScoreMin: s.Conditions.ImpactScoreThreshold,
-		Sentiments:     s.Conditions.Sentiments,
-		Categories:     s.Conditions.Categories,
-		Stocks:         s.Conditions.Stocks,
-		PriceMin:       s.Conditions.PriceRange.MinPrice,
-		PriceMax:       s.Conditions.PriceRange.MaxPrice,
-		VolumeMin:      s.Conditions.VolumeThreshold,
-		PctChangeMin:   s.Conditions.PctChangeThreshold,
-		Exchange:       normalizeExchange(s.TradeConfig.Exchange),
-		MaxDailyTrades: s.RiskLimits.MaxDailyTrades,
-		MaxLossPerDay:  s.RiskLimits.MaxLossPerDay,
-		UpdatedAt:      s.UpdatedAt.Unix(),
+		StrategyID:       s.StrategyID,
+		UserID:           s.UserID,
+		StrategyName:     s.StrategyName,
+		Active:           s.Active,
+		Stocks:           s.Conditions.Stocks,
+		Exchanges:        s.Conditions.Exchanges,
+		PriceMin:         s.Conditions.PriceRange.MinPrice,
+		PriceMax:         s.Conditions.PriceRange.MaxPrice,
+		VolumeMin:        s.Conditions.VolumeThreshold,
+		PctChangeMin:     s.Conditions.PctChangeThreshold,
+		MinBidQty:        s.Conditions.MinBidQuantity,
+		MinAskQty:        s.Conditions.MinAskQuantity,
+		MaxSpreadPct:     s.Conditions.MaxSpreadPct,
+		MinBidAskRatio:   s.Conditions.MinBidAskRatio,
+		MaxBidAskRatio:   s.Conditions.MaxBidAskRatio,
+		MinTotalDepthQty: s.Conditions.MinTotalDepthQty,
+		MaxDailyTrades:   s.RiskLimits.MaxDailyTrades,
+		MaxLossPerDay:    s.RiskLimits.MaxLossPerDay,
+		UpdatedAt:        s.UpdatedAt.Unix(),
 	}
 }
 
@@ -136,12 +146,6 @@ func (s *Strategy) Validate() error {
 	}
 	if s.UserID == "" {
 		return ErrInvalidUserID
-	}
-	if s.Conditions.ImpactScoreThreshold < 0 || s.Conditions.ImpactScoreThreshold > 10 {
-		return ErrInvalidImpactScore
-	}
-	if len(s.Conditions.Sentiments) == 0 {
-		return ErrInvalidSentiments
 	}
 	if s.TradeConfig.Quantity <= 0 {
 		return ErrInvalidQuantity
@@ -161,34 +165,6 @@ func (s *Strategy) MatchesStock(stockCode int64) bool {
 
 	for _, stock := range s.Conditions.Stocks {
 		if stock == stockCode {
-			return true
-		}
-	}
-	return false
-}
-
-// MatchesSentiment checks if strategy applies to the sentiment
-func (s *Strategy) MatchesSentiment(sentiment string) bool {
-	if len(s.Conditions.Sentiments) == 0 {
-		return true
-	}
-
-	for _, s := range s.Conditions.Sentiments {
-		if s == sentiment {
-			return true
-		}
-	}
-	return false
-}
-
-// MatchesCategory checks if strategy applies to the category
-func (s *Strategy) MatchesCategory(category string) bool {
-	if len(s.Conditions.Categories) == 0 {
-		return true
-	}
-
-	for _, c := range s.Conditions.Categories {
-		if c == category {
 			return true
 		}
 	}

@@ -133,13 +133,12 @@ func (c *Client) convertProtoToStrategy(protoStrategy *pb.Strategy) (*models.Str
 	// Parse conditions
 	if protoStrategy.Conditions != nil {
 		conditions := models.Conditions{
-			MatchAllNews:         protoStrategy.Conditions.MatchAllNews,
-			ImpactScoreThreshold: protoStrategy.Conditions.ImpactScoreThreshold,
-			Sentiments:           convertSentiments(protoStrategy.Conditions.Sentiments),
-			Categories:           protoStrategy.Conditions.Categories,
-			Stocks:               protoStrategy.Conditions.StockCodes,
-			VolumeThreshold:      protoStrategy.Conditions.VolumeThreshold,
-			PctChangeThreshold:   protoStrategy.Conditions.PctChangeThreshold,
+			Stocks:             protoStrategy.Conditions.StockCodes,
+			VolumeThreshold:    protoStrategy.Conditions.VolumeThreshold,
+			PctChangeThreshold: protoStrategy.Conditions.PctChangeThreshold,
+			MinBidQuantity:     protoStrategy.Conditions.MinBidQuantity,
+			MinAskQuantity:     protoStrategy.Conditions.MinAskQuantity,
+			MaxSpreadPct:       protoStrategy.Conditions.MaxSpreadPct,
 		}
 
 		// Parse price range
@@ -158,10 +157,14 @@ func (c *Client) convertProtoToStrategy(protoStrategy *pb.Strategy) (*models.Str
 		tradeConfig := models.TradeConfig{
 			Quantity:        protoStrategy.TradeConfig.Quantity,
 			OrderType:       normalizeOrderType(protoStrategy.TradeConfig.OrderType.String()),
+			OrderSide:       normalizeOrderSide(protoStrategy.TradeConfig.OrderSide.String()),
 			Exchange:        normalizeExchange(protoStrategy.TradeConfig.Exchange.String()),
 			StopLossPct:     protoStrategy.TradeConfig.StopLossPct,
 			TakeProfitPct:   protoStrategy.TradeConfig.TakeProfitPct,
 			MaxPositionSize: protoStrategy.TradeConfig.MaxPositionSize,
+			StopLossType:    normalizeStopLossType(protoStrategy.TradeConfig.StopLossType.String()),
+			TrailingSLPct:   protoStrategy.TradeConfig.TrailingSlPct,
+			ProductType:     protoStrategy.TradeConfig.ProductType,
 		}
 
 		strategy.TradeConfig = tradeConfig
@@ -231,6 +234,30 @@ func normalizeExchange(exchange string) string {
 		return "BSE"
 	default:
 		return "NSE"
+	}
+}
+
+// normalizeOrderSide converts proto enum to internal format
+func normalizeOrderSide(orderSide string) string {
+	switch orderSide {
+	case "ORDER_SIDE_BUY":
+		return "BUY"
+	case "ORDER_SIDE_SELL":
+		return "SELL"
+	default:
+		return "BUY"
+	}
+}
+
+// normalizeStopLossType converts proto enum to internal format
+func normalizeStopLossType(stopLossType string) string {
+	switch stopLossType {
+	case "STOP_LOSS_TYPE_FIXED":
+		return "FIXED"
+	case "STOP_LOSS_TYPE_TRAILING":
+		return "TRAILING"
+	default:
+		return "FIXED"
 	}
 }
 

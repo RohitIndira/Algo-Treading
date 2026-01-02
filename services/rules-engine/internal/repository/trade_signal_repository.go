@@ -63,31 +63,32 @@ func (r *TradeSignalRepository) SaveTradeSignal(ctx context.Context, orderReq *m
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
-			$9, 'BUY', $10, $11, $12, $13,
-			$14, $15, $16, $17,
-			'PENDING', $18, $18
+			$9, $10, $11, $12, $13, $14,
+			$15, $16, $17, $18,
+			'PENDING', $19, $19
 		)
 	`
 
 	_, err := r.db.ExecContext(ctx, query,
-		orderReq.OrderID,
-		orderReq.UserID,
-		orderReq.StrategyID,
-		orderReq.StrategyName,
-		orderReq.EventID,
-		orderReq.StockCode,
-		orderReq.Symbol,
-		orderReq.Exchange,
-		orderReq.OrderType,
-		orderReq.Quantity,
-		orderReq.Price,
-		orderReq.StopLoss,
-		orderReq.TakeProfit,
-		orderReq.MatchScore,
-		orderReq.ImpactScore,
-		orderReq.Sentiment,
-		orderReq.NewsCategory,
-		orderReq.Timestamp,
+		orderReq.OrderID,      // $1
+		orderReq.UserID,       // $2
+		orderReq.StrategyID,   // $3
+		orderReq.StrategyName, // $4
+		orderReq.EventID,      // $5
+		orderReq.StockCode,    // $6
+		orderReq.Symbol,       // $7
+		orderReq.Exchange,     // $8
+		orderReq.OrderType,    // $9
+		orderReq.OrderSide,    // $10
+		orderReq.Quantity,     // $11
+		orderReq.Price,        // $12
+		orderReq.StopLoss,     // $13
+		orderReq.TakeProfit,   // $14
+		orderReq.MatchScore,   // $15
+		nil,                   // $16 - impact_score (not available in OrderRequest)
+		nil,                   // $17 - sentiment (not available in OrderRequest)
+		nil,                   // $18 - news_category (not available in OrderRequest)
+		orderReq.Timestamp,    // $19
 	)
 
 	if err != nil {
@@ -185,9 +186,6 @@ func (r *TradeSignalRepository) GetPendingSignals(ctx context.Context, limit int
 			&orderReq.StopLoss,
 			&orderReq.TakeProfit,
 			&orderReq.MatchScore,
-			&orderReq.ImpactScore,
-			&orderReq.Sentiment,
-			&orderReq.NewsCategory,
 			&orderReq.Timestamp,
 		)
 		if err != nil {
@@ -238,9 +236,6 @@ func (r *TradeSignalRepository) GetUserSignals(ctx context.Context, userID strin
 			&orderReq.StopLoss,
 			&orderReq.TakeProfit,
 			&orderReq.MatchScore,
-			&orderReq.ImpactScore,
-			&orderReq.Sentiment,
-			&orderReq.NewsCategory,
 			&orderReq.Timestamp,
 		)
 		if err != nil {

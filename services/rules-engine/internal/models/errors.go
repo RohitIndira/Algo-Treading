@@ -9,12 +9,11 @@ var (
 	ErrInvalidEventType   = errors.New("invalid event type")
 	ErrInvalidStockCode   = errors.New("invalid stock code")
 	ErrInvalidExchange    = errors.New("invalid exchange")
-	ErrInvalidImpactScore = errors.New("invalid impact score")
+	ErrMissingMarketDepth = errors.New("missing market depth data (bid/ask prices and quantities required)")
 
 	// Strategy validation errors
 	ErrInvalidStrategyID = errors.New("invalid strategy ID")
 	ErrInvalidUserID     = errors.New("invalid user ID")
-	ErrInvalidSentiments = errors.New("invalid sentiments")
 	ErrInvalidQuantity   = errors.New("invalid quantity")
 	ErrInvalidOrderType  = errors.New("invalid order type")
 

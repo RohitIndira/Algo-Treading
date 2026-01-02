@@ -138,6 +138,9 @@ func (m *Matcher) evaluateStrategiesConcurrent(
 			var strategy *models.Strategy
 			if cached, exists := cachedStrategies[esStrategy.StrategyID]; exists {
 				strategy = cached
+				m.logger.Debug("Strategy found in cache",
+					zap.String("strategy_id", esStrategy.StrategyID),
+					zap.String("user_id", esStrategy.UserID))
 			} else {
 				// Fallback: Try fetching from user-config service via gRPC
 				m.logger.Info("Strategy not in cache, attempting to fetch from user-config service",
@@ -147,29 +150,32 @@ func (m *Matcher) evaluateStrategiesConcurrent(
 				if m.userConfigClient != nil {
 					fetchedStrategy, err := m.userConfigClient.GetStrategy(ctx, esStrategy.StrategyID, esStrategy.UserID)
 					if err != nil {
-						m.logger.Warn("Failed to fetch strategy from user-config service, skipping",
+						m.logger.Warn("Failed to fetch strategy from user-config service, using reconstructed strategy with defaults",
 							zap.String("strategy_id", esStrategy.StrategyID),
 							zap.String("user_id", esStrategy.UserID),
 							zap.Error(err))
-						return
-					}
-					strategy = fetchedStrategy
-
-					// Cache the fetched strategy for future use
-					if err := m.strategyCache.SetStrategy(ctx, strategy); err != nil {
-						m.logger.Warn("Failed to cache fetched strategy",
-							zap.String("strategy_id", strategy.StrategyID),
-							zap.Error(err))
+						// Use reconstructed strategy as fallback
+						strategy = m.reconstructStrategy(esStrategy)
 					} else {
-						m.logger.Info("Strategy fetched and cached successfully",
-							zap.String("strategy_id", strategy.StrategyID))
+						strategy = fetchedStrategy
+
+						// Cache the fetched strategy for future use
+						if err := m.strategyCache.SetStrategy(ctx, strategy); err != nil {
+							m.logger.Warn("Failed to cache fetched strategy",
+								zap.String("strategy_id", strategy.StrategyID),
+								zap.Error(err))
+						} else {
+							m.logger.Info("Strategy fetched from user-config and cached successfully",
+								zap.String("strategy_id", strategy.StrategyID))
+						}
 					}
 				} else {
-					m.logger.Warn("Strategy not found in cache and no user-config client available",
+					m.logger.Warn("Strategy not found in cache and no user-config client available, using reconstructed strategy",
 						zap.String("strategy_id", esStrategy.StrategyID),
 						zap.String("user_id", esStrategy.UserID),
 						zap.String("strategy_name", esStrategy.StrategyName))
-					return
+					// Use reconstructed strategy as fallback
+					strategy = m.reconstructStrategy(esStrategy)
 				}
 			}
 
@@ -246,28 +252,36 @@ func (m *Matcher) evaluateStrategy(ctx context.Context, event *models.MarketEven
 
 // reconstructStrategy reconstructs a full strategy from Elasticsearch data
 func (m *Matcher) reconstructStrategy(esStrategy *models.ElasticsearchStrategy) *models.Strategy {
+	// Provide sensible defaults for trade_config when not available from cache/user-config
 	return &models.Strategy{
 		StrategyID:   esStrategy.StrategyID,
 		UserID:       esStrategy.UserID,
 		StrategyName: esStrategy.StrategyName,
 		Active:       esStrategy.Active,
 		Conditions: models.Conditions{
-			MatchAllNews:         esStrategy.MatchAllNews,
-			ImpactScoreThreshold: esStrategy.ImpactScoreMin,
-			Sentiments:           esStrategy.Sentiments,
-			Categories:           esStrategy.Categories,
-			Stocks:               esStrategy.Stocks,
+			Stocks:    esStrategy.Stocks,
+			Exchanges: esStrategy.Exchanges,
 			PriceRange: models.PriceRange{
 				MinPrice: esStrategy.PriceMin,
 				MaxPrice: esStrategy.PriceMax,
 			},
 			VolumeThreshold:    esStrategy.VolumeMin,
 			PctChangeThreshold: esStrategy.PctChangeMin,
+			MinBidQuantity:     esStrategy.MinBidQty,
+			MinAskQuantity:     esStrategy.MinAskQty,
+			MaxSpreadPct:       esStrategy.MaxSpreadPct,
+			MinBidAskRatio:     esStrategy.MinBidAskRatio,
+			MaxBidAskRatio:     esStrategy.MaxBidAskRatio,
+			MinTotalDepthQty:   esStrategy.MinTotalDepthQty,
 		},
 		TradeConfig: models.TradeConfig{
-			Exchange: esStrategy.Exchange, // Already normalized in Elasticsearch
-			// Note: Some fields may not be available in ES index
-			// They should be fetched from cache or User Config Service
+			// Defaults - these should ideally come from cache/user-config
+			OrderType:    "MARKET",
+			OrderSide:    "BUY",
+			Quantity:     100, // Default quantity
+			Exchange:     "",  // Will be set from Elasticsearch data
+			ProductType:  "INTRADAY",
+			StopLossType: "FIXED",
 		},
 		RiskLimits: models.RiskLimits{
 			MaxDailyTrades: esStrategy.MaxDailyTrades,

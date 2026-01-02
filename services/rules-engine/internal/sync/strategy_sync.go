@@ -240,7 +240,9 @@ func (ss *StrategySyncer) convertToStrategy(payload *StrategyPayload) (*models.S
 
 	// Normalize Kafka field values to match internal format
 	tradeConfig.OrderType = normalizeOrderType(tradeConfig.OrderType)
+	tradeConfig.OrderSide = normalizeOrderSide(tradeConfig.OrderSide)
 	tradeConfig.Exchange = normalizeExchange(tradeConfig.Exchange)
+	tradeConfig.StopLossType = normalizeStopLossType(tradeConfig.StopLossType)
 
 	return &models.Strategy{
 		StrategyID:   payload.StrategyID,
@@ -282,6 +284,32 @@ func normalizeExchange(exchange string) string {
 		return "BSE"
 	default:
 		return exchange // Return as-is if already normalized
+	}
+}
+
+// normalizeOrderSide converts Kafka order side format to internal format
+// "ORDER_SIDE_BUY" -> "BUY", "ORDER_SIDE_SELL" -> "SELL"
+func normalizeOrderSide(orderSide string) string {
+	switch orderSide {
+	case "ORDER_SIDE_BUY":
+		return "BUY"
+	case "ORDER_SIDE_SELL":
+		return "SELL"
+	default:
+		return orderSide // Return as-is if already normalized
+	}
+}
+
+// normalizeStopLossType converts Kafka stop loss type format to internal format
+// "STOP_LOSS_TYPE_FIXED" -> "FIXED", "STOP_LOSS_TYPE_TRAILING" -> "TRAILING"
+func normalizeStopLossType(stopLossType string) string {
+	switch stopLossType {
+	case "STOP_LOSS_TYPE_FIXED":
+		return "FIXED"
+	case "STOP_LOSS_TYPE_TRAILING":
+		return "TRAILING"
+	default:
+		return stopLossType // Return as-is if already normalized
 	}
 }
 

@@ -5,14 +5,12 @@ import (
 	"time"
 )
 
-// MarketEvent represents a market event from Kafka
+// MarketEvent represents a market event from Kafka (market depth based)
 type MarketEvent struct {
 	EventID    string     `json:"event_id"`
 	EventType  string     `json:"event_type"`
 	Timestamp  time.Time  `json:"timestamp"`
 	StockData  StockData  `json:"stock_data"`
-	NewsData   NewsData   `json:"news_data"`
-	Analysis   Analysis   `json:"analysis"`
 	MarketData MarketData `json:"market_data"`
 }
 
@@ -63,34 +61,28 @@ type StockData struct {
 	CompanyName string `json:"company_name"`
 }
 
-// NewsData contains news information
-type NewsData struct {
-	NewsID       string    `json:"news_id"`
-	NewsLink     string    `json:"news_link"`
-	Category     string    `json:"category"`
-	ShortSummary string    `json:"short_summary"`
-	DocumentDate time.Time `json:"document_date"`
+// DepthMetrics contains market depth analysis metrics
+type DepthMetrics struct {
+	SpreadPct       float64 `json:"spread_pct"`
+	BidAskRatio     float64 `json:"bid_ask_ratio"`
+	TotalBidQty     int64   `json:"total_bid_qty"`
+	TotalAskQty     int64   `json:"total_ask_qty"`
+	ImbalanceRatio  float64 `json:"imbalance_ratio"`   // (bid_qty - ask_qty) / (bid_qty + ask_qty)
+	LTPPositionType string  `json:"ltp_position_type"` // "between_spread", "above_ask", "below_bid"
 }
 
-// Analysis contains sentiment analysis
-type Analysis struct {
-	Sentiment   string `json:"sentiment"`
-	Impact      string `json:"impact"`
-	ImpactScore int32  `json:"impact_score"`
-}
-
-// MarketData contains market data
+// MarketData contains market depth data
 type MarketData struct {
 	LastTradedPrice float64  `json:"last_traded_price"`
 	PctChange       float64  `json:"pct_change"`
-	NewsFirstPrice  float64  `json:"news_first_price"`
-	NewsPctChange   float64  `json:"news_pct_change"`
 	PriceMap        PriceMap `json:"price_map"`
-	// Best bid/ask depth (optional - provided by data-ingestion)
+	// Market depth - bid/ask levels (required)
 	BidPrices     []float64 `json:"bid_prices"`
 	BidQuantities []int     `json:"bid_quantities"`
 	AskPrices     []float64 `json:"ask_prices"`
 	AskQuantities []int     `json:"ask_quantities"`
+	// Calculated depth metrics
+	DepthMetrics DepthMetrics `json:"depth_metrics"`
 }
 
 // PriceMap contains OHLCV data
@@ -106,9 +98,9 @@ func (e *MarketEvent) Validate() error {
 	if e.EventID == "" {
 		return ErrInvalidEventID
 	}
-	// Auto-set event_type if missing (MongoDB doesn't have this field)
+	// Auto-set event_type if missing
 	if e.EventType == "" {
-		e.EventType = "news" // Default for MongoDB news events
+		e.EventType = "market_depth" // Default for market depth events
 	}
 	if e.StockData.StockCode <= 0 {
 		return ErrInvalidStockCode
@@ -116,23 +108,9 @@ func (e *MarketEvent) Validate() error {
 	if e.StockData.Exchange == "" {
 		return ErrInvalidExchange
 	}
-	if e.Analysis.ImpactScore < 0 || e.Analysis.ImpactScore > 10 {
-		return ErrInvalidImpactScore
+	// Market depth must have bid/ask prices and quantities
+	if len(e.MarketData.BidPrices) == 0 || len(e.MarketData.AskPrices) == 0 {
+		return ErrMissingMarketDepth
 	}
 	return nil
-}
-
-// GetSentimentValue converts sentiment string to normalized value
-func (a *Analysis) GetSentimentValue() string {
-	// Normalize sentiment values
-	switch a.Sentiment {
-	case "Positive", "positive", "POSITIVE":
-		return "positive"
-	case "Negative", "negative", "NEGATIVE":
-		return "negative"
-	case "Neutral", "neutral", "NEUTRAL":
-		return "neutral"
-	default:
-		return "neutral"
-	}
 }

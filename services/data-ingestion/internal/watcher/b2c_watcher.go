@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/publisher"
+	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/transformer"
 
 	"go.uber.org/zap"
 )
@@ -204,12 +207,58 @@ func (w *B2CWatcher) validateMarketData(data *B2CMarketData) bool {
 	return true
 }
 
-// publishMarketData publishes market data to Kafka
+// publishMarketData publishes market data to Kafka, transforming B2C format to MarketEvent
 func (w *B2CWatcher) publishMarketData(ctx context.Context, data *B2CMarketData) error {
-	// Marshal to JSON
-	payload, err := json.Marshal(data)
+	// Transform B2C market data to MarketEvent with depth metrics
+	// Extract stock code from token (token is typically stock code as string)
+	stockCode := int64(0)
+	if code, err := strconv.ParseInt(data.Token, 10, 64); err == nil {
+		stockCode = code
+	} else {
+		w.lgr.Warn("failed to parse token as stock code, using 0", zap.String("token", data.Token))
+		stockCode = 0
+	}
+
+	// Determine exchange from environment or default to NSE
+	exchange := os.Getenv("DEFAULT_EXCHANGE")
+	if exchange == "" {
+		exchange = "NSE" // default to NSE
+	}
+
+	// Create transformer instance and transform data
+	marketEvent, err := transformer.TransformB2CToMarketEvent(
+		&transformer.B2CMarketData{
+			Symbol:        data.Symbol,
+			Token:         data.Token,
+			LTP:           data.LTP,
+			High:          data.High,
+			Low:           data.Low,
+			Open:          data.Open,
+			Close:         data.Close,
+			Volume:        data.Volume,
+			Change:        data.Change,
+			PrevClose:     data.PrevClose,
+			Timestamp:     data.Timestamp,
+			Week52High:    data.Week52High,
+			Week52Low:     data.Week52Low,
+			AvgVolume5D:   data.AvgVolume5D,
+			BidPrices:     data.BidPrices,
+			BidQuantities: data.BidQuantities,
+			AskPrices:     data.AskPrices,
+			AskQuantities: data.AskQuantities,
+		},
+		stockCode,
+		exchange,
+	)
+
 	if err != nil {
-		return fmt.Errorf("failed to marshal market data: %w", err)
+		return fmt.Errorf("failed to transform market data: %w", err)
+	}
+
+	// Marshal transformed event to JSON
+	payload, err := json.Marshal(marketEvent)
+	if err != nil {
+		return fmt.Errorf("failed to marshal market event: %w", err)
 	}
 
 	// Use token as key
@@ -223,10 +272,13 @@ func (w *B2CWatcher) publishMarketData(ctx context.Context, data *B2CMarketData)
 		return fmt.Errorf("failed to publish: %w", err)
 	}
 
-	w.lgr.Debug("published market data to kafka",
+	w.lgr.Debug("published market event to kafka",
 		zap.String("token", data.Token),
+		zap.String("symbol", data.Symbol),
 		zap.Float64("ltp", data.LTP),
-		zap.Int64("volume", data.Volume),
+		zap.Float64("spread_pct", marketEvent.MarketData.DepthMetrics.SpreadPct),
+		zap.Float64("bid_ask_ratio", marketEvent.MarketData.DepthMetrics.BidAskRatio),
+		zap.String("ltp_position", marketEvent.MarketData.DepthMetrics.LTPPositionType),
 	)
 
 	return nil
