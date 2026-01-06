@@ -9,7 +9,19 @@ from dotenv import load_dotenv
 import os
 
 # Load environment variables
-load_dotenv()
+#
+# When the Python bridge is started from the Go data-ingestion service,
+# the current working directory may be the Go service directory while the
+# .env with B2C credentials can live either:
+#   - next to this script (b2c-api-python/.env), or
+#   - in the data-ingestion service directory.
+#
+# We therefore:
+#   1. Load the default .env for the current working directory.
+#   2. Explicitly load a .env that lives alongside this script.
+script_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv()  # current working directory
+load_dotenv(os.path.join(script_dir, ".env"), override=True)  # script directory
 
 # Configure logging to stderr (stdout is used for data)
 logging.basicConfig(
@@ -21,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 # Import B2C WebSocket client
 # Add the b2c-api-python directory to Python path
-script_dir = os.path.dirname(os.path.abspath(__file__))
 b2c_api_path = script_dir   # because pycloudrestapi is inside the same folder
 
 logger.info(f"🔍 Script directory: {script_dir}")
@@ -482,13 +493,32 @@ class B2CBridge:
             raise  # Re-raise to trigger reconnection
 
 def load_b2c_config():
-    """Load B2C configuration from .env file"""
+    """Load B2C configuration from environment / .env files.
+
+    Supports both UPPERCASE (API_KEY) and lowercase (api_key) variable names so
+    that credentials can be provided either from the Go service .env or the
+    Python package .env without code changes.
+    """
+
+    def _get_env_var(*names: str) -> str:
+        """Return the first non-empty env var for the given names."""
+        for name in names:
+            value = os.getenv(name)
+            if value:
+                return value
+        return ""
+
     config = {
-        'api_key': os.getenv('api_key', ''),
-        'api_url': os.getenv('api_url', ''),
-        'user_id': os.getenv('user_id', ''),
-        'password': os.getenv('password', ''),
-        'totp_secret': os.getenv('totp_secret', ''),
+        # API / base URL
+        'api_key': _get_env_var('API_KEY', 'api_key'),
+        'api_url': _get_env_var('API_URL', 'api_url'),
+
+        # Primary login credentials
+        'user_id': _get_env_var('USER_ID', 'user_id'),
+        'password': _get_env_var('PASSWORD', 'password'),
+
+        # TOTP secret for 2FA
+        'totp_secret': _get_env_var('TOTP_SECRET', 'totp_secret'),
     }
     
     # Validate required fields
@@ -496,7 +526,10 @@ def load_b2c_config():
     missing_fields = [field for field in required_fields if not config[field]]
     
     if missing_fields:
-        logger.error(f"❌ Missing required .env variables: {', '.join(missing_fields)}")
+        logger.error(
+            "❌ Missing required environment variables for B2C bridge: "
+            + ", ".join(missing_fields)
+        )
         return {}
     
     logger.info(f"✅ Loaded B2C config from .env file")

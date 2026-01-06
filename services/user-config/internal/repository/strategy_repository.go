@@ -10,6 +10,14 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
+// truncateString ensures a string does not exceed max length
+func truncateString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
+}
+
 // StrategyRepository handles database operations for strategies
 type StrategyRepository struct {
 	db *sqlx.DB
@@ -96,13 +104,21 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			RETURNING created_at`
 
+		// Truncate string fields to avoid DB column length errors (some schemas use VARCHAR(20))
+		orderType := truncateString(req.TradeConfig.OrderType, 20)
+		exchange := truncateString(req.TradeConfig.Exchange, 20)
+		orderSide := truncateString(req.TradeConfig.OrderSide, 20)
+		validity := truncateString(req.TradeConfig.Validity, 20)
+		stopLossType := truncateString(req.TradeConfig.StopLossType, 20)
+		productType := truncateString(req.TradeConfig.ProductType, 20)
+
 		err = tx.QueryRowxContext(ctx, tradeQuery,
-			tradeConfigID, strategy.StrategyID, req.TradeConfig.OrderType,
+			tradeConfigID, strategy.StrategyID, orderType,
 			req.TradeConfig.Quantity, req.TradeConfig.MaxPositionSize,
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
-			req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
-			req.TradeConfig.LimitPrice, req.TradeConfig.Validity,
-			req.TradeConfig.StopLossType, req.TradeConfig.TrailingSLPct, req.TradeConfig.ProductType,
+			exchange, orderSide,
+			req.TradeConfig.LimitPrice, validity,
+			stopLossType, req.TradeConfig.TrailingSLPct, productType,
 		).Scan(&req.TradeConfig.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert trade config: %w", err)

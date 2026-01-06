@@ -16,10 +16,10 @@ const (
 	DefaultTimeout = 30 * time.Second
 
 	// Environment variable names
-	EnvIndiraBaseURL = ""
+	EnvIndiraBaseURL = "https://livemiddleware.indiratrade.com"
 
 	// Fallback base URL if environment variable is not set
-	FallbackBaseURL = ""
+	FallbackBaseURL = "https://livemiddleware.indiratrade.com"
 )
 
 // getDefaultBaseURL returns the base URL from environment or uses fallback

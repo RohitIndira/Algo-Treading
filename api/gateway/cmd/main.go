@@ -35,7 +35,7 @@ func main() {
 
 	log.Println("Starting API Gateway...")
 
-	// gRPC client: user-config-service
+	// gRPC client: user-config-service---create a gRPC client that talks to the User Config Service it pass adress of the User Config Service like localhost:9001 and how long to wait before giving up on a gRPC call
 	userConfigClient, err := grpc_clients.NewUserConfigClient(
 		cfg.Services.UserConfigAddr,
 		cfg.Server.GRPCTimeout,
@@ -43,12 +43,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize user config client: %v", err)
 	}
-	defer userConfigClient.Close()
+	defer userConfigClient.Close() // Close the gRPC connection when main function exits
 
 	log.Printf("Connected to User Config Service at %s", cfg.Services.UserConfigAddr)
 
 	// Initialize handlers
-	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient)
+	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient) // Handler for user config related HTTP requests  It calls `handlers.NewUserConfigHandler(...)` and passes the gRPC client we just created.
 
 	// Initialize Redis client for WebSocket pub/sub
 	redisClient := redis.NewClient(&redis.Options{

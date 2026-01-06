@@ -17,6 +17,7 @@ import (
 )
 
 func main() {
+
 	cfg := config.Load()
 
 	lgr, err := logger.NewWithDefaults("data-ingestion")
@@ -27,7 +28,7 @@ func main() {
 
 	lgr.Info("Starting data-ingestion service (B2C Market Data)")
 
-	// Initialize Kafka producer
+	// Initialize Kafka producer build Producerconfig or pkg/kafka
 	prodCfg := kafkapkg.ProducerConfig{
 		Brokers:     cfg.KafkaBrokers,
 		Topic:       cfg.KafkaTopic,

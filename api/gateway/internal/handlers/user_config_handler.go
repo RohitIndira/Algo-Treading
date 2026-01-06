@@ -181,6 +181,15 @@ func (h *UserConfigHandler) CreateDepthMarketStrategy(w http.ResponseWriter, r *
 		}
 	}
 
+	// Convert exchanges []string to []common.Exchange
+	var exchangesProto []common.Exchange
+	if len(depthReq.Exchanges) > 0 {
+		exchangesProto = make([]common.Exchange, len(depthReq.Exchanges))
+		for i, s := range depthReq.Exchanges {
+			exchangesProto[i] = parseExchange(s)
+		}
+	}
+
 	// Build the proto request
 	req := &pb.CreateStrategyRequest{
 		UserId:              depthReq.UserID,
@@ -192,7 +201,7 @@ func (h *UserConfigHandler) CreateDepthMarketStrategy(w http.ResponseWriter, r *
 		Source:              source,
 		Conditions: &pb.StrategyConditions{
 			StockCodes:              depthReq.StockCodes,
-			Exchanges:               depthReq.Exchanges,
+			Exchanges:               exchangesProto,
 			PriceRange:              priceRange,
 			VolumeThreshold:         depthReq.VolumeThreshold,
 			PctChangeThreshold:      0,

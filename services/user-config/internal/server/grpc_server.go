@@ -337,9 +337,10 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 		return nil
 	}
 
+	// proto.Exchanges is a slice of enum values; convert each to its string name
 	exchanges := make(pq.StringArray, len(proto.Exchanges))
 	for i, e := range proto.Exchanges {
-		exchanges[i] = e
+		exchanges[i] = e.String()
 	}
 
 	stockCodes := make(pq.Int64Array, len(proto.StockCodes))
@@ -463,9 +464,15 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 		return nil
 	}
 
-	exchanges := make([]string, len(model.Exchanges))
+	// model.Exchanges holds enum names as strings; convert to enum values
+	exchanges := make([]common.Exchange, len(model.Exchanges))
 	for i, e := range model.Exchanges {
-		exchanges[i] = e
+		if val, ok := common.Exchange_value[e]; ok {
+			exchanges[i] = common.Exchange(val)
+		} else {
+			// fallback to ZERO value (0) if unknown
+			exchanges[i] = common.Exchange(0)
+		}
 	}
 
 	stockCodes := make([]int64, len(model.StockCodes))

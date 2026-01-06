@@ -182,7 +182,7 @@ func LoadConfig() (*Config, error) {
 
 		PostgreSQL: PostgreSQLConfig{
 			Host:     getEnv("POSTGRES_HOST", "localhost"),
-			Port:     getEnv("POSTGRES_PORT", "5432"),
+			Port:     getEnv("POSTGRES_PORT", "55432"),
 			User:     getEnv("POSTGRES_USER", "postgres"),
 			Password: getEnv("POSTGRES_PASSWORD", "postgres"),
 			Database: getEnv("POSTGRES_DB", "trading_db"),
@@ -274,7 +274,7 @@ func LoadConfig() (*Config, error) {
 			CloseHour:    getEnvAsInt("MARKET_CLOSE_HOUR", 15),
 			CloseMinute:  getEnvAsInt("MARKET_CLOSE_MINUTE", 30),
 			Timezone:     getEnv("MARKET_TIMEZONE", "Asia/Kolkata"),
-			EnforceHours: getEnvAsBool("MARKET_ENFORCE_HOURS", true),
+			EnforceHours: getEnvAsBool("MARKET_ENFORCE_HOURS", false),
 		},
 	}
 

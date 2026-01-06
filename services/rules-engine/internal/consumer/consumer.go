@@ -90,6 +90,14 @@ func (c *Consumer) processMessage(ctx context.Context) error {
 		zap.Int64("offset", msg.Offset),
 		zap.Time("time", msg.Time))
 
+	// Log the exact JSON payload received from Kafka for debugging
+	// This helps verify what the Rules Engine is consuming from the market data topic
+	c.logger.Info("Kafka raw market event JSON received",
+		zap.Int("partition", msg.Partition),
+		zap.Int64("offset", msg.Offset),
+		zap.ByteString("value", msg.Value),
+	)
+
 	// First, try to unmarshal as MarketEvent (from new data-ingestion transformer)
 	var event models.MarketEvent
 	if err := json.Unmarshal(msg.Value, &event); err == nil {

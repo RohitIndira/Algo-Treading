@@ -209,6 +209,23 @@ func (m *Matcher) evaluateStrategy(ctx context.Context, event *models.MarketEven
 		return nil
 	}
 
+	// Optional SBS hook: allow custom business logic to short-circuit matching
+	// if m.sbs != nil {
+	// 	if sbsResult := m.sbs.EvaluateSBS(ctx, event, strategy); sbsResult != nil {
+	// 		if !sbsResult.Match {
+	// 			// Strategy explicitly rejected by SBS logic
+	// 			m.logger.Debug("Strategy rejected by SBS",
+	// 				zap.String("strategy_id", strategy.StrategyID),
+	// 				zap.String("strategy_name", strategy.StrategyName),
+	// 				zap.Strings("sbs_failed", sbsResult.FailedConditions),
+	// 			)
+	// 			return nil
+	// 		}
+	// 		// If SBS says match, we still run normal evaluator/scorer, but we
+	// 		// can merge SBS conditions into the result so scoring/logging sees them.
+	// 	}
+	// }
+
 	// Evaluate conditions
 	result := m.evaluator.Evaluate(event, strategy)
 

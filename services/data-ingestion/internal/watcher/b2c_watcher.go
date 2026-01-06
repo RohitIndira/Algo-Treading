@@ -19,7 +19,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// B2CMarketData represents live market price data from B2C API bridge
+// B2CMarketData represents live market price data from B2C API bridge This is the exact JSON structure the Python bridge prints per line
 type B2CMarketData struct {
 	Symbol        string    `json:"symbol"`
 	Token         string    `json:"token"`
@@ -261,6 +261,14 @@ func (w *B2CWatcher) publishMarketData(ctx context.Context, data *B2CMarketData)
 		return fmt.Errorf("failed to marshal market event: %w", err)
 	}
 
+	// Log the exact JSON payload that will be published for debugging
+	// This helps verify what is being sent to Kafka via docker logs
+	w.lgr.Info("B2C market event JSON prepared",
+		zap.String("token", data.Token),
+		zap.String("symbol", data.Symbol),
+		zap.String("json", string(payload)),
+	)
+
 	// Use token as key
 	key := []byte(data.Token)
 
@@ -272,7 +280,7 @@ func (w *B2CWatcher) publishMarketData(ctx context.Context, data *B2CMarketData)
 		return fmt.Errorf("failed to publish: %w", err)
 	}
 
-	w.lgr.Debug("published market event to kafka",
+	w.lgr.Info("published B2C market event to kafka",
 		zap.String("token", data.Token),
 		zap.String("symbol", data.Symbol),
 		zap.Float64("ltp", data.LTP),

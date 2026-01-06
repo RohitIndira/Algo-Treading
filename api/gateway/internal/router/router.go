@@ -8,12 +8,13 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// NewRouter sets up the HTTP router with all routes and middleware.
 func NewRouter(
 	userConfigHandler *handlers.UserConfigHandler,
 	websocketHandler *handlers.WebSocketHandler,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
-
+	// Create a new Gorilla Mux router Think of r as the central routing table for the API Gateway.
 	r := mux.NewRouter()
 
 	// CORS middleware
@@ -45,6 +46,6 @@ func NewRouter(
 	// WebSocket routes for live match feed
 	r.HandleFunc("/ws/matches", websocketHandler.HandleMatchesFeed)        // Single user
 	r.HandleFunc("/ws/matches/all", websocketHandler.HandleAllMatchesFeed) // All users
-
+	// Return the configured router
 	return r
 }

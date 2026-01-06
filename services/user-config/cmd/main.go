@@ -1,5 +1,18 @@
 package main
 
+/*
+ User Config Service – Main Application Flow
+
+ 1. Load configuration (Kafka and database settings).
+ 2. Initialize logger.
+ 3. Connect to PostgreSQL.
+ 4. Initialize Kafka writer (if enabled).
+ 5. Create repository and StrategyService (business logic) using DB and Kafka.
+ 6. Create gRPC server and register UserConfigService with StrategyService.
+ 7. Start gRPC server on the configured port.
+ 8. Listen for OS signals and shut down gracefully.
+*/
+
 import (
 	"context"
 	"fmt"
@@ -49,7 +62,7 @@ func main() {
 
 	lgr.Info("Database connection established")
 
-	// Initialize Kafka writer
+	// Initialize Kafka writer if enabled in config
 	var kafkaWriter *kafka.Writer
 	if cfg.Kafka.Enabled {
 		kafkaWriter = kafka.NewWriter(kafka.WriterConfig{
@@ -71,8 +84,8 @@ func main() {
 	// We need to use jmoiron/sqlx to wrap it
 	sqlxDB := sqlx.NewDb(dbClient.DB, "postgres")
 	repo := repository.NewStrategyRepository(sqlxDB)
-
-	// Initialize service
+	// so repo knows how to insert stratgies into DB update/delete statgies from DB
+	// Initialize service (Busness logic +kafka publishing)
 	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic)
 
 	// Initialize gRPC server
