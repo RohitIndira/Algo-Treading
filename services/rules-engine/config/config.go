@@ -43,6 +43,10 @@ type Config struct {
 
 	// Market Hours Configuration
 	MarketHours MarketHoursConfig
+
+	// Cash 52-week High strategy configuration (Phase 1)
+	Cash52WTopic   string
+	Cash52WUserIDs []string
 }
 
 // KafkaConfig holds Kafka-specific configuration
@@ -276,6 +280,10 @@ func LoadConfig() (*Config, error) {
 			Timezone:     getEnv("MARKET_TIMEZONE", "Asia/Kolkata"),
 			EnforceHours: getEnvAsBool("MARKET_ENFORCE_HOURS", true),
 		},
+
+		// Cash 52-week High strategy (Phase 1): topic + participating user IDs
+		Cash52WTopic:   getEnv("KAFKA_TOPIC_52W_BREAKOUT", "market.data.52w_breakouts"),
+		Cash52WUserIDs: getEnvAsSlice("CASH52W_USER_IDS", []string{}),
 	}
 
 	// Validate configuration

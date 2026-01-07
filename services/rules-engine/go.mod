@@ -5,6 +5,9 @@ go 1.23.0
 toolchain go1.24.6
 
 require (
+	github.com/RohitIndira/Algo-Treading/api/proto/common v0.0.0
+	github.com/RohitIndira/Algo-Treading/api/proto/risk_management v0.0.0
+	github.com/RohitIndira/Algo-Treading/api/proto/user_config v0.0.0
 	github.com/elastic/go-elasticsearch/v8 v8.11.0
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/google/uuid v1.6.0
@@ -34,3 +37,9 @@ require (
 )
 
 replace github.com/RohitIndira/Algo-Treading => ../..
+
+replace github.com/RohitIndira/Algo-Treading/api/proto/common => ../../api/proto/common
+
+replace github.com/RohitIndira/Algo-Treading/api/proto/risk_management => ../../api/proto/risk_management
+
+replace github.com/RohitIndira/Algo-Treading/api/proto/user_config => ../../api/proto/user_config

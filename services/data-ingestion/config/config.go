@@ -25,6 +25,15 @@ type Config struct {
 	KafkaBrokers []string
 	KafkaTopic   string
 
+	// Additional Kafka topic for 52-week high breakout events
+	KafkaTopic52Week string
+
+	// External Redis market data configuration (for 52-week highs, etc.).
+	MarketRedisAddr         string
+	MarketRedisPassword     string
+	MarketRedisDB           int
+	MarketRedisPollInterval time.Duration
+
 	WorkerCount int
 	MaxRetries  int
 	// timeouts
@@ -44,6 +53,13 @@ func Load() *Config {
 		topic = "market.data.news"
 	}
 
+	// Separate topic for 52-week breakout events so downstream
+	// consumers can subscribe independently of news.
+	breakoutTopic := os.Getenv("KAFKA_TOPIC_52W_BREAKOUT")
+	if breakoutTopic == "" {
+		breakoutTopic = "market.data.52w_breakouts"
+	}
+
 	db := os.Getenv("MONGO_DATABASE")
 	if db == "" {
 		db = "CAG_CHATBOT"
@@ -58,14 +74,19 @@ func Load() *Config {
 	maxRetries := 3
 
 	return &Config{
-		MongoURI:            getEnv("MONGO_URI", "mongodb://localhost:27017"),
-		MongoDatabase:       db,
-		MongoCollection:     coll,
-		KafkaBrokers:        strings.Split(brokers, ","),
-		KafkaTopic:          topic,
-		WorkerCount:         workerCount,
-		MaxRetries:          maxRetries,
-		MongoConnectTimeout: 10 * time.Second,
+		MongoURI:                getEnv("MONGO_URI", "mongodb://localhost:27017"),
+		MongoDatabase:           db,
+		MongoCollection:         coll,
+		KafkaBrokers:            strings.Split(brokers, ","),
+		KafkaTopic:              topic,
+		KafkaTopic52Week:        breakoutTopic,
+		WorkerCount:             workerCount,
+		MaxRetries:              maxRetries,
+		MongoConnectTimeout:     10 * time.Second,
+		MarketRedisAddr:         getEnv("MARKET_REDIS_ADDR", "65.20.83.31:6379"),
+		MarketRedisPassword:     os.Getenv("MARKET_REDIS_PASSWORD"),
+		MarketRedisDB:           0,
+		MarketRedisPollInterval: 2 * time.Second,
 	}
 }
 

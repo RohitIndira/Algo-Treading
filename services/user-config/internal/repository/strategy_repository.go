@@ -571,3 +571,143 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 
 	return strategies, nil
 }
+
+// ConfigureCash52WeekStrategy creates or updates the managed "Cash 52W High"
+// strategy for a user. It uses existing Create/Update/Activate/Deactivate
+// methods rather than custom SQL so that all related tables stay consistent.
+//
+// Behaviour:
+//   - If enabled=false: deactivate existing Cash 52W strategy (if any).
+//   - If enabled=true: create or update a Cash 52W strategy with the provided
+//     capital_per_stock and default SL/TP/risk settings.
+func (r *StrategyRepository) ConfigureCash52WeekStrategy(
+	ctx context.Context,
+	userID string,
+	capitalPerStock float64,
+	maxPositions int,
+	stopLossPct, takeProfitPct float64,
+	riskProfile string,
+	enabled bool,
+) (*models.Strategy, error) {
+	const strategyName = "Cash 52W High"
+
+	// Fetch existing strategies for this user and look for our managed one.
+	strategies, _, err := r.ListByUserID(ctx, userID, false, 100, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list strategies for ConfigureCash52WeekStrategy: %w", err)
+	}
+
+	var existing *models.Strategy
+	for _, s := range strategies {
+		if s.StrategyName == strategyName {
+			existing = s
+			break
+		}
+	}
+
+	// If disabling, simply deactivate existing strategy if it exists.
+	if !enabled {
+		if existing == nil {
+			return nil, nil
+		}
+		if err := r.Deactivate(ctx, existing.StrategyID, userID); err != nil {
+			return nil, err
+		}
+		return r.GetByID(ctx, existing.StrategyID, userID)
+	}
+
+	// Common default values if the caller passed zero/invalid overrides.
+	if maxPositions <= 0 {
+		maxPositions = 25
+	}
+	if stopLossPct <= 0 {
+		stopLossPct = 10
+	}
+	if takeProfitPct <= 0 {
+		takeProfitPct = 20
+	}
+
+	// Helper to build TradeConfig and RiskLimits for this 52W strategy.
+	buildTradeAndRisk := func() (*models.TradeConfig, *models.RiskLimits) {
+		// TradeConfig: MARKET BUY, quantity 0 (52W engine decides), max_position_size
+		// treated as capital_per_stock.
+		mc := &models.TradeConfig{
+			OrderType:       "ORDER_TYPE_MARKET",
+			Quantity:        0,
+			MaxPositionSize: &capitalPerStock,
+			StopLossPct:     &stopLossPct,
+			TakeProfitPct:   &takeProfitPct,
+			Exchange:        "EXCHANGE_NSE",
+			OrderSide:       "ORDER_SIDE_BUY",
+			LimitPrice:      nil,
+			Validity:        "DAY",
+		}
+
+		// RiskLimits: reasonable defaults for this strategy; these are separate
+		// from generic platform limits enforced in the risk-management service.
+		maxDailyTrades := int32(50)
+		maxLossPerDay := 50000.0
+		maxPerTradeRisk := capitalPerStock * stopLossPct / 100.0
+		positionSizing := "POSITION_SIZING_FIXED"
+		maxPortfolioExposurePct := 0.0
+
+		rl := &models.RiskLimits{
+			MaxDailyTrades:          &maxDailyTrades,
+			MaxLossPerDay:           &maxLossPerDay,
+			PositionSizing:          positionSizing,
+			MaxPortfolioExposurePct: &maxPortfolioExposurePct,
+			MaxPerTradeRisk:         &maxPerTradeRisk,
+			EnableRiskChecks:        true,
+		}
+
+		return mc, rl
+	}
+
+	if existing != nil {
+		// Update existing strategy via generic Update method.
+		tradeCfg, riskLimits := buildTradeAndRisk()
+		upd := &models.UpdateStrategyRequest{
+			StrategyID:  existing.StrategyID,
+			UserID:      userID,
+			Version:     existing.Version,
+			TradeConfig: tradeCfg,
+			RiskLimits:  riskLimits,
+		}
+
+		updated, err := r.Update(ctx, upd)
+		if err != nil {
+			return nil, err
+		}
+
+		// Ensure it is active.
+		if err := r.Activate(ctx, updated.StrategyID, userID); err != nil {
+			return nil, err
+		}
+		return r.GetByID(ctx, updated.StrategyID, userID)
+	}
+
+	// No existing strategy: create a new one using the generic Create path.
+	tradeCfg, riskLimits := buildTradeAndRisk()
+	cond := &models.StrategyCondition{
+		ImpactScoreThreshold: 1, // minimal dummy condition; 52W engine does not use news filters
+		Sentiments:           nil,
+		Categories:           nil,
+		StockCodes:           nil,
+		Exchanges:            nil,
+	}
+	cr := &models.CreateStrategyRequest{
+		UserID:              userID,
+		StrategyName:        strategyName,
+		Description:         "Managed Cash 52-Week High breakout strategy",
+		Conditions:          cond,
+		TradeConfig:         tradeCfg,
+		RiskLimits:          riskLimits,
+		ActivateImmediately: true,
+	}
+
+	created, err := r.Create(ctx, cr)
+	if err != nil {
+		return nil, err
+	}
+	return created, nil
+}

@@ -25,6 +25,44 @@ func NewUserConfigServer(service *service.StrategyService) *UserConfigServer {
 	}
 }
 
+// ConfigureCash52WeekStrategy configures the managed Cash 52-week High strategy
+// for a user. It exposes only high-level fields (enabled, capital_per_stock)
+// to callers; the service fills in all detailed trade/risk settings.
+func (s *UserConfigServer) ConfigureCash52WeekStrategy(ctx context.Context, req *pb.ConfigureCash52WeekStrategyRequest) (*pb.ConfigureCash52WeekStrategyResponse, error) {
+	modelReq := &models.ConfigureCash52WeekStrategyRequest{
+		UserID:          req.UserId,
+		Enabled:         req.Enabled,
+		CapitalPerStock: req.CapitalPerStock,
+		// max_positions, stop_loss_pct, take_profit_pct and risk_profile are
+		// optional; backend will default them if zero/empty.
+		MaxPositions:  int(req.MaxPositions),
+		StopLossPct:   req.StopLossPct,
+		TakeProfitPct: req.TakeProfitPct,
+		RiskProfile:   req.RiskProfile,
+	}
+
+	strategy, err := s.service.ConfigureCash52WeekStrategy(ctx, modelReq)
+	if err != nil {
+		return &pb.ConfigureCash52WeekStrategyResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "CONFIGURE_52W_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	var protoStrategy *pb.Strategy
+	if strategy != nil {
+		protoStrategy = modelStrategyToProto(strategy)
+	}
+
+	return &pb.ConfigureCash52WeekStrategyResponse{
+		Success:  true,
+		Strategy: protoStrategy,
+	}, nil
+}
+
 // CreateStrategy creates a new trading strategy
 func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStrategyRequest) (*pb.CreateStrategyResponse, error) {
 	// Convert proto request to domain model

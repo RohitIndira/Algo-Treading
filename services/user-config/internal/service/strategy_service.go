@@ -29,6 +29,50 @@ func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.
 	}
 }
 
+// ConfigureCash52WeekStrategy creates or updates the managed Cash 52-week High
+// strategy for a user based on a small set of high-level parameters. This
+// hides most of the low-level fields from the frontend.
+func (s *StrategyService) ConfigureCash52WeekStrategy(ctx context.Context, req *models.ConfigureCash52WeekStrategyRequest) (*models.Strategy, error) {
+	if req.UserID == "" {
+		return nil, fmt.Errorf("user_id is required")
+	}
+
+	// Backend defaults if caller doesn't specify overrides
+	capitalPerStock := req.CapitalPerStock
+	if capitalPerStock <= 0 {
+		capitalPerStock = 20000 // ₹20,000 per stock
+	}
+	maxPositions := req.MaxPositions
+	if maxPositions <= 0 {
+		maxPositions = 25
+	}
+	stopLossPct := req.StopLossPct
+	if stopLossPct <= 0 {
+		stopLossPct = 10
+	}
+	takeProfitPct := req.TakeProfitPct
+	if takeProfitPct <= 0 {
+		takeProfitPct = 20
+	}
+
+	// Delegate actual persistence logic to repository helper that knows how to
+	// find/create the CASH_52W_HIGH strategy for this user. For now we keep
+	// this high-level API here; repository implements the DB details.
+	strategy, err := s.repo.ConfigureCash52WeekStrategy(ctx, req.UserID, capitalPerStock, maxPositions, stopLossPct, takeProfitPct, req.RiskProfile, req.Enabled)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure cash 52w strategy: %w", err)
+	}
+
+	// Publish config change to Kafka as a normal strategy event
+	if strategy != nil {
+		if err := s.publishToKafka(ctx, "UPDATE", strategy); err != nil {
+			fmt.Printf("Warning: failed to publish 52w config to kafka: %v\n", err)
+		}
+	}
+
+	return strategy, nil
+}
+
 // ConfigEvent represents a strategy configuration event for Kafka
 type ConfigEvent struct {
 	EventType string           `json:"event_type"` // CREATE, UPDATE, DELETE, ACTIVATE, DEACTIVATE

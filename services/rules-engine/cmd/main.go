@@ -12,6 +12,7 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/config"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cash52w"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/index"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
@@ -199,6 +200,40 @@ func main() {
 	defer kafkaPub.Close()
 	logger.Info("Kafka trade-signals publisher initialized successfully")
 
+	// Initialize Cash 52-week High strategy engine (if configured)
+	var cash52wEngine *cash52w.Engine
+	var breakoutConsumer *consumer.BreakoutConsumer
+	if len(cfg.Cash52WUserIDs) > 0 && cfg.Cash52WTopic != "" {
+		logger.Info("Initializing Cash 52-week High engine",
+			zap.String("topic", cfg.Cash52WTopic),
+			zap.Strings("user_ids", cfg.Cash52WUserIDs))
+
+		engineCfg := cash52w.Config{
+			UserIDs:         cfg.Cash52WUserIDs,
+			CapitalPerStock: 20000,
+			MaxPositions:    25,
+			SLPercent:       10,
+			TSLPercent:      20,
+		}
+		cash52wEngine = cash52w.NewEngine(engineCfg, riskClient, rabbitPub, kafkaPub, logger)
+
+		breakoutConsumer, err = consumer.NewBreakoutConsumer(
+			cfg.Kafka.Brokers,
+			cfg.Cash52WTopic,
+			"rules-engine-cash52w-group",
+			cash52wEngine,
+			logger,
+		)
+		if err != nil {
+			logger.Error("Failed to initialize 52w-breakout consumer", zap.Error(err))
+		} else {
+			defer breakoutConsumer.Close()
+			logger.Info("52w-breakout consumer initialized successfully")
+		}
+	} else {
+		logger.Info("Cash 52-week High engine disabled (no CASH52W_USER_IDS configured)")
+	}
+
 	// Initialize market hours from configuration
 	logger.Info("Initializing market hours configuration...",
 		zap.Int("open_hour", cfg.MarketHours.OpenHour),
@@ -241,6 +276,17 @@ func main() {
 			logger.Error("Strategy syncer error", zap.Error(err))
 		}
 	}()
+
+	// Start consuming 52-week breakout events if engine is enabled
+	if breakoutConsumer != nil && cash52wEngine != nil {
+		go func() {
+			logger.Info("Starting 52w-breakout consumer",
+				zap.String("topic", cfg.Cash52WTopic))
+			if err := breakoutConsumer.Start(ctx); err != nil {
+				logger.Error("52w-breakout consumer error", zap.Error(err))
+			}
+		}()
+	}
 
 	// Start consuming market events from Kafka
 	go func() {

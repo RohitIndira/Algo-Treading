@@ -291,42 +291,45 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	}
 
 	// 1. Check risk management BEFORE publishing
-	// TODO: TEMPORARILY BYPASSED FOR TESTING - REMOVE THIS BEFORE PRODUCTION
-	if false && h.riskClient != nil {
+	if h.riskClient != nil {
+		// Call central RiskManagementService to validate the order before it goes
+		// to RabbitMQ / Trade Execution.
 		riskResp, err := h.riskClient.CheckPreTradeRisk(ctx, orderReq, strategy)
 		if err != nil {
 			h.logger.Error("Risk check failed",
 				zap.Error(err),
 				zap.String("order_id", orderReq.OrderID))
-			// Set as not approved if risk check fails
+			// Mark as not approved and DO NOT publish this order.
 			orderReq.RiskApproved = false
 			orderReq.RiskScore = 100.0 // High risk score for failures
-		} else {
-			// Update order with risk check results
-			orderReq.RiskApproved = riskResp.Approved
-			orderReq.RiskScore = riskResp.RiskScore
+			return nil
+		}
 
-			if !riskResp.Approved {
-				h.logger.Warn("Order rejected by risk management",
+		// Update order with risk check results
+		orderReq.RiskApproved = riskResp.Approved
+		orderReq.RiskScore = riskResp.RiskScore
+
+		if !riskResp.Approved {
+			h.logger.Warn("Order rejected by risk management",
+				zap.String("order_id", orderReq.OrderID),
+				zap.String("user_id", orderReq.UserID),
+				zap.Float64("risk_score", riskResp.RiskScore),
+				zap.Int("violations", len(riskResp.Violations)))
+
+			// Log violations for debugging / audit
+			for _, violation := range riskResp.Violations {
+				h.logger.Debug("Risk violation",
 					zap.String("order_id", orderReq.OrderID),
-					zap.String("user_id", orderReq.UserID),
-					zap.Float64("risk_score", riskResp.RiskScore),
-					zap.Int("violations", len(riskResp.Violations)))
-
-				// Log violations
-				for _, violation := range riskResp.Violations {
-					h.logger.Debug("Risk violation",
-						zap.String("order_id", orderReq.OrderID),
-						zap.String("type", violation.Type.String()),
-						zap.String("message", violation.Message))
-				}
-				// Don't publish rejected orders
-				return nil
+					zap.String("type", violation.Type.String()),
+					zap.String("message", violation.Message))
 			}
+			// Don't publish rejected orders
+			return nil
 		}
 	} else {
-		// TESTING MODE: Bypassing risk checks - Auto-approving all orders
-		h.logger.Warn("RISK CHECK BYPASSED FOR TESTING - Auto-approving order",
+		// No risk client configured. For safety in production, you may prefer to
+		// block orders here instead of auto-approving.
+		h.logger.Warn("Risk client not configured - auto-approving order by default",
 			zap.String("order_id", orderReq.OrderID))
 		orderReq.RiskApproved = true
 		orderReq.RiskScore = 0.0

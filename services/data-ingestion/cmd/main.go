@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/pkg/database/mongodb"
+	redispkg "github.com/RohitIndira/Algo-Treading/pkg/database/redis"
 	kafkapkg "github.com/RohitIndira/Algo-Treading/pkg/kafka"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/config"
@@ -28,7 +29,7 @@ func main() {
 
 	lgr.Info("Starting data-ingestion service")
 
-	// Initialize MongoDB client
+	// Initialize MongoDB client (news ingestion)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
 	defer cancel()
 
@@ -40,7 +41,7 @@ func main() {
 
 	lgr.Info("Connected to MongoDB", zap.String("database", cfg.MongoDatabase), zap.String("collection", cfg.MongoCollection))
 
-	// Initialize Kafka producer
+	// Initialize Kafka producer for news events
 	prodCfg := kafkapkg.ProducerConfig{
 		Brokers:     cfg.KafkaBrokers,
 		Topic:       cfg.KafkaTopic,
@@ -56,12 +57,31 @@ func main() {
 	if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopic, 1, 1); err != nil {
 		lgr.Fatal("failed to ensure topic exists", zap.Error(err))
 	}
-	lgr.Info("Connected to Kafka", zap.Strings("brokers", cfg.KafkaBrokers), zap.String("topic", cfg.KafkaTopic))
+	lgr.Info("Connected to Kafka (news)", zap.Strings("brokers", cfg.KafkaBrokers), zap.String("topic", cfg.KafkaTopic))
 
-	// Create publisher wrapper
+	// Create publisher wrapper for news
 	pub := publisher.NewKafkaPublisher(producer, cfg.KafkaTopic)
 
-	// Start watcher
+	// Initialize Kafka producer for 52-week breakout events
+	breakoutProdCfg := kafkapkg.ProducerConfig{
+		Brokers:     cfg.KafkaBrokers,
+		Topic:       cfg.KafkaTopic52Week,
+		BatchSize:   100,
+		MaxAttempts: 3,
+	}
+	breakoutProducer, err := kafkapkg.NewProducer(breakoutProdCfg)
+	if err != nil {
+		lgr.Fatal("failed to create 52w-breakout kafka producer", zap.Error(err))
+	}
+	defer breakoutProducer.Close()
+	if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopic52Week, 1, 1); err != nil {
+		lgr.Fatal("failed to ensure 52w-breakout topic exists", zap.Error(err))
+	}
+	lgr.Info("Connected to Kafka (52w breakouts)", zap.Strings("brokers", cfg.KafkaBrokers), zap.String("topic", cfg.KafkaTopic52Week))
+
+	breakoutPub := publisher.NewKafkaPublisher(breakoutProducer, cfg.KafkaTopic52Week)
+
+	// Start MongoDB -> Kafka watcher (news)
 	ctxRun, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
 
@@ -72,7 +92,29 @@ func main() {
 
 	go func() {
 		if err := w.Run(ctxRun); err != nil {
-			lgr.Error("watcher stopped with error", zap.Error(err))
+			lgr.Error("mongo watcher stopped with error", zap.Error(err))
+			cancelRun()
+		}
+	}()
+
+	// Initialize Redis client for market data (52-week highs)
+	redisClient, err := redispkg.New(redispkg.Config{
+		Address:      cfg.MarketRedisAddr,
+		Password:     cfg.MarketRedisPassword,
+		DB:           cfg.MarketRedisDB,
+		PoolSize:     100,
+		MinIdleConns: 10,
+	})
+	if err != nil {
+		lgr.Fatal("failed to connect to market redis", zap.Error(err))
+	}
+	defer redisClient.Close()
+
+	// Start Redis -> Kafka watcher for 52-week high breakouts
+	redisWatcher := watcher.NewRedis52WWatcher(redisClient, breakoutPub, cfg.MarketRedisPollInterval, lgr)
+	go func() {
+		if err := redisWatcher.Run(ctxRun); err != nil {
+			lgr.Error("redis 52w watcher stopped with error", zap.Error(err))
 			cancelRun()
 		}
 	}()

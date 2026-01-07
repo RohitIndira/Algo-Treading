@@ -35,6 +35,12 @@ service UserConfigService {
   
   // Health check
   rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+
+  // Configure the built-in Cash 52-week High strategy for a user. This is a
+  // higher-level convenience API that hides most of the internal fields and
+  // lets the user simply enable/disable the strategy and choose capital.
+  rpc ConfigureCash52WeekStrategy(ConfigureCash52WeekStrategyRequest)
+      returns (ConfigureCash52WeekStrategyResponse);
 }
 
 // Strategy condition filters
@@ -273,5 +279,40 @@ message GetStrategiesByIDsRequest {
 message GetStrategiesByIDsResponse {
   bool success = 1;
   repeated Strategy strategies = 2;
+  common.Error error = 3;
+}
+
+// Configure the managed Cash 52-week High strategy for a user.
+// This does NOT expose all low-level fields; instead, the backend fills in
+// sensible defaults for trade_config and risk_limits based on these few
+// parameters.
+message ConfigureCash52WeekStrategyRequest {
+  string user_id = 1;
+
+  // Enable or disable the strategy for this user.
+  bool enabled = 2;
+
+  // Optional overrides; if zero/omitted, backend uses defaults.
+  // e.g. 20000.0 for ₹20,000 per stock
+  double capital_per_stock = 3;
+
+  // Maximum number of concurrent 52-week positions (e.g. 25).
+  int32 max_positions = 4;
+
+  // Stop-loss percentage (e.g. 10.0 for 10%).
+  double stop_loss_pct = 5;
+
+  // Take-profit / trailing target percentage (e.g. 20.0 for 20%).
+  double take_profit_pct = 6;
+
+  // Optional user risk profile label (e.g. "conservative", "moderate",
+  // "aggressive"). Currently informational; future versions may integrate
+  // this with risk-management profiles.
+  string risk_profile = 7;
+}
+
+message ConfigureCash52WeekStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;  // The underlying strategy record (may be nil if disabled)
   common.Error error = 3;
 }
