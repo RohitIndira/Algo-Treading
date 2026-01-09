@@ -162,24 +162,15 @@ func main() {
 	)
 	logger.Info("Matcher engine initialized successfully")
 
-	// Initialize risk management client
-	logger.Info("Initializing risk management client...")
-	riskClient, err := risk.NewClient(risk.Config{
-		Address:          cfg.GRPCClients.RiskManagement.Address,
-		Timeout:          cfg.GRPCClients.RiskManagement.Timeout,
-		MaxRetries:       cfg.GRPCClients.RiskManagement.MaxRetries,
-		RetryBackoff:     cfg.GRPCClients.RiskManagement.RetryBackoff,
-		KeepAlive:        cfg.GRPCClients.RiskManagement.KeepAlive,
-		KeepAliveTimeout: cfg.GRPCClients.RiskManagement.KeepAliveTimeout,
-	}, logger)
-	if err != nil {
-		logger.Warn("Failed to initialize risk management client - orders will be auto-approved",
-			zap.Error(err))
-		riskClient = nil // Continue without risk checks
-	} else {
-		defer riskClient.Close()
-		logger.Info("Risk management client initialized successfully")
-	}
+	// Initialize risk management client (DISABLED for development).
+	// For now we bypass risk checks entirely so that we can validate
+	// end-to-end flow of all microservices. The Cash 52W engine and
+	// news-based handler will auto-approve orders when riskClient is nil.
+	//
+	// To re-enable risk in future, restore the original initialization
+	// using risk.NewClient and pass the resulting client into handlers.
+	logger.Warn("Risk management client disabled for development - orders will be auto-approved")
+	var riskClient *risk.Client = nil
 
 	// Initialize RabbitMQ publisher
 	logger.Info("Initializing RabbitMQ publisher...")
@@ -192,13 +183,24 @@ func main() {
 
 	// Initialize Kafka publisher for trade-signals topic
 	logger.Info("Initializing Kafka publisher for trade-signals...")
-	kafkaPub := publisher.NewKafkaPublisher(
+	tradeSignalPub := publisher.NewKafkaPublisher(
 		cfg.Kafka.Brokers,
 		"trade-signals", // Topic for order signals
 		logger,
 	)
-	defer kafkaPub.Close()
+	defer tradeSignalPub.Close()
 	logger.Info("Kafka trade-signals publisher initialized successfully")
+
+	// Initialize Kafka publisher for portfolio allocation state events
+	logger.Info("Initializing Kafka publisher for portfolio allocations...",
+		zap.String("topic", cfg.PortfolioAllocTopic))
+	allocationPub := publisher.NewKafkaPublisher(
+		cfg.Kafka.Brokers,
+		cfg.PortfolioAllocTopic,
+		logger,
+	)
+	defer allocationPub.Close()
+	logger.Info("Kafka portfolio allocations publisher initialized successfully")
 
 	// Initialize Cash 52-week High strategy engine (if configured)
 	var cash52wEngine *cash52w.Engine
@@ -215,12 +217,12 @@ func main() {
 			SLPercent:       10,
 			TSLPercent:      20,
 		}
-		cash52wEngine = cash52w.NewEngine(engineCfg, riskClient, rabbitPub, kafkaPub, logger)
+		cash52wEngine = cash52w.NewEngine(engineCfg, riskClient, rabbitPub, tradeSignalPub, allocationPub, logger)
 
 		breakoutConsumer, err = consumer.NewBreakoutConsumer(
 			cfg.Kafka.Brokers,
 			cfg.Cash52WTopic,
-			"rules-engine-cash52w-group",
+			"", // use default versioned group with earliest offsets for same-day backlog
 			cash52wEngine,
 			logger,
 		)
@@ -253,8 +255,12 @@ func main() {
 	logger.Info("Market hours initialized",
 		zap.String("status", marketHours.GetMarketStatus()))
 
-	// Initialize event handler
-	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, redisCache, strategyCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours)
+	// Initialize event handler.
+	// For now we disable market-hours enforcement so that orders can be
+	// generated at any time during development/testing. Once the behaviour
+	// is validated end-to-end, this can be switched back to
+	// cfg.MarketHours.EnforceHours.
+	handler := consumer.NewHandler(matcherEngine, rabbitPub, tradeSignalPub, signalRepo, riskClient, redisCache, strategyCache, stats, logger, marketHours, false)
 
 	// Initialize Kafka consumer
 	logger.Info("Initializing Kafka consumer...")

@@ -47,6 +47,11 @@ type Config struct {
 	// Cash 52-week High strategy configuration (Phase 1)
 	Cash52WTopic   string
 	Cash52WUserIDs []string
+
+	// Portfolio allocation state topic (for publishing per-user 52W
+	// allocation snapshots). This is generic so we can reuse it for
+	// other strategies later.
+	PortfolioAllocTopic string
 }
 
 // KafkaConfig holds Kafka-specific configuration
@@ -282,8 +287,9 @@ func LoadConfig() (*Config, error) {
 		},
 
 		// Cash 52-week High strategy (Phase 1): topic + participating user IDs
-		Cash52WTopic:   getEnv("KAFKA_TOPIC_52W_BREAKOUT", "market.data.52w_breakouts"),
-		Cash52WUserIDs: getEnvAsSlice("CASH52W_USER_IDS", []string{}),
+		Cash52WTopic:        getEnv("KAFKA_TOPIC_52W_BREAKOUT", "market.data.52w_breakouts"),
+		Cash52WUserIDs:      getEnvAsSlice("CASH52W_USER_IDS", []string{}),
+		PortfolioAllocTopic: getEnv("KAFKA_TOPIC_PORTFOLIO_ALLOCATIONS", "portfolio.allocations"),
 	}
 
 	// Validate configuration

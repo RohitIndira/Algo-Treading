@@ -32,7 +32,10 @@ func NewBreakoutConsumer(brokers []string, topic, groupID string, handler Breako
 		return nil, fmt.Errorf("brokers cannot be empty")
 	}
 	if groupID == "" {
-		groupID = "rules-engine-cash52w-group"
+		// Use a versioned consumer group so that when this behaviour was
+		// introduced (starting from earliest offsets with same-day filtering),
+		// we can safely re-read the topic and pick up same-day backlog.
+		groupID = "rules-engine-cash52w-group-v2"
 	}
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
@@ -42,8 +45,12 @@ func NewBreakoutConsumer(brokers []string, topic, groupID string, handler Breako
 		MinBytes:       1,
 		MaxBytes:       10 * 1024 * 1024,
 		CommitInterval: 1 * time.Second,
-		StartOffset:    kafka.LastOffset,
-		MaxWait:        1 * time.Second,
+		// Start from the earliest offsets for this consumer group so that
+		// on a fresh deployment we can process same-day backlog of breakouts
+		// for users who enable the strategy later in the day. Older
+		// breakouts are filtered out by date in the engine.
+		StartOffset: kafka.FirstOffset,
+		MaxWait:     1 * time.Second,
 	})
 
 	logger.Info("52w-breakout Kafka consumer created",

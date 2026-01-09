@@ -19,20 +19,20 @@ import (
 	"go.uber.org/zap"
 )
 
-// MongoWatcher listens to a MongoDB collection change stream and forwards inserts to a publisher
+// MongoWatcher listens to a MongoDB collection change stream and forwards inserts to a publisher // Struct definition
 type MongoWatcher struct {
 	client              *mongodb.Client
 	collection          string
 	companiesDB         string
 	companiesCollection string
-	pub                 publisher.Publisher
+	pub                 publisher.Publisher //is an interface for publishing messages
 	lgr                 *logger.Logger
 	resumeToken         bson.Raw
-	mu                  sync.RWMutex
+	mu                  sync.RWMutex         //read-write mutex for resumeToken
 	processedIDs        map[string]time.Time // Track processed document IDs to prevent duplicates
 }
 
-// NewMongoWatcher creates a new watcher
+// NewMongoWatcher creates a new watcher CONSTRUCTOR
 func NewMongoWatcher(client *mongodb.Client, collection string, pub publisher.Publisher, lgr *logger.Logger) (*MongoWatcher, error) {
 	if client == nil {
 		return nil, fmt.Errorf("mongodb client is nil")

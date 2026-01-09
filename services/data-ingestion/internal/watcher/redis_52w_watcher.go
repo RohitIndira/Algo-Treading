@@ -23,6 +23,7 @@ import (
 //
 // We intentionally keep this minimal; the full JSON is forwarded to Kafka
 // unchanged so downstream consumers can evolve independently.
+// data models:MarketSnapshot
 type MarketSnapshot struct {
 	Symbol          string  `json:"symbol"`
 	Token           string  `json:"token"`
@@ -44,18 +45,20 @@ type MarketSnapshot struct {
 // downstream consumers must be idempotent. The goal is to avoid re-scanning
 // all symbols per user request and instead maintain a continuous stream of
 // "today's 52-week breakouts".
+// Struct: Redis52WWatcher
 type Redis52WWatcher struct {
-	client       *redispkg.Client
-	pub          publisher.Publisher
+	client       *redispkg.Client    //Redis client
+	pub          publisher.Publisher //Kafka publisher (same interface type as Mongo watcher uses)
 	lgr          *logger.Logger
 	pollInterval time.Duration
 
-	mu         sync.Mutex
-	seenToday  map[string]struct{} // key: YYYY-MM-DD|exchange|token
-	lastDayStr string
+	mu              sync.Mutex
+	seenToday       map[string]struct{} // key: YYYY-MM-DD|exchange|token
+	lastDayStr      string
+	initialScanDone bool // whether we've already performed the first full-day scan
 }
 
-// NewRedis52WWatcher constructs a new watcher.
+// NewRedis52WWatcher constructs a new watcher. Constructor: NewRedis52WWatcher
 func NewRedis52WWatcher(client *redispkg.Client, pub publisher.Publisher, pollInterval time.Duration, lgr *logger.Logger) *Redis52WWatcher {
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
@@ -68,6 +71,8 @@ func NewRedis52WWatcher(client *redispkg.Client, pub publisher.Publisher, pollIn
 		pollInterval: pollInterval,
 		seenToday:    make(map[string]struct{}),
 		lastDayStr:   todayStr(),
+		// On startup we haven't done the initial full-day scan yet.
+		initialScanDone: false,
 	}
 }
 
@@ -79,10 +84,16 @@ func (w *Redis52WWatcher) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
 
-	// Initial scan so we don't wait for the first tick.
+	// Initial scan so we don't wait for the first tick. On this first
+	// run we publish all symbols that meet today's breakout criteria
+	// (based purely on dates), regardless of when during the day the
+	// service was started.
 	if err := w.scanOnce(ctx); err != nil {
 		w.lgr.Error("initial redis 52w scan error", zap.Error(err))
 	}
+	w.mu.Lock()
+	w.initialScanDone = true
+	w.mu.Unlock()
 
 	for {
 		select {
@@ -90,6 +101,9 @@ func (w *Redis52WWatcher) Run(ctx context.Context) error {
 			w.lgr.Info("redis 52w-high watcher stopping", zap.Error(ctx.Err()))
 			return ctx.Err()
 		case <-ticker.C:
+			// Subsequent scans continue to look for today's 52W highs;
+			// in-memory dedupe ensures we don't emit the same token more
+			// than once per process.
 			if err := w.scanOnce(ctx); err != nil {
 				w.lgr.Error("redis 52w scan error", zap.Error(err))
 			}
@@ -97,8 +111,15 @@ func (w *Redis52WWatcher) Run(ctx context.Context) error {
 	}
 }
 
-// scanOnce scans both NSE and BSE market keys and publishes any new
-// 52-week high breakouts for the current day.
+// scanOnce scans both NSE and BSE market keys and publishes 52-week high
+// breakouts for the current day. A breakout is defined strictly by the
+// relationship between `week_52_high_date` and `last_updated`/`timestamp`:
+//
+//   - Let D = DATE(last_updated) (or DATE(timestamp) if last_updated is empty)
+//   - D must be today's date (service run day)
+//   - week_52_high_date must equal D
+//
+// The is_new_week_52_high flag is ignored for publishing decisions.
 func (w *Redis52WWatcher) scanOnce(ctx context.Context) error {
 	// Reset daily dedupe if we moved to a new day.
 	w.resetIfNewDay()
@@ -137,16 +158,9 @@ func (w *Redis52WWatcher) scanPattern(ctx context.Context, pattern string) error
 			continue
 		}
 
-		if !snap.IsNewWeek52High {
-			continue
-		}
-
-		// Only consider symbols that actually broke 52-week high **today**.
-		// We enforce two things:
-		//   1) week_52_high_date must be today's date (the breakout day), and
-		//   2) last_updated (or timestamp) must also be today, so we don't
-		//      re-emit old breakouts carried over in Redis.
-		if !isBreakoutToday(snap) {
+		// Only consider symbols whose week_52_high_date matches the date part
+		// of last_updated (or timestamp) and that date is today.
+		if !isToday52WBreakout(snap) {
 			continue
 		}
 
@@ -203,37 +217,44 @@ func todayStr() string {
 	return time.Now().Format("2006-01-02")
 }
 
-// isBreakoutToday returns true if:
-//   - the 52-week high date (week_52_high_date) is today, AND
-//   - the snapshot's last_updated (or, as a fallback, timestamp) is also today.
-//
-// This matches the requirement: "push all tokens that were updated today AND
-// broke 52-week high today", but not old breakouts from previous days.
-func isBreakoutToday(snap MarketSnapshot) bool {
-	day := todayStr()
-
-	// 1) The recorded 52-week high date must be today.
-	if snap.Week52HighDate != "" && snap.Week52HighDate != day {
-		return false
-	}
-
-	// 2) Prefer parsing the explicit last_updated timestamp if present.
+// updatedDate extracts the local date (YYYY-MM-DD) from last_updated or,
+// as a fallback, from timestamp. Returns the date string and true on
+// success, or "" and false if no valid date is available.
+func updatedDate(snap MarketSnapshot) (string, bool) {
+	// Prefer parsing the explicit last_updated timestamp if present.
 	if snap.LastUpdated != "" {
 		if t, err := time.Parse(time.RFC3339Nano, snap.LastUpdated); err == nil {
 			local := t.Local()
-			return local.Format("2006-01-02") == day
+			return local.Format("2006-01-02"), true
 		}
 	}
 
-	// 3) Fallback: use the millisecond epoch "timestamp" field if non-zero.
+	// Fallback: use the millisecond epoch "timestamp" field if non-zero.
 	if snap.Timestamp != 0 {
 		t := time.Unix(0, snap.Timestamp*int64(time.Millisecond)).Local()
-		return t.Format("2006-01-02") == day
+		return t.Format("2006-01-02"), true
 	}
 
-	// If we have no reliable time information, be conservative and treat it as
-	// not-from-today so we don't emit stale breakouts.
-	return false
+	return "", false
+}
+
+// isToday52WBreakout returns true if:
+//   - updatedDate(snap) == today
+//   - week_52_high_date == updatedDate(snap)
+//
+// This ignores is_new_week_52_high and only uses dates.
+func isToday52WBreakout(snap MarketSnapshot) bool {
+	updateDay, ok := updatedDate(snap)
+	if !ok {
+		return false
+	}
+	if updateDay != todayStr() {
+		return false
+	}
+	if snap.Week52HighDate == "" {
+		return false
+	}
+	return snap.Week52HighDate == updateDay
 }
 
 // resetIfNewDay clears the in-memory dedupe map when day boundary changes.

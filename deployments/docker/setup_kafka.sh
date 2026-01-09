@@ -85,12 +85,15 @@ echo "${YELLOW}Step 5: Creating required topics for all services...${NC}"
 
 # Comprehensive array of all topics needed for the trading system
 topics=(
-    "user-configs"          # User Config Service - strategy updates
-    "news-events"           # Data Ingestion - incoming market news
-    "trade-signals"         # Rules Engine - matched trading signals
-    "trade-executions"      # Trade Execution - execution results
-    "risk-approvals"        # Risk Management - approved trades
-    "order-updates"         # Trade Execution - order status updates
+	"user-configs"              # User Config Service - strategy updates
+	"news-events"               # Legacy/news topic (KT docs)
+	"market.data.news"          # Data Ingestion -> Rules Engine (market events)
+	"market.data.52w_breakouts" # Redis 52W watcher -> Rules Engine 52W engine
+	"trade-signals"             # Rules Engine -> Trade Execution (order requests)
+	"trade-executions"          # Trade Execution -> downstream (execution results)
+	"risk-approvals"            # Risk Management -> Rules Engine / TE (approvals)
+	"order-updates"             # Trade Execution -> frontend/services (order status)
+	"portfolio.allocations"     # Rules Engine 52W engine -> allocation snapshots
 )
 
 for topic in "${topics[@]}"; do
@@ -129,16 +132,16 @@ echo "${GREEN}Kafka Setup Complete!${NC}"
 echo "${GREEN}================================================${NC}"
 echo ""
 echo "Services running:"
-docker-compose -f docker-compose-kafka.yml ps
+$DOCKER_COMPOSE_CMD -f docker-compose-kafka.yml ps
 echo ""
 echo "Access Kafka UI at: ${GREEN}http://localhost:8082${NC}"
 echo ""
 echo "Kafka broker available at: ${GREEN}localhost:9092${NC}"
 echo ""
 echo "Useful commands:"
-echo "  - View logs: docker-compose -f docker-compose-kafka.yml logs -f"
-echo "  - Stop Kafka: docker-compose -f docker-compose-kafka.yml down"
-echo "  - Restart: docker-compose -f docker-compose-kafka.yml restart"
+echo "  - View logs: $DOCKER_COMPOSE_CMD -f docker-compose-kafka.yml logs -f"
+echo "  - Stop Kafka: $DOCKER_COMPOSE_CMD -f docker-compose-kafka.yml down"
+echo "  - Restart: $DOCKER_COMPOSE_CMD -f docker-compose-kafka.yml restart"
 echo ""
 echo "Next steps:"
 echo "  1. Update your service .env file:"

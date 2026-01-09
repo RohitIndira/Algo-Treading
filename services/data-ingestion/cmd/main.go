@@ -110,6 +110,10 @@ func main() {
 	}
 	defer redisClient.Close()
 
+	lgr.Info("Connected to market Redis for 52w highs",
+		zap.String("service", "data-ingestion"),
+		zap.String("addr", cfg.MarketRedisAddr))
+
 	// Start Redis -> Kafka watcher for 52-week high breakouts
 	redisWatcher := watcher.NewRedis52WWatcher(redisClient, breakoutPub, cfg.MarketRedisPollInterval, lgr)
 	go func() {

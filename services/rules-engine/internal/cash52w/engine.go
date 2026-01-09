@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,9 +27,12 @@ type Config struct {
 	TSLPercent      float64
 }
 
-// per-user in-memory state (Phase 1: approximate, reset daily).
+// per-user in-memory state (Phase 1: approximate, reset daily). We track
+// positions opened today to avoid re-entries.
 type userState struct {
-	Positions map[string]struct{} // tokens we already opened today
+	// Positions we already opened today, keyed by token. We keep the
+	// symbol/exchange so we can publish a useful allocation snapshot.
+	Positions map[string]models.AllocationPosition
 }
 
 // Engine implements the 52-week breakout strategy for multiple users.
@@ -36,8 +40,11 @@ type Engine struct {
 	cfg        Config
 	riskClient *risk.Client
 	rabbitPub  *publisher.Publisher
-	kafkaPub   *publisher.KafkaPublisher
-	logger     *zap.Logger
+	// kafkaPub publishes trade-signals (order requests)
+	kafkaPub *publisher.KafkaPublisher
+	// allocPub publishes portfolio allocation snapshots
+	allocPub *publisher.KafkaPublisher
+	logger   *zap.Logger
 
 	mu        sync.Mutex
 	day       string
@@ -45,7 +52,7 @@ type Engine struct {
 }
 
 // NewEngine creates a new Cash 52-week engine.
-func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publisher, kafkaPub *publisher.KafkaPublisher, logger *zap.Logger) *Engine {
+func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publisher, kafkaPub *publisher.KafkaPublisher, allocPub *publisher.KafkaPublisher, logger *zap.Logger) *Engine {
 	// defaults
 	if cfg.CapitalPerStock <= 0 {
 		cfg.CapitalPerStock = 20000
@@ -75,6 +82,7 @@ func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publish
 		riskClient: riskClient,
 		rabbitPub:  rabbitPub,
 		kafkaPub:   kafkaPub,
+		allocPub:   allocPub,
 		logger:     logger,
 		day:        todayStr(),
 		userState:  make(map[string]*userState),
@@ -82,6 +90,20 @@ func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publish
 }
 
 func todayStr() string { return time.Now().Format("2006-01-02") }
+
+// parseToken converts the breakout event's token string into an int64 token
+// used by OrderRequest. If parsing fails, it returns 0 so that we never
+// panic; in practice tokens should always be numeric.
+func parseToken(tok string) int64 {
+	if tok == "" {
+		return 0
+	}
+	val, err := strconv.ParseInt(tok, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return val
+}
 
 func (e *Engine) resetIfNewDay() {
 	e.mu.Lock()
@@ -98,6 +120,14 @@ func (e *Engine) resetIfNewDay() {
 func (e *Engine) HandleBreakout(ctx context.Context, ev *models.Breakout52WEvent) error {
 	if ev == nil {
 		return fmt.Errorf("nil Breakout52WEvent")
+	}
+
+	// Only act on breakouts that occurred today. The data-ingestion Redis
+	// watcher already tries to enforce this, but since the consumer now
+	// starts from the earliest offsets (to support same-day backlog), we add
+	// a final safeguard here.
+	if ev.Week52HighDate != "" && ev.Week52HighDate != todayStr() {
+		return nil
 	}
 
 	// basic sanity
@@ -130,10 +160,55 @@ func (e *Engine) getUserState(userID string) *userState {
 
 	st, ok := e.userState[userID]
 	if !ok {
-		st = &userState{Positions: make(map[string]struct{})}
+		st = &userState{Positions: make(map[string]models.AllocationPosition)}
 		e.userState[userID] = st
 	}
 	return st
+}
+
+// publishAllocation emits the current allocation snapshot for a given user to
+// the portfolio.allocations topic. It is safe to call this frequently; callers
+// should only invoke it after a meaningful change (e.g. new position opened
+// or closed).
+func (e *Engine) publishAllocation(ctx context.Context, userID string) {
+	if e.allocPub == nil {
+		return
+	}
+
+	e.mu.Lock()
+	st, ok := e.userState[userID]
+	if !ok {
+		e.mu.Unlock()
+		return
+	}
+
+	positions := make([]models.AllocationPosition, 0, len(st.Positions))
+	for _, pos := range st.Positions {
+		positions = append(positions, pos)
+	}
+	e.mu.Unlock()
+
+	ev := &models.PortfolioAllocationEvent{
+		UserID:          userID,
+		StrategyID:      "CASH_52W_HIGH",
+		StrategyName:    "Cash 52-Week High",
+		Date:            todayStr(),
+		Positions:       positions,
+		TotalPositions:  len(positions),
+		MaxPositions:    e.cfg.MaxPositions,
+		CapitalPerStock: e.cfg.CapitalPerStock,
+		Timestamp:       time.Now(),
+	}
+
+	if err := e.allocPub.PublishAllocation(ctx, ev); err != nil {
+		e.logger.Error("Failed to publish portfolio allocation",
+			zap.String("user_id", userID),
+			zap.Error(err))
+	} else {
+		e.logger.Debug("Published portfolio allocation",
+			zap.String("user_id", userID),
+			zap.Int("total_positions", ev.TotalPositions))
+	}
 }
 
 func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Breakout52WEvent) error {
@@ -170,12 +245,16 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 		StrategyID:   "CASH_52W_HIGH", // fixed strategy id for phase 1
 		StrategyName: "Cash 52-Week High",
 		EventID:      "", // not tied to news event
-		StockCode:    0,  // unknown here; can be mapped later if needed
-		Symbol:       ev.Symbol,
-		Exchange:     strings.ToUpper(ev.Exchange),
-		OrderType:    "MARKET",
-		Quantity:     qty,
-		Price:        ev.LTP,
+		// For 52W engine we don't yet have an integer stock_code mapping,
+		// so we focus on the trading token coming from the breakout event.
+		// Trade-execution can treat Token as the primary identifier.
+		StockCode: 0,
+		Token:     parseToken(ev.Token),
+		Symbol:    ev.Symbol,
+		Exchange:  strings.ToUpper(ev.Exchange),
+		OrderType: "MARKET",
+		Quantity:  qty,
+		Price:     ev.LTP,
 		// initial SL/TP based on config
 		StopLoss:     ev.LTP * (1 - e.cfg.SLPercent/100),
 		TakeProfit:   ev.LTP * (1 + e.cfg.TSLPercent/100),
@@ -258,7 +337,14 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 	}
 
 	// Track that this user has taken this token today
-	st.Positions[ev.Token] = struct{}{}
+	st.Positions[ev.Token] = models.AllocationPosition{
+		Token:    ev.Token,
+		Symbol:   ev.Symbol,
+		Exchange: orderReq.Exchange,
+	}
+
+	// Publish updated allocation snapshot
+	e.publishAllocation(ctx, userID)
 
 	e.logger.Info("52w-high order published",
 		zap.String("user_id", userID),

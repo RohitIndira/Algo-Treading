@@ -74,6 +74,42 @@ func (p *KafkaPublisher) PublishTradeSignal(ctx context.Context, orderReq *model
 	return nil
 }
 
+// PublishAllocation publishes a portfolio allocation event to Kafka. This is
+// used for tracking per-user allocation state for strategies like
+// Cash 52-Week High.
+func (p *KafkaPublisher) PublishAllocation(ctx context.Context, ev *models.PortfolioAllocationEvent) error {
+	if ev == nil {
+		return fmt.Errorf("allocation event is nil")
+	}
+
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("failed to marshal allocation event: %w", err)
+	}
+
+	msg := kafka.Message{
+		Key:   []byte(ev.UserID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{Key: "user_id", Value: []byte(ev.UserID)},
+			{Key: "strategy_id", Value: []byte(ev.StrategyID)},
+			{Key: "strategy_name", Value: []byte(ev.StrategyName)},
+			{Key: "date", Value: []byte(ev.Date)},
+		},
+	}
+
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
+		return fmt.Errorf("failed to write allocation event to Kafka: %w", err)
+	}
+
+	p.logger.Debug("Portfolio allocation event published to Kafka",
+		zap.String("user_id", ev.UserID),
+		zap.String("strategy_id", ev.StrategyID),
+		zap.Int("total_positions", ev.TotalPositions))
+
+	return nil
+}
+
 // Close closes the Kafka writer
 func (p *KafkaPublisher) Close() error {
 	p.logger.Info("Closing Kafka publisher")

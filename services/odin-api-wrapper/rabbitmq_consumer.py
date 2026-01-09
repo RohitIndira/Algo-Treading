@@ -239,7 +239,9 @@ class OdinOrderExecutor:
             "disclosed_quantity": 0,
             "validity": order_req.get("validity", "DAY"),
             "validity_days": 0,
-            "is_amo": "false",  # Set to True to allow orders outside market hours
+            # Odin API expects a **boolean** here, not a string. Using False for
+            # intraday (non-AMO) orders by default to avoid e-102 errors.
+            "is_amo": False,
             "order_identifier": order_identifier,  # Truncated to max 8 chars
             "strategy_id": order_req.get("strategy_id", ""),
         }
@@ -268,12 +270,26 @@ class OdinOrderExecutor:
             
             # Handle response
             if isinstance(response, dict):
-                if "error" in response:
-                    logger.error(f"❌ Order placement failed: {response.get('message', 'Unknown error')}")
+                # Many Odin responses include a top-level "status" field.
+                status = response.get("status")
+                if status and isinstance(status, str) and status.lower() != "success":
+                    # Treat any non-success status (e.g. "error") as a failed order
+                    msg = response.get("message") or response.get("error") or "Order placement failed"
+                    logger.error(f"❌ Order placement failed: {msg}")
                     return {
                         "success": False,
-                        "error": response.get("message", "Order placement failed"),
-                        "broker_response": response
+                        "error": msg,
+                        "broker_response": response,
+                    }
+
+                # Fallback: legacy error field
+                if "error" in response and not status:
+                    msg = response.get("message") or response.get("error") or "Order placement failed"
+                    logger.error(f"❌ Order placement failed: {msg}")
+                    return {
+                        "success": False,
+                        "error": msg,
+                        "broker_response": response,
                     }
                 
                 # Extract order_id from response
