@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg := config.Load() //– calls `Load()` from `config` package
 
 	lgr, err := logger.NewWithDefaults("data-ingestion")
 	if err != nil {
@@ -29,7 +29,7 @@ func main() {
 
 	lgr.Info("Starting data-ingestion service")
 
-	// Initialize MongoDB client (news ingestion)
+	// Initialize MongoDB client (news ingestion) Context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
 	defer cancel()
 

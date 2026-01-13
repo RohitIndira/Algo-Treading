@@ -177,6 +177,42 @@ else
 fi
 echo ""
 
+# 4.5: Odin API Wrapper Service
+echo "${BLUE}=== Odin API Wrapper Service ===${NC}"
+MIGRATIONS_DIR="../services/odin-api-wrapper/migrations"
+if [ -d "$MIGRATIONS_DIR" ]; then
+    for migration in $(ls $MIGRATIONS_DIR/*.sql 2>/dev/null | sort); do
+        echo "Running migration: $(basename $migration)"
+        PGPASSWORD=$DB_PASSWORD psql -h localhost -U $DB_USER -d trading_system -f "$migration"
+        if [ $? -eq 0 ]; then
+            echo "${GREEN}✓ Migration completed: $(basename $migration)${NC}"
+        else
+            echo "${RED}✗ Migration failed: $(basename $migration)${NC}"
+        fi
+    done
+else
+    echo "${YELLOW}! No migrations found for odin-api-wrapper service${NC}"
+fi
+echo ""
+
+# 4.6: Risk Management Service
+echo "${BLUE}=== Risk Management Service ===${NC}"
+MIGRATIONS_DIR="../services/risk-management/migrations"
+if [ -d "$MIGRATIONS_DIR" ]; then
+    for migration in $(ls $MIGRATIONS_DIR/*.sql 2>/dev/null | sort); do
+        echo "Running migration: $(basename $migration)"
+        PGPASSWORD=$DB_PASSWORD psql -h localhost -U $DB_USER -d $USER_CONFIG_DB -f "$migration"
+        if [ $? -eq 0 ]; then
+            echo "${GREEN}✓ Migration completed: $(basename $migration)${NC}"
+        else
+            echo "${RED}✗ Migration failed: $(basename $migration)${NC}"
+        fi
+    done
+else
+    echo "${YELLOW}! No migrations found for risk-management service${NC}"
+fi
+echo ""
+
 # Step 5: Verify tables in each database
 echo "${YELLOW}Step 5: Verifying created tables...${NC}"
 echo ""
