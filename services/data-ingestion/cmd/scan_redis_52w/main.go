@@ -110,6 +110,7 @@ func scanPattern(ctx context.Context, client *redispkg.Client, pattern string) (
 
 func main() {
 	// Load .env to pick up MARKET_REDIS_* values
+	fmt.Println("Loading .env file (if any)... scan_redis_52w")
 	_ = godotenv.Load()
 
 	cfg := config.Load()
