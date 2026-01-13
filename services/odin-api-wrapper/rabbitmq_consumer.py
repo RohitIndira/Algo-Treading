@@ -93,7 +93,7 @@ class OdinOrderExecutor:
     def __init__(self):
         self.client: Optional[IBTConnect] = None
         self.current_user_id: Optional[str] = None
-        self.db_helper = DatabaseHelper()
+        # self.db_helper = DatabaseHelper()
         # Encryption key for decrypting passwords (should be stored securely)
         self.encryption_key = os.getenv("ENCRYPTION_KEY", "")
         
@@ -112,6 +112,52 @@ class OdinOrderExecutor:
             # Return as-is if decryption fails (might be plain text in dev)
             return encrypted_password
     
+    def login_from_env(self) -> bool:
+    #"""Login to Odin API using environment variables"""
+        try:
+            api_url = os.getenv("ODIN_API_URL")
+            api_key = os.getenv("ODIN_API_KEY")
+            user_id = os.getenv("ODIN_USER_ID")
+            password_encrypted = os.getenv("ODIN_PASSWORD")
+            totp_secret = os.getenv("ODIN_TOTP_SECRET")
+            source = os.getenv("ODIN_SOURCE", "MOBILEAPI")
+
+            if not all([api_url, api_key, user_id, password_encrypted, totp_secret]):
+                logger.error("❌ Missing required Odin environment variables")
+                return False
+
+            password = self.decrypt_password(password_encrypted)
+
+            totp = pyotp.TOTP(totp_secret.strip().upper()).now()
+
+            self.client = IBTConnect(params={
+                "baseurl": api_url,
+                "api_key": api_key,
+                "debug": True
+            })
+
+            login_params = {
+                "userId": user_id,
+                "password": password,
+                "totp": totp
+            }
+
+            logger.info(f"🔐 Logging in to Odin API as {user_id}")
+            response = self.client.login(params=login_params)
+
+            if response.get("data"):
+                self.current_user_id = user_id
+                logger.info(f"✓ Logged in successfully as {user_id}")
+                return True
+
+            logger.error(f"❌ Login failed: {response}")
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ Odin login error: {str(e)}", exc_info=True)
+            return False
+
+
     def login_with_user_credentials(self, user_id: str) -> bool:
         """Login to Odin API using credentials from database"""
         try:
@@ -407,13 +453,31 @@ class RabbitMQConsumer:
             logger.info(f"   Strategy: {order_req.get('strategy_name')}")
             
             # Login for this user if not already logged in or if user changed
-            if not self.executor.client or self.executor.current_user_id != user_id:
-                logger.info(f"🔐 Logging in for user {user_id}")
-                if not self.executor.login_with_user_credentials(user_id):
-                    logger.error(f"❌ Failed to login for user {user_id}")
-                    # Negative acknowledge - message will be requeued
-                    channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                    return
+            # if not self.executor.client or self.executor.current_user_id != user_id:
+            #     logger.info(f"🔐 Logging in for user {user_id}")
+            #     if not self.executor.login_with_user_credentials(user_id):
+            #         logger.error(f"❌ Failed to login for user {user_id}")
+            #         # Negative acknowledge - message will be requeued
+            #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            #         return
+            if not self.executor.client:
+                logger.info("🔐 Logging in using environment credentials")
+
+            if not self.executor.login_from_env():
+                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                return
+
+            # ✅ Strategy filter
+            if order_req.get("strategy_name") != "Jobbing Strategy":
+                logger.info("⏭ Skipping order — not Jobbing Strategy")
+                channel.basic_ack(delivery_tag=method.delivery_tag)
+                return
+
+            # Place order
+            result = self.executor.place_order(order_req)
+
+
+
             
             # Place order
             result = self.executor.place_order(order_req)
