@@ -38,4 +38,8 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS update_user_credentials_updated_at ON user_credentials;
 CREATE TRIGGER update_user_credentials_updated_at BEFORE UPDATE ON user_credentials
+<<<<<<< HEAD
     FOR EACH ROW EXECUTE FUNCTION odin_update_updated_at();
+=======
+    FOR EACH ROW EXECUTE FUNCTION odin_update_updated_at();
+>>>>>>> dev

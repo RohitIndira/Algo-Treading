@@ -68,4 +68,8 @@ CREATE TRIGGER update_risk_limits_updated_at BEFORE UPDATE ON risk_limits
 
 DROP TRIGGER IF EXISTS update_position_history_updated_at ON position_history;
 CREATE TRIGGER update_position_history_updated_at BEFORE UPDATE ON position_history
+<<<<<<< HEAD
     FOR EACH ROW EXECUTE FUNCTION rm_update_updated_at();
+=======
+    FOR EACH ROW EXECUTE FUNCTION rm_update_updated_at();
+>>>>>>> dev

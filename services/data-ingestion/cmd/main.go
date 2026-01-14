@@ -20,9 +20,13 @@ import (
 )
 
 func main() {
+<<<<<<< HEAD
 	fmt.Println("In the main function of main.go file in data-ingestion service")
 	cfg := config.Load()
 	fmt.Println("Configuration loaded successfully")
+=======
+	cfg := config.Load() //– calls `Load()` from `config` package
+>>>>>>> dev
 
 	lgr, err := logger.NewWithDefaults("data-ingestion")
 	if err != nil {
@@ -41,6 +45,10 @@ func main() {
 	// ========================================================================
 	lgr.Info("Initializing MongoDB news ingestion pipeline")
 
+<<<<<<< HEAD
+=======
+	// Initialize MongoDB client (news ingestion) Context with timeout
+>>>>>>> dev
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
 	mongoClient, err := mongodb.New(ctx, mongodb.Config{
 		URI:            cfg.MongoURI,

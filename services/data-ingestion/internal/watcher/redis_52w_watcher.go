@@ -185,7 +185,15 @@ func (w *Redis52WWatcher) scanPattern(ctx context.Context, pattern string) error
 		if w.alreadySeenToday(snap) {
 			continue
 		}
-
+		// Publish breakout event.logging and publishing to kafka
+		w.lgr.Info("attempting to publish 52w breakout to kafka",
+			zap.String("key", key),
+			zap.String("token", snap.Token),
+			zap.String("symbol", snap.Symbol),
+			zap.String("exchange", snap.Exchange),
+			zap.Float64("ltp", snap.LTP),
+			zap.Float64("week_52_high", snap.Week52High),
+			zap.String("week_52_high_date", snap.Week52HighDate))
 		// Publish the original JSON payload so downstream consumers
 		// receive the full market snapshot as stored in Redis.
 		if err := w.pub.Publish(ctx, []byte(snap.Token), []byte(raw)); err != nil {
