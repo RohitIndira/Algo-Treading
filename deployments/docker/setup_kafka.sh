@@ -87,32 +87,51 @@ echo "${YELLOW}Step 5: Creating required topics for all services...${NC}"
 topics=(
 	"user-configs"              # User Config Service - strategy updates
 	"news-events"               # Legacy/news topic (KT docs)
-	"market.data.news"          # Data Ingestion -> Rules Engine (market events)
+	"market.data.news"          # Data Ingestion -> Rules Engine (news-based events)
+	"market.data.live"          # Live market depth (B2C bridge) -> Rules Engine jobbing
 	"market.data.52w_breakouts" # Redis 52W watcher -> Rules Engine 52W engine
 	"trade-signals"             # Rules Engine -> Trade Execution (order requests)
 	"trade-executions"          # Trade Execution -> downstream (execution results)
 	"risk-approvals"            # Risk Management -> Rules Engine / TE (approvals)
 	"order-updates"             # Trade Execution -> frontend/services (order status)
 	"portfolio.allocations"     # Rules Engine 52W engine -> allocation snapshots
+	"jobbing.configs"           # (Planned) Jobbing strategy configs broadcast
 )
 
 for topic in "${topics[@]}"; do
     # Extract topic name (before the comment)
     topic_name=$(echo "$topic" | awk '{print $1}')
     
-    echo "Creating topic: $topic_name"
-    docker exec trading-kafka kafka-topics --create \
-        --bootstrap-server localhost:9092 \
-        --replication-factor 1 \
-        --partitions 3 \
-        --topic "$topic_name" \
-        --if-not-exists 2>/dev/null
-    
-    if [ $? -eq 0 ]; then
-        echo "${GREEN}✓ Topic $topic_name created${NC}"
-    else
-        echo "${YELLOW}! Topic $topic_name might already exist${NC}"
-    fi
+	echo "Creating topic: $topic_name"
+
+	if [ "$topic_name" = "market.data.live" ]; then
+		# Configure market.data.live as a compacted topic so that for each
+		# token key only the latest tick is retained in Kafka storage.
+		# This matches the requirement: keep current tick, old ticks are
+		# garbage-collected by log compaction.
+		docker exec trading-kafka kafka-topics --create \
+			--bootstrap-server localhost:9092 \
+			--replication-factor 1 \
+			--partitions 3 \
+			--topic "$topic_name" \
+			--config cleanup.policy=compact \
+			--config min.cleanable.dirty.ratio=0.01 \
+			--config segment.ms=600000 \
+			--if-not-exists 2>/dev/null
+	else
+		docker exec trading-kafka kafka-topics --create \
+			--bootstrap-server localhost:9092 \
+			--replication-factor 1 \
+			--partitions 3 \
+			--topic "$topic_name" \
+			--if-not-exists 2>/dev/null
+	fi
+	
+	if [ $? -eq 0 ]; then
+		echo "${GREEN}✓ Topic $topic_name created${NC}"
+	else
+		echo "${YELLOW}! Topic $topic_name might already exist${NC}"
+	fi
 done
 
 echo ""

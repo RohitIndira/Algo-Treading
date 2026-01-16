@@ -25,6 +25,9 @@ type KafkaConfig struct {
 	Enabled bool
 	Brokers []string
 	Topic   string
+	// JobbingTopic is an optional dedicated topic for jobbing strategy
+	// configuration events. By default it is "jobbing.configs".
+	JobbingTopic string
 }
 
 // Load loads configuration from environment variables
@@ -45,6 +48,9 @@ func Load() (*Config, error) {
 			Enabled: getEnvAsBool("KAFKA_ENABLED", true),
 			Brokers: getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
 			Topic:   getEnv("KAFKA_TOPIC", "user-configs"),
+			// Separate topic for jobbing configs so rules-engine can
+			// subscribe to a focused stream if desired.
+			JobbingTopic: getEnv("KAFKA_JOBBING_TOPIC", "jobbing.configs"),
 		},
 		LogLevel: getEnv("LOG_LEVEL", "INFO"),
 	}

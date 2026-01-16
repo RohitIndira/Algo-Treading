@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
@@ -13,19 +14,27 @@ import (
 
 // StrategyService handles business logic for strategies
 type StrategyService struct {
-	repo         *repository.StrategyRepository
+	repo *repository.StrategyRepository
+	// Primary Kafka stream for all strategy events (user-configs topic)
 	kafkaWriter  *kafka.Writer
 	kafkaTopic   string
 	kafkaEnabled bool
+	// Optional dedicated Kafka stream for JOBBING strategies only
+	jobbingWriter       *kafka.Writer
+	jobbingTopic        string
+	jobbingKafkaEnabled bool
 }
 
 // NewStrategyService creates a new strategy service
-func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string) *StrategyService {
+func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string, jobbingWriter *kafka.Writer, jobbingTopic string) *StrategyService {
 	return &StrategyService{
-		repo:         repo,
-		kafkaWriter:  kafkaWriter,
-		kafkaTopic:   kafkaTopic,
-		kafkaEnabled: kafkaWriter != nil,
+		repo:                repo,
+		kafkaWriter:         kafkaWriter,
+		kafkaTopic:          kafkaTopic,
+		kafkaEnabled:        kafkaWriter != nil,
+		jobbingWriter:       jobbingWriter,
+		jobbingTopic:        jobbingTopic,
+		jobbingKafkaEnabled: jobbingWriter != nil && jobbingTopic != "",
 	}
 }
 
@@ -118,9 +127,17 @@ func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, 
 		},
 	}
 
-	err = s.kafkaWriter.WriteMessages(ctx, msg)
-	if err != nil {
+	// Publish to main user-configs topic
+	if err := s.kafkaWriter.WriteMessages(ctx, msg); err != nil {
 		return fmt.Errorf("failed to publish to kafka: %w", err)
+	}
+
+	// Optionally mirror JOBBING strategies to a dedicated topic so
+	// rules-engine can subscribe to a focused stream.
+	if s.jobbingKafkaEnabled && isJobbingStrategy(strategy) {
+		if err := s.jobbingWriter.WriteMessages(ctx, msg); err != nil {
+			fmt.Printf("Warning: failed to publish jobbing config to kafka: %v\n", err)
+		}
 	}
 
 	return nil
@@ -139,6 +156,20 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// isJobbingStrategy determines whether the given strategy should be treated
+// as a JOBBING strategy for the purpose of emitting dedicated jobbing
+// configuration events. We use a simple naming convention here.
+func isJobbingStrategy(strategy *models.Strategy) bool {
+	if strategy == nil {
+		return false
+	}
+	name := strings.ToUpper(strings.TrimSpace(strategy.StrategyName))
+	if name == "" {
+		return false
+	}
+	return name == "JOBBING" || strings.HasPrefix(name, "JOBBING_")
 }
 
 // CreateStrategy creates a new strategy

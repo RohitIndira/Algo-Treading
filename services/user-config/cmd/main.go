@@ -49,8 +49,9 @@ func main() {
 
 	lgr.Info("Database connection established")
 
-	// Initialize Kafka writer
+	// Initialize Kafka writers
 	var kafkaWriter *kafka.Writer
+	var jobbingWriter *kafka.Writer
 	if cfg.Kafka.Enabled {
 		kafkaWriter = kafka.NewWriter(kafka.WriterConfig{
 			Brokers:      cfg.Kafka.Brokers,
@@ -63,6 +64,21 @@ func main() {
 		})
 		defer kafkaWriter.Close()
 		lgr.Info("Kafka writer initialized", zap.String("topic", cfg.Kafka.Topic))
+
+		// Optional dedicated writer for jobbing configs
+		if cfg.Kafka.JobbingTopic != "" && cfg.Kafka.JobbingTopic != cfg.Kafka.Topic {
+			jobbingWriter = kafka.NewWriter(kafka.WriterConfig{
+				Brokers:      cfg.Kafka.Brokers,
+				Topic:        cfg.Kafka.JobbingTopic,
+				Balancer:     &kafka.LeastBytes{},
+				RequiredAcks: int(kafka.RequireOne),
+				Async:        false,
+				BatchSize:    1,
+				BatchTimeout: 10 * time.Millisecond,
+			})
+			defer jobbingWriter.Close()
+			lgr.Info("Kafka writer initialized for jobbing configs", zap.String("topic", cfg.Kafka.JobbingTopic))
+		}
 	} else {
 		lgr.Warn("Kafka is disabled")
 	}
@@ -73,7 +89,7 @@ func main() {
 	repo := repository.NewStrategyRepository(sqlxDB)
 
 	// Initialize service
-	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic)
+	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic, jobbingWriter, cfg.Kafka.JobbingTopic)
 
 	// Initialize gRPC server
 	grpcServer := grpc.NewServer(

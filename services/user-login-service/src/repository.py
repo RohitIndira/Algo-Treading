@@ -5,9 +5,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from typing import Optional, List
 from datetime import datetime
-import json
 
 from .models import UserCredentials, UserSession, LoginHistory
+from .crypto_utils import encrypt_str, decrypt_str
 
 
 class Repository:
@@ -34,6 +34,11 @@ class Repository:
         """Create new user credentials"""
         conn = self.get_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Encrypt sensitive fields before persisting
+            enc_password = encrypt_str(creds.password_encrypted) if creds.password_encrypted else None
+            enc_totp = encrypt_str(creds.totp_secret) if creds.totp_secret else None
+            enc_mpin = encrypt_str(creds.mpin_encrypted) if creds.mpin_encrypted else None
+
             cur.execute("""
                 INSERT INTO user_credentials 
                 (user_id, api_key, x_api_key, api_url, password_encrypted, 
@@ -43,7 +48,7 @@ class Repository:
                 RETURNING id, created_at, updated_at
             """, (
                 creds.user_id, creds.api_key, creds.x_api_key, creds.api_url,
-                creds.password_encrypted, creds.totp_secret, creds.mpin_encrypted,
+                enc_password, enc_totp, enc_mpin,
                 creds.client_id, creds.pan, creds.email, creds.mobile_no,
                 creds.source, creds.preferred_login_type, creds.preferred_second_auth,
                 creds.is_active
@@ -65,6 +70,13 @@ class Repository:
             """, (user_id,))
             row = cur.fetchone()
             if row:
+                # Decrypt sensitive fields on read
+                if row.get("password_encrypted"):
+                    row["password_encrypted"] = decrypt_str(row["password_encrypted"])
+                if row.get("totp_secret"):
+                    row["totp_secret"] = decrypt_str(row["totp_secret"])
+                if row.get("mpin_encrypted"):
+                    row["mpin_encrypted"] = decrypt_str(row["mpin_encrypted"])
                 return UserCredentials(**row)
         return None
     
@@ -72,6 +84,11 @@ class Repository:
         """Update user credentials"""
         conn = self.get_connection()
         with conn.cursor() as cur:
+            # Encrypt sensitive fields before update
+            enc_password = encrypt_str(creds.password_encrypted) if creds.password_encrypted else None
+            enc_totp = encrypt_str(creds.totp_secret) if creds.totp_secret else None
+            enc_mpin = encrypt_str(creds.mpin_encrypted) if creds.mpin_encrypted else None
+
             cur.execute("""
                 UPDATE user_credentials
                 SET api_key = %s, x_api_key = %s, api_url = %s,
@@ -82,7 +99,7 @@ class Repository:
                 WHERE user_id = %s
             """, (
                 creds.api_key, creds.x_api_key, creds.api_url,
-                creds.password_encrypted, creds.totp_secret, creds.mpin_encrypted,
+                enc_password, enc_totp, enc_mpin,
                 creds.pan, creds.email, creds.mobile_no,
                 creds.source, creds.preferred_login_type, creds.preferred_second_auth,
                 creds.is_active, creds.last_login, creds.user_id

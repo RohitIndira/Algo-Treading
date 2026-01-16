@@ -73,10 +73,12 @@ class AuthService:
             self._log_login_attempt(request, "FAILED", error_msg)
             raise Exception(error_msg)
         
-        # Use stored password if not provided in request
-        password = request.password if request.password else creds.password_encrypted
+        # In production we require the caller to always supply the password
+        # in the login request. We do NOT fall back to the stored password
+        # anymore to avoid invisible logins without explicit user input.
+        password = request.password
         if not password:
-            error_msg = f"No password available for user: {request.user_id}"
+            error_msg = "Password is required in login request"
             self._log_login_attempt(request, "FAILED", error_msg)
             raise Exception(error_msg)
         

@@ -621,6 +621,15 @@ func main() {
 		}
 		jobbingEngine = jobbing.NewEngine(jobbingCfg, riskClient, rabbitPub, tradeSignalPub, allocationPub, logger)
 
+		// Load per-user, per-token jobbing configs dynamically from user-config
+		// service. This allows one user to have multiple jobbing configs across
+		// different symbols, with parameters stored in the strategies tables.
+		if userConfigClient != nil {
+			loadJobbingConfigsForUsers(context.Background(), logger, userConfigClient, jobbingEngine, cfg.JobbingUserIDs)
+		} else {
+			logger.Warn("User-config client not available, jobbing engine will use static env-based configuration only")
+		}
+
 		jobbingConsumer, err = consumer.NewJobbingConsumer(
 			cfg.Kafka.Brokers,
 			cfg.JobbingTopic,
@@ -637,6 +646,11 @@ func main() {
 	} else {
 		logger.Info("Jobbing strategy engine disabled (no JOBBING_USER_IDS configured)")
 	}
+
+	// TODO: In a future enhancement we can also subscribe directly to the
+	// jobbing.configs Kafka topic (emitted by user-config service) to
+	// dynamically refresh jobbingEngine user/token configs in near real-time.
+	// For now, configs are loaded once at startup via gRPC calls above.
 
 	// Initialize market hours from configuration
 	logger.Info("Initializing market hours configuration...",

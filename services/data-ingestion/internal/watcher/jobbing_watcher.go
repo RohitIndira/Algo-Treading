@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +46,7 @@ type B2CMarketData struct {
 type B2CWatcher struct {
 	b2cBridgePath  string
 	b2cTokens      []string
+	stocksDBPath   string
 	pub            publisher.Publisher
 	lgr            *logger.Logger
 	cmd            *exec.Cmd
@@ -53,7 +55,7 @@ type B2CWatcher struct {
 }
 
 // NewB2CWatcher creates a new B2C watcher
-func NewB2CWatcher(b2cBridgePath string, b2cTokens []string, pub publisher.Publisher, lgr *logger.Logger) (*B2CWatcher, error) {
+func NewB2CWatcher(b2cBridgePath string, b2cTokens []string, stocksDBPath string, pub publisher.Publisher, lgr *logger.Logger) (*B2CWatcher, error) {
 	if b2cBridgePath == "" {
 		return nil, fmt.Errorf("b2c bridge path is empty")
 	}
@@ -63,6 +65,7 @@ func NewB2CWatcher(b2cBridgePath string, b2cTokens []string, pub publisher.Publi
 	return &B2CWatcher{
 		b2cBridgePath:  b2cBridgePath,
 		b2cTokens:      b2cTokens,
+		stocksDBPath:   stocksDBPath,
 		pub:            pub,
 		lgr:            lgr,
 		processedCount: 0,
@@ -150,8 +153,14 @@ func (w *B2CWatcher) Run(ctx context.Context) error {
 
 // startB2CBridge starts the B2C bridge Python process
 func (w *B2CWatcher) startB2CBridge(ctx context.Context) error {
-	// Build command with tokens as arguments
-	args := w.b2cTokens
+	// Determine subscription tokens. Prefer dynamic list from stocks.db if
+	// configured; fall back to static B2C_TOKENS from environment.
+	args := w.getSubscriptionTokens()
+	if len(args) == 0 {
+		// As an ultimate fallback, do not start the bridge without any tokens.
+		return fmt.Errorf("no tokens available for B2C subscription (stocks.db and B2C_TOKENS both empty)")
+	}
+
 	w.cmd = exec.CommandContext(ctx, "python", append([]string{w.b2cBridgePath}, args...)...)
 
 	// Redirect stderr to logger
@@ -171,6 +180,73 @@ func (w *B2CWatcher) stopB2CBridge() {
 	if w.cmd != nil && w.cmd.Process != nil {
 		_ = w.cmd.Process.Kill()
 	}
+}
+
+// getSubscriptionTokens builds the list of token arguments to pass to the
+// Python B2C bridge. The bridge expects arguments in the form:
+//
+//	token            -> defaults to NSE
+//	token:EXCHANGE   -> explicit exchange (NSE/BSE), used to derive market
+//	                     segment IDs inside the Python script.
+//
+// We first try to read all ACTIVE rows from the stock_subscriptions table
+// in the stocks.db SQLite database. If that succeeds and yields tokens,
+// we return a list like ["476:NSE", "500410:BSE", ...]. If anything fails
+// (missing sqlite3 binary, DB not found, query error, or empty result), we
+// fall back to the static B2C_TOKENS list provided via environment.
+func (w *B2CWatcher) getSubscriptionTokens() []string {
+	// If no DB path is configured, just use static tokens.
+	if strings.TrimSpace(w.stocksDBPath) == "" {
+		w.lgr.Info("Stocks DB path not set; using static B2C_TOKENS from env",
+			zap.Strings("tokens", w.b2cTokens))
+		return w.b2cTokens
+	}
+
+	// Use sqlite3 CLI to query tokens and exchanges from stock_subscriptions.
+	// We rely on the sqlite3 binary being available on the host (which is
+	// already used in local tooling/scripts).
+	cmd := exec.Command("sqlite3", "-separator", "|", w.stocksDBPath,
+		"SELECT token, exchange FROM stock_subscriptions WHERE status = 'ACTIVE';")
+	out, err := cmd.Output()
+	if err != nil {
+		w.lgr.Warn("failed to query stocks.db for subscriptions; falling back to static B2C_TOKENS",
+			zap.String("db_path", w.stocksDBPath),
+			zap.Error(err))
+		return w.b2cTokens
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var tokens []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 2)
+		token := strings.TrimSpace(parts[0])
+		if token == "" {
+			continue
+		}
+		exchange := "NSE"
+		if len(parts) > 1 {
+			exchange = strings.ToUpper(strings.TrimSpace(parts[1]))
+			if exchange == "" {
+				exchange = "NSE"
+			}
+		}
+
+		tokens = append(tokens, fmt.Sprintf("%s:%s", token, exchange))
+	}
+
+	if len(tokens) == 0 {
+		w.lgr.Warn("no ACTIVE stock_subscriptions found in stocks.db; using static B2C_TOKENS",
+			zap.String("db_path", w.stocksDBPath))
+		return w.b2cTokens
+	}
+
+	w.lgr.Info("Loaded subscription tokens from stocks.db",
+		zap.String("db_path", w.stocksDBPath),
+		zap.Int("count", len(tokens)))
+	return tokens
 }
 
 // logBridgeStderr logs stderr from B2C bridge
@@ -197,12 +273,17 @@ func (w *B2CWatcher) validateMarketData(data *B2CMarketData) bool {
 		return false
 	}
 
-	// Check timestamp is recent (not more than 1 minute old)
-	now := time.Now().UnixMilli()
-	if now-data.Timestamp > 10 { // 60 seconds=60000  or 1000 =1 s
-		w.lgr.Warn("stale market data", zap.String("token", data.Token), zap.Int64("age_ms", now-data.Timestamp))
-		return false
-	}
+	// We intentionally do NOT reject ticks based on timestamp age anymore.
+	// Some symbols are illiquid and may trade rarely; we still want to keep
+	// their last known tick. Kafka compaction (by token key) ensures that for
+	// each token only the most recent tick is retained in storage, and
+	// downstream consumers naturally see the latest event.
+	//
+	// If you ever want to monitor extremely old data, you can add a log here:
+	//   now := time.Now().UnixMilli()
+	//   age := now - data.Timestamp
+	//   if age > N { log.Warn(...) }
+	// but without returning false.
 
 	return true
 }

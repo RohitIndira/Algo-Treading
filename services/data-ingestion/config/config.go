@@ -162,6 +162,12 @@ type Config struct {
 	B2CBridgePath string
 	B2CTokens     []string
 
+	// StocksDBPath is the path to the SQLite database that contains
+	// the stock_subscriptions table. This is used to dynamically
+	// determine which tokens (and exchanges) should be subscribed to
+	// via the B2C bridge, instead of hardcoding B2C_TOKENS in env.
+	StocksDBPath string
+
 	// Worker configuration
 	WorkerCount int
 	MaxRetries  int
@@ -272,6 +278,7 @@ func Load() *Config {
 		// B2C Bridge
 		B2CBridgePath: bridgePath,
 		B2CTokens:     tokens,
+		StocksDBPath:  getEnv("STOCKS_DB_PATH", filepath.Join("..", "..", "..", "stocks.db")),
 
 		// Workers
 		WorkerCount: workerCount,

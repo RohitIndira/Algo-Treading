@@ -20,13 +20,9 @@ import (
 )
 
 func main() {
-<<<<<<< HEAD
 	fmt.Println("In the main function of main.go file in data-ingestion service")
-	cfg := config.Load()
+	cfg := config.Load() // calls `Load()` from `config` package
 	fmt.Println("Configuration loaded successfully")
-=======
-	cfg := config.Load() //– calls `Load()` from `config` package
->>>>>>> dev
 
 	lgr, err := logger.NewWithDefaults("data-ingestion")
 	if err != nil {
@@ -45,10 +41,6 @@ func main() {
 	// ========================================================================
 	lgr.Info("Initializing MongoDB news ingestion pipeline")
 
-<<<<<<< HEAD
-=======
-	// Initialize MongoDB client (news ingestion) Context with timeout
->>>>>>> dev
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
 	mongoClient, err := mongodb.New(ctx, mongodb.Config{
 		URI:            cfg.MongoURI,
@@ -168,8 +160,6 @@ func main() {
 	// Validate B2C configuration
 	if cfg.B2CBridgePath == "" {
 		lgr.Warn("B2C_BRIDGE_PATH not set, skipping B2C market data ingestion")
-	} else if len(cfg.B2CTokens) == 0 {
-		lgr.Warn("B2C_TOKENS not set, skipping B2C market data ingestion")
 	} else {
 		// Kafka producer for live market data
 		marketDataProdCfg := kafkapkg.ProducerConfig{
@@ -195,13 +185,16 @@ func main() {
 
 		lgr.Info("B2C Configuration loaded",
 			zap.String("bridge_path", cfg.B2CBridgePath),
-			zap.Strings("tokens", cfg.B2CTokens),
+			zap.Strings("tokens_env", cfg.B2CTokens),
+			zap.String("stocks_db_path", cfg.StocksDBPath),
 		)
 
-		// Start B2C watcher
+		// Start B2C watcher (will derive subscriptions from stocks.db when
+		// available, falling back to cfg.B2CTokens if needed).
 		b2cWatcher, err := watcher.NewB2CWatcher(
 			cfg.B2CBridgePath,
 			cfg.B2CTokens,
+			cfg.StocksDBPath,
 			marketDataPub,
 			lgr,
 		)

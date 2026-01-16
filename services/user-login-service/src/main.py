@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, status, BackgroundTasks, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -48,6 +48,19 @@ KAFKA_CONFIG = {
 # Session configuration
 SESSION_DURATION_HOURS = int(os.getenv('SESSION_DURATION_HOURS', '24'))
 CLEANUP_INTERVAL_MINUTES = int(os.getenv('CLEANUP_INTERVAL_MINUTES', '60'))
+
+# CORS / frontend origins
+ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "*")
+if ALLOWED_ORIGINS_RAW.strip() == "*":
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS_RAW.split(",") if o.strip()]
+
+# Internal API key for protecting admin/credential endpoints.
+# If not set, these endpoints are open (development). For production, set a
+# strong random value and ensure only trusted callers (e.g. API gateway) send
+# `X-Internal-API-Key` header.
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 
 # Global instances
 auth_service: Optional[AuthService] = None
@@ -184,10 +197,10 @@ Monitor active sessions, user counts, and system health in real-time.
     ]
 )
 
-# CORS middleware
+# CORS middleware (configurable origins; use ALLOWED_ORIGINS env in prod)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -244,7 +257,40 @@ class HistoryResponse(BaseModel):
     message: str = ""
 
 
+class TOTPGenerateRequest(BaseModel):
+    """Request body for generating a TOTP code from a secret.
+
+    Using a Pydantic model ensures FastAPI correctly parses JSON bodies like:
+
+    {
+      "secret": "BASE32_TOTP_SECRET"
+    }
+    """
+
+    secret: str = Field(..., description="Base32-encoded TOTP secret (16+ chars)")
+
+
+class TOTPVerifyRequest(BaseModel):
+    """Request body for verifying a TOTP code."""
+
+    secret: str = Field(..., description="Base32-encoded TOTP secret")
+    code: str = Field(..., description="TOTP code to verify (typically 6 digits)")
+
+
 # ============ Helper Functions ============
+
+def require_internal_api_key(x_internal_api_key: Optional[str] = Header(None, alias="X-Internal-API-Key")):
+    """Guard for internal/admin endpoints.
+
+    In production, set INTERNAL_API_KEY to a strong secret and configure
+    your API gateway or internal clients to send it as X-Internal-API-Key.
+    If INTERNAL_API_KEY is empty, this check is skipped (development mode).
+    """
+
+    if not INTERNAL_API_KEY:
+        return
+    if x_internal_api_key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
 def get_client_ip(request: Request) -> str:
     """Extract client IP from request"""
@@ -316,8 +362,13 @@ async def health_check():
 
 # ============ Credentials Management ============
 
-@app.post("/api/v1/credentials/register", response_model=CredentialsResponse, tags=["Credentials"])
-async def register_credentials(request: RegisterCredentialsRequest):
+@app.post(
+    "/api/v1/credentials/register",
+    response_model=CredentialsResponse,
+    tags=["Credentials"],
+    dependencies=[Depends(require_internal_api_key)],
+)
+async def register_credentials(request: RegisterCredentialsRequest, response: Response):
     """
     Register or update user credentials
     
@@ -382,6 +433,30 @@ async def register_credentials(request: RegisterCredentialsRequest):
                     detail=f"Invalid totp_secret: {str(e)}. Please provide a valid base32-encoded TOTP secret."
                 )
         
+        # First, check if credentials already exist for this user.
+        # In production we do NOT silently overwrite credentials; this can
+        # break existing logins. Instead, we return a clear 409 response so
+        # the caller knows the user is already registered.
+        existing = auth_service.repo.get_user_credentials(actual_user_id)
+        if existing:
+            response.status_code = status.HTTP_409_CONFLICT
+            conflict_message = (
+                "Credentials already registered for this user. "
+                "If you need to rotate or update credentials, please use the "
+                "appropriate admin flow or contact support instead of "
+                "calling the register endpoint again."
+            )
+            return CredentialsResponse(
+                success=False,
+                data={
+                    "user_id": existing.user_id,
+                    "jwt_user_id": actual_user_id,
+                    "created_at": existing.created_at.isoformat() if existing.created_at else None,
+                    "updated_at": existing.updated_at.isoformat() if existing.updated_at else None,
+                },
+                message=conflict_message,
+            )
+
         # Use the actual user_id from JWT token
         creds = UserCredentials(
             user_id=actual_user_id,
@@ -399,13 +474,13 @@ async def register_credentials(request: RegisterCredentialsRequest):
             preferred_login_type=request.preferred_login_type,
             preferred_second_auth=request.preferred_second_auth
         )
-        
+
         result = auth_service.register_user(creds)
-        
+
         response_message = "Credentials registered successfully. Backend will auto-generate TOTP codes from the secret during login."
         if request.user_id != actual_user_id:
             response_message += f" Note: Registered under user_id '{actual_user_id}' (from JWT token) instead of '{request.user_id}'."
-        
+
         return CredentialsResponse(
             success=True,
             data={
@@ -423,7 +498,11 @@ async def register_credentials(request: RegisterCredentialsRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/v1/credentials/{user_id}", response_model=CredentialsResponse)
+@app.get(
+    "/api/v1/credentials/{user_id}",
+    response_model=CredentialsResponse,
+    dependencies=[Depends(require_internal_api_key)],
+)
 async def get_credentials(user_id: str):
     """
     Get user credentials (passwords/secrets are not returned)
@@ -676,7 +755,11 @@ async def get_active_session(user_id: str):
 
 
 @app.put("/api/v1/session/validate", response_model=SessionResponse)
-async def validate_session(session_id: str = Header(..., alias="X-Session-ID")):
+async def validate_session(
+    request: Request,
+    session_id_header: Optional[str] = Header(None, alias="X-Session-ID"),
+    session_id_query: Optional[str] = Query(None, alias="session_id"),
+):
     """
     Validate session and update activity timestamp
     
@@ -685,17 +768,50 @@ async def validate_session(session_id: str = Header(..., alias="X-Session-ID")):
     - Updates last activity timestamp
     - Returns session details if valid
     """
+    # Accept either the X-Session-ID header (preferred) or a `session_id`
+    # query parameter, so clients are more forgiving.
+    session_id = session_id_header or session_id_query
+    if not session_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing session identifier. Provide X-Session-ID header or session_id query parameter.",
+        )
+
     try:
         session = auth_service.validate_session(session_id)
-        
+
         return SessionResponse(
             success=True,
             data=session_to_dict(session),
-            message="Session is valid"
+            message="Session is valid",
         )
     except Exception as e:
-        logger.error(f"Validate session error: {e}")
-        raise HTTPException(status_code=401, detail=str(e))
+        # Map common validation failures to clearer HTTP statuses/messages
+        error_text = str(e)
+        logger.error(f"Validate session error for {session_id}: {error_text}")
+
+        lowered = error_text.lower()
+        if "not found" in lowered:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found for id '{session_id}'. Please login again.",
+            )
+        if "expired" in lowered:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has expired. Please login again.",
+            )
+        if "not active" in lowered:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session is no longer active. Please login again.",
+            )
+
+        # Fallback: unexpected error
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to validate session due to an internal error.",
+        )
 
 
 @app.get("/api/v1/session/user/{user_id}/all", response_model=SessionResponse)
@@ -760,12 +876,21 @@ async def get_login_history(user_id: str, limit: int = 50):
 # ============ TOTP Management ============
 
 @app.post("/api/v1/totp/generate")
-async def generate_totp(secret: str):
+async def generate_totp(body: TOTPGenerateRequest):
     """
-    Generate TOTP code from secret
+    Generate TOTP code from secret.
+
+    This endpoint now expects a JSON body:
+
+    {
+      "secret": "BASE32_TOTP_SECRET"
+    }
     """
     try:
-        code = auth_service.generate_totp(secret)
+        if not body.secret:
+            raise ValueError("TOTP secret is required")
+
+        code = auth_service.generate_totp(body.secret)
         
         return {
             "success": True,
@@ -778,12 +903,22 @@ async def generate_totp(secret: str):
 
 
 @app.post("/api/v1/totp/verify")
-async def verify_totp(secret: str, code: str):
+async def verify_totp(body: TOTPVerifyRequest):
     """
-    Verify TOTP code
+    Verify TOTP code.
+
+    Expects JSON body:
+
+    {
+      "secret": "BASE32_TOTP_SECRET",
+      "code": "123456"
+    }
     """
     try:
-        valid = auth_service.verify_totp(secret, code)
+        if not body.secret or not body.code:
+            raise ValueError("Both secret and code are required")
+
+        valid = auth_service.verify_totp(body.secret, body.code)
         
         return {
             "success": True,
@@ -797,7 +932,10 @@ async def verify_totp(secret: str, code: str):
 
 # ============ Admin/Maintenance ============
 
-@app.post("/api/v1/admin/cleanup-sessions")
+@app.post(
+    "/api/v1/admin/cleanup-sessions",
+    dependencies=[Depends(require_internal_api_key)],
+)
 async def manual_cleanup_sessions(background_tasks: BackgroundTasks):
     """
     Manually trigger session cleanup
@@ -816,7 +954,10 @@ async def manual_cleanup_sessions(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/v1/admin/stats")
+@app.get(
+    "/api/v1/admin/stats",
+    dependencies=[Depends(require_internal_api_key)],
+)
 async def get_stats():
     """
     Get service statistics

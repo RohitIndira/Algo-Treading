@@ -212,9 +212,10 @@ class B2CBridge:
         # Restart WebSocket connections
         try:
             await self.start_websocket()
-            # Resubscribe (in case _on_websocket_open doesn't trigger)
-            await self._resubscribe_tokens()
-            logger.info("✅ Reconnected and resubscribed successfully")
+            # Subscriptions will be re-established via _on_websocket_open
+            # callback. We intentionally avoid an extra manual resubscribe
+            # here to prevent double-subscription spam.
+            logger.info("✅ Reconnected successfully (subscriptions handled on open)")
         except Exception as e:
             logger.error(f"❌ Reconnection failed: {e}")
     
@@ -248,16 +249,12 @@ class B2CBridge:
         """Periodic heartbeat to prevent idle timeouts"""
         while self.is_connected:
             try:
-                # Option 1: If library has heartbeat method (check pycloudrestapi docs/source)
-                # await self.client.send_heartbeat()  # Uncomment if available
-                
-                # Option 2: Fallback - Send a dummy BESTFIVE resubscribe (acts as "ping")
-                if self.subscribed_tokens:
-                    sample_token = next(iter(self.subscribed_tokens))
-                    dummy_batch = [{"MktSegId": "1", "token": sample_token}]  # Use first token
-                    await self.client.bestfive_subscription(dummy_batch)
-                    logger.debug(f"❤️ Heartbeat sent via dummy BESTFIVE subscription for {sample_token}")
-                
+                # For now, we avoid sending any extra BESTFIVE resubscribe
+                # calls as "heartbeats" because they can cause unnecessary
+                # re-subscription errors on the B2C side. If the underlying
+                # library exposes an official heartbeat/ping method, that
+                # should be used here instead.
+
                 await asyncio.sleep(self.heartbeat_interval)
             except Exception as e:
                 logger.warning(f"⚠️ Heartbeat error: {e}")

@@ -9,6 +9,8 @@ import (
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/gorilla/mux"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type UserConfigHandler struct {
@@ -40,7 +42,7 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	respondWithJSON(w, http.StatusCreated, resp)
+	respondWithProtoJSON(w, http.StatusCreated, resp)
 }
 
 // UpdateStrategy handles PUT /api/v1/strategies/{strategy_id}
@@ -68,7 +70,7 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithProtoJSON(w, http.StatusOK, resp)
 }
 
 // DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}
@@ -98,7 +100,7 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithProtoJSON(w, http.StatusOK, resp)
 }
 
 // GetStrategy handles GET /api/v1/strategies/{strategy_id}
@@ -128,7 +130,7 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithProtoJSON(w, http.StatusOK, resp)
 }
 
 // ListUserStrategies handles GET /api/v1/users/{user_id}/strategies
@@ -177,7 +179,11 @@ func (h *UserConfigHandler) ListUserStrategies(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	// Use protobuf-aware JSON marshalling with EmitUnpopulated so that
+	// boolean fields like `active` are always present in the response,
+	// even when false. This fixes the issue where `active` disappeared
+	// after deactivation.
+	respondWithProtoJSON(w, http.StatusOK, resp)
 }
 
 // ActivateStrategy handles POST /api/v1/strategies/{strategy_id}/activate
@@ -215,7 +221,7 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithProtoJSON(w, http.StatusOK, resp)
 }
 
 // DeactivateStrategy handles POST /api/v1/strategies/{strategy_id}/deactivate
@@ -253,7 +259,7 @@ func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithProtoJSON(w, http.StatusOK, resp)
 }
 
 // HealthCheck handles GET /api/v1/health
@@ -266,7 +272,7 @@ func (h *UserConfigHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithProtoJSON(w, http.StatusOK, resp)
 }
 
 // Helper functions
@@ -275,6 +281,27 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error":"Failed to marshal response"}`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(response)
+}
+
+// respondWithProtoJSON marshals a protobuf message to JSON using the
+// official protojson package, with EmitUnpopulated enabled so that
+// zero-value fields (like bool=false) are still included in the output.
+func respondWithProtoJSON(w http.ResponseWriter, code int, msg proto.Message) {
+	mo := protojson.MarshalOptions{
+		EmitUnpopulated: true,
+		UseEnumNumbers:  false,
+	}
+
+	response, err := mo.Marshal(msg)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"Failed to marshal protobuf response"}`))
 		return
 	}
 

@@ -10,12 +10,14 @@ import (
 type AuthProxyHandler struct {
 	loginServiceURL string
 	client          *http.Client
+	internalAPIKey  string
 }
 
-func NewAuthProxyHandler(loginServiceURL string) *AuthProxyHandler {
+func NewAuthProxyHandler(loginServiceURL string, internalAPIKey string) *AuthProxyHandler {
 	return &AuthProxyHandler{
 		loginServiceURL: loginServiceURL,
 		client:          &http.Client{},
+		internalAPIKey:  internalAPIKey,
 	}
 }
 
@@ -50,6 +52,13 @@ func (h *AuthProxyHandler) ProxyRequest(w http.ResponseWriter, r *http.Request) 
 		for _, value := range values {
 			proxyReq.Header.Add(key, value)
 		}
+	}
+
+	// Ensure internal API key header is set for protected endpoints on the
+	// user-login-service. We always override any inbound X-Internal-API-Key
+	// to avoid clients spoofing it.
+	if h.internalAPIKey != "" {
+		proxyReq.Header.Set("X-Internal-API-Key", h.internalAPIKey)
 	}
 
 	// Execute request

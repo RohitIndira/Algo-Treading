@@ -40,6 +40,18 @@ type Config struct {
 	Tokens []string
 }
 
+// UserTokenConfig holds per-user, per-token parameters for the Jobbing
+// strategy. These can be loaded dynamically from the user-config service
+// instead of (or in addition to) global defaults provided via env/config.
+type UserTokenConfig struct {
+	LowerRange       float64
+	HigherRange      float64
+	InitialBuyOffset float64
+	DistanceContinue float64
+	QuantityPerOrder int32
+	MaxQuantity      int32
+}
+
 // userTokenState tracks the state for a specific user-token combination
 type userTokenState struct {
 	Token            string
@@ -65,9 +77,16 @@ type Engine struct {
 	allocPub   *publisher.KafkaPublisher
 	logger     *zap.Logger
 
-	mu        sync.Mutex
-	day       string
+	mu sync.Mutex
+	// trading day tracking (for resetting intraday state)
+	day string
+	// userState holds per-user runtime state (filled qty, active orders, etc.).
 	userState map[string]*userState // key: userID
+	// userConfigs holds per-user, per-token jobbing parameters loaded from
+	// user-config service. Keyed as userID -> token -> config.
+	userConfigs map[string]map[string]UserTokenConfig
+	// tokenUsers is the reverse index: token -> set of userIDs with configs.
+	tokenUsers map[string]map[string]struct{}
 }
 
 // NewEngine creates a new Jobbing strategy engine.
@@ -113,14 +132,16 @@ func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publish
 	cfg.Tokens = tokens
 
 	return &Engine{
-		cfg:        cfg,
-		riskClient: riskClient,
-		rabbitPub:  rabbitPub,
-		kafkaPub:   kafkaPub,
-		allocPub:   allocPub,
-		logger:     logger,
-		day:        todayStr(),
-		userState:  make(map[string]*userState),
+		cfg:         cfg,
+		riskClient:  riskClient,
+		rabbitPub:   rabbitPub,
+		kafkaPub:    kafkaPub,
+		allocPub:    allocPub,
+		logger:      logger,
+		day:         todayStr(),
+		userState:   make(map[string]*userState),
+		userConfigs: make(map[string]map[string]UserTokenConfig),
+		tokenUsers:  make(map[string]map[string]struct{}),
 	}
 }
 
@@ -136,6 +157,8 @@ func (e *Engine) resetIfNewDay() {
 			zap.String("old_day", e.day),
 			zap.String("new_day", day))
 		e.day = day
+		// Reset only runtime state (positions, totals, etc.). Keep
+		// configuration loaded from user-config service.
 		e.userState = make(map[string]*userState)
 	}
 }
@@ -172,6 +195,72 @@ func (e *Engine) getTokenState(userID, token string) *userTokenState {
 	return tokenSt
 }
 
+// SetJobbingConfig registers or updates jobbing parameters for a given user
+// and a set of tokens. This is typically called from the rules-engine main
+// process after loading strategies from the user-config service.
+func (e *Engine) SetJobbingConfig(userID string, tokens []string, cfg UserTokenConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.userConfigs == nil {
+		e.userConfigs = make(map[string]map[string]UserTokenConfig)
+	}
+	if e.tokenUsers == nil {
+		e.tokenUsers = make(map[string]map[string]struct{})
+	}
+
+	userCfg, ok := e.userConfigs[userID]
+	if !ok {
+		userCfg = make(map[string]UserTokenConfig)
+		e.userConfigs[userID] = userCfg
+	}
+
+	for _, t := range tokens {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		userCfg[t] = cfg
+
+		usersForToken, ok := e.tokenUsers[t]
+		if !ok {
+			usersForToken = make(map[string]struct{})
+			e.tokenUsers[t] = usersForToken
+		}
+		usersForToken[userID] = struct{}{}
+	}
+}
+
+// getConfig returns a per-user, per-token config if present.
+func (e *Engine) getConfig(userID, token string) (UserTokenConfig, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	userCfg, ok := e.userConfigs[userID]
+	if !ok {
+		return UserTokenConfig{}, false
+	}
+	cfg, ok := userCfg[token]
+	return cfg, ok
+}
+
+// getUsersForToken returns all user IDs that have a jobbing config
+// for the given token.
+func (e *Engine) getUsersForToken(token string) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	usersMap, ok := e.tokenUsers[token]
+	if !ok || len(usersMap) == 0 {
+		return nil
+	}
+	users := make([]string, 0, len(usersMap))
+	for u := range usersMap {
+		users = append(users, u)
+	}
+	return users
+}
+
 // HandleJobbing processes a market depth event for the jobbing strategy.
 func (e *Engine) HandleJobbing(ctx context.Context, ev *models.JobbingMarketDepthEvent) error {
 	if ev == nil {
@@ -186,17 +275,26 @@ func (e *Engine) HandleJobbing(ctx context.Context, ev *models.JobbingMarketDept
 		return nil
 	}
 
-	// Check if this token is in our configured list
+	// Determine token identifier for config/state lookup
 	token := fmt.Sprintf("%d", ev.StockData.StockCode)
-	if !e.isTokenEnabled(token) {
-		// Not a token we're trading
-		return nil
+
+	// If we have dynamic configs loaded (from user-config service), use those
+	// to decide which users are active for this token. Otherwise, fall back
+	// to static cfg.UserIDs / cfg.Tokens from env.
+	users := e.getUsersForToken(token)
+	if len(users) == 0 {
+		// Fallback: use static configuration if no dynamic configs exist.
+		if !e.isTokenEnabled(token) {
+			// Not a token we're trading
+			return nil
+		}
+		users = e.cfg.UserIDs
 	}
 
 	e.resetIfNewDay()
 
-	// Process for all configured users
-	for _, userID := range e.cfg.UserIDs {
+	// Process for all relevant users
+	for _, userID := range users {
 		if err := e.handleForUser(ctx, userID, ev); err != nil {
 			e.logger.Error("Failed to handle jobbing for user",
 				zap.Error(err),
@@ -226,26 +324,57 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 	token := fmt.Sprintf("%d", ev.StockData.StockCode)
 	ltp := ev.MarketData.LastTradedPrice
 
+	// Start from global defaults and override with per-user+token config if
+	// available. This allows a mix of env-based and dynamic configurations.
+	cfg := UserTokenConfig{
+		LowerRange:       e.cfg.LowerRange,
+		HigherRange:      e.cfg.HigherRange,
+		InitialBuyOffset: e.cfg.InitialBuyOffset,
+		DistanceContinue: e.cfg.DistanceContinue,
+		QuantityPerOrder: e.cfg.QuantityPerOrder,
+		MaxQuantity:      e.cfg.MaxQuantity,
+	}
+	if userCfg, ok := e.getConfig(userID, token); ok {
+		if userCfg.LowerRange > 0 {
+			cfg.LowerRange = userCfg.LowerRange
+		}
+		if userCfg.HigherRange > 0 {
+			cfg.HigherRange = userCfg.HigherRange
+		}
+		if userCfg.InitialBuyOffset > 0 {
+			cfg.InitialBuyOffset = userCfg.InitialBuyOffset
+		}
+		if userCfg.DistanceContinue > 0 {
+			cfg.DistanceContinue = userCfg.DistanceContinue
+		}
+		if userCfg.QuantityPerOrder > 0 {
+			cfg.QuantityPerOrder = userCfg.QuantityPerOrder
+		}
+		if userCfg.MaxQuantity > 0 {
+			cfg.MaxQuantity = userCfg.MaxQuantity
+		}
+	}
+
 	// Check if LTP is within configured range
-	if ltp < e.cfg.LowerRange || ltp > e.cfg.HigherRange {
+	if ltp < cfg.LowerRange || ltp > cfg.HigherRange {
 		e.logger.Debug("LTP outside jobbing range, skipping",
 			zap.String("user_id", userID),
 			zap.String("symbol", ev.StockData.Symbol),
 			zap.Float64("ltp", ltp),
-			zap.Float64("lower_range", e.cfg.LowerRange),
-			zap.Float64("higher_range", e.cfg.HigherRange))
+			zap.Float64("lower_range", cfg.LowerRange),
+			zap.Float64("higher_range", cfg.HigherRange))
 		return nil
 	}
 
 	tokenState := e.getTokenState(userID, token)
 
 	// Check if max quantity reached
-	if tokenState.TotalQuantityBuy >= e.cfg.MaxQuantity {
+	if tokenState.TotalQuantityBuy >= cfg.MaxQuantity {
 		e.logger.Debug("Max quantity reached for token",
 			zap.String("user_id", userID),
 			zap.String("symbol", ev.StockData.Symbol),
 			zap.Int32("total_qty", tokenState.TotalQuantityBuy),
-			zap.Int32("max_qty", e.cfg.MaxQuantity))
+			zap.Int32("max_qty", cfg.MaxQuantity))
 		return nil
 	}
 
@@ -253,22 +382,22 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 	var orderPrice float64
 	if tokenState.LastOrderPrice == 0 {
 		// First order: LTP - InitialBuyOffset
-		orderPrice = ltp - e.cfg.InitialBuyOffset
+		orderPrice = ltp - cfg.InitialBuyOffset
 	} else {
 		// Subsequent orders: LastOrderPrice - DistanceContinue
-		orderPrice = tokenState.LastOrderPrice - e.cfg.DistanceContinue
+		orderPrice = tokenState.LastOrderPrice - cfg.DistanceContinue
 	}
 
 	// Round to 2 decimal places
 	orderPrice = math.Round(orderPrice*100) / 100
 
 	// Ensure order price is within range
-	if orderPrice < e.cfg.LowerRange {
+	if orderPrice < cfg.LowerRange {
 		e.logger.Debug("Calculated order price below lower range",
 			zap.String("user_id", userID),
 			zap.String("symbol", ev.StockData.Symbol),
 			zap.Float64("order_price", orderPrice),
-			zap.Float64("lower_range", e.cfg.LowerRange))
+			zap.Float64("lower_range", cfg.LowerRange))
 		return nil
 	}
 
@@ -282,8 +411,8 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 	}
 
 	// Calculate remaining quantity
-	remainingQty := e.cfg.MaxQuantity - tokenState.TotalQuantityBuy
-	qty := e.cfg.QuantityPerOrder
+	remainingQty := cfg.MaxQuantity - tokenState.TotalQuantityBuy
+	qty := cfg.QuantityPerOrder
 	if qty > remainingQty {
 		qty = remainingQty
 	}
