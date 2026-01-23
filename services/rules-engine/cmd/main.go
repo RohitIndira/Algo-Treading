@@ -365,6 +365,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -414,6 +415,7 @@ func main() {
 	logger.Info("Starting Rules Engine Service",
 		zap.String("version", cfg.ServiceVersion),
 		zap.String("environment", cfg.Environment),
+		zap.String("trading_mode", cfg.TradingMode),
 		zap.Int("grpc_port", cfg.GRPCPort))
 
 	// Initialize matching statistics
@@ -566,20 +568,41 @@ func main() {
 	defer allocationPub.Close()
 	logger.Info("Kafka portfolio allocations publisher initialized successfully")
 
-	// Initialize Cash 52-week High strategy engine (if configured)
+	// Initialize Kafka publisher for realtime portfolio valuations
+	logger.Info("Initializing Kafka publisher for realtime portfolios...",
+		zap.String("topic", cfg.PortfolioRealtimeTopic))
+	realtimePortfolioPub := publisher.NewKafkaPublisher(
+		cfg.Kafka.Brokers,
+		cfg.PortfolioRealtimeTopic,
+		logger,
+	)
+	defer realtimePortfolioPub.Close()
+	logger.Info("Kafka realtime portfolio publisher initialized successfully")
+
+	// Initialize Cash 52-week High strategy engine.
+	//
+	// IMPORTANT: We no longer require a static list of CASH52W_USER_IDS
+	// to enable the engine. Instead, the engine is always enabled when
+	// a CASH52W_TOPIC is configured, and the active user list is driven
+	// dynamically from Elasticsearch via ListUsersWithActiveStrategy.
 	var cash52wEngine *cash52w.Engine
 	var breakoutConsumer *consumer.BreakoutConsumer
-	if len(cfg.Cash52WUserIDs) > 0 && cfg.Cash52WTopic != "" {
+	if cfg.Cash52WTopic != "" {
 		logger.Info("Initializing Cash 52-week High engine",
 			zap.String("topic", cfg.Cash52WTopic),
-			zap.Strings("user_ids", cfg.Cash52WUserIDs))
+			zap.Strings("initial_user_ids", cfg.Cash52WUserIDs),
+			zap.String("trading_mode", cfg.TradingMode))
 
 		engineCfg := cash52w.Config{
+			// Start with any statically configured users (optional); this
+			// list will be refreshed periodically from ES so that ALL users
+			// with an active CASH_52W_HIGH strategy are included.
 			UserIDs:         cfg.Cash52WUserIDs,
 			CapitalPerStock: 20000,
 			MaxPositions:    25,
 			SLPercent:       10,
 			TSLPercent:      20,
+			TradingMode:     cfg.TradingMode,
 		}
 		cash52wEngine = cash52w.NewEngine(engineCfg, riskClient, rabbitPub, tradeSignalPub, allocationPub, logger)
 
@@ -597,7 +620,7 @@ func main() {
 			logger.Info("52w-breakout consumer initialized successfully")
 		}
 	} else {
-		logger.Info("Cash 52-week High engine disabled (no CASH52W_USER_IDS configured)")
+		logger.Info("Cash 52-week High engine disabled (no CASH52W_TOPIC configured)")
 	}
 
 	// Initialize Jobbing strategy engine (if configured)
@@ -699,6 +722,50 @@ func main() {
 		}
 	}()
 
+	// Dynamically refresh the list of users enrolled in the managed
+	// CASH_52W_HIGH strategy and their per-user trading modes (LIVE/PAPER)
+	// based on strategies stored in user-config DB (and mirrored into
+	// Elasticsearch via StrategySyncer). This replaces the old static
+	// CASH52W_USER_IDS env list and allows per-user paper/live control.
+	if cash52wEngine != nil {
+		go func() {
+			refreshInterval := 30 * time.Second
+			logger.Info("Starting 52W user + mode refresh loop from ES index",
+				zap.Duration("interval", refreshInterval))
+
+			ticker := time.NewTicker(refreshInterval)
+			defer ticker.Stop()
+
+			// Initial refresh immediately
+			for {
+				select {
+				case <-ctx.Done():
+					logger.Info("Stopping 52W user + mode refresh loop")
+					return
+				case <-ticker.C:
+					users, err := queryEngine.ListUsersWithActiveStrategy(ctx, "CASH_52W_HIGH")
+					if err != nil {
+						logger.Error("Failed to refresh 52W users from ES",
+							zap.Error(err))
+						continue
+					}
+					cash52wEngine.SetUsers(users)
+
+					// Refresh per-user trading modes (LIVE/PAPER) from ES. If this
+					// call fails, we keep the previous snapshot so the engine
+					// continues using the last known configuration.
+					modes, err := queryEngine.GetCash52WUserModes(ctx)
+					if err != nil {
+						logger.Error("Failed to refresh 52W trading modes from ES",
+							zap.Error(err))
+						continue
+					}
+					cash52wEngine.SetUserModes(modes)
+				}
+			}
+		}()
+	}
+
 	// Start consuming 52-week breakout events if engine is enabled
 	if breakoutConsumer != nil && cash52wEngine != nil {
 		go func() {
@@ -708,6 +775,11 @@ func main() {
 				logger.Error("52w-breakout consumer error", zap.Error(err))
 			}
 		}()
+	}
+
+	// Start realtime portfolio publisher loop (52W) if engine is enabled
+	if cash52wEngine != nil {
+		go startRealtimePortfolioLoop(ctx, logger, cash52wEngine, redisCache, realtimePortfolioPub)
 	}
 
 	// Start consuming jobbing market depth events if engine is enabled
@@ -796,4 +868,75 @@ func main() {
 		zap.Int64("total_errors", stats.EvaluationErrors+stats.KafkaErrors+stats.RabbitMQErrors))
 
 	logger.Info("Rules Engine Service shutdown complete")
+}
+
+// startRealtimePortfolioLoop periodically builds realtime marked-to-market
+// portfolios for the CASH_52W_HIGH strategy and publishes them to Kafka.
+// This uses live prices from Redis (written by the data-ingestion service)
+// and the in-memory allocation state maintained by the cash52w engine.
+func startRealtimePortfolioLoop(
+	ctx context.Context,
+	logger *zap.Logger,
+	engine *cash52w.Engine,
+	redisCache *cache.RedisCache,
+	pub *publisher.KafkaPublisher,
+) {
+	if engine == nil || redisCache == nil || pub == nil {
+		logger.Warn("Realtime portfolio loop not started (missing dependencies)")
+		return
+	}
+
+	interval := 5 * time.Second // can be made configurable later
+	logger.Info("Starting realtime 52W portfolio publisher loop",
+		zap.Duration("interval", interval))
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("Stopping realtime 52W portfolio publisher loop")
+			return
+		case <-ticker.C:
+			// Build realtime portfolios for all users with 52W positions
+			events := engine.BuildRealtimePortfolios(ctx, redisCache)
+			if len(events) == 0 {
+				continue
+			}
+
+			for _, ev := range events {
+				// 1) Publish to Kafka (analytics/other services)
+				if err := pub.PublishRealtimePortfolio(ctx, ev); err != nil {
+					logger.Error("Failed to publish realtime 52W portfolio event",
+						zap.Error(err),
+						zap.String("user_id", ev.UserID))
+				}
+
+				// 2) Publish the same snapshot to Redis Pub/Sub so API gateway
+				//    can stream it to frontend via WebSockets (/ws/pnl).
+				//    Channel pattern: user:{user_id}:pnl
+				channel := fmt.Sprintf("user:%s:pnl", ev.UserID)
+				payload, err := json.Marshal(ev)
+				if err != nil {
+					logger.Error("Failed to marshal realtime portfolio event for Redis",
+						zap.Error(err),
+						zap.String("user_id", ev.UserID))
+					continue
+				}
+				if err := redisCache.Publish(ctx, channel, string(payload)); err != nil {
+					logger.Error("Failed to publish realtime portfolio to Redis",
+						zap.Error(err),
+						zap.String("user_id", ev.UserID),
+						zap.String("channel", channel))
+				} else {
+					// Debug log so we can verify that PnL snapshots are actually
+					// being pushed to Redis for consumption by the API gateway.
+					logger.Info("Published realtime 52W portfolio to Redis",
+						zap.String("user_id", ev.UserID),
+						zap.String("channel", channel))
+				}
+			}
+		}
+	}
 }

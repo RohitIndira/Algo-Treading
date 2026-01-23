@@ -1,50 +1,3 @@
-// package middleware
-
-// import (
-// 	"net/http"
-// 	"strings"
-// )
-
-// type CORSConfig struct {
-// 	AllowedOrigins []string
-// 	AllowedMethods []string
-// 	AllowedHeaders []string
-// }
-
-// func CORS(config CORSConfig) func(http.Handler) http.Handler {
-// 	return func(next http.Handler) http.Handler {
-// 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-// 			origin := r.Header.Get("Origin")
-
-// 			// Check if origin is allowed
-// 			allowed := false
-// 			for _, allowedOrigin := range config.AllowedOrigins {
-// 				if allowedOrigin == "*" || allowedOrigin == origin {
-// 					allowed = true
-// 					break
-// 				}
-// 			}
-
-// 			if allowed {
-// 				w.Header().Set("Access-Control-Allow-Origin", origin)
-// 			}
-
-// 			w.Header().Set("Access-Control-Allow-Methods", strings.Join(config.AllowedMethods, ", "))
-// 			w.Header().Set("Access-Control-Allow-Headers", strings.Join(config.AllowedHeaders, ", "))
-// 			w.Header().Set("Access-Control-Allow-Credentials", "true")
-// 			w.Header().Set("Access-Control-Max-Age", "3600")
-
-// 			// Handle preflight request
-// 			if r.Method == http.MethodOptions {
-// 				w.WriteHeader(http.StatusNoContent)
-// 				return
-// 			}
-
-// 			next.ServeHTTP(w, r)
-// 		})
-// 	}
-// }
-
 package middleware
 
 import (
@@ -112,8 +65,19 @@ func CORS(config CORSConfig) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
 			}
 
-			w.Header().Set("Access-Control-Allow-Methods", strings.Join(config.AllowedMethods, ", "))
-			w.Header().Set("Access-Control-Allow-Headers", strings.Join(config.AllowedHeaders, ", "))
+			// Methods: if "*" is configured, allow all methods during development.
+			if len(config.AllowedMethods) == 1 && config.AllowedMethods[0] == "*" {
+				w.Header().Set("Access-Control-Allow-Methods", "*")
+			} else {
+				w.Header().Set("Access-Control-Allow-Methods", strings.Join(config.AllowedMethods, ", "))
+			}
+
+			// Headers: if "*" is configured, allow all headers during development.
+			if len(config.AllowedHeaders) == 1 && config.AllowedHeaders[0] == "*" {
+				w.Header().Set("Access-Control-Allow-Headers", "*")
+			} else {
+				w.Header().Set("Access-Control-Allow-Headers", strings.Join(config.AllowedHeaders, ", "))
+			}
 			w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 

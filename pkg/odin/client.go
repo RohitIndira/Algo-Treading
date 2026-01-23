@@ -54,6 +54,7 @@ type LoginRequest struct {
 	UserID     string `json:"user_id"`
 	Password   string `json:"password"`
 	TOTPSecret string `json:"totp_secret"`
+	APIKey     string `json:"api_key,omitempty"`
 }
 
 // LoginResponse represents login response

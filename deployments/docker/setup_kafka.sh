@@ -95,6 +95,7 @@ topics=(
 	"risk-approvals"            # Risk Management -> Rules Engine / TE (approvals)
 	"order-updates"             # Trade Execution -> frontend/services (order status)
 	"portfolio.allocations"     # Rules Engine 52W engine -> allocation snapshots
+	"portfolio.realtime.52w"    # Rules Engine 52W realtime portfolio valuations -> UI/analytics
 	"jobbing.configs"           # (Planned) Jobbing strategy configs broadcast
 )
 

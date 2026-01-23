@@ -136,88 +136,177 @@ class B2CBridge:
             return False
     
     async def _on_websocket_open(self, message):
-        """WebSocket open callback - subscribe to tokens with correct market segments"""
+        """WebSocket open callback - subscribe to tokens with correct market segments.
+
+        IMPORTANT:
+        - We subscribe in small batches (default 50 instruments per batch) with a
+          pause between batches to avoid overloading the B2C infrastructure.
+        - Batch size and delay are configurable via env vars:
+            B2C_BATCH_SIZE        (default: 50)
+            B2C_BATCH_DELAY_SEC   (default: 1.0 seconds between batches)
+        """
         logger.info("✅ B2C WebSocket connected")
-        
+
         try:
             # Get token:exchange pairs from command line arguments
             token_exchange_pairs = sys.argv[1:] if len(sys.argv) > 1 else []
-            
+
             if not token_exchange_pairs:
                 logger.warning("⚠️ No tokens provided for subscription")
                 return
-            
-            logger.info(f"🎯 Subscribing to {len(token_exchange_pairs)} tokens with exchange-specific market segments")
-            
+
+            # Configurable batching for BESTFIVE
+            try:
+                batch_size = int(os.getenv("B2C_BATCH_SIZE", "50"))
+            except ValueError:
+                batch_size = 50
+
+            try:
+                batch_delay = float(os.getenv("B2C_BATCH_DELAY_SEC", "1.0"))
+            except ValueError:
+                batch_delay = 1.0
+
+            # How many tokens should also get BESTFIVE depth (others get only touchline)?
+            try:
+                max_bestfive = int(os.getenv("B2C_MAX_BESTFIVE", "500"))
+            except ValueError:
+                max_bestfive = 500
+
+            enable_touchline_all = os.getenv("B2C_TOUCHLINE_ALL", "true").lower() in ("1", "true", "yes")
+
+            logger.info(
+                f"🎯 Preparing subscription for {len(token_exchange_pairs)} tokens "
+                f"with batch_size={batch_size}, batch_delay={batch_delay}s, "
+                f"max_bestfive={max_bestfive}, touchline_all={enable_touchline_all}"
+            )
+
             # Parse token:exchange pairs and create instruments with correct market segments
-            instruments = []
+            instruments: List[Dict[str, str]] = []
             for pair in token_exchange_pairs:
                 if ':' in pair:
                     # Format: token:exchange (e.g., "476:NSE" or "500410:BSE")
                     token, exchange = pair.split(':', 1)
                     market_segment = "1" if exchange.upper() == "NSE" else "3"  # NSE=1, BSE=3
                     instruments.append({"MktSegId": market_segment, "token": token})
-                    logger.info(f"📊 Token {token} -> {exchange} exchange -> Market Segment {market_segment}")
+                    logger.info(
+                        f"📊 Token {token} -> {exchange} exchange -> Market Segment {market_segment}"
+                    )
                 else:
                     # Fallback: assume NSE if no exchange specified
                     token = pair
                     market_segment = "1"  # Default to NSE
                     instruments.append({"MktSegId": market_segment, "token": token})
-                    logger.info(f"📊 Token {token} -> NSE (default) -> Market Segment {market_segment}")
-            
-            # Subscribe to each token individually (B2C API requires per-token subscription)
-            logger.info(f"🚀 OPTIMIZED: Processing {len(instruments)} tokens using BESTFIVE")
-            
+                    logger.info(
+                        f"📊 Token {token} -> NSE (default) -> Market Segment {market_segment}"
+                    )
+
+            total = len(instruments)
+            if total == 0:
+                logger.warning("⚠️ No valid instruments built from token list")
+                return
+
+            # ------------------------------------------------------------------
+            # 1) TOUCHLINE for ALL tokens (lightweight LTP stream)
+            # ------------------------------------------------------------------
+            if enable_touchline_all:
+                # Use moderate batch size for touchline to avoid very large payloads
+                tl_batch_size = min(200, total)
+                logger.info(
+                    f"📡 Subscribing TOUCHLINE for {total} tokens in batches of {tl_batch_size}"
+                )
+
+                for start in range(0, total, tl_batch_size):
+                    end = min(start + tl_batch_size, total)
+                    tl_batch = instruments[start:end]
+                    try:
+                        await self.client.touchline_subscription(tl_batch)
+                        logger.info(
+                            f"✅ TOUCHLINE subscribed for tokens {start + 1}-{end} of {total}"
+                        )
+                    except Exception as e:
+                        logger.error(f"❌ TOUCHLINE subscription error for batch {start + 1}-{end}: {e}")
+
+                    if end < total:
+                        await asyncio.sleep(batch_delay)
+
+            # ------------------------------------------------------------------
+            # 2) BESTFIVE for a subset (for full depth metrics)
+            # ------------------------------------------------------------------
+            if max_bestfive <= 0:
+                logger.info("ℹ️ B2C_MAX_BESTFIVE <= 0, skipping BESTFIVE subscriptions")
+                return
+
+            bf_total = min(total, max_bestfive)
+            logger.info(
+                f"🚀 OPTIMIZED: Processing {bf_total} tokens using BESTFIVE in batches of {batch_size}"
+            )
+
             successful_subscriptions = 0
-            for idx, instrument in enumerate(instruments, 1):
-                try:
-                    # B2C API expects a single instrument dict, not a list
-                    await self.client.bestfive_subscription(instrument)
-                    self.subscribed_tokens.add(instrument["token"])
-                    successful_subscriptions += 1
-                    logger.info(f"✅ Subscribed to token {instrument['token']} (MktSegId: {instrument['MktSegId']}) [{idx}/{len(instruments)}]")
-                    
-                    # Minimal delay for API stability
-                    if idx < len(instruments):
-                        await asyncio.sleep(0.02)  # 20ms delay between subscriptions
-                    
-                except Exception as e:
-                    logger.error(f"❌ Error subscribing to token {idx}/{len(instruments)}: {e}")
-                    continue
-                    
-            logger.info(f"🎯 Subscribed to {len(self.subscribed_tokens)} tokens successfully with exchange-aware market segments")
-                
+            batch_index = 0
+
+            # Process only the first bf_total instruments for BESTFIVE
+            for start in range(0, bf_total, batch_size):
+                end = min(start + batch_size, bf_total)
+                batch = instruments[start:end]
+                batch_index += 1
+
+                logger.info(
+                    f"📦 Starting BESTFIVE batch {batch_index}: subscribing tokens {start + 1}-{end} of {bf_total}"
+                )
+
+                for offset, instrument in enumerate(batch, start=1):
+                    global_idx = start + offset  # 1-based index across BESTFIVE subset
+                    try:
+                        await self.client.bestfive_subscription(instrument)
+                        self.subscribed_tokens.add(instrument["token"])
+                        successful_subscriptions += 1
+                        logger.info(
+                            f"✅ BESTFIVE subscribed token {instrument['token']} "
+                            f"(MktSegId: {instrument['MktSegId']}) [{global_idx}/{bf_total}]"
+                        )
+
+                        if global_idx < bf_total:
+                            await asyncio.sleep(0.02)  # 20ms delay between individual subscriptions
+
+                    except Exception as e:
+                        logger.error(
+                            f"❌ Error BESTFIVE-subscribing token {global_idx}/{bf_total}: {e}"
+                        )
+                        continue
+
+                if end < bf_total:
+                    logger.info(
+                        f"⏱ Completed BESTFIVE batch {batch_index} ({end}/{bf_total}). "
+                        f"Sleeping for {batch_delay} seconds before next batch..."
+                    )
+                    await asyncio.sleep(batch_delay)
+
+            logger.info(
+                f"🎯 BESTFIVE subscribed to {len(self.subscribed_tokens)} tokens successfully "
+                f"(requested={bf_total}, success_rate={len(self.subscribed_tokens)}/{bf_total})"
+            )
+
         except Exception as e:
             logger.error(f"❌ Error in websocket open callback: {e}")
     
     async def _on_websocket_close(self, close_msg):
-        """WebSocket close callback - FULL reconnection with delay"""
+        """WebSocket close callback.
+
+        We **do not** try to handle reconnection loops or resubscriptions
+        directly here anymore. That logic is handled by the outer `main()`
+        retry loop in this script. This avoids recursive reconnect spam and
+        repeated full re-subscription storms when the server is overloaded.
+        """
         logger.warning(f"⚠️ B2C WebSocket disconnected: {close_msg}")
         self.is_connected = False
-        
+
         # Cancel heartbeat if running
         if self.heartbeat_task and not self.heartbeat_task.done():
             self.heartbeat_task.cancel()
-        
-        # Delay to avoid spam on rapid closes
-        await asyncio.sleep(self.reconnect_delay)
-        
-        # Re-login
-        if not self.connect():
-            logger.error("❌ Re-login failed - retrying in 30s")
-            await asyncio.sleep(30)
-            await self._on_websocket_close(close_msg)  # Recursive retry with longer delay
-            return
-        
-        # Restart WebSocket connections
-        try:
-            await self.start_websocket()
-            # Subscriptions will be re-established via _on_websocket_open
-            # callback. We intentionally avoid an extra manual resubscribe
-            # here to prevent double-subscription spam.
-            logger.info("✅ Reconnected successfully (subscriptions handled on open)")
-        except Exception as e:
-            logger.error(f"❌ Reconnection failed: {e}")
+            logger.info("🛑 Heartbeat task cancelled due to disconnect")
+
+        # Outer loop in `main()` will handle backoff, re-login, and restart
+        logger.info("ℹ️ WebSocket closed; outer main() loop will manage reconnection if configured")
     
     async def _resubscribe_tokens(self):
         """Manual resubscription if needed"""
@@ -533,43 +622,55 @@ def load_b2c_config():
     return config
 
 async def main():
-    """Main function"""
-    max_retries = 5
+    """Main function
+
+    Runs the bridge in a persistent loop with backoff on errors. We
+    deliberately avoid a hard max-retry exit so the Go service can keep
+    the Python process alive for the full market session.
+    """
+
     retry_count = 0
-    
-    while retry_count < max_retries:
+
+    while True:
         try:
             logger.info("🐍 Starting Python B2C Bridge")
-            
+
             # Load B2C configuration
             config = load_b2c_config()
             if not config:
-                logger.error("❌ No B2C configuration found")
-                sys.exit(1)
-            
+                logger.error("❌ No B2C configuration found; will retry in 60s")
+                await asyncio.sleep(60)
+                continue
+
             # Create and connect bridge
             bridge = B2CBridge(config)
             if not bridge.connect():
                 raise Exception("Initial login failed")
-            
+
+            # Reset retry counter after a successful connect
+            retry_count = 0
+
             # Start WebSocket connections (this will start heartbeat)
             await bridge.start_websocket()
-            
-            # Keep running
+
+            # Keep running while connected
             while bridge.is_connected:
                 await asyncio.sleep(1)  # Prevent tight loop
-                
+
+            # If we exit the loop without an explicit exception, this means
+            # the WebSocket was closed in a controlled way; fall through to
+            # retry logic below.
+
         except KeyboardInterrupt:
             logger.info("🛑 Received shutdown signal")
             break
         except Exception as e:
             retry_count += 1
-            logger.error(f"❌ Bridge error (attempt {retry_count}/{max_retries}): {e}")
-            if retry_count < max_retries:
-                await asyncio.sleep(10 * retry_count)  # Exponential backoff
-            else:
-                logger.error("💥 Max retries exceeded - exiting")
-                sys.exit(1)
+            # Backoff with an upper cap so we don't hammer the login endpoint
+            delay = min(60, 10 * retry_count)
+            logger.error(f"❌ Bridge error (attempt {retry_count}): {e} - retrying in {delay}s")
+            await asyncio.sleep(delay)
+
 
 if __name__ == "__main__":
     # Check if tokens are provided

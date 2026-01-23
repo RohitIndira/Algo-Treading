@@ -25,6 +25,7 @@ type ServicesConfig struct {
 	UserConfigAddr      string
 	UserLoginServiceURL string
 	InternalAPIKey      string
+	TradeExecutionAddr  string
 }
 
 type CORSConfig struct {
@@ -53,6 +54,7 @@ func Load() (*Config, error) {
 			UserConfigAddr:      getEnv("USER_CONFIG_GRPC_ADDR", "localhost:50051"),
 			UserLoginServiceURL: getEnv("USER_LOGIN_SERVICE_URL", "http://localhost:8002"),
 			InternalAPIKey:      getEnv("INTERNAL_API_KEY", ""),
+			TradeExecutionAddr:  getEnv("TRADE_EXECUTION_GRPC_ADDR", "localhost:9004"),
 		},
 		CORS: CORSConfig{
 			AllowedOrigins: strings.Split(getEnv("CORS_ALLOWED_ORIGINS", "*"), ","),

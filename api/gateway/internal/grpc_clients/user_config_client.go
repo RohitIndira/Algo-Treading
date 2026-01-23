@@ -80,3 +80,13 @@ func (c *UserConfigClient) HealthCheck(ctx context.Context, req *common.HealthCh
 	defer cancel()
 	return c.client.HealthCheck(ctx, req)
 }
+
+// ConfigureCash52WeekStrategy calls the high-level 52W configuration RPC.
+// This is used by the API gateway HTTP endpoint to let the frontend enable/
+// disable the managed Cash 52-week High strategy for a user without
+// dealing with low-level trade_config/risk_limits fields.
+func (c *UserConfigClient) ConfigureCash52WeekStrategy(ctx context.Context, req *pb.ConfigureCash52WeekStrategyRequest) (*pb.ConfigureCash52WeekStrategyResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.ConfigureCash52WeekStrategy(ctx, req)
+}

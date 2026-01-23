@@ -6,3 +6,4 @@ requests
 cryptography
 websockets
 python-socketio
+kafka-python

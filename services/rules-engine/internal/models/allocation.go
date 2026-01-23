@@ -5,9 +5,11 @@ import "time"
 // AllocationPosition represents a single position in the user's
 // 52-week portfolio (or other strategies in future).
 type AllocationPosition struct {
-	Token    string `json:"token"`
-	Symbol   string `json:"symbol"`
-	Exchange string `json:"exchange"`
+	Token      string  `json:"token"`
+	Symbol     string  `json:"symbol"`
+	Exchange   string  `json:"exchange"`
+	Quantity   int32   `json:"quantity,omitempty"`    // optional, used by realtime valuation
+	EntryPrice float64 `json:"entry_price,omitempty"` // optional, average entry price per share
 }
 
 // PortfolioAllocationEvent represents the allocation state for a user

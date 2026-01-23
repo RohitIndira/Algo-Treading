@@ -144,6 +144,7 @@ func (i *Indexer) getIndexMapping() string {
 				"exchange": {"type": "keyword"},
 				"max_daily_trades": {"type": "integer"},
 				"max_loss_per_day": {"type": "double"},
+				"trading_mode": {"type": "keyword"},
 				"updated_at": {"type": "long"}
 			}
 		}

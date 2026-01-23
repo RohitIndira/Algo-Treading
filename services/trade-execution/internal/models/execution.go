@@ -154,12 +154,17 @@ type NotificationChannels struct {
 
 // Trade Signal from Kafka (consumed from trade-signals topic)
 type TradeSignal struct {
-	OrderID      string    `json:"order_id"`
-	UserID       string    `json:"user_id"`
-	StrategyID   string    `json:"strategy_id"`
-	StrategyName string    `json:"strategy_name"`
-	EventID      string    `json:"event_id"`
-	StockCode    int64     `json:"stock_code"`
+	OrderID      string `json:"order_id"`
+	UserID       string `json:"user_id"`
+	StrategyID   string `json:"strategy_id"`
+	StrategyName string `json:"strategy_name"`
+	EventID      string `json:"event_id"`
+	StockCode    int64  `json:"stock_code"`
+	// Token is the actual trading token (scrip token) from rules-engine
+	// OrderRequest.Token. This is what Odin expects as scrip_token. Keeping it
+	// alongside StockCode lets us evolve instrument mapping without breaking
+	// analytics.
+	Token        int64     `json:"token"`
 	Symbol       string    `json:"symbol"`
 	Exchange     string    `json:"exchange"`
 	OrderType    string    `json:"order_type"`

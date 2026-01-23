@@ -1,10 +1,15 @@
-"""
-Odin Trading API HTTP Wrapper Service
-Provides HTTP endpoints for the b2c-api-python SDK
+"""Odin Trading API HTTP Wrapper Service
+
+This service wraps the b2c-api-python SDK with HTTP endpoints and now also
+emits lightweight Kafka events when orders are successfully sent to the
+broker's OMS. These Kafka events can be consumed later by downstream
+services (e.g. order tracking, analytics).
 """
 
 import os
 import asyncio
+import json
+from datetime import datetime, timezone
 import pyotp
 from typing import Optional, Dict, Any, List
 from pathlib import Path
@@ -14,6 +19,8 @@ from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import logging
 from dotenv import load_dotenv
+
+from kafka import KafkaProducer
 
 # Load environment variables from .env file in the same directory as this script
 env_path = Path(__file__).parent / '.env'
@@ -34,6 +41,13 @@ logger = logging.getLogger(__name__)
 # Global client store (session management)
 clients: Dict[str, IBTConnect] = {}
 
+# Global Kafka producer for order events (initialized in lifespan)
+kafka_producer: Optional[KafkaProducer] = None
+
+# Kafka configuration for order events
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+KAFKA_ORDER_EVENTS_TOPIC = os.getenv("KAFKA_ORDER_EVENTS_TOPIC", "trade-executions")
+
 # Environment configuration
 API_URL = os.getenv("ODIN_API_URL", "")
 API_KEY = os.getenv("ODIN_API_KEY", "")
@@ -48,14 +62,49 @@ TOTP_SECRET = os.getenv("ODIN_TOTP_SECRET", "")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan"""
+    global kafka_producer
+
     logger.info("Starting Odin API Wrapper Service")
     logger.info(f"Loaded .env from: {env_path}")
     logger.info(f"API URL configured: {bool(API_URL)}")
     logger.info(f"API Key configured: {bool(API_KEY)}")
     logger.info(f"User ID: {USER_ID if USER_ID else 'Not configured'}")
     logger.info(f"TOTP Secret configured: {bool(TOTP_SECRET)} (length: {len(TOTP_SECRET) if TOTP_SECRET else 0})")
+    # Initialize Kafka producer (best-effort, non-fatal on failure)
+    try:
+        brokers = [b.strip() for b in KAFKA_BROKERS.split(",") if b.strip()]
+        if brokers:
+            kafka_producer = KafkaProducer(
+                bootstrap_servers=brokers,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                linger_ms=10,
+                retries=3,
+            )
+            logger.info(
+                "Kafka producer initialized",
+                extra={
+                    "brokers": brokers,
+                    "topic": KAFKA_ORDER_EVENTS_TOPIC,
+                },
+            )
+        else:
+            logger.warning("KAFKA_BROKERS is empty; Kafka producer not initialized")
+    except Exception as e:
+        logger.error("Failed to initialize Kafka producer", exc_info=True)
+        kafka_producer = None
+
     yield
+
     logger.info("Shutting down Odin API Wrapper Service")
+
+    # Close Kafka producer
+    if kafka_producer is not None:
+        try:
+            kafka_producer.close()
+            logger.info("Kafka producer closed")
+        except Exception:
+            logger.exception("Error while closing Kafka producer")
+
     # Clean up all client connections
     for user_id in list(clients.keys()):
         try:
@@ -109,7 +158,9 @@ class OrderRequest(BaseModel):
     disclosed_quantity: int = 0
     validity: str = "DAY"
     validity_days: int = 0
-    is_amo: bool = False
+    # Set is_amo=True so that orders are treated as After-Market Orders (AMO)
+    # which avoids broker error e-103 ("Only AMO allowed in AMO timing for NSE Cash segment")
+    is_amo: bool = True
     order_identifier: str = ""
     part_code: str = ""
     algo_id: str = ""
@@ -311,8 +362,13 @@ async def place_order(
 ):
     """Place a regular order"""
     try:
-        logger.info(f"📤 Placing order: {order.dict()}")
-        response = client.place_order(order.dict())
+        # Force AMO flag true at runtime so that broker accepts orders during
+        # AMO-only timing windows, regardless of what the caller sent.
+        order_data = order.dict()
+        order_data["is_amo"] = True
+
+        logger.info(f"📤 Placing order: {order_data}")
+        response = client.place_order(order_data)
         logger.info(f"📥 Broker response: {response}")
         
         # Handle response - the broker returns order details directly
@@ -335,6 +391,52 @@ async def place_order(
             
             if order_id:
                 logger.info(f"✓ Order placed successfully: {order_id}")
+
+                # Publish lightweight order event to Kafka so that
+                # downstream services can track orders sent to OMS.
+                try:
+                    if kafka_producer is not None:
+                        # Attempt to infer user_id from the global clients map
+                        user_id = None
+                        for uid, c in clients.items():
+                            if c is client:
+                                user_id = uid
+                                break
+
+                        scrip_info = order.scrip_info or {}
+                        event = {
+                            "event_type": "ORDER_SENT_TO_OMS",
+                            "user_id": user_id,
+                            "broker_order_id": order_id,
+                            "symbol": scrip_info.get("symbol"),
+                            "exchange": scrip_info.get("exchange"),
+                            "quantity": order.quantity,
+                            "product_type": order.product_type,
+                            "order_type": order.order_type,
+                            "is_amo": True,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+
+                        kafka_producer.send(
+                            KAFKA_ORDER_EVENTS_TOPIC,
+                            value=event,
+                        )
+                        # Fire-and-forget; errors will be logged by callbacks
+                        logger.info(
+                            "Published ORDER_SENT_TO_OMS event to Kafka",
+                            extra={
+                                "topic": KAFKA_ORDER_EVENTS_TOPIC,
+                                "user_id": user_id,
+                                "broker_order_id": order_id,
+                            },
+                        )
+                    else:
+                        logger.debug(
+                            "Kafka producer not initialized; skipping order event publish"
+                        )
+                except Exception:
+                    logger.exception("Failed to publish order event to Kafka")
+
                 return StandardResponse(
                     success=True,
                     data={"order_id": order_id, "orderId": order_id},

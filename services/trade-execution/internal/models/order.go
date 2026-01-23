@@ -54,9 +54,13 @@ type Order struct {
 	EventID    uuid.UUID `json:"event_id" db:"event_id"`
 
 	// Stock information
-	StockCode int64    `json:"stock_code" db:"stock_code"`
-	Exchange  Exchange `json:"exchange" db:"exchange"`
-	Symbol    string   `json:"symbol" db:"symbol"`
+	StockCode int64 `json:"stock_code" db:"stock_code"`
+	// Token is the actual trading token used by Odin. For most flows this is
+	// identical to StockCode, but we keep it separate so we can evolve the
+	// schema without touching the DB. Not persisted (db:"-").
+	Token    int64    `json:"token,omitempty" db:"-"`
+	Exchange Exchange `json:"exchange" db:"exchange"`
+	Symbol   string   `json:"symbol" db:"symbol"`
 
 	// Order details
 	OrderType OrderType `json:"order_type" db:"order_type"`
@@ -102,11 +106,16 @@ type Order struct {
 
 // OrderRequest from RabbitMQ
 type OrderRequest struct {
-	RequestID  string   `json:"request_id"`
-	UserID     string   `json:"user_id"`
-	StrategyID string   `json:"strategy_id"`
-	EventID    string   `json:"event_id"`
-	StockCode  int64    `json:"stock_code"`
+	RequestID  string `json:"request_id"`
+	UserID     string `json:"user_id"`
+	StrategyID string `json:"strategy_id"`
+	EventID    string `json:"event_id"`
+	StockCode  int64  `json:"stock_code"`
+	// Token mirrors the rules-engine OrderRequest.Token field and carries the
+	// exchange-specific trading token (scrip token) used by Odin. This allows
+	// us to avoid e-101 "Scrip details not found" by sending the correct
+	// scrip_token instead of 0.
+	Token      int64    `json:"token"`
 	Exchange   string   `json:"exchange"`
 	Symbol     string   `json:"symbol"`
 	OrderType  string   `json:"order_type"`

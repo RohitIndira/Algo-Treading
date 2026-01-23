@@ -40,8 +40,11 @@ class DatabaseHelper:
     def __init__(self):
         self.db_host = os.getenv("DB_HOST", "localhost")
         self.db_port = os.getenv("DB_PORT", "5432")
-        self.db_name = os.getenv("DB_NAME", "trading_system")
-        self.db_user = os.getenv("DB_USER", "trading_user")
+        # Default to the same trading_db used by the user-login service so
+        # that any user registered there automatically has credentials for
+        # trade execution. These can be overridden via env if needed.
+        self.db_name = os.getenv("DB_NAME", "trading_db")
+        self.db_user = os.getenv("DB_USER", "postgres")
         self.db_password = os.getenv("DB_PASSWORD", "postgres")
         
     def get_user_credentials(self, user_id: str) -> Optional[Dict[str, Any]]:
@@ -93,7 +96,9 @@ class OdinOrderExecutor:
     def __init__(self):
         self.client: Optional[IBTConnect] = None
         self.current_user_id: Optional[str] = None
-        # self.db_helper = DatabaseHelper()
+        # Helper wired to the same DB schema as user-login's
+        # user_credentials table.
+        self.db_helper = DatabaseHelper()
         # Encryption key for decrypting passwords (should be stored securely)
         self.encryption_key = os.getenv("ENCRYPTION_KEY", "")
         
@@ -453,19 +458,13 @@ class RabbitMQConsumer:
             logger.info(f"   Strategy: {order_req.get('strategy_name')}")
             
             # Login for this user if not already logged in or if user changed
-            # if not self.executor.client or self.executor.current_user_id != user_id:
-            #     logger.info(f"🔐 Logging in for user {user_id}")
-            #     if not self.executor.login_with_user_credentials(user_id):
-            #         logger.error(f"❌ Failed to login for user {user_id}")
-            #         # Negative acknowledge - message will be requeued
-            #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            #         return
-            if not self.executor.client:
-                logger.info("🔐 Logging in using environment credentials")
-
-            if not self.executor.login_from_env():
-                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                return
+            if not self.executor.client or self.executor.current_user_id != user_id:
+                logger.info(f"🔐 Logging in for user {user_id} using DB credentials")
+                if not self.executor.login_with_user_credentials(user_id):
+                    logger.error(f"❌ Failed to login for user {user_id}")
+                    # Negative acknowledge - message will be requeued
+                    channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                    return
 
             # ✅ Strategy filter
             if order_req.get("strategy_name") != "Jobbing Strategy":
@@ -473,12 +472,6 @@ class RabbitMQConsumer:
                 channel.basic_ack(delivery_tag=method.delivery_tag)
                 return
 
-            # Place order
-            result = self.executor.place_order(order_req)
-
-
-
-            
             # Place order
             result = self.executor.place_order(order_req)
             

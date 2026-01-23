@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -51,21 +52,51 @@ func main() {
 	)
 	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient)
 
+	// gRPC client: trade-execution-service
+	tradeExecClient, err := grpc_clients.NewTradeExecutionClient(
+		cfg.Services.TradeExecutionAddr,
+		cfg.Server.GRPCTimeout,
+	)
+	if err != nil {
+		log.Fatalf("Failed to initialize trade execution client: %v", err)
+	}
+	defer tradeExecClient.Close()
+
+	tradeExecHandler := handlers.NewTradeExecutionHandler(tradeExecClient)
+
 	log.Printf("User Login Service URL: %s", cfg.Services.UserLoginServiceURL)
 
 	// Initialize Redis client for WebSocket pub/sub
+	//
+	// In production this should point to the same Redis instance that
+	// data-ingestion and rules-engine use for market data and realtime
+	// PnL publishing (e.g. 15.207.203.46:6379). We make the address,
+	// password and DB configurable via environment variables so the
+	// gateway can run in different environments without code changes.
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+	redisDB := 0
+	if v := os.Getenv("REDIS_DB"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			redisDB = parsed
+		}
+	}
+
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
+		Addr:     redisAddr,
+		Password: redisPassword,
+		DB:       redisDB,
 	})
 
 	// Test Redis connection
 	ctx := context.Background()
 	if err := redisClient.Ping(ctx).Err(); err != nil {
-		log.Printf("Warning: Redis connection failed: %v (WebSocket features will not work)", err)
+		log.Printf("Warning: Redis connection failed (%s/%d): %v (WebSocket features will not work)", redisAddr, redisDB, err)
 	} else {
-		log.Println("Connected to Redis for WebSocket pub/sub")
+		log.Printf("Connected to Redis for WebSocket pub/sub at %s/%d", redisAddr, redisDB)
 	}
 	defer redisClient.Close()
 
@@ -84,7 +115,7 @@ func main() {
 	}
 
 	// Router
-	r := router.NewRouter(userConfigHandler, authProxyHandler, websocketHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, authProxyHandler, websocketHandler, tradeExecHandler, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

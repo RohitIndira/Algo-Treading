@@ -339,3 +339,176 @@ func (q *QueryEngine) CountActiveUsers(ctx context.Context) (int, error) {
 
 	return result.Aggregations.UniqueUsers.Value, nil
 }
+
+// ListUsersWithActiveStrategy returns the list of user_ids that have an
+// active strategy with the given logical ID. For the managed 52W strategy
+// we historically used the logical id "CASH_52W_HIGH", but the
+// user-config service stores the human-readable name "Cash 52W High" in
+// Postgres and this name is what gets indexed into Elasticsearch. To
+// bridge this, we translate known logical IDs into the corresponding
+// strategy_name filter when building the ES query.
+func (q *QueryEngine) ListUsersWithActiveStrategy(ctx context.Context, strategyID string) ([]string, error) {
+	// Map logical strategy ids to the strategy_name stored in ES.
+	nameFilter := strategyID
+	if strategyID == "CASH_52W_HIGH" {
+		nameFilter = "Cash 52W High"
+	}
+
+	query := map[string]interface{}{
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": []interface{}{
+					map[string]interface{}{
+						"term": map[string]interface{}{
+							"active": true,
+						},
+					},
+					map[string]interface{}{
+						// strategy_name is mapped as a text field (no .keyword
+						// subfield). Use a match query so that the analyzer can
+						// still match the full name "Cash 52W High".
+						"match": map[string]interface{}{
+							"strategy_name": nameFilter,
+						},
+					},
+				},
+			},
+		},
+		"aggs": map[string]interface{}{
+			"users": map[string]interface{}{
+				"terms": map[string]interface{}{
+					"field": "user_id",
+					"size":  10000,
+				},
+			},
+		},
+		"size": 0,
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(query); err != nil {
+		return nil, fmt.Errorf("failed to encode query: %w", err)
+	}
+
+	res, err := q.client.Search(
+		q.client.Search.WithContext(ctx),
+		q.client.Search.WithIndex(q.indexName),
+		q.client.Search.WithBody(&buf),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("elasticsearch search error: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		return nil, fmt.Errorf("elasticsearch search failed: %s", res.Status())
+	}
+
+	var result struct {
+		Aggregations struct {
+			Users struct {
+				Buckets []struct {
+					KeyAsString string  `json:"key_as_string"`
+					Key         string  `json:"key"`
+					DocCount    float64 `json:"doc_count"`
+				} `json:"buckets"`
+			} `json:"users"`
+		} `json:"aggregations"`
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	userIDs := make([]string, 0, len(result.Aggregations.Users.Buckets))
+	for _, b := range result.Aggregations.Users.Buckets {
+		if b.Key != "" {
+			userIDs = append(userIDs, b.Key)
+		}
+	}
+
+	q.logger.Info("Refreshed users for strategy",
+		zap.String("strategy_id", strategyID),
+		zap.Int("user_count", len(userIDs)))
+
+	return userIDs, nil
+}
+
+// GetCash52WUserModes returns a map of user_id -> trading_mode for all
+// users who have an active CASH_52W_HIGH strategy. The trading_mode field
+// is stored in Elasticsearch documents by StrategySyncer.
+func (q *QueryEngine) GetCash52WUserModes(ctx context.Context) (map[string]string, error) {
+	query := map[string]interface{}{
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": []interface{}{
+					map[string]interface{}{
+						"term": map[string]interface{}{"active": true},
+					},
+					map[string]interface{}{
+						// Match the human-readable strategy name that
+						// is indexed by StrategySyncer for the managed
+						// 52W strategy. strategy_name is a text field, so
+						// we use a match query rather than a term on
+						// strategy_name.keyword.
+						"match": map[string]interface{}{"strategy_name": "Cash 52W High"},
+					},
+				},
+			},
+		},
+		"_source": []string{"user_id", "trading_mode"},
+		"size":    10000,
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(query); err != nil {
+		return nil, fmt.Errorf("failed to encode query: %w", err)
+	}
+
+	res, err := q.client.Search(
+		q.client.Search.WithContext(ctx),
+		q.client.Search.WithIndex(q.indexName),
+		q.client.Search.WithBody(&buf),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("elasticsearch search error: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		return nil, fmt.Errorf("elasticsearch search failed: %s", res.Status())
+	}
+
+	var result struct {
+		Hits struct {
+			Hits []struct {
+				Source struct {
+					UserID      string `json:"user_id"`
+					TradingMode string `json:"trading_mode"`
+				} `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	modes := make(map[string]string, len(result.Hits.Hits))
+	for _, h := range result.Hits.Hits {
+		uid := h.Source.UserID
+		if uid == "" {
+			continue
+		}
+		mode := h.Source.TradingMode
+		if mode == "" {
+			mode = "LIVE"
+		}
+		modes[uid] = mode
+	}
+
+	q.logger.Info("Refreshed 52W trading modes from ES",
+		zap.Int("user_count", len(modes)))
+
+	return modes, nil
+}

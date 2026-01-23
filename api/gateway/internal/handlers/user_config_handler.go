@@ -23,6 +23,40 @@ func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHand
 	}
 }
 
+// ConfigureCash52WeekStrategy handles POST /api/v1/strategies/cash52w/configure
+// This is a high-level endpoint for the managed Cash 52-week High strategy.
+// Frontend sends a simple JSON payload with user_id, enabled and a few
+// numeric fields; the backend fills in detailed trade_config/risk_limits.
+func (h *UserConfigHandler) ConfigureCash52WeekStrategy(w http.ResponseWriter, r *http.Request) {
+	var req pb.ConfigureCash52WeekStrategyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if req.UserId == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	resp, err := h.client.ConfigureCash52WeekStrategy(r.Context(), &req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to configure 52w strategy: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to configure 52w strategy")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
 // CreateStrategy handles POST /api/v1/strategies
 func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Request) {
 	var req pb.CreateStrategyRequest

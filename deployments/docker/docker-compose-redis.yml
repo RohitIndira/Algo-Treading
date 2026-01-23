@@ -4,8 +4,9 @@ services:
   redis:
     image: redis:7-alpine
     container_name: trading-redis
+    # Expose Redis on host port 6380 to avoid clashing with the existing host Redis on 6379
     ports:
-      - "6379:6379"
+      - "6380:6379"
     command: redis-server --appendonly yes --requirepass ""
     volumes:
       - redis-data:/data
@@ -23,8 +24,10 @@ services:
     container_name: trading-redis-ui
     environment:
       - REDIS_HOSTS=local:trading-redis:6379
+    # Expose Redis Commander on a high host port to avoid clashing with existing services
+    # Host port 18081 -> container port 8081
     ports:
-      - "8081:8081"
+      - "18081:8081"
     depends_on:
       - redis
     networks:

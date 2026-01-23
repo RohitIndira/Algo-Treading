@@ -458,6 +458,21 @@ type Config struct {
 	// other strategies later.
 	PortfolioAllocTopic string
 
+	// PortfolioRealtimeTopic is a Kafka topic where realtime marked-to-
+	// market portfolio snapshots (joined with Redis market data) are
+	// published for UI/analytics consumption.
+	PortfolioRealtimeTopic string
+
+	// TradingMode controls whether the rules engine sends real orders to
+	// downstream systems (LIVE) or only simulates/publishes signals
+	// without actually routing orders to trade-execution (PAPER).
+	//
+	// Values (case-insensitive):
+	//   - "LIVE"  (default) -> normal behaviour, publish to RabbitMQ
+	//   - "PAPER"           -> simulate only (no RabbitMQ orders for
+	//                          strategies that respect this flag).
+	TradingMode string
+
 	// Jobbing Strategy Configuration
 	JobbingTopic            string
 	JobbingUserIDs          []string
@@ -703,9 +718,16 @@ func LoadConfig() (*Config, error) {
 		},
 
 		// Cash 52-week High strategy (Phase 1): topic + participating user IDs
-		Cash52WTopic:        getEnv("KAFKA_TOPIC_52W_BREAKOUT", "market.data.52w_breakouts"),
-		Cash52WUserIDs:      getEnvAsSlice("CASH52W_USER_IDS", []string{}),
-		PortfolioAllocTopic: getEnv("KAFKA_TOPIC_PORTFOLIO_ALLOCATIONS", "portfolio.allocations"),
+		Cash52WTopic:           getEnv("KAFKA_TOPIC_52W_BREAKOUT", "market.data.52w_breakouts"),
+		Cash52WUserIDs:         getEnvAsSlice("CASH52W_USER_IDS", []string{}),
+		PortfolioAllocTopic:    getEnv("KAFKA_TOPIC_PORTFOLIO_ALLOCATIONS", "portfolio.allocations"),
+		PortfolioRealtimeTopic: getEnv("KAFKA_TOPIC_PORTFOLIO_REALTIME", "portfolio.realtime.52w"),
+
+		// Trading mode (LIVE or PAPER). Default is LIVE for backward
+		// compatibility. PAPER mode is primarily respected by the
+		// Cash 52-week strategy engine (and can be extended to other
+		// strategies over time).
+		TradingMode: strings.ToUpper(getEnv("TRADING_MODE", "LIVE")),
 
 		// Jobbing Strategy Configuration
 		JobbingTopic:            getEnv("JOBBING_TOPIC", "market.data.live"),
@@ -761,6 +783,20 @@ func (c *Config) Validate() error {
 	}
 	if c.Performance.MinMatchScore < 0 || c.Performance.MinMatchScore > 100 {
 		return fmt.Errorf("min match score must be between 0 and 100")
+	}
+
+	// Normalise / validate trading mode (non-fatal: fall back to LIVE)
+	if c.TradingMode == "" {
+		c.TradingMode = "LIVE"
+	} else {
+		mode := strings.ToUpper(c.TradingMode)
+		if mode != "LIVE" && mode != "PAPER" {
+			// Log-style validation is not available here, so just
+			// coerce to LIVE to avoid startup failures.
+			c.TradingMode = "LIVE"
+		} else {
+			c.TradingMode = mode
+		}
 	}
 
 	// Validate Jobbing configuration if enabled

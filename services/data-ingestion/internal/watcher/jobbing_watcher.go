@@ -93,8 +93,14 @@ func (w *B2CWatcher) Run(ctx context.Context) error {
 
 	w.lgr.Info("started B2C bridge process", zap.String("path", w.b2cBridgePath), zap.Strings("tokens", w.b2cTokens))
 
-	// Read and process market data
+	// Read and process market data. We use a bufio.Scanner but explicitly
+	// increase the maximum token size because B2C BESTFIVE payloads can be
+	// large (deep bid/ask arrays). The default 64KB limit would cause
+	// "bufio.Scanner: token too long" and stop the watcher silently.
 	scanner := bufio.NewScanner(stdout)
+	buf := make([]byte, 0, 64*1024)
+	// Allow up to 5MB per line which is plenty for our JSON payloads.
+	scanner.Buffer(buf, 5*1024*1024)
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -202,11 +208,28 @@ func (w *B2CWatcher) getSubscriptionTokens() []string {
 		return w.b2cTokens
 	}
 
+	// Optional: cap the number of tokens we subscribe to from stocks.db.
+	// This prevents trying to stream thousands of symbols at once and
+	// overwhelming the B2C infra.
+	maxTokensStr := os.Getenv("B2C_MAX_TOKENS")
+	maxTokens := 0
+	if maxTokensStr != "" {
+		if v, err := strconv.Atoi(maxTokensStr); err == nil && v > 0 {
+			maxTokens = v
+		}
+	}
+
 	// Use sqlite3 CLI to query tokens and exchanges from stock_subscriptions.
 	// We rely on the sqlite3 binary being available on the host (which is
 	// already used in local tooling/scripts).
-	cmd := exec.Command("sqlite3", "-separator", "|", w.stocksDBPath,
-		"SELECT token, exchange FROM stock_subscriptions WHERE status = 'ACTIVE';")
+	sql := "SELECT token, exchange FROM stock_subscriptions WHERE status = 'ACTIVE'"
+	if maxTokens > 0 {
+		sql = fmt.Sprintf("%s LIMIT %d", sql, maxTokens)
+		w.lgr.Info("Applying B2C_MAX_TOKENS limit for subscriptions",
+			zap.Int("max_tokens", maxTokens))
+	}
+
+	cmd := exec.Command("sqlite3", "-separator", "|", w.stocksDBPath, sql)
 	out, err := cmd.Output()
 	if err != nil {
 		w.lgr.Warn("failed to query stocks.db for subscriptions; falling back to static B2C_TOKENS",
@@ -252,6 +275,11 @@ func (w *B2CWatcher) getSubscriptionTokens() []string {
 // logBridgeStderr logs stderr from B2C bridge
 func (w *B2CWatcher) logBridgeStderr(stderr io.ReadCloser) {
 	scanner := bufio.NewScanner(stderr)
+	buf := make([]byte, 0, 16*1024)
+	// Stderr lines are usually small log messages, but in case of large
+	// stack traces we still allow up to 1MB so we don't silently stop
+	// consuming error logs.
+	scanner.Buffer(buf, 1*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		w.lgr.Info("B2C bridge log", zap.String("message", line))

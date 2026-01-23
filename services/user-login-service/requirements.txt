@@ -13,6 +13,9 @@ kafka-python==2.0.2
 pyotp==2.9.0
 cryptography==41.0.7
 
+# JWT (used as `import jwt` in src/main.py and src/auth_service.py)
+pyjwt==2.8.0
+
 # Configuration
 python-dotenv==1.0.0
 

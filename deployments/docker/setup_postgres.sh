@@ -31,7 +31,29 @@ cd "$SCRIPT_DIR"
 
 echo ""
 echo "Starting PostgreSQL container..."
-docker-compose -f docker-compose-postgres.yml up -d
+
+# Prefer modern Docker Compose V2 (`docker compose`) but fall back to legacy `docker-compose` if needed
+if docker compose version &> /dev/null; then
+    COMPOSE_CMD="docker compose"
+elif command -v docker-compose &> /dev/null; then
+    COMPOSE_CMD="docker-compose"
+else
+    echo "❌ Error: Neither 'docker compose' nor 'docker-compose' is available."
+    echo "Please install Docker Compose: https://docs.docker.com/compose/install/"
+    exit 1
+fi
+
+${COMPOSE_CMD} -f docker-compose-postgres.yml up -d
+
+# Determine the actual Postgres container name (handles cases where Docker adds prefixes)
+POSTGRES_CONTAINER=$(docker ps --filter "name=trading-postgres" --format '{{.Names}}' | head -n 1)
+
+if [ -z "$POSTGRES_CONTAINER" ]; then
+    echo "❌ Error: Could not find a running Postgres container matching name 'trading-postgres'"
+    echo "Current containers:"
+    docker ps
+    exit 1
+fi
 
 echo ""
 echo "Waiting for PostgreSQL to be ready..."
@@ -39,7 +61,7 @@ sleep 5
 
 # Wait for PostgreSQL to be healthy
 for i in {1..30}; do
-    if docker exec trading-postgres pg_isready -U postgres -d trading_db &> /dev/null; then
+    if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres -d trading_db &> /dev/null; then
         echo "✅ PostgreSQL is ready!"
         break
     fi
@@ -48,7 +70,7 @@ for i in {1..30}; do
 done
 
 # Verify connection
-if docker exec trading-postgres psql -U postgres -d trading_db -c "SELECT 1;" &> /dev/null; then
+if docker exec "$POSTGRES_CONTAINER" psql -U postgres -d trading_db -c "SELECT 1;" &> /dev/null; then
     echo "✅ Database connection successful"
     echo ""
     echo "=========================================="
@@ -66,9 +88,9 @@ if docker exec trading-postgres psql -U postgres -d trading_db -c "SELECT 1;" &>
     echo "  postgresql://postgres:postgres@localhost:5432/trading_db?sslmode=disable"
     echo ""
     echo "🔧 Useful Commands:"
-    echo "  Stop:    docker-compose -f docker-compose-postgres.yml down"
-    echo "  Restart: docker-compose -f docker-compose-postgres.yml restart"
-    echo "  Logs:    docker-compose -f docker-compose-postgres.yml logs -f postgres"
+    echo "  Stop:    ${COMPOSE_CMD} -f docker-compose-postgres.yml down"
+    echo "  Restart: ${COMPOSE_CMD} -f docker-compose-postgres.yml restart"
+    echo "  Logs:    ${COMPOSE_CMD} -f docker-compose-postgres.yml logs -f postgres"
     echo "  Shell:   docker exec -it trading-postgres psql -U postgres -d trading_db"
     echo ""
     echo "📁 Migrations automatically applied from:"
@@ -76,6 +98,6 @@ if docker exec trading-postgres psql -U postgres -d trading_db -c "SELECT 1;" &>
     echo ""
 else
     echo "❌ Failed to connect to database"
-    echo "Check logs with: docker-compose -f docker-compose-postgres.yml logs postgres"
+    echo "Check logs with: ${COMPOSE_CMD} -f docker-compose-postgres.yml logs postgres"
     exit 1
 fi

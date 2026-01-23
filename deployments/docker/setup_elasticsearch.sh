@@ -15,18 +15,28 @@ fi
 echo "Docker is running."
 echo ""
 
+# Prefer modern Docker Compose V2 (`docker compose`) but fall back to legacy `docker-compose` if needed
+if docker compose version > /dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+elif command -v docker-compose > /dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+else
+    echo "Error: Neither 'docker compose' nor 'docker-compose' is available. Please install Docker Compose."
+    exit 1
+fi
+
 # Navigate to the docker directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
 # Stop and remove existing containers
 echo "Stopping existing Elasticsearch containers..."
-docker-compose -f docker-compose-elasticsearch.yml down -v
+${COMPOSE_CMD} -f docker-compose-elasticsearch.yml down -v
 echo ""
 
 # Start Elasticsearch
 echo "Starting Elasticsearch..."
-docker-compose -f docker-compose-elasticsearch.yml up -d
+${COMPOSE_CMD} -f docker-compose-elasticsearch.yml up -d
 
 # Wait for Elasticsearch to be ready
 echo ""
@@ -62,11 +72,11 @@ if [ "$ready" = true ]; then
     echo "Setup complete! You can now run your Rules Engine service."
 else
     echo "Elasticsearch failed to start within the timeout period."
-    echo "Check logs with: docker-compose -f docker-compose-elasticsearch.yml logs"
+    echo "Check logs with: ${COMPOSE_CMD} -f docker-compose-elasticsearch.yml logs"
     exit 1
 fi
 
 # Display running containers
 echo ""
 echo "Running containers:"
-docker-compose -f docker-compose-elasticsearch.yml ps
+${COMPOSE_CMD} -f docker-compose-elasticsearch.yml ps

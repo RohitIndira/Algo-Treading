@@ -23,11 +23,14 @@ type RabbitMQPublisher struct {
 
 // OrderMessage represents the order message format expected by odin-api-wrapper
 type OrderMessage struct {
-	OrderID    string  `json:"order_id"`
-	UserID     string  `json:"user_id"`
-	StrategyID string  `json:"strategy_id"`
-	EventID    string  `json:"event_id,omitempty"`
-	Token      int64   `json:"token"` // Stock code
+	OrderID    string `json:"order_id"`
+	UserID     string `json:"user_id"`
+	StrategyID string `json:"strategy_id"`
+	EventID    string `json:"event_id,omitempty"`
+	// Token is the trading token (scrip token) used by Odin. For backwards
+	// compatibility, we default to the order's StockCode when Token is not
+	// explicitly set.
+	Token      int64   `json:"token"`
 	Symbol     string  `json:"symbol"`
 	Exchange   string  `json:"exchange"`
 	OrderType  string  `json:"order_type"` // MARKET or LIMIT
@@ -99,12 +102,17 @@ func NewRabbitMQPublisher(url, exchange, routingKey string, logger *zap.Logger) 
 // PublishOrder publishes an order to RabbitMQ for odin-api-wrapper to consume
 func (p *RabbitMQPublisher) PublishOrder(ctx context.Context, order *models.Order) error {
 	// Convert Order to OrderMessage format expected by odin-api-wrapper
+	token := order.StockCode
+	if order.Token > 0 {
+		token = order.Token
+	}
+
 	orderMsg := OrderMessage{
 		OrderID:    order.OrderID.String(),
 		UserID:     order.UserID,
 		StrategyID: order.StrategyID,
 		EventID:    order.EventID.String(),
-		Token:      order.StockCode,
+		Token:      token,
 		Symbol:     order.Symbol,
 		Exchange:   string(order.Exchange),
 		OrderType:  string(order.OrderType),

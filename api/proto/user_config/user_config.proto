@@ -168,6 +168,12 @@ message Strategy {
   
   // Version for optimistic locking
   int32 version = 11;
+
+  // Per-strategy trading mode. For most generic strategies this will
+  // default to "LIVE". For managed strategies like CASH_52W_HIGH this
+  // can be configured per user as "LIVE" or "PAPER" to control whether
+  // orders are actually sent to the broker or only simulated.
+  string trading_mode = 12;  // "LIVE" or "PAPER"
 }
 
 // Create strategy request
@@ -309,6 +315,13 @@ message ConfigureCash52WeekStrategyRequest {
   // "aggressive"). Currently informational; future versions may integrate
   // this with risk-management profiles.
   string risk_profile = 7;
+
+  // Per-user trading mode for the managed 52W strategy. When set to
+  // "PAPER", the rules-engine will simulate trades for this user
+  // (no real orders sent to trade-execution) even if the global
+  // TRADING_MODE is LIVE. When set to "LIVE" (or empty), trades are
+  // executed normally according to the global mode.
+  string trading_mode = 8;  // "LIVE" or "PAPER"
 }
 
 message ConfigureCash52WeekStrategyResponse {

@@ -44,9 +44,23 @@ func main() {
 	defer db.Close()
 	log.Println("✓ Connected to PostgreSQL")
 
+	// Initialize separate PostgreSQL connection for credentials (user-login DB).
+	// This ensures we always read broker credentials from the same
+	// trading_db used by the user-login service, instead of duplicating
+	// tables in the trade-execution database.
+	credsDB, err := initCredsPostgres()
+	if err != nil {
+		log.Fatalf("Failed to connect to credentials PostgreSQL (trading_db): %v", err)
+	}
+	defer credsDB.Close()
+	log.Println("✓ Connected to PostgreSQL (credentials DB)")
+
 	// Initialize repositories
 	orderRepo := repository.NewOrderRepository(db)
-	credsRepo := repository.NewCredentialsRepository(db)
+	// CredentialsRepository now points to the user-login database
+	// (trading_db) so any user created via user-login immediately has
+	// usable broker credentials for trade execution.
+	credsRepo := repository.NewCredentialsRepository(credsDB)
 	log.Println("✓ Repository layer initialized")
 
 	// Initialize Odin client
@@ -225,6 +239,44 @@ func initPostgres(cfg Config) (*sqlx.DB, error) {
 	// Test connection
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	return db, nil
+}
+
+// initCredsPostgres initializes a separate PostgreSQL connection for
+// reading broker/user credentials. By default this points to the same
+// trading_db used by the user-login service, so any user created via
+// user-login automatically has credentials available for trade-execution.
+//
+// You can override these defaults with CRED_DB_* environment variables
+// if needed:
+//
+//	CRED_DB_HOST, CRED_DB_PORT, CRED_DB_USER,
+//	CRED_DB_PASSWORD, CRED_DB_NAME, CRED_DB_SSLMODE
+func initCredsPostgres() (*sqlx.DB, error) {
+	dsn := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		getEnv("CRED_DB_HOST", "localhost"),
+		getEnv("CRED_DB_PORT", "5432"),
+		getEnv("CRED_DB_USER", "postgres"),
+		getEnv("CRED_DB_PASSWORD", "postgres"),
+		getEnv("CRED_DB_NAME", "trading_db"),
+		getEnv("CRED_DB_SSLMODE", "disable"),
+	)
+
+	db, err := sqlx.Connect("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	// Keep a modest pool for credentials lookups
+	db.SetMaxOpenConns(getEnvInt("CRED_DB_MAX_OPEN_CONNS", 10))
+	db.SetMaxIdleConns(getEnvInt("CRED_DB_MAX_IDLE_CONNS", 5))
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping credentials database: %w", err)
 	}
 
 	return db, nil

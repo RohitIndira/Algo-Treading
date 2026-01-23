@@ -16,6 +16,10 @@ type Strategy struct {
 	RiskLimits   RiskLimits  `json:"risk_limits" bson:"risk_limits"`
 	CreatedAt    time.Time   `json:"created_at" bson:"created_at"`
 	UpdatedAt    time.Time   `json:"updated_at" bson:"updated_at"`
+	// TradingMode mirrors the per-strategy trading_mode from user-config
+	// (e.g. "LIVE" or "PAPER"). When empty, the engine falls back to the
+	// global TRADING_MODE environment setting.
+	TradingMode string `json:"trading_mode" bson:"trading_mode"`
 }
 
 // Conditions represents the conditions for a strategy
@@ -73,6 +77,7 @@ type ElasticsearchStrategy struct {
 	Exchange       string   `json:"exchange"`
 	MaxDailyTrades int32    `json:"max_daily_trades"`
 	MaxLossPerDay  float64  `json:"max_loss_per_day"`
+	TradingMode    string   `json:"trading_mode"`
 	UpdatedAt      int64    `json:"updated_at"` // Unix timestamp
 }
 
@@ -95,6 +100,7 @@ func (s *Strategy) ToElasticsearchStrategy() *ElasticsearchStrategy {
 		Exchange:       normalizeExchange(s.TradeConfig.Exchange),
 		MaxDailyTrades: s.RiskLimits.MaxDailyTrades,
 		MaxLossPerDay:  s.RiskLimits.MaxLossPerDay,
+		TradingMode:    strings.ToUpper(strings.TrimSpace(s.TradingMode)),
 		UpdatedAt:      s.UpdatedAt.Unix(),
 	}
 }

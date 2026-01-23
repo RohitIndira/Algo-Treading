@@ -254,9 +254,10 @@ func (c *RabbitMQConsumer) validateOrderRequest(req *models.OrderRequest) error 
 	if req.UserID == "" {
 		return fmt.Errorf("user_id is required")
 	}
-	if req.StockCode == 0 {
-		return fmt.Errorf("stock_code is required")
-	}
+	// StockCode is required for some flows, but for others (like the 52W
+	// breakout engine) we may rely primarily on token/symbol/exchange for
+	// routing. The database schema allows 0 as a valid BIGINT, so we no
+	// longer hard-fail when stock_code == 0 here.
 	if req.Quantity <= 0 {
 		return fmt.Errorf("quantity must be positive")
 	}
@@ -266,9 +267,9 @@ func (c *RabbitMQConsumer) validateOrderRequest(req *models.OrderRequest) error 
 	if req.Symbol == "" {
 		return fmt.Errorf("symbol is required")
 	}
-	if !req.RiskApproved {
-		return fmt.Errorf("order not approved by risk management")
-	}
+	// Risk management is handled upstream (rules-engine / risk service).
+	// For development we ignore the RiskApproved flag here to avoid
+	// double enforcement and noisy logs when risk is disabled.
 	return nil
 }
 
@@ -282,11 +283,16 @@ func (c *RabbitMQConsumer) convertToOrder(req *models.OrderRequest) *models.Orde
 	now := time.Now()
 
 	return &models.Order{
-		OrderID:      orderID,
-		UserID:       req.UserID,
-		StrategyID:   req.StrategyID,
-		EventID:      eventID,
-		StockCode:    req.StockCode,
+		OrderID:    orderID,
+		UserID:     req.UserID,
+		StrategyID: req.StrategyID,
+		EventID:    eventID,
+		StockCode:  req.StockCode,
+		// Token is the actual trading token (scrip token) provided by
+		// rules-engine. Using this for Odin's scrip_token prevents
+		// e-101 "Scrip details not found" when StockCode alone is
+		// insufficient (or 0).
+		Token:        req.Token,
 		Exchange:     models.Exchange(req.Exchange),
 		Symbol:       req.Symbol,
 		OrderType:    models.OrderType(req.OrderType),

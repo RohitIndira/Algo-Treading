@@ -100,11 +100,16 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 
 	// Create Order model
 	order := &models.Order{
-		OrderID:      orderID,
-		UserID:       signal.UserID,
-		StrategyID:   signal.StrategyID,
-		EventID:      eventID,
-		StockCode:    signal.StockCode,
+		OrderID:    orderID,
+		UserID:     signal.UserID,
+		StrategyID: signal.StrategyID,
+		EventID:    eventID,
+		StockCode:  signal.StockCode,
+		// Token is the actual trading token (scrip token) used by Odin. The
+		// rules-engine publishes both StockCode and Token; StockCode is used for
+		// analytics while Token is what the broker expects as scrip_token. This
+		// ensures we avoid e-101 "Scrip details not found" when placing orders.
+		Token:        signal.Token,
 		Exchange:     models.Exchange(signal.Exchange),
 		Symbol:       signal.Symbol,
 		OrderType:    models.OrderType(signal.OrderType),

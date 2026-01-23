@@ -292,3 +292,4 @@ func (ss *StrategySyncer) Close() error {
 
 	return ss.reader.Close()
 }
+

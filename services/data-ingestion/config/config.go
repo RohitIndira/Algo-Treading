@@ -218,8 +218,9 @@ func Load() *Config {
 	// B2C Bridge Path
 	bridgePath := os.Getenv("B2C_BRIDGE_PATH")
 	if bridgePath == "" {
-		serviceDir := filepath.Join("..", "..", "..", "b2c-api-python", "b2c_bridge.py")
-		bridgePath = serviceDir
+		// Default relative path when running from services/data-ingestion/
+		// (can be overridden via .env if needed)
+		bridgePath = filepath.Join("..", "..", "..", "b2c-api-python", "b2c_bridge.py")
 	}
 
 	// B2C Tokens as comma-separated list
@@ -278,7 +279,10 @@ func Load() *Config {
 		// B2C Bridge
 		B2CBridgePath: bridgePath,
 		B2CTokens:     tokens,
-		StocksDBPath:  getEnv("STOCKS_DB_PATH", filepath.Join("..", "..", "..", "stocks.db")),
+		// Default path assumes runtime from services/data-ingestion/; you
+		// have already set the correct absolute path in .env, which will
+		// override this.
+		StocksDBPath: getEnv("STOCKS_DB_PATH", filepath.Join("..", "..", "..", "stocks.db")),
 
 		// Workers
 		WorkerCount: workerCount,

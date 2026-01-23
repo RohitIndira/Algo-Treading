@@ -25,7 +25,7 @@ func NewExecutionClient(baseURL string) *ExecutionClient {
 }
 
 // ensureLoginWithCredentials ensures user is logged in with provided credentials
-func (c *ExecutionClient) ensureLoginWithCredentials(ctx context.Context, odinUserID, password, totpSecret string) error {
+func (c *ExecutionClient) ensureLoginWithCredentials(ctx context.Context, odinUserID, apiKey, password, totpSecret string) error {
 	c.loginMutex.Lock()
 	defer c.loginMutex.Unlock()
 
@@ -44,6 +44,7 @@ func (c *ExecutionClient) ensureLoginWithCredentials(ctx context.Context, odinUs
 		UserID:     odinUserID,
 		Password:   password,
 		TOTPSecret: totpSecret,
+		APIKey:     apiKey,
 	}
 
 	log.Printf("Logging in user %s to Odin API...", odinUserID)
@@ -58,9 +59,9 @@ func (c *ExecutionClient) ensureLoginWithCredentials(ctx context.Context, odinUs
 }
 
 // PlaceOrderWithCredentials places order via Odin API using provided credentials
-func (c *ExecutionClient) PlaceOrderWithCredentials(ctx context.Context, order *models.Order, odinUserID, password, totpSecret string) (string, error) {
+func (c *ExecutionClient) PlaceOrderWithCredentials(ctx context.Context, order *models.Order, odinUserID, apiKey, password, totpSecret string) (string, error) {
 	// Ensure user is logged in first with their credentials
-	if err := c.ensureLoginWithCredentials(ctx, odinUserID, password, totpSecret); err != nil {
+	if err := c.ensureLoginWithCredentials(ctx, odinUserID, apiKey, password, totpSecret); err != nil {
 		return "", fmt.Errorf("login failed: %w", err)
 	}
 
@@ -102,10 +103,19 @@ func (c *ExecutionClient) convertToOdinRequest(order *models.Order) odin.OrderRe
 	// Convert exchange format: "EXCHANGE_NSE" -> "NSE_EQ", "NSE" -> "NSE_EQ"
 	exchange := c.formatExchange(string(order.Exchange))
 
+	// Prefer the dedicated Token field (true scrip token) if present; fall
+	// back to StockCode for backwards compatibility. This matches the
+	// rules-engine OrderRequest.Token field and avoids e-101 "Scrip details
+	// not found" from Odin when scrip_token is zero.
+	scripToken := order.StockCode
+	if order.Token > 0 {
+		scripToken = order.Token
+	}
+
 	req := odin.OrderRequest{
 		ScripInfo: odin.ScripInfo{
 			Exchange:   exchange,
-			ScripToken: int(order.StockCode),
+			ScripToken: int(scripToken),
 			Symbol:     order.Symbol,
 			Series:     "EQ", // Default to equity
 		},

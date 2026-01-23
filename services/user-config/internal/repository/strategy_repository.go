@@ -587,6 +587,7 @@ func (r *StrategyRepository) ConfigureCash52WeekStrategy(
 	maxPositions int,
 	stopLossPct, takeProfitPct float64,
 	riskProfile string,
+	tradingMode string,
 	enabled bool,
 ) (*models.Strategy, error) {
 	const strategyName = "Cash 52W High"
@@ -630,10 +631,13 @@ func (r *StrategyRepository) ConfigureCash52WeekStrategy(
 	// Helper to build TradeConfig and RiskLimits for this 52W strategy.
 	buildTradeAndRisk := func() (*models.TradeConfig, *models.RiskLimits) {
 		// TradeConfig: MARKET BUY, quantity 0 (52W engine decides), max_position_size
-		// treated as capital_per_stock.
+		// treated as capital_per_stock. Note: rules-engine's Strategy.Validate()
+		// requires Quantity > 0 for a strategy to be indexed into Elasticsearch,
+		// so we store a dummy quantity of 1 here. The 52W engine ignores this
+		// field and computes the real quantity from CapitalPerStock/LTP.
 		mc := &models.TradeConfig{
 			OrderType:       "ORDER_TYPE_MARKET",
-			Quantity:        0,
+			Quantity:        1,
 			MaxPositionSize: &capitalPerStock,
 			StopLossPct:     &stopLossPct,
 			TakeProfitPct:   &takeProfitPct,
@@ -679,6 +683,15 @@ func (r *StrategyRepository) ConfigureCash52WeekStrategy(
 			return nil, err
 		}
 
+		// Persist per-strategy trading_mode for this user/strategy.
+		if _, err := r.db.ExecContext(ctx,
+			`UPDATE strategies SET trading_mode = $1 WHERE strategy_id = $2`,
+			tradingMode, updated.StrategyID,
+		); err != nil {
+			return nil, fmt.Errorf("failed to update trading_mode for 52w strategy: %w", err)
+		}
+		updated.TradingMode = tradingMode
+
 		// Ensure it is active.
 		if err := r.Activate(ctx, updated.StrategyID, userID); err != nil {
 			return nil, err
@@ -688,13 +701,17 @@ func (r *StrategyRepository) ConfigureCash52WeekStrategy(
 
 	// No existing strategy: create a new one using the generic Create path.
 	tradeCfg, riskLimits := buildTradeAndRisk()
-	cond := &models.StrategyCondition{
-		ImpactScoreThreshold: 1, // minimal dummy condition; 52W engine does not use news filters
-		Sentiments:           nil,
-		Categories:           nil,
-		StockCodes:           nil,
-		Exchanges:            nil,
-	}
+		cond := &models.StrategyCondition{
+			ImpactScoreThreshold: 1, // minimal dummy condition; 52W engine does not use news filters
+			// Use a non-empty sentiments array so that rules-engine's
+			// Strategy.Validate() (which requires len(Sentiments) > 0)
+			// accepts this strategy and indexes it into Elasticsearch.
+			// The actual value ("ANY") is not used by the 52W engine.
+			Sentiments: []string{"ANY"},
+			Categories: nil,
+			StockCodes: nil,
+			Exchanges:  nil,
+		}
 	cr := &models.CreateStrategyRequest{
 		UserID:              userID,
 		StrategyName:        strategyName,
@@ -709,5 +726,14 @@ func (r *StrategyRepository) ConfigureCash52WeekStrategy(
 	if err != nil {
 		return nil, err
 	}
+
+	// Set trading_mode on the newly created strategy row.
+	if _, err := r.db.ExecContext(ctx,
+		`UPDATE strategies SET trading_mode = $1 WHERE strategy_id = $2`,
+		tradingMode, created.StrategyID,
+	); err != nil {
+		return nil, fmt.Errorf("failed to set trading_mode for new 52w strategy: %w", err)
+	}
+	created.TradingMode = tradingMode
 	return created, nil
 }

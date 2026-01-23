@@ -64,10 +64,17 @@ func (s *StrategyService) ConfigureCash52WeekStrategy(ctx context.Context, req *
 		takeProfitPct = 20
 	}
 
+	// Normalise trading mode; default to LIVE when empty/invalid. This will
+	// be stored on the strategy row and propagated via Kafka to rules-engine.
+	tradingMode := strings.ToUpper(strings.TrimSpace(req.TradingMode))
+	if tradingMode != "PAPER" {
+		tradingMode = "LIVE"
+	}
+
 	// Delegate actual persistence logic to repository helper that knows how to
 	// find/create the CASH_52W_HIGH strategy for this user. For now we keep
 	// this high-level API here; repository implements the DB details.
-	strategy, err := s.repo.ConfigureCash52WeekStrategy(ctx, req.UserID, capitalPerStock, maxPositions, stopLossPct, takeProfitPct, req.RiskProfile, req.Enabled)
+	strategy, err := s.repo.ConfigureCash52WeekStrategy(ctx, req.UserID, capitalPerStock, maxPositions, stopLossPct, takeProfitPct, req.RiskProfile, tradingMode, req.Enabled)
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure cash 52w strategy: %w", err)
 	}

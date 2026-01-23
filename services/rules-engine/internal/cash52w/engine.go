@@ -25,6 +25,14 @@ type Config struct {
 	MaxPositions    int
 	SLPercent       float64
 	TSLPercent      float64
+
+	// TradingMode controls how orders are handled for this strategy.
+	// Accepted values (uppercased by caller):
+	//   - "LIVE":  normal behaviour, send real orders via RabbitMQ.
+	//   - "PAPER": paper trading; still uses real breakout prices but
+	//              does NOT publish orders to RabbitMQ. Trade-signals
+	//              can still be sent to Kafka for analytics.
+	TradingMode string
 }
 
 // per-user in-memory state (Phase 1: approximate, reset daily). We track
@@ -49,6 +57,11 @@ type Engine struct {
 	mu        sync.Mutex
 	day       string
 	userState map[string]*userState // key: userID
+	// userTradingMode holds per-user overrides for trading mode (LIVE/PAPER)
+	// fetched from Elasticsearch via QueryEngine. When a user is present
+	// here with mode PAPER, their 52W orders will be simulated even if the
+	// global cfg.TradingMode is LIVE.
+	userTradingMode map[string]string // key: userID -> "LIVE" / "PAPER"
 }
 
 // NewEngine creates a new Cash 52-week engine.
@@ -77,15 +90,23 @@ func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publish
 	}
 	cfg.UserIDs = users
 
+	// Normalise trading mode for internal use
+	mode := strings.ToUpper(strings.TrimSpace(cfg.TradingMode))
+	if mode != "PAPER" {
+		mode = "LIVE"
+	}
+	cfg.TradingMode = mode
+
 	return &Engine{
-		cfg:        cfg,
-		riskClient: riskClient,
-		rabbitPub:  rabbitPub,
-		kafkaPub:   kafkaPub,
-		allocPub:   allocPub,
-		logger:     logger,
-		day:        todayStr(),
-		userState:  make(map[string]*userState),
+		cfg:             cfg,
+		riskClient:      riskClient,
+		rabbitPub:       rabbitPub,
+		kafkaPub:        kafkaPub,
+		allocPub:        allocPub,
+		logger:          logger,
+		day:             todayStr(),
+		userState:       make(map[string]*userState),
+		userTradingMode: make(map[string]string),
 	}
 }
 
@@ -114,6 +135,65 @@ func (e *Engine) resetIfNewDay() {
 		e.day = day
 		e.userState = make(map[string]*userState)
 	}
+}
+
+// SetUsers replaces the configured user list for the 52W engine with a new
+// set discovered dynamically from user-config DB (via Elasticsearch index).
+// This allows the engine to run for all users who have an active
+// CASH_52W_HIGH strategy instead of relying on static env lists.
+func (e *Engine) SetUsers(userIDs []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	normalized := make([]string, 0, len(userIDs))
+	seen := make(map[string]bool)
+	for _, u := range userIDs {
+		u = strings.TrimSpace(u)
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		normalized = append(normalized, u)
+	}
+
+	e.cfg.UserIDs = normalized
+
+	e.logger.Info("Updated Cash52W user list from dynamic source",
+		zap.Int("user_count", len(e.cfg.UserIDs)),
+		zap.Strings("users", e.cfg.UserIDs))
+}
+
+// SetUserModes updates per-user trading modes (LIVE/PAPER) based on data
+// fetched from Elasticsearch. This allows user-config to control whether
+// a given user's 52W strategy runs live or in paper mode.
+func (e *Engine) SetUserModes(modes map[string]string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.userTradingMode = make(map[string]string, len(modes))
+	for uid, mode := range modes {
+		m := strings.ToUpper(strings.TrimSpace(mode))
+		if m != "PAPER" { // default to LIVE if anything else
+			m = "LIVE"
+		}
+		e.userTradingMode[uid] = m
+	}
+
+	e.logger.Info("Updated Cash52W user trading modes",
+		zap.Int("user_count", len(e.userTradingMode)))
+}
+
+// effectiveModeForUser returns the trading mode for a specific user,
+// falling back to the global engine cfg.TradingMode when no per-user
+// override is present.
+func (e *Engine) effectiveModeForUser(userID string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if m, ok := e.userTradingMode[userID]; ok {
+		return m
+	}
+	return e.cfg.TradingMode
 }
 
 // HandleBreakout processes a single 52-week breakout event for all configured users.
@@ -245,10 +325,12 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 		StrategyID:   "CASH_52W_HIGH", // fixed strategy id for phase 1
 		StrategyName: "Cash 52-Week High",
 		EventID:      "", // not tied to news event
-		// For 52W engine we don't yet have an integer stock_code mapping,
-		// so we focus on the trading token coming from the breakout event.
-		// Trade-execution can treat Token as the primary identifier.
-		StockCode: 0,
+		// For 52W engine we derive StockCode directly from the numeric
+		// trading token provided in the breakout event. This token is
+		// sourced from stocks.db via the data-ingestion service, so using
+		// it here ensures trade-execution sees a real stock_code instead
+		// of 0.
+		StockCode: parseToken(ev.Token),
 		Token:     parseToken(ev.Token),
 		Symbol:    ev.Symbol,
 		Exchange:  strings.ToUpper(ev.Exchange),
@@ -331,22 +413,42 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 		}
 	}
 
-	// Publish to RabbitMQ
-	if err := e.rabbitPub.PublishOrder(ctx, orderReq); err != nil {
-		return fmt.Errorf("failed to publish 52w order: %w", err)
+	mode := e.effectiveModeForUser(userID)
+
+	// In PAPER mode we stop here: we have computed the order using real
+	// breakout prices and sent a trade-signal to Kafka (if configured),
+	// but we deliberately do NOT send the order to RabbitMQ /
+	// trade-execution.
+	if mode == "PAPER" {
+		e.logger.Info("52w-high paper trade simulated (no real order sent)",
+			zap.String("user_id", userID),
+			zap.String("token", ev.Token),
+			zap.String("symbol", ev.Symbol),
+			zap.String("exchange", orderReq.Exchange),
+			zap.Int32("quantity", qty),
+			zap.Float64("price", ev.LTP))
+	} else {
+		// LIVE mode: publish order to RabbitMQ for real execution
+		if err := e.rabbitPub.PublishOrder(ctx, orderReq); err != nil {
+			return fmt.Errorf("failed to publish 52w order: %w", err)
+		}
 	}
 
 	// Track that this user has taken this token today
 	st.Positions[ev.Token] = models.AllocationPosition{
-		Token:    ev.Token,
-		Symbol:   ev.Symbol,
-		Exchange: orderReq.Exchange,
+		Token:      ev.Token,
+		Symbol:     ev.Symbol,
+		Exchange:   orderReq.Exchange,
+		Quantity:   qty,
+		EntryPrice: ev.LTP,
 	}
 
 	// Publish updated allocation snapshot
 	e.publishAllocation(ctx, userID)
 
-	e.logger.Info("52w-high order published",
+	modeLabel := mode
+	e.logger.Info("52w-high order processed",
+		zap.String("mode", modeLabel),
 		zap.String("user_id", userID),
 		zap.String("token", ev.Token),
 		zap.String("symbol", ev.Symbol),

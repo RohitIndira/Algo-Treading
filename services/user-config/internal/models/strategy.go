@@ -11,11 +11,15 @@ import (
 
 // Strategy represents a user trading strategy
 type Strategy struct {
-	StrategyID   uuid.UUID          `db:"strategy_id" json:"strategy_id"`
-	UserID       string             `db:"user_id" json:"user_id"`
-	StrategyName string             `db:"strategy_name" json:"strategy_name"`
-	Description  string             `db:"description" json:"description"`
-	Active       bool               `db:"active" json:"active"`
+	StrategyID   uuid.UUID `db:"strategy_id" json:"strategy_id"`
+	UserID       string    `db:"user_id" json:"user_id"`
+	StrategyName string    `db:"strategy_name" json:"strategy_name"`
+	Description  string    `db:"description" json:"description"`
+	Active       bool      `db:"active" json:"active"`
+	// TradingMode controls whether this strategy should execute orders as
+	// LIVE trades against the broker or be treated as PAPER (simulated).
+	// Defaults to "LIVE" when empty.
+	TradingMode  string             `db:"trading_mode" json:"trading_mode"`
 	MatchAllNews bool               `db:"match_all_news" json:"match_all_news"`
 	Version      int32              `db:"version" json:"version"`
 	CreatedAt    time.Time          `db:"created_at" json:"created_at"`
@@ -107,6 +111,11 @@ type ConfigureCash52WeekStrategyRequest struct {
 	StopLossPct   float64 `json:"-"`
 	TakeProfitPct float64 `json:"-"`
 	RiskProfile   string  `json:"-"`
+
+	// Optional per-user trading mode for this managed strategy. When set to
+	// "PAPER", rules-engine should simulate trades for this user even if
+	// global TRADING_MODE is LIVE. When empty or invalid, defaults to LIVE.
+	TradingMode string `json:"trading_mode"`
 }
 
 // Value implements the driver.Valuer interface for JSON marshaling

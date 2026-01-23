@@ -35,6 +35,65 @@ func NewWebSocketHandler(redisClient *redis.Client, logger *zap.Logger) *WebSock
 	}
 }
 
+// HandlePnLFeed handles WebSocket connections for live PnL/portfolio
+// updates per user.
+//
+//	GET /ws/pnl?user_id=ISPL19027
+//
+// The backend is expected to publish JSON PnL snapshots to Redis on the
+// channel pattern: "user:{user_id}:pnl". The handler simply forwards those
+// JSON messages to the WebSocket client, adding a small metadata wrapper.
+func (h *WebSocketHandler) HandlePnLFeed(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "user_id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Upgrade HTTP connection to WebSocket
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		h.logger.Error("Failed to upgrade to WebSocket (PnL)", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	h.logger.Info("WebSocket PnL connection established",
+		zap.String("user_id", userID),
+		zap.String("remote_addr", conn.RemoteAddr().String()))
+
+	// Register this connection under the user
+	h.registerClient(userID, conn)
+	defer h.unregisterClient(userID, conn)
+
+	// Send welcome message
+	welcome := map[string]any{
+		"type":    "connected",
+		"subtype": "pnl",
+		"message": "Connected to live PnL feed",
+		"user_id": userID,
+	}
+	if err := conn.WriteJSON(welcome); err != nil {
+		h.logger.Error("Failed to send PnL welcome message", zap.Error(err))
+		return
+	}
+
+	// Subscribe to Redis Pub/Sub for this user's PnL channel
+	ctx := context.Background()
+	channel := "user:" + userID + ":pnl"
+	pubsub := h.redisClient.Subscribe(ctx, channel)
+	defer pubsub.Close()
+
+	h.logger.Info("Subscribed to Redis PnL channel",
+		zap.String("channel", channel),
+		zap.String("user_id", userID))
+
+	ch := pubsub.Channel()
+
+	// We can reuse the same listen loop but tag events as type=pnl
+	h.listenAndForwardPnL(ctx, conn, ch, userID)
+}
+
 // HandleMatchesFeed handles WebSocket connections for live match updates
 // GET /ws/matches?user_id=xxx
 func (h *WebSocketHandler) HandleMatchesFeed(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +250,83 @@ func (h *WebSocketHandler) listenAndForward(ctx context.Context, conn *websocket
 
 		case <-ctx.Done():
 			h.logger.Info("Context cancelled, closing WebSocket", zap.String("identifier", identifier))
+			return
+		}
+	}
+}
+
+// listenAndForwardPnL is similar to listenAndForward but tags outbound
+// messages as PnL events instead of match events. The Redis payload is
+// expected to already be JSON representing a portfolio/PnL snapshot.
+func (h *WebSocketHandler) listenAndForwardPnL(ctx context.Context, conn *websocket.Conn, ch <-chan *redis.Message, userID string) {
+	// Heartbeat ticker to keep connection alive
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case msg := <-ch:
+			if msg == nil {
+				return
+			}
+
+			h.logger.Debug("Received PnL message from Redis",
+				zap.String("channel", msg.Channel),
+				zap.String("payload", msg.Payload))
+
+			var snapshot map[string]any
+			if err := json.Unmarshal([]byte(msg.Payload), &snapshot); err != nil {
+				h.logger.Error("Failed to parse PnL snapshot", zap.Error(err))
+				continue
+			}
+
+			// Wrap with metadata
+			wrapper := map[string]any{
+				"type":          "pnl",
+				"user_id":       userID,
+				"redis_channel": msg.Channel,
+				"snapshot":      snapshot,
+			}
+
+			if err := conn.WriteJSON(wrapper); err != nil {
+				// Most commonly this means the client disconnected; log at
+				// info level to avoid noisy stacktraces, and exit the loop.
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					h.logger.Info("PnL WebSocket closed while sending snapshot",
+						zap.Error(err),
+						zap.String("user_id", userID))
+				} else {
+					h.logger.Info("PnL WebSocket write error (snapshot)",
+						zap.Error(err),
+						zap.String("user_id", userID))
+				}
+				return
+			}
+
+		case <-ticker.C:
+			heartbeat := map[string]any{
+				"type":      "heartbeat",
+				"subtype":   "pnl",
+				"timestamp": time.Now().Unix(),
+			}
+			if err := conn.WriteJSON(heartbeat); err != nil {
+				// Broken pipe here almost always means the browser/tab closed
+				// the connection. Treat it as a normal disconnect rather than
+				// an error with stacktrace spam.
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					h.logger.Info("PnL WebSocket closed by client during heartbeat",
+						zap.Error(err),
+						zap.String("user_id", userID))
+				} else {
+					h.logger.Info("PnL WebSocket write error (heartbeat)",
+						zap.Error(err),
+						zap.String("user_id", userID))
+				}
+				return
+			}
+
+		case <-ctx.Done():
+			h.logger.Info("Context cancelled, closing PnL WebSocket", zap.String("user_id", userID))
 			return
 		}
 	}
