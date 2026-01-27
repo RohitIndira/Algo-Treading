@@ -39,6 +39,11 @@ func (s *UserConfigServer) ConfigureCash52WeekStrategy(ctx context.Context, req 
 		StopLossPct:   req.StopLossPct,
 		TakeProfitPct: req.TakeProfitPct,
 		RiskProfile:   req.RiskProfile,
+		// Forward per-user trading_mode ("LIVE"/"PAPER") from the proto
+		// request into the domain model so the service can normalise and
+		// persist it. If this is empty or anything other than PAPER, the
+		// service layer will default it to LIVE.
+		TradingMode: req.TradingMode,
 	}
 
 	strategy, err := s.service.ConfigureCash52WeekStrategy(ctx, modelReq)
@@ -453,6 +458,10 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 		StrategyName: model.StrategyName,
 		Description:  model.Description,
 		Active:       model.Active,
+		// Propagate per-strategy trading_mode ("LIVE"/"PAPER") from the
+		// domain model to the protobuf response so callers can see the
+		// effective mode in JSON responses.
+		TradingMode:  model.TradingMode,
 		Version:      model.Version,
 		CreatedAt:    &common.Timestamp{Seconds: model.CreatedAt.Unix()},
 		UpdatedAt:    &common.Timestamp{Seconds: model.UpdatedAt.Unix()},

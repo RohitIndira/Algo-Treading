@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -79,19 +80,162 @@ func (h *WebSocketHandler) HandlePnLFeed(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Subscribe to Redis Pub/Sub for this user's PnL channel
-	ctx := context.Background()
-	channel := "user:" + userID + ":pnl"
-	pubsub := h.redisClient.Subscribe(ctx, channel)
-	defer pubsub.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Subscribe to control-plane channel for this user's PnL streams.
+	ctrlChannel := fmt.Sprintf("user:%s:pnl:control", userID)
+	ctrlSub := h.redisClient.Subscribe(ctx, ctrlChannel)
+	defer ctrlSub.Close()
+	ctrlCh := ctrlSub.Channel()
+
+	// Determine the initial PnL data channel. We first attempt to read
+	// the active stream mapping from Redis. If not found or malformed
+	// we fall back to the legacy static channel user:{user_id}:pnl so
+	// existing producers/consumers continue to work.
+	activeKey := fmt.Sprintf("user:%s:pnl:active", userID)
+	activeChannel := fmt.Sprintf("user:%s:pnl", userID)
+	if val, err := h.redisClient.Get(ctx, activeKey).Result(); err == nil {
+		var meta struct {
+			Channel string `json:"channel"`
+		}
+		if err := json.Unmarshal([]byte(val), &meta); err == nil && meta.Channel != "" {
+			activeChannel = meta.Channel
+		}
+	}
+
+	dataSub := h.redisClient.Subscribe(ctx, activeChannel)
+	defer dataSub.Close()
+	dataCh := dataSub.Channel()
 
 	h.logger.Info("Subscribed to Redis PnL channel",
-		zap.String("channel", channel),
+		zap.String("channel", activeChannel),
 		zap.String("user_id", userID))
 
-	ch := pubsub.Channel()
+	// Heartbeat ticker to keep connection alive
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 
-	// We can reuse the same listen loop but tag events as type=pnl
-	h.listenAndForwardPnL(ctx, conn, ch, userID)
+	currentChannel := activeChannel
+
+	for {
+		select {
+		case msg := <-dataCh:
+			if msg == nil {
+				return
+			}
+
+			h.logger.Debug("Received PnL message from Redis",
+				zap.String("channel", msg.Channel),
+				zap.String("payload", msg.Payload))
+
+			var snapshot map[string]any
+			if err := json.Unmarshal([]byte(msg.Payload), &snapshot); err != nil {
+				h.logger.Error("Failed to parse PnL snapshot", zap.Error(err))
+				continue
+			}
+
+			// Wrap with metadata
+			wrapper := map[string]any{
+				"type":          "pnl",
+				"user_id":       userID,
+				"redis_channel": msg.Channel,
+				"snapshot":      snapshot,
+			}
+
+			if err := conn.WriteJSON(wrapper); err != nil {
+				// Most commonly this means the client disconnected; log at
+				// info level to avoid noisy stacktraces, and exit the loop.
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					h.logger.Info("PnL WebSocket closed while sending snapshot",
+						zap.Error(err),
+						zap.String("user_id", userID))
+				} else {
+					h.logger.Info("PnL WebSocket write error (snapshot)",
+						zap.Error(err),
+						zap.String("user_id", userID))
+				}
+				return
+			}
+
+		case ctrlMsg := <-ctrlCh:
+			if ctrlMsg == nil {
+				continue
+			}
+
+			var event map[string]any
+			if err := json.Unmarshal([]byte(ctrlMsg.Payload), &event); err != nil {
+				h.logger.Error("Failed to parse PnL control message", zap.Error(err))
+				continue
+			}
+
+			typeVal, _ := event["type"].(string)
+			if typeVal != "switch" {
+				continue
+			}
+
+			newChannel, _ := event["new_channel"].(string)
+			if newChannel == "" || newChannel == currentChannel {
+				continue
+			}
+
+			h.logger.Info("Received PnL stream switch event",
+				zap.String("user_id", userID),
+				zap.String("old_channel", currentChannel),
+				zap.String("new_channel", newChannel))
+
+			// Unsubscribe from old channel and subscribe to the new one.
+			if err := dataSub.Unsubscribe(ctx, currentChannel); err != nil {
+				h.logger.Warn("Failed to unsubscribe from old PnL channel",
+					zap.Error(err),
+					zap.String("channel", currentChannel))
+			}
+			dataSub.Close()
+
+			dataSub = h.redisClient.Subscribe(ctx, newChannel)
+			dataCh = dataSub.Channel()
+			currentChannel = newChannel
+
+			// Optionally notify the frontend that the underlying stream
+			// has changed. This is informational; the client does not
+			// need to take any action.
+			notify := map[string]any{
+				"type":        "pnl_stream_switched",
+				"user_id":     userID,
+				"new_channel": newChannel,
+			}
+			if err := conn.WriteJSON(notify); err != nil {
+				// If the client is gone, just terminate loop.
+				return
+			}
+
+		case <-ticker.C:
+			heartbeat := map[string]any{
+				"type":      "heartbeat",
+				"subtype":   "pnl",
+				"timestamp": time.Now().Unix(),
+			}
+			if err := conn.WriteJSON(heartbeat); err != nil {
+				// Broken pipe here almost always means the browser/tab closed
+				// the connection. Treat it as a normal disconnect rather than
+				// an error with stacktrace spam.
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					h.logger.Info("PnL WebSocket closed by client during heartbeat",
+						zap.Error(err),
+						zap.String("user_id", userID))
+				} else {
+					h.logger.Info("PnL WebSocket write error (heartbeat)",
+						zap.Error(err),
+						zap.String("user_id", userID))
+				}
+				return
+			}
+
+		case <-ctx.Done():
+			h.logger.Info("Context cancelled, closing PnL WebSocket", zap.String("user_id", userID))
+			return
+		}
+	}
 }
 
 // HandleMatchesFeed handles WebSocket connections for live match updates

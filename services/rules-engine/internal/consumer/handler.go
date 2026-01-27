@@ -363,7 +363,35 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		}
 	}
 
-	// 4. Publish order to RabbitMQ
+	// Determine effective trading mode for this strategy/user.
+	// We only honour the per-strategy TradingMode coming from user-config
+	// (via Elasticsearch). When it is set to "PAPER" we simulate the
+	// trade (DB + Kafka + Redis) but do NOT send a real order to
+	// RabbitMQ / trade-execution. Any other value (including empty) is
+	// treated as LIVE.
+	mode := strings.ToUpper(strings.TrimSpace(strategy.TradingMode))
+	if mode == "PAPER" {
+		h.logger.Info("PAPER mode: simulating matched order (no RabbitMQ publish)",
+			zap.String("order_id", orderReq.OrderID),
+			zap.String("user_id", orderReq.UserID),
+			zap.String("strategy_id", orderReq.StrategyID),
+			zap.Float64("price", orderReq.Price),
+			zap.Int32("quantity", orderReq.Quantity))
+
+		// Even in PAPER mode we still want the frontend to see the match
+		// and order details via WebSocket, so publish the match event to
+		// Redis as usual.
+		if err := h.publishMatchEvent(ctx, orderReq, event, match); err != nil {
+			h.logger.Error("Failed to publish match event to Redis (PAPER)",
+				zap.Error(err),
+				zap.String("user_id", orderReq.UserID))
+		}
+
+		// Do not count this as a real order sent to the broker.
+		return nil
+	}
+
+	// 4. Publish order to RabbitMQ (LIVE mode)
 	if err := h.rabbitPubl.PublishOrder(ctx, orderReq); err != nil {
 		h.stats.IncrementRabbitMQErrors()
 		return fmt.Errorf("failed to publish order: %w", err)

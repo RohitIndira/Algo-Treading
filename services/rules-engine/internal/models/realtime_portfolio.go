@@ -29,4 +29,8 @@ type RealtimePortfolioEvent struct {
 	TotalInvested float64            `json:"total_invested"`
 	TotalCurrent  float64            `json:"total_current"`
 	Timestamp     time.Time          `json:"timestamp"`
+	// StreamID identifies the logical PnL stream for this snapshot.
+	// When strategies change we rotate to a new stream so that
+	// consumers can distinguish old vs new configurations.
+	StreamID string `json:"stream_id,omitempty"`
 }

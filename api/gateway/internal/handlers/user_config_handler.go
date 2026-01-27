@@ -28,18 +28,52 @@ func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHand
 // Frontend sends a simple JSON payload with user_id, enabled and a few
 // numeric fields; the backend fills in detailed trade_config/risk_limits.
 func (h *UserConfigHandler) ConfigureCash52WeekStrategy(w http.ResponseWriter, r *http.Request) {
-	var req pb.ConfigureCash52WeekStrategyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Decode into a lightweight DTO first so we can support both the
+	// JSON field names used by the frontend (snake_case) and the
+	// proto-generated camelCase names. Then map into the protobuf
+	// request explicitly.
+	var body struct {
+		UserID          string  `json:"user_id"`
+		Enabled         bool    `json:"enabled"`
+		CapitalPerStock float64 `json:"capital_per_stock"`
+		MaxPositions    int32   `json:"max_positions"`
+		StopLossPct     float64 `json:"stop_loss_pct"`
+		TakeProfitPct   float64 `json:"take_profit_pct"`
+		RiskProfile     string  `json:"risk_profile"`
+		// Support both snake_case (trading_mode) and camelCase (tradingMode)
+		// from the frontend. We will normalise after decoding.
+		TradingModeSnake string `json:"trading_mode"`
+		TradingModeCamel string `json:"tradingMode"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
 		return
 	}
 
-	if req.UserId == "" {
+	if body.UserID == "" {
 		respondWithError(w, http.StatusBadRequest, "user_id is required")
 		return
 	}
 
-	resp, err := h.client.ConfigureCash52WeekStrategy(r.Context(), &req)
+	// Prefer explicit snake_case field, but fall back to camelCase if needed.
+	tradingMode := body.TradingModeSnake
+	if tradingMode == "" {
+		tradingMode = body.TradingModeCamel
+	}
+
+	req := &pb.ConfigureCash52WeekStrategyRequest{
+		UserId:          body.UserID,
+		Enabled:         body.Enabled,
+		CapitalPerStock: body.CapitalPerStock,
+		MaxPositions:    body.MaxPositions,
+		StopLossPct:     body.StopLossPct,
+		TakeProfitPct:   body.TakeProfitPct,
+		RiskProfile:     body.RiskProfile,
+		TradingMode:     tradingMode,
+	}
+
+	resp, err := h.client.ConfigureCash52WeekStrategy(r.Context(), req)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to configure 52w strategy: "+err.Error())
 		return

@@ -630,11 +630,11 @@ func (r *StrategyRepository) ConfigureCash52WeekStrategy(
 
 	// Helper to build TradeConfig and RiskLimits for this 52W strategy.
 	buildTradeAndRisk := func() (*models.TradeConfig, *models.RiskLimits) {
-		// TradeConfig: MARKET BUY, quantity 0 (52W engine decides), max_position_size
-		// treated as capital_per_stock. Note: rules-engine's Strategy.Validate()
-		// requires Quantity > 0 for a strategy to be indexed into Elasticsearch,
-		// so we store a dummy quantity of 1 here. The 52W engine ignores this
-		// field and computes the real quantity from CapitalPerStock/LTP.
+		// TradeConfig: MARKET BUY, quantity is a dummy value required so that
+		// generic strategy validation/indexing works. The Cash 52W engine
+		// derives the actual per-trade quantity from CapitalPerStock/LTP at
+		// runtime (e.g. ₹20,000 / LTP). We keep Quantity=1 here to avoid
+		// confusing UIs while still satisfying validation rules.
 		mc := &models.TradeConfig{
 			OrderType:       "ORDER_TYPE_MARKET",
 			Quantity:        1,

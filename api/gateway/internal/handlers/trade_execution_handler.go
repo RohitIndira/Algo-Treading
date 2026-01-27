@@ -77,6 +77,7 @@ func (h *TradeExecutionHandler) ListSuccessfulUserOrders(w http.ResponseWriter, 
 	})
 	defer reader.Close()
 
+	// Collect only executions that belong to the requested user.
 	executions := make([]map[string]any, 0)
 	maxMessages := 1000 // safety limit per request
 	for i := 0; i < maxMessages; i++ {
@@ -91,11 +92,13 @@ func (h *TradeExecutionHandler) ListSuccessfulUserOrders(w http.ResponseWriter, 
 			continue
 		}
 
-		// TEMP: append all messages from partition 2 so we can verify that
-		// the gateway is correctly connected to Kafka and reading the
-		// trade-executions topic. Once we confirm messages appear here, we
-		// can re-introduce filtering by user_id.
-		executions = append(executions, ev)
+		// Filter by user_id from the Kafka message payload so that this endpoint
+		// only returns orders placed by the specific user in the path
+		// (e.g. /users/ISPL19027/orders/success should only return orders
+		// where user_id == "ISPL19027").
+		if evUserID, ok := ev["user_id"].(string); ok && evUserID == userID {
+			executions = append(executions, ev)
+		}
 	}
 
 	respondWithJSON(w, http.StatusOK, map[string]any{

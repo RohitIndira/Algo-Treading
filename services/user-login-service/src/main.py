@@ -19,6 +19,7 @@ import threading
 from .models import UserCredentials, UserSession, LoginRequest
 from .repository import Repository
 from .auth_service import AuthService
+from .odin_client import OdinClient
 
 # Load environment variables
 load_dotenv()
@@ -456,6 +457,56 @@ async def register_credentials(request: RegisterCredentialsRequest, response: Re
                 },
                 message=conflict_message,
             )
+
+        # For new registrations we now require a password so that downstream
+        # services (odin-api-wrapper, trade-execution) can perform automatic
+        # logins using the stored credentials.
+        if not request.password_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "password_encrypted is required when registering credentials. "
+                    "Provide the plain ODIN password here; it will be encrypted "
+                    "before being stored."
+                ),
+            )
+
+        # Optionally validate ODIN credentials at registration time. We do a
+        # lightweight login attempt using the supplied api_key, password, and
+        # totp_secret. If this fails, we reject the registration so that bad
+        # credentials are not stored silently.
+        if totp_secret:
+            try:
+                odin_client = OdinClient(request.api_url, request.x_api_key)
+                test_totp = pyotp.TOTP(totp_secret).now()
+
+                odin_resp = odin_client.login(
+                    user_id=actual_user_id,
+                    api_key=request.api_key,
+                    login_type=request.preferred_login_type or "PASSWORD",
+                    password=request.password_encrypted,
+                    second_auth_type=request.preferred_second_auth or "TOTP",
+                    second_auth=test_totp,
+                    source=request.source,
+                    udid="",
+                    device_info=None,
+                )
+
+                if not isinstance(odin_resp, dict) or odin_resp.get("status") != "success" or not odin_resp.get("data"):
+                    msg = odin_resp.get("message") if isinstance(odin_resp, dict) else "Unknown error"
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"ODIN login failed during registration: {msg}",
+                    )
+            except HTTPException:
+                # Bubble up structured errors
+                raise
+            except Exception as e:
+                logger.error(f"Failed to validate ODIN credentials during registration: {e}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to validate ODIN credentials during registration: {str(e)}",
+                )
 
         # Use the actual user_id from JWT token
         creds = UserCredentials(

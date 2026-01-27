@@ -307,7 +307,8 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 		return nil
 	}
 
-	// compute quantity based on capital per stock
+	// Compute quantity from capital per stock so that we invest roughly
+	// ₹CapitalPerStock per breakout: qty ≈ CapitalPerStock / LTP.
 	qty := int32(math.Floor(e.cfg.CapitalPerStock / ev.LTP))
 	if qty <= 0 {
 		e.logger.Warn("Computed non-positive quantity for 52w breakout",

@@ -461,6 +461,9 @@ func main() {
 	strategyCache := cache.NewStrategyCache(redisCache, cfg.Redis.CacheTTL, logger)
 	logger.Info("Redis cache initialized successfully")
 
+	// Initialize PnL stream manager (for per-user, per-strategy PnL streams).
+	pnlStreamManager := cache.NewPnLStreamManager(redisCache, logger, cfg.Redis.CacheTTL)
+
 	// Initialize Elasticsearch indexer
 	logger.Info("Initializing Elasticsearch indexer...")
 	indexer, err := index.NewIndexer(
@@ -484,6 +487,7 @@ func main() {
 		"rules-engine-strategy-sync-v2", // Changed group to avoid replaying old DELETE events
 		indexer,
 		strategyCache,
+		pnlStreamManager,
 		logger,
 	)
 	defer strategySyncer.Close()
@@ -699,7 +703,19 @@ func main() {
 	// generated at any time during development/testing. Once the behaviour
 	// is validated end-to-end, this can be switched back to
 	// cfg.MarketHours.EnforceHours.
-	handler := consumer.NewHandler(matcherEngine, rabbitPub, tradeSignalPub, signalRepo, riskClient, redisCache, strategyCache, stats, logger, marketHours, false)
+	handler := consumer.NewHandler(
+		matcherEngine,
+		rabbitPub,
+		tradeSignalPub,
+		signalRepo,
+		riskClient,
+		redisCache,
+		strategyCache,
+		stats,
+		logger,
+		marketHours,
+		false, // enforceHours disabled for now
+	)
 
 	// Initialize Kafka consumer
 	logger.Info("Initializing Kafka consumer...")
@@ -779,7 +795,7 @@ func main() {
 
 	// Start realtime portfolio publisher loop (52W) if engine is enabled
 	if cash52wEngine != nil {
-		go startRealtimePortfolioLoop(ctx, logger, cash52wEngine, redisCache, realtimePortfolioPub)
+		go startRealtimePortfolioLoop(ctx, logger, cash52wEngine, redisCache, realtimePortfolioPub, pnlStreamManager)
 	}
 
 	// Start consuming jobbing market depth events if engine is enabled
@@ -880,6 +896,7 @@ func startRealtimePortfolioLoop(
 	engine *cash52w.Engine,
 	redisCache *cache.RedisCache,
 	pub *publisher.KafkaPublisher,
+	pnlStreams *cache.PnLStreamManager,
 ) {
 	if engine == nil || redisCache == nil || pub == nil {
 		logger.Warn("Realtime portfolio loop not started (missing dependencies)")
@@ -915,8 +932,27 @@ func startRealtimePortfolioLoop(
 
 				// 2) Publish the same snapshot to Redis Pub/Sub so API gateway
 				//    can stream it to frontend via WebSockets (/ws/pnl).
-				//    Channel pattern: user:{user_id}:pnl
+				//
+				// By default we publish to the legacy static channel
+				// user:{user_id}:pnl for backward compatibility. If a
+				// PnLStreamManager is available we instead resolve a
+				// per-user, per-strategy stream and publish to the
+				// versioned channel user:{user_id}:pnl:{stream_id}.
 				channel := fmt.Sprintf("user:%s:pnl", ev.UserID)
+				if pnlStreams != nil {
+					meta, err := pnlStreams.GetOrCreateStream(ctx, ev.UserID, ev.StrategyID)
+					if err != nil {
+						logger.Warn("Failed to resolve PnL stream, using legacy channel",
+							zap.Error(err),
+							zap.String("user_id", ev.UserID))
+					} else if meta != nil {
+						channel = meta.Channel
+						// Attach stream ID to the event so consumers
+						// (e.g. frontend) can reason about which stream
+						// a snapshot belongs to if needed.
+						ev.StreamID = meta.StreamID
+					}
+				}
 				payload, err := json.Marshal(ev)
 				if err != nil {
 					logger.Error("Failed to marshal realtime portfolio event for Redis",

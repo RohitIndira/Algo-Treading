@@ -38,6 +38,7 @@ type StrategySyncer struct {
 	reader        *kafka.Reader
 	indexer       *index.Indexer
 	strategyCache *cache.StrategyCache
+	pnlStreams    *cache.PnLStreamManager
 	logger        *zap.Logger
 	stats         *SyncStats
 }
@@ -54,12 +55,17 @@ type SyncStats struct {
 }
 
 // NewStrategySyncer creates a new strategy syncer
-func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *index.Indexer, strategyCache *cache.StrategyCache, logger *zap.Logger) *StrategySyncer {
+func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *index.Indexer, strategyCache *cache.StrategyCache, pnlStreams *cache.PnLStreamManager, logger *zap.Logger) *StrategySyncer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
 		Topic:          topic,
 		GroupID:        groupID,
-		StartOffset:    kafka.LastOffset, // Use last offset to avoid replaying old DELETE events
+		// Start from the beginning for new consumer groups so we replay the
+		// full strategy history (CREATE/UPDATE/DELETE) and ensure the
+		// Elasticsearch index and Redis cache are fully in sync with the
+		// user-config database, even if deletes happened before this
+		// rules-engine instance was started.
+		StartOffset:    kafka.FirstOffset,
 		MinBytes:       10e3,             // 10KB
 		MaxBytes:       10e6,             // 10MB
 		CommitInterval: time.Second,
@@ -70,6 +76,7 @@ func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *
 		reader:        reader,
 		indexer:       indexer,
 		strategyCache: strategyCache,
+		pnlStreams:    pnlStreams,
 		logger:        logger,
 		stats:         &SyncStats{},
 	}
@@ -180,6 +187,18 @@ func (ss *StrategySyncer) processMessage(ctx context.Context, msg *kafka.Message
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("user_id", strategy.UserID),
 			zap.Bool("active", strategy.Active))
+
+		// Rotate the user's PnL stream whenever a strategy changes so that
+		// downstream consumers (API gateway / frontend) can cleanly switch
+		// to a fresh PnL channel and avoid mixing old/new configurations.
+		if ss.pnlStreams != nil {
+			if _, err := ss.pnlStreams.RotateStream(ctx, strategy.UserID, strategy.StrategyName); err != nil {
+				ss.logger.Warn("Failed to rotate PnL stream for strategy event",
+					zap.String("strategy_id", strategy.StrategyID),
+					zap.String("user_id", strategy.UserID),
+					zap.Error(err))
+			}
+		}
 
 	case "DELETE":
 		if err := ss.indexer.DeleteStrategy(ctx, event.Strategy.StrategyID); err != nil {
@@ -292,4 +311,3 @@ func (ss *StrategySyncer) Close() error {
 
 	return ss.reader.Close()
 }
-
