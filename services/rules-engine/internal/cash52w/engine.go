@@ -190,6 +190,21 @@ func (e *Engine) HandleBreakout(ctx context.Context, ev *models.Breakout52WEvent
 		return fmt.Errorf("nil Breakout52WEvent")
 	}
 
+	// Safety guard: the breakout topic may retain older messages; we only
+	// want to trade the current trading day's 52W highs.
+	//
+	// data-ingestion already tries to publish only today's breakouts, but
+	// we re-check here so a new consumer group starting from old offsets
+	// doesn't generate historical orders.
+	if strings.TrimSpace(ev.Week52HighDate) != "" && strings.TrimSpace(ev.Week52HighDate) != todayStr() {
+		e.logger.Debug("Skipping 52W breakout not from today",
+			zap.String("symbol", ev.Symbol),
+			zap.String("token", ev.Token),
+			zap.String("week_52_high_date", ev.Week52HighDate),
+			zap.String("today", todayStr()))
+		return nil
+	}
+
 	// LTP MUST be present in breakout event from Redis 52W watcher.
 	// Since we're sourcing breakouts from Redis (which has real-time market data),
 	// there's no fallback - we need the LTP to calculate position size.
@@ -334,6 +349,7 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 	// user has not enabled the managed 52W strategy, or if the breakout
 	// event occurred before the user enabled it, we skip.
 	var capitalPerStock float64
+	mode := "LIVE"
 	if e.store != nil {
 		cfg, ok := e.store.Get(userID)
 		if !ok {
@@ -348,21 +364,22 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 				zap.String("token", ev.Token))
 			return nil
 		}
-
-		// Convert event timestamp (ms since epoch) to time.Time.
-		evTime := time.Unix(0, ev.Timestamp*int64(time.Millisecond))
-		if cfg.EnabledSince.After(evTime) {
-			// Breakout happened before the user enabled 52W; ignore.
-			e.logger.Info("Skipping breakout - occurred before user enabled strategy",
-				zap.String("user_id", userID),
-				zap.String("token", ev.Token),
-				zap.String("symbol", ev.Symbol),
-				zap.Time("breakout_time", evTime),
-				zap.Time("enabled_since", cfg.EnabledSince))
-			return nil
-		}
-
 		capitalPerStock = cfg.CapitalPerStock
+
+		// IMPORTANT: derive trading mode from the config store directly so
+		// that a newly enabled user is immediately treated as PAPER/LIVE
+		// (no waiting for the 15s refresh loop that calls SetUserModes).
+		m := strings.ToUpper(strings.TrimSpace(cfg.TradingMode))
+		if m == "PAPER" {
+			mode = "PAPER"
+		} else {
+			mode = "LIVE"
+		}
+		// Keep the engine cache in sync so helper methods like
+		// effectiveModeForUser()/publishAllocation() reflect the latest.
+		e.mu.Lock()
+		e.userTradingMode[userID] = mode
+		e.mu.Unlock()
 	}
 
 	// Fallback to engine-level default if config is missing or invalid.
@@ -436,9 +453,11 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 	orderReq.OrderSide = "BUY"
 
 	// Attach trading mode (LIVE/PAPER) to the order request so that
-	// downstream services and analytics can distinguish simulated vs
-	// real trades in the trade-signals stream.
-	mode := e.effectiveModeForUser(userID)
+	// downstream services (paper-execution) and analytics can distinguish
+	// simulated vs real trades in the trade-signals stream.
+	//
+	// NOTE: `mode` is derived above from config store for immediate
+	// correctness after a user config event.
 	orderReq.TradingMode = mode
 
 	// Run risk check if client is available
