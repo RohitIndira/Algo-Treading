@@ -56,16 +56,16 @@ func (r *TradeSignalRepository) SaveTradeSignal(ctx context.Context, orderReq *m
 	query := `
 		INSERT INTO trade_signals (
 			order_id, user_id, strategy_id, strategy_name, event_id,
-			stock_code, symbol, exchange,
+			stock_code, symbol, exchange, token,
 			order_type, order_side, quantity, price, stop_loss, take_profit,
 			match_score, impact_score, sentiment, news_category,
 			status, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
-			$6, $7, $8,
-			$9, 'BUY', $10, $11, $12, $13,
-			$14, $15, $16, $17,
-			'PENDING', $18, $18
+			$6, $7, $8, $9,
+			$10, 'BUY', $11, $12, $13, $14,
+			$15, $16, $17, $18,
+			'PENDING', $19, $19
 		)
 	`
 
@@ -78,6 +78,7 @@ func (r *TradeSignalRepository) SaveTradeSignal(ctx context.Context, orderReq *m
 		orderReq.StockCode,
 		orderReq.Symbol,
 		orderReq.Exchange,
+		orderReq.Token,
 		orderReq.OrderType,
 		orderReq.Quantity,
 		orderReq.Price,
@@ -200,6 +201,50 @@ func (r *TradeSignalRepository) GetPendingSignals(ctx context.Context, limit int
 	return signals, rows.Err()
 }
 
+// GetTradeSignal retrieves a single trade signal by order ID
+func (r *TradeSignalRepository) GetTradeSignal(ctx context.Context, orderID string) (*models.OrderRequest, error) {
+	query := `
+		SELECT order_id, user_id, strategy_id, strategy_name, event_id,
+		       stock_code, symbol, exchange,
+		       order_type, quantity, price, stop_loss, take_profit,
+		       match_score, impact_score, sentiment, news_category,
+		       created_at, order_side
+		FROM trade_signals
+		WHERE order_id = $1
+	`
+
+	var orderReq models.OrderRequest
+	err := r.db.QueryRowContext(ctx, query, orderID).Scan(
+		&orderReq.OrderID,
+		&orderReq.UserID,
+		&orderReq.StrategyID,
+		&orderReq.StrategyName,
+		&orderReq.EventID,
+		&orderReq.StockCode,
+		&orderReq.Symbol,
+		&orderReq.Exchange,
+		&orderReq.OrderType,
+		&orderReq.Quantity,
+		&orderReq.Price,
+		&orderReq.StopLoss,
+		&orderReq.TakeProfit,
+		&orderReq.MatchScore,
+		&orderReq.ImpactScore,
+		&orderReq.Sentiment,
+		&orderReq.NewsCategory,
+		&orderReq.Timestamp,
+		&orderReq.OrderSide,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("signal not found: %s", orderID)
+		}
+		return nil, fmt.Errorf("failed to get trade signal: %w", err)
+	}
+
+	return &orderReq, nil
+}
+
 // GetUserSignals retrieves trade signals for a specific user
 func (r *TradeSignalRepository) GetUserSignals(ctx context.Context, userID string, limit int, offset int) ([]*models.OrderRequest, error) {
 	query := `
@@ -251,6 +296,75 @@ func (r *TradeSignalRepository) GetUserSignals(ctx context.Context, userID strin
 	}
 
 	return signals, rows.Err()
+}
+
+// GetActivePositions retrieves all currently EXECUTED (active) positions for a strategy/user
+func (r *TradeSignalRepository) GetActivePositions(ctx context.Context, userID, strategyID string) (map[string]models.AllocationPosition, error) {
+	query := `
+		SELECT COALESCE(token, 0), symbol, exchange, quantity, execution_price
+		FROM trade_signals
+		WHERE user_id = $1 AND strategy_id = $2 AND status = 'EXECUTED' AND order_side = 'BUY'
+	`
+	// Note: This is a simplified logic. A production system would match BUYs and SELLs.
+	// For 52W strategy, we currently assume positions are opened and then eventually closed.
+	// We'll filter out tokens that have a corresponding SELL order later if needed,
+	// but for now we look for EXECUTED BUYs.
+
+	rows, err := r.db.QueryContext(ctx, query, userID, strategyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active positions: %w", err)
+	}
+	defer rows.Close()
+
+	positions := make(map[string]models.AllocationPosition)
+	for rows.Next() {
+		var (
+			token            int64
+			symbol, exchange string
+			qty              int32
+			price            float64
+		)
+		if err := rows.Scan(&token, &symbol, &exchange, &qty, &price); err != nil {
+			r.logger.Warn("Failed to scan position row", zap.Error(err))
+			continue
+		}
+		tokenStr := fmt.Sprintf("%d", token)
+		positions[tokenStr] = models.AllocationPosition{
+			Token:      tokenStr,
+			Symbol:     symbol,
+			Exchange:   exchange,
+			Quantity:   qty,
+			EntryPrice: price,
+		}
+	}
+
+	return positions, rows.Err()
+}
+
+// GetRealizedPnL calculates the total realized P&L for a user and strategy
+func (r *TradeSignalRepository) GetRealizedPnL(ctx context.Context, userID, strategyID string) (float64, error) {
+	// For simplicity, we calculate P&L from EXECUTED SELL orders if they have metadata about buy price,
+	// or we look at the difference between BUY and SELL executions for the same token.
+	// Since the current schema doesn't explicitly link BUY/SELL, we might need to rely on metadata
+	// or a more complex query.
+	// For now, let's assume P&L is stored in metadata or calculated as sum(exec_price * qty) for SELLs - sum(exec_price * qty) for matching BUYs.
+
+	query := `
+		SELECT 
+			COALESCE(SUM(CASE WHEN order_side = 'SELL' THEN execution_price * quantity ELSE 0 END), 0) -
+			COALESCE(SUM(CASE WHEN order_side = 'SELL' THEN (metadata->>'buy_price')::numeric * quantity ELSE 0 END), 0) as realized_pnl
+		FROM trade_signals
+		WHERE user_id = $1 AND strategy_id = $2 AND status = 'EXECUTED'
+	`
+	// Note: This assumes metadata->>'buy_price' exists for SELL orders.
+
+	var pnl float64
+	err := r.db.QueryRowContext(ctx, query, userID, strategyID).Scan(&pnl)
+	if err != nil {
+		return 0, fmt.Errorf("failed to calculate realized pnl: %w", err)
+	}
+
+	return pnl, nil
 }
 
 // Close closes the database connection

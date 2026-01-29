@@ -70,7 +70,6 @@ func main() {
 	//
 	// In production this should point to the same Redis instance that
 	// data-ingestion and rules-engine use for market data and realtime
-	// PnL publishing (e.g. 15.207.203.46:6379). We make the address,
 	// password and DB configurable via environment variables so the
 	// gateway can run in different environments without code changes.
 	redisAddr := os.Getenv("REDIS_ADDR")

@@ -105,7 +105,7 @@ func (s *Server) GetUserOrders(ctx context.Context, req *pb.GetUserOrdersRequest
 
 	offset := (page - 1) * pageSize
 
-	orders, err := s.repo.GetUserOrders(ctx, req.UserId, pageSize, offset)
+	orders, err := s.repo.GetUserOrders(ctx, req.UserId, pageSize, offset, req.TradingMode)
 	if err != nil {
 		log.Printf("Failed to get user orders: %v", err)
 		return &pb.GetUserOrdersResponse{
@@ -271,6 +271,7 @@ func (s *Server) convertToProtoOrder(order *models.Order) *pb.Order {
 		Validity:       order.Validity,
 		Status:         s.convertOrderStatus(order.Status),
 		FilledQuantity: order.FilledQuantity,
+		TradingMode:    order.TradingMode,
 	}
 
 	if order.Price != nil {

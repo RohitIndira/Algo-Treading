@@ -27,11 +27,24 @@ type OrderRequest struct {
 	ImpactScore  int32     `json:"impact_score"`
 	Sentiment    string    `json:"sentiment"`
 	NewsCategory string    `json:"news_category"`
+	TradingMode  string    `json:"trading_mode"` // LIVE, PAPER
 	RiskApproved bool      `json:"risk_approved"` // Temporary: Set to true until risk-management integration
 	RiskScore    float64   `json:"risk_score"`
 	RetryCount   int       `json:"retry_count"`
 	OrderSide    string    `json:"order_side"` // BUY, SELL
 	Validity     string    `json:"validity"`   // DAY, IOC, etc.
+}
+
+// ExecutionResult represents execution result from Kafka
+type ExecutionResult struct {
+	ExecutionID   string    `json:"execution_id"`
+	OrderID       string    `json:"order_id"`
+	Status        string    `json:"status"`
+	ExecutedPrice float64   `json:"executed_price"`
+	ExecutedQty   int32     `json:"executed_quantity"`
+	BrokerOrderID string    `json:"broker_order_id"`
+	ExecutionTime time.Time `json:"execution_time"`
+	ErrorMessage  string    `json:"error_message,omitempty"`
 }
 
 // RuleMatch represents a successful rule match

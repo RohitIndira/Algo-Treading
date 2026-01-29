@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -14,24 +15,69 @@ import (
 
 // SignalProcessor processes trade signals from Kafka
 type SignalProcessor struct {
-	executor        *OrderExecutor
-	orderRepo       repository.OrderRepository
-	rabbitPublisher *publisher.RabbitMQPublisher
+	executor          *OrderExecutor
+	orderRepo         repository.OrderRepository
+	rabbitPublisher   *publisher.RabbitMQPublisher
+	paperTradeHandler *PaperTradeHandler // Add paper trade handler
 }
 
 // NewSignalProcessor creates a new trade signal processor
-func NewSignalProcessor(executor *OrderExecutor, orderRepo repository.OrderRepository, rabbitPublisher *publisher.RabbitMQPublisher) *SignalProcessor {
+func NewSignalProcessor(
+	executor *OrderExecutor,
+	orderRepo repository.OrderRepository,
+	rabbitPublisher *publisher.RabbitMQPublisher,
+	paperTradeHandler *PaperTradeHandler,
+) *SignalProcessor {
 	return &SignalProcessor{
-		executor:        executor,
-		orderRepo:       orderRepo,
-		rabbitPublisher: rabbitPublisher,
+		executor:          executor,
+		orderRepo:         orderRepo,
+		rabbitPublisher:   rabbitPublisher,
+		paperTradeHandler: paperTradeHandler,
 	}
 }
 
 // ProcessTradeSignal processes a trade signal from Kafka
 func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models.TradeSignal) error {
-	log.Printf("Processing trade signal: OrderID=%s, UserID=%s, Symbol=%s, Price=%.2f",
-		signal.OrderID, signal.UserID, signal.Symbol, signal.Price)
+	log.Printf("Processing trade signal: OrderID=%s, UserID=%s, Symbol=%s, Price=%.2f, Mode=%s",
+		signal.OrderID, signal.UserID, signal.Symbol, signal.Price, signal.TradingMode)
+
+	// SAFEGUARD: Skip processing if the signal is for PAPER trading.
+	// This prevents unintended real orders if rules-engine publishes to Kafka.
+	if strings.ToUpper(signal.TradingMode) == "PAPER" {
+		log.Printf("⏩ Processing paper trade signal: OrderID=%s (Simulated)", signal.OrderID)
+
+		// Convert signal to order for paper trading
+		order, err := p.convertSignalToOrder(signal)
+		if err != nil {
+			return fmt.Errorf("failed to convert paper signal to order: %w", err)
+		}
+
+		// For paper trading, immediately mark order as FILLED since there's no real broker execution
+		// Use signal price as the filled price
+		order.Status = models.StatusFilled
+		order.FilledQuantity = order.Quantity
+		order.FilledPrice = order.Price
+		now := time.Now()
+		order.SubmittedAt = &now
+		order.ExecutedAt = &now
+
+		// Save paper order to database
+		if err := p.orderRepo.Create(ctx, order); err != nil {
+			return fmt.Errorf("failed to save paper order: %w", err)
+		}
+
+		log.Printf("✓ Paper order %s saved to database with status FILLED", order.OrderID)
+
+		// Process paper trade (create position, track PnL, etc.)
+		if p.paperTradeHandler != nil {
+			if err := p.paperTradeHandler.ProcessPaperOrder(ctx, order); err != nil {
+				log.Printf("⚠️ Failed to process paper order: %v", err)
+				// Don't fail completely, order is still saved
+			}
+		}
+
+		return nil
+	}
 
 	// Convert TradeSignal to Order
 	order, err := p.convertSignalToOrder(signal)
@@ -125,6 +171,7 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 		RetryCount:   0,
 		CreatedAt:    now,
 		UpdatedAt:    now,
+		TradingMode:  signal.TradingMode,
 	}
 
 	log.Printf("Converted signal to order: ID=%s, Side=%s, Qty=%d, Price=%.2f",

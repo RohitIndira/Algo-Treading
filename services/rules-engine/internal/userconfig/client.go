@@ -128,6 +128,7 @@ func (c *Client) convertProtoToStrategy(protoStrategy *pb.Strategy) (*models.Str
 		UserID:       protoStrategy.UserId,
 		StrategyName: protoStrategy.StrategyName,
 		Active:       protoStrategy.Active,
+		TradingMode:  protoStrategy.TradingMode,
 	}
 
 	// Parse conditions

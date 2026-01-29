@@ -18,7 +18,7 @@ type OrderRepository interface {
 	Update(ctx context.Context, order *models.Order) error
 	GetByID(ctx context.Context, orderID uuid.UUID) (*models.Order, error)
 	GetByOdinOrderID(ctx context.Context, odinOrderID string) (*models.Order, error)
-	GetUserOrders(ctx context.Context, userID string, limit, offset int) ([]*models.Order, error)
+	GetUserOrders(ctx context.Context, userID string, limit, offset int, tradingMode ...string) ([]*models.Order, error)
 	GetOrdersByStatus(ctx context.Context, status models.OrderStatus, limit int) ([]*models.Order, error)
 	UpdateStatus(ctx context.Context, orderID uuid.UUID, status models.OrderStatus) error
 	RecordExecutionEvent(ctx context.Context, orderID uuid.UUID, eventType string, eventData map[string]interface{}) error
@@ -42,10 +42,12 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			order_type, order_side, quantity, price,
 			stop_loss, take_profit, validity,
 			status, risk_approved, risk_score,
-			retry_count, created_at, updated_at
+			retry_count, created_at, updated_at,
+			trading_mode
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-			$12, $13, $14, $15, $16, $17, $18, $19, $20
+			$12, $13, $14, $15, $16, $17, $18, $19, $20,
+			$21
 		)
 	`
 
@@ -56,6 +58,7 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 		order.StopLoss, order.TakeProfit, order.Validity,
 		order.Status, order.RiskApproved, order.RiskScore,
 		order.RetryCount, order.CreatedAt, order.UpdatedAt,
+		order.TradingMode,
 	)
 
 	if err != nil {
@@ -134,20 +137,31 @@ func (r *orderRepository) GetByOdinOrderID(ctx context.Context, odinOrderID stri
 }
 
 // GetUserOrders retrieves orders for a user with pagination
-func (r *orderRepository) GetUserOrders(ctx context.Context, userID string, limit, offset int) ([]*models.Order, error) {
+// GetUserOrders retrieves orders for a user with optional trading_mode filter
+func (r *orderRepository) GetUserOrders(ctx context.Context, userID string, limit, offset int, tradingMode ...string) ([]*models.Order, error) {
 	var orders []*models.Order
-	query := `
-		SELECT * FROM orders 
-		WHERE user_id = $1 
-		ORDER BY created_at DESC 
-		LIMIT $2 OFFSET $3
-	`
-
-	err := r.db.SelectContext(ctx, &orders, query, userID, limit, offset)
+	var query string
+	var err error
+	if len(tradingMode) > 0 && tradingMode[0] != "" {
+		query = `
+		       SELECT * FROM orders 
+		       WHERE user_id = $1 AND trading_mode = $2
+		       ORDER BY created_at DESC 
+		       LIMIT $3 OFFSET $4
+	       `
+		err = r.db.SelectContext(ctx, &orders, query, userID, tradingMode[0], limit, offset)
+	} else {
+		query = `
+		       SELECT * FROM orders 
+		       WHERE user_id = $1 
+		       ORDER BY created_at DESC 
+		       LIMIT $2 OFFSET $3
+	       `
+		err = r.db.SelectContext(ctx, &orders, query, userID, limit, offset)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user orders: %w", err)
 	}
-
 	return orders, nil
 }
 

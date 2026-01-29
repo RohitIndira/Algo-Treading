@@ -2,15 +2,15 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
+	"github.com/RohitIndira/Algo-Treading/api/proto/common"
+	pb "github.com/RohitIndira/Algo-Treading/api/proto/trade_execution"
 	"github.com/gorilla/mux"
-	"github.com/segmentio/kafka-go"
 )
 
 // TradeExecutionHandler exposes HTTP endpoints related to trade executions.
@@ -28,12 +28,10 @@ func NewTradeExecutionHandler(client *grpc_clients.TradeExecutionClient) *TradeE
 
 // ListSuccessfulUserOrders handles:
 //
-//	GET /api/v1/users/{user_id}/orders/success
+//	GET /api/v1/users/{user_id}/orders/success?page=1&page_size=20&trading_mode=PAPER
 //
-// It reads all messages from the Kafka "trade-executions" topic from the
-// beginning on each request, filters them by user_id from the path, and
-// returns the raw execution result JSONs for that user. This matches your
-// request to make this API reflect the Kafka topic directly.
+// It retrieves all orders for a user from the database via the trade-execution gRPC service.
+// Supports pagination and optional trading_mode filter (LIVE/PAPER).
 func (h *TradeExecutionHandler) ListSuccessfulUserOrders(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	userID := vars["user_id"]
@@ -42,67 +40,61 @@ func (h *TradeExecutionHandler) ListSuccessfulUserOrders(w http.ResponseWriter, 
 		return
 	}
 
-	brokersStr := os.Getenv("KAFKA_BROKERS")
-	if brokersStr == "" {
-		brokersStr = "localhost:9092"
-	}
-	parts := strings.Split(brokersStr, ",")
-	brokers := make([]string, 0, len(parts))
-	for _, b := range parts {
-		b = strings.TrimSpace(b)
-		if b != "" {
-			brokers = append(brokers, b)
+	// Parse pagination parameters
+	page := int32(1)
+	pageSize := int32(20)
+	if pageStr := r.URL.Query().Get("page"); pageStr != "" {
+		if p, err := parseInt(pageStr); err == nil && p > 0 {
+			page = int32(p)
 		}
 	}
-	if len(brokers) == 0 {
-		respondWithError(w, http.StatusInternalServerError, "No Kafka brokers configured")
+	if pageSizeStr := r.URL.Query().Get("page_size"); pageSizeStr != "" {
+		if ps, err := parseInt(pageSizeStr); err == nil && ps > 0 {
+			pageSize = int32(ps)
+		}
+	}
+
+	// Optional trading_mode filter (LIVE/PAPER)
+	tradingMode := strings.ToUpper(r.URL.Query().Get("trading_mode"))
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// Create gRPC request
+	req := &pb.GetUserOrdersRequest{
+		UserId: userID,
+		Pagination: &common.PaginationRequest{
+			Page:     page,
+			PageSize: pageSize,
+		},
+		TradingMode: tradingMode,
+	}
+
+	// Call gRPC service to get orders from database
+	resp, err := h.client.GetUserOrders(ctx, req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to retrieve orders: "+err.Error())
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-
-	// For now, we know from your Kafka UI that all messages for this
-	// environment are on partition 2 of trade-executions. To keep things
-	// simple and reliable, we read directly from that partition starting
-	// at the first offset.
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     brokers,
-		Topic:       "trade-executions",
-		Partition:   2,
-		MinBytes:    1,
-		MaxBytes:    10e6,
-		MaxWait:     500 * time.Millisecond,
-		StartOffset: kafka.FirstOffset,
-	})
-	defer reader.Close()
-
-	// Collect only executions that belong to the requested user.
-	executions := make([]map[string]any, 0)
-	maxMessages := 1000 // safety limit per request
-	for i := 0; i < maxMessages; i++ {
-		msg, err := reader.ReadMessage(ctx)
-		if err != nil {
-			// On timeout or EOF, stop reading.
-			break
+	if !resp.Success {
+		errMsg := "Failed to retrieve orders"
+		if resp.Error != nil {
+			errMsg = resp.Error.Message
 		}
-
-		var ev map[string]any
-		if err := json.Unmarshal(msg.Value, &ev); err != nil {
-			continue
-		}
-
-		// Filter by user_id from the Kafka message payload so that this endpoint
-		// only returns orders placed by the specific user in the path
-		// (e.g. /users/ISPL19027/orders/success should only return orders
-		// where user_id == "ISPL19027").
-		if evUserID, ok := ev["user_id"].(string); ok && evUserID == userID {
-			executions = append(executions, ev)
-		}
+		respondWithError(w, http.StatusInternalServerError, errMsg)
+		return
 	}
 
 	respondWithJSON(w, http.StatusOK, map[string]any{
-		"success": true,
-		"orders":  executions,
+		"success":    true,
+		"orders":     resp.Orders,
+		"pagination": resp.Pagination,
 	})
+}
+
+func parseInt(s string) (int, error) {
+	var i int
+	_, err := fmt.Sscanf(s, "%d", &i)
+	return i, err
 }

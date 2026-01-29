@@ -26,6 +26,7 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 		BatchSize:    10,
 		BatchTimeout: 10 * time.Millisecond,
 		Async:        false, // Synchronous for reliability
+		AllowAutoTopicCreation: true,
 	}
 
 	logger.Info("Kafka publisher initialized",
@@ -142,6 +143,35 @@ func (p *KafkaPublisher) PublishRealtimePortfolio(ctx context.Context, ev *model
 		zap.String("user_id", ev.UserID),
 		zap.String("strategy_id", ev.StrategyID),
 		zap.Int("positions", len(ev.Positions)))
+
+	return nil
+}
+
+// PublishExecutionResult publishes an execution result event to Kafka.
+// This is used by the simulation logic to notify the rest of the ecosystem
+// about paper trade fills.
+func (p *KafkaPublisher) PublishExecutionResult(ctx context.Context, res models.ExecutionResult) error {
+	payload, err := json.Marshal(res)
+	if err != nil {
+		return fmt.Errorf("failed to marshal execution result: %w", err)
+	}
+
+	msg := kafka.Message{
+		Key:   []byte(res.OrderID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{Key: "order_id", Value: []byte(res.OrderID)},
+			{Key: "status", Value: []byte(res.Status)},
+		},
+	}
+
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
+		return fmt.Errorf("failed to write execution result to Kafka: %w", err)
+	}
+
+	p.logger.Debug("Simulated execution result published to Kafka",
+		zap.String("order_id", res.OrderID),
+		zap.String("status", res.Status))
 
 	return nil
 }

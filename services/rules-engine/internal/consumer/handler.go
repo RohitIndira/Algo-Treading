@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cash52w"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/utils"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -30,6 +32,12 @@ type Handler struct {
 	logger        *zap.Logger
 	marketHours   *utils.MarketHours
 	enforceHours  bool
+	cash52w       *cash52w.Engine
+	executionPub  *publisher.KafkaPublisher // For simulated paper fills
+	// TradingMode is the global fallback mode (LIVE or PAPER) used when a
+	// strategy doesn't specify its own trading_mode. Typically loaded from
+	// the TRADING_MODE environment variable.
+	tradingMode   string
 }
 
 // NewHandler creates a new event handler
@@ -45,7 +53,16 @@ func NewHandler(
 	logger *zap.Logger,
 	marketHours *utils.MarketHours,
 	enforceHours bool,
+	cash52w *cash52w.Engine,
+	executionPub *publisher.KafkaPublisher,
+	tradingMode string,
 ) *Handler {
+	// Normalize trading mode to LIVE or PAPER
+	mode := strings.ToUpper(strings.TrimSpace(tradingMode))
+	if mode != "PAPER" {
+		mode = "LIVE"
+	}
+	
 	return &Handler{
 		matcher:       matcher,
 		rabbitPubl:    rabbitPubl,
@@ -58,6 +75,9 @@ func NewHandler(
 		logger:        logger,
 		marketHours:   marketHours,
 		enforceHours:  enforceHours,
+		cash52w:       cash52w,
+		executionPub:  executionPub,
+		tradingMode:   mode,
 	}
 }
 
@@ -349,6 +369,18 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		}
 	}
 
+	// Determine effective trading mode for this strategy/user.
+	// Priority: per-strategy TradingMode from user-config (via Elasticsearch),
+	// fallback to global handler.tradingMode from TRADING_MODE env variable.
+	// When mode is "PAPER" we simulate the trade (DB + Kafka + Redis) but do
+	// NOT send a real order to RabbitMQ / trade-execution.
+	mode := strings.ToUpper(strings.TrimSpace(strategy.TradingMode))
+	if mode == "" {
+		// Strategy doesn't specify a mode, use global fallback
+		mode = h.tradingMode
+	}
+	orderReq.TradingMode = mode
+
 	// 3. Publish to Kafka "trade-signals" topic
 	if h.kafkaPubl != nil {
 		if err := h.kafkaPubl.PublishTradeSignal(ctx, orderReq); err != nil {
@@ -359,17 +391,11 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		} else {
 			h.logger.Debug("Trade signal published to Kafka",
 				zap.String("order_id", orderReq.OrderID),
-				zap.String("topic", "trade-signals"))
+				zap.String("topic", "trade-signals"),
+				zap.String("mode", mode))
 		}
 	}
 
-	// Determine effective trading mode for this strategy/user.
-	// We only honour the per-strategy TradingMode coming from user-config
-	// (via Elasticsearch). When it is set to "PAPER" we simulate the
-	// trade (DB + Kafka + Redis) but do NOT send a real order to
-	// RabbitMQ / trade-execution. Any other value (including empty) is
-	// treated as LIVE.
-	mode := strings.ToUpper(strings.TrimSpace(strategy.TradingMode))
 	if mode == "PAPER" {
 		h.logger.Info("PAPER mode: simulating matched order (no RabbitMQ publish)",
 			zap.String("order_id", orderReq.OrderID),
@@ -385,6 +411,38 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			h.logger.Error("Failed to publish match event to Redis (PAPER)",
 				zap.Error(err),
 				zap.String("user_id", orderReq.UserID))
+		}
+
+		// Simulate an execution result so the strategy engines (like Cash52W or
+		// others) can update their in-memory state and track P&L/Portfolio
+		// for this paper trade.
+		simResult := models.ExecutionResult{
+			ExecutionID:   uuid.New().String(),
+			OrderID:       orderReq.OrderID,
+			Status:        "FILLED",
+			ExecutedPrice: orderReq.Price,
+			ExecutedQty:   orderReq.Quantity,
+			ExecutionTime: time.Now(),
+		}
+
+		// Update repository so UI/History shows the paper trade as executed
+		if h.signalRepo != nil {
+			_ = h.signalRepo.UpdateSignalStatus(ctx, simResult.OrderID, "FILLED", simResult.ExecutedPrice, "PAPER_BROKER", "")
+		}
+
+		// Notify Cash52W engine if this order belongs to it
+		if h.cash52w != nil && orderReq.StrategyID == "CASH_52W_HIGH" {
+			h.cash52w.HandleExecution(ctx, simResult)
+		}
+
+		// Publish simulated execution to Kafka "trade-executions" topic so that
+		// the Order API (Gateway) and other services see this paper trade.
+		if h.executionPub != nil {
+			if err := h.executionPub.PublishExecutionResult(ctx, simResult); err != nil {
+				h.logger.Error("Failed to publish simulated execution result to Kafka",
+					zap.Error(err),
+					zap.String("order_id", simResult.OrderID))
+			}
 		}
 
 		// Do not count this as a real order sent to the broker.

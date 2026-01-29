@@ -62,6 +62,9 @@ type Order struct {
 	Exchange Exchange `json:"exchange" db:"exchange"`
 	Symbol   string   `json:"symbol" db:"symbol"`
 
+	// Trading mode: "LIVE" or "PAPER"
+	TradingMode string `json:"trading_mode" db:"trading_mode"`
+
 	// Order details
 	OrderType OrderType `json:"order_type" db:"order_type"`
 	OrderSide OrderSide `json:"order_side" db:"order_side"`

@@ -1,929 +1,341 @@
-# Rules Engine Service - Knowledge Transfer Document
+# Rules Engine Service - Knowledge Transfer Documentation
 
-## 📋 Table of Contents
-
+## Table of Contents
 1. [Overview](#overview)
-2. [Architecture & Design](#architecture--design)
-3. [Project Structure](#project-structure)
-4. [Core Components](#core-components)
-5. [Matching Algorithm](#matching-algorithm)
-6. [Elasticsearch Integration](#elasticsearch-integration)
-7. [Redis Caching](#redis-caching)
-8. [Message Processing](#message-processing)
-9. [Configuration](#configuration)
-10. [Setup & Deployment](#setup--deployment)
-11. [Performance Optimization](#performance-optimization)
-12. [Monitoring & Metrics](#monitoring--metrics)
-13. [Troubleshooting](#troubleshooting)
+2. [Architecture](#architecture)
+3. [Core Components](#core-components)
+4. [Matching Logic](#matching-logic)
+5. [Data Flow](#data-flow)
+6. [Configuration](#configuration)
+7. [Elasticsearch Integration](#elasticsearch-integration)
+8. [Setup & Deployment](#setup--deployment)
+9. [Testing](#testing)
+10. [Monitoring & Troubleshooting](#monitoring--troubleshooting)
 
 ---
 
-## Overview
+## 1. Overview
 
 ### Purpose
-The Rules Engine Service is the **core intelligence** of the algorithmic trading system. It matches incoming market events (news, announcements) against thousands of user-defined trading strategies in real-time and generates trading signals when matches are found.
+The **Rules Engine Service** is the "brain" of the algorithmic trading system. It is responsible for evaluating real-time market events (news, price breakouts) against thousands of user-defined trading strategies to generate actionable trade signals.
 
 ### Key Responsibilities
-- **Real-time Event Processing**: Consume market events from Kafka
-- **Strategy Matching**: Match events against 10,000+ user strategies using Elasticsearch
-- **Condition Evaluation**: Evaluate complex matching conditions with configurable weights
-- **Order Generation**: Create order requests when strategies match
-- **Signal Publishing**: Publish matched orders to RabbitMQ for execution
-- **Performance Optimization**: High-throughput, low-latency processing
+- **Event Processing**: Consumes high-velocity market data and news events.
+- **Strategy Indexing**: Maintains a searchable index of active user strategies in Elasticsearch.
+- **Pattern Matching**: Matches incoming events against strategies in near real-time.
+- **Signal Generation**: Produces `TradeSignal` events for the Trade Execution Service.
+- **State Management**: Uses Redis to prevent duplicate signals and manage state.
+- **52-Week High/Low Engine**: Specialized engine for tracking and acting on 52-week breakout events.
 
 ### Technology Stack
-- **Language**: Go 1.23+
-- **Message Queue**: Apache Kafka (input), RabbitMQ (output)
-- **Search Engine**: Elasticsearch 8.x
-- **Cache**: Redis
-- **Database**: PostgreSQL
-- **RPC**: gRPC
-
-### Performance Characteristics
-- **Throughput**: 1000+ events/hour
-- **Latency**: <100ms matching (p95)
-- **Concurrency**: 50+ worker goroutines
-- **Strategy Capacity**: 10,000+ active strategies
+- **Language**: Go 1.21+
+- **Search Engine**: Elasticsearch 8.x (Strategy indexing and reverse search)
+- **Cache**: Redis (Deduplication, state tracking)
+- **Message Queue**: Kafka (Input: events/configs, Output: signals)
+- **Protocol**: gRPC (Port 9003)
 
 ---
 
-## Architecture & Design
+## 2. Architecture
 
-### High-Level Architecture
+### High-Level Design
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  Rules Engine Service                        │
-│                     (Port 9003)                              │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌──────────────┐    ┌────────────────┐    ┌────────────┐  │
-│  │   Kafka      │───▶│  Event Handler │───▶│  Matcher   │  │
-│  │  Consumer    │    │                │    │  Engine    │  │
-│  └──────────────┘    └────────────────┘    └──────┬─────┘  │
-│         ↑                                          │         │
-│         │                                          ▼         │
-│    news-events                            ┌────────────────┐│
-│      topic                                │ Elasticsearch  ││
-│                                           │ Query Builder  ││
-│                                           └────────┬───────┘│
-│                                                    │         │
-│                                                    ▼         │
-│                                           ┌────────────────┐│
-│                                           │  Strategy      ││
-│                                           │  Cache (Redis) ││
-│                                           └────────┬───────┘│
-│                                                    │         │
-│                                                    ▼         │
-│                                           ┌────────────────┐│
-│                                           │  Condition     ││
-│                                           │  Evaluator     ││
-│                                           └────────┬───────┘│
-│                                                    │         │
-│                                                    ▼         │
-│                                           ┌────────────────┐│
-│  ┌──────────────┐                        │  Match Scorer  ││
-│  │  RabbitMQ    │◀───────────────────────┤                ││
-│  │  Publisher   │    Order Requests      └────────────────┘│
-│  └──────────────┘                                           │
-│         │                                                    │
-└─────────┼────────────────────────────────────────────────────┘
-          │
-          ▼
-  trade.executions queue
-          │
-          ▼
-  ┌──────────────────┐
-  │  Trade Execution │
-  │     Service      │
-  └──────────────────┘
+```mermaid
+graph TD
+    subgraph Inputs
+        K1[Kafka: news-events]
+        K2[Kafka: user-configs]
+        K3[Kafka: market.data.52w_breakouts]
+    end
+
+    subgraph "Rules Engine Service"
+        C1[Event Consumer]
+        C2[Config Consumer]
+        
+        SM[Strategy Manager]
+        ES[(Elasticsearch)]
+        
+        ME[Matching Engine]
+        RC[(Redis Cache)]
+        
+        SP[Signal Publisher]
+    end
+
+    subgraph Outputs
+        K4[Kafka: trade-signals]
+        K5[Kafka: portfolio.allocations]
+    end
+
+    K1 --> C1
+    K3 --> C1
+    K2 --> C2
+    
+    C2 --> SM
+    SM --> ES
+    
+    C1 --> ME
+    ME <--> ES
+    ME <--> RC
+    
+    ME --> SP
+    SP --> K4
+    SP --> K5
 ```
 
-### Data Flow
-
-```
-1. Market Event (Kafka) → Rules Engine
-2. Parse Event → Extract key fields
-3. Build Elasticsearch Query → Search matching strategies
-4. For each matched strategy:
-   a. Load from cache or DB
-   b. Evaluate conditions (keywords, sentiment, impact score)
-   c. Calculate match score
-   d. If score >= threshold → Generate order
-5. Publish Order to RabbitMQ
-6. Update metrics and logs
-```
-
-### Component Interaction
-
-```
-┌─────────────┐
-│ Kafka Event │
-└──────┬──────┘
-       │
-       ▼
-┌────────────────┐
-│ Event Handler  │  ← Validates, parses event
-└──────┬─────────┘
-       │
-       ▼
-┌────────────────┐
-│ Matcher Engine │  ← Core matching logic
-└──────┬─────────┘
-       │
-       ├─→ Elasticsearch ← Find candidate strategies
-       │
-       ├─→ Redis Cache    ← Fast strategy lookup
-       │
-       ├─→ PostgreSQL     ← Fallback, full strategy data
-       │
-       └─→ Evaluator      ← Score matches
-              │
-              ▼
-       ┌──────────────┐
-       │ RabbitMQ     │  ← Publish orders
-       └──────────────┘
-```
+### Design Patterns
+- **Reverse Search (Percolation-style)**: Instead of searching for data, we index "queries" (strategies) and match "documents" (events) against them.
+- **Event-Driven Architecture**: Fully decoupled via Kafka.
+- **Worker Pool**: Concurrent processing of incoming events.
+- **Optimistic Concurrency**: Handling strategy updates.
 
 ---
 
-## Project Structure
+## 3. Core Components
 
-```
-services/rules-engine/
-├── cmd/
-│   └── main.go                          # Entry point
-├── config/
-│   └── config.go                        # Configuration loader
-├── internal/
-│   ├── consumer/
-│   │   ├── consumer.go                  # Kafka consumer
-│   │   └── handler.go                   # Event handler
-│   ├── matcher/
-│   │   ├── matcher.go                   # Core matching engine
-│   │   ├── evaluator.go                 # Condition evaluator
-│   │   └── scorer.go                    # Match scorer
-│   ├── index/
-│   │   ├── indexer.go                   # Elasticsearch indexer
-│   │   └── query_builder.go             # ES query builder
-│   ├── cache/
-│   │   ├── redis_cache.go               # Redis cache
-│   │   └── strategy_cache.go            # Strategy caching
-│   ├── publisher/
-│   │   ├── publisher.go                 # RabbitMQ publisher
-│   │   └── circuit_breaker.go           # Circuit breaker
-│   ├── repository/
-│   │   └── strategy_repository.go       # Database access
-│   ├── userconfig/
-│   │   └── grpc_client.go               # User Config gRPC client
-│   ├── sync/
-│   │   └── strategy_sync.go             # Strategy synchronization
-│   └── models/
-│       ├── event.go                     # Event models
-│       ├── strategy.go                  # Strategy models
-│       └── match.go                     # Match result models
-├── migrations/
-│   └── 001_create_trade_signals.sql     # Database schema
-├── .env                                 # Environment config
-├── go.mod                               # Dependencies
-└── README.md                            # Documentation
-```
+### 3.1 Strategy Manager
+**Purpose**: Ensures the Elasticsearch index is in sync with the PostgreSQL database (source of truth).
+- Listens to `user-configs` topic.
+- Handles `CREATE`, `UPDATE`, `DELETE`, `ACTIVATE`, `DEACTIVATE` events.
+- Normalizes data (e.g., converting "NSE" to standard format) before indexing.
+
+### 3.2 Event Consumer
+**Purpose**: Ingests market data.
+- **News Consumer**: Listens to `news-events`. Payload includes sentiment, impact score, and tickers.
+- **Breakout Consumer**: Listens to `market.data.52w_breakouts`. Payload includes stock code, breakout type, and price.
+
+### 3.3 Matching Engine
+**Purpose**: The core logic that queries Elasticsearch.
+- Constructs dynamic queries based on event attributes.
+- Example: "Find all active strategies where `stock_code` matches event OR `stock_code` is ALL, AND `sentiment` matches event, AND `impact_score` <= event score."
+
+### 3.4 Signal Publisher
+**Purpose**: Formats and sends trade signals.
+- Topic: `trade-signals`
+- Ensures signals adhere to the schema required by Trade Execution Service.
 
 ---
 
-## Core Components
+## 4. Matching Logic
 
-### 1. Main Application (`cmd/main.go`)
-
-**Purpose:** Bootstrap and dependency injection.
-
-```go
-func main() {
-    // 1. Load configuration
-    cfg := config.Load()
-    
-    // 2. Initialize dependencies
-    db := initPostgreSQL(cfg)
-    esClient := initElasticsearch(cfg)
-    redisClient := initRedis(cfg)
-    rabbitMQ := initRabbitMQ(cfg)
-    
-    // 3. Create components
-    cache := cache.NewStrategyCache(redisClient)
-    repo := repository.NewStrategyRepository(db)
-    indexer := index.NewElasticsearchIndexer(esClient)
-    publisher := publisher.NewRabbitMQPublisher(rabbitMQ)
-    
-    // 4. Create matcher
-    matcher := matcher.NewMatcher(indexer, cache, repo, publisher)
-    
-    // 5. Create event handler
-    handler := consumer.NewEventHandler(matcher)
-    
-    // 6. Start Kafka consumer
-    kafkaConsumer := consumer.NewKafkaConsumer(cfg, handler)
-    kafkaConsumer.Start()
-    
-    // 7. Start gRPC server (for health checks, admin)
-    grpcServer := server.NewGRPCServer(matcher, cache)
-    go grpcServer.Start(cfg.GRPCPort)
-    
-    // 8. Wait for shutdown
-    <-shutdown
-    gracefulShutdown(kafkaConsumer, grpcServer, db, esClient)
+### News Event Matching
+When a news event arrives:
+```json
+{
+  "stock_code": 12345,
+  "sentiment": "POSITIVE",
+  "impact_score": 8,
+  "category": "EARNINGS"
 }
 ```
 
-### 2. Kafka Consumer (`internal/consumer/consumer.go`)
+The engine queries Elasticsearch for strategies that:
+1. Are **Active** (`active: true`).
+2. Target this **Stock** OR all stocks.
+3. Accept **POSITIVE** sentiment.
+4. Have a minimum impact score threshold **<= 8**.
+5. Include the category **EARNINGS**.
 
-**Purpose:** Consume market events from Kafka.
-
-```go
-type KafkaConsumer struct {
-    consumer *kafka.Consumer
-    handler  *EventHandler
-    config   *config.Config
-}
-
-func (c *KafkaConsumer) Start() {
-    // Subscribe to topic
-    c.consumer.SubscribeTopics([]string{c.config.KafkaTopicNews}, nil)
-    
-    // Start worker pool
-    workers := make(chan *kafka.Message, c.config.WorkerPoolSize)
-    for i := 0; i < c.config.WorkerPoolSize; i++ {
-        go c.worker(workers)
-    }
-    
-    // Consume messages
-    for {
-        msg, err := c.consumer.ReadMessage(-1)
-        if err != nil {
-            log.Printf("Consumer error: %v", err)
-            continue
-        }
-        
-        workers <- msg
-    }
-}
-
-func (c *KafkaConsumer) worker(messages <-chan *kafka.Message) {
-    for msg := range messages {
-        // Process message
-        if err := c.handler.HandleEvent(msg.Value); err != nil {
-            log.Printf("Handler error: %v", err)
-            continue
-        }
-        
-        // Commit offset
-        c.consumer.CommitMessage(msg)
-    }
-}
-```
-
-### 3. Event Handler (`internal/consumer/handler.go`)
-
-**Purpose:** Parse and validate incoming events.
-
-```go
-type EventHandler struct {
-    matcher *matcher.Matcher
-}
-
-func (h *EventHandler) HandleEvent(data []byte) error {
-    // 1. Parse event
-    var event models.NewsEvent
-    if err := json.Unmarshal(data, &event); err != nil {
-        return fmt.Errorf("failed to parse event: %w", err)
-    }
-    
-    // 2. Validate event
-    if err := h.validateEvent(&event); err != nil {
-        return fmt.Errorf("invalid event: %w", err)
-    }
-    
-    // 3. Extract Extended JSON MongoDB document
-    extJSON := event.FullDocument
-    if extJSON == nil {
-        return errors.New("missing full_document")
-    }
-    
-    // 4. Send to matcher
-    matches, err := h.matcher.MatchEvent(extJSON)
-    if err != nil {
-        return fmt.Errorf("matching error: %w", err)
-    }
-    
-    log.Printf("Event matched %d strategies", len(matches))
-    return nil
-}
-
-func (h *EventHandler) validateEvent(event *models.NewsEvent) error {
-    if event.Title == "" {
-        return errors.New("missing title")
-    }
-    if event.Timestamp.IsZero() {
-        return errors.New("missing timestamp")
-    }
-    return nil
-}
-```
-
-### 4. Matcher Engine (`internal/matcher/matcher.go`)
-
-**Purpose:** Core matching logic.
-
-```go
-type Matcher struct {
-    indexer   *index.ElasticsearchIndexer
-    cache     *cache.StrategyCache
-    repo      *repository.StrategyRepository
-    publisher *publisher.RabbitMQPublisher
-    evaluator *Evaluator
-}
-
-func (m *Matcher) MatchEvent(event map[string]interface{}) ([]models.Match, error) {
-    // 1. Extract key fields from event
-    keywords := extractKeywords(event)
-    stockCodes := extractStockCodes(event)
-    sentiment := extractSentiment(event)
-    impactScore := extractImpactScore(event)
-    
-    // 2. Build Elasticsearch query
-    query := m.buildMatchQuery(keywords, stockCodes, sentiment)
-    
-    // 3. Search Elasticsearch
-    strategyIDs, err := m.indexer.Search(query)
-    if err != nil {
-        return nil, fmt.Errorf("ES search failed: %w", err)
-    }
-    
-    log.Printf("Found %d candidate strategies", len(strategyIDs))
-    
-    // 4. Load strategies (cache first, DB fallback)
-    strategies := m.loadStrategies(strategyIDs)
-    
-    // 5. Evaluate each strategy
-    var matches []models.Match
-    for _, strategy := range strategies {
-        score := m.evaluator.Evaluate(strategy, event)
-        
-        // 6. Check if match threshold met
-        if score >= m.config.MatchThreshold {
-            match := models.Match{
-                StrategyID:  strategy.StrategyID,
-                UserID:      strategy.UserID,
-                Event:       event,
-                Score:       score,
-                MatchedAt:   time.Now(),
-            }
-            
-            matches = append(matches, match)
-            
-            // 7. Generate and publish order
-            m.publishOrder(strategy, event, match)
-        }
-    }
-    
-    return matches, nil
-}
-
-func (m *Matcher) loadStrategies(strategyIDs []string) []*models.Strategy {
-    var strategies []*models.Strategy
-    
-    for _, id := range strategyIDs {
-        // Try cache first
-        strategy, err := m.cache.Get(id)
-        if err == nil {
-            strategies = append(strategies, strategy)
-            continue
-        }
-        
-        // Fallback to database
-        strategy, err = m.repo.GetByID(context.Background(), id)
-        if err != nil {
-            log.Printf("Failed to load strategy %s: %v", id, err)
-            continue
-        }
-        
-        // Update cache
-        m.cache.Set(id, strategy, 1*time.Hour)
-        strategies = append(strategies, strategy)
-    }
-    
-    return strategies
-}
-```
-
-### 5. Condition Evaluator (`internal/matcher/evaluator.go`)
-
-**Purpose:** Evaluate matching conditions and calculate scores.
-
-```go
-type Evaluator struct {
-    weights MatchWeights
-}
-
-type MatchWeights struct {
-    KeywordMatch    float64  // 0.3
-    SentimentMatch  float64  // 0.2
-    ImpactScore     float64  // 0.3
-    StockCodeMatch  float64  // 0.2
-}
-
-func (e *Evaluator) Evaluate(strategy *models.Strategy, event map[string]interface{}) float64 {
-    var score float64
-    
-    // 1. Keyword matching
-    keywordScore := e.evaluateKeywords(strategy.NewsConfig.Keywords, event)
-    score += keywordScore * e.weights.KeywordMatch
-    
-    // 2. Sentiment matching
-    sentimentScore := e.evaluateSentiment(strategy.NewsConfig.Sentiment, event)
-    score += sentimentScore * e.weights.SentimentMatch
-    
-    // 3. Impact score matching
-    impactScoreMatch := e.evaluateImpactScore(strategy.NewsConfig.MinImpactScore, event)
-    score += impactScoreMatch * e.weights.ImpactScore
-    
-    // 4. Stock code matching
-    stockCodeScore := e.evaluateStockCodes(strategy.NewsConfig.StockCodes, event)
-    score += stockCodeScore * e.weights.StockCodeMatch
-    
-    return score
-}
-
-func (e *Evaluator) evaluateKeywords(keywords []string, event map[string]interface{}) float64 {
-    title, _ := event["title"].(string)
-    content, _ := event["content"].(string)
-    combined := strings.ToLower(title + " " + content)
-    
-    matchedCount := 0
-    for _, keyword := range keywords {
-        if strings.Contains(combined, strings.ToLower(keyword)) {
-            matchedCount++
-        }
-    }
-    
-    if len(keywords) == 0 {
-        return 0
-    }
-    
-    return float64(matchedCount) / float64(len(keywords))
-}
-
-func (e *Evaluator) evaluateSentiment(expectedSentiment string, event map[string]interface{}) float64 {
-    actualSentiment, _ := event["sentiment"].(string)
-    
-    if strings.ToUpper(expectedSentiment) == strings.ToUpper(actualSentiment) {
-        return 1.0
-    }
-    return 0.0
-}
-
-func (e *Evaluator) evaluateImpactScore(minScore float64, event map[string]interface{}) float64 {
-    impactScore, _ := event["impact_score"].(float64)
-    
-    if impactScore >= minScore {
-        // Normalize to 0-1 range
-        return (impactScore - minScore) / (10.0 - minScore)
-    }
-    return 0.0
-}
-```
-
-### 6. Elasticsearch Indexer (`internal/index/indexer.go`)
-
-**Purpose:** Index strategies and build search queries.
-
-**Indexing:**
-```go
-func (idx *ElasticsearchIndexer) IndexStrategy(strategy *models.Strategy) error {
-    // Build index document
-    doc := map[string]interface{}{
-        "strategy_id": strategy.StrategyID,
-        "user_id":     strategy.UserID,
-        "keywords":    strategy.NewsConfig.Keywords,
-        "sentiment":   strategy.NewsConfig.Sentiment,
-        "stock_codes": strategy.NewsConfig.StockCodes,
-        "min_impact":  strategy.NewsConfig.MinImpactScore,
-        "is_active":   strategy.IsActive,
-        "indexed_at":  time.Now(),
-    }
-    
-    // Index in Elasticsearch
-    req := esapi.IndexRequest{
-        Index:      "strategies",
-        DocumentID: strategy.StrategyID,
-        Body:       esutil.NewJSONReader(doc),
-        Refresh:    "true",
-    }
-    
-    res, err := req.Do(context.Background(), idx.client)
-    if err != nil {
-        return err
-    }
-    defer res.Body.Close()
-    
-    if res.IsError() {
-        return fmt.Errorf("ES index error: %s", res.Status())
-    }
-    
-    return nil
-}
-```
-
-**Query Building:**
-```go
-func (idx *ElasticsearchIndexer) buildMatchQuery(keywords []string, stockCodes []int, sentiment string) map[string]interface{} {
-    // Build bool query
-    query := map[string]interface{}{
-        "query": map[string]interface{}{
-            "bool": map[string]interface{}{
-                "must": []interface{}{
-                    // Must be active
-                    map[string]interface{}{
-                        "term": map[string]interface{}{
-                            "is_active": true,
-                        },
-                    },
-                },
-                "should": []interface{}{
-                    // Match keywords
-                    map[string]interface{}{
-                        "terms": map[string]interface{}{
-                            "keywords": keywords,
-                        },
-                    },
-                    // Match stock codes
-                    map[string]interface{}{
-                        "terms": map[string]interface{}{
-                            "stock_codes": stockCodes,
-                        },
-                    },
-                },
-                "filter": []interface{}{
-                    // Filter by sentiment if specified
-                    map[string]interface{}{
-                        "term": map[string]interface{}{
-                            "sentiment": sentiment,
-                        },
-                    },
-                },
-                "minimum_should_match": 1,
-            },
-        },
-        "size": 1000,  // Max strategies to return
-    }
-    
-    return query
-}
-```
-
-### 7. Redis Cache (`internal/cache/strategy_cache.go`)
-
-**Purpose:** Cache frequently accessed strategies.
-
-```go
-type StrategyCache struct {
-    client *redis.Client
-    ttl    time.Duration
-}
-
-func (c *StrategyCache) Get(strategyID string) (*models.Strategy, error) {
-    key := fmt.Sprintf("strategy:%s", strategyID)
-    
-    data, err := c.client.Get(context.Background(), key).Bytes()
-    if err != nil {
-        return nil, err
-    }
-    
-    var strategy models.Strategy
-    if err := json.Unmarshal(data, &strategy); err != nil {
-        return nil, err
-    }
-    
-    return &strategy, nil
-}
-
-func (c *StrategyCache) Set(strategyID string, strategy *models.Strategy, ttl time.Duration) error {
-    key := fmt.Sprintf("strategy:%s", strategyID)
-    
-    data, err := json.Marshal(strategy)
-    if err != nil {
-        return err
-    }
-    
-    return c.client.Set(context.Background(), key, data, ttl).Err()
-}
-
-func (c *StrategyCache) Delete(strategyID string) error {
-    key := fmt.Sprintf("strategy:%s", strategyID)
-    return c.client.Del(context.Background(), key).Err()
-}
-
-func (c *StrategyCache) Clear() error {
-    // Clear all strategy keys
-    keys, err := c.client.Keys(context.Background(), "strategy:*").Result()
-    if err != nil {
-        return err
-    }
-    
-    if len(keys) > 0 {
-        return c.client.Del(context.Background(), keys...).Err()
-    }
-    
-    return nil
-}
-```
-
-### 8. RabbitMQ Publisher (`internal/publisher/publisher.go`)
-
-**Purpose:** Publish order requests to RabbitMQ.
-
-```go
-type RabbitMQPublisher struct {
-    conn          *amqp.Connection
-    channel       *amqp.Channel
-    exchange      string
-    routingKey    string
-    circuitBreaker *CircuitBreaker
-}
-
-func (p *RabbitMQPublisher) PublishOrder(order *models.OrderRequest) error {
-    // Check circuit breaker
-    if !p.circuitBreaker.Allow() {
-        return errors.New("circuit breaker open")
-    }
-    
-    // Marshal order
-    orderJSON, err := json.Marshal(order)
-    if err != nil {
-        return err
-    }
-    
-    // Publish message
-    err = p.channel.Publish(
-        p.exchange,    // exchange
-        p.routingKey,  // routing key
-        false,         // mandatory
-        false,         // immediate
-        amqp.Publishing{
-            ContentType:  "application/json",
-            DeliveryMode: amqp.Persistent,
-            Body:         orderJSON,
-            Headers: amqp.Table{
-                "user_id":     order.UserID,
-                "strategy_id": order.StrategyID,
-                "event_id":    order.EventID,
-            },
-        },
-    )
-    
-    // Update circuit breaker
-    if err != nil {
-        p.circuitBreaker.RecordFailure()
-        return err
-    }
-    
-    p.circuitBreaker.RecordSuccess()
-    return nil
-}
-```
+### 52-Week Breakout Matching
+When a breakout event arrives:
+1. Checks Redis for existing positions/signals to avoid duplicates.
+2. Queries strategies configured for "Technical/Breakout" triggers.
+3. Validates against risk parameters (e.g., is the stock in F&O ban?).
 
 ---
 
-## Matching Algorithm
+## 5. Data Flow
 
-### Algorithm Steps
+### Strategy Update Flow
+1. **User** creates strategy in Frontend.
+2. **User Config Service** saves to DB and publishes to `user-configs`.
+3. **Rules Engine** consumes `user-configs`.
+4. **Strategy Manager** updates `trading-strategies` index in Elasticsearch.
 
-1. **Event Ingestion**
-   - Receive event from Kafka
-   - Parse Extended JSON document
-   - Extract key fields (title, keywords, sentiment, impact_score, stock_codes)
-
-2. **Candidate Selection (Elasticsearch)**
-   - Build boolean query with keywords, stock codes, sentiment
-   - Search Elasticsearch index
-   - Return strategy IDs that match basic criteria
-
-3. **Strategy Loading**
-   - Check Redis cache for each strategy
-   - If not in cache, load from PostgreSQL
-   - Update cache with loaded strategy
-
-4. **Detailed Evaluation**
-   - For each candidate strategy:
-     - Calculate keyword match score
-     - Calculate sentiment match score
-     - Calculate impact score match
-     - Calculate stock code match score
-     - Weighted sum = total score
-
-5. **Threshold Check**
-   - If total score >= threshold (e.g., 0.7)
-   - Generate order request
-
-6. **Order Publishing**
-   - Create OrderRequest message
-   - Publish to RabbitMQ
-   - Publish match event to Redis (for WebSocket)
-
-### Scoring Example
-
-```
-Strategy: "Apple Earnings Play"
-- Keywords: ["Apple", "AAPL", "earnings"]
-- Sentiment: POSITIVE
-- Min Impact Score: 7
-- Stock Codes: [2885]
-
-Event: "Apple reports record Q4 earnings, stock surges"
-- Title/Content contains: Apple, earnings
-- Sentiment: POSITIVE
-- Impact Score: 9
-- Stock Codes: [2885]
-
-Calculation:
-- Keyword Match: 2/3 = 0.67 → 0.67 * 0.3 = 0.20
-- Sentiment Match: 1.0 → 1.0 * 0.2 = 0.20
-- Impact Score: (9-7)/(10-7) = 0.67 → 0.67 * 0.3 = 0.20
-- Stock Code Match: 1.0 → 1.0 * 0.2 = 0.20
-
-Total Score: 0.20 + 0.20 + 0.20 + 0.20 = 0.80
-
-Result: MATCH (score 0.80 >= threshold 0.70)
-```
+### Trade Signal Flow
+1. **Data Ingestion** detects news, publishes to `news-events`.
+2. **Rules Engine** consumes event.
+3. **Matcher** queries Elasticsearch for matching strategies.
+4. **Elasticsearch** returns List of Strategy IDs.
+5. **Rules Engine** iterates through matches:
+   - Checks Redis (deduplication: "Has this strategy already traded this event?").
+   - Generates `TradeSignal` object.
+6. **Signal Publisher** pushes to `trade-signals`.
+7. **Trade Execution Service** consumes signal.
 
 ---
 
-## Configuration
+## 6. Configuration
 
 ### Environment Variables
+**File**: `.env` or `config.yaml`
 
 ```bash
-# Service Configuration
-SERVICE_NAME=rules-engine
-SERVICE_VERSION=1.0.0
+# Server
 GRPC_PORT=9003
-ENVIRONMENT=production
-
-# Kafka Consumer
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-KAFKA_GROUP_ID=rules-engine-group
-KAFKA_TOPIC_NEWS=news-events
-KAFKA_AUTO_OFFSET_RESET=earliest
+LOG_LEVEL=info
 
 # Elasticsearch
 ELASTICSEARCH_URL=http://localhost:9200
-ELASTICSEARCH_INDEX=strategies
-ELASTICSEARCH_USERNAME=elastic
-ELASTICSEARCH_PASSWORD=changeme
+ES_INDEX_STRATEGIES=trading-strategies
 
-# Redis Cache
+# Kafka
+KAFKA_BROKERS=localhost:9092
+KAFKA_GROUP_ID=rules-engine-group
+TOPIC_NEWS_EVENTS=news-events
+TOPIC_USER_CONFIGS=user-configs
+TOPIC_TRADE_SIGNALS=trade-signals
+TOPIC_52W_BREAKOUTS=market.data.52w_breakouts
+
+# Redis
 REDIS_ADDR=localhost:6379
 REDIS_PASSWORD=
 REDIS_DB=0
-REDIS_CACHE_TTL=3600
-
-# RabbitMQ Publisher
-RABBITMQ_URL=amqp://guest:guest@localhost:5672/
-RABBITMQ_EXCHANGE=trade.execution
-RABBITMQ_ROUTING_KEY=order.new
-RABBITMQ_QUEUE=trade.executions
-
-# PostgreSQL
-DATABASE_URL=postgresql://trading_user:postgres@localhost:5432/trading_system
-
-# Performance
-WORKER_POOL_SIZE=50
-MATCH_THRESHOLD=0.70
-BATCH_SIZE=100
-
-# Logging
-LOG_LEVEL=INFO
-LOG_FORMAT=json
 ```
 
 ---
 
-## Setup & Deployment
+## 7. Elasticsearch Integration
 
-### Prerequisites
+### Index Mapping (`trading-strategies`)
+The index is optimized for filtering.
 
-```bash
-# 1. Kafka
-docker run -d --name kafka -p 9092:9092 apache/kafka:latest
-
-# 2. Elasticsearch
-docker run -d --name elasticsearch -p 9200:9200 -e "discovery.type=single-node" elasticsearch:8.11.0
-
-# 3. Redis
-docker run -d --name redis -p 6379:6379 redis:latest
-
-# 4. RabbitMQ
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
-
-# 5. PostgreSQL
-docker run -d --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:15
-```
-
-### Running the Service
-
-```bash
-# 1. Navigate to service
-cd services/rules-engine
-
-# 2. Install dependencies
-go mod download
-
-# 3. Setup database
-psql -d trading_system -f migrations/001_create_trade_signals.sql
-
-# 4. Configure environment
-cp .env.example .env
-# Edit .env
-
-# 5. Build and run
-go build -o bin/rules-engine cmd/main.go
-./bin/rules-engine
-```
-
----
-
-## Performance Optimization
-
-### 1. Elasticsearch Optimization
-- Use bulk indexing for initial load
-- Shard index by user_id
-- Replicate for read scaling
-- Use query cache
-
-### 2. Redis Caching
-- Cache hot strategies (frequently matched)
-- Use TTL to prevent stale data
-- Implement cache warming
-
-### 3. Worker Pool
-- Adjust pool size based on CPU cores
-- Monitor queue depth
-- Use bounded channels
-
-### 4. Circuit Breaker
-- Prevent cascade failures
-- Auto-recovery after timeout
-- Monitor failure rates
-
----
-
-## Monitoring & Metrics
-
-### Key Metrics
-
-```go
-type Metrics struct {
-    EventsProcessed     prometheus.Counter
-    EventsMatched       prometheus.Counter
-    MatchingLatency     prometheus.Histogram
-    ElasticsearchErrors prometheus.Counter
-    CacheHitRate        prometheus.Gauge
-    ActiveWorkers       prometheus.Gauge
+```json
+{
+  "mappings": {
+    "properties": {
+      "strategy_id": { "type": "keyword" },
+      "user_id": { "type": "keyword" },
+      "active": { "type": "boolean" },
+      "exchange": { "type": "keyword" },
+      "stock_codes": { "type": "long" },
+      "sentiments": { "type": "keyword" },
+      "categories": { "type": "keyword" },
+      "impact_score_min": { "type": "integer" },
+      "created_at": { "type": "date" }
+    }
+  }
 }
 ```
 
-### Health Checks
+### Maintenance Scripts
+Located in `scripts/`:
 
-```bash
-# gRPC health check
-grpcurl -plaintext localhost:9003 grpc.health.v1.Health/Check
+1. **`check_elasticsearch_index.sh`**:
+   - Verifies index existence, health, and document count.
+   - Checks mapping validity.
+   - Compares counts with PostgreSQL (if available).
 
-# Metrics endpoint
-curl http://localhost:9003/metrics
+2. **`reindex_strategies.sh`**:
+   - **Critical for recovery**.
+   - Deletes the existing index.
+   - Triggers the Rules Engine to reload all strategies from the database (requires service restart or API trigger).
+   - Normalizes data formats (e.g., fixing `EXCHANGE_NSE` -> `NSE`).
+
+---
+
+## 8. Setup & Deployment
+
+### Local Development
+
+1. **Prerequisites**:
+   - Elasticsearch running on port 9200.
+   - Redis running on port 6379.
+   - Kafka running on port 9092.
+
+2. **Run Service**:
+   ```bash
+   cd services/rules-engine
+   go mod download
+   go run cmd/main.go
+   ```
+
+3. **Verify Startup**:
+   - Check logs for "Connected to Elasticsearch".
+   - Check logs for "Kafka consumer started".
+
+### Docker Deployment
+
+```yaml
+  rules-engine:
+    build: ./services/rules-engine
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - KAFKA_BROKERS=kafka:9092
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      - elasticsearch
+      - kafka
+      - redis
 ```
 
 ---
 
-## Troubleshooting
+## 9. Testing
 
-### Common Issues
+### Unit Tests
+```bash
+go test ./internal/matcher/...
+go test ./internal/strategy/...
+```
 
-#### 1. High Latency
-- Check Elasticsearch performance
-- Verify cache hit rate
-- Review worker pool size
+### Integration Test: End-to-End Match
 
-#### 2. Memory Issues
-- Reduce cache TTL
-- Lower worker pool size
-- Check for memory leaks
+1. **Create a Strategy** (via User Config Service or manually in DB):
+   - Stock: RELIANCE (Token: 2885)
+   - Sentiment: POSITIVE
+   - Impact: > 5
 
-#### 3. Kafka Lag
-- Increase worker pool
-- Optimize matching logic
-- Scale horizontally
+2. **Verify Indexing**:
+   ```bash
+   curl -s "http://localhost:9200/trading-strategies/_search?q=stock_codes:2885"
+   ```
+
+3. **Simulate News Event** (Produce to Kafka):
+   ```bash
+   # Using kcat or kafka-console-producer
+   echo '{"event_id":"evt1","stock_code":2885,"sentiment":"POSITIVE","impact_score":8,"timestamp":"2025-01-23T10:00:00Z"}' | \
+   docker exec -i trading-kafka kafka-console-producer --broker-list localhost:9092 --topic news-events
+   ```
+
+4. **Verify Signal**:
+   - Check `trade-signals` topic.
+   - Check Rules Engine logs: `Matched strategy {id} for event {evt1}`.
 
 ---
 
-**Last Updated:** December 12, 2025  
-**Version:** 1.0  
-**Maintained by:** Backend Development Team
+## 10. Monitoring & Troubleshooting
+
+### Common Issues
+
+#### 1. Strategies Not Matching
+- **Symptom**: News comes in, but no signal is generated.
+- **Checks**:
+  - Is the strategy `active`?
+  - Run `scripts/check_elasticsearch_index.sh` to verify the strategy is indexed.
+  - Check if the event attributes (sentiment, score) strictly meet strategy conditions.
+  - Check Redis keys (is it being deduplicated?): `KEYS signal_dedup:*`.
+
+#### 2. Elasticsearch Connection Refused
+- **Symptom**: Service crashes on startup or logs connection errors.
+- **Fix**:
+  - Ensure ES is running: `curl localhost:9200`.
+  - Check `ELASTICSEARCH_URL` in env.
+  - If running in Docker, ensure network connectivity (use container name `elasticsearch` instead of `localhost`).
+
+#### 3. Stale Strategies
+- **Symptom**: Deleted strategies still generating signals.
+- **Fix**:
+  - The `DELETE` event might have been missed.
+  - Run `scripts/reindex_strategies.sh` to rebuild the index from the database.
+
+### Key Metrics to Monitor
+- **Latency**: Time from Event Consumption -> Signal Publication (Target: < 50ms).
+- **Match Rate**: Percentage of events resulting in signals.
+- **Consumer Lag**: Lag on `news-events` topic.
+- **ES Query Time**: Duration of search queries.
+
+---
+
+**Document Version**: 1.0
+**Last Updated**: January 2026
+**Maintainer**: Backend Team

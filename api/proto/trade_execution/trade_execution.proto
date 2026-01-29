@@ -35,29 +35,26 @@ service TradeExecutionService {
 message Order {
   // Internal order ID
   string order_id = 1;
-  
   // User and strategy information
   string user_id = 2;
   string strategy_id = 3;
   string event_id = 4;  // Market event that triggered this order
-  
   // Stock information
   int64 stock_code = 5;
   common.Exchange exchange = 6;
   string symbol = 7;
-  
   // Order details
   common.OrderType order_type = 8;
   common.OrderSide order_side = 9;
   int32 quantity = 10;
   double price = 11;  // For LIMIT orders
-  
   // Stop loss and take profit
   double stop_loss = 12;
   double take_profit = 13;
-  
   // Order validity
   string validity = 14;  // DAY, IOC, GTD, etc.
+  // Trading mode (LIVE or PAPER)
+  string trading_mode = 29;
   
   // Order status
   common.OrderStatus status = 15;
@@ -164,6 +161,8 @@ message GetUserOrdersRequest {
   string user_id = 1;
   OrderFilter filter = 2;
   common.PaginationRequest pagination = 3;
+  // Optional: filter by trading_mode (LIVE/PAPER)
+  string trading_mode = 4;
 }
 
 message GetUserOrdersResponse {

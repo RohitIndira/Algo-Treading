@@ -26,6 +26,7 @@ type StrategyPayload struct {
 	UserID       string          `json:"user_id"`
 	StrategyName string          `json:"strategy_name"`
 	Active       bool            `json:"active"`
+	TradingMode  string          `json:"trading_mode"`
 	Conditions   json.RawMessage `json:"conditions"`
 	TradeConfig  json.RawMessage `json:"trade_config"`
 	RiskLimits   json.RawMessage `json:"risk_limits"`
@@ -261,6 +262,7 @@ func (ss *StrategySyncer) convertToStrategy(payload *StrategyPayload) (*models.S
 		UserID:       payload.UserID,
 		StrategyName: payload.StrategyName,
 		Active:       payload.Active,
+		TradingMode:  payload.TradingMode,
 		Conditions:   conditions,
 		TradeConfig:  tradeConfig,
 		RiskLimits:   riskLimits,

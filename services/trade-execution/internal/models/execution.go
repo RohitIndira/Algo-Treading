@@ -176,5 +176,6 @@ type TradeSignal struct {
 	ImpactScore  int32     `json:"impact_score"`
 	Sentiment    string    `json:"sentiment"`
 	NewsCategory string    `json:"news_category"`
+	TradingMode  string    `json:"trading_mode"`
 	Timestamp    time.Time `json:"timestamp"`
 }

@@ -38,6 +38,10 @@ type Config struct {
 
 	// List of tokens (stocks) to apply this strategy on
 	Tokens []string
+	
+	// TradingMode controls whether orders are sent to broker (LIVE) or
+	// simulated (PAPER). Defaults to LIVE when empty.
+	TradingMode string
 }
 
 // UserTokenConfig holds per-user, per-token parameters for the Jobbing
@@ -130,6 +134,13 @@ func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publish
 		}
 	}
 	cfg.Tokens = tokens
+	
+	// Normalize trading mode
+	mode := strings.ToUpper(strings.TrimSpace(cfg.TradingMode))
+	if mode != "PAPER" {
+		mode = "LIVE"
+	}
+	cfg.TradingMode = mode
 
 	return &Engine{
 		cfg:         cfg,
@@ -489,9 +500,20 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		}
 	}
 
-	// Publish to RabbitMQ
-	if err := e.rabbitPub.PublishOrder(ctx, orderReq); err != nil {
-		return fmt.Errorf("failed to publish jobbing order: %w", err)
+	// Check trading mode before publishing to RabbitMQ
+	if e.cfg.TradingMode == "PAPER" {
+		e.logger.Info("PAPER mode: simulating jobbing order (no RabbitMQ publish)",
+			zap.String("order_id", orderReq.OrderID),
+			zap.String("user_id", userID),
+			zap.String("symbol", ev.StockData.Symbol),
+			zap.Float64("order_price", orderPrice),
+			zap.Int32("quantity", qty))
+		// Skip RabbitMQ publish but continue to update state
+	} else {
+		// LIVE mode: Publish to RabbitMQ
+		if err := e.rabbitPub.PublishOrder(ctx, orderReq); err != nil {
+			return fmt.Errorf("failed to publish jobbing order: %w", err)
+		}
 	}
 
 	// Update token state

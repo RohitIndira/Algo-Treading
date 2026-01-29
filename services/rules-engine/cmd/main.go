@@ -369,6 +369,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -583,6 +584,16 @@ func main() {
 	defer realtimePortfolioPub.Close()
 	logger.Info("Kafka realtime portfolio publisher initialized successfully")
 
+	// Initialize Kafka publisher for simulated execution fills (Paper Trading)
+	logger.Info("Initializing Kafka publisher for trade executions (Paper simulation)...")
+	executionPub := publisher.NewKafkaPublisher(
+		cfg.Kafka.Brokers,
+		"trade-executions", // Topic for execution results
+		logger,
+	)
+	defer executionPub.Close()
+	logger.Info("Kafka trade-executions publisher initialized successfully")
+
 	// Initialize Cash 52-week High strategy engine.
 	//
 	// IMPORTANT: We no longer require a static list of CASH52W_USER_IDS
@@ -608,7 +619,13 @@ func main() {
 			TSLPercent:      20,
 			TradingMode:     cfg.TradingMode,
 		}
-		cash52wEngine = cash52w.NewEngine(engineCfg, riskClient, rabbitPub, tradeSignalPub, allocationPub, logger)
+		cash52wEngine = cash52w.NewEngine(engineCfg, riskClient, rabbitPub, tradeSignalPub, allocationPub, executionPub, signalRepo, logger)
+
+		// Initial bootstrap for statically configured users (if any). Dynamic
+		// users will be bootstrapped via the refresh loop or as they appear.
+		if len(cfg.Cash52WUserIDs) > 0 {
+			cash52wEngine.BootstrapManagedUsers(context.Background(), cfg.Cash52WUserIDs)
+		}
 
 		breakoutConsumer, err = consumer.NewBreakoutConsumer(
 			cfg.Kafka.Brokers,
@@ -679,6 +696,20 @@ func main() {
 	// dynamically refresh jobbingEngine user/token configs in near real-time.
 	// For now, configs are loaded once at startup via gRPC calls above.
 
+	// Initialize execution consumer (to update portfolio state on order fills)
+	var executionConsumer *consumer.ExecutionConsumer
+	if signalRepo != nil {
+		logger.Info("Initializing Execution Consumer to track order fills...")
+		executionConsumer = consumer.NewExecutionConsumer(
+			cfg.Kafka.Brokers,
+			"rules-engine-executions-v2",
+			signalRepo,
+			cash52wEngine,
+			logger,
+		)
+		defer executionConsumer.Close()
+	}
+
 	// Initialize market hours from configuration
 	logger.Info("Initializing market hours configuration...",
 		zap.Int("open_hour", cfg.MarketHours.OpenHour),
@@ -715,6 +746,9 @@ func main() {
 		logger,
 		marketHours,
 		false, // enforceHours disabled for now
+		cash52wEngine, // Inject engine for paper trade simulation
+		executionPub,  // Inject execution publisher for simulated fills
+		cfg.TradingMode, // global trading mode fallback
 	)
 
 	// Initialize Kafka consumer
@@ -749,34 +783,41 @@ func main() {
 			logger.Info("Starting 52W user + mode refresh loop from ES index",
 				zap.Duration("interval", refreshInterval))
 
+			// Helper to refresh users and modes
+			refresh := func() {
+				users, err := queryEngine.ListUsersWithActiveStrategy(ctx, cash52w.Cash52WStrategyID)
+				if err != nil {
+					logger.Error("Failed to refresh 52W users from ES",
+						zap.Error(err))
+					return
+				}
+				cash52wEngine.SetUsers(users)
+				// Bootstrap state for all active users (loads positions/PnL from DB)
+				cash52wEngine.BootstrapManagedUsers(ctx, users)
+
+				// Refresh per-user trading modes (LIVE/PAPER) from ES.
+				modes, err := queryEngine.GetCash52WUserModes(ctx)
+				if err != nil {
+					logger.Error("Failed to refresh 52W trading modes from ES",
+						zap.Error(err))
+					return
+				}
+				cash52wEngine.SetUserModes(modes)
+			}
+
+			// Run immediately on startup
+			refresh()
+
 			ticker := time.NewTicker(refreshInterval)
 			defer ticker.Stop()
 
-			// Initial refresh immediately
 			for {
 				select {
 				case <-ctx.Done():
 					logger.Info("Stopping 52W user + mode refresh loop")
 					return
 				case <-ticker.C:
-					users, err := queryEngine.ListUsersWithActiveStrategy(ctx, "CASH_52W_HIGH")
-					if err != nil {
-						logger.Error("Failed to refresh 52W users from ES",
-							zap.Error(err))
-						continue
-					}
-					cash52wEngine.SetUsers(users)
-
-					// Refresh per-user trading modes (LIVE/PAPER) from ES. If this
-					// call fails, we keep the previous snapshot so the engine
-					// continues using the last known configuration.
-					modes, err := queryEngine.GetCash52WUserModes(ctx)
-					if err != nil {
-						logger.Error("Failed to refresh 52W trading modes from ES",
-							zap.Error(err))
-						continue
-					}
-					cash52wEngine.SetUserModes(modes)
+					refresh()
 				}
 			}
 		}()
@@ -809,6 +850,17 @@ func main() {
 			}
 		}()
 	}
+
+	// Start execution consumer if enabled
+	if executionConsumer != nil {
+		go func() {
+			logger.Info("Starting execution consumer")
+			if err := executionConsumer.Start(ctx); err != nil {
+				logger.Error("Execution consumer error", zap.Error(err))
+			}
+		}()
+	}
+
 
 	// Start consuming market events from Kafka
 	go func() {
@@ -975,4 +1027,104 @@ func startRealtimePortfolioLoop(
 			}
 		}
 	}
+}
+
+// loadJobbingConfigsForUsers loads active JOBBING strategies for the given
+// users from the user-config service and registers per-user, per-token
+// parameters in the Jobbing engine. This is called once at startup.
+func loadJobbingConfigsForUsers(ctx context.Context, logger *zap.Logger, ucClient *userconfig.Client, engine *jobbing.Engine, userIDs []string) {
+	if ucClient == nil || engine == nil {
+		return
+	}
+
+	for _, userID := range userIDs {
+		userID = strings.TrimSpace(userID)
+		if userID == "" {
+			continue
+		}
+
+		// Fetch all active strategies for this user
+		strategies, err := ucClient.ListActiveStrategies(ctx, userID)
+		if err != nil {
+			logger.Warn("Failed to list strategies for jobbing user", zap.String("user_id", userID), zap.Error(err))
+			continue
+		}
+
+		for _, strat := range strategies {
+			if !isJobbingStrategyName(strat.StrategyName) {
+				continue
+			}
+
+			if strat.TradeConfig.Quantity <= 0 {
+				logger.Warn("Skipping jobbing strategy with invalid quantity", zap.String("user_id", userID), zap.String("strategy_id", strat.StrategyID))
+				continue
+			}
+			if len(strat.Conditions.Stocks) == 0 {
+				logger.Warn("Skipping jobbing strategy with no stock codes configured", zap.String("user_id", userID), zap.String("strategy_id", strat.StrategyID))
+				continue
+			}
+
+			// Map fields from user-config strategy into per-user jobbing params
+			cfg := jobbing.UserTokenConfig{}
+
+			// Price range
+			if strat.Conditions.PriceRange.MinPrice > 0 {
+				cfg.LowerRange = strat.Conditions.PriceRange.MinPrice
+			}
+			if strat.Conditions.PriceRange.MaxPrice > 0 {
+				cfg.HigherRange = strat.Conditions.PriceRange.MaxPrice
+			}
+
+			// Quantity per order
+			cfg.QuantityPerOrder = strat.TradeConfig.Quantity
+
+			// Interpret MaxPositionSize as MaxQuantity for jobbing (integer semantics)
+			if strat.TradeConfig.MaxPositionSize > 0 {
+				cfg.MaxQuantity = int32(strat.TradeConfig.MaxPositionSize)
+			}
+
+			// Reuse stop_loss_pct as initial offset (B) and take_profit_pct as distance continue (S)
+			if strat.TradeConfig.StopLossPct > 0 {
+				cfg.InitialBuyOffset = strat.TradeConfig.StopLossPct
+			}
+			if strat.TradeConfig.TakeProfitPct > 0 {
+				cfg.DistanceContinue = strat.TradeConfig.TakeProfitPct
+			}
+
+			// Normalize tokens from stock codes
+			tokens := make([]string, 0, len(strat.Conditions.Stocks))
+			for _, code := range strat.Conditions.Stocks {
+				if code <= 0 {
+					continue
+				}
+				tokens = append(tokens, fmt.Sprintf("%d", code))
+			}
+			if len(tokens) == 0 {
+				continue
+			}
+
+			engine.SetJobbingConfig(userID, tokens, cfg)
+
+			logger.Info("Loaded jobbing config from user-config",
+				zap.String("user_id", userID),
+				zap.String("strategy_id", strat.StrategyID),
+				zap.Any("tokens", tokens),
+				zap.Float64("lower_range", cfg.LowerRange),
+				zap.Float64("higher_range", cfg.HigherRange),
+				zap.Float64("initial_offset", cfg.InitialBuyOffset),
+				zap.Float64("distance_continue", cfg.DistanceContinue),
+				zap.Int32("qty_per_order", cfg.QuantityPerOrder),
+				zap.Int32("max_qty", cfg.MaxQuantity))
+		}
+	}
+}
+
+// isJobbingStrategyName implements a simple convention-based check on
+// StrategyName to identify jobbing strategies on the rules-engine side.
+func isJobbingStrategyName(name string) bool {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+	return name == "JOBBING" || strings.HasPrefix(name, "JOBBING_")
 }

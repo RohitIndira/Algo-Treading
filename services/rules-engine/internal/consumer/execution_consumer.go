@@ -6,32 +6,23 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cash52w"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
 
-// ExecutionResult represents execution result from Kafka
-type ExecutionResult struct {
-	ExecutionID   string    `json:"execution_id"`
-	OrderID       string    `json:"order_id"`
-	Status        string    `json:"status"`
-	ExecutedPrice float64   `json:"executed_price"`
-	ExecutedQty   int32     `json:"executed_quantity"`
-	BrokerOrderID string    `json:"broker_order_id"`
-	ExecutionTime time.Time `json:"execution_time"`
-	ErrorMessage  string    `json:"error_message,omitempty"`
-}
-
 // ExecutionConsumer consumes execution results from Kafka
 type ExecutionConsumer struct {
-	reader     *kafka.Reader
-	signalRepo *repository.TradeSignalRepository
-	logger     *zap.Logger
+	reader        *kafka.Reader
+	signalRepo    *repository.TradeSignalRepository
+	cash52wEngine *cash52w.Engine
+	logger        *zap.Logger
 }
 
 // NewExecutionConsumer creates a new execution consumer
-func NewExecutionConsumer(brokers []string, groupID string, signalRepo *repository.TradeSignalRepository, logger *zap.Logger) *ExecutionConsumer {
+func NewExecutionConsumer(brokers []string, groupID string, signalRepo *repository.TradeSignalRepository, cash52wEngine *cash52w.Engine, logger *zap.Logger) *ExecutionConsumer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
 		Topic:          "trade-executions",
@@ -48,9 +39,10 @@ func NewExecutionConsumer(brokers []string, groupID string, signalRepo *reposito
 		zap.String("group_id", groupID))
 
 	return &ExecutionConsumer{
-		reader:     reader,
-		signalRepo: signalRepo,
-		logger:     logger,
+		reader:        reader,
+		signalRepo:    signalRepo,
+		cash52wEngine: cash52wEngine,
+		logger:        logger,
 	}
 }
 
@@ -101,7 +93,7 @@ func (c *ExecutionConsumer) processMessage(ctx context.Context, msg kafka.Messag
 		zap.Int64("offset", msg.Offset))
 
 	// Parse execution result
-	var result ExecutionResult
+	var result models.ExecutionResult
 	if err := json.Unmarshal(msg.Value, &result); err != nil {
 		return fmt.Errorf("failed to unmarshal execution result: %w", err)
 	}
@@ -130,6 +122,11 @@ func (c *ExecutionConsumer) processMessage(ctx context.Context, msg kafka.Messag
 			zap.String("order_id", result.OrderID),
 			zap.String("status", result.Status),
 			zap.Float64("executed_price", result.ExecutedPrice))
+	}
+
+	// Notify strategy engines to update in-memory portfolio state
+	if c.cash52wEngine != nil {
+		c.cash52wEngine.HandleExecution(ctx, result)
 	}
 
 	return nil

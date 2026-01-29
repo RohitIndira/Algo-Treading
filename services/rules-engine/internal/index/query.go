@@ -350,7 +350,9 @@ func (q *QueryEngine) CountActiveUsers(ctx context.Context) (int, error) {
 func (q *QueryEngine) ListUsersWithActiveStrategy(ctx context.Context, strategyID string) ([]string, error) {
 	// Map logical strategy ids to the strategy_name stored in ES.
 	nameFilter := strategyID
-	if strategyID == "CASH_52W_HIGH" {
+	// Bridge logical IDs (CASH_52W_HIGH) or UUIDs to the human-readable
+	// strategy_name stored in Elasticsearch.
+	if strategyID == "CASH_52W_HIGH" || strategyID == "52525252-5252-5252-5252-525252525252" {
 		nameFilter = "Cash 52W High"
 	}
 

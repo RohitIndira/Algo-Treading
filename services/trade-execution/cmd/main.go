@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -17,6 +18,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/odin"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/paper"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
@@ -57,11 +59,22 @@ func main() {
 
 	// Initialize repositories
 	orderRepo := repository.NewOrderRepository(db)
+	paperPosRepo := repository.NewPaperPositionRepository(db)
 	// CredentialsRepository now points to the user-login database
 	// (trading_db) so any user created via user-login immediately has
 	// usable broker credentials for trade execution.
 	credsRepo := repository.NewCredentialsRepository(credsDB)
 	log.Println("✓ Repository layer initialized")
+
+	// Initialize Redis for paper trading
+	log.Println("Connecting to Redis...")
+	redisClient := initRedis()
+	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+		log.Printf("⚠️ Redis connection failed: %v (paper trading will not work)", err)
+		log.Println("Continuing without Redis...")
+	} else {
+		log.Println("✓ Connected to Redis")
+	}
 
 	// Initialize Odin client
 	odinClient := odin.NewExecutionClient(cfg.OdinBaseURL)
@@ -112,9 +125,21 @@ func main() {
 	defer rabbitPublisher.Close()
 	log.Println("✓ RabbitMQ publisher initialized")
 
+	// Initialize paper trading components
+	log.Println("Initializing paper trading system...")
+	priceProvider := paper.NewRedisPriceProvider(redisClient)
+	positionManager := paper.NewPositionManager(
+		paperPosRepo,
+		orderRepo,
+		priceProvider,
+		cfg.PaperPositionCheckInterval,
+	)
+	paperTradeHandler := executor.NewPaperTradeHandler(positionManager)
+	log.Println("✓ Paper trading system initialized")
+
 	// Initialize Kafka consumer for trade-signals
 	log.Println("Initializing Kafka consumer...")
-	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, rabbitPublisher)
+	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, rabbitPublisher, paperTradeHandler)
 	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger)
 	defer kafkaConsumer.Close()
 	log.Println("✓ Kafka consumer initialized")
@@ -126,6 +151,16 @@ func main() {
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start paper position manager for SL/TP monitoring
+	go func() {
+		log.Println("Starting paper position manager...")
+		if err := positionManager.Start(ctx); err != nil {
+			log.Printf("⚠️ Failed to start position manager: %v", err)
+		} else {
+			log.Println("✓ Paper position manager started")
+		}
+	}()
 
 	// Start Kafka consumer for trade-signals
 	go func() {
@@ -182,20 +217,24 @@ func main() {
 
 // Config holds service configuration
 type Config struct {
-	GRPCPort      int
-	RabbitMQURL   string
-	QueueName     string
-	Exchange      string
-	RoutingKey    string
-	PrefetchCount int
-	WorkerCount   int
-	KafkaBrokers  []string
-	KafkaGroupID  string
-	KafkaTopic    string
-	OdinBaseURL   string
-	MaxRetries    int
-	RetryDelay    time.Duration
-	PostgresURL   string
+	GRPCPort                   int
+	RabbitMQURL                string
+	QueueName                  string
+	Exchange                   string
+	RoutingKey                 string
+	PrefetchCount              int
+	WorkerCount                int
+	KafkaBrokers               []string
+	KafkaGroupID               string
+	KafkaTopic                 string
+	OdinBaseURL                string
+	MaxRetries                 int
+	RetryDelay                 time.Duration
+	PostgresURL                string
+	RedisAddr                  string
+	RedisPassword              string
+	RedisDB                    int
+	PaperPositionCheckInterval time.Duration
 }
 
 func loadConfig() Config {
@@ -207,21 +246,30 @@ func loadConfig() Config {
 		}
 	}
 
+	redisAddr := fmt.Sprintf("%s:%s",
+		getEnv("REDIS_HOST", "localhost"),
+		getEnv("REDIS_PORT", "6379"),
+	)
+
 	return Config{
-		GRPCPort:      getEnvInt("SERVICE_PORT", 9004),
-		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
-		QueueName:     getEnv("RABBITMQ_QUEUE", "trade.executions"),
-		Exchange:      getEnv("RABBITMQ_EXCHANGE", "trade.execution"),
-		RoutingKey:    getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
-		PrefetchCount: getEnvInt("RABBITMQ_PREFETCH", 10),
-		WorkerCount:   getEnvInt("WORKER_COUNT", 10),
-		KafkaBrokers:  kafkaBrokers,
-		KafkaGroupID:  getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
-		KafkaTopic:    getEnv("KAFKA_TOPIC", "trade-signals"),
-		OdinBaseURL:   getEnv("ODIN_BASE_URL", ""),
-		MaxRetries:    getEnvInt("MAX_RETRIES", 3),
-		RetryDelay:    time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
-		PostgresURL:   buildPostgresURL(),
+		GRPCPort:                   getEnvInt("SERVICE_PORT", 9004),
+		RabbitMQURL:                getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
+		QueueName:                  getEnv("RABBITMQ_QUEUE", "trade.executions"),
+		Exchange:                   getEnv("RABBITMQ_EXCHANGE", "trade.execution"),
+		RoutingKey:                 getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
+		PrefetchCount:              getEnvInt("RABBITMQ_PREFETCH", 10),
+		WorkerCount:                getEnvInt("WORKER_COUNT", 10),
+		KafkaBrokers:               kafkaBrokers,
+		KafkaGroupID:               getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
+		KafkaTopic:                 getEnv("KAFKA_TOPIC", "trade-signals"),
+		OdinBaseURL:                getEnv("ODIN_BASE_URL", ""),
+		MaxRetries:                 getEnvInt("MAX_RETRIES", 3),
+		RetryDelay:                 time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
+		PostgresURL:                buildPostgresURL(),
+		RedisAddr:                  redisAddr,
+		RedisPassword:              getEnv("REDIS_PASSWORD", ""),
+		RedisDB:                    getEnvInt("REDIS_DB", 0),
+		PaperPositionCheckInterval: time.Duration(getEnvInt("PAPER_POSITION_CHECK_INTERVAL_SEC", 10)) * time.Second,
 	}
 }
 
@@ -354,4 +402,13 @@ func trim(s string) string {
 
 func initLogger() (*zap.Logger, error) {
 	return zap.NewProduction()
+}
+
+func initRedis() *redis.Client {
+	cfg := loadConfig()
+	return redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+		DB:       cfg.RedisDB,
+	})
 }
