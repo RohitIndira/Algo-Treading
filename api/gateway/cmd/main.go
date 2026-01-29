@@ -107,6 +107,9 @@ func main() {
 	// Initialize WebSocket handler
 	websocketHandler := handlers.NewWebSocketHandler(redisClient, logger)
 
+	// Initialize Paper PnL handler (reads from same Redis as WebSocket)
+	paperPnLHandler := handlers.NewPaperPnLHandler(redisClient, logger)
+
 	// CORS config
 	corsConfig := middleware.CORSConfig{
 		AllowedOrigins: cfg.CORS.AllowedOrigins,
@@ -115,7 +118,7 @@ func main() {
 	}
 
 	// Router
-	r := router.NewRouter(userConfigHandler, authProxyHandler, websocketHandler, tradeExecHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, authProxyHandler, websocketHandler, tradeExecHandler, paperPnLHandler, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

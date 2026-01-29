@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
@@ -23,10 +24,14 @@ type StrategyService struct {
 	jobbingWriter       *kafka.Writer
 	jobbingTopic        string
 	jobbingKafkaEnabled bool
+	// Optional dedicated Kafka stream for managed Cash 52W strategy configs
+	cash52wWriter       *kafka.Writer
+	cash52wTopic        string
+	cash52wKafkaEnabled bool
 }
 
 // NewStrategyService creates a new strategy service
-func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string, jobbingWriter *kafka.Writer, jobbingTopic string) *StrategyService {
+func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string, jobbingWriter *kafka.Writer, jobbingTopic string, cash52wWriter *kafka.Writer, cash52wTopic string) *StrategyService {
 	return &StrategyService{
 		repo:                repo,
 		kafkaWriter:         kafkaWriter,
@@ -35,7 +40,25 @@ func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.
 		jobbingWriter:       jobbingWriter,
 		jobbingTopic:        jobbingTopic,
 		jobbingKafkaEnabled: jobbingWriter != nil && jobbingTopic != "",
+		cash52wWriter:       cash52wWriter,
+		cash52wTopic:        cash52wTopic,
+		cash52wKafkaEnabled: cash52wWriter != nil && cash52wTopic != "",
 	}
+}
+
+// Cash52WeekConfigEvent is a minimal, 52W-specific configuration event
+// published to a dedicated Kafka topic so downstream services (such as
+// rules-engine) don't have to parse the full generic Strategy payload.
+//
+// EventType indicates what happened to the managed 52W strategy for
+// this user: CREATE, UPDATE, or DELETE.
+type Cash52WeekConfigEvent struct {
+	EventType       string  `json:"event_type"`
+	UserID          string  `json:"user_id"`
+	Enabled         bool    `json:"enabled"`
+	CapitalPerStock float64 `json:"capital_per_stock"`
+	TradingMode     string  `json:"trading_mode"` // "LIVE" or "PAPER"
+	Timestamp       int64   `json:"timestamp"`
 }
 
 // ConfigureCash52WeekStrategy creates or updates the managed Cash 52-week High
@@ -71,18 +94,79 @@ func (s *StrategyService) ConfigureCash52WeekStrategy(ctx context.Context, req *
 		tradingMode = "LIVE"
 	}
 
-	// Delegate actual persistence logic to repository helper that knows how to
-	// find/create the CASH_52W_HIGH strategy for this user. For now we keep
-	// this high-level API here; repository implements the DB details.
-	strategy, err := s.repo.ConfigureCash52WeekStrategy(ctx, req.UserID, capitalPerStock, maxPositions, stopLossPct, takeProfitPct, req.RiskProfile, tradingMode, req.Enabled)
+	// Determine prior state from the dedicated 52W config table so we no
+	// longer depend on generic strategies/trade_configs rows.
+	existingCfg, err := s.repo.GetCash52WConfig(ctx, req.UserID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to configure cash 52w strategy: %w", err)
+		return nil, fmt.Errorf("failed to load existing cash 52w config: %w", err)
+	}
+	hadExisting := existingCfg != nil
+
+	// Persist the minimal 52W configuration into the dedicated
+	// cash52w_configs table so that production systems don't rely on
+	// generic strategies/trade_configs with dummy values.
+	cfg := &models.Cash52WConfig{
+		UserID:          req.UserID,
+		Enabled:         req.Enabled,
+		CapitalPerStock: capitalPerStock,
+		TradingMode:     tradingMode,
 	}
 
-	// Publish config change to Kafka as a normal strategy event
-	if strategy != nil {
-		if err := s.publishToKafka(ctx, "UPDATE", strategy); err != nil {
-			fmt.Printf("Warning: failed to publish 52w config to kafka: %v\n", err)
+	// Determine event type and update DB accordingly.
+	var eventType string
+	if !req.Enabled {
+		if hadExisting {
+			// Disable existing config.
+			if err := s.repo.DeleteCash52WConfig(ctx, req.UserID); err != nil {
+				return nil, fmt.Errorf("failed to delete cash52w_config: %w", err)
+			}
+			eventType = "DELETE"
+		} else {
+			// No prior config and disabling -> nothing to do.
+			return nil, nil
+		}
+	} else {
+		// Enable or update config.
+		if err := s.repo.UpsertCash52WConfig(ctx, cfg); err != nil {
+			return nil, fmt.Errorf("failed to upsert cash52w_config: %w", err)
+		}
+		if !hadExisting {
+			eventType = "CREATE"
+		} else {
+			eventType = "UPDATE"
+		}
+	}
+
+	// Build a synthetic Strategy object purely for response and for
+	// publishing the compact 52W config event. We no longer create or
+	// update generic strategy/trade_config/risk_limits rows for 52W.
+	now := time.Now()
+	strategy := &models.Strategy{
+		StrategyID:   uuid.New(),
+		UserID:       req.UserID,
+		StrategyName: "Cash 52W High",
+		Description:  "Managed Cash 52-Week High breakout strategy",
+		Active:       req.Enabled,
+		TradingMode:  tradingMode,
+		Version:      1,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	// Expose capital_per_stock via TradeConfig.MaxPositionSize so that
+	// gateways that still map response from Strategy can derive the
+	// configured capital.
+	strategy.TradeConfig = &models.TradeConfig{
+		MaxPositionSize: &capitalPerStock,
+	}
+
+	// IMPORTANT: For the managed 52W strategy we no longer publish the
+	// generic Strategy payload to the main user-configs topic. Instead we
+	// only emit the compact Cash52WeekConfigEvent to the dedicated
+	// Cash52WConfigTopic so that downstream services don't have to
+	// interpret a full generic strategy object for this managed case.
+	if eventType != "" {
+		if err := s.publishCash52WeekConfig(ctx, strategy, capitalPerStock, tradingMode, req.Enabled, eventType); err != nil {
+			fmt.Printf("Warning: failed to publish Cash52W config to dedicated topic: %v\n", err)
 		}
 	}
 
@@ -100,6 +184,18 @@ type ConfigEvent struct {
 func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, strategy *models.Strategy) error {
 	if !s.kafkaEnabled {
 		return nil // Kafka is disabled, skip publishing
+	}
+
+	// Skip generic publishing for the managed Cash 52W strategy. All
+	// configuration changes for this strategy are now emitted via the
+	// dedicated Cash52WeekConfigEvent on the user-configs.cash52w topic,
+	// so there is no need to send a full generic Strategy payload (with
+	// trade_config, risk_limits, etc.) to the main user-configs stream.
+	if strategy != nil {
+		name := strings.ToUpper(strings.TrimSpace(strategy.StrategyName))
+		if name == "CASH 52W HIGH" {
+			return nil
+		}
 	}
 
 	event := ConfigEvent{
@@ -145,6 +241,45 @@ func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, 
 		if err := s.jobbingWriter.WriteMessages(ctx, msg); err != nil {
 			fmt.Printf("Warning: failed to publish jobbing config to kafka: %v\n", err)
 		}
+	}
+
+	return nil
+}
+
+// publishCash52WeekConfig publishes a compact 52W-only configuration event
+// to the dedicated Cash52W Kafka topic, if configured.
+func (s *StrategyService) publishCash52WeekConfig(ctx context.Context, strategy *models.Strategy, capitalPerStock float64, tradingMode string, enabled bool, eventType string) error {
+	if !s.cash52wKafkaEnabled || s.cash52wWriter == nil || strategy == nil {
+		return nil
+	}
+
+	event := Cash52WeekConfigEvent{
+		EventType:       eventType,
+		UserID:          strategy.UserID,
+		Enabled:         enabled,
+		CapitalPerStock: capitalPerStock,
+		TradingMode:     tradingMode,
+		Timestamp:       strategy.UpdatedAt.Unix(),
+	}
+
+	eventBytes, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Cash52W config event: %w", err)
+	}
+
+	// Log a concise 52W-specific line so we can easily trace all managed
+	// 52W configuration changes without looking at the generic strategy
+	// events.
+	fmt.Printf("[USER-CONFIG][52W] event_type=%s user_id=%s enabled=%v capital=%.2f mode=%s\\n",
+		event.EventType, event.UserID, event.Enabled, event.CapitalPerStock, event.TradingMode)
+
+	msg := kafka.Message{
+		Key:   []byte(strategy.UserID),
+		Value: eventBytes,
+	}
+
+	if err := s.cash52wWriter.WriteMessages(ctx, msg); err != nil {
+		return fmt.Errorf("failed to publish Cash52W config event to kafka: %w", err)
 	}
 
 	return nil

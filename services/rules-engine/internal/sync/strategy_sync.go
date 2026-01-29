@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+	"strings"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/index"
@@ -26,6 +27,12 @@ type StrategyPayload struct {
 	UserID       string          `json:"user_id"`
 	StrategyName string          `json:"strategy_name"`
 	Active       bool            `json:"active"`
+	// TradingMode is the per-strategy trading mode as stored by the
+	// user-config service (e.g. "LIVE" or "PAPER"). When this field is
+	// missing or empty we fall back to the global TRADING_MODE setting in
+	// the rules-engine. This field is important for ensuring that PAPER
+	// strategies do not send real orders to trade-execution.
+	TradingMode  string          `json:"trading_mode"`
 	Conditions   json.RawMessage `json:"conditions"`
 	TradeConfig  json.RawMessage `json:"trade_config"`
 	RiskLimits   json.RawMessage `json:"risk_limits"`
@@ -38,7 +45,6 @@ type StrategySyncer struct {
 	reader        *kafka.Reader
 	indexer       *index.Indexer
 	strategyCache *cache.StrategyCache
-	pnlStreams    *cache.PnLStreamManager
 	logger        *zap.Logger
 	stats         *SyncStats
 }
@@ -55,7 +61,7 @@ type SyncStats struct {
 }
 
 // NewStrategySyncer creates a new strategy syncer
-func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *index.Indexer, strategyCache *cache.StrategyCache, pnlStreams *cache.PnLStreamManager, logger *zap.Logger) *StrategySyncer {
+func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *index.Indexer, strategyCache *cache.StrategyCache, logger *zap.Logger) *StrategySyncer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
 		Topic:          topic,
@@ -76,7 +82,6 @@ func NewStrategySyncer(brokers []string, topic string, groupID string, indexer *
 		reader:        reader,
 		indexer:       indexer,
 		strategyCache: strategyCache,
-		pnlStreams:    pnlStreams,
 		logger:        logger,
 		stats:         &SyncStats{},
 	}
@@ -188,18 +193,6 @@ func (ss *StrategySyncer) processMessage(ctx context.Context, msg *kafka.Message
 			zap.String("user_id", strategy.UserID),
 			zap.Bool("active", strategy.Active))
 
-		// Rotate the user's PnL stream whenever a strategy changes so that
-		// downstream consumers (API gateway / frontend) can cleanly switch
-		// to a fresh PnL channel and avoid mixing old/new configurations.
-		if ss.pnlStreams != nil {
-			if _, err := ss.pnlStreams.RotateStream(ctx, strategy.UserID, strategy.StrategyName); err != nil {
-				ss.logger.Warn("Failed to rotate PnL stream for strategy event",
-					zap.String("strategy_id", strategy.StrategyID),
-					zap.String("user_id", strategy.UserID),
-					zap.Error(err))
-			}
-		}
-
 	case "DELETE":
 		if err := ss.indexer.DeleteStrategy(ctx, event.Strategy.StrategyID); err != nil {
 			return fmt.Errorf("failed to delete strategy: %w", err)
@@ -256,6 +249,19 @@ func (ss *StrategySyncer) convertToStrategy(payload *StrategyPayload) (*models.S
 	tradeConfig.OrderType = normalizeOrderType(tradeConfig.OrderType)
 	tradeConfig.Exchange = normalizeExchange(tradeConfig.Exchange)
 
+	// Normalise trading mode from user-config. We accept "LIVE" or
+	// "PAPER" (case-insensitive). Any other value, including empty,
+	// will be treated as falling back to the global TRADING_MODE
+	// environment variable inside the rules-engine. However, we must
+	// preserve explicit "PAPER" so that PAPER strategies are simulated
+	// and do NOT send real orders to RabbitMQ.
+	mode := strings.ToUpper(strings.TrimSpace(payload.TradingMode))
+	if mode != "PAPER" {
+		// Treat everything other than explicit PAPER as empty here so
+		// downstream code can uniformly fall back to the global setting.
+		mode = ""
+	}
+
 	return &models.Strategy{
 		StrategyID:   payload.StrategyID,
 		UserID:       payload.UserID,
@@ -266,6 +272,7 @@ func (ss *StrategySyncer) convertToStrategy(payload *StrategyPayload) (*models.S
 		RiskLimits:   riskLimits,
 		CreatedAt:    payload.CreatedAt,
 		UpdatedAt:    payload.UpdatedAt,
+		TradingMode:  mode,
 	}, nil
 }
 

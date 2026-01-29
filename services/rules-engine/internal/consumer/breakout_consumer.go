@@ -82,7 +82,17 @@ func (c *BreakoutConsumer) Start(ctx context.Context) error {
 	}
 }
 
-func (c *BreakoutConsumer) processMessage(ctx context.Context) error {
+func (c *BreakoutConsumer) processMessage(ctx context.Context) (err error) {
+	// Panic recovery to prevent consumer death
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("PANIC in 52w-breakout message processing",
+				zap.Any("panic", r),
+				zap.Stack("stack"))
+			err = fmt.Errorf("panic in 52w-breakout processing: %v", r)
+		}
+	}()
+
 	msg, err := c.reader.FetchMessage(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to fetch 52w-breakout message: %w", err)
@@ -107,6 +117,10 @@ func (c *BreakoutConsumer) processMessage(ctx context.Context) error {
 
 	if err := c.handler.HandleBreakout(ctx, &ev); err != nil {
 		c.logger.Error("Failed to handle Breakout52WEvent", zap.Error(err))
+		// Commit even on error to move forward
+		if commitErr := c.reader.CommitMessages(ctx, msg); commitErr != nil {
+			c.logger.Error("Failed to commit failed 52w-breakout message", zap.Error(commitErr))
+		}
 		return fmt.Errorf("failed to handle Breakout52WEvent: %w", err)
 	}
 

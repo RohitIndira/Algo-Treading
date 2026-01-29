@@ -25,9 +25,12 @@ type RealtimePortfolioEvent struct {
 	StrategyName  string             `json:"strategy_name"`
 	Mode          string             `json:"mode"` // LIVE or PAPER
 	Positions     []RealtimePosition `json:"positions"`
-	TotalPnL      float64            `json:"total_pnl"`
-	TotalInvested float64            `json:"total_invested"`
-	TotalCurrent  float64            `json:"total_current"`
+	TotalPnL      float64            `json:"total_pnl"`       // Open PnL for current positions
+	TotalInvested float64            `json:"total_invested"`  // Sum of buy_price * qty for open positions
+	TotalCurrent  float64            `json:"total_current"`   // Sum of LTP * qty for open positions
+	ClosedPnL     float64            `json:"closed_pnl"`      // Realized PnL from exited positions (currently 0 for 52W)
+	PortfolioValue float64           `json:"portfolio_value"` // Market value of open positions + ClosedPnL
+	AveragePerStock float64          `json:"average_per_stock"` // PortfolioValue / 25 (per strategy design)
 	Timestamp     time.Time          `json:"timestamp"`
 	// StreamID identifies the logical PnL stream for this snapshot.
 	// When strategies change we rotate to a new stream so that

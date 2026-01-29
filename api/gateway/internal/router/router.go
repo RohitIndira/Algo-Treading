@@ -13,6 +13,7 @@ func NewRouter(
 	authProxyHandler *handlers.AuthProxyHandler,
 	websocketHandler *handlers.WebSocketHandler,
 	tradeExecHandler *handlers.TradeExecutionHandler,
+	paperPnLHandler *handlers.PaperPnLHandler,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
 
@@ -50,6 +51,14 @@ func NewRouter(
 
 	// Trade execution: list successful orders for a user
 	api.HandleFunc("/users/{user_id}/orders/success", tradeExecHandler.ListSuccessfulUserOrders).Methods("GET")
+
+	// Paper Trading PnL API (REST endpoints)
+	api.HandleFunc("/paper-pnl/{user_id}/positions", paperPnLHandler.GetOpenPositions).Methods("GET")
+	api.HandleFunc("/paper-pnl/{user_id}/history", paperPnLHandler.GetClosedPositions).Methods("GET")
+	api.HandleFunc("/paper-pnl/{user_id}/summary", paperPnLHandler.GetPortfolioSummary).Methods("GET")
+	
+	// Live Trading PnL API (for comparison)
+	api.HandleFunc("/live-pnl/{user_id}/summary", paperPnLHandler.GetLivePnL).Methods("GET")
 
 	// WebSocket routes for live match feed
 	r.HandleFunc("/ws/matches", websocketHandler.HandleMatchesFeed)        // Single user

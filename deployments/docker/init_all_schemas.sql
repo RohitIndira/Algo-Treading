@@ -4,8 +4,8 @@
 -- Description: Creates all required tables, indexes, triggers, and functions
 -- ============================================================================
 
--- Connect to the trading_system database
-\c trading_system;
+-- Connect to the main trading database (as configured in docker-compose)
+\c trading_db;
 
 -- ============================================================================
 -- EXTENSIONS
@@ -419,6 +419,21 @@ COMMENT ON TABLE strategy_conditions IS 'Conditions/filters for strategy trigger
 COMMENT ON TABLE trade_configs IS 'Trade execution configuration for strategies';
 COMMENT ON TABLE risk_limits IS 'Risk management limits for strategies';
 COMMENT ON COLUMN strategies.match_all_news IS 'When true, strategy matches ALL news events (overrides filters). Only impact_score_threshold is checked.';
+
+-- Dedicated configuration table for managed Cash 52-Week High strategy.
+-- This stores only the fields that actually matter for the managed 52W
+-- strategy so that we don't have to rely on generic strategy/trade_config
+-- rows with dummy/default values.
+CREATE TABLE IF NOT EXISTS cash52w_configs (
+    user_id           VARCHAR(100) PRIMARY KEY,
+    enabled           BOOLEAN NOT NULL,
+    capital_per_stock DECIMAL(15,2) NOT NULL,
+    trading_mode      VARCHAR(10) NOT NULL, -- LIVE / PAPER
+    updated_at        TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_cash52w_configs_enabled ON cash52w_configs(enabled);
+CREATE INDEX IF NOT EXISTS idx_cash52w_configs_trading_mode ON cash52w_configs(trading_mode);
 
 -- Trade Execution Service
 COMMENT ON TABLE orders IS 'Order records submitted to broker';

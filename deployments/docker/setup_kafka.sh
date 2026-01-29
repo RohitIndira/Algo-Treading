@@ -85,7 +85,8 @@ echo "${YELLOW}Step 5: Creating required topics for all services...${NC}"
 
 # Comprehensive array of all topics needed for the trading system
 topics=(
-	"user-configs"              # User Config Service - strategy updates
+	"user-configs"              # User Config Service - generic strategy updates
+	"user-configs.cash52w"      # User Config Service - 52W-only config events
 	"news-events"               # Legacy/news topic (KT docs)
 	"market.data.news"          # Data Ingestion -> Rules Engine (news-based events)
 	"market.data.live"          # Live market depth (B2C bridge) -> Rules Engine jobbing
@@ -97,6 +98,8 @@ topics=(
 	"portfolio.allocations"     # Rules Engine 52W engine -> allocation snapshots
 	"portfolio.realtime.52w"    # Rules Engine 52W realtime portfolio valuations -> UI/analytics
 	"jobbing.configs"           # (Planned) Jobbing strategy configs broadcast
+	"paper-executions.52w"      # Paper Execution Service - simulated 52W fills/partial exits
+	"paper-pnl.52w"             # Paper Execution Service - optional aggregated 52W PnL snapshots
 )
 
 for topic in "${topics[@]}"; do

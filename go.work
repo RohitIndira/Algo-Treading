@@ -8,8 +8,10 @@ use (
 	./api/proto/rules_engine
 	./api/proto/trade_execution
 	./api/proto/user_config
+	./pkg/database/redis
 	./pkg/logger
 	./services/data-ingestion
+	./services/paper-execution
 	./services/risk-management
 	./services/rules-engine
 	./services/trade-execution

@@ -28,20 +28,22 @@ func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHand
 // Frontend sends a simple JSON payload with user_id, enabled and a few
 // numeric fields; the backend fills in detailed trade_config/risk_limits.
 func (h *UserConfigHandler) ConfigureCash52WeekStrategy(w http.ResponseWriter, r *http.Request) {
-	// Decode into a lightweight DTO first so we can support both the
-	// JSON field names used by the frontend (snake_case) and the
-	// proto-generated camelCase names. Then map into the protobuf
-	// request explicitly.
+	// For the managed Cash 52W strategy we keep the public JSON payload
+	// intentionally minimal so that callers don't have to understand all
+	// low-level fields. The backend will apply sensible defaults for
+	// everything else.
+	//
+	// Accepted JSON fields:
+	//   - user_id          (string, required)
+	//   - enabled          (bool, required)
+	//   - capital_per_stock (float, optional; default ~20000 if <= 0)
+	//   - trading_mode     (string, optional; "LIVE" or "PAPER", default LIVE)
+	//
+	// We also accept camelCase "tradingMode" for convenience.
 	var body struct {
 		UserID          string  `json:"user_id"`
 		Enabled         bool    `json:"enabled"`
 		CapitalPerStock float64 `json:"capital_per_stock"`
-		MaxPositions    int32   `json:"max_positions"`
-		StopLossPct     float64 `json:"stop_loss_pct"`
-		TakeProfitPct   float64 `json:"take_profit_pct"`
-		RiskProfile     string  `json:"risk_profile"`
-		// Support both snake_case (trading_mode) and camelCase (tradingMode)
-		// from the frontend. We will normalise after decoding.
 		TradingModeSnake string `json:"trading_mode"`
 		TradingModeCamel string `json:"tradingMode"`
 	}
@@ -66,10 +68,6 @@ func (h *UserConfigHandler) ConfigureCash52WeekStrategy(w http.ResponseWriter, r
 		UserId:          body.UserID,
 		Enabled:         body.Enabled,
 		CapitalPerStock: body.CapitalPerStock,
-		MaxPositions:    body.MaxPositions,
-		StopLossPct:     body.StopLossPct,
-		TakeProfitPct:   body.TakeProfitPct,
-		RiskProfile:     body.RiskProfile,
 		TradingMode:     tradingMode,
 	}
 
@@ -88,7 +86,37 @@ func (h *UserConfigHandler) ConfigureCash52WeekStrategy(w http.ResponseWriter, r
 		return
 	}
 
-	respondWithProtoJSON(w, http.StatusOK, resp)
+	// Return a minimal JSON response for the managed 52W strategy instead
+	// of the full generic Strategy payload. Frontend callers only care
+	// about the high-level configuration they just set/applied.
+	strategy := resp.GetStrategy()
+	if strategy == nil {
+		respondWithError(w, http.StatusInternalServerError, "52w strategy missing in response")
+		return
+	}
+
+	// Derive capital_per_stock from trade_config.max_position_size, which
+	// is where the backend stores this value for the managed 52W strategy.
+	capital := 0.0
+	if strategy.TradeConfig != nil {
+		capital = strategy.TradeConfig.MaxPositionSize
+	}
+
+	out := struct {
+		Success         bool    `json:"success"`
+		UserID          string  `json:"user_id"`
+		Enabled         bool    `json:"enabled"`
+		CapitalPerStock float64 `json:"capital_per_stock"`
+		TradingMode     string  `json:"trading_mode"`
+	}{
+		Success:         resp.Success,
+		UserID:          strategy.UserId,
+		Enabled:         strategy.Active,
+		CapitalPerStock: capital,
+		TradingMode:     strategy.TradingMode,
+	}
+
+	respondWithJSON(w, http.StatusOK, out)
 }
 
 // CreateStrategy handles POST /api/v1/strategies

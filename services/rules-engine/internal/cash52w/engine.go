@@ -26,13 +26,6 @@ type Config struct {
 	SLPercent       float64
 	TSLPercent      float64
 
-	// TradingMode controls how orders are handled for this strategy.
-	// Accepted values (uppercased by caller):
-	//   - "LIVE":  normal behaviour, send real orders via RabbitMQ.
-	//   - "PAPER": paper trading; still uses real breakout prices but
-	//              does NOT publish orders to RabbitMQ. Trade-signals
-	//              can still be sent to Kafka for analytics.
-	TradingMode string
 }
 
 // per-user in-memory state (Phase 1: approximate, reset daily). We track
@@ -46,6 +39,7 @@ type userState struct {
 // Engine implements the 52-week breakout strategy for multiple users.
 type Engine struct {
 	cfg        Config
+	store      *ConfigStore
 	riskClient *risk.Client
 	rabbitPub  *publisher.Publisher
 	// kafkaPub publishes trade-signals (order requests)
@@ -57,15 +51,15 @@ type Engine struct {
 	mu        sync.Mutex
 	day       string
 	userState map[string]*userState // key: userID
-	// userTradingMode holds per-user overrides for trading mode (LIVE/PAPER)
-	// fetched from Elasticsearch via QueryEngine. When a user is present
-	// here with mode PAPER, their 52W orders will be simulated even if the
-	// global cfg.TradingMode is LIVE.
+	// userTradingMode holds per-user trading modes (LIVE/PAPER) fetched
+	// from Elasticsearch via QueryEngine. When a user is present here
+	// with mode PAPER, their 52W orders will be simulated (no real
+	// orders sent to trade-execution). When absent, we default to LIVE.
 	userTradingMode map[string]string // key: userID -> "LIVE" / "PAPER"
 }
 
 // NewEngine creates a new Cash 52-week engine.
-func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publisher, kafkaPub *publisher.KafkaPublisher, allocPub *publisher.KafkaPublisher, logger *zap.Logger) *Engine {
+func NewEngine(cfg Config, store *ConfigStore, riskClient *risk.Client, rabbitPub *publisher.Publisher, kafkaPub *publisher.KafkaPublisher, allocPub *publisher.KafkaPublisher, logger *zap.Logger) *Engine {
 	// defaults
 	if cfg.CapitalPerStock <= 0 {
 		cfg.CapitalPerStock = 20000
@@ -90,15 +84,9 @@ func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publish
 	}
 	cfg.UserIDs = users
 
-	// Normalise trading mode for internal use
-	mode := strings.ToUpper(strings.TrimSpace(cfg.TradingMode))
-	if mode != "PAPER" {
-		mode = "LIVE"
-	}
-	cfg.TradingMode = mode
-
 	return &Engine{
 		cfg:             cfg,
+		store:           store,
 		riskClient:      riskClient,
 		rabbitPub:       rabbitPub,
 		kafkaPub:        kafkaPub,
@@ -183,9 +171,9 @@ func (e *Engine) SetUserModes(modes map[string]string) {
 		zap.Int("user_count", len(e.userTradingMode)))
 }
 
-// effectiveModeForUser returns the trading mode for a specific user,
-// falling back to the global engine cfg.TradingMode when no per-user
-// override is present.
+// effectiveModeForUser returns the trading mode for a specific user.
+// When there is no explicit per-user override from user-config
+// (via Elasticsearch), we default to LIVE.
 func (e *Engine) effectiveModeForUser(userID string) string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -193,7 +181,7 @@ func (e *Engine) effectiveModeForUser(userID string) string {
 	if m, ok := e.userTradingMode[userID]; ok {
 		return m
 	}
-	return e.cfg.TradingMode
+	return "LIVE"
 }
 
 // HandleBreakout processes a single 52-week breakout event for all configured users.
@@ -202,34 +190,76 @@ func (e *Engine) HandleBreakout(ctx context.Context, ev *models.Breakout52WEvent
 		return fmt.Errorf("nil Breakout52WEvent")
 	}
 
-	// Only act on breakouts that occurred today. The data-ingestion Redis
-	// watcher already tries to enforce this, but since the consumer now
-	// starts from the earliest offsets (to support same-day backlog), we add
-	// a final safeguard here.
-	if ev.Week52HighDate != "" && ev.Week52HighDate != todayStr() {
-		return nil
-	}
-
-	// basic sanity
+	// LTP MUST be present in breakout event from Redis 52W watcher.
+	// Since we're sourcing breakouts from Redis (which has real-time market data),
+	// there's no fallback - we need the LTP to calculate position size.
 	if ev.LTP <= 0 {
-		e.logger.Warn("Skipping 52w breakout with invalid LTP",
+		e.logger.Error("CRITICAL: 52w breakout event missing LTP from Redis",
 			zap.String("symbol", ev.Symbol),
 			zap.String("token", ev.Token),
-			zap.Float64("ltp", ev.LTP))
-		return nil
+			zap.Float64("ltp", ev.LTP),
+			zap.String("exchange", ev.Exchange))
+		return fmt.Errorf("breakout event has invalid LTP: %f", ev.LTP)
 	}
+
+	// Log the breakout event for debugging
+	e.logger.Info("Processing 52W breakout from Redis",
+		zap.String("symbol", ev.Symbol),
+		zap.String("token", ev.Token),
+		zap.String("exchange", ev.Exchange),
+		zap.Float64("ltp", ev.LTP),
+		zap.String("52w_high_date", ev.Week52HighDate))
 
 	e.resetIfNewDay()
 
-	for _, userID := range e.cfg.UserIDs {
+	// Get the list of users from the ConfigStore directly to avoid race
+	// conditions where the periodic refresh hasn't synced new users yet.
+	// This ensures immediate processing of breakout events for users who
+	// just enabled the strategy.
+	var userIDs []string
+	if e.store != nil {
+		userIDs, _ = e.store.Snapshot()
+	} else {
+		userIDs = e.cfg.UserIDs
+	}
+
+	if len(userIDs) == 0 {
+		e.logger.Warn("No users configured for 52W strategy - skipping breakout",
+			zap.String("symbol", ev.Symbol),
+			zap.String("token", ev.Token))
+		return nil
+	}
+
+	e.logger.Info("Processing breakout for users",
+		zap.Int("user_count", len(userIDs)),
+		zap.Strings("user_ids", userIDs),
+		zap.String("symbol", ev.Symbol),
+		zap.String("token", ev.Token))
+
+	successCount := 0
+	for _, userID := range userIDs {
+		e.logger.Debug("Calling handleForUser",
+			zap.String("user_id", userID),
+			zap.String("token", ev.Token),
+			zap.String("symbol", ev.Symbol))
+		
 		if err := e.handleForUser(ctx, userID, ev); err != nil {
 			e.logger.Error("Failed to handle 52w breakout for user",
 				zap.Error(err),
 				zap.String("user_id", userID),
-				zap.String("token", ev.Token))
+				zap.String("token", ev.Token),
+				zap.String("symbol", ev.Symbol))
 			// continue with other users
+		} else {
+			successCount++
 		}
 	}
+
+	e.logger.Info("Breakout processing complete",
+		zap.String("symbol", ev.Symbol),
+		zap.String("token", ev.Token),
+		zap.Int("success_count", successCount),
+		zap.Int("total_users", len(userIDs)))
 
 	return nil
 }
@@ -252,6 +282,14 @@ func (e *Engine) getUserState(userID string) *userState {
 // or closed).
 func (e *Engine) publishAllocation(ctx context.Context, userID string) {
 	if e.allocPub == nil {
+		return
+	}
+
+	// For now, publish allocation snapshots only for PAPER users so that
+	// we can focus on paper-trading analytics without mixing in live
+	// execution portfolios.
+	mode := e.effectiveModeForUser(userID)
+	if mode != "PAPER" {
 		return
 	}
 
@@ -285,13 +323,53 @@ func (e *Engine) publishAllocation(ctx context.Context, userID string) {
 			zap.String("user_id", userID),
 			zap.Error(err))
 	} else {
-		e.logger.Debug("Published portfolio allocation",
+		e.logger.Debug("Published portfolio allocation (PAPER)",
 			zap.String("user_id", userID),
 			zap.Int("total_positions", ev.TotalPositions))
 	}
 }
 
 func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Breakout52WEvent) error {
+	// Check per-user 52W configuration from the in-memory store. If the
+	// user has not enabled the managed 52W strategy, or if the breakout
+	// event occurred before the user enabled it, we skip.
+	var capitalPerStock float64
+	if e.store != nil {
+		cfg, ok := e.store.Get(userID)
+		if !ok {
+			e.logger.Debug("User not found in config store",
+				zap.String("user_id", userID),
+				zap.String("token", ev.Token))
+			return nil
+		}
+		if !cfg.Enabled {
+			e.logger.Debug("User has disabled 52W strategy",
+				zap.String("user_id", userID),
+				zap.String("token", ev.Token))
+			return nil
+		}
+
+		// Convert event timestamp (ms since epoch) to time.Time.
+		evTime := time.Unix(0, ev.Timestamp*int64(time.Millisecond))
+		if cfg.EnabledSince.After(evTime) {
+			// Breakout happened before the user enabled 52W; ignore.
+			e.logger.Info("Skipping breakout - occurred before user enabled strategy",
+				zap.String("user_id", userID),
+				zap.String("token", ev.Token),
+				zap.String("symbol", ev.Symbol),
+				zap.Time("breakout_time", evTime),
+				zap.Time("enabled_since", cfg.EnabledSince))
+			return nil
+		}
+
+		capitalPerStock = cfg.CapitalPerStock
+	}
+
+	// Fallback to engine-level default if config is missing or invalid.
+	if capitalPerStock <= 0 {
+		capitalPerStock = e.cfg.CapitalPerStock
+	}
+
 	st := e.getUserState(userID)
 
 	// enforce max positions per user per day
@@ -304,12 +382,17 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 
 	// don't re-enter same token for this user on the same day
 	if _, exists := st.Positions[ev.Token]; exists {
+		e.logger.Info("Skipping duplicate 52w breakout - position already opened today",
+			zap.String("user_id", userID),
+			zap.String("token", ev.Token),
+			zap.String("symbol", ev.Symbol),
+			zap.Int("current_positions", len(st.Positions)))
 		return nil
 	}
 
 	// Compute quantity from capital per stock so that we invest roughly
 	// ₹CapitalPerStock per breakout: qty ≈ CapitalPerStock / LTP.
-	qty := int32(math.Floor(e.cfg.CapitalPerStock / ev.LTP))
+	qty := int32(math.Floor(capitalPerStock / ev.LTP))
 	if qty <= 0 {
 		e.logger.Warn("Computed non-positive quantity for 52w breakout",
 			zap.String("user_id", userID),
@@ -351,6 +434,12 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 	// For now we treat all as BUY; SELL leg / exits will be managed by
 	// risk/execution logic and future enhancements.
 	orderReq.OrderSide = "BUY"
+
+	// Attach trading mode (LIVE/PAPER) to the order request so that
+	// downstream services and analytics can distinguish simulated vs
+	// real trades in the trade-signals stream.
+	mode := e.effectiveModeForUser(userID)
+	orderReq.TradingMode = mode
 
 	// Run risk check if client is available
 	if e.riskClient != nil {
@@ -413,8 +502,6 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 				zap.String("order_id", orderReq.OrderID))
 		}
 	}
-
-	mode := e.effectiveModeForUser(userID)
 
 	// In PAPER mode we stop here: we have computed the order using real
 	// breakout prices and sent a trade-signal to Kafka (if configured),

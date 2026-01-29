@@ -32,6 +32,7 @@ type OrderRequest struct {
 	RetryCount   int       `json:"retry_count"`
 	OrderSide    string    `json:"order_side"` // BUY, SELL
 	Validity     string    `json:"validity"`   // DAY, IOC, etc.
+	TradingMode  string    `json:"trading_mode"` // LIVE or PAPER
 }
 
 // RuleMatch represents a successful rule match

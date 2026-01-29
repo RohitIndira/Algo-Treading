@@ -8,7 +8,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RohitIndira/Algo-Treading/pkg/database/mongodb"
 	redispkg "github.com/RohitIndira/Algo-Treading/pkg/database/redis"
 	kafkapkg "github.com/RohitIndira/Algo-Treading/pkg/kafka"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
@@ -37,61 +36,34 @@ func main() {
 	defer cancelRun()
 
 	// ========================================================================
-	// 1. MONGODB NEWS INGESTION SETUP
+	// 1. MONGODB NEWS INGESTION SETUP (DISABLED)
 	// ========================================================================
-	lgr.Info("Initializing MongoDB news ingestion pipeline")
-
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
-	mongoClient, err := mongodb.New(ctx, mongodb.Config{
-		URI:            cfg.MongoURI,
-		Database:       cfg.MongoDatabase,
-		ConnectTimeout: cfg.MongoConnectTimeout,
-	})
-	cancel()
-
-	if err != nil {
-		lgr.Fatal("failed to connect to mongodb", zap.Error(err))
-	}
-	defer mongoClient.Close(context.Background())
-
-	lgr.Info("Connected to MongoDB",
-		zap.String("database", cfg.MongoDatabase),
-		zap.String("collection", cfg.MongoCollection))
-
-	// Kafka producer for news events
-	newsProdCfg := kafkapkg.ProducerConfig{
-		Brokers:     cfg.KafkaBrokers,
-		Topic:       cfg.KafkaTopic,
-		BatchSize:   100,
-		MaxAttempts: 3,
-	}
-	newsProducer, err := kafkapkg.NewProducer(newsProdCfg)
-	if err != nil {
-		lgr.Fatal("failed to create kafka producer for news", zap.Error(err))
-	}
-	defer newsProducer.Close()
-
-	if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopic, 1, 1); err != nil {
-		lgr.Fatal("failed to ensure news topic exists", zap.Error(err))
-	}
-	lgr.Info("Connected to Kafka (news)",
-		zap.Strings("brokers", cfg.KafkaBrokers),
-		zap.String("topic", cfg.KafkaTopic))
-
-	newsPub := publisher.NewKafkaPublisher(newsProducer, cfg.KafkaTopic)
-
-	// Start MongoDB -> Kafka watcher (news)
-	mongoWatcher, err := watcher.NewMongoWatcher(mongoClient, cfg.MongoCollection, newsPub, lgr)
-	if err != nil {
-		lgr.Fatal("failed to create mongo watcher", zap.Error(err))
-	}
-
-	go func() {
-		lgr.Info("Starting MongoDB news watcher")
-		if err := mongoWatcher.Run(ctxRun); err != nil {
-			lgr.Error("mongo watcher stopped with error", zap.Error(err))
-		}
-	}()
+	// For current production focus we only need 52-week breakout data.
+	// The MongoDB news -> Kafka pipeline is temporarily disabled.
+	//
+	// When you want to re-enable news ingestion, restore the block below
+	// and ensure cfg.MongoURI/MongoDatabase/MongoCollection/KafkaTopic
+	// are set correctly.
+	//
+	// lgr.Info("Initializing MongoDB news ingestion pipeline")
+	// ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
+	// mongoClient, err := mongodb.New(ctx, mongodb.Config{
+	// 	URI:            cfg.MongoURI,
+	// 	Database:       cfg.MongoDatabase,
+	// 	ConnectTimeout: cfg.MongoConnectTimeout,
+	// })
+	// cancel()
+	// if err != nil {
+	// 	lgr.Fatal("failed to connect to mongodb", zap.Error(err))
+	// }
+	// defer mongoClient.Close(context.Background())
+	// lgr.Info("Connected to MongoDB",
+	// 	zap.String("database", cfg.MongoDatabase),
+	// 	zap.String("collection", cfg.MongoCollection))
+	// newsProdCfg := kafkapkg.ProducerConfig{...}
+	// newsProducer, err := kafkapkg.NewProducer(newsProdCfg)
+	// ...
+	// go func() { mongoWatcher.Run(ctxRun) }()
 
 	// ========================================================================
 	// 2. REDIS 52-WEEK HIGH BREAKOUT SETUP
@@ -153,62 +125,19 @@ func main() {
 	}()
 
 	// ========================================================================
-	// 3. B2C LIVE MARKET DATA SETUP
+	// 3. B2C LIVE MARKET DATA SETUP (DISABLED)
 	// ========================================================================
-	lgr.Info("Initializing B2C live market data pipeline")
-
-	// Validate B2C configuration
-	if cfg.B2CBridgePath == "" {
-		lgr.Warn("B2C_BRIDGE_PATH not set, skipping B2C market data ingestion")
-	} else {
-		// Kafka producer for live market data
-		marketDataProdCfg := kafkapkg.ProducerConfig{
-			Brokers:     cfg.KafkaBrokers,
-			Topic:       cfg.KafkaTopicMarketData,
-			BatchSize:   100,
-			MaxAttempts: 3,
-		}
-		marketDataProducer, err := kafkapkg.NewProducer(marketDataProdCfg)
-		if err != nil {
-			lgr.Fatal("failed to create kafka producer for market data", zap.Error(err))
-		}
-		defer marketDataProducer.Close()
-
-		if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopicMarketData, 1, 1); err != nil {
-			lgr.Fatal("failed to ensure market data topic exists", zap.Error(err))
-		}
-		lgr.Info("Connected to Kafka (live market data)",
-			zap.Strings("brokers", cfg.KafkaBrokers),
-			zap.String("topic", cfg.KafkaTopicMarketData))
-
-		marketDataPub := publisher.NewKafkaPublisher(marketDataProducer, cfg.KafkaTopicMarketData)
-
-		lgr.Info("B2C Configuration loaded",
-			zap.String("bridge_path", cfg.B2CBridgePath),
-			zap.Strings("tokens_env", cfg.B2CTokens),
-			zap.String("stocks_db_path", cfg.StocksDBPath),
-		)
-
-		// Start B2C watcher (will derive subscriptions from stocks.db when
-		// available, falling back to cfg.B2CTokens if needed).
-		b2cWatcher, err := watcher.NewB2CWatcher(
-			cfg.B2CBridgePath,
-			cfg.B2CTokens,
-			cfg.StocksDBPath,
-			marketDataPub,
-			lgr,
-		)
-		if err != nil {
-			lgr.Fatal("failed to create B2C watcher", zap.Error(err))
-		}
-
-		go func() {
-			lgr.Info("Starting B2C market data watcher")
-			if err := b2cWatcher.Run(ctxRun); err != nil {
-				lgr.Error("B2C watcher stopped with error", zap.Error(err))
-			}
-		}()
-	}
+	// For now we are not using the B2C live market data bridge. The entire
+	// ingestion pipeline for market data is disabled. When needed again,
+	// uncomment this section and ensure B2C_BRIDGE_PATH and related config
+	// are set correctly.
+	//
+	// lgr.Info("Initializing B2C live market data pipeline")
+	// if cfg.B2CBridgePath == "" {
+	// 	lgr.Warn("B2C_BRIDGE_PATH not set, skipping B2C market data ingestion")
+	// } else {
+	// 	...
+	// }
 
 	// ========================================================================
 	// GRACEFUL SHUTDOWN

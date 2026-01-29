@@ -2,7 +2,7 @@ module github.com/RohitIndira/Algo-Treading/pkg/logger
 
 go 1.21
 
-require go.uber.org/zap v1.27.0
+require go.uber.org/zap v1.27.1
 
 require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect

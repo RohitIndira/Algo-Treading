@@ -5,7 +5,6 @@ go 1.23.0
 toolchain go1.24.6
 
 require (
-	github.com/go-redis/redis/v8 v8.11.5
 	github.com/lib/pq v1.10.9
 	github.com/segmentio/kafka-go v0.4.49
 	github.com/streadway/amqp v1.1.0
@@ -13,9 +12,7 @@ require (
 )
 
 require (
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect

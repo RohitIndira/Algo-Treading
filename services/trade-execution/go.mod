@@ -4,12 +4,9 @@ go 1.23.0
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/google/uuid v1.6.0
 	github.com/jmoiron/sqlx v1.3.5
 	github.com/lib/pq v1.10.9
 	github.com/rabbitmq/amqp091-go v1.9.0
-	google.golang.org/grpc v1.68.1
-	google.golang.org/protobuf v1.34.2 // indirect
 	google.golang.org/grpc v1.68.1
 	google.golang.org/protobuf v1.34.2 // indirect
 )
@@ -18,9 +15,7 @@ require (
 	github.com/RohitIndira/Algo-Treading/pkg/odin v0.0.0
 	github.com/joho/godotenv v1.5.1
 	github.com/segmentio/kafka-go v0.4.49
-	go.uber.org/zap v1.27.0
-	github.com/segmentio/kafka-go v0.4.49
-	go.uber.org/zap v1.27.0
+	go.uber.org/zap v1.27.1
 )
 
 require (

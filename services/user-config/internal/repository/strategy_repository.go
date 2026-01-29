@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/google/uuid"
@@ -570,6 +571,79 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 	}
 
 	return strategies, nil
+}
+
+// UpsertCash52WConfig inserts or updates the minimal 52W configuration for
+// a given user in the dedicated cash52w_configs table. This avoids relying
+// on generic strategies/trade_configs rows with dummy values.
+func (r *StrategyRepository) UpsertCash52WConfig(ctx context.Context, cfg *models.Cash52WConfig) error {
+	if cfg == nil || cfg.UserID == "" {
+		return fmt.Errorf("invalid Cash52WConfig: user_id is required")
+	}
+
+	query := `
+		INSERT INTO cash52w_configs (user_id, enabled, capital_per_stock, trading_mode, updated_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (user_id)
+		DO UPDATE SET
+			enabled = EXCLUDED.enabled,
+			capital_per_stock = EXCLUDED.capital_per_stock,
+			trading_mode = EXCLUDED.trading_mode,
+			updated_at = EXCLUDED.updated_at
+	`
+
+	if cfg.UpdatedAt.IsZero() {
+		cfg.UpdatedAt = time.Now()
+	}
+
+	_, err := r.db.ExecContext(ctx, query,
+		cfg.UserID,
+		cfg.Enabled,
+		cfg.CapitalPerStock,
+		cfg.TradingMode,
+		cfg.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upsert cash52w_config: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteCash52WConfig removes the 52W configuration for a user from the
+// dedicated table. Used when the managed 52W strategy is disabled.
+func (r *StrategyRepository) DeleteCash52WConfig(ctx context.Context, userID string) error {
+	if userID == "" {
+		return fmt.Errorf("user_id is required")
+	}
+
+	query := `DELETE FROM cash52w_configs WHERE user_id = $1`
+	_, err := r.db.ExecContext(ctx, query, userID)
+	if err != nil {
+		return fmt.Errorf("failed to delete cash52w_config: %w", err)
+	}
+
+	return nil
+}
+
+// GetCash52WConfig fetches the 52W configuration for a user from the
+// dedicated table. Returns (nil, nil) if no row exists.
+func (r *StrategyRepository) GetCash52WConfig(ctx context.Context, userID string) (*models.Cash52WConfig, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("user_id is required")
+	}
+
+	var cfg models.Cash52WConfig
+	query := `SELECT user_id, enabled, capital_per_stock, trading_mode, updated_at FROM cash52w_configs WHERE user_id = $1`
+	err := r.db.GetContext(ctx, &cfg, query, userID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get cash52w_config: %w", err)
+	}
+
+	return &cfg, nil
 }
 
 // ConfigureCash52WeekStrategy creates or updates the managed "Cash 52W High"
