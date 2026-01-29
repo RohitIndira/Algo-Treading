@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
@@ -18,9 +19,10 @@ type BreakoutHandler interface {
 
 // BreakoutConsumer consumes 52-week breakout events from Kafka.
 type BreakoutConsumer struct {
-	reader  *kafka.Reader
-	handler BreakoutHandler
-	logger  *zap.Logger
+	reader      *kafka.Reader
+	handler     BreakoutHandler
+	logger      *zap.Logger
+	workerCount int
 }
 
 // NewBreakoutConsumer creates a new Kafka consumer for 52-week breakouts.
@@ -59,31 +61,97 @@ func NewBreakoutConsumer(brokers []string, topic, groupID string, handler Breako
 		zap.String("group", groupID))
 
 	return &BreakoutConsumer{
-		reader:  reader,
-		handler: handler,
-		logger:  logger,
+		reader:      reader,
+		handler:     handler,
+		logger:      logger,
+		workerCount: 10, // Default: 10 concurrent workers
 	}, nil
 }
 
 // Start begins consuming breakout messages until context is cancelled.
+// Uses a worker pool for concurrent processing of multiple events.
 func (c *BreakoutConsumer) Start(ctx context.Context) error {
-	c.logger.Info("Starting 52w-breakout Kafka consumer")
+	c.logger.Info("Starting 52w-breakout Kafka consumer with worker pool",
+		zap.Int("workers", c.workerCount))
 
-	for {
-		select {
-		case <-ctx.Done():
-			c.logger.Info("52w-breakout Kafka consumer stopped")
-			return ctx.Err()
-		default:
-			if err := c.processMessage(ctx); err != nil {
-				c.logger.Error("Failed to process 52w-breakout message", zap.Error(err))
+	// Create a buffered channel for message distribution
+	messageChan := make(chan kafka.Message, c.workerCount*2)
+
+	// WaitGroup to track worker goroutines
+	var wg sync.WaitGroup
+
+	// Start worker pool
+	for i := 0; i < c.workerCount; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			c.worker(ctx, workerID, messageChan)
+		}(i)
+	}
+
+	c.logger.Info("52w-breakout worker pool started", zap.Int("workers", c.workerCount))
+
+	// Main loop: fetch messages and distribute to workers
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				c.logger.Info("52w-breakout message fetcher stopping")
+				close(messageChan)
+				return
+			default:
+				msg, err := c.reader.FetchMessage(ctx)
+				if err != nil {
+					if ctx.Err() != nil {
+						// Context cancelled, exit gracefully
+						close(messageChan)
+						return
+					}
+					c.logger.Error("Failed to fetch 52w-breakout message", zap.Error(err))
+					time.Sleep(time.Second)
+					continue
+				}
+
+				// Send message to worker pool
+				select {
+				case messageChan <- msg:
+					// Message sent to worker
+				case <-ctx.Done():
+					close(messageChan)
+					return
+				}
 			}
 		}
-	}
+	}()
+
+	// Wait for context cancellation
+	<-ctx.Done()
+	c.logger.Info("52w-breakout Kafka consumer stopping, waiting for workers to finish")
+
+	// Wait for all workers to complete
+	wg.Wait()
+
+	c.logger.Info("52w-breakout Kafka consumer stopped")
+	return ctx.Err()
 }
 
-func (c *BreakoutConsumer) processMessage(ctx context.Context) (err error) {
-	// Panic recovery to prevent consumer death
+// worker processes messages from the message channel concurrently
+func (c *BreakoutConsumer) worker(ctx context.Context, workerID int, messageChan <-chan kafka.Message) {
+	c.logger.Debug("52w-breakout worker started", zap.Int("worker_id", workerID))
+
+	for msg := range messageChan {
+		if err := c.processMessage(ctx, msg); err != nil {
+			c.logger.Error("Failed to process 52w-breakout message",
+				zap.Int("worker_id", workerID),
+				zap.Error(err))
+		}
+	}
+
+	c.logger.Debug("52w-breakout worker stopped", zap.Int("worker_id", workerID))
+}
+
+func (c *BreakoutConsumer) processMessage(ctx context.Context, msg kafka.Message) (err error) {
+	// Panic recovery to prevent worker death
 	defer func() {
 		if r := recover(); r != nil {
 			c.logger.Error("PANIC in 52w-breakout message processing",
@@ -93,12 +161,7 @@ func (c *BreakoutConsumer) processMessage(ctx context.Context) (err error) {
 		}
 	}()
 
-	msg, err := c.reader.FetchMessage(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to fetch 52w-breakout message: %w", err)
-	}
-
-	c.logger.Debug("Received 52w-breakout Kafka message",
+	c.logger.Debug("Processing 52w-breakout Kafka message",
 		zap.Int("partition", msg.Partition),
 		zap.Int64("offset", msg.Offset),
 		zap.Time("time", msg.Time))
@@ -115,8 +178,15 @@ func (c *BreakoutConsumer) processMessage(ctx context.Context) (err error) {
 		return fmt.Errorf("failed to unmarshal Breakout52WEvent: %w", err)
 	}
 
+	c.logger.Info("Processing 52w-breakout event",
+		zap.String("symbol", ev.Symbol),
+		zap.String("token", ev.Token),
+		zap.Float64("ltp", ev.LTP))
+
 	if err := c.handler.HandleBreakout(ctx, &ev); err != nil {
-		c.logger.Error("Failed to handle Breakout52WEvent", zap.Error(err))
+		c.logger.Error("Failed to handle Breakout52WEvent",
+			zap.Error(err),
+			zap.String("symbol", ev.Symbol))
 		// Commit even on error to move forward
 		if commitErr := c.reader.CommitMessages(ctx, msg); commitErr != nil {
 			c.logger.Error("Failed to commit failed 52w-breakout message", zap.Error(commitErr))
@@ -129,6 +199,8 @@ func (c *BreakoutConsumer) processMessage(ctx context.Context) (err error) {
 		return fmt.Errorf("failed to commit 52w-breakout message: %w", err)
 	}
 
+	c.logger.Debug("52w-breakout event processed successfully",
+		zap.String("symbol", ev.Symbol))
 	return nil
 }
 
