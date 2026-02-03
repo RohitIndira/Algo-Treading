@@ -158,6 +158,9 @@ type TradeSignal struct {
 	UserID       string `json:"user_id"`
 	StrategyID   string `json:"strategy_id"`
 	StrategyName string `json:"strategy_name"`
+	// TradingMode indicates whether this signal is PAPER or LIVE.
+	// When PAPER, trade-execution must NOT place real orders.
+	TradingMode string `json:"trading_mode,omitempty"`
 	EventID      string `json:"event_id"`
 	StockCode    int64  `json:"stock_code"`
 	// Token is the actual trading token (scrip token) from rules-engine

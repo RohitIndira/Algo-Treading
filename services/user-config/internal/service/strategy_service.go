@@ -13,6 +13,8 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
+func floatPtr(v float64) *float64 { return &v }
+
 // StrategyService handles business logic for strategies
 type StrategyService struct {
 	repo *repository.StrategyRepository
@@ -141,8 +143,11 @@ func (s *StrategyService) ConfigureCash52WeekStrategy(ctx context.Context, req *
 	// publishing the compact 52W config event. We no longer create or
 	// update generic strategy/trade_config/risk_limits rows for 52W.
 	now := time.Now()
+	// Use a deterministic UUID so that the managed strategy appears as the
+	// same strategy_id across configure + list responses.
+	stableID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("CASH_52W_HIGH:"+req.UserID))
 	strategy := &models.Strategy{
-		StrategyID:   uuid.New(),
+		StrategyID:   stableID,
 		UserID:       req.UserID,
 		StrategyName: "Cash 52W High",
 		Description:  "Managed Cash 52-Week High breakout strategy",
@@ -171,6 +176,98 @@ func (s *StrategyService) ConfigureCash52WeekStrategy(ctx context.Context, req *
 	}
 
 	return strategy, nil
+}
+
+// ListUserStrategies lists all strategies for a user, including the managed
+// Cash52W strategy (stored in cash52w_configs) as a synthetic Strategy item.
+func (s *StrategyService) ListUserStrategies(ctx context.Context, userID string, activeOnly bool, limit, offset int) ([]*models.Strategy, int, error) {
+	// Set default pagination
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Managed Cash52W config (if enabled) counts as one virtual strategy.
+	managedCfg, err := s.repo.GetCash52WConfig(ctx, userID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to load cash52w_config: %w", err)
+	}
+	includeManaged := managedCfg != nil && managedCfg.Enabled
+
+	// If activeOnly is true, include managed only when enabled=true.
+	if activeOnly && !includeManaged {
+		includeManaged = false
+	}
+
+	// Adjust pagination for the underlying DB strategies so the virtual managed
+	// strategy appears as the first item.
+	repoLimit := limit
+	repoOffset := offset
+	if includeManaged {
+		if offset == 0 {
+			// page starts with the managed item
+			repoLimit = limit - 1
+			if repoLimit < 0 {
+				repoLimit = 0
+			}
+			repoOffset = 0
+		} else {
+			// skip the managed item
+			repoLimit = limit
+			repoOffset = offset - 1
+		}
+	}
+
+	strategies, total, err := s.repo.ListByUserID(ctx, userID, activeOnly, repoLimit, repoOffset)
+	if err != nil {
+		return nil, 0, err
+	}
+	if includeManaged {
+		total += 1
+	}
+
+	// Prepend managed strategy if it falls into this page.
+	if includeManaged && offset == 0 {
+		stableID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("CASH_52W_HIGH:"+userID))
+		now := time.Now()
+		cap := managedCfg.CapitalPerStock
+		mode := strings.ToUpper(strings.TrimSpace(managedCfg.TradingMode))
+		if mode != "PAPER" {
+			mode = "LIVE"
+		}
+		// Populate a meaningful TradeConfig for the managed 52W strategy so that
+		// the frontend doesn't see UNSPECIFIED enum values.
+		//
+		// Note: these are the *defaults* for the managed strategy.
+		// Quantity is dynamic (capital_per_stock / LTP) in rules-engine, so we
+		// expose quantity=0 here.
+		m := &models.Strategy{
+			StrategyID:   stableID,
+			UserID:       userID,
+			StrategyName: "Cash 52W High",
+			Description:  "Managed Cash 52-Week High breakout strategy",
+			Active:       true,
+			TradingMode:  mode,
+			Version:      1,
+			CreatedAt:    now,
+			UpdatedAt:    managedCfg.UpdatedAt,
+			TradeConfig: &models.TradeConfig{
+				OrderType:       "ORDER_TYPE_MARKET",
+				OrderSide:       "ORDER_SIDE_BUY",
+				Exchange:        "EXCHANGE_NSE",
+				Validity:        "DAY",
+				Quantity:        0,
+				MaxPositionSize: &cap,
+				StopLossPct:     floatPtr(10),
+				TakeProfitPct:   floatPtr(20),
+			},
+		}
+		strategies = append([]*models.Strategy{m}, strategies...)
+	}
+
+	return strategies, total, nil
 }
 
 // ConfigEvent represents a strategy configuration event for Kafka
@@ -339,19 +436,6 @@ func (s *StrategyService) CreateStrategy(ctx context.Context, req *models.Create
 // GetStrategy retrieves a strategy by ID
 func (s *StrategyService) GetStrategy(ctx context.Context, strategyID uuid.UUID, userID string) (*models.Strategy, error) {
 	return s.repo.GetByID(ctx, strategyID, userID)
-}
-
-// ListUserStrategies lists all strategies for a user
-func (s *StrategyService) ListUserStrategies(ctx context.Context, userID string, activeOnly bool, limit, offset int) ([]*models.Strategy, int, error) {
-	// Set default pagination
-	if limit <= 0 || limit > 100 {
-		limit = 20
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	return s.repo.ListByUserID(ctx, userID, activeOnly, limit, offset)
 }
 
 // UpdateStrategy updates a strategy

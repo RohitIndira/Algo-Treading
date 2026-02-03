@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -30,6 +31,17 @@ func NewSignalProcessor(executor *OrderExecutor, orderRepo repository.OrderRepos
 
 // ProcessTradeSignal processes a trade signal from Kafka
 func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models.TradeSignal) error {
+	// IMPORTANT:
+	// trade-execution must NOT place real orders for PAPER trade signals.
+	// PAPER execution is handled by the paper-execution service.
+	if signal != nil {
+		mode := strings.ToUpper(strings.TrimSpace(signal.TradingMode))
+		if mode == "PAPER" {
+			log.Printf("Skipping PAPER trade signal in trade-execution: OrderID=%s UserID=%s StrategyID=%s", signal.OrderID, signal.UserID, signal.StrategyID)
+			return nil
+		}
+	}
+
 	log.Printf("Processing trade signal: OrderID=%s, UserID=%s, Symbol=%s, Price=%.2f",
 		signal.OrderID, signal.UserID, signal.Symbol, signal.Price)
 

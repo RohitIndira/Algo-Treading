@@ -56,6 +56,71 @@ type Simulator struct {
 	closedPnL map[string]float64        // user -> closed pnl
 }
 
+// CloseAllPositionsForUser force-closes all open PAPER positions for the given
+// user by emitting SELL execution events using the latest available LTP.
+//
+// This is used when the user disables/deletes the CASH_52W_HIGH strategy so
+// the paper portfolio doesn't remain stuck with open positions.
+func (s *Simulator) CloseAllPositionsForUser(ctx context.Context, userID string) error {
+	uid := strings.TrimSpace(userID)
+	if uid == "" {
+		return nil
+	}
+
+	// Snapshot user's open positions.
+	s.mu.Lock()
+	positions := make([]*PositionState, 0)
+	for _, p := range s.positions {
+		if p == nil || p.QtyOpen <= 0 {
+			continue
+		}
+		if p.UserID == uid {
+			positions = append(positions, p)
+		}
+	}
+	s.mu.Unlock()
+
+	if len(positions) == 0 {
+		return nil
+	}
+
+	for _, p := range positions {
+		if p == nil || p.QtyOpen <= 0 {
+			continue
+		}
+		ltp, ok := s.getLTP(ctx, p.Exchange, p.Token)
+		if !ok || ltp <= 0 {
+			// fallback to entry price if market data not available
+			ltp = p.EntryPrice
+		}
+
+		// Close remaining open quantity.
+		s.executeSell(
+			ctx,
+			p.UserID,
+			p.Token,
+			"FORCE_EXIT",
+			"STRATEGY_DISABLED",
+			p.BuyOrderID,
+			p.Symbol,
+			p.Exchange,
+			p.QtyOpen,
+			ltp,
+		)
+	}
+
+	// Emit a PnL snapshot immediately so UI updates quickly.
+	s.emitPnL(ctx)
+	return nil
+}
+
+// OnCash52WDisabled implements consumer.Cash52WConfigHandler.
+// When user disables the managed Cash52W strategy we force close all
+// open positions for that user.
+func (s *Simulator) OnCash52WDisabled(ctx context.Context, userID string) error {
+	return s.CloseAllPositionsForUser(ctx, userID)
+}
+
 func NewSimulator(cfg Config, redisClient *redisdb.Client, pub *publisher.KafkaPublisher, logger *zap.Logger) *Simulator {
 	if cfg.StrategyID == "" {
 		cfg.StrategyID = "CASH_52W_HIGH"

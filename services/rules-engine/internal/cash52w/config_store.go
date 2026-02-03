@@ -30,12 +30,23 @@ type UserConfig struct {
 type ConfigStore struct {
 	mu      sync.RWMutex
 	configs map[string]UserConfig // key: user_id
+	// onEnable is called when a user becomes enabled (CREATE/UPDATE enabled=true)
+	// so the engine can perform catch-up/backfill.
+	onEnable func(userID string, enabledSince time.Time)
 }
 
 func NewConfigStore() *ConfigStore {
 	return &ConfigStore{
 		configs: make(map[string]UserConfig),
 	}
+}
+
+// SetOnEnable registers a callback that is triggered whenever a user is
+// enabled for the 52W strategy.
+func (s *ConfigStore) SetOnEnable(fn func(userID string, enabledSince time.Time)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onEnable = fn
 }
 
 // ApplyEvent applies a single 52W config event to the in-memory state.
@@ -65,6 +76,10 @@ func (s *ConfigStore) ApplyEvent(ev ConfigEvent) {
 			EnabledSince:    enabledSince,
 		}
 		s.configs[ev.UserID] = cfg
+
+		if s.onEnable != nil {
+			go s.onEnable(ev.UserID, enabledSince)
+		}
 
 	case "DELETE":
 		delete(s.configs, ev.UserID)

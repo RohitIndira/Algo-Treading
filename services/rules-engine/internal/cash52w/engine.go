@@ -31,6 +31,7 @@ type Config struct {
 // per-user in-memory state (Phase 1: approximate, reset daily). We track
 // positions opened today to avoid re-entries.
 type userState struct {
+	mu sync.Mutex
 	// Positions we already opened today, keyed by token. We keep the
 	// symbol/exchange so we can publish a useful allocation snapshot.
 	Positions map[string]models.AllocationPosition
@@ -258,14 +259,15 @@ func (e *Engine) HandleBreakout(ctx context.Context, ev *models.Breakout52WEvent
 			zap.String("token", ev.Token),
 			zap.String("symbol", ev.Symbol))
 		
-		if err := e.handleForUser(ctx, userID, ev); err != nil {
+		opened, err := e.handleForUser(ctx, userID, ev)
+		if err != nil {
 			e.logger.Error("Failed to handle 52w breakout for user",
 				zap.Error(err),
 				zap.String("user_id", userID),
 				zap.String("token", ev.Token),
 				zap.String("symbol", ev.Symbol))
 			// continue with other users
-		} else {
+		} else if opened {
 			successCount++
 		}
 	}
@@ -277,6 +279,13 @@ func (e *Engine) HandleBreakout(ctx context.Context, ev *models.Breakout52WEvent
 		zap.Int("total_users", len(userIDs)))
 
 	return nil
+}
+
+// HandleBreakoutForUser processes a breakout event for exactly one user.
+// This is used for catch-up/backfill when a user enables the strategy after
+// the breakout topic already contains messages for the day.
+func (e *Engine) HandleBreakoutForUser(ctx context.Context, userID string, ev *models.Breakout52WEvent) (bool, error) {
+	return e.handleForUser(ctx, userID, ev)
 }
 
 func (e *Engine) getUserState(userID string) *userState {
@@ -308,18 +317,22 @@ func (e *Engine) publishAllocation(ctx context.Context, userID string) {
 		return
 	}
 
+	// Get the user's state pointer under engine lock, then copy positions
+	// under per-user lock. This prevents races with concurrent breakout
+	// processing workers.
 	e.mu.Lock()
 	st, ok := e.userState[userID]
+	e.mu.Unlock()
 	if !ok {
-		e.mu.Unlock()
 		return
 	}
 
+	st.mu.Lock()
 	positions := make([]models.AllocationPosition, 0, len(st.Positions))
 	for _, pos := range st.Positions {
 		positions = append(positions, pos)
 	}
-	e.mu.Unlock()
+	st.mu.Unlock()
 
 	ev := &models.PortfolioAllocationEvent{
 		UserID:          userID,
@@ -344,7 +357,7 @@ func (e *Engine) publishAllocation(ctx context.Context, userID string) {
 	}
 }
 
-func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Breakout52WEvent) error {
+func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Breakout52WEvent) (bool, error) {
 	// Check per-user 52W configuration from the in-memory store. If the
 	// user has not enabled the managed 52W strategy, or if the breakout
 	// event occurred before the user enabled it, we skip.
@@ -356,13 +369,13 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 			e.logger.Debug("User not found in config store",
 				zap.String("user_id", userID),
 				zap.String("token", ev.Token))
-			return nil
+			return false, nil
 		}
 		if !cfg.Enabled {
 			e.logger.Debug("User has disabled 52W strategy",
 				zap.String("user_id", userID),
 				zap.String("token", ev.Token))
-			return nil
+			return false, nil
 		}
 		capitalPerStock = cfg.CapitalPerStock
 
@@ -389,23 +402,36 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 
 	st := e.getUserState(userID)
 
+	// IMPORTANT: breakout processing is concurrent (worker pool). We must
+	// enforce max positions + dedupe atomically per user. We use a lightweight
+	// reservation inside the Positions map so that multiple workers can't
+	// exceed MaxPositions before the final position write.
+	st.mu.Lock()
 	// enforce max positions per user per day
 	if len(st.Positions) >= e.cfg.MaxPositions {
+		st.mu.Unlock()
 		e.logger.Debug("User already has max 52w positions for today",
 			zap.String("user_id", userID),
 			zap.Int("max_positions", e.cfg.MaxPositions))
-		return nil
+		return false, nil
 	}
 
 	// don't re-enter same token for this user on the same day
 	if _, exists := st.Positions[ev.Token]; exists {
+		current := len(st.Positions)
+		st.mu.Unlock()
 		e.logger.Info("Skipping duplicate 52w breakout - position already opened today",
 			zap.String("user_id", userID),
 			zap.String("token", ev.Token),
 			zap.String("symbol", ev.Symbol),
-			zap.Int("current_positions", len(st.Positions)))
-		return nil
+			zap.Int("current_positions", current))
+		return false, nil
 	}
+
+	// reserve this token immediately so other workers count it towards max
+	// positions and don't concurrently create the 26th position.
+	st.Positions[ev.Token] = models.AllocationPosition{Token: ev.Token, Symbol: ev.Symbol}
+	st.mu.Unlock()
 
 	// Compute quantity from capital per stock so that we invest roughly
 	// ₹CapitalPerStock per breakout: qty ≈ CapitalPerStock / LTP.
@@ -416,7 +442,10 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 			zap.String("token", ev.Token),
 			zap.Float64("ltp", ev.LTP),
 			zap.Float64("capital_per_stock", e.cfg.CapitalPerStock))
-		return nil
+		st.mu.Lock()
+		delete(st.Positions, ev.Token)
+		st.mu.Unlock()
+		return false, nil
 	}
 
 	// Build a minimal order request compatible with risk + trade-execution.
@@ -493,7 +522,10 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 				zap.Error(err),
 				zap.String("user_id", userID),
 				zap.String("token", ev.Token))
-			return nil
+			st.mu.Lock()
+			delete(st.Positions, ev.Token)
+			st.mu.Unlock()
+			return false, nil
 		}
 		orderReq.RiskApproved = riskResp.Approved
 		orderReq.RiskScore = riskResp.RiskScore
@@ -502,7 +534,10 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 				zap.String("user_id", userID),
 				zap.String("token", ev.Token),
 				zap.Float64("risk_score", riskResp.RiskScore))
-			return nil
+			st.mu.Lock()
+			delete(st.Positions, ev.Token)
+			st.mu.Unlock()
+			return false, nil
 		}
 	} else {
 		orderReq.RiskApproved = true
@@ -537,11 +572,15 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 	} else {
 		// LIVE mode: publish order to RabbitMQ for real execution
 		if err := e.rabbitPub.PublishOrder(ctx, orderReq); err != nil {
-			return fmt.Errorf("failed to publish 52w order: %w", err)
+			st.mu.Lock()
+			delete(st.Positions, ev.Token)
+			st.mu.Unlock()
+			return false, fmt.Errorf("failed to publish 52w order: %w", err)
 		}
 	}
 
-	// Track that this user has taken this token today
+	// Track that this user has taken this token today (under per-user lock)
+	st.mu.Lock()
 	st.Positions[ev.Token] = models.AllocationPosition{
 		Token:      ev.Token,
 		Symbol:     ev.Symbol,
@@ -549,6 +588,7 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 		Quantity:   qty,
 		EntryPrice: ev.LTP,
 	}
+	st.mu.Unlock()
 
 	// Publish updated allocation snapshot
 	e.publishAllocation(ctx, userID)
@@ -563,5 +603,5 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 		zap.Int32("quantity", qty),
 		zap.Float64("price", ev.LTP))
 
-	return nil
+	return true, nil
 }

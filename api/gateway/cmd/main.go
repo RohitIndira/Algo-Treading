@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"strconv"
 	"syscall"
 	"time"
@@ -105,7 +106,20 @@ func main() {
 	defer logger.Sync()
 
 	// Initialize WebSocket handler
-	websocketHandler := handlers.NewWebSocketHandler(redisClient, logger)
+	brokersStr := os.Getenv("KAFKA_BROKERS")
+	if brokersStr == "" {
+		brokersStr = "localhost:9092"
+	}
+	brokers := make([]string, 0)
+	for _, b := range strings.Split(brokersStr, ",") {
+		b = strings.TrimSpace(b)
+		if b != "" {
+			brokers = append(brokers, b)
+		}
+	}
+	// Kafka-backed PnL topic for PAPER trading (defaults to paper-pnl.52w)
+	pnlTopic := os.Getenv("KAFKA_TOPIC_PAPER_PNL")
+	websocketHandler := handlers.NewWebSocketHandler(redisClient, logger, brokers, pnlTopic)
 
 	// Initialize Paper PnL handler (reads from same Redis as WebSocket)
 	paperPnLHandler := handlers.NewPaperPnLHandler(redisClient, logger)

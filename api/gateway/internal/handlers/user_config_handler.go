@@ -8,10 +8,17 @@ import (
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
+
+func cash52wStableStrategyID(userID string) string {
+	// Must match user-config service stable id logic:
+	// uuid.NewSHA1(uuid.NameSpaceOID, []byte("CASH_52W_HIGH:"+user_id))
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("CASH_52W_HIGH:"+userID)).String()
+}
 
 type UserConfigHandler struct {
 	client *grpc_clients.UserConfigClient
@@ -180,22 +187,58 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	req := &pb.DeleteStrategyRequest{
-		StrategyId: strategyID,
-		UserId:     userID,
+	// Special case: managed CASH_52W_HIGH is stored in cash52w_configs and does
+	// not exist as a generic strategies row. Frontend still calls
+	// DELETE /strategies/{strategy_id}?user_id=... using the stable UUID.
+	// We translate that into a disable call.
+	if strategyID == cash52wStableStrategyID(userID) {
+		// Disable (delete config row) via the managed endpoint.
+		req := &pb.ConfigureCash52WeekStrategyRequest{
+			UserId:  userID,
+			Enabled: false,
+		}
+		resp, err := h.client.ConfigureCash52WeekStrategy(r.Context(), req)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "Failed to disable cash52w strategy: "+err.Error())
+			return
+		}
+		if !resp.Success {
+			if resp.Error != nil {
+				respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+				return
+			}
+			respondWithError(w, http.StatusBadRequest, "Failed to disable cash52w strategy")
+			return
+		}
+
+		// Mirror the minimal JSON response used by ConfigureCash52WeekStrategy.
+		strategy := resp.GetStrategy()
+		capital := 0.0
+		if strategy != nil && strategy.TradeConfig != nil {
+			capital = strategy.TradeConfig.MaxPositionSize
+		}
+		respondWithJSON(w, http.StatusOK, map[string]any{
+			"success":           true,
+			"strategy_id":       strategyID,
+			"user_id":           userID,
+			"enabled":           false,
+			"capital_per_stock": capital,
+			"trading_mode":      func() string { if strategy != nil { return strategy.TradingMode }; return "" }(),
+		})
+		return
 	}
 
+	// Default: delete generic strategy via user-config service.
+	req := &pb.DeleteStrategyRequest{StrategyId: strategyID, UserId: userID}
 	resp, err := h.client.DeleteStrategy(r.Context(), req)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to delete strategy: "+err.Error())
 		return
 	}
-
 	if !resp.Success {
 		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
 		return
 	}
-
 	respondWithProtoJSON(w, http.StatusOK, resp)
 }
 

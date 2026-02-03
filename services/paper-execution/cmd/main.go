@@ -26,6 +26,7 @@ type Config struct {
 	TopicSignals string
 	TopicExec    string
 	TopicPnL     string
+	TopicCash52WConfig string
 
 	RedisAddr     string
 	RedisPassword string
@@ -88,6 +89,16 @@ func main() {
 	cons := consumer.NewTradeSignalConsumer(cfg.KafkaBrokers, cfg.TopicSignals, cfg.KafkaGroupID, sim, logger)
 	defer cons.Close()
 
+	// Also consume user-configs.cash52w so that when a user disables/deletes the
+	// managed strategy we force-close their open PAPER positions.
+	configCons, err := consumer.NewCash52WConfigConsumer(cfg.KafkaBrokers, cfg.TopicCash52WConfig, "", sim, logger)
+	if err != nil {
+		logger.Warn("Failed to initialize cash52w-config consumer", zap.Error(err))
+		configCons = nil
+	} else {
+		defer configCons.Close()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -96,6 +107,14 @@ func main() {
 			logger.Error("trade-signals consumer error", zap.Error(err))
 		}
 	}()
+
+	if configCons != nil {
+		go func() {
+			if err := configCons.Start(ctx); err != nil {
+				logger.Error("cash52w-config consumer error", zap.Error(err))
+			}
+		}()
+	}
 
 	go sim.Start(ctx)
 
@@ -141,6 +160,7 @@ func loadConfig() (Config, error) {
 		TopicSignals: getenv("KAFKA_TOPIC_TRADE_SIGNALS", "trade-signals"),
 		TopicExec:    getenv("KAFKA_TOPIC_PAPER_EXECUTIONS", "paper-executions.52w"),
 		TopicPnL:     getenv("KAFKA_TOPIC_PAPER_PNL", "paper-pnl.52w"),
+		TopicCash52WConfig: getenv("KAFKA_TOPIC_CASH52W_CONFIG", "user-configs.cash52w"),
 		RedisAddr:    getenv("MARKET_REDIS_ADDR", "localhost:6379"),
 		RedisPassword: getenv("MARKET_REDIS_PASSWORD", ""),
 		RedisDB:      redisDB,

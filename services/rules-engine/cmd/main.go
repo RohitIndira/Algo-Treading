@@ -240,6 +240,13 @@ func main() {
 		}
 		cash52wConfigStore = cash52w.NewConfigStore()
 		cash52wEngine = cash52w.NewEngine(engineCfg, cash52wConfigStore, riskClient, rabbitPub, tradeSignalPub, allocationPub, logger)
+		// When a user enables the strategy, backfill today's already-published
+		// breakouts so the user can immediately get up to 25 positions.
+		cash52wConfigStore.SetOnEnable(func(userID string, enabledSince time.Time) {
+			// Small delay to allow the periodic SetUsers loop to pick up the user.
+			time.Sleep(500 * time.Millisecond)
+			_ = cash52w.BackfillFromBreakouts(context.Background(), logger, cfg.Kafka.Brokers, cfg.Cash52WTopic, cash52wEngine, userID, 15*time.Second)
+		})
 
 		breakoutConsumer, err = consumer.NewBreakoutConsumer(
 			cfg.Kafka.Brokers,

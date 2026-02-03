@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cash52w"
 	"github.com/segmentio/kafka-go"
@@ -22,23 +23,28 @@ func NewCash52WConfigConsumer(brokers []string, topic, groupID string, store *ca
 	if topic == "" {
 		return nil, fmt.Errorf("cash52w config topic cannot be empty")
 	}
-	if groupID == "" {
-		groupID = "rules-engine-cash52w-config-v1"
-	}
-
+	// NOTE:
+	// We intentionally DO NOT use a Kafka consumer group for this topic.
+	// Reason: ConfigStore is purely in-memory. If we use a group, Kafka will
+	// resume from the last committed offsets after a restart, but our in-memory
+	// store will be empty, so rules-engine would think there are no configured
+	// users until a new config event arrives.
+	//
+	// By consuming without a group from the earliest offset, every restart
+	// rebuilds the full config state from the retained topic history.
+	_ = groupID // kept for backward compatibility with call sites
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:        brokers,
-		GroupID:        groupID,
-		Topic:          topic,
-		MinBytes:       10e3, // 10KB
-		MaxBytes:       10e6, // 10MB
-		CommitInterval: 1 * 1e9, // 1s
+		Brokers:     brokers,
+		Topic:       topic,
+		MinBytes:    1,
+		MaxBytes:    10e6,
+		MaxWait:     500 * time.Millisecond,
+		StartOffset: kafka.FirstOffset,
 	})
 
-	logger.Info("Cash52W config Kafka consumer created",
+	logger.Info("Cash52W config Kafka consumer created (no group, replay from earliest)",
 		zap.Strings("brokers", brokers),
-		zap.String("topic", topic),
-		zap.String("group_id", groupID))
+		zap.String("topic", topic))
 
 	return &Cash52WConfigConsumer{
 		reader: reader,
@@ -62,7 +68,9 @@ func (c *Cash52WConfigConsumer) Start(ctx context.Context) error {
 		default:
 		}
 
-		msg, err := c.reader.FetchMessage(ctx)
+		// ReadMessage advances the reader offset automatically. We don't commit
+		// because we are not using a consumer group.
+		msg, err := c.reader.ReadMessage(ctx)
 		if err != nil {
 			if err == context.Canceled {
 				c.logger.Info("Cash52W config consumer context cancelled")
@@ -76,18 +84,10 @@ func (c *Cash52WConfigConsumer) Start(ctx context.Context) error {
 		if err := json.Unmarshal(msg.Value, &ev); err != nil {
 			c.logger.Error("Failed to unmarshal Cash52W ConfigEvent",
 				zap.Error(err))
-			if commitErr := c.reader.CommitMessages(ctx, msg); commitErr != nil {
-				c.logger.Error("Failed to commit malformed Cash52W config message", zap.Error(commitErr))
-			}
 			continue
 		}
 
 		c.store.ApplyEvent(ev)
-
-		if err := c.reader.CommitMessages(ctx, msg); err != nil {
-			c.logger.Error("Failed to commit Cash52W config message", zap.Error(err))
-			continue
-		}
 	}
 }
 
