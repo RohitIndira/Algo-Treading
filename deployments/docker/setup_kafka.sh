@@ -91,7 +91,8 @@ topics=(
 	"market.data.news"          # Data Ingestion -> Rules Engine (news-based events)
 	"market.data.live"          # Live market depth (B2C bridge) -> Rules Engine jobbing
 	"market.data.52w_breakouts" # Redis 52W watcher -> Rules Engine 52W engine
-	"trade-signals"             # Rules Engine -> Trade Execution (order requests)
+	"trade-signals"             # Rules Engine -> Trade Execution (ALL BUY/SELL signals including exits)
+	"position-states"           # Rules Engine -> Position lifecycle tracking (OPEN/PARTIAL_EXIT/CLOSED)
 	"trade-executions"          # Trade Execution -> downstream (execution results)
 	"risk-approvals"            # Risk Management -> Rules Engine / TE (approvals)
 	"order-updates"             # Trade Execution -> frontend/services (order status)

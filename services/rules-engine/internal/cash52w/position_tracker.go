@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"go.uber.org/zap"
 )
 

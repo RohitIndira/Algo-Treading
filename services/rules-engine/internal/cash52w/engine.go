@@ -94,6 +94,7 @@ func NewEngine(cfg Config, store *ConfigStore, riskClient *risk.Client, rabbitPu
 		rabbitPub:       rabbitPub,
 		kafkaPub:        kafkaPub,
 		allocPub:        allocPub,
+		positionTracker: positionTracker,
 		logger:          logger,
 		day:             todayStr(),
 		userState:       make(map[string]*userState),
@@ -628,6 +629,18 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 
 	// Publish updated allocation snapshot
 	e.publishAllocation(ctx, userID)
+
+	// Track position in persistent position tracker with Kafka publishing
+	if e.positionTracker != nil {
+		e.positionTracker.TrackNewPosition(
+			userID,
+			ev.Token,
+			ev.Symbol,
+			orderReq.Exchange,
+			ev.LTP,
+			qty,
+		)
+	}
 
 	modeLabel := mode
 	e.logger.Info("52w-high order processed",

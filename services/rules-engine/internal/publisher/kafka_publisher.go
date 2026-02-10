@@ -146,6 +146,28 @@ func (p *KafkaPublisher) PublishRealtimePortfolio(ctx context.Context, ev *model
 	return nil
 }
 
+// Publish publishes a generic message to the configured Kafka topic
+// This is a low-level method used by position tracker for flexible publishing
+func (p *KafkaPublisher) Publish(ctx context.Context, topic string, key []byte, value []byte) error {
+	// Note: This publisher is configured with a specific topic in NewKafkaPublisher
+	// For position-states, create a dedicated publisher with that topic
+	msg := kafka.Message{
+		Key:   key,
+		Value: value,
+	}
+
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
+		return fmt.Errorf("failed to write message to Kafka topic %s: %w", topic, err)
+	}
+
+	p.logger.Debug("Generic message published to Kafka",
+		zap.String("topic", topic),
+		zap.Int("key_len", len(key)),
+		zap.Int("value_len", len(value)))
+
+	return nil
+}
+
 // Close closes the Kafka writer
 func (p *KafkaPublisher) Close() error {
 	p.logger.Info("Closing Kafka publisher")

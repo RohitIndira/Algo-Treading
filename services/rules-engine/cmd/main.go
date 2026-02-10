@@ -161,10 +161,18 @@ func main() {
 	)
 	defer realtimePortfolioPub.Close()
 
+	// Kafka publisher for position state tracking
+	positionStatesPub := publisher.NewKafkaPublisher(
+		cfg.Kafka.Brokers,
+		"position-states",
+		logger,
+	)
+	defer positionStatesPub.Close()
+
 	logger.Info("✓ All publishers initialized")
 
 	// ========================================================================
-	// STEP 5: Initialize Cash 52W Engine
+	// STEP 5: Initialize Cash 52W Engine with Position Tracker
 	// ========================================================================
 	logger.Info("[5/8] Initializing Cash 52-Week High strategy engine...")
 
@@ -174,6 +182,9 @@ func main() {
 
 	// Create config store (in-memory Phase 1 enhanced configs)
 	cash52wConfigStore := cash52w.NewConfigStore()
+
+	// Create position tracker with Kafka publisher
+	positionTracker := cash52w.NewPositionTracker(logger, positionStatesPub)
 
 	// Create engine with default config (will be overridden by config store)
 	engineCfg := cash52w.Config{
@@ -191,6 +202,7 @@ func main() {
 		rabbitPub,
 		tradeSignalPub,
 		allocationPub,
+		positionTracker,
 		logger,
 	)
 

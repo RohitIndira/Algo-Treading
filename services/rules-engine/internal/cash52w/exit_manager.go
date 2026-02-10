@@ -365,14 +365,31 @@ func (em *ExitManager) executeExitSignal(ctx context.Context, signal *PositionEx
 		}
 
 		em.logger.Info("Exit order generated",
-			zap.String("mode", mode),
 			zap.String("user_id", signal.UserID),
+			zap.String("token", signal.Token),
 			zap.String("symbol", signal.Symbol),
 			zap.String("level_type", level.LevelType),
 			zap.Int("level_number", level.LevelNumber),
-			zap.Int32("quantity", level.ExitQuantity),
-			zap.Float64("price", signal.CurrentPrice),
-			zap.String("reason", level.Reason))
+			zap.Int32("exit_qty", level.ExitQuantity),
+			zap.Float64("exit_price", signal.CurrentPrice),
+			zap.String("order_id", orderReq.OrderID))
+		
+		// Record exit in position tracker for lifecycle tracking
+		if em.engine.positionTracker != nil {
+			if err := em.engine.positionTracker.RecordExit(
+				signal.UserID,
+				signal.Token,
+				level.LevelType,
+				level.LevelNumber,
+				signal.CurrentPrice,
+				level.ExitQuantity,
+			); err != nil {
+				em.logger.Error("Failed to record exit in position tracker",
+					zap.Error(err),
+					zap.String("user_id", signal.UserID),
+					zap.String("token", signal.Token))
+			}
+		}
 	}
 
 	return nil
