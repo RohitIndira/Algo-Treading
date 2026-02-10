@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -15,50 +14,72 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cash52w"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/consumer"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/index"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/jobbing"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/sync"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/userconfig"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/utils"
 
 	"go.uber.org/zap"
 )
 
+// ============================================================================
+// PRODUCTION-READY RULES ENGINE - 52-WEEK STRATEGY ONLY
+// ============================================================================
+//
+// This is a SIMPLIFIED, PRODUCTION-READY version of the rules-engine service
+// that ONLY handles the Cash 52-Week High breakout strategy.
+//
+// REMOVED COMPONENTS (compared to original main.go):
+// ✗ News/generic matching (matcher, elasticsearch, strategy syncer)
+// ✗ Jobbing strategy engine
+// ✗ Market hours enforcement
+// ✗ Generic event handler
+//
+// ACTIVE COMPONENTS:
+// ✓ Cash 52W Engine (core strategy logic)
+// ✓ 52W Breakout Consumer (market:52w-breakouts topic)
+// ✓ 52W Config Consumer (user-configs.cash52w topic)
+// ✓ Config Store (in-memory Phase 1 configs)
+// ✓ Redis cache (for live market data)
+// ✓ PostgreSQL (trade signal tracking)
+// ✓ RabbitMQ publisher (order execution)
+// ✓ Kafka publishers (signals, allocations, portfolios)
+// ✓ Risk management (optional, currently disabled)
+//
+// ============================================================================
+
 func main() {
-	// Load .env file if it exists
+	// Load environment variables
 	if err := godotenv.Load(); err != nil {
-		// .env file not found is not an error - we can use system env vars
 		fmt.Printf("Note: .env file not found, using system environment variables\n")
 	}
 
 	// Load configuration
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		panic(fmt.Sprintf("failed to load configuration: %v", err))
+		panic(fmt.Sprintf("Failed to load configuration: %v", err))
 	}
 
-	// Initialize logger
+	// Initialize production logger
 	logger, err := zap.NewProduction()
 	if err != nil {
-		panic(fmt.Sprintf("failed to initialize logger: %v", err))
+		panic(fmt.Sprintf("Failed to initialize logger: %v", err))
 	}
 	defer logger.Sync()
 
-	logger.Info("Starting Rules Engine Service",
+	logger.Info("=============================================================")
+	logger.Info("Starting Rules Engine Service - 52W STRATEGY ONLY")
+	logger.Info("=============================================================",
 		zap.String("version", cfg.ServiceVersion),
-		zap.String("environment", cfg.Environment),
-		zap.Int("grpc_port", cfg.GRPCPort))
+		zap.String("environment", cfg.Environment))
 
-	// Initialize matching statistics
-	stats := models.NewMatchingStats()
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Initialize PostgreSQL repository for trade signal tracking
-	logger.Info("Initializing PostgreSQL trade signal repository...")
+	// ========================================================================
+	// STEP 1: Initialize PostgreSQL Repository (Trade Signal Tracking)
+	// ========================================================================
+	logger.Info("[1/8] Initializing PostgreSQL trade signal repository...")
 	signalRepo, err := repository.NewTradeSignalRepository(
 		cfg.PostgreSQL.Host,
 		cfg.PostgreSQL.Port,
@@ -69,16 +90,18 @@ func main() {
 		logger,
 	)
 	if err != nil {
-		logger.Warn("Failed to initialize trade signal repository - orders won't be tracked in DB",
+		logger.Warn("PostgreSQL unavailable - continuing without DB tracking",
 			zap.Error(err))
-		signalRepo = nil // Continue without DB tracking
+		signalRepo = nil
 	} else {
 		defer signalRepo.Close()
-		logger.Info("Trade signal repository initialized successfully")
+		logger.Info("✓ PostgreSQL repository initialized")
 	}
 
-	// Initialize Redis cache
-	logger.Info("Initializing Redis cache...")
+	// ========================================================================
+	// STEP 2: Initialize Redis Cache (Live Market Data)
+	// ========================================================================
+	logger.Info("[2/8] Initializing Redis cache...")
 	redisCache, err := cache.NewRedisCache(
 		cfg.Redis.Addrs,
 		cfg.Redis.Password,
@@ -90,387 +113,198 @@ func main() {
 		logger,
 	)
 	if err != nil {
-		logger.Fatal("Failed to initialize Redis cache", zap.Error(err))
+		logger.Fatal("Failed to initialize Redis cache (REQUIRED)", zap.Error(err))
 	}
 	defer redisCache.Close()
+	logger.Info("✓ Redis cache initialized")
 
-	strategyCache := cache.NewStrategyCache(redisCache, cfg.Redis.CacheTTL, logger)
-	logger.Info("Redis cache initialized successfully")
-
-	// Initialize Elasticsearch indexer
-	logger.Info("Initializing Elasticsearch indexer...")
-	indexer, err := index.NewIndexer(
-		cfg.Elasticsearch.URLs,
-		cfg.Elasticsearch.Username,
-		cfg.Elasticsearch.Password,
-		cfg.Elasticsearch.IndexName,
-		logger,
-	)
-	if err != nil {
-		logger.Fatal("Failed to initialize Elasticsearch indexer", zap.Error(err))
-	}
-	defer indexer.Close()
-	logger.Info("Elasticsearch indexer initialized successfully")
-
-	// Initialize strategy syncer (loads strategies from Kafka user-configs topic)
-	logger.Info("Initializing strategy syncer...")
-	strategySyncer := sync.NewStrategySyncer(
-		cfg.Kafka.Brokers,
-		"user-configs",                  // Topic where user-config service publishes strategy events
-		"rules-engine-strategy-sync-v2", // Changed group to avoid replaying old DELETE events
-		indexer,
-		strategyCache,
-		logger,
-	)
-	defer strategySyncer.Close()
-	logger.Info("Strategy syncer initialized successfully")
-
-	// Initialize query engine
-	queryEngine := index.NewQueryEngine(
-		indexer.GetClient(),
-		cfg.Elasticsearch.IndexName,
-		cfg.Elasticsearch.Timeout,
-		logger,
-	)
-
-	// Initialize user-config client for fetching strategies
-	logger.Info("Initializing user-config client...")
-	userConfigClient, err := userconfig.NewClient(userconfig.Config{
-		Address:          cfg.GRPCClients.UserConfigService.Address,
-		Timeout:          cfg.GRPCClients.UserConfigService.Timeout,
-		MaxRetries:       cfg.GRPCClients.UserConfigService.MaxRetries,
-		RetryBackoff:     cfg.GRPCClients.UserConfigService.RetryBackoff,
-		KeepAlive:        cfg.GRPCClients.UserConfigService.KeepAlive,
-		KeepAliveTimeout: cfg.GRPCClients.UserConfigService.KeepAliveTimeout,
-	}, logger)
-	if err != nil {
-		logger.Warn("Failed to initialize user-config client - will rely only on cache",
-			zap.Error(err))
-		userConfigClient = nil
-	} else {
-		defer userConfigClient.Close()
-		logger.Info("User-config client initialized successfully")
-	}
-
-	// Initialize matcher
-	logger.Info("Initializing matcher engine...")
-	matcherEngine := matcher.NewMatcher(
-		queryEngine,
-		strategyCache,
-		userConfigClient,
-		cfg.Performance.MinMatchScore,
-		cfg.Performance.MaxConcurrentMatches,
-		logger,
-	)
-	logger.Info("Matcher engine initialized successfully")
-
-	// Initialize risk management client (DISABLED for development).
-	// For now we bypass risk checks entirely so that we can validate
-	// end-to-end flow of all microservices. The Cash 52W engine and
-	// news-based handler will auto-approve orders when riskClient is nil.
-	//
-	// To re-enable risk in future, restore the original initialization
-	// using risk.NewClient and pass the resulting client into handlers.
-	logger.Warn("Risk management client disabled for development - orders will be auto-approved")
+	// ========================================================================
+	// STEP 3: Initialize Risk Management Client (OPTIONAL - Currently Disabled)
+	// ========================================================================
+	logger.Info("[3/8] Initializing risk management...")
 	var riskClient *risk.Client = nil
+	logger.Warn("✓ Risk management DISABLED - orders will be auto-approved")
 
-	// Initialize RabbitMQ publisher
-	logger.Info("Initializing RabbitMQ publisher...")
+	// ========================================================================
+	// STEP 4: Initialize Publishers (RabbitMQ + Kafka)
+	// ========================================================================
+	logger.Info("[4/8] Initializing publishers...")
+
+	// RabbitMQ for order execution
 	rabbitPub, err := publisher.NewPublisher(&cfg.RabbitMQ, logger)
 	if err != nil {
-		logger.Fatal("Failed to initialize RabbitMQ publisher", zap.Error(err))
+		logger.Fatal("Failed to initialize RabbitMQ publisher (REQUIRED)", zap.Error(err))
 	}
 	defer rabbitPub.Close()
-	logger.Info("RabbitMQ publisher initialized successfully")
 
-	// Initialize Kafka publisher for trade-signals topic
-	logger.Info("Initializing Kafka publisher for trade-signals...")
+	// Kafka publisher for trade signals
 	tradeSignalPub := publisher.NewKafkaPublisher(
 		cfg.Kafka.Brokers,
-		"trade-signals", // Topic for order signals
+		"trade-signals",
 		logger,
 	)
 	defer tradeSignalPub.Close()
-	logger.Info("Kafka trade-signals publisher initialized successfully")
 
-	// Initialize Kafka publisher for portfolio allocation state events
-	logger.Info("Initializing Kafka publisher for portfolio allocations...",
-		zap.String("topic", cfg.PortfolioAllocTopic))
+	// Kafka publisher for portfolio allocations
 	allocationPub := publisher.NewKafkaPublisher(
 		cfg.Kafka.Brokers,
 		cfg.PortfolioAllocTopic,
 		logger,
 	)
 	defer allocationPub.Close()
-	logger.Info("Kafka portfolio allocations publisher initialized successfully")
 
-	// Initialize Kafka publisher for realtime portfolio valuations
-	logger.Info("Initializing Kafka publisher for realtime portfolios...",
-		zap.String("topic", cfg.PortfolioRealtimeTopic))
+	// Kafka publisher for realtime portfolios
 	realtimePortfolioPub := publisher.NewKafkaPublisher(
 		cfg.Kafka.Brokers,
 		cfg.PortfolioRealtimeTopic,
 		logger,
 	)
 	defer realtimePortfolioPub.Close()
-	logger.Info("Kafka realtime portfolio publisher initialized successfully")
 
-	// Initialize Cash 52-week High strategy engine.
-	//
-	// IMPORTANT: We no longer require a static list of CASH52W_USER_IDS
-	// to enable the engine. Instead, the engine is always enabled when
-	// a CASH52W_TOPIC is configured, and the active user list is driven
-	// dynamically from Elasticsearch via ListUsersWithActiveStrategy.
-	var cash52wEngine *cash52w.Engine
-	var breakoutConsumer *consumer.BreakoutConsumer
-	var cash52wConfigStore *cash52w.ConfigStore
-	var cash52wConfigConsumer *consumer.Cash52WConfigConsumer
-	if cfg.Cash52WTopic != "" {
-		logger.Info("Initializing Cash 52-week High engine",
-			zap.String("breakout_topic", cfg.Cash52WTopic))
+	logger.Info("✓ All publishers initialized")
 
-		engineCfg := cash52w.Config{
-			// Start with no users; the active user list will be filled
-			// dynamically from Elasticsearch (user-config DB) via SetUsers.
-			UserIDs:         []string{},
-			CapitalPerStock: 20000,
-			MaxPositions:    25,
-			SLPercent:       10,
-			TSLPercent:      20,
-		}
-		cash52wConfigStore = cash52w.NewConfigStore()
-		cash52wEngine = cash52w.NewEngine(engineCfg, cash52wConfigStore, riskClient, rabbitPub, tradeSignalPub, allocationPub, logger)
-		// When a user enables the strategy, backfill today's already-published
-		// breakouts so the user can immediately get up to 25 positions.
-		cash52wConfigStore.SetOnEnable(func(userID string, enabledSince time.Time) {
-			// Small delay to allow the periodic SetUsers loop to pick up the user.
-			time.Sleep(500 * time.Millisecond)
-			_ = cash52w.BackfillFromBreakouts(context.Background(), logger, cfg.Kafka.Brokers, cfg.Cash52WTopic, cash52wEngine, userID, 15*time.Second)
-		})
+	// ========================================================================
+	// STEP 5: Initialize Cash 52W Engine
+	// ========================================================================
+	logger.Info("[5/8] Initializing Cash 52-Week High strategy engine...")
 
-		breakoutConsumer, err = consumer.NewBreakoutConsumer(
-			cfg.Kafka.Brokers,
-			cfg.Cash52WTopic,
-			"", // use default versioned group with earliest offsets for same-day backlog
-			cash52wEngine,
-			logger,
-		)
-		if err != nil {
-			logger.Error("Failed to initialize 52w-breakout consumer", zap.Error(err))
-		} else {
-			defer breakoutConsumer.Close()
-			logger.Info("52w-breakout consumer initialized successfully")
-		}
-
-		// Initialize 52W config consumer (user-configs.cash52w) so that
-		// per-user enabled/capital/trading_mode is driven from user-config
-		// events rather than Elasticsearch.
-		cash52wConfigConsumer, err = consumer.NewCash52WConfigConsumer(
-			cfg.Kafka.Brokers,
-			"user-configs.cash52w",
-			"",
-			cash52wConfigStore,
-			logger,
-		)
-		if err != nil {
-			logger.Error("Failed to initialize Cash52W config consumer", zap.Error(err))
-		} else {
-			defer cash52wConfigConsumer.Close()
-			logger.Info("Cash52W config consumer initialized successfully")
-		}
-	} else {
-		logger.Info("Cash 52-week High engine disabled (no CASH52W_TOPIC configured)")
+	if cfg.Cash52WTopic == "" {
+		logger.Fatal("CASH52W_TOPIC not configured - cannot start 52W engine")
 	}
 
-	// Initialize Jobbing strategy engine (if configured)
-	var jobbingEngine *jobbing.Engine
-	var jobbingConsumer *consumer.JobbingConsumer
-	if len(cfg.JobbingUserIDs) > 0 && cfg.JobbingTopic != "" {
-		logger.Info("Initializing Jobbing strategy engine",
-			zap.String("topic", cfg.JobbingTopic),
-			zap.Strings("user_ids", cfg.JobbingUserIDs),
-			zap.Strings("tokens", cfg.JobbingTokens))
+	// Create config store (in-memory Phase 1 enhanced configs)
+	cash52wConfigStore := cash52w.NewConfigStore()
 
-		jobbingCfg := jobbing.Config{
-			UserIDs:          cfg.JobbingUserIDs,
-			LowerRange:       cfg.JobbingLowerRange,
-			HigherRange:      cfg.JobbingHigherRange,
-			InitialBuyOffset: cfg.JobbingInitialOffset,
-			DistanceContinue: cfg.JobbingDistanceContinue,
-			QuantityPerOrder: cfg.JobbingQtyPerOrder,
-			MaxQuantity:      cfg.JobbingMaxQty,
-			Tokens:           cfg.JobbingTokens,
-		}
-		jobbingEngine = jobbing.NewEngine(jobbingCfg, riskClient, rabbitPub, tradeSignalPub, allocationPub, logger)
-
-		// Load per-user, per-token jobbing configs dynamically from user-config
-		// service. This allows one user to have multiple jobbing configs across
-		// different symbols, with parameters stored in the strategies tables.
-		if userConfigClient != nil {
-			loadJobbingConfigsForUsers(context.Background(), logger, userConfigClient, jobbingEngine, cfg.JobbingUserIDs)
-		} else {
-			logger.Warn("User-config client not available, jobbing engine will use static env-based configuration only")
-		}
-
-		jobbingConsumer, err = consumer.NewJobbingConsumer(
-			cfg.Kafka.Brokers,
-			cfg.JobbingTopic,
-			"", // use default group
-			jobbingEngine,
-			logger,
-		)
-		if err != nil {
-			logger.Error("Failed to initialize jobbing consumer", zap.Error(err))
-		} else {
-			defer jobbingConsumer.Close()
-			logger.Info("Jobbing consumer initialized successfully")
-		}
-	} else {
-		logger.Info("Jobbing strategy engine disabled (no JOBBING_USER_IDS configured)")
+	// Create engine with default config (will be overridden by config store)
+	engineCfg := cash52w.Config{
+		UserIDs:         []string{}, // Populated dynamically
+		CapitalPerStock: 20000,      // Default (overridden by user configs)
+		MaxPositions:    25,          // Default
+		SLPercent:       10,          // Default
+		TSLPercent:      20,          // Default
 	}
 
-	// TODO: In a future enhancement we can also subscribe directly to the
-	// jobbing.configs Kafka topic (emitted by user-config service) to
-	// dynamically refresh jobbingEngine user/token configs in near real-time.
-	// For now, configs are loaded once at startup via gRPC calls above.
-
-	// Initialize market hours from configuration
-	logger.Info("Initializing market hours configuration...",
-		zap.Int("open_hour", cfg.MarketHours.OpenHour),
-		zap.Int("open_minute", cfg.MarketHours.OpenMinute),
-		zap.Int("close_hour", cfg.MarketHours.CloseHour),
-		zap.Int("close_minute", cfg.MarketHours.CloseMinute),
-		zap.String("timezone", cfg.MarketHours.Timezone),
-		zap.Bool("enforce_hours", cfg.MarketHours.EnforceHours))
-
-	marketHours := utils.NewMarketHours(
-		cfg.MarketHours.OpenHour,
-		cfg.MarketHours.OpenMinute,
-		cfg.MarketHours.CloseHour,
-		cfg.MarketHours.CloseMinute,
-		cfg.MarketHours.Timezone,
-	)
-	logger.Info("Market hours initialized",
-		zap.String("status", marketHours.GetMarketStatus()))
-
-	// Initialize event handler.
-	// For now we disable market-hours enforcement so that orders can be
-	// generated at any time during development/testing. Once the behaviour
-	// is validated end-to-end, this can be switched back to
-	// cfg.MarketHours.EnforceHours.
-	handler := consumer.NewHandler(
-		matcherEngine,
+	cash52wEngine := cash52w.NewEngine(
+		engineCfg,
+		cash52wConfigStore,
+		riskClient,
 		rabbitPub,
 		tradeSignalPub,
-		signalRepo,
-		riskClient,
-		redisCache,
-		strategyCache,
-		stats,
+		allocationPub,
 		logger,
-		marketHours,
-		false, // enforceHours disabled for now
 	)
 
-	// Initialize Kafka consumer
-	logger.Info("Initializing Kafka consumer...")
-	kafkaConsumer, err := consumer.NewConsumer(&cfg.Kafka, handler, stats, logger)
+	// Set backfill callback for when users enable strategy
+	cash52wConfigStore.SetOnEnable(func(userID string, enabledSince time.Time) {
+		logger.Info("User enabled 52W strategy - triggering backfill",
+			zap.String("user_id", userID))
+		time.Sleep(500 * time.Millisecond) // Allow config to propagate
+		_ = cash52w.BackfillFromBreakouts(
+			context.Background(),
+			logger,
+			cfg.Kafka.Brokers,
+			cfg.Cash52WTopic,
+			cash52wEngine,
+			userID,
+			15*time.Second,
+		)
+	})
+
+	logger.Info("✓ Cash 52W engine initialized")
+
+	// ========================================================================
+	// STEP 6: Initialize 52W Config Consumer (user-configs.cash52w)
+	// ========================================================================
+	logger.Info("[6/8] Initializing Cash52W config consumer...")
+
+	cash52wConfigConsumer, err := consumer.NewCash52WConfigConsumer(
+		cfg.Kafka.Brokers,
+		"user-configs.cash52w",
+		"", // Use default group
+		cash52wConfigStore,
+		logger,
+	)
 	if err != nil {
-		logger.Fatal("Failed to initialize Kafka consumer", zap.Error(err))
+		logger.Fatal("Failed to initialize Cash52W config consumer (REQUIRED)", zap.Error(err))
 	}
-	defer kafkaConsumer.Close()
-	logger.Info("Kafka consumer initialized successfully")
+	defer cash52wConfigConsumer.Close()
 
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	logger.Info("✓ Cash52W config consumer initialized")
 
-	// Start strategy syncer (loads from Kafka user-configs topic)
+	// ========================================================================
+	// STEP 7: Initialize 52W Breakout Consumer (market:52w-breakouts)
+	// ========================================================================
+	logger.Info("[7/8] Initializing 52W breakout consumer...")
+
+	breakoutConsumer, err := consumer.NewBreakoutConsumer(
+		cfg.Kafka.Brokers,
+		cfg.Cash52WTopic,
+		"", // Use default group
+		cash52wEngine,
+		logger,
+	)
+	if err != nil {
+		logger.Fatal("Failed to initialize 52W breakout consumer (REQUIRED)", zap.Error(err))
+	}
+	defer breakoutConsumer.Close()
+
+	logger.Info("✓ 52W breakout consumer initialized")
+
+	// ========================================================================
+	// STEP 8: Start All Background Services
+	// ========================================================================
+	logger.Info("[8/8] Starting background services...")
+
+	// Start Cash52W config consumer
 	go func() {
-		logger.Info("Starting strategy syncer from Kafka user-configs topic...")
-		if err := strategySyncer.Start(ctx); err != nil {
-			logger.Error("Strategy syncer error", zap.Error(err))
+		logger.Info("→ Starting Cash52W config consumer",
+			zap.String("topic", "user-configs.cash52w"))
+		if err := cash52wConfigConsumer.Start(ctx); err != nil {
+			logger.Error("Cash52W config consumer error", zap.Error(err))
 		}
 	}()
 
-	// Dynamically refresh the list of users enrolled in the managed 52W
-	// strategy and their per-user trading modes (LIVE/PAPER) based on the
-	// in-memory ConfigStore fed by user-configs.cash52w. This replaces the
-	// previous Elasticsearch-based discovery.
-	if cash52wEngine != nil && cash52wConfigStore != nil {
-		go func() {
-			refreshInterval := 15 * time.Second
-			logger.Info("Starting 52W user + mode refresh loop from config store",
-				zap.Duration("interval", refreshInterval))
+	// Start dynamic user/mode refresh loop
+	go func() {
+		refreshInterval := 15 * time.Second
+		logger.Info("→ Starting 52W user refresh loop",
+			zap.Duration("interval", refreshInterval))
 
-			ticker := time.NewTicker(refreshInterval)
-			defer ticker.Stop()
+		ticker := time.NewTicker(refreshInterval)
+		defer ticker.Stop()
 
-			for {
-				select {
-				case <-ctx.Done():
-					logger.Info("Stopping 52W user + mode refresh loop")
-					return
-				case <-ticker.C:
-					users, modes := cash52wConfigStore.Snapshot()
-					cash52wEngine.SetUsers(users)
-					cash52wEngine.SetUserModes(modes)
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Info("Stopping 52W user refresh loop")
+				return
+			case <-ticker.C:
+				users, modes := cash52wConfigStore.Snapshot()
+				cash52wEngine.SetUsers(users)
+				cash52wEngine.SetUserModes(modes)
+
+				if len(users) > 0 {
+					logger.Debug("Refreshed active 52W users",
+						zap.Strings("users", users),
+						zap.Int("count", len(users)))
 				}
 			}
-		}()
-	}
-
-	// Start consuming 52-week breakout events if engine is enabled
-	if breakoutConsumer != nil && cash52wEngine != nil {
-		go func() {
-			logger.Info("Starting 52w-breakout consumer",
-				zap.String("topic", cfg.Cash52WTopic))
-			if err := breakoutConsumer.Start(ctx); err != nil {
-				logger.Error("52w-breakout consumer error", zap.Error(err))
-			}
-		}()
-	}
-
-	// Start consuming 52W user-config events if consumer is initialized
-	if cash52wConfigConsumer != nil {
-		go func() {
-			logger.Info("Starting Cash52W config consumer",
-				zap.String("topic", "user-configs.cash52w"))
-			if err := cash52wConfigConsumer.Start(ctx); err != nil {
-				logger.Error("Cash52W config consumer error", zap.Error(err))
-			}
-		}()
-	}
-
-	// Start realtime portfolio publisher loop (52W) if engine is enabled
-	if cash52wEngine != nil {
-		go startRealtimePortfolioLoop(ctx, logger, cash52wEngine, redisCache, realtimePortfolioPub)
-	}
-
-	// Start consuming jobbing market depth events if engine is enabled
-	if jobbingConsumer != nil && jobbingEngine != nil {
-		go func() {
-			logger.Info("Starting jobbing consumer",
-				zap.String("topic", cfg.JobbingTopic),
-				zap.Strings("tokens", cfg.JobbingTokens))
-			if err := jobbingConsumer.Start(ctx); err != nil {
-				logger.Error("Jobbing consumer error", zap.Error(err))
-			}
-		}()
-	}
-
-	// Start consuming market events from Kafka
-	go func() {
-		logger.Info("Starting to consume market events from Kafka",
-			zap.String("topic", cfg.Kafka.Topic),
-			zap.String("consumer_group", cfg.Kafka.ConsumerGroup))
-
-		if err := kafkaConsumer.Start(ctx); err != nil {
-			logger.Error("Kafka consumer error", zap.Error(err))
 		}
 	}()
 
-	// Log periodic statistics
+	// Start 52W breakout consumer
+	go func() {
+		logger.Info("→ Starting 52W breakout consumer",
+			zap.String("topic", cfg.Cash52WTopic))
+		if err := breakoutConsumer.Start(ctx); err != nil {
+			logger.Error("52W breakout consumer error", zap.Error(err))
+		}
+	}()
+
+	// Start realtime portfolio publisher loop with exit monitoring
+	go startRealtimePortfolioLoop(ctx, logger, cash52wEngine, redisCache, realtimePortfolioPub)
+
+	// Start periodic statistics logger
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -478,67 +312,54 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				syncStats := strategySyncer.GetStats()
-				logger.Info("Matching statistics",
-					zap.Int64("events_processed", stats.TotalEventsProcessed),
-					zap.Int64("matches_found", stats.TotalMatchesFound),
-					zap.Int64("orders_generated", stats.TotalOrdersGenerated),
-					zap.Int64("cache_hits", stats.CacheHits),
-					zap.Int64("cache_misses", stats.CacheMisses))
-				logger.Info("Strategy sync statistics",
-					zap.Int64("strategies_synced", syncStats.TotalProcessed),
-					zap.Int64("created", syncStats.Created),
-					zap.Int64("updated", syncStats.Updated),
-					zap.Int64("deleted", syncStats.Deleted),
-					zap.Int64("sync_errors", syncStats.Errors))
-
-				// Log jobbing statistics if engine is active
-				if jobbingEngine != nil {
-					jobbingStats := jobbingEngine.GetStats()
-					logger.Info("Jobbing strategy statistics",
-						zap.Any("stats", jobbingStats))
-				}
+				stats := cash52wEngine.GetStats()
+				logger.Info("📊 Cash 52W Strategy Statistics",
+					zap.Any("stats", stats))
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
-	logger.Info("Rules Engine Service started successfully",
-		zap.Int("worker_count", cfg.Performance.WorkerCount),
-		zap.Float64("min_match_score", cfg.Performance.MinMatchScore))
+	logger.Info("=============================================================")
+	logger.Info("✅ Rules Engine Service Started Successfully")
+	logger.Info("=============================================================")
+	logger.Info("Listening for:")
+	logger.Info("  • 52W breakouts:       market:52w-breakouts")
+	logger.Info("  • User configurations: user-configs.cash52w")
+	logger.Info("Publishing to:")
+	logger.Info("  • Trade signals:       trade-signals")
+	logger.Info("  • Allocations:         " + cfg.PortfolioAllocTopic)
+	logger.Info("  • Realtime portfolios: " + cfg.PortfolioRealtimeTopic)
+	logger.Info("  • Orders:              RabbitMQ (odin-api-wrapper)")
+	logger.Info("=============================================================")
 
-	// Wait for interrupt signal
+	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	<-sigCh
-	logger.Info("Received shutdown signal, starting graceful shutdown...")
+	logger.Info("🛑 Received shutdown signal, starting graceful shutdown...")
 
 	// Cancel context to stop all goroutines
 	cancel()
 
-	// Give some time for graceful shutdown
+	// Give time for graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
-	// Wait for shutdown with timeout
 	<-shutdownCtx.Done()
 
 	// Log final statistics
-	logger.Info("Final statistics",
-		zap.Int64("total_events_processed", stats.TotalEventsProcessed),
-		zap.Int64("total_matches_found", stats.TotalMatchesFound),
-		zap.Int64("total_orders_generated", stats.TotalOrdersGenerated),
-		zap.Int64("total_errors", stats.EvaluationErrors+stats.KafkaErrors+stats.RabbitMQErrors))
+	finalStats := cash52wEngine.GetStats()
+	logger.Info("📊 Final Statistics", zap.Any("stats", finalStats))
 
-	logger.Info("Rules Engine Service shutdown complete")
+	logger.Info("✅ Rules Engine Service shutdown complete")
 }
 
 // startRealtimePortfolioLoop periodically builds realtime marked-to-market
-// portfolios for the CASH_52W_HIGH strategy and publishes them to Kafka.
-// This uses live prices from Redis (written by the data-ingestion service)
-// and the in-memory allocation state maintained by the cash52w engine.
+// portfolios for all active 52W users, evaluates exit signals (multi-level
+// SL/profit), and publishes everything to Kafka.
 func startRealtimePortfolioLoop(
 	ctx context.Context,
 	logger *zap.Logger,
@@ -546,14 +367,12 @@ func startRealtimePortfolioLoop(
 	redisCache *cache.RedisCache,
 	pub *publisher.KafkaPublisher,
 ) {
-	if engine == nil || redisCache == nil || pub == nil {
-		logger.Warn("Realtime portfolio loop not started (missing dependencies)")
-		return
-	}
-
-	interval := 5 * time.Second // can be made configurable later
-	logger.Info("Starting realtime 52W portfolio publisher loop",
+	interval := 5 * time.Second
+	logger.Info("→ Starting realtime 52W portfolio publisher + exit monitor",
 		zap.Duration("interval", interval))
+
+	// Create exit manager for Phase 1 multi-level SL/profit
+	exitManager := cash52w.NewExitManager(engine, logger)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -561,23 +380,45 @@ func startRealtimePortfolioLoop(
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("Stopping realtime 52W portfolio publisher loop")
+			logger.Info("Stopping realtime 52W portfolio publisher + exit monitor")
 			return
 		case <-ticker.C:
-			// Build realtime portfolios for all users with 52W positions
+			// Build realtime portfolios for all users with positions
 			events := engine.BuildRealtimePortfolios(ctx, redisCache)
 			if len(events) == 0 {
 				continue
 			}
 
+			// Publish each portfolio event to Kafka
 			for _, ev := range events {
-				// Publish to Kafka only (no Redis PnL publishing). The
-				// API/Gateway can consume this topic directly for /ws/pnl
-				// or any PnL-related APIs.
 				if err := pub.PublishRealtimePortfolio(ctx, ev); err != nil {
-					logger.Error("Failed to publish realtime 52W portfolio event",
+					logger.Error("Failed to publish realtime portfolio",
 						zap.Error(err),
 						zap.String("user_id", ev.UserID))
+				}
+			}
+
+			// ================================================================
+			// PHASE 1: Multi-Level Exit Evaluation
+			// ================================================================
+			// Evaluate all positions against Phase 1 exit levels:
+			// - Profit L1: +15% → Exit 33%
+			// - Profit L2: +30% → Exit 50%
+			// - Profit L3: +50% → Exit 100% (trailing)
+			// - SL L1: -10% → Exit 50%
+			// - SL L2: -20% → Exit 100%
+			// - Force exits (manual controls)
+			exitSignals := exitManager.EvaluateExits(ctx, events)
+			
+			if len(exitSignals) > 0 {
+				logger.Info("Exit signals generated",
+					zap.Int("signal_count", len(exitSignals)))
+				
+				// Execute exit signals (SELL orders)
+				// This publishes to both Kafka (trade-signals) and RabbitMQ
+				if err := exitManager.ExecuteExitSignals(ctx, exitSignals); err != nil {
+					logger.Error("Failed to execute exit signals",
+						zap.Error(err))
 				}
 			}
 		}

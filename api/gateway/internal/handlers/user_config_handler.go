@@ -452,3 +452,257 @@ func respondWithProtoJSON(w http.ResponseWriter, code int, msg proto.Message) {
 func respondWithError(w http.ResponseWriter, code int, message string) {
 	respondWithJSON(w, code, map[string]string{"error": message})
 }
+
+// ============================================================================
+// PHASE 1: Enhanced Cash52W Configuration REST Endpoints
+// ============================================================================
+
+// ConfigureCash52WStrategyEnhanced handles POST /api/v1/strategies/cash52w/configure-enhanced
+// This is the FULL Phase 1 endpoint with all multi-level profit/SL, portfolio config, and manual controls
+func (h *UserConfigHandler) ConfigureCash52WStrategyEnhanced(w http.ResponseWriter, r *http.Request) {
+	var req pb.ConfigureCash52WStrategyEnhancedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if req.UserId == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	resp, err := h.client.ConfigureCash52WStrategyEnhanced(r.Context(), &req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to configure enhanced strategy: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to configure enhanced strategy")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// GetCash52WConfig handles GET /api/v1/strategies/cash52w/config/{user_id}
+func (h *UserConfigHandler) GetCash52WConfig(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	userID := vars["user_id"]
+
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	req := &pb.GetCash52WConfigRequest{
+		UserId: userID,
+	}
+
+	resp, err := h.client.GetCash52WConfig(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get config: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusNotFound, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusNotFound, "Config not found")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// ForceExitAll handles PUT /api/v1/strategies/cash52w/force-exit-all
+func (h *UserConfigHandler) ForceExitAll(w http.ResponseWriter, r *http.Request) {
+	var reqBody struct {
+		UserID string `json:"user_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if reqBody.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	req := &pb.ForceExitAllRequest{
+		UserId: reqBody.UserID,
+	}
+
+	resp, err := h.client.ForceExitAll(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to force exit: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to force exit")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// ForceExitStocks handles PUT /api/v1/strategies/cash52w/force-exit-stocks
+func (h *UserConfigHandler) ForceExitStocks(w http.ResponseWriter, r *http.Request) {
+	var reqBody struct {
+		UserID string   `json:"user_id"`
+		Stocks []string `json:"stocks"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if reqBody.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	if len(reqBody.Stocks) == 0 {
+		respondWithError(w, http.StatusBadRequest, "stocks list cannot be empty")
+		return
+	}
+
+	req := &pb.ForceExitStocksRequest{
+		UserId: reqBody.UserID,
+		Stocks: reqBody.Stocks,
+	}
+
+	resp, err := h.client.ForceExitStocks(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to force exit stocks: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to force exit stocks")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// UpdateManualControls handles PUT /api/v1/strategies/cash52w/manual-controls
+func (h *UserConfigHandler) UpdateManualControls(w http.ResponseWriter, r *http.Request) {
+	var reqBody struct {
+		UserID          string `json:"user_id"`
+		PauseNewEntries bool   `json:"pause_new_entries"`
+		ResetForceExit  bool   `json:"reset_force_exit"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if reqBody.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	req := &pb.UpdateManualControlsRequest{
+		UserId:          reqBody.UserID,
+		PauseNewEntries: reqBody.PauseNewEntries,
+		ResetForceExit:  reqBody.ResetForceExit,
+	}
+
+	resp, err := h.client.UpdateManualControls(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to update manual controls: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to update manual controls")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// DisableCash52W handles PUT /api/v1/strategies/cash52w/disable
+func (h *UserConfigHandler) DisableCash52W(w http.ResponseWriter, r *http.Request) {
+	var reqBody struct {
+		UserID string `json:"user_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if reqBody.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	req := &pb.DisableCash52WRequest{
+		UserId: reqBody.UserID,
+	}
+
+	resp, err := h.client.DisableCash52W(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to disable strategy: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to disable strategy")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// GetAllEnabledConfigs handles GET /api/v1/strategies/cash52w/enabled-configs
+// This is for admin/monitoring purposes only
+func (h *UserConfigHandler) GetAllEnabledConfigs(w http.ResponseWriter, r *http.Request) {
+	req := &pb.GetAllEnabledConfigsRequest{}
+
+	resp, err := h.client.GetAllEnabledConfigs(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get enabled configs: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusInternalServerError, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusInternalServerError, "Failed to get enabled configs")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}

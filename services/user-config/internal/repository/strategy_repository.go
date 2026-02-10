@@ -573,40 +573,71 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 	return strategies, nil
 }
 
-// UpsertCash52WConfig inserts or updates the minimal 52W configuration for
-// a given user in the dedicated cash52w_configs table. This avoids relying
-// on generic strategies/trade_configs rows with dummy values.
+// UpsertCash52WConfig inserts or updates the ENHANCED Phase 1 52W configuration
+// Supports: multi-level profit/SL, portfolio config, force exit controls
 func (r *StrategyRepository) UpsertCash52WConfig(ctx context.Context, cfg *models.Cash52WConfig) error {
 	if cfg == nil || cfg.UserID == "" {
 		return fmt.Errorf("invalid Cash52WConfig: user_id is required")
 	}
 
+	// Validate config before saving
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("config validation failed: %w", err)
+	}
+
 	query := `
-		INSERT INTO cash52w_configs (user_id, enabled, capital_per_stock, trading_mode, updated_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO cash52w_configs (
+			user_id, enabled, total_capital, capital_per_stock, max_stocks, auto_rebalance,
+			stop_loss_levels, profit_levels, trading_mode,
+			force_exit_all, force_exit_stocks, pause_new_entries,
+			version, updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (user_id)
 		DO UPDATE SET
 			enabled = EXCLUDED.enabled,
+			total_capital = EXCLUDED.total_capital,
 			capital_per_stock = EXCLUDED.capital_per_stock,
+			max_stocks = EXCLUDED.max_stocks,
+			auto_rebalance = EXCLUDED.auto_rebalance,
+			stop_loss_levels = EXCLUDED.stop_loss_levels,
+			profit_levels = EXCLUDED.profit_levels,
 			trading_mode = EXCLUDED.trading_mode,
+			force_exit_all = EXCLUDED.force_exit_all,
+			force_exit_stocks = EXCLUDED.force_exit_stocks,
+			pause_new_entries = EXCLUDED.pause_new_entries,
+			version = cash52w_configs.version + 1,
 			updated_at = EXCLUDED.updated_at
+		RETURNING version
 	`
 
 	if cfg.UpdatedAt.IsZero() {
 		cfg.UpdatedAt = time.Now()
 	}
 
-	_, err := r.db.ExecContext(ctx, query,
+	var newVersion int
+	err := r.db.QueryRowContext(ctx, query,
 		cfg.UserID,
 		cfg.Enabled,
+		cfg.TotalCapital,
 		cfg.CapitalPerStock,
+		cfg.MaxStocks,
+		cfg.AutoRebalance,
+		cfg.StopLossLevels,
+		cfg.ProfitLevels,
 		cfg.TradingMode,
+		cfg.ForceExitAll,
+		cfg.ForceExitStocks,
+		cfg.PauseNewEntries,
+		cfg.Version,
 		cfg.UpdatedAt,
-	)
+	).Scan(&newVersion)
+
 	if err != nil {
 		return fmt.Errorf("failed to upsert cash52w_config: %w", err)
 	}
 
+	cfg.Version = newVersion
 	return nil
 }
 
@@ -626,15 +657,23 @@ func (r *StrategyRepository) DeleteCash52WConfig(ctx context.Context, userID str
 	return nil
 }
 
-// GetCash52WConfig fetches the 52W configuration for a user from the
-// dedicated table. Returns (nil, nil) if no row exists.
+// GetCash52WConfig fetches the ENHANCED Phase 1 52W configuration for a user
+// Returns (nil, nil) if no row exists
 func (r *StrategyRepository) GetCash52WConfig(ctx context.Context, userID string) (*models.Cash52WConfig, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("user_id is required")
 	}
 
 	var cfg models.Cash52WConfig
-	query := `SELECT user_id, enabled, capital_per_stock, trading_mode, updated_at FROM cash52w_configs WHERE user_id = $1`
+	query := `
+		SELECT 
+			user_id, enabled, total_capital, capital_per_stock, max_stocks, auto_rebalance,
+			stop_loss_levels, profit_levels, trading_mode,
+			force_exit_all, force_exit_stocks, pause_new_entries,
+			version, updated_at
+		FROM cash52w_configs 
+		WHERE user_id = $1
+	`
 	err := r.db.GetContext(ctx, &cfg, query, userID)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -644,6 +683,28 @@ func (r *StrategyRepository) GetCash52WConfig(ctx context.Context, userID string
 	}
 
 	return &cfg, nil
+}
+
+// GetAllEnabledCash52WConfigs fetches all enabled 52W configurations
+// Used by rules-engine for initial cache load
+func (r *StrategyRepository) GetAllEnabledCash52WConfigs(ctx context.Context) ([]*models.Cash52WConfig, error) {
+	var configs []*models.Cash52WConfig
+	query := `
+		SELECT 
+			user_id, enabled, total_capital, capital_per_stock, max_stocks, auto_rebalance,
+			stop_loss_levels, profit_levels, trading_mode,
+			force_exit_all, force_exit_stocks, pause_new_entries,
+			version, updated_at
+		FROM cash52w_configs 
+		WHERE enabled = TRUE
+		ORDER BY updated_at DESC
+	`
+	err := r.db.SelectContext(ctx, &configs, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get enabled cash52w_configs: %w", err)
+	}
+
+	return configs, nil
 }
 
 // ConfigureCash52WeekStrategy creates or updates the managed "Cash 52W High"

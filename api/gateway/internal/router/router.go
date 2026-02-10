@@ -46,6 +46,17 @@ func NewRouter(
 	// 52W strategy without dealing with low-level fields.
 	api.HandleFunc("/strategies/cash52w/configure", userConfigHandler.ConfigureCash52WeekStrategy).Methods("POST")
 
+	// ========================================================================
+	// PHASE 1: Enhanced Cash52W Configuration Endpoints
+	// ========================================================================
+	api.HandleFunc("/strategies/cash52w/configure-enhanced", userConfigHandler.ConfigureCash52WStrategyEnhanced).Methods("POST")
+	api.HandleFunc("/strategies/cash52w/config/{user_id}", userConfigHandler.GetCash52WConfig).Methods("GET")
+	api.HandleFunc("/strategies/cash52w/force-exit-all", userConfigHandler.ForceExitAll).Methods("PUT")
+	api.HandleFunc("/strategies/cash52w/force-exit-stocks", userConfigHandler.ForceExitStocks).Methods("PUT")
+	api.HandleFunc("/strategies/cash52w/manual-controls", userConfigHandler.UpdateManualControls).Methods("PUT")
+	api.HandleFunc("/strategies/cash52w/disable", userConfigHandler.DisableCash52W).Methods("PUT")
+	api.HandleFunc("/strategies/cash52w/enabled-configs", userConfigHandler.GetAllEnabledConfigs).Methods("GET")
+
 	// User strategies
 	api.HandleFunc("/users/{user_id}/strategies", userConfigHandler.ListUserStrategies).Methods("GET")
 

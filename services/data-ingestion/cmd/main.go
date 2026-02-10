@@ -12,66 +12,42 @@ import (
 	kafkapkg "github.com/RohitIndira/Algo-Treading/pkg/kafka"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/config"
+	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/detector"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/publisher"
-	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/watcher"
+	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/subscriber"
 
 	"go.uber.org/zap"
 )
 
 func main() {
-	fmt.Println("In the main function of main.go file in data-ingestion service")
-	cfg := config.Load() // calls `Load()` from `config` package
-	fmt.Println("Configuration loaded successfully")
+	fmt.Println("╔══════════════════════════════════════════════════════════════╗")
+	fmt.Println("║      DATA INGESTION SERVICE - Event-Driven Architecture      ║")
+	fmt.Println("║         52-Week Breakout Detection for Indian Markets        ║")
+	fmt.Println("╚══════════════════════════════════════════════════════════════╝")
 
+	// Load configuration
+	cfg := config.Load()
+	fmt.Printf("✓ Configuration loaded successfully\n")
+
+	// Initialize logger
 	lgr, err := logger.NewWithDefaults("data-ingestion")
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("failed to initialize logger: %w", err))
 	}
 	defer lgr.Sync()
-	fmt.Println("2.Starting unified data-ingestion service (MongoDB News + Redis 52W + B2C Market Data)")
-	lgr.Info("3. Starting unified data-ingestion service (MongoDB News + Redis 52W + B2C Market Data)")
+
+	lgr.Info("Starting data-ingestion service (event-driven mode)",
+		zap.Int("worker_pool_size", cfg.WorkerPoolSize))
 
 	// Context for the entire application
-	ctxRun, cancelRun := context.WithCancel(context.Background())
-	defer cancelRun()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// ========================================================================
-	// 1. MONGODB NEWS INGESTION SETUP (DISABLED)
+	// KAFKA PRODUCER SETUP
 	// ========================================================================
-	// For current production focus we only need 52-week breakout data.
-	// The MongoDB news -> Kafka pipeline is temporarily disabled.
-	//
-	// When you want to re-enable news ingestion, restore the block below
-	// and ensure cfg.MongoURI/MongoDatabase/MongoCollection/KafkaTopic
-	// are set correctly.
-	//
-	// lgr.Info("Initializing MongoDB news ingestion pipeline")
-	// ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
-	// mongoClient, err := mongodb.New(ctx, mongodb.Config{
-	// 	URI:            cfg.MongoURI,
-	// 	Database:       cfg.MongoDatabase,
-	// 	ConnectTimeout: cfg.MongoConnectTimeout,
-	// })
-	// cancel()
-	// if err != nil {
-	// 	lgr.Fatal("failed to connect to mongodb", zap.Error(err))
-	// }
-	// defer mongoClient.Close(context.Background())
-	// lgr.Info("Connected to MongoDB",
-	// 	zap.String("database", cfg.MongoDatabase),
-	// 	zap.String("collection", cfg.MongoCollection))
-	// newsProdCfg := kafkapkg.ProducerConfig{...}
-	// newsProducer, err := kafkapkg.NewProducer(newsProdCfg)
-	// ...
-	// go func() { mongoWatcher.Run(ctxRun) }()
+	lgr.Info("Initializing Kafka producer for 52-week breakouts")
 
-	// ========================================================================
-	// 2. REDIS 52-WEEK HIGH BREAKOUT SETUP
-	// ========================================================================
-	lgr.Info("Initializing Redis 52-week high breakout pipeline")
-	fmt.Println("Initializing Redis 52-week high breakout pipeline----------------------------------**********")
-
-	// Kafka producer for 52-week breakout events
 	breakoutProdCfg := kafkapkg.ProducerConfig{
 		Brokers:     cfg.KafkaBrokers,
 		Topic:       cfg.KafkaTopic52Week,
@@ -80,20 +56,28 @@ func main() {
 	}
 	breakoutProducer, err := kafkapkg.NewProducer(breakoutProdCfg)
 	if err != nil {
-		lgr.Fatal("failed to create 52w-breakout kafka producer", zap.Error(err))
+		lgr.Fatal("Failed to create Kafka producer", zap.Error(err))
 	}
 	defer breakoutProducer.Close()
 
+	// Ensure Kafka topic exists with 7-day retention
 	if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopic52Week, 1, 1); err != nil {
-		lgr.Fatal("failed to ensure 52w-breakout topic exists", zap.Error(err))
+		lgr.Fatal("Failed to ensure Kafka topic exists", zap.Error(err))
 	}
-	lgr.Info("Connected to Kafka (52w breakouts)",
+
+	lgr.Info("Connected to Kafka",
 		zap.Strings("brokers", cfg.KafkaBrokers),
 		zap.String("topic", cfg.KafkaTopic52Week))
 
-	breakoutPub := publisher.NewKafkaPublisher(breakoutProducer, cfg.KafkaTopic52Week)
+	// Create Kafka publisher
+	kafkaPub := publisher.NewKafkaPublisher(breakoutProducer, cfg.KafkaTopic52Week)
+	defer kafkaPub.Close()
 
-	// Initialize Redis client for market data (52-week highs)
+	// ========================================================================
+	// REDIS CLIENT SETUP
+	// ========================================================================
+	lgr.Info("Connecting to Redis market data store")
+
 	redisClient, err := redispkg.New(redispkg.Config{
 		Address:      cfg.MarketRedisAddr,
 		Password:     cfg.MarketRedisPassword,
@@ -102,67 +86,114 @@ func main() {
 		MinIdleConns: 10,
 	})
 	if err != nil {
-		lgr.Fatal("failed to connect to market redis", zap.Error(err))
+		lgr.Fatal("Failed to connect to Redis", zap.Error(err))
 	}
 	defer redisClient.Close()
 
-	lgr.Info("Connected to market Redis for 52w highs",
-		zap.String("addr", cfg.MarketRedisAddr))
+	lgr.Info("Connected to Redis",
+		zap.String("addr", cfg.MarketRedisAddr),
+		zap.Int("db", cfg.MarketRedisDB))
 
-	// Start Redis -> Kafka watcher for 52-week high breakouts
-	redisWatcher := watcher.NewRedis52WWatcher(
+	// ========================================================================
+	// BREAKOUT DETECTION SETUP
+	// ========================================================================
+	lgr.Info("Initializing breakout detection components")
+
+	// State manager for persistent dedupe
+	stateMgr := detector.NewStateManager(redisClient, lgr)
+
+	// Breakout detector
+	breakoutDetector := detector.NewBreakoutDetector(stateMgr, lgr)
+
+	// Run cleanup of old breakout state on startup
+	if err := stateMgr.CleanupOldBreakouts(ctx); err != nil {
+		lgr.Warn("Failed to cleanup old breakouts", zap.Error(err))
+	}
+
+	// ========================================================================
+	// START EVENT-DRIVEN 52-WEEK BREAKOUT DETECTION
+	// ========================================================================
+	lgr.Info("🚀 Starting event-driven 52-week breakout detection",
+		zap.Int("workers", cfg.WorkerPoolSize))
+
+	redisSub := subscriber.NewRedisSubscriber(
 		redisClient,
-		breakoutPub,
-		cfg.MarketRedisPollInterval,
+		breakoutDetector,
+		kafkaPub,
 		lgr,
+		subscriber.Config{
+			WorkerCount: cfg.WorkerPoolSize,
+		},
 	)
 
 	go func() {
-		lgr.Info("Starting Redis 52-week high watcher")
-		if err := redisWatcher.Run(ctxRun); err != nil {
-			lgr.Error("redis 52w watcher stopped with error", zap.Error(err))
+		if err := redisSub.Start(ctx); err != nil && err != context.Canceled {
+			lgr.Error("Redis subscriber stopped with error", zap.Error(err))
+		}
+	}()
+
+	lgr.Info("✓ Event-driven subscriber started successfully")
+	lgr.Info("📊 Listening for Redis keyspace notifications on pattern: __keyevent@0__:set")
+	lgr.Info("🎯 Filtering keys: market:nse:*, market:bse:*")
+
+	// ========================================================================
+	// DAILY CLEANUP SCHEDULER
+	// ========================================================================
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				lgr.Info("Running daily cleanup of old breakout state")
+				if err := stateMgr.CleanupOldBreakouts(ctx); err != nil {
+					lgr.Error("Daily cleanup failed", zap.Error(err))
+				} else {
+					lgr.Info("Daily cleanup completed successfully")
+				}
+			}
 		}
 	}()
 
 	// ========================================================================
-	// 3. B2C LIVE MARKET DATA SETUP (DISABLED)
+	// SERVICE STATUS
 	// ========================================================================
-	// For now we are not using the B2C live market data bridge. The entire
-	// ingestion pipeline for market data is disabled. When needed again,
-	// uncomment this section and ensure B2C_BRIDGE_PATH and related config
-	// are set correctly.
-	//
-	// lgr.Info("Initializing B2C live market data pipeline")
-	// if cfg.B2CBridgePath == "" {
-	// 	lgr.Warn("B2C_BRIDGE_PATH not set, skipping B2C market data ingestion")
-	// } else {
-	// 	...
-	// }
+	lgr.Info("✓ Data-ingestion service started successfully")
+	lgr.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	lgr.Info("Service Mode: EVENT-DRIVEN (Real-time Redis Keyspace Notifications)")
+	lgr.Info("Workers", zap.Int("count", cfg.WorkerPoolSize))
+	lgr.Info("Kafka Config",
+		zap.String("topic", cfg.KafkaTopic52Week),
+		zap.Strings("brokers", cfg.KafkaBrokers))
+	lgr.Info("Redis Config",
+		zap.String("addr", cfg.MarketRedisAddr),
+		zap.Int("db", cfg.MarketRedisDB))
+	lgr.Info("Timezone", zap.String("tz", "Asia/Kolkata (IST)"))
+	lgr.Info("Retention", zap.String("kafka", "7 days"), zap.String("redis_state", "7 days"))
+	lgr.Info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	lgr.Info("✓ Service ready - Press Ctrl+C to stop")
 
 	// ========================================================================
 	// GRACEFUL SHUTDOWN
 	// ========================================================================
-	lgr.Info("All data ingestion pipelines started successfully")
-	lgr.Info("Service is running. Press Ctrl+C to stop.")
-
-	// Wait for termination signal
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	lgr.Info("Shutdown signal received, stopping all pipelines...")
-
-	// Cancel all running goroutines
-	cancelRun()
+	lgr.Info("Shutdown signal received, stopping service...")
+	cancel()
 
 	// Allow graceful shutdown with timeout
-	tctx, tcancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer tcancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
 
-	// Wait for graceful shutdown or timeout
-	<-tctx.Done()
+	// Wait for graceful shutdown
+	<-shutdownCtx.Done()
 
-	if tctx.Err() == context.DeadlineExceeded {
+	if shutdownCtx.Err() == context.DeadlineExceeded {
 		lgr.Warn("Graceful shutdown timed out")
 	} else {
 		lgr.Info("All components shut down gracefully")

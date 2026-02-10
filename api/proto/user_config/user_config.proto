@@ -41,6 +41,16 @@ service UserConfigService {
   // lets the user simply enable/disable the strategy and choose capital.
   rpc ConfigureCash52WeekStrategy(ConfigureCash52WeekStrategyRequest)
       returns (ConfigureCash52WeekStrategyResponse);
+
+  // PHASE 1: Enhanced Cash52W Configuration APIs
+  rpc ConfigureCash52WStrategyEnhanced(ConfigureCash52WStrategyEnhancedRequest)
+      returns (ConfigureCash52WStrategyEnhancedResponse);
+  rpc GetCash52WConfig(GetCash52WConfigRequest) returns (GetCash52WConfigResponse);
+  rpc ForceExitAll(ForceExitAllRequest) returns (ForceExitAllResponse);
+  rpc ForceExitStocks(ForceExitStocksRequest) returns (ForceExitStocksResponse);
+  rpc UpdateManualControls(UpdateManualControlsRequest) returns (UpdateManualControlsResponse);
+  rpc DisableCash52W(DisableCash52WRequest) returns (DisableCash52WResponse);
+  rpc GetAllEnabledConfigs(GetAllEnabledConfigsRequest) returns (GetAllEnabledConfigsResponse);
 }
 
 // Strategy condition filters
@@ -327,5 +337,136 @@ message ConfigureCash52WeekStrategyRequest {
 message ConfigureCash52WeekStrategyResponse {
   bool success = 1;
   Strategy strategy = 2;  // The underlying strategy record (may be nil if disabled)
+  common.Error error = 3;
+}
+
+// ============================================================================
+// PHASE 1: Enhanced Cash52W Configuration Messages
+// ============================================================================
+
+message StopLossLevel {
+  double trigger_percent = 1;        // e.g. -10 for 10% loss
+  int32 exit_quantity_percent = 2;   // e.g. 50 for 50% of position
+  string type = 3;                   // "fixed" or "trailing"
+  bool enabled = 4;
+}
+
+message StopLossLevels {
+  StopLossLevel level_1 = 1;
+  StopLossLevel level_2 = 2;
+}
+
+message ProfitLevel {
+  double trigger_percent = 1;        // e.g. 15 for 15% profit
+  int32 exit_quantity_percent = 2;   // e.g. 33 for 33% of position
+  string type = 3;                   // "fixed" or "trailing"
+  double trail_percent = 4;          // for trailing only
+  bool enabled = 5;
+}
+
+message ProfitLevels {
+  ProfitLevel level_1 = 1;
+  ProfitLevel level_2 = 2;
+  ProfitLevel level_3 = 3;
+}
+
+message Cash52WConfig {
+  string user_id = 1;
+  bool enabled = 2;
+  double total_capital = 3;
+  double capital_per_stock = 4;
+  int32 max_stocks = 5;
+  bool auto_rebalance = 6;
+  StopLossLevels stop_loss_levels = 7;
+  ProfitLevels profit_levels = 8;
+  string trading_mode = 9;
+  bool force_exit_all = 10;
+  repeated string force_exit_stocks = 11;
+  bool pause_new_entries = 12;
+  common.Timestamp updated_at = 13;
+  int32 version = 14;
+}
+
+message ConfigureCash52WStrategyEnhancedRequest {
+  string user_id = 1;
+  bool enabled = 2;
+  double total_capital = 3;
+  double capital_per_stock = 4;
+  int32 max_stocks = 5;
+  bool auto_rebalance = 6;
+  StopLossLevels stop_loss_levels = 7;
+  ProfitLevels profit_levels = 8;
+  string trading_mode = 9;
+  bool force_exit_all = 10;
+  repeated string force_exit_stocks = 11;
+  bool pause_new_entries = 12;
+}
+
+message ConfigureCash52WStrategyEnhancedResponse {
+  bool success = 1;
+  Cash52WConfig config = 2;
+  common.Error error = 3;
+}
+
+message GetCash52WConfigRequest {
+  string user_id = 1;
+}
+
+message GetCash52WConfigResponse {
+  bool success = 1;
+  Cash52WConfig config = 2;
+  common.Error error = 3;
+}
+
+message ForceExitAllRequest {
+  string user_id = 1;
+}
+
+message ForceExitAllResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+message ForceExitStocksRequest {
+  string user_id = 1;
+  repeated string stocks = 2;
+}
+
+message ForceExitStocksResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+message UpdateManualControlsRequest {
+  string user_id = 1;
+  bool pause_new_entries = 2;
+  bool reset_force_exit = 3;
+}
+
+message UpdateManualControlsResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+message DisableCash52WRequest {
+  string user_id = 1;
+}
+
+message DisableCash52WResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+message GetAllEnabledConfigsRequest {
+  // No parameters needed
+}
+
+message GetAllEnabledConfigsResponse {
+  bool success = 1;
+  repeated Cash52WConfig configs = 2;
   common.Error error = 3;
 }

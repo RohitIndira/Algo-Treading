@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
 	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
@@ -30,10 +31,12 @@ type StrategyService struct {
 	cash52wWriter       *kafka.Writer
 	cash52wTopic        string
 	cash52wKafkaEnabled bool
+	// NEW: Enhanced Phase 1 Kafka publisher (replaces cash52wWriter)
+	configPublisher *publisher.ConfigPublisher
 }
 
 // NewStrategyService creates a new strategy service
-func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string, jobbingWriter *kafka.Writer, jobbingTopic string, cash52wWriter *kafka.Writer, cash52wTopic string) *StrategyService {
+func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string, jobbingWriter *kafka.Writer, jobbingTopic string, cash52wWriter *kafka.Writer, cash52wTopic string, configPublisher *publisher.ConfigPublisher) *StrategyService {
 	return &StrategyService{
 		repo:                repo,
 		kafkaWriter:         kafkaWriter,
@@ -45,6 +48,7 @@ func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.
 		cash52wWriter:       cash52wWriter,
 		cash52wTopic:        cash52wTopic,
 		cash52wKafkaEnabled: cash52wWriter != nil && cash52wTopic != "",
+		configPublisher:     configPublisher,
 	}
 }
 
@@ -590,4 +594,262 @@ func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyReques
 	}
 
 	return nil
+}
+
+// ============================================================================
+// PHASE 1: Enhanced Cash52W Configuration Service Methods
+// ============================================================================
+
+// ConfigureCash52WStrategyEnhanced creates or updates the ENHANCED Phase 1
+// 52W configuration with multi-level profit/SL, portfolio config, and manual controls
+func (s *StrategyService) ConfigureCash52WStrategyEnhanced(ctx context.Context, cfg *models.Cash52WConfig) (*models.Cash52WConfig, error) {
+	if cfg == nil || cfg.UserID == "" {
+		return nil, fmt.Errorf("invalid config: user_id is required")
+	}
+
+	// Apply defaults if not provided
+	if cfg.TotalCapital <= 0 {
+		cfg.TotalCapital = 500000 // ₹5L default
+	}
+	if cfg.CapitalPerStock <= 0 {
+		cfg.CapitalPerStock = 20000 // ₹20K default
+	}
+	if cfg.MaxStocks <= 0 {
+		cfg.MaxStocks = 25 // 25 stocks default
+	}
+	if cfg.TradingMode == "" {
+		cfg.TradingMode = "PAPER" // Default to paper trading
+	}
+
+	// Apply default stop-loss levels if not provided
+	if cfg.StopLossLevels.Level1.TriggerPercent == 0 {
+		cfg.StopLossLevels = models.StopLossLevels{
+			Level1: models.StopLossLevel{
+				TriggerPercent:      -10,
+				ExitQuantityPercent: 50,
+				Type:                "fixed",
+				Enabled:             true,
+			},
+			Level2: models.StopLossLevel{
+				TriggerPercent:      -20,
+				ExitQuantityPercent: 100,
+				Type:                "trailing",
+				Enabled:             true,
+			},
+		}
+	}
+
+	// Apply default profit levels if not provided
+	if cfg.ProfitLevels.Level1.TriggerPercent == 0 {
+		cfg.ProfitLevels = models.ProfitLevels{
+			Level1: models.ProfitLevel{
+				TriggerPercent:      15,
+				ExitQuantityPercent: 33,
+				Type:                "fixed",
+				Enabled:             true,
+			},
+			Level2: models.ProfitLevel{
+				TriggerPercent:      30,
+				ExitQuantityPercent: 50,
+				Type:                "fixed",
+				Enabled:             true,
+			},
+			Level3: models.ProfitLevel{
+				TriggerPercent:      50,
+				ExitQuantityPercent: 100,
+				Type:                "trailing",
+				TrailPercent:        10,
+				Enabled:             true,
+			},
+		}
+	}
+
+	// Validate the configuration
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validation failed: %w", err)
+	}
+
+	// Save to database
+	if err := s.repo.UpsertCash52WConfig(ctx, cfg); err != nil {
+		return nil, fmt.Errorf("failed to save config: %w", err)
+	}
+
+	// Publish to Kafka (if configPublisher is available)
+	if s.configPublisher != nil {
+		if err := s.configPublisher.PublishConfigUpdate(ctx, cfg); err != nil {
+			// Log warning but don't fail the operation
+			fmt.Printf("[USER-CONFIG] Warning: failed to publish config to Kafka: %v\n", err)
+		}
+	}
+
+	return cfg, nil
+}
+
+// GetCash52WConfig retrieves the Phase 1 configuration for a user
+func (s *StrategyService) GetCash52WConfig(ctx context.Context, userID string) (*models.Cash52WConfig, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("user_id is required")
+	}
+
+	cfg, err := s.repo.GetCash52WConfig(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get config: %w", err)
+	}
+
+	// Return default config if none exists
+	if cfg == nil {
+		return models.DefaultBalancedConfig(userID), nil
+	}
+
+	return cfg, nil
+}
+
+// ForceExitAll triggers emergency exit for all positions
+func (s *StrategyService) ForceExitAll(ctx context.Context, userID string) error {
+	if userID == "" {
+		return fmt.Errorf("user_id is required")
+	}
+
+	// Get existing config
+	cfg, err := s.repo.GetCash52WConfig(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+	if cfg == nil {
+		return fmt.Errorf("no config found for user")
+	}
+
+	// Update force exit flag
+	cfg.ForceExitAll = true
+	cfg.UpdatedAt = time.Now()
+
+	// Save to database
+	if err := s.repo.UpsertCash52WConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("failed to update config: %w", err)
+	}
+
+	// Publish high-priority force exit command to Kafka
+	if s.configPublisher != nil {
+		if err := s.configPublisher.PublishForceExit(ctx, userID, true, nil); err != nil {
+			fmt.Printf("[USER-CONFIG] Warning: failed to publish force exit: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+// ForceExitStocks triggers exit for specific stocks
+func (s *StrategyService) ForceExitStocks(ctx context.Context, userID string, stocks []string) error {
+	if userID == "" {
+		return fmt.Errorf("user_id is required")
+	}
+	if len(stocks) == 0 {
+		return fmt.Errorf("stocks list cannot be empty")
+	}
+
+	// Get existing config
+	cfg, err := s.repo.GetCash52WConfig(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+	if cfg == nil {
+		return fmt.Errorf("no config found for user")
+	}
+
+	// Update force exit stocks
+	cfg.ForceExitStocks = stocks
+	cfg.UpdatedAt = time.Now()
+
+	// Save to database
+	if err := s.repo.UpsertCash52WConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("failed to update config: %w", err)
+	}
+
+	// Publish high-priority force exit command to Kafka
+	if s.configPublisher != nil {
+		if err := s.configPublisher.PublishForceExit(ctx, userID, false, stocks); err != nil {
+			fmt.Printf("[USER-CONFIG] Warning: failed to publish force exit: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+// UpdateManualControls updates manual control flags (pause entries, reset force exit)
+func (s *StrategyService) UpdateManualControls(ctx context.Context, userID string, pauseNewEntries bool, resetForceExit bool) error {
+	if userID == "" {
+		return fmt.Errorf("user_id is required")
+	}
+
+	// Get existing config
+	cfg, err := s.repo.GetCash52WConfig(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+	if cfg == nil {
+		return fmt.Errorf("no config found for user")
+	}
+
+	// Update manual controls
+	cfg.PauseNewEntries = pauseNewEntries
+	if resetForceExit {
+		cfg.ForceExitAll = false
+		cfg.ForceExitStocks = []string{}
+	}
+	cfg.UpdatedAt = time.Now()
+
+	// Save to database
+	if err := s.repo.UpsertCash52WConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("failed to update config: %w", err)
+	}
+
+	// Publish update to Kafka
+	if s.configPublisher != nil {
+		if err := s.configPublisher.PublishConfigUpdate(ctx, cfg); err != nil {
+			fmt.Printf("[USER-CONFIG] Warning: failed to publish config update: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+// DisableCash52W disables the 52W strategy for a user
+func (s *StrategyService) DisableCash52W(ctx context.Context, userID string) error {
+	if userID == "" {
+		return fmt.Errorf("user_id is required")
+	}
+
+	// Get existing config
+	cfg, err := s.repo.GetCash52WConfig(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+	if cfg == nil {
+		// Already disabled/doesn't exist
+		return nil
+	}
+
+	// Disable
+	cfg.Enabled = false
+	cfg.UpdatedAt = time.Now()
+
+	// Save to database
+	if err := s.repo.UpsertCash52WConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("failed to disable config: %w", err)
+	}
+
+	// Publish to Kafka
+	if s.configPublisher != nil {
+		if err := s.configPublisher.PublishConfigUpdate(ctx, cfg); err != nil {
+			fmt.Printf("[USER-CONFIG] Warning: failed to publish config update: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+// GetAllEnabledConfigs retrieves all enabled 52W configurations
+// Used for administrative/monitoring purposes
+func (s *StrategyService) GetAllEnabledConfigs(ctx context.Context) ([]*models.Cash52WConfig, error) {
+	return s.repo.GetAllEnabledCash52WConfigs(ctx)
 }

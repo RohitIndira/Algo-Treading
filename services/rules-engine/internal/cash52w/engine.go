@@ -47,6 +47,8 @@ type Engine struct {
 	kafkaPub *publisher.KafkaPublisher
 	// allocPub publishes portfolio allocation snapshots
 	allocPub *publisher.KafkaPublisher
+	// positionTracker tracks position lifecycle with Kafka persistence
+	positionTracker *PositionTracker
 	logger   *zap.Logger
 
 	mu        sync.Mutex
@@ -60,7 +62,7 @@ type Engine struct {
 }
 
 // NewEngine creates a new Cash 52-week engine.
-func NewEngine(cfg Config, store *ConfigStore, riskClient *risk.Client, rabbitPub *publisher.Publisher, kafkaPub *publisher.KafkaPublisher, allocPub *publisher.KafkaPublisher, logger *zap.Logger) *Engine {
+func NewEngine(cfg Config, store *ConfigStore, riskClient *risk.Client, rabbitPub *publisher.Publisher, kafkaPub *publisher.KafkaPublisher, allocPub *publisher.KafkaPublisher, positionTracker *PositionTracker, logger *zap.Logger) *Engine {
 	// defaults
 	if cfg.CapitalPerStock <= 0 {
 		cfg.CapitalPerStock = 20000
@@ -363,6 +365,8 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 	// event occurred before the user enabled it, we skip.
 	var capitalPerStock float64
 	mode := "LIVE"
+	var userEnabledSince time.Time
+	
 	if e.store != nil {
 		cfg, ok := e.store.Get(userID)
 		if !ok {
@@ -377,7 +381,39 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 				zap.String("token", ev.Token))
 			return false, nil
 		}
+		
 		capitalPerStock = cfg.CapitalPerStock
+		userEnabledSince = cfg.EnabledSince
+		
+		// ⚠️ CRITICAL: TIME-BASED ALLOCATION
+		// Only allocate positions for breakouts that occurred AFTER
+		// user enabled the strategy.
+		//
+		// Example:
+		//   User enabled:  2026-02-10T10:28:27Z
+		//   Breakout time: 2026-02-10T15:31:21+05:30
+		//   Action: ✅ ALLOCATE (breakout is AFTER enablement)
+		//
+		//   Breakout time: 2026-02-10T09:00:00Z
+		//   Action: ❌ SKIP (breakout was BEFORE enablement)
+		if !ev.Week52HighTimestamp.IsZero() && !userEnabledSince.IsZero() {
+			if ev.Week52HighTimestamp.Before(userEnabledSince) || ev.Week52HighTimestamp.Equal(userEnabledSince) {
+				e.logger.Info("⏰ Skipping past breakout - occurred before/at user enablement",
+					zap.String("user_id", userID),
+					zap.String("token", ev.Token),
+					zap.String("symbol", ev.Symbol),
+					zap.Time("breakout_time", ev.Week52HighTimestamp),
+					zap.Time("user_enabled_since", userEnabledSince),
+					zap.Duration("time_diff", userEnabledSince.Sub(ev.Week52HighTimestamp)))
+				return false, nil
+			}
+			
+			e.logger.Debug("✅ Breakout time validated - after user enablement",
+				zap.String("user_id", userID),
+				zap.String("token", ev.Token),
+				zap.Time("breakout_time", ev.Week52HighTimestamp),
+				zap.Time("user_enabled_since", userEnabledSince))
+		}
 
 		// IMPORTANT: derive trading mode from the config store directly so
 		// that a newly enabled user is immediately treated as PAPER/LIVE
@@ -604,4 +640,41 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Br
 		zap.Float64("price", ev.LTP))
 
 	return true, nil
+}
+
+// Stats represents statistics for the 52W engine
+type Stats struct {
+	ActiveUsers      int                        `json:"active_users"`
+	TotalPositions   int                        `json:"total_positions"`
+	UserPositions    map[string]int             `json:"user_positions"`
+	Day              string                     `json:"day"`
+	MaxPositions     int                        `json:"max_positions"`
+	CapitalPerStock  float64                    `json:"capital_per_stock"`
+}
+
+// GetStats returns current statistics for the 52W engine
+func (e *Engine) GetStats() Stats {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	stats := Stats{
+		ActiveUsers:     len(e.userState),
+		UserPositions:   make(map[string]int),
+		Day:             e.day,
+		MaxPositions:    e.cfg.MaxPositions,
+		CapitalPerStock: e.cfg.CapitalPerStock,
+	}
+
+	totalPos := 0
+	for uid, st := range e.userState {
+		st.mu.Lock()
+		count := len(st.Positions)
+		st.mu.Unlock()
+		
+		stats.UserPositions[uid] = count
+		totalPos += count
+	}
+	
+	stats.TotalPositions = totalPos
+	return stats
 }

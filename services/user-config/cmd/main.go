@@ -15,6 +15,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/config"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/consumer"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
@@ -118,8 +119,19 @@ func main() {
 		lgr.Warn("Kafka is disabled")
 	}
 
+	// Initialize Phase 1 ConfigPublisher for enhanced Cash52W configs
+	var configPublisher *publisher.ConfigPublisher
+	if cfg.Kafka.Enabled {
+		var err error
+		configPublisher, err = publisher.NewConfigPublisher(cfg.Kafka.Brokers, "user-config-updates", lgr)
+		if err != nil {
+			lgr.Fatal("Failed to create config publisher", zap.Error(err))
+		}
+		defer configPublisher.Close()
+	}
+
 	// Initialize service
-	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic, jobbingWriter, cfg.Kafka.JobbingTopic, cash52wWriter, cfg.Kafka.Cash52WConfigTopic)
+	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic, jobbingWriter, cfg.Kafka.JobbingTopic, cash52wWriter, cfg.Kafka.Cash52WConfigTopic, configPublisher)
 
 	// Initialize gRPC server
 	grpcServer := grpc.NewServer(

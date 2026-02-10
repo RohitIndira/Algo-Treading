@@ -90,3 +90,49 @@ func (c *UserConfigClient) ConfigureCash52WeekStrategy(ctx context.Context, req 
 	defer cancel()
 	return c.client.ConfigureCash52WeekStrategy(ctx, req)
 }
+
+// ============================================================================
+// PHASE 1: Enhanced Cash52W Configuration Client Methods
+// ============================================================================
+
+func (c *UserConfigClient) ConfigureCash52WStrategyEnhanced(ctx context.Context, req *pb.ConfigureCash52WStrategyEnhancedRequest) (*pb.ConfigureCash52WStrategyEnhancedResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.ConfigureCash52WStrategyEnhanced(ctx, req)
+}
+
+func (c *UserConfigClient) GetCash52WConfig(ctx context.Context, req *pb.GetCash52WConfigRequest) (*pb.GetCash52WConfigResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetCash52WConfig(ctx, req)
+}
+
+func (c *UserConfigClient) ForceExitAll(ctx context.Context, req *pb.ForceExitAllRequest) (*pb.ForceExitAllResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.ForceExitAll(ctx, req)
+}
+
+func (c *UserConfigClient) ForceExitStocks(ctx context.Context, req *pb.ForceExitStocksRequest) (*pb.ForceExitStocksResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.ForceExitStocks(ctx, req)
+}
+
+func (c *UserConfigClient) UpdateManualControls(ctx context.Context, req *pb.UpdateManualControlsRequest) (*pb.UpdateManualControlsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.UpdateManualControls(ctx, req)
+}
+
+func (c *UserConfigClient) DisableCash52W(ctx context.Context, req *pb.DisableCash52WRequest) (*pb.DisableCash52WResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.DisableCash52W(ctx, req)
+}
+
+func (c *UserConfigClient) GetAllEnabledConfigs(ctx context.Context, req *pb.GetAllEnabledConfigsRequest) (*pb.GetAllEnabledConfigsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetAllEnabledConfigs(ctx, req)
+}

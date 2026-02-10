@@ -370,6 +370,269 @@ func (s *UserConfigServer) HealthCheck(ctx context.Context, req *common.HealthCh
 	}, nil
 }
 
+// ============================================================================
+// PHASE 1: Enhanced Cash52W Configuration gRPC Handlers
+// ============================================================================
+
+// ConfigureCash52WStrategyEnhanced configures the FULL Phase 1 enhanced 52W strategy
+// with multi-level profit/SL, portfolio config, and manual controls
+func (s *UserConfigServer) ConfigureCash52WStrategyEnhanced(ctx context.Context, req *pb.ConfigureCash52WStrategyEnhancedRequest) (*pb.ConfigureCash52WStrategyEnhancedResponse, error) {
+	// Convert proto to model
+	cfg := &models.Cash52WConfig{
+		UserID:          req.UserId,
+		Enabled:         req.Enabled,
+		TotalCapital:    req.TotalCapital,
+		CapitalPerStock: req.CapitalPerStock,
+		MaxStocks:       int(req.MaxStocks),
+		AutoRebalance:   req.AutoRebalance,
+		TradingMode:     req.TradingMode,
+		ForceExitAll:    req.ForceExitAll,
+		ForceExitStocks: req.ForceExitStocks,
+		PauseNewEntries: req.PauseNewEntries,
+	}
+
+	// Convert stop-loss levels
+	if req.StopLossLevels != nil {
+		cfg.StopLossLevels = models.StopLossLevels{
+			Level1: models.StopLossLevel{
+				TriggerPercent:      req.StopLossLevels.Level_1.TriggerPercent,
+				ExitQuantityPercent: int(req.StopLossLevels.Level_1.ExitQuantityPercent),
+				Type:                req.StopLossLevels.Level_1.Type,
+				Enabled:             req.StopLossLevels.Level_1.Enabled,
+			},
+			Level2: models.StopLossLevel{
+				TriggerPercent:      req.StopLossLevels.Level_2.TriggerPercent,
+				ExitQuantityPercent: int(req.StopLossLevels.Level_2.ExitQuantityPercent),
+				Type:                req.StopLossLevels.Level_2.Type,
+				Enabled:             req.StopLossLevels.Level_2.Enabled,
+			},
+		}
+	}
+
+	// Convert profit levels
+	if req.ProfitLevels != nil {
+		cfg.ProfitLevels = models.ProfitLevels{
+			Level1: models.ProfitLevel{
+				TriggerPercent:      req.ProfitLevels.Level_1.TriggerPercent,
+				ExitQuantityPercent: int(req.ProfitLevels.Level_1.ExitQuantityPercent),
+				Type:                req.ProfitLevels.Level_1.Type,
+				Enabled:             req.ProfitLevels.Level_1.Enabled,
+			},
+			Level2: models.ProfitLevel{
+				TriggerPercent:      req.ProfitLevels.Level_2.TriggerPercent,
+				ExitQuantityPercent: int(req.ProfitLevels.Level_2.ExitQuantityPercent),
+				Type:                req.ProfitLevels.Level_2.Type,
+				Enabled:             req.ProfitLevels.Level_2.Enabled,
+			},
+			Level3: models.ProfitLevel{
+				TriggerPercent:      req.ProfitLevels.Level_3.TriggerPercent,
+				ExitQuantityPercent: int(req.ProfitLevels.Level_3.ExitQuantityPercent),
+				Type:                req.ProfitLevels.Level_3.Type,
+				TrailPercent:        req.ProfitLevels.Level_3.TrailPercent,
+				Enabled:             req.ProfitLevels.Level_3.Enabled,
+			},
+		}
+	}
+
+	// Call service
+	result, err := s.service.ConfigureCash52WStrategyEnhanced(ctx, cfg)
+	if err != nil {
+		return &pb.ConfigureCash52WStrategyEnhancedResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "CONFIGURE_ENHANCED_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	// Convert back to proto
+	return &pb.ConfigureCash52WStrategyEnhancedResponse{
+		Success: true,
+		Config:  modelCash52WConfigToProto(result),
+	}, nil
+}
+
+// GetCash52WConfig retrieves the Phase 1 configuration for a user
+func (s *UserConfigServer) GetCash52WConfig(ctx context.Context, req *pb.GetCash52WConfigRequest) (*pb.GetCash52WConfigResponse, error) {
+	cfg, err := s.service.GetCash52WConfig(ctx, req.UserId)
+	if err != nil {
+		return &pb.GetCash52WConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "GET_CONFIG_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.GetCash52WConfigResponse{
+		Success: true,
+		Config:  modelCash52WConfigToProto(cfg),
+	}, nil
+}
+
+// ForceExitAll triggers emergency exit for all positions
+func (s *UserConfigServer) ForceExitAll(ctx context.Context, req *pb.ForceExitAllRequest) (*pb.ForceExitAllResponse, error) {
+	err := s.service.ForceExitAll(ctx, req.UserId)
+	if err != nil {
+		return &pb.ForceExitAllResponse{
+			Success: false,
+			Message: "",
+			Error: &common.Error{
+				Code:    "FORCE_EXIT_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.ForceExitAllResponse{
+		Success: true,
+		Message: "Force exit all triggered successfully",
+	}, nil
+}
+
+// ForceExitStocks triggers exit for specific stocks
+func (s *UserConfigServer) ForceExitStocks(ctx context.Context, req *pb.ForceExitStocksRequest) (*pb.ForceExitStocksResponse, error) {
+	err := s.service.ForceExitStocks(ctx, req.UserId, req.Stocks)
+	if err != nil {
+		return &pb.ForceExitStocksResponse{
+			Success: false,
+			Message: "",
+			Error: &common.Error{
+				Code:    "FORCE_EXIT_STOCKS_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.ForceExitStocksResponse{
+		Success: true,
+		Message: fmt.Sprintf("Force exit triggered for %d stocks", len(req.Stocks)),
+	}, nil
+}
+
+// UpdateManualControls updates manual control flags
+func (s *UserConfigServer) UpdateManualControls(ctx context.Context, req *pb.UpdateManualControlsRequest) (*pb.UpdateManualControlsResponse, error) {
+	err := s.service.UpdateManualControls(ctx, req.UserId, req.PauseNewEntries, req.ResetForceExit)
+	if err != nil {
+		return &pb.UpdateManualControlsResponse{
+			Success: false,
+			Message: "",
+			Error: &common.Error{
+				Code:    "UPDATE_CONTROLS_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.UpdateManualControlsResponse{
+		Success: true,
+		Message: "Manual controls updated successfully",
+	}, nil
+}
+
+// DisableCash52W disables the 52W strategy for a user
+func (s *UserConfigServer) DisableCash52W(ctx context.Context, req *pb.DisableCash52WRequest) (*pb.DisableCash52WResponse, error) {
+	err := s.service.DisableCash52W(ctx, req.UserId)
+	if err != nil {
+		return &pb.DisableCash52WResponse{
+			Success: false,
+			Message: "",
+			Error: &common.Error{
+				Code:    "DISABLE_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.DisableCash52WResponse{
+		Success: true,
+		Message: "Cash 52W strategy disabled successfully",
+	}, nil
+}
+
+// GetAllEnabledConfigs retrieves all enabled 52W configurations (admin/monitoring)
+func (s *UserConfigServer) GetAllEnabledConfigs(ctx context.Context, req *pb.GetAllEnabledConfigsRequest) (*pb.GetAllEnabledConfigsResponse, error) {
+	configs, err := s.service.GetAllEnabledConfigs(ctx)
+	if err != nil {
+		return &pb.GetAllEnabledConfigsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "GET_ALL_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	protoConfigs := make([]*pb.Cash52WConfig, len(configs))
+	for i, cfg := range configs {
+		protoConfigs[i] = modelCash52WConfigToProto(cfg)
+	}
+
+	return &pb.GetAllEnabledConfigsResponse{
+		Success: true,
+		Configs: protoConfigs,
+	}, nil
+}
+
+// modelCash52WConfigToProto converts model to proto
+func modelCash52WConfigToProto(model *models.Cash52WConfig) *pb.Cash52WConfig {
+	if model == nil {
+		return nil
+	}
+
+	return &pb.Cash52WConfig{
+		UserId:          model.UserID,
+		Enabled:         model.Enabled,
+		TotalCapital:    model.TotalCapital,
+		CapitalPerStock: model.CapitalPerStock,
+		MaxStocks:       int32(model.MaxStocks),
+		AutoRebalance:   model.AutoRebalance,
+		StopLossLevels: &pb.StopLossLevels{
+			Level_1: &pb.StopLossLevel{
+				TriggerPercent:      model.StopLossLevels.Level1.TriggerPercent,
+				ExitQuantityPercent: int32(model.StopLossLevels.Level1.ExitQuantityPercent),
+				Type:                model.StopLossLevels.Level1.Type,
+				Enabled:             model.StopLossLevels.Level1.Enabled,
+			},
+			Level_2: &pb.StopLossLevel{
+				TriggerPercent:      model.StopLossLevels.Level2.TriggerPercent,
+				ExitQuantityPercent: int32(model.StopLossLevels.Level2.ExitQuantityPercent),
+				Type:                model.StopLossLevels.Level2.Type,
+				Enabled:             model.StopLossLevels.Level2.Enabled,
+			},
+		},
+		ProfitLevels: &pb.ProfitLevels{
+			Level_1: &pb.ProfitLevel{
+				TriggerPercent:      model.ProfitLevels.Level1.TriggerPercent,
+				ExitQuantityPercent: int32(model.ProfitLevels.Level1.ExitQuantityPercent),
+				Type:                model.ProfitLevels.Level1.Type,
+				Enabled:             model.ProfitLevels.Level1.Enabled,
+			},
+			Level_2: &pb.ProfitLevel{
+				TriggerPercent:      model.ProfitLevels.Level2.TriggerPercent,
+				ExitQuantityPercent: int32(model.ProfitLevels.Level2.ExitQuantityPercent),
+				Type:                model.ProfitLevels.Level2.Type,
+				Enabled:             model.ProfitLevels.Level2.Enabled,
+			},
+			Level_3: &pb.ProfitLevel{
+				TriggerPercent:      model.ProfitLevels.Level3.TriggerPercent,
+				ExitQuantityPercent: int32(model.ProfitLevels.Level3.ExitQuantityPercent),
+				Type:                model.ProfitLevels.Level3.Type,
+				TrailPercent:        model.ProfitLevels.Level3.TrailPercent,
+				Enabled:             model.ProfitLevels.Level3.Enabled,
+			},
+		},
+		TradingMode:     model.TradingMode,
+		ForceExitAll:    model.ForceExitAll,
+		ForceExitStocks: model.ForceExitStocks,
+		PauseNewEntries: model.PauseNewEntries,
+		UpdatedAt:       &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
+		Version:         int32(model.Version),
+	}
+}
+
 // Helper functions to convert between proto and model types
 
 func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondition {

@@ -9,6 +9,7 @@ require (
 	github.com/RohitIndira/Algo-Treading/api/proto/trade_execution v0.0.0
 	github.com/RohitIndira/Algo-Treading/api/proto/user_config v0.0.0
 	github.com/go-redis/redis/v8 v8.11.5
+	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.0
 	github.com/joho/godotenv v1.5.1
