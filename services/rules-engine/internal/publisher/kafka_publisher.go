@@ -74,9 +74,7 @@ func (p *KafkaPublisher) PublishTradeSignal(ctx context.Context, orderReq *model
 	return nil
 }
 
-// PublishAllocation publishes a portfolio allocation event to Kafka. This is
-// used for tracking per-user allocation state for strategies like
-// Cash 52-Week High.
+// PublishAllocation publishes a portfolio allocation event to Kafka.
 func (p *KafkaPublisher) PublishAllocation(ctx context.Context, ev *models.PortfolioAllocationEvent) error {
 	if ev == nil {
 		return fmt.Errorf("allocation event is nil")

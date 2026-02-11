@@ -36,11 +36,34 @@ service UserConfigService {
   // Health check
   rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
 
-  // Configure the built-in Cash 52-week High strategy for a user. This is a
-  // higher-level convenience API that hides most of the internal fields and
-  // lets the user simply enable/disable the strategy and choose capital.
-  rpc ConfigureCash52WeekStrategy(ConfigureCash52WeekStrategyRequest)
-      returns (ConfigureCash52WeekStrategyResponse);
+  // Jobbing Strategy Configuration APIs
+  // Configure jobbing strategy for multiple tokens for a user
+  rpc ConfigureJobbingStrategy(ConfigureJobbingStrategyRequest)
+      returns (ConfigureJobbingStrategyResponse);
+  
+  // Get all jobbing configurations for a user
+  rpc GetJobbingConfigs(GetJobbingConfigsRequest)
+      returns (GetJobbingConfigsResponse);
+  
+  // Get a single jobbing configuration for a user and token
+  rpc GetJobbingConfig(GetJobbingConfigRequest)
+      returns (GetJobbingConfigResponse);
+  
+  // Update a jobbing configuration
+  rpc UpdateJobbingConfig(UpdateJobbingConfigRequest)
+      returns (UpdateJobbingConfigResponse);
+  
+  // Delete a jobbing configuration
+  rpc DeleteJobbingConfig(DeleteJobbingConfigRequest)
+      returns (DeleteJobbingConfigResponse);
+  
+  // Enable a jobbing configuration
+  rpc EnableJobbingConfig(EnableJobbingConfigRequest)
+      returns (EnableJobbingConfigResponse);
+  
+  // Disable a jobbing configuration
+  rpc DisableJobbingConfig(DisableJobbingConfigRequest)
+      returns (DisableJobbingConfigResponse);
 }
 
 // Strategy condition filters
@@ -169,10 +192,8 @@ message Strategy {
   // Version for optimistic locking
   int32 version = 11;
 
-  // Per-strategy trading mode. For most generic strategies this will
-  // default to "LIVE". For managed strategies like CASH_52W_HIGH this
-  // can be configured per user as "LIVE" or "PAPER" to control whether
-  // orders are actually sent to the broker or only simulated.
+  // Per-strategy trading mode. Defaults to "LIVE". Can be set to "PAPER"
+  // to simulate trades for this strategy without sending real orders.
   string trading_mode = 12;  // "LIVE" or "PAPER"
 }
 
@@ -288,44 +309,158 @@ message GetStrategiesByIDsResponse {
   common.Error error = 3;
 }
 
-// Configure the managed Cash 52-week High strategy for a user.
-// This does NOT expose all low-level fields; instead, the backend fills in
-// sensible defaults for trade_config and risk_limits based on these few
-// parameters.
-message ConfigureCash52WeekStrategyRequest {
-  string user_id = 1;
+// ========================================================================
+// Jobbing Strategy Configuration Messages
+// ========================================================================
 
-  // Enable or disable the strategy for this user.
-  bool enabled = 2;
-
-  // Optional overrides; if zero/omitted, backend uses defaults.
-  // e.g. 20000.0 for ₹20,000 per stock
-  double capital_per_stock = 3;
-
-  // Maximum number of concurrent 52-week positions (e.g. 25).
-  int32 max_positions = 4;
-
-  // Stop-loss percentage (e.g. 10.0 for 10%).
-  double stop_loss_pct = 5;
-
-  // Take-profit / trailing target percentage (e.g. 20.0 for 20%).
-  double take_profit_pct = 6;
-
-  // Optional user risk profile label (e.g. "conservative", "moderate",
-  // "aggressive"). Currently informational; future versions may integrate
-  // this with risk-management profiles.
-  string risk_profile = 7;
-
-  // Per-user trading mode for the managed 52W strategy. When set to
-  // "PAPER", the rules-engine will simulate trades for this user
-  // (no real orders sent to trade-execution) even if the global
-  // TRADING_MODE is LIVE. When set to "LIVE" (or empty), trades are
-  // executed normally according to the global mode.
-  string trading_mode = 8;  // "LIVE" or "PAPER"
+// Jobbing token configuration for a single stock
+message JobbingTokenConfig {
+  string token = 1;
+  string symbol = 2;
+  string exchange = 3;  // Default: "NSE"
+  
+  // Price range (required)
+  double lower_range = 4;
+  double higher_range = 5;
+  
+  // Order parameters (optional, will use defaults)
+  double initial_buy_offset = 6;  // Default: 0.01
+  double distance_continue = 7;   // Default: 0.01
+  
+  // Quantity (optional, will use defaults)
+  int32 quantity_per_order = 8;  // Default: 1
+  int32 max_quantity = 9;         // Default: 10
+  
+  // Trading mode (optional, defaults to LIVE)
+  string trading_mode = 10;  // "LIVE" or "PAPER"
+  
+  // Enable/disable flag (optional, defaults to true)
+  bool enabled = 11;
 }
 
-message ConfigureCash52WeekStrategyResponse {
+// Jobbing configuration model
+message JobbingConfig {
+  string id = 1;
+  string user_id = 2;
+  string strategy_id = 3;
+  
+  string token = 4;
+  string symbol = 5;
+  string exchange = 6;
+  
+  double lower_range = 7;
+  double higher_range = 8;
+  
+  double initial_buy_offset = 9;
+  double distance_continue = 10;
+  
+  int32 quantity_per_order = 11;
+  int32 max_quantity = 12;
+  
+  string trading_mode = 13;
+  
+  bool enabled = 14;
+  string enabled_at = 15;
+  string disabled_at = 16;
+  
+  string created_at = 17;
+  string updated_at = 18;
+}
+
+// Configure jobbing strategy for multiple tokens
+message ConfigureJobbingStrategyRequest {
+  string user_id = 1;
+  repeated JobbingTokenConfig configs = 2;
+}
+
+message ConfigureJobbingStrategyResponse {
   bool success = 1;
-  Strategy strategy = 2;  // The underlying strategy record (may be nil if disabled)
+  string message = 2;
+  string user_id = 3;
+  repeated JobbingConfig configs = 4;
+  int32 total_count = 5;
+  common.Error error = 6;
+}
+
+// Get all jobbing configurations for a user
+message GetJobbingConfigsRequest {
+  string user_id = 1;
+  bool enabled_only = 2;  // Default: false
+}
+
+message GetJobbingConfigsResponse {
+  bool success = 1;
+  repeated JobbingConfig configs = 2;
+  int32 total_count = 3;
+  common.Error error = 4;
+}
+
+// Get a single jobbing configuration
+message GetJobbingConfigRequest {
+  string user_id = 1;
+  string token = 2;
+}
+
+message GetJobbingConfigResponse {
+  bool success = 1;
+  JobbingConfig config = 2;
+  common.Error error = 3;
+}
+
+// Update a jobbing configuration
+message UpdateJobbingConfigRequest {
+  string user_id = 1;
+  string token = 2;
+  
+  // Optional updates
+  optional double lower_range = 3;
+  optional double higher_range = 4;
+  optional double initial_buy_offset = 5;
+  optional double distance_continue = 6;
+  optional int32 quantity_per_order = 7;
+  optional int32 max_quantity = 8;
+  optional string trading_mode = 9;
+  optional bool enabled = 10;
+}
+
+message UpdateJobbingConfigResponse {
+  bool success = 1;
+  JobbingConfig config = 2;
+  common.Error error = 3;
+}
+
+// Delete a jobbing configuration
+message DeleteJobbingConfigRequest {
+  string user_id = 1;
+  string token = 2;
+}
+
+message DeleteJobbingConfigResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+// Enable a jobbing configuration
+message EnableJobbingConfigRequest {
+  string user_id = 1;
+  string token = 2;
+}
+
+message EnableJobbingConfigResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+// Disable a jobbing configuration
+message DisableJobbingConfigRequest {
+  string user_id = 1;
+  string token = 2;
+}
+
+message DisableJobbingConfigResponse {
+  bool success = 1;
+  string message = 2;
   common.Error error = 3;
 }

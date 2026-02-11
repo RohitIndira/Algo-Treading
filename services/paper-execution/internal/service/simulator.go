@@ -123,7 +123,7 @@ func (s *Simulator) OnCash52WDisabled(ctx context.Context, userID string) error 
 
 func NewSimulator(cfg Config, redisClient *redisdb.Client, pub *publisher.KafkaPublisher, logger *zap.Logger) *Simulator {
 	if cfg.StrategyID == "" {
-		cfg.StrategyID = "CASH_52W_HIGH"
+		cfg.StrategyID = "JOBBING"
 	}
 	if cfg.TradingMode == "" {
 		cfg.TradingMode = "PAPER"
@@ -564,24 +564,21 @@ func (s *Simulator) emitPnL(ctx context.Context) {
 		// This is the correct formula - we do NOT add initial investment again
 		portfolioValue := totalMarketValue + closedPnL
 
-		// Average per-stock (for 25 stocks max in 52W strategy)
-		avgPerStock := 0.0
-		if s.cfg.StrategyID == "CASH_52W_HIGH" {
-			avgPerStock = portfolioValue / 25.0
-		}
+		// Calculate average per stock (strategy uses 25 stocks)
+		avgPerStock := closedPnL / 25.0
 
 		summary := &models.PortfolioPnLSummary{
-			UserID:              uid,
-			StrategyID:          s.cfg.StrategyID,
-			OpenPositions:       openPnLList,
-			OpenPositionsCount:  len(openPnLList),
-			TotalMarketValue:    totalMarketValue,
-			TotalUnrealizedPnL:  totalUnrealizedPnL,
-			TotalClosedPnL:      closedPnL,
-			PortfolioValue:      portfolioValue,
-			AvgPerStock:         avgPerStock,
-			AvailableCapital:    avgPerStock, // Capital available for next reinvestment
-			Timestamp:           time.Now(),
+			UserID:             uid,
+			StrategyID:         s.cfg.StrategyID,
+			OpenPositions:      openPnLList,
+			OpenPositionsCount: len(openPnLList),
+			TotalMarketValue:   totalMarketValue,
+			TotalUnrealizedPnL: totalUnrealizedPnL,
+			TotalClosedPnL:     closedPnL,
+			PortfolioValue:     portfolioValue,
+			AvgPerStock:        avgPerStock,
+			AvailableCapital:   avgPerStock, // Capital available for next reinvestment
+			Timestamp:          time.Now(),
 		}
 
 		// Publish comprehensive portfolio summary
@@ -612,17 +609,17 @@ func (s *Simulator) emitPnL(ctx context.Context) {
 
 		// User has closed PnL but no open positions
 		summary := &models.PortfolioPnLSummary{
-			UserID:              uid,
-			StrategyID:          s.cfg.StrategyID,
-			OpenPositions:       []models.OpenPositionPnL{},
-			OpenPositionsCount:  0,
-			TotalMarketValue:    0,
-			TotalUnrealizedPnL:  0,
-			TotalClosedPnL:      closedPnL,
-			PortfolioValue:      closedPnL,
-			AvgPerStock:         avgPerStock,
-			AvailableCapital:    avgPerStock,
-			Timestamp:           time.Now(),
+			UserID:             uid,
+			StrategyID:         s.cfg.StrategyID,
+			OpenPositions:      []models.OpenPositionPnL{},
+			OpenPositionsCount: 0,
+			TotalMarketValue:   0,
+			TotalUnrealizedPnL: 0,
+			TotalClosedPnL:     closedPnL,
+			PortfolioValue:     closedPnL,
+			AvgPerStock:        avgPerStock,
+			AvailableCapital:   avgPerStock,
+			Timestamp:          time.Now(),
 		}
 
 		_ = s.pub.PublishPortfolioSummary(ctx, summary)

@@ -56,10 +56,9 @@ type ExecutionResult struct {
 	BrokerTimestamp time.Time `json:"broker_timestamp,omitempty"`
 
 	// Related Information
-	EventID      string  `json:"event_id,omitempty"`
-	NewsCategory string  `json:"news_category,omitempty"`
-	ImpactScore  int32   `json:"impact_score,omitempty"`
-	MatchScore   float64 `json:"match_score,omitempty"`
+	EventID     string  `json:"event_id,omitempty"`
+	ImpactScore int32   `json:"impact_score,omitempty"`
+	MatchScore  float64 `json:"match_score,omitempty"`
 
 	// Error Information
 	ErrorCode       string `json:"error_code,omitempty"`
@@ -161,23 +160,22 @@ type TradeSignal struct {
 	// TradingMode indicates whether this signal is PAPER or LIVE.
 	// When PAPER, trade-execution must NOT place real orders.
 	TradingMode string `json:"trading_mode,omitempty"`
-	EventID      string `json:"event_id"`
-	StockCode    int64  `json:"stock_code"`
+	EventID     string `json:"event_id"`
+	StockCode   int64  `json:"stock_code"`
 	// Token is the actual trading token (scrip token) from rules-engine
 	// OrderRequest.Token. This is what Odin expects as scrip_token. Keeping it
 	// alongside StockCode lets us evolve instrument mapping without breaking
 	// analytics.
-	Token        int64     `json:"token"`
-	Symbol       string    `json:"symbol"`
-	Exchange     string    `json:"exchange"`
-	OrderType    string    `json:"order_type"`
-	Quantity     int32     `json:"quantity"`
-	Price        float64   `json:"price"`
-	StopLoss     float64   `json:"stop_loss"`
-	TakeProfit   float64   `json:"take_profit"`
-	MatchScore   float64   `json:"match_score"`
-	ImpactScore  int32     `json:"impact_score"`
-	Sentiment    string    `json:"sentiment"`
-	NewsCategory string    `json:"news_category"`
-	Timestamp    time.Time `json:"timestamp"`
+	Token       int64     `json:"token"`
+	Symbol      string    `json:"symbol"`
+	Exchange    string    `json:"exchange"`
+	OrderType   string    `json:"order_type"`
+	Quantity    int32     `json:"quantity"`
+	Price       float64   `json:"price"`
+	StopLoss    float64   `json:"stop_loss"`
+	TakeProfit  float64   `json:"take_profit"`
+	MatchScore  float64   `json:"match_score"`
+	ImpactScore int32     `json:"impact_score"`
+	Sentiment   string    `json:"sentiment"`
+	Timestamp   time.Time `json:"timestamp"`
 }

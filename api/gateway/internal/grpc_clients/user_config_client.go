@@ -81,12 +81,48 @@ func (c *UserConfigClient) HealthCheck(ctx context.Context, req *common.HealthCh
 	return c.client.HealthCheck(ctx, req)
 }
 
-// ConfigureCash52WeekStrategy calls the high-level 52W configuration RPC.
-// This is used by the API gateway HTTP endpoint to let the frontend enable/
-// disable the managed Cash 52-week High strategy for a user without
-// dealing with low-level trade_config/risk_limits fields.
-func (c *UserConfigClient) ConfigureCash52WeekStrategy(ctx context.Context, req *pb.ConfigureCash52WeekStrategyRequest) (*pb.ConfigureCash52WeekStrategyResponse, error) {
+// ========================================================================
+// Jobbing Strategy Configuration Client Methods
+// ========================================================================
+
+func (c *UserConfigClient) ConfigureJobbingStrategy(ctx context.Context, req *pb.ConfigureJobbingStrategyRequest) (*pb.ConfigureJobbingStrategyResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	return c.client.ConfigureCash52WeekStrategy(ctx, req)
+	return c.client.ConfigureJobbingStrategy(ctx, req)
+}
+
+func (c *UserConfigClient) GetJobbingConfigs(ctx context.Context, req *pb.GetJobbingConfigsRequest) (*pb.GetJobbingConfigsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetJobbingConfigs(ctx, req)
+}
+
+func (c *UserConfigClient) GetJobbingConfig(ctx context.Context, req *pb.GetJobbingConfigRequest) (*pb.GetJobbingConfigResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetJobbingConfig(ctx, req)
+}
+
+func (c *UserConfigClient) UpdateJobbingConfig(ctx context.Context, req *pb.UpdateJobbingConfigRequest) (*pb.UpdateJobbingConfigResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.UpdateJobbingConfig(ctx, req)
+}
+
+func (c *UserConfigClient) DeleteJobbingConfig(ctx context.Context, req *pb.DeleteJobbingConfigRequest) (*pb.DeleteJobbingConfigResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.DeleteJobbingConfig(ctx, req)
+}
+
+func (c *UserConfigClient) EnableJobbingConfig(ctx context.Context, req *pb.EnableJobbingConfigRequest) (*pb.EnableJobbingConfigResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.EnableJobbingConfig(ctx, req)
+}
+
+func (c *UserConfigClient) DisableJobbingConfig(ctx context.Context, req *pb.DisableJobbingConfigRequest) (*pb.DisableJobbingConfigResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.DisableJobbingConfig(ctx, req)
 }

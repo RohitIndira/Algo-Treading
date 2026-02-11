@@ -109,18 +109,16 @@ for topic in "${topics[@]}"; do
 	echo "Creating topic: $topic_name"
 
 	if [ "$topic_name" = "market.data.live" ]; then
-		# Configure market.data.live as a compacted topic so that for each
-		# token key only the latest tick is retained in Kafka storage.
-		# This matches the requirement: keep current tick, old ticks are
-		# garbage-collected by log compaction.
+		# Configure market.data.live with 1-day retention as per requirements
+		# Delete old data after 24 hours, keep latest ticks for real-time trading
 		docker exec trading-kafka kafka-topics --create \
 			--bootstrap-server localhost:9092 \
 			--replication-factor 1 \
 			--partitions 3 \
 			--topic "$topic_name" \
-			--config cleanup.policy=compact \
-			--config min.cleanable.dirty.ratio=0.01 \
-			--config segment.ms=600000 \
+			--config cleanup.policy=delete \
+			--config retention.ms=86400000 \
+			--config segment.ms=3600000 \
 			--if-not-exists 2>/dev/null
 	else
 		docker exec trading-kafka kafka-topics --create \

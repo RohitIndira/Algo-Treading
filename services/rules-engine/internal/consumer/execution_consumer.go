@@ -11,10 +11,18 @@ import (
 	"go.uber.org/zap"
 )
 
+// OrderFillHandler defines interface for handling order fill notifications
+type OrderFillHandler interface {
+	HandleOrderFill(orderID string, userID string, token string, side string, executedQty int32, executedPrice float64) error
+}
+
 // ExecutionResult represents execution result from Kafka
 type ExecutionResult struct {
 	ExecutionID   string    `json:"execution_id"`
 	OrderID       string    `json:"order_id"`
+	UserID        string    `json:"user_id"` // Added for jobbing engine
+	Token         string    `json:"token"`   // Added for jobbing engine
+	Side          string    `json:"side"`    // Added for jobbing engine (BUY/SELL)
 	Status        string    `json:"status"`
 	ExecutedPrice float64   `json:"executed_price"`
 	ExecutedQty   int32     `json:"executed_quantity"`
@@ -25,13 +33,14 @@ type ExecutionResult struct {
 
 // ExecutionConsumer consumes execution results from Kafka
 type ExecutionConsumer struct {
-	reader     *kafka.Reader
-	signalRepo *repository.TradeSignalRepository
-	logger     *zap.Logger
+	reader           *kafka.Reader
+	signalRepo       *repository.TradeSignalRepository
+	orderFillHandler OrderFillHandler
+	logger           *zap.Logger
 }
 
 // NewExecutionConsumer creates a new execution consumer
-func NewExecutionConsumer(brokers []string, groupID string, signalRepo *repository.TradeSignalRepository, logger *zap.Logger) *ExecutionConsumer {
+func NewExecutionConsumer(brokers []string, groupID string, signalRepo *repository.TradeSignalRepository, orderFillHandler OrderFillHandler, logger *zap.Logger) *ExecutionConsumer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
 		Topic:          "trade-executions",
@@ -48,9 +57,10 @@ func NewExecutionConsumer(brokers []string, groupID string, signalRepo *reposito
 		zap.String("group_id", groupID))
 
 	return &ExecutionConsumer{
-		reader:     reader,
-		signalRepo: signalRepo,
-		logger:     logger,
+		reader:           reader,
+		signalRepo:       signalRepo,
+		orderFillHandler: orderFillHandler,
+		logger:           logger,
 	}
 }
 
@@ -130,6 +140,34 @@ func (c *ExecutionConsumer) processMessage(ctx context.Context, msg kafka.Messag
 			zap.String("order_id", result.OrderID),
 			zap.String("status", result.Status),
 			zap.Float64("executed_price", result.ExecutedPrice))
+	}
+
+	// Notify order fill handler (e.g., jobbing engine) if execution was successful
+	if c.orderFillHandler != nil && result.Status == "COMPLETE" && result.ExecutedQty > 0 {
+		err := c.orderFillHandler.HandleOrderFill(
+			result.OrderID,
+			result.UserID,
+			result.Token,
+			result.Side,
+			result.ExecutedQty,
+			result.ExecutedPrice,
+		)
+		if err != nil {
+			c.logger.Error("Failed to notify order fill handler",
+				zap.Error(err),
+				zap.String("order_id", result.OrderID),
+				zap.String("user_id", result.UserID),
+				zap.String("token", result.Token))
+			// Don't return error - this is not critical for execution processing
+		} else {
+			c.logger.Info("Order fill handler notified successfully",
+				zap.String("order_id", result.OrderID),
+				zap.String("user_id", result.UserID),
+				zap.String("token", result.Token),
+				zap.String("side", result.Side),
+				zap.Int32("executed_qty", result.ExecutedQty),
+				zap.Float64("executed_price", result.ExecutedPrice))
+		}
 	}
 
 	return nil

@@ -25,49 +25,6 @@ func NewUserConfigServer(service *service.StrategyService) *UserConfigServer {
 	}
 }
 
-// ConfigureCash52WeekStrategy configures the managed Cash 52-week High strategy
-// for a user. It exposes only high-level fields (enabled, capital_per_stock)
-// to callers; the service fills in all detailed trade/risk settings.
-func (s *UserConfigServer) ConfigureCash52WeekStrategy(ctx context.Context, req *pb.ConfigureCash52WeekStrategyRequest) (*pb.ConfigureCash52WeekStrategyResponse, error) {
-	modelReq := &models.ConfigureCash52WeekStrategyRequest{
-		UserID:          req.UserId,
-		Enabled:         req.Enabled,
-		CapitalPerStock: req.CapitalPerStock,
-		// max_positions, stop_loss_pct, take_profit_pct and risk_profile are
-		// optional; backend will default them if zero/empty.
-		MaxPositions:  int(req.MaxPositions),
-		StopLossPct:   req.StopLossPct,
-		TakeProfitPct: req.TakeProfitPct,
-		RiskProfile:   req.RiskProfile,
-		// Forward per-user trading_mode ("LIVE"/"PAPER") from the proto
-		// request into the domain model so the service can normalise and
-		// persist it. If this is empty or anything other than PAPER, the
-		// service layer will default it to LIVE.
-		TradingMode: req.TradingMode,
-	}
-
-	strategy, err := s.service.ConfigureCash52WeekStrategy(ctx, modelReq)
-	if err != nil {
-		return &pb.ConfigureCash52WeekStrategyResponse{
-			Success: false,
-			Error: &common.Error{
-				Code:    "CONFIGURE_52W_FAILED",
-				Message: err.Error(),
-			},
-		}, nil
-	}
-
-	var protoStrategy *pb.Strategy
-	if strategy != nil {
-		protoStrategy = modelStrategyToProto(strategy)
-	}
-
-	return &pb.ConfigureCash52WeekStrategyResponse{
-		Success:  true,
-		Strategy: protoStrategy,
-	}, nil
-}
-
 // CreateStrategy creates a new trading strategy
 func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStrategyRequest) (*pb.CreateStrategyResponse, error) {
 	// Convert proto request to domain model
@@ -461,10 +418,10 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 		// Propagate per-strategy trading_mode ("LIVE"/"PAPER") from the
 		// domain model to the protobuf response so callers can see the
 		// effective mode in JSON responses.
-		TradingMode:  model.TradingMode,
-		Version:      model.Version,
-		CreatedAt:    &common.Timestamp{Seconds: model.CreatedAt.Unix()},
-		UpdatedAt:    &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
+		TradingMode: model.TradingMode,
+		Version:     model.Version,
+		CreatedAt:   &common.Timestamp{Seconds: model.CreatedAt.Unix()},
+		UpdatedAt:   &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
 	}
 
 	if model.Conditions != nil {
@@ -578,4 +535,354 @@ func modelRiskLimitsToProto(model *models.RiskLimits) *pb.RiskLimits {
 	}
 
 	return limits
+}
+
+// ========================================================================
+// Jobbing Strategy gRPC Handlers
+// ========================================================================
+
+// ConfigureJobbingStrategy configures jobbing strategy for multiple tokens
+func (s *UserConfigServer) ConfigureJobbingStrategy(ctx context.Context, req *pb.ConfigureJobbingStrategyRequest) (*pb.ConfigureJobbingStrategyResponse, error) {
+	if req.UserId == "" {
+		return &pb.ConfigureJobbingStrategyResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "VALIDATION_ERROR",
+				Message: "user_id is required",
+			},
+		}, nil
+	}
+
+	if len(req.Configs) == 0 {
+		return &pb.ConfigureJobbingStrategyResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "VALIDATION_ERROR",
+				Message: "at least one token configuration is required",
+			},
+		}, nil
+	}
+
+	// Convert proto configs to model
+	modelConfigs := make([]models.JobbingTokenConfig, len(req.Configs))
+	for i, protoConfig := range req.Configs {
+		modelConfigs[i] = protoJobbingTokenConfigToModel(protoConfig)
+	}
+
+	modelReq := &models.ConfigureJobbingStrategyRequest{
+		UserID:  req.UserId,
+		Configs: modelConfigs,
+	}
+
+	resp, err := s.service.ConfigureJobbingStrategy(ctx, modelReq)
+	if err != nil {
+		return &pb.ConfigureJobbingStrategyResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "CONFIGURATION_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	// Convert model response to proto
+	protoConfigs := make([]*pb.JobbingConfig, len(resp.Configs))
+	for i, cfg := range resp.Configs {
+		protoConfigs[i] = modelJobbingConfigToProto(&cfg)
+	}
+
+	return &pb.ConfigureJobbingStrategyResponse{
+		Success:    resp.Success,
+		Message:    resp.Message,
+		UserId:     resp.UserID,
+		Configs:    protoConfigs,
+		TotalCount: int32(resp.TotalCount),
+	}, nil
+}
+
+// GetJobbingConfigs retrieves all jobbing configurations for a user
+func (s *UserConfigServer) GetJobbingConfigs(ctx context.Context, req *pb.GetJobbingConfigsRequest) (*pb.GetJobbingConfigsResponse, error) {
+	if req.UserId == "" {
+		return &pb.GetJobbingConfigsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "VALIDATION_ERROR",
+				Message: "user_id is required",
+			},
+		}, nil
+	}
+
+	configs, err := s.service.GetJobbingConfigs(ctx, req.UserId, req.EnabledOnly)
+	if err != nil {
+		return &pb.GetJobbingConfigsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "RETRIEVAL_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	protoConfigs := make([]*pb.JobbingConfig, len(configs))
+	for i, cfg := range configs {
+		protoConfigs[i] = modelJobbingConfigToProto(&cfg)
+	}
+
+	return &pb.GetJobbingConfigsResponse{
+		Success:    true,
+		Configs:    protoConfigs,
+		TotalCount: int32(len(configs)),
+	}, nil
+}
+
+// GetJobbingConfig retrieves a single jobbing configuration
+func (s *UserConfigServer) GetJobbingConfig(ctx context.Context, req *pb.GetJobbingConfigRequest) (*pb.GetJobbingConfigResponse, error) {
+	if req.UserId == "" || req.Token == "" {
+		return &pb.GetJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "VALIDATION_ERROR",
+				Message: "user_id and token are required",
+			},
+		}, nil
+	}
+
+	cfg, err := s.service.GetJobbingConfig(ctx, req.UserId, req.Token)
+	if err != nil {
+		return &pb.GetJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "RETRIEVAL_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	if cfg == nil {
+		return &pb.GetJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "NOT_FOUND",
+				Message: "jobbing configuration not found",
+			},
+		}, nil
+	}
+
+	return &pb.GetJobbingConfigResponse{
+		Success: true,
+		Config:  modelJobbingConfigToProto(cfg),
+	}, nil
+}
+
+// UpdateJobbingConfig updates an existing jobbing configuration
+func (s *UserConfigServer) UpdateJobbingConfig(ctx context.Context, req *pb.UpdateJobbingConfigRequest) (*pb.UpdateJobbingConfigResponse, error) {
+	if req.UserId == "" || req.Token == "" {
+		return &pb.UpdateJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "VALIDATION_ERROR",
+				Message: "user_id and token are required",
+			},
+		}, nil
+	}
+
+	modelReq := &models.UpdateJobbingConfigRequest{
+		UserID: req.UserId,
+		Token:  req.Token,
+	}
+
+	if req.LowerRange != nil {
+		modelReq.LowerRange = req.LowerRange
+	}
+	if req.HigherRange != nil {
+		modelReq.HigherRange = req.HigherRange
+	}
+	if req.InitialBuyOffset != nil {
+		modelReq.InitialBuyOffset = req.InitialBuyOffset
+	}
+	if req.DistanceContinue != nil {
+		modelReq.DistanceContinue = req.DistanceContinue
+	}
+	if req.QuantityPerOrder != nil {
+		modelReq.QuantityPerOrder = req.QuantityPerOrder
+	}
+	if req.MaxQuantity != nil {
+		modelReq.MaxQuantity = req.MaxQuantity
+	}
+	if req.TradingMode != nil {
+		modelReq.TradingMode = req.TradingMode
+	}
+	if req.Enabled != nil {
+		modelReq.Enabled = req.Enabled
+	}
+
+	cfg, err := s.service.UpdateJobbingConfig(ctx, modelReq)
+	if err != nil {
+		return &pb.UpdateJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "UPDATE_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.UpdateJobbingConfigResponse{
+		Success: true,
+		Config:  modelJobbingConfigToProto(cfg),
+	}, nil
+}
+
+// DeleteJobbingConfig deletes a jobbing configuration
+func (s *UserConfigServer) DeleteJobbingConfig(ctx context.Context, req *pb.DeleteJobbingConfigRequest) (*pb.DeleteJobbingConfigResponse, error) {
+	if req.UserId == "" || req.Token == "" {
+		return &pb.DeleteJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "VALIDATION_ERROR",
+				Message: "user_id and token are required",
+			},
+		}, nil
+	}
+
+	err := s.service.DeleteJobbingConfig(ctx, req.UserId, req.Token)
+	if err != nil {
+		return &pb.DeleteJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "DELETION_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.DeleteJobbingConfigResponse{
+		Success: true,
+		Message: "Jobbing configuration deleted successfully",
+	}, nil
+}
+
+// EnableJobbingConfig enables a jobbing configuration
+func (s *UserConfigServer) EnableJobbingConfig(ctx context.Context, req *pb.EnableJobbingConfigRequest) (*pb.EnableJobbingConfigResponse, error) {
+	if req.UserId == "" || req.Token == "" {
+		return &pb.EnableJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "VALIDATION_ERROR",
+				Message: "user_id and token are required",
+			},
+		}, nil
+	}
+
+	err := s.service.EnableJobbingConfig(ctx, req.UserId, req.Token)
+	if err != nil {
+		return &pb.EnableJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "ENABLE_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.EnableJobbingConfigResponse{
+		Success: true,
+		Message: "Jobbing configuration enabled successfully",
+	}, nil
+}
+
+// DisableJobbingConfig disables a jobbing configuration
+func (s *UserConfigServer) DisableJobbingConfig(ctx context.Context, req *pb.DisableJobbingConfigRequest) (*pb.DisableJobbingConfigResponse, error) {
+	if req.UserId == "" || req.Token == "" {
+		return &pb.DisableJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "VALIDATION_ERROR",
+				Message: "user_id and token are required",
+			},
+		}, nil
+	}
+
+	err := s.service.DisableJobbingConfig(ctx, req.UserId, req.Token)
+	if err != nil {
+		return &pb.DisableJobbingConfigResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "DISABLE_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.DisableJobbingConfigResponse{
+		Success: true,
+		Message: "Jobbing configuration disabled successfully",
+	}, nil
+}
+
+// Helper conversion functions for Jobbing
+
+func protoJobbingTokenConfigToModel(proto *pb.JobbingTokenConfig) models.JobbingTokenConfig {
+	cfg := models.JobbingTokenConfig{
+		Token:       proto.Token,
+		Symbol:      proto.Symbol,
+		Exchange:    proto.Exchange,
+		LowerRange:  proto.LowerRange,
+		HigherRange: proto.HigherRange,
+	}
+
+	if proto.InitialBuyOffset != 0 {
+		cfg.InitialBuyOffset = &proto.InitialBuyOffset
+	}
+	if proto.DistanceContinue != 0 {
+		cfg.DistanceContinue = &proto.DistanceContinue
+	}
+	if proto.QuantityPerOrder != 0 {
+		cfg.QuantityPerOrder = &proto.QuantityPerOrder
+	}
+	if proto.MaxQuantity != 0 {
+		cfg.MaxQuantity = &proto.MaxQuantity
+	}
+	if proto.TradingMode != "" {
+		cfg.TradingMode = &proto.TradingMode
+	}
+	if proto.Enabled {
+		cfg.Enabled = &proto.Enabled
+	}
+
+	return cfg
+}
+
+func modelJobbingConfigToProto(model *models.JobbingConfig) *pb.JobbingConfig {
+	if model == nil {
+		return nil
+	}
+
+	proto := &pb.JobbingConfig{
+		Id:               model.ID.String(),
+		UserId:           model.UserID,
+		StrategyId:       model.StrategyID,
+		Token:            model.Token,
+		Symbol:           model.Symbol,
+		Exchange:         model.Exchange,
+		LowerRange:       model.LowerRange,
+		HigherRange:      model.HigherRange,
+		InitialBuyOffset: model.InitialBuyOffset,
+		DistanceContinue: model.DistanceContinue,
+		QuantityPerOrder: model.QuantityPerOrder,
+		MaxQuantity:      model.MaxQuantity,
+		TradingMode:      model.TradingMode,
+		Enabled:          model.Enabled,
+		CreatedAt:        model.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt:        model.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	}
+
+	if model.EnabledAt != nil {
+		proto.EnabledAt = model.EnabledAt.Format("2006-01-02T15:04:05Z07:00")
+	}
+	if model.DisabledAt != nil {
+		proto.DisabledAt = model.DisabledAt.Format("2006-01-02T15:04:05Z07:00")
+	}
+
+	return proto
 }

@@ -8,7 +8,6 @@ import (
 	"syscall"
 	"time"
 
-	redispkg "github.com/RohitIndira/Algo-Treading/pkg/database/redis"
 	kafkapkg "github.com/RohitIndira/Algo-Treading/pkg/kafka"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/config"
@@ -28,116 +27,62 @@ func main() {
 		panic(err)
 	}
 	defer lgr.Sync()
-	fmt.Println("2.Starting unified data-ingestion service (MongoDB News + Redis 52W + B2C Market Data)")
-	lgr.Info("3. Starting unified data-ingestion service (MongoDB News + Redis 52W + B2C Market Data)")
+	fmt.Println("Starting data-ingestion service for Jobbing strategy (Live Market Data)")
+	lgr.Info("Starting data-ingestion service for Jobbing strategy (Live Market Data)")
 
 	// Context for the entire application
 	ctxRun, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
 
 	// ========================================================================
-	// 1. MONGODB NEWS INGESTION SETUP (DISABLED)
+	// B2C LIVE MARKET DATA SETUP (JOBBING STRATEGY)
 	// ========================================================================
-	// For current production focus we only need 52-week breakout data.
-	// The MongoDB news -> Kafka pipeline is temporarily disabled.
-	//
-	// When you want to re-enable news ingestion, restore the block below
-	// and ensure cfg.MongoURI/MongoDatabase/MongoCollection/KafkaTopic
-	// are set correctly.
-	//
-	// lgr.Info("Initializing MongoDB news ingestion pipeline")
-	// ctx, cancel := context.WithTimeout(context.Background(), cfg.MongoConnectTimeout)
-	// mongoClient, err := mongodb.New(ctx, mongodb.Config{
-	// 	URI:            cfg.MongoURI,
-	// 	Database:       cfg.MongoDatabase,
-	// 	ConnectTimeout: cfg.MongoConnectTimeout,
-	// })
-	// cancel()
-	// if err != nil {
-	// 	lgr.Fatal("failed to connect to mongodb", zap.Error(err))
-	// }
-	// defer mongoClient.Close(context.Background())
-	// lgr.Info("Connected to MongoDB",
-	// 	zap.String("database", cfg.MongoDatabase),
-	// 	zap.String("collection", cfg.MongoCollection))
-	// newsProdCfg := kafkapkg.ProducerConfig{...}
-	// newsProducer, err := kafkapkg.NewProducer(newsProdCfg)
-	// ...
-	// go func() { mongoWatcher.Run(ctxRun) }()
+	lgr.Info("Initializing B2C live market data pipeline for Jobbing strategy")
 
-	// ========================================================================
-	// 2. REDIS 52-WEEK HIGH BREAKOUT SETUP
-	// ========================================================================
-	lgr.Info("Initializing Redis 52-week high breakout pipeline")
-	fmt.Println("Initializing Redis 52-week high breakout pipeline----------------------------------**********")
-
-	// Kafka producer for 52-week breakout events
-	breakoutProdCfg := kafkapkg.ProducerConfig{
+	// Kafka producer for live market data
+	marketDataProdCfg := kafkapkg.ProducerConfig{
 		Brokers:     cfg.KafkaBrokers,
-		Topic:       cfg.KafkaTopic52Week,
+		Topic:       cfg.KafkaTopic,
 		BatchSize:   100,
 		MaxAttempts: 3,
 	}
-	breakoutProducer, err := kafkapkg.NewProducer(breakoutProdCfg)
+	marketDataProducer, err := kafkapkg.NewProducer(marketDataProdCfg)
 	if err != nil {
-		lgr.Fatal("failed to create 52w-breakout kafka producer", zap.Error(err))
+		lgr.Fatal("failed to create market-data kafka producer", zap.Error(err))
 	}
-	defer breakoutProducer.Close()
+	defer marketDataProducer.Close()
 
-	if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopic52Week, 1, 1); err != nil {
-		lgr.Fatal("failed to ensure 52w-breakout topic exists", zap.Error(err))
+	if err := kafkapkg.EnsureTopicExists(cfg.KafkaBrokers, cfg.KafkaTopic, 3, 1); err != nil {
+		lgr.Fatal("failed to ensure market.data.live topic exists", zap.Error(err))
 	}
-	lgr.Info("Connected to Kafka (52w breakouts)",
+	lgr.Info("Connected to Kafka (live market data)",
 		zap.Strings("brokers", cfg.KafkaBrokers),
-		zap.String("topic", cfg.KafkaTopic52Week))
+		zap.String("topic", cfg.KafkaTopic))
 
-	breakoutPub := publisher.NewKafkaPublisher(breakoutProducer, cfg.KafkaTopic52Week)
+	marketDataPub := publisher.NewKafkaPublisher(marketDataProducer, cfg.KafkaTopic)
 
-	// Initialize Redis client for market data (52-week highs)
-	redisClient, err := redispkg.New(redispkg.Config{
-		Address:      cfg.MarketRedisAddr,
-		Password:     cfg.MarketRedisPassword,
-		DB:           cfg.MarketRedisDB,
-		PoolSize:     100,
-		MinIdleConns: 10,
-	})
-	if err != nil {
-		lgr.Fatal("failed to connect to market redis", zap.Error(err))
-	}
-	defer redisClient.Close()
-
-	lgr.Info("Connected to market Redis for 52w highs",
-		zap.String("addr", cfg.MarketRedisAddr))
-
-	// Start Redis -> Kafka watcher for 52-week high breakouts
-	redisWatcher := watcher.NewRedis52WWatcher(
-		redisClient,
-		breakoutPub,
-		cfg.MarketRedisPollInterval,
-		lgr,
-	)
-
-	go func() {
-		lgr.Info("Starting Redis 52-week high watcher")
-		if err := redisWatcher.Run(ctxRun); err != nil {
-			lgr.Error("redis 52w watcher stopped with error", zap.Error(err))
+	// Start B2C watcher for live market data (Jobbing strategy)
+	if cfg.B2CBridgePath == "" {
+		lgr.Warn("B2C_BRIDGE_PATH not set, skipping B2C market data ingestion")
+	} else {
+		jobbingWatcher, err := watcher.NewB2CWatcher(
+			cfg.B2CBridgePath,
+			cfg.B2CTokens,
+			cfg.StocksDBPath,
+			marketDataPub,
+			lgr,
+		)
+		if err != nil {
+			lgr.Fatal("failed to create B2C watcher", zap.Error(err))
 		}
-	}()
 
-	// ========================================================================
-	// 3. B2C LIVE MARKET DATA SETUP (DISABLED)
-	// ========================================================================
-	// For now we are not using the B2C live market data bridge. The entire
-	// ingestion pipeline for market data is disabled. When needed again,
-	// uncomment this section and ensure B2C_BRIDGE_PATH and related config
-	// are set correctly.
-	//
-	// lgr.Info("Initializing B2C live market data pipeline")
-	// if cfg.B2CBridgePath == "" {
-	// 	lgr.Warn("B2C_BRIDGE_PATH not set, skipping B2C market data ingestion")
-	// } else {
-	// 	...
-	// }
+		go func() {
+			lgr.Info("Starting B2C live market data watcher")
+			if err := jobbingWatcher.Run(ctxRun); err != nil {
+				lgr.Error("B2C watcher stopped with error", zap.Error(err))
+			}
+		}()
+	}
 
 	// ========================================================================
 	// GRACEFUL SHUTDOWN

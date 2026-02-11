@@ -20,23 +20,14 @@ type Config struct {
 	// Kafka Configuration
 	Kafka KafkaConfig
 
-	// PostgreSQL Configuration (for loading strategies)
-	PostgreSQL PostgreSQLConfig
-
-	// Elasticsearch Configuration
-	Elasticsearch ElasticsearchConfig
-
-	// Redis Configuration
-	Redis RedisConfig
-
 	// RabbitMQ Configuration
 	RabbitMQ RabbitMQConfig
 
+	// PostgreSQL Configuration
+	PostgreSQL PostgreSQLConfig
+
 	// gRPC Client Configuration
 	GRPCClients GRPCClientsConfig
-
-	// Performance Configuration
-	Performance PerformanceConfig
 
 	// Logging Configuration
 	Logging LoggingConfig
@@ -44,19 +35,8 @@ type Config struct {
 	// Market Hours Configuration
 	MarketHours MarketHoursConfig
 
-	// Cash 52-week High strategy configuration (Phase 1)
-	Cash52WTopic   string
-	Cash52WUserIDs []string
-
-	// Portfolio allocation state topic (for publishing per-user 52W
-	// allocation snapshots). This is generic so we can reuse it for
-	// other strategies later.
+	// Portfolio allocation state topic (generic for all strategies)
 	PortfolioAllocTopic string
-
-	// PortfolioRealtimeTopic is a Kafka topic where realtime marked-to-
-	// market portfolio snapshots (joined with Redis market data) are
-	// published for UI/analytics consumption.
-	PortfolioRealtimeTopic string
 
 	// Jobbing Strategy Configuration
 	JobbingTopic            string
@@ -153,19 +133,6 @@ type GRPCClientConfig struct {
 	KeepAliveTimeout time.Duration
 }
 
-// PerformanceConfig holds performance tuning configuration
-type PerformanceConfig struct {
-	WorkerCount             int
-	MaxBatchSize            int
-	ProcessingTimeout       time.Duration
-	MaxConcurrentMatches    int
-	ESQueryTimeout          time.Duration
-	CacheRefreshInterval    time.Duration
-	CircuitBreakerThreshold int
-	CircuitBreakerTimeout   time.Duration
-	MinMatchScore           float64
-}
-
 // LoggingConfig holds logging configuration
 type LoggingConfig struct {
 	Level      string
@@ -178,7 +145,7 @@ type LoggingConfig struct {
 type MarketHoursConfig struct {
 	OpenHour     int    // Market opening hour (0-23)
 	OpenMinute   int    // Market opening minute (0-59)
-	CloseHour    int    // Market closing hour (0-23)ISPL
+	CloseHour    int    // Market closing hour (0-23)
 	CloseMinute  int    // Market closing minute (0-59)
 	Timezone     string // Timezone (e.g., "Asia/Kolkata")
 	EnforceHours bool   // Whether to enforce market hours check
@@ -195,7 +162,7 @@ func LoadConfig() (*Config, error) {
 
 		Kafka: KafkaConfig{
 			Brokers:           getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
-			Topic:             getEnv("KAFKA_TOPIC", "market.data.news"),
+			Topic:             getEnv("KAFKA_TOPIC", "market.data.live"),
 			ConsumerGroup:     getEnv("KAFKA_CONSUMER_GROUP", "rules-engine-group"),
 			StartOffset:       getEnv("KAFKA_START_OFFSET", "latest"),
 			CommitInterval:    getEnvAsDuration("KAFKA_COMMIT_INTERVAL", 1*time.Second),
@@ -203,41 +170,6 @@ func LoadConfig() (*Config, error) {
 			SessionTimeout:    getEnvAsDuration("KAFKA_SESSION_TIMEOUT", 10*time.Second),
 			HeartbeatInterval: getEnvAsDuration("KAFKA_HEARTBEAT_INTERVAL", 3*time.Second),
 			RebalanceTimeout:  getEnvAsDuration("KAFKA_REBALANCE_TIMEOUT", 60*time.Second),
-		},
-
-		PostgreSQL: PostgreSQLConfig{
-			Host:     getEnv("POSTGRES_HOST", "localhost"),
-			Port:     getEnv("POSTGRES_PORT", "5432"),
-			User:     getEnv("POSTGRES_USER", "postgres"),
-			Password: getEnv("POSTGRES_PASSWORD", "postgres"),
-			Database: getEnv("POSTGRES_DB", "trading_db"),
-			SSLMode:  getEnv("POSTGRES_SSLMODE", "disable"),
-		},
-
-		Elasticsearch: ElasticsearchConfig{
-			URLs:                getEnvAsSlice("ELASTICSEARCH_URLS", []string{"http://localhost:9200"}),
-			Username:            getEnv("ELASTICSEARCH_USERNAME", ""),
-			Password:            getEnv("ELASTICSEARCH_PASSWORD", ""),
-			IndexName:           getEnv("ELASTICSEARCH_INDEX", "user_strategies"),
-			MaxRetries:          getEnvAsInt("ELASTICSEARCH_MAX_RETRIES", 3),
-			RetryBackoff:        getEnvAsDuration("ELASTICSEARCH_RETRY_BACKOFF", 1*time.Second),
-			HealthCheckInterval: getEnvAsDuration("ELASTICSEARCH_HEALTH_CHECK_INTERVAL", 30*time.Second),
-			Timeout:             getEnvAsDuration("ELASTICSEARCH_TIMEOUT", 5*time.Second),
-		},
-
-		Redis: RedisConfig{
-			Addrs:        getEnvAsSlice("REDIS_ADDRS", []string{"65.20.83.31:6379"}),
-			Password:     getEnv("REDIS_PASSWORD", ""),
-			DB:           getEnvAsInt("REDIS_DB", 0),
-			PoolSize:     getEnvAsInt("REDIS_POOL_SIZE", 100),
-			MinIdleConns: getEnvAsInt("REDIS_MIN_IDLE_CONNS", 10),
-			MaxRetries:   getEnvAsInt("REDIS_MAX_RETRIES", 3),
-			DialTimeout:  getEnvAsDuration("REDIS_DIAL_TIMEOUT", 5*time.Second),
-			ReadTimeout:  getEnvAsDuration("REDIS_READ_TIMEOUT", 3*time.Second),
-			WriteTimeout: getEnvAsDuration("REDIS_WRITE_TIMEOUT", 3*time.Second),
-			PoolTimeout:  getEnvAsDuration("REDIS_POOL_TIMEOUT", 4*time.Second),
-			CacheTTL:     getEnvAsDuration("REDIS_CACHE_TTL", 5*time.Minute),
-			ClusterMode:  getEnvAsBool("REDIS_CLUSTER_MODE", false),
 		},
 
 		RabbitMQ: RabbitMQConfig{
@@ -255,9 +187,18 @@ func LoadConfig() (*Config, error) {
 			MaxReconnectAttempts: getEnvAsInt("RABBITMQ_MAX_RECONNECT_ATTEMPTS", 10),
 		},
 
+		PostgreSQL: PostgreSQLConfig{
+			Host:     getEnv("POSTGRES_HOST", "localhost"),
+			Port:     getEnv("POSTGRES_PORT", "5432"),
+			User:     getEnv("POSTGRES_USER", "algo_user"),
+			Password: getEnv("POSTGRES_PASSWORD", "algopass123"),
+			Database: getEnv("POSTGRES_DB", "algotrading"),
+			SSLMode:  getEnv("POSTGRES_SSLMODE", "disable"),
+		},
+
 		GRPCClients: GRPCClientsConfig{
 			UserConfigService: GRPCClientConfig{
-				Address:          getEnv("USER_CONFIG_SERVICE_ADDR", "localhost:9001"),
+				Address:          getEnv("USER_CONFIG_SERVICE_ADDR", "localhost:50051"),
 				Timeout:          getEnvAsDuration("USER_CONFIG_SERVICE_TIMEOUT", 5*time.Second),
 				MaxRetries:       getEnvAsInt("USER_CONFIG_SERVICE_MAX_RETRIES", 3),
 				RetryBackoff:     getEnvAsDuration("USER_CONFIG_SERVICE_RETRY_BACKOFF", 1*time.Second),
@@ -272,18 +213,6 @@ func LoadConfig() (*Config, error) {
 				KeepAlive:        getEnvAsDuration("RISK_MANAGEMENT_SERVICE_KEEP_ALIVE", 30*time.Second),
 				KeepAliveTimeout: getEnvAsDuration("RISK_MANAGEMENT_SERVICE_KEEP_ALIVE_TIMEOUT", 10*time.Second),
 			},
-		},
-
-		Performance: PerformanceConfig{
-			WorkerCount:             getEnvAsInt("WORKER_COUNT", 50),
-			MaxBatchSize:            getEnvAsInt("MAX_BATCH_SIZE", 100),
-			ProcessingTimeout:       getEnvAsDuration("PROCESSING_TIMEOUT", 30*time.Second),
-			MaxConcurrentMatches:    getEnvAsInt("MAX_CONCURRENT_MATCHES", 100),
-			ESQueryTimeout:          getEnvAsDuration("ES_QUERY_TIMEOUT", 2*time.Second),
-			CacheRefreshInterval:    getEnvAsDuration("CACHE_REFRESH_INTERVAL", 1*time.Minute),
-			CircuitBreakerThreshold: getEnvAsInt("CIRCUIT_BREAKER_THRESHOLD", 5),
-			CircuitBreakerTimeout:   getEnvAsDuration("CIRCUIT_BREAKER_TIMEOUT", 60*time.Second),
-			MinMatchScore:           getEnvAsFloat("MIN_MATCH_SCORE", 20.0),
 		},
 
 		Logging: LoggingConfig{
@@ -302,11 +231,7 @@ func LoadConfig() (*Config, error) {
 			EnforceHours: getEnvAsBool("MARKET_ENFORCE_HOURS", true),
 		},
 
-		// Cash 52-week High strategy (Phase 1): topic + participating user IDs
-		Cash52WTopic:           getEnv("KAFKA_TOPIC_52W_BREAKOUT", "market.data.52w_breakouts"),
-		Cash52WUserIDs:         getEnvAsSlice("CASH52W_USER_IDS", []string{}),
-		PortfolioAllocTopic:    getEnv("KAFKA_TOPIC_PORTFOLIO_ALLOCATIONS", "portfolio.allocations"),
-		PortfolioRealtimeTopic: getEnv("KAFKA_TOPIC_PORTFOLIO_REALTIME", "portfolio.realtime.52w"),
+		PortfolioAllocTopic: getEnv("KAFKA_TOPIC_PORTFOLIO_ALLOCATIONS", "portfolio.allocations"),
 
 		// Jobbing Strategy Configuration
 		JobbingTopic:            getEnv("JOBBING_TOPIC", "market.data.live"),
@@ -339,29 +264,11 @@ func (c *Config) Validate() error {
 	if c.Kafka.ConsumerGroup == "" {
 		return fmt.Errorf("kafka consumer group cannot be empty")
 	}
-	if len(c.Elasticsearch.URLs) == 0 {
-		return fmt.Errorf("elasticsearch URLs cannot be empty")
-	}
-	if c.Elasticsearch.IndexName == "" {
-		return fmt.Errorf("elasticsearch index name cannot be empty")
-	}
-	if len(c.Redis.Addrs) == 0 {
-		return fmt.Errorf("redis addresses cannot be empty")
-	}
 	if c.RabbitMQ.URL == "" {
 		return fmt.Errorf("rabbitmq URL cannot be empty")
 	}
 	if c.GRPCClients.UserConfigService.Address == "" {
 		return fmt.Errorf("user config service address cannot be empty")
-	}
-	if c.GRPCClients.RiskManagement.Address == "" {
-		return fmt.Errorf("risk management service address cannot be empty")
-	}
-	if c.Performance.WorkerCount <= 0 {
-		return fmt.Errorf("worker count must be positive")
-	}
-	if c.Performance.MinMatchScore < 0 || c.Performance.MinMatchScore > 100 {
-		return fmt.Errorf("min match score must be between 0 and 100")
 	}
 
 	// Validate Jobbing configuration if enabled

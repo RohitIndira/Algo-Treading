@@ -41,10 +41,14 @@ func NewRouter(
 	api.HandleFunc("/strategies/{strategy_id}/activate", userConfigHandler.ActivateStrategy).Methods("POST")
 	api.HandleFunc("/strategies/{strategy_id}/deactivate", userConfigHandler.DeactivateStrategy).Methods("POST")
 
-	// High-level configuration endpoint for the managed Cash 52-week High
-	// strategy. Frontend calls this to enable/disable and set capital for
-	// 52W strategy without dealing with low-level fields.
-	api.HandleFunc("/strategies/cash52w/configure", userConfigHandler.ConfigureCash52WeekStrategy).Methods("POST")
+	// Jobbing Strategy Configuration Endpoints
+	api.HandleFunc("/strategies/jobbing/configure", userConfigHandler.ConfigureJobbingStrategy).Methods("POST")
+	api.HandleFunc("/strategies/jobbing", userConfigHandler.GetJobbingConfigs).Methods("GET")
+	api.HandleFunc("/strategies/jobbing/{token}", userConfigHandler.GetJobbingConfig).Methods("GET")
+	api.HandleFunc("/strategies/jobbing/{token}", userConfigHandler.UpdateJobbingConfig).Methods("PUT")
+	api.HandleFunc("/strategies/jobbing/{token}", userConfigHandler.DeleteJobbingConfig).Methods("DELETE")
+	api.HandleFunc("/strategies/jobbing/{token}/enable", userConfigHandler.EnableJobbingConfig).Methods("POST")
+	api.HandleFunc("/strategies/jobbing/{token}/disable", userConfigHandler.DisableJobbingConfig).Methods("POST")
 
 	// User strategies
 	api.HandleFunc("/users/{user_id}/strategies", userConfigHandler.ListUserStrategies).Methods("GET")
@@ -56,7 +60,7 @@ func NewRouter(
 	api.HandleFunc("/paper-pnl/{user_id}/positions", paperPnLHandler.GetOpenPositions).Methods("GET")
 	api.HandleFunc("/paper-pnl/{user_id}/history", paperPnLHandler.GetClosedPositions).Methods("GET")
 	api.HandleFunc("/paper-pnl/{user_id}/summary", paperPnLHandler.GetPortfolioSummary).Methods("GET")
-	
+
 	// Live Trading PnL API (for comparison)
 	api.HandleFunc("/live-pnl/{user_id}/summary", paperPnLHandler.GetLivePnL).Methods("GET")
 

@@ -26,7 +26,6 @@ type Config struct {
 	TopicSignals string
 	TopicExec    string
 	TopicPnL     string
-	TopicCash52WConfig string
 
 	RedisAddr     string
 	RedisPassword string
@@ -38,8 +37,8 @@ type Config struct {
 	TSLPct       float64
 	PollInterval time.Duration
 
-	EmitPnLSnapshots     bool
-	PnLSnapshotInterval  time.Duration
+	EmitPnLSnapshots    bool
+	PnLSnapshotInterval time.Duration
 }
 
 func main() {
@@ -77,27 +76,17 @@ func main() {
 	defer pub.Close()
 
 	sim := service.NewSimulator(service.Config{
-		StrategyID:           cfg.StrategyID,
-		TradingMode:          cfg.TradingMode,
-		SLPct:                cfg.SLPct,
-		TSLPct:               cfg.TSLPct,
-		PollInterval:         cfg.PollInterval,
-		EmitPnLSnapshots:     cfg.EmitPnLSnapshots,
-		PnLSnapshotInterval:  cfg.PnLSnapshotInterval,
+		StrategyID:          cfg.StrategyID,
+		TradingMode:         cfg.TradingMode,
+		SLPct:               cfg.SLPct,
+		TSLPct:              cfg.TSLPct,
+		PollInterval:        cfg.PollInterval,
+		EmitPnLSnapshots:    cfg.EmitPnLSnapshots,
+		PnLSnapshotInterval: cfg.PnLSnapshotInterval,
 	}, redisClient, pub, logger)
 
 	cons := consumer.NewTradeSignalConsumer(cfg.KafkaBrokers, cfg.TopicSignals, cfg.KafkaGroupID, sim, logger)
 	defer cons.Close()
-
-	// Also consume user-configs.cash52w so that when a user disables/deletes the
-	// managed strategy we force-close their open PAPER positions.
-	configCons, err := consumer.NewCash52WConfigConsumer(cfg.KafkaBrokers, cfg.TopicCash52WConfig, "", sim, logger)
-	if err != nil {
-		logger.Warn("Failed to initialize cash52w-config consumer", zap.Error(err))
-		configCons = nil
-	} else {
-		defer configCons.Close()
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -107,14 +96,6 @@ func main() {
 			logger.Error("trade-signals consumer error", zap.Error(err))
 		}
 	}()
-
-	if configCons != nil {
-		go func() {
-			if err := configCons.Start(ctx); err != nil {
-				logger.Error("cash52w-config consumer error", zap.Error(err))
-			}
-		}()
-	}
 
 	go sim.Start(ctx)
 
@@ -155,20 +136,19 @@ func loadConfig() (Config, error) {
 	emitPnL := strings.ToLower(strings.TrimSpace(getenv("EMIT_PNL_SNAPSHOTS", "false"))) == "true"
 
 	return Config{
-		KafkaBrokers: brokers,
-		KafkaGroupID: getenv("KAFKA_GROUP_ID", "paper-execution-service"),
-		TopicSignals: getenv("KAFKA_TOPIC_TRADE_SIGNALS", "trade-signals"),
-		TopicExec:    getenv("KAFKA_TOPIC_PAPER_EXECUTIONS", "paper-executions.52w"),
-		TopicPnL:     getenv("KAFKA_TOPIC_PAPER_PNL", "paper-pnl.52w"),
-		TopicCash52WConfig: getenv("KAFKA_TOPIC_CASH52W_CONFIG", "user-configs.cash52w"),
-		RedisAddr:    getenv("MARKET_REDIS_ADDR", "localhost:6379"),
-		RedisPassword: getenv("MARKET_REDIS_PASSWORD", ""),
-		RedisDB:      redisDB,
-		StrategyID:   getenv("STRATEGY_ID", "CASH_52W_HIGH"),
-		TradingMode:  strings.ToUpper(strings.TrimSpace(getenv("TRADING_MODE", "PAPER"))),
-		SLPct:        slPct,
-		TSLPct:       tslPct,
-		PollInterval: pi,
+		KafkaBrokers:        brokers,
+		KafkaGroupID:        getenv("KAFKA_GROUP_ID", "paper-execution-service"),
+		TopicSignals:        getenv("KAFKA_TOPIC_TRADE_SIGNALS", "trade-signals"),
+		TopicExec:           getenv("KAFKA_TOPIC_PAPER_EXECUTIONS", "paper-executions"),
+		TopicPnL:            getenv("KAFKA_TOPIC_PAPER_PNL", "paper-pnl"),
+		RedisAddr:           getenv("MARKET_REDIS_ADDR", "localhost:6379"),
+		RedisPassword:       getenv("MARKET_REDIS_PASSWORD", ""),
+		RedisDB:             redisDB,
+		StrategyID:          getenv("STRATEGY_ID", "JOBBING"),
+		TradingMode:         strings.ToUpper(strings.TrimSpace(getenv("TRADING_MODE", "PAPER"))),
+		SLPct:               slPct,
+		TSLPct:              tslPct,
+		PollInterval:        pi,
 		EmitPnLSnapshots:    emitPnL,
 		PnLSnapshotInterval: psi,
 	}, nil

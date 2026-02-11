@@ -2,8 +2,7 @@ package models
 
 import "time"
 
-// AllocationPosition represents a single position in the user's
-// 52-week portfolio (or other strategies in future).
+// AllocationPosition represents a single position in the user's portfolio.
 type AllocationPosition struct {
 	Token      string  `json:"token"`
 	Symbol     string  `json:"symbol"`

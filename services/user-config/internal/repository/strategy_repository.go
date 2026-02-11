@@ -573,241 +573,222 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 	return strategies, nil
 }
 
-// UpsertCash52WConfig inserts or updates the minimal 52W configuration for
-// a given user in the dedicated cash52w_configs table. This avoids relying
-// on generic strategies/trade_configs rows with dummy values.
-func (r *StrategyRepository) UpsertCash52WConfig(ctx context.Context, cfg *models.Cash52WConfig) error {
-	if cfg == nil || cfg.UserID == "" {
-		return fmt.Errorf("invalid Cash52WConfig: user_id is required")
+// ========================================================================
+// Jobbing Strategy Configuration Repository Methods
+// ========================================================================
+
+// UpsertJobbingConfig inserts or updates a jobbing configuration for a user and token
+func (r *StrategyRepository) UpsertJobbingConfig(ctx context.Context, cfg *models.JobbingConfig) error {
+	if cfg.UserID == "" || cfg.Token == "" {
+		return fmt.Errorf("invalid JobbingConfig: user_id and token are required")
+	}
+
+	// Set defaults if not provided
+	if cfg.StrategyID == "" {
+		cfg.StrategyID = "JOBBING"
+	}
+	if cfg.Exchange == "" {
+		cfg.Exchange = "NSE"
+	}
+	if cfg.TradingMode == "" {
+		cfg.TradingMode = "LIVE"
+	}
+	if cfg.ID == uuid.Nil {
+		cfg.ID = uuid.New()
 	}
 
 	query := `
-		INSERT INTO cash52w_configs (user_id, enabled, capital_per_stock, trading_mode, updated_at)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (user_id)
+		INSERT INTO jobbing_configs (
+			id, user_id, strategy_id, token, symbol, exchange,
+			lower_range, higher_range,
+			initial_buy_offset, distance_continue,
+			quantity_per_order, max_quantity,
+			trading_mode, enabled, enabled_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			$7, $8,
+			$9, $10,
+			$11, $12,
+			$13, $14, $15
+		)
+		ON CONFLICT (user_id, token)
 		DO UPDATE SET
-			enabled = EXCLUDED.enabled,
-			capital_per_stock = EXCLUDED.capital_per_stock,
+			symbol = EXCLUDED.symbol,
+			exchange = EXCLUDED.exchange,
+			lower_range = EXCLUDED.lower_range,
+			higher_range = EXCLUDED.higher_range,
+			initial_buy_offset = EXCLUDED.initial_buy_offset,
+			distance_continue = EXCLUDED.distance_continue,
+			quantity_per_order = EXCLUDED.quantity_per_order,
+			max_quantity = EXCLUDED.max_quantity,
 			trading_mode = EXCLUDED.trading_mode,
-			updated_at = EXCLUDED.updated_at
-	`
+			enabled = EXCLUDED.enabled,
+			updated_at = CURRENT_TIMESTAMP
+		RETURNING created_at, updated_at`
 
-	if cfg.UpdatedAt.IsZero() {
-		cfg.UpdatedAt = time.Now()
+	var enabledAt *time.Time
+	if cfg.Enabled {
+		now := time.Now()
+		enabledAt = &now
 	}
 
-	_, err := r.db.ExecContext(ctx, query,
-		cfg.UserID,
-		cfg.Enabled,
-		cfg.CapitalPerStock,
-		cfg.TradingMode,
-		cfg.UpdatedAt,
-	)
+	err := r.db.QueryRowContext(ctx, query,
+		cfg.ID, cfg.UserID, cfg.StrategyID, cfg.Token, cfg.Symbol, cfg.Exchange,
+		cfg.LowerRange, cfg.HigherRange,
+		cfg.InitialBuyOffset, cfg.DistanceContinue,
+		cfg.QuantityPerOrder, cfg.MaxQuantity,
+		cfg.TradingMode, cfg.Enabled, enabledAt,
+	).Scan(&cfg.CreatedAt, &cfg.UpdatedAt)
+
 	if err != nil {
-		return fmt.Errorf("failed to upsert cash52w_config: %w", err)
+		return fmt.Errorf("failed to upsert jobbing config: %w", err)
 	}
 
 	return nil
 }
 
-// DeleteCash52WConfig removes the 52W configuration for a user from the
-// dedicated table. Used when the managed 52W strategy is disabled.
-func (r *StrategyRepository) DeleteCash52WConfig(ctx context.Context, userID string) error {
-	if userID == "" {
-		return fmt.Errorf("user_id is required")
-	}
+// GetJobbingConfig fetches a single jobbing configuration by user_id and token
+func (r *StrategyRepository) GetJobbingConfig(ctx context.Context, userID, token string) (*models.JobbingConfig, error) {
+	query := `
+		SELECT 
+			id, user_id, strategy_id, token, symbol, exchange,
+			lower_range, higher_range,
+			initial_buy_offset, distance_continue,
+			quantity_per_order, max_quantity,
+			trading_mode, enabled, enabled_at, disabled_at,
+			created_at, updated_at
+		FROM jobbing_configs
+		WHERE user_id = $1 AND token = $2`
 
-	query := `DELETE FROM cash52w_configs WHERE user_id = $1`
-	_, err := r.db.ExecContext(ctx, query, userID)
+	var cfg models.JobbingConfig
+	err := r.db.GetContext(ctx, &cfg, query, userID, token)
+	if err == sql.ErrNoRows {
+		return nil, nil // Not found, but not an error
+	}
 	if err != nil {
-		return fmt.Errorf("failed to delete cash52w_config: %w", err)
-	}
-
-	return nil
-}
-
-// GetCash52WConfig fetches the 52W configuration for a user from the
-// dedicated table. Returns (nil, nil) if no row exists.
-func (r *StrategyRepository) GetCash52WConfig(ctx context.Context, userID string) (*models.Cash52WConfig, error) {
-	if userID == "" {
-		return nil, fmt.Errorf("user_id is required")
-	}
-
-	var cfg models.Cash52WConfig
-	query := `SELECT user_id, enabled, capital_per_stock, trading_mode, updated_at FROM cash52w_configs WHERE user_id = $1`
-	err := r.db.GetContext(ctx, &cfg, query, userID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to get cash52w_config: %w", err)
+		return nil, fmt.Errorf("failed to get jobbing config: %w", err)
 	}
 
 	return &cfg, nil
 }
 
-// ConfigureCash52WeekStrategy creates or updates the managed "Cash 52W High"
-// strategy for a user. It uses existing Create/Update/Activate/Deactivate
-// methods rather than custom SQL so that all related tables stay consistent.
-//
-// Behaviour:
-//   - If enabled=false: deactivate existing Cash 52W strategy (if any).
-//   - If enabled=true: create or update a Cash 52W strategy with the provided
-//     capital_per_stock and default SL/TP/risk settings.
-func (r *StrategyRepository) ConfigureCash52WeekStrategy(
-	ctx context.Context,
-	userID string,
-	capitalPerStock float64,
-	maxPositions int,
-	stopLossPct, takeProfitPct float64,
-	riskProfile string,
-	tradingMode string,
-	enabled bool,
-) (*models.Strategy, error) {
-	const strategyName = "Cash 52W High"
+// ListJobbingConfigs fetches all jobbing configurations for a user
+func (r *StrategyRepository) ListJobbingConfigs(ctx context.Context, userID string, enabledOnly bool) ([]models.JobbingConfig, error) {
+	query := `
+		SELECT 
+			id, user_id, strategy_id, token, symbol, exchange,
+			lower_range, higher_range,
+			initial_buy_offset, distance_continue,
+			quantity_per_order, max_quantity,
+			trading_mode, enabled, enabled_at, disabled_at,
+			created_at, updated_at
+		FROM jobbing_configs
+		WHERE user_id = $1`
 
-	// Fetch existing strategies for this user and look for our managed one.
-	strategies, _, err := r.ListByUserID(ctx, userID, false, 100, 0)
+	if enabledOnly {
+		query += " AND enabled = true"
+	}
+
+	query += " ORDER BY created_at DESC"
+
+	var configs []models.JobbingConfig
+	err := r.db.SelectContext(ctx, &configs, query, userID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list strategies for ConfigureCash52WeekStrategy: %w", err)
+		return nil, fmt.Errorf("failed to list jobbing configs: %w", err)
 	}
 
-	var existing *models.Strategy
-	for _, s := range strategies {
-		if s.StrategyName == strategyName {
-			existing = s
-			break
-		}
-	}
+	return configs, nil
+}
 
-	// If disabling, simply deactivate existing strategy if it exists.
-	if !enabled {
-		if existing == nil {
-			return nil, nil
-		}
-		if err := r.Deactivate(ctx, existing.StrategyID, userID); err != nil {
-			return nil, err
-		}
-		return r.GetByID(ctx, existing.StrategyID, userID)
-	}
+// DeleteJobbingConfig deletes a jobbing configuration for a user and token
+func (r *StrategyRepository) DeleteJobbingConfig(ctx context.Context, userID, token string) error {
+	query := `DELETE FROM jobbing_configs WHERE user_id = $1 AND token = $2`
 
-	// Common default values if the caller passed zero/invalid overrides.
-	if maxPositions <= 0 {
-		maxPositions = 25
-	}
-	if stopLossPct <= 0 {
-		stopLossPct = 10
-	}
-	if takeProfitPct <= 0 {
-		takeProfitPct = 20
-	}
-
-	// Helper to build TradeConfig and RiskLimits for this 52W strategy.
-	buildTradeAndRisk := func() (*models.TradeConfig, *models.RiskLimits) {
-		// TradeConfig: MARKET BUY, quantity is a dummy value required so that
-		// generic strategy validation/indexing works. The Cash 52W engine
-		// derives the actual per-trade quantity from CapitalPerStock/LTP at
-		// runtime (e.g. ₹20,000 / LTP). We keep Quantity=1 here to avoid
-		// confusing UIs while still satisfying validation rules.
-		mc := &models.TradeConfig{
-			OrderType:       "ORDER_TYPE_MARKET",
-			Quantity:        1,
-			MaxPositionSize: &capitalPerStock,
-			StopLossPct:     &stopLossPct,
-			TakeProfitPct:   &takeProfitPct,
-			Exchange:        "EXCHANGE_NSE",
-			OrderSide:       "ORDER_SIDE_BUY",
-			LimitPrice:      nil,
-			Validity:        "DAY",
-		}
-
-		// RiskLimits: reasonable defaults for this strategy; these are separate
-		// from generic platform limits enforced in the risk-management service.
-		maxDailyTrades := int32(50)
-		maxLossPerDay := 50000.0
-		maxPerTradeRisk := capitalPerStock * stopLossPct / 100.0
-		positionSizing := "POSITION_SIZING_FIXED"
-		maxPortfolioExposurePct := 0.0
-
-		rl := &models.RiskLimits{
-			MaxDailyTrades:          &maxDailyTrades,
-			MaxLossPerDay:           &maxLossPerDay,
-			PositionSizing:          positionSizing,
-			MaxPortfolioExposurePct: &maxPortfolioExposurePct,
-			MaxPerTradeRisk:         &maxPerTradeRisk,
-			EnableRiskChecks:        true,
-		}
-
-		return mc, rl
-	}
-
-	if existing != nil {
-		// Update existing strategy via generic Update method.
-		tradeCfg, riskLimits := buildTradeAndRisk()
-		upd := &models.UpdateStrategyRequest{
-			StrategyID:  existing.StrategyID,
-			UserID:      userID,
-			Version:     existing.Version,
-			TradeConfig: tradeCfg,
-			RiskLimits:  riskLimits,
-		}
-
-		updated, err := r.Update(ctx, upd)
-		if err != nil {
-			return nil, err
-		}
-
-		// Persist per-strategy trading_mode for this user/strategy.
-		if _, err := r.db.ExecContext(ctx,
-			`UPDATE strategies SET trading_mode = $1 WHERE strategy_id = $2`,
-			tradingMode, updated.StrategyID,
-		); err != nil {
-			return nil, fmt.Errorf("failed to update trading_mode for 52w strategy: %w", err)
-		}
-		updated.TradingMode = tradingMode
-
-		// Ensure it is active.
-		if err := r.Activate(ctx, updated.StrategyID, userID); err != nil {
-			return nil, err
-		}
-		return r.GetByID(ctx, updated.StrategyID, userID)
-	}
-
-	// No existing strategy: create a new one using the generic Create path.
-	tradeCfg, riskLimits := buildTradeAndRisk()
-		cond := &models.StrategyCondition{
-			ImpactScoreThreshold: 1, // minimal dummy condition; 52W engine does not use news filters
-			// Use a non-empty sentiments array so that rules-engine's
-			// Strategy.Validate() (which requires len(Sentiments) > 0)
-			// accepts this strategy and indexes it into Elasticsearch.
-			// The actual value ("ANY") is not used by the 52W engine.
-			Sentiments: []string{"ANY"},
-			Categories: nil,
-			StockCodes: nil,
-			Exchanges:  nil,
-		}
-	cr := &models.CreateStrategyRequest{
-		UserID:              userID,
-		StrategyName:        strategyName,
-		Description:         "Managed Cash 52-Week High breakout strategy",
-		Conditions:          cond,
-		TradeConfig:         tradeCfg,
-		RiskLimits:          riskLimits,
-		ActivateImmediately: true,
-	}
-
-	created, err := r.Create(ctx, cr)
+	result, err := r.db.ExecContext(ctx, query, userID, token)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to delete jobbing config: %w", err)
 	}
 
-	// Set trading_mode on the newly created strategy row.
-	if _, err := r.db.ExecContext(ctx,
-		`UPDATE strategies SET trading_mode = $1 WHERE strategy_id = $2`,
-		tradingMode, created.StrategyID,
-	); err != nil {
-		return nil, fmt.Errorf("failed to set trading_mode for new 52w strategy: %w", err)
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
-	created.TradingMode = tradingMode
-	return created, nil
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("jobbing config not found for user %s and token %s", userID, token)
+	}
+
+	return nil
+}
+
+// UpdateJobbingConfigStatus enables or disables a jobbing configuration
+func (r *StrategyRepository) UpdateJobbingConfigStatus(ctx context.Context, userID, token string, enabled bool) error {
+	query := `
+		UPDATE jobbing_configs
+		SET enabled = $1, updated_at = CURRENT_TIMESTAMP
+		WHERE user_id = $2 AND token = $3`
+
+	result, err := r.db.ExecContext(ctx, query, enabled, userID, token)
+	if err != nil {
+		return fmt.Errorf("failed to update jobbing config status: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("jobbing config not found for user %s and token %s", userID, token)
+	}
+
+	return nil
+}
+
+// ListAllEnabledJobbingConfigs fetches all enabled jobbing configurations across all users
+// This is useful for the rules-engine to discover active jobbing strategies
+func (r *StrategyRepository) ListAllEnabledJobbingConfigs(ctx context.Context) ([]models.JobbingConfig, error) {
+	query := `
+		SELECT 
+			id, user_id, strategy_id, token, symbol, exchange,
+			lower_range, higher_range,
+			initial_buy_offset, distance_continue,
+			quantity_per_order, max_quantity,
+			trading_mode, enabled, enabled_at, disabled_at,
+			created_at, updated_at
+		FROM jobbing_configs
+		WHERE enabled = true
+		ORDER BY user_id, token`
+
+	var configs []models.JobbingConfig
+	err := r.db.SelectContext(ctx, &configs, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list all enabled jobbing configs: %w", err)
+	}
+
+	return configs, nil
+}
+
+// GetJobbingConfigsByToken fetches all enabled jobbing configurations for a specific token
+// This allows the rules-engine to find all users interested in a particular token
+func (r *StrategyRepository) GetJobbingConfigsByToken(ctx context.Context, token string) ([]models.JobbingConfig, error) {
+	query := `
+		SELECT 
+			id, user_id, strategy_id, token, symbol, exchange,
+			lower_range, higher_range,
+			initial_buy_offset, distance_continue,
+			quantity_per_order, max_quantity,
+			trading_mode, enabled, enabled_at, disabled_at,
+			created_at, updated_at
+		FROM jobbing_configs
+		WHERE token = $1 AND enabled = true
+		ORDER BY user_id`
+
+	var configs []models.JobbingConfig
+	err := r.db.SelectContext(ctx, &configs, query, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get jobbing configs by token: %w", err)
+	}
+
+	return configs, nil
 }

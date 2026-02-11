@@ -1,117 +1,3 @@
-// package config
-
-// import (
-// 	"fmt"
-// 	"log"
-// 	"os"
-// 	"strings"
-// 	"time"
-
-// 	"github.com/joho/godotenv"
-// )
-
-// /*
-// 	func init() {
-// 		// Load .env file if it exists
-// 		if err := godotenv.Load(); err != nil {
-// 			log.Println("No .env file found, using environment variables")
-// 		}
-
-// }
-// */
-// func init() {
-// 	cwd, _ := os.Getwd()
-// 	log.Println("Current working directory:", cwd)
-
-// 	if err := godotenv.Load(); err != nil {
-// 		log.Println("--------->No .env file found, using environment variables")
-// 	}
-// }
-
-// // Config holds data-ingestion configuration
-// type Config struct {
-// 	MongoURI        string
-// 	MongoDatabase   string
-// 	MongoCollection string
-
-// 	KafkaBrokers []string
-// 	KafkaTopic   string
-
-// 	// Additional Kafka topic for 52-week high breakout events
-// 	KafkaTopic52Week string
-
-// 	// External Redis market data configuration (for 52-week highs, etc.).
-// 	MarketRedisAddr         string
-// 	MarketRedisPassword     string
-// 	MarketRedisDB           int
-// 	MarketRedisPollInterval time.Duration
-
-// 	WorkerCount int
-// 	MaxRetries  int
-// 	// timeouts
-// 	MongoConnectTimeout time.Duration
-// }
-
-// // Load loads configuration from environment variables with sensible defaults
-// func Load() *Config {
-// 	fmt.Println("In the Load function of config.go file in data-ingestion service")
-
-// 	brokers := os.Getenv("KAFKA_BROKERS")
-// 	if brokers == "" {
-// 		brokers = "localhost:9092"
-// 	}
-
-// 	topic := os.Getenv("KAFKA_TOPIC_NEWS")
-// 	if topic == "" {
-// 		// follow repo convention
-// 		topic = "market.data.news"
-// 	}
-
-// 	// Separate topic for 52-week breakout events so downstream
-// 	// consumers can subscribe independently of news.
-// 	breakoutTopic := os.Getenv("KAFKA_TOPIC_52W_BREAKOUT")
-// 	if breakoutTopic == "" {
-// 		breakoutTopic = "market.data.52w_breakouts"
-// 	}
-
-// 	db := os.Getenv("MONGO_DATABASE")
-// 	if db == "" {
-// 		db = "CAG_CHATBOT"
-// 	}
-
-// 	coll := os.Getenv("MONGO_NEWS_COLLECTION")
-// 	if coll == "" {
-// 		coll = "NewsImpactDashboard"
-// 	}
-
-// 	workerCount := 4
-// 	maxRetries := 3
-
-// 	return &Config{
-// 		MongoURI:                getEnv("MONGO_URI", "mongodb://localhost:27017"),
-// 		MongoDatabase:           db,
-// 		MongoCollection:         coll,
-// 		KafkaBrokers:            strings.Split(brokers, ","),
-// 		KafkaTopic:              topic,
-// 		KafkaTopic52Week:        breakoutTopic,
-// 		WorkerCount:             workerCount,
-// 		MaxRetries:              maxRetries,
-// 		MongoConnectTimeout:     10 * time.Second,
-// 		MarketRedisAddr:         getEnv("MARKET_REDIS_ADDR", "65.20.83.31:6379"),
-// 		MarketRedisPassword:     os.Getenv("MARKET_REDIS_PASSWORD"),
-// 		MarketRedisDB:           0,
-// 		MarketRedisPollInterval: 2 * time.Second,
-// 	}
-// }
-
-// func getEnv(key, def string) string {
-// 	v := os.Getenv(key)
-// 	if v == "" {
-// 		return def
-// 	}
-// 	return v
-// }
-
 package config
 
 import (
@@ -137,30 +23,19 @@ func init() {
 
 // Config holds data-ingestion configuration
 type Config struct {
-	// MongoDB configuration
-	MongoURI        string
-	MongoDatabase   string
-	MongoCollection string
 
 	// Kafka configuration
 	KafkaBrokers []string
 	KafkaTopic   string
 
-	// Additional Kafka topic for 52-week high breakout events
-	KafkaTopic52Week string
-
-	// Additional Kafka topic for live market data
-	KafkaTopicMarketData string
-
-	// External Redis market data configuration (for 52-week highs, etc.)
-	MarketRedisAddr         string
-	MarketRedisPassword     string
-	MarketRedisDB           int
-	MarketRedisPollInterval time.Duration
-
 	// B2C API Bridge configuration
 	B2CBridgePath string
 	B2CTokens     []string
+
+	// External Redis market data (52-week highs, etc.)
+	MarketRedisAddr     string
+	MarketRedisPassword string
+	MarketRedisDB       int
 
 	// StocksDBPath is the path to the SQLite database that contains
 	// the stock_subscriptions table. This is used to dynamically
@@ -178,7 +53,7 @@ type Config struct {
 
 // Load loads configuration from environment variables with sensible defaults
 func Load() *Config {
-	fmt.Println("In the Load function of config.go file in data-ingestion service")
+	fmt.Println("Loading data-ingestion configuration for Jobbing strategy")
 
 	// Kafka Brokers
 	brokers := os.Getenv("KAFKA_BROKERS")
@@ -186,33 +61,10 @@ func Load() *Config {
 		brokers = "localhost:9092"
 	}
 
-	// Kafka Topic for News
-	topicNews := os.Getenv("KAFKA_TOPIC_NEWS")
-	if topicNews == "" {
-		topicNews = "market.data.news"
-	}
-
-	// Kafka Topic for 52-week breakouts
-	breakoutTopic := os.Getenv("KAFKA_TOPIC_52W_BREAKOUT")
-	if breakoutTopic == "" {
-		breakoutTopic = "market.data.52w_breakouts"
-	}
-
-	// Kafka Topic for Live Market Data
-	topicMarketData := os.Getenv("KAFKA_TOPIC_MARKET_DATA")
-	if topicMarketData == "" {
-		topicMarketData = "market.data.live"
-	}
-
-	// MongoDB configuration
-	db := os.Getenv("MONGO_DATABASE")
-	if db == "" {
-		db = "CAG_CHATBOT"
-	}
-
-	coll := os.Getenv("MONGO_NEWS_COLLECTION")
-	if coll == "" {
-		coll = "NewsImpactDashboard"
+	// Kafka Topic for Live Market Data (Jobbing)
+	topicLive := os.Getenv("KAFKA_TOPIC_LIVE")
+	if topicLive == "" {
+		topicLive = "market.data.live"
 	}
 
 	// B2C Bridge Path
@@ -234,14 +86,6 @@ func Load() *Config {
 		}
 	}
 
-	// Redis DB (parse as int)
-	redisDB := 0
-	if redisDBStr := os.Getenv("MARKET_REDIS_DB"); redisDBStr != "" {
-		if parsed, err := strconv.Atoi(redisDBStr); err == nil {
-			redisDB = parsed
-		}
-	}
-
 	// Worker configuration
 	workerCount := 4
 	if wc := os.Getenv("WORKER_COUNT"); wc != "" {
@@ -257,24 +101,20 @@ func Load() *Config {
 		}
 	}
 
+	// Redis configuration for external market data store
+	redisAddr := getEnv("MARKET_REDIS_ADDR", "localhost:6379")
+	redisPassword := os.Getenv("MARKET_REDIS_PASSWORD")
+	redisDB := 0
+	if v := os.Getenv("MARKET_REDIS_DB"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+			redisDB = parsed
+		}
+	}
+
 	return &Config{
-		// MongoDB
-		MongoURI:            getEnv("MONGO_URI", "mongodb://localhost:27017"),
-		MongoDatabase:       db,
-		MongoCollection:     coll,
-		MongoConnectTimeout: 10 * time.Second,
-
 		// Kafka
-		KafkaBrokers:         strings.Split(brokers, ","),
-		KafkaTopic:           topicNews,
-		KafkaTopic52Week:     breakoutTopic,
-		KafkaTopicMarketData: topicMarketData,
-
-		// Redis
-		MarketRedisAddr:         getEnv("MARKET_REDIS_ADDR", "65.20.83.31:6379"),
-		MarketRedisPassword:     os.Getenv("MARKET_REDIS_PASSWORD"),
-		MarketRedisDB:           redisDB,
-		MarketRedisPollInterval: 2 * time.Second,
+		KafkaBrokers: strings.Split(brokers, ","),
+		KafkaTopic:   topicLive,
 
 		// B2C Bridge
 		B2CBridgePath: bridgePath,
@@ -287,6 +127,11 @@ func Load() *Config {
 		// Workers
 		WorkerCount: workerCount,
 		MaxRetries:  maxRetries,
+
+		// Redis
+		MarketRedisAddr:     redisAddr,
+		MarketRedisPassword: redisPassword,
+		MarketRedisDB:       redisDB,
 	}
 }
 

@@ -97,27 +97,6 @@ type UpdateStrategyRequest struct {
 	Version      int32              `json:"version" validate:"required"`
 }
 
-// ConfigureCash52WeekStrategyRequest is a high-level request used by the
-// service layer to configure the managed Cash 52-week High strategy for a
-// user. Most fields are optional and will take backend defaults; the
-// frontend typically only provides UserID, Enabled and CapitalPerStock.
-type ConfigureCash52WeekStrategyRequest struct {
-	UserID          string  `json:"user_id"`
-	Enabled         bool    `json:"enabled"`
-	CapitalPerStock float64 `json:"capital_per_stock"`
-
-	// Optional overrides (not required from frontend today)
-	MaxPositions  int     `json:"-"`
-	StopLossPct   float64 `json:"-"`
-	TakeProfitPct float64 `json:"-"`
-	RiskProfile   string  `json:"-"`
-
-	// Optional per-user trading mode for this managed strategy. When set to
-	// "PAPER", rules-engine should simulate trades for this user even if
-	// global TRADING_MODE is LIVE. When empty or invalid, defaults to LIVE.
-	TradingMode string `json:"trading_mode"`
-}
-
 // Value implements the driver.Valuer interface for JSON marshaling
 func (s StrategyCondition) Value() (driver.Value, error) {
 	return json.Marshal(s)

@@ -26,14 +26,10 @@ type StrategyService struct {
 	jobbingWriter       *kafka.Writer
 	jobbingTopic        string
 	jobbingKafkaEnabled bool
-	// Optional dedicated Kafka stream for managed Cash 52W strategy configs
-	cash52wWriter       *kafka.Writer
-	cash52wTopic        string
-	cash52wKafkaEnabled bool
 }
 
 // NewStrategyService creates a new strategy service
-func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string, jobbingWriter *kafka.Writer, jobbingTopic string, cash52wWriter *kafka.Writer, cash52wTopic string) *StrategyService {
+func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string, jobbingWriter *kafka.Writer, jobbingTopic string) *StrategyService {
 	return &StrategyService{
 		repo:                repo,
 		kafkaWriter:         kafkaWriter,
@@ -42,144 +38,10 @@ func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.
 		jobbingWriter:       jobbingWriter,
 		jobbingTopic:        jobbingTopic,
 		jobbingKafkaEnabled: jobbingWriter != nil && jobbingTopic != "",
-		cash52wWriter:       cash52wWriter,
-		cash52wTopic:        cash52wTopic,
-		cash52wKafkaEnabled: cash52wWriter != nil && cash52wTopic != "",
 	}
 }
 
-// Cash52WeekConfigEvent is a minimal, 52W-specific configuration event
-// published to a dedicated Kafka topic so downstream services (such as
-// rules-engine) don't have to parse the full generic Strategy payload.
-//
-// EventType indicates what happened to the managed 52W strategy for
-// this user: CREATE, UPDATE, or DELETE.
-type Cash52WeekConfigEvent struct {
-	EventType       string  `json:"event_type"`
-	UserID          string  `json:"user_id"`
-	Enabled         bool    `json:"enabled"`
-	CapitalPerStock float64 `json:"capital_per_stock"`
-	TradingMode     string  `json:"trading_mode"` // "LIVE" or "PAPER"
-	Timestamp       int64   `json:"timestamp"`
-}
-
-// ConfigureCash52WeekStrategy creates or updates the managed Cash 52-week High
-// strategy for a user based on a small set of high-level parameters. This
-// hides most of the low-level fields from the frontend.
-func (s *StrategyService) ConfigureCash52WeekStrategy(ctx context.Context, req *models.ConfigureCash52WeekStrategyRequest) (*models.Strategy, error) {
-	if req.UserID == "" {
-		return nil, fmt.Errorf("user_id is required")
-	}
-
-	// Backend defaults if caller doesn't specify overrides
-	capitalPerStock := req.CapitalPerStock
-	if capitalPerStock <= 0 {
-		capitalPerStock = 20000 // ₹20,000 per stock
-	}
-	maxPositions := req.MaxPositions
-	if maxPositions <= 0 {
-		maxPositions = 25
-	}
-	stopLossPct := req.StopLossPct
-	if stopLossPct <= 0 {
-		stopLossPct = 10
-	}
-	takeProfitPct := req.TakeProfitPct
-	if takeProfitPct <= 0 {
-		takeProfitPct = 20
-	}
-
-	// Normalise trading mode; default to LIVE when empty/invalid. This will
-	// be stored on the strategy row and propagated via Kafka to rules-engine.
-	tradingMode := strings.ToUpper(strings.TrimSpace(req.TradingMode))
-	if tradingMode != "PAPER" {
-		tradingMode = "LIVE"
-	}
-
-	// Determine prior state from the dedicated 52W config table so we no
-	// longer depend on generic strategies/trade_configs rows.
-	existingCfg, err := s.repo.GetCash52WConfig(ctx, req.UserID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load existing cash 52w config: %w", err)
-	}
-	hadExisting := existingCfg != nil
-
-	// Persist the minimal 52W configuration into the dedicated
-	// cash52w_configs table so that production systems don't rely on
-	// generic strategies/trade_configs with dummy values.
-	cfg := &models.Cash52WConfig{
-		UserID:          req.UserID,
-		Enabled:         req.Enabled,
-		CapitalPerStock: capitalPerStock,
-		TradingMode:     tradingMode,
-	}
-
-	// Determine event type and update DB accordingly.
-	var eventType string
-	if !req.Enabled {
-		if hadExisting {
-			// Disable existing config.
-			if err := s.repo.DeleteCash52WConfig(ctx, req.UserID); err != nil {
-				return nil, fmt.Errorf("failed to delete cash52w_config: %w", err)
-			}
-			eventType = "DELETE"
-		} else {
-			// No prior config and disabling -> nothing to do.
-			return nil, nil
-		}
-	} else {
-		// Enable or update config.
-		if err := s.repo.UpsertCash52WConfig(ctx, cfg); err != nil {
-			return nil, fmt.Errorf("failed to upsert cash52w_config: %w", err)
-		}
-		if !hadExisting {
-			eventType = "CREATE"
-		} else {
-			eventType = "UPDATE"
-		}
-	}
-
-	// Build a synthetic Strategy object purely for response and for
-	// publishing the compact 52W config event. We no longer create or
-	// update generic strategy/trade_config/risk_limits rows for 52W.
-	now := time.Now()
-	// Use a deterministic UUID so that the managed strategy appears as the
-	// same strategy_id across configure + list responses.
-	stableID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("CASH_52W_HIGH:"+req.UserID))
-	strategy := &models.Strategy{
-		StrategyID:   stableID,
-		UserID:       req.UserID,
-		StrategyName: "Cash 52W High",
-		Description:  "Managed Cash 52-Week High breakout strategy",
-		Active:       req.Enabled,
-		TradingMode:  tradingMode,
-		Version:      1,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-	// Expose capital_per_stock via TradeConfig.MaxPositionSize so that
-	// gateways that still map response from Strategy can derive the
-	// configured capital.
-	strategy.TradeConfig = &models.TradeConfig{
-		MaxPositionSize: &capitalPerStock,
-	}
-
-	// IMPORTANT: For the managed 52W strategy we no longer publish the
-	// generic Strategy payload to the main user-configs topic. Instead we
-	// only emit the compact Cash52WeekConfigEvent to the dedicated
-	// Cash52WConfigTopic so that downstream services don't have to
-	// interpret a full generic strategy object for this managed case.
-	if eventType != "" {
-		if err := s.publishCash52WeekConfig(ctx, strategy, capitalPerStock, tradingMode, req.Enabled, eventType); err != nil {
-			fmt.Printf("Warning: failed to publish Cash52W config to dedicated topic: %v\n", err)
-		}
-	}
-
-	return strategy, nil
-}
-
-// ListUserStrategies lists all strategies for a user, including the managed
-// Cash52W strategy (stored in cash52w_configs) as a synthetic Strategy item.
+// ListUserStrategies lists all strategies for a user.
 func (s *StrategyService) ListUserStrategies(ctx context.Context, userID string, activeOnly bool, limit, offset int) ([]*models.Strategy, int, error) {
 	// Set default pagination
 	if limit <= 0 || limit > 100 {
@@ -189,82 +51,9 @@ func (s *StrategyService) ListUserStrategies(ctx context.Context, userID string,
 		offset = 0
 	}
 
-	// Managed Cash52W config (if enabled) counts as one virtual strategy.
-	managedCfg, err := s.repo.GetCash52WConfig(ctx, userID)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to load cash52w_config: %w", err)
-	}
-	includeManaged := managedCfg != nil && managedCfg.Enabled
-
-	// If activeOnly is true, include managed only when enabled=true.
-	if activeOnly && !includeManaged {
-		includeManaged = false
-	}
-
-	// Adjust pagination for the underlying DB strategies so the virtual managed
-	// strategy appears as the first item.
-	repoLimit := limit
-	repoOffset := offset
-	if includeManaged {
-		if offset == 0 {
-			// page starts with the managed item
-			repoLimit = limit - 1
-			if repoLimit < 0 {
-				repoLimit = 0
-			}
-			repoOffset = 0
-		} else {
-			// skip the managed item
-			repoLimit = limit
-			repoOffset = offset - 1
-		}
-	}
-
-	strategies, total, err := s.repo.ListByUserID(ctx, userID, activeOnly, repoLimit, repoOffset)
+	strategies, total, err := s.repo.ListByUserID(ctx, userID, activeOnly, limit, offset)
 	if err != nil {
 		return nil, 0, err
-	}
-	if includeManaged {
-		total += 1
-	}
-
-	// Prepend managed strategy if it falls into this page.
-	if includeManaged && offset == 0 {
-		stableID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("CASH_52W_HIGH:"+userID))
-		now := time.Now()
-		cap := managedCfg.CapitalPerStock
-		mode := strings.ToUpper(strings.TrimSpace(managedCfg.TradingMode))
-		if mode != "PAPER" {
-			mode = "LIVE"
-		}
-		// Populate a meaningful TradeConfig for the managed 52W strategy so that
-		// the frontend doesn't see UNSPECIFIED enum values.
-		//
-		// Note: these are the *defaults* for the managed strategy.
-		// Quantity is dynamic (capital_per_stock / LTP) in rules-engine, so we
-		// expose quantity=0 here.
-		m := &models.Strategy{
-			StrategyID:   stableID,
-			UserID:       userID,
-			StrategyName: "Cash 52W High",
-			Description:  "Managed Cash 52-Week High breakout strategy",
-			Active:       true,
-			TradingMode:  mode,
-			Version:      1,
-			CreatedAt:    now,
-			UpdatedAt:    managedCfg.UpdatedAt,
-			TradeConfig: &models.TradeConfig{
-				OrderType:       "ORDER_TYPE_MARKET",
-				OrderSide:       "ORDER_SIDE_BUY",
-				Exchange:        "EXCHANGE_NSE",
-				Validity:        "DAY",
-				Quantity:        0,
-				MaxPositionSize: &cap,
-				StopLossPct:     floatPtr(10),
-				TakeProfitPct:   floatPtr(20),
-			},
-		}
-		strategies = append([]*models.Strategy{m}, strategies...)
 	}
 
 	return strategies, total, nil
@@ -281,18 +70,6 @@ type ConfigEvent struct {
 func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, strategy *models.Strategy) error {
 	if !s.kafkaEnabled {
 		return nil // Kafka is disabled, skip publishing
-	}
-
-	// Skip generic publishing for the managed Cash 52W strategy. All
-	// configuration changes for this strategy are now emitted via the
-	// dedicated Cash52WeekConfigEvent on the user-configs.cash52w topic,
-	// so there is no need to send a full generic Strategy payload (with
-	// trade_config, risk_limits, etc.) to the main user-configs stream.
-	if strategy != nil {
-		name := strings.ToUpper(strings.TrimSpace(strategy.StrategyName))
-		if name == "CASH 52W HIGH" {
-			return nil
-		}
 	}
 
 	event := ConfigEvent{
@@ -338,45 +115,6 @@ func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, 
 		if err := s.jobbingWriter.WriteMessages(ctx, msg); err != nil {
 			fmt.Printf("Warning: failed to publish jobbing config to kafka: %v\n", err)
 		}
-	}
-
-	return nil
-}
-
-// publishCash52WeekConfig publishes a compact 52W-only configuration event
-// to the dedicated Cash52W Kafka topic, if configured.
-func (s *StrategyService) publishCash52WeekConfig(ctx context.Context, strategy *models.Strategy, capitalPerStock float64, tradingMode string, enabled bool, eventType string) error {
-	if !s.cash52wKafkaEnabled || s.cash52wWriter == nil || strategy == nil {
-		return nil
-	}
-
-	event := Cash52WeekConfigEvent{
-		EventType:       eventType,
-		UserID:          strategy.UserID,
-		Enabled:         enabled,
-		CapitalPerStock: capitalPerStock,
-		TradingMode:     tradingMode,
-		Timestamp:       strategy.UpdatedAt.Unix(),
-	}
-
-	eventBytes, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("failed to marshal Cash52W config event: %w", err)
-	}
-
-	// Log a concise 52W-specific line so we can easily trace all managed
-	// 52W configuration changes without looking at the generic strategy
-	// events.
-	fmt.Printf("[USER-CONFIG][52W] event_type=%s user_id=%s enabled=%v capital=%.2f mode=%s\\n",
-		event.EventType, event.UserID, event.Enabled, event.CapitalPerStock, event.TradingMode)
-
-	msg := kafka.Message{
-		Key:   []byte(strategy.UserID),
-		Value: eventBytes,
-	}
-
-	if err := s.cash52wWriter.WriteMessages(ctx, msg); err != nil {
-		return fmt.Errorf("failed to publish Cash52W config event to kafka: %w", err)
 	}
 
 	return nil
@@ -587,6 +325,281 @@ func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyReques
 		if req.TradeConfig.Quantity <= 0 {
 			return fmt.Errorf("quantity must be greater than 0")
 		}
+	}
+
+	return nil
+}
+
+// ========================================================================
+// Jobbing Strategy Configuration Service Methods
+// ========================================================================
+
+// ConfigureJobbingStrategy creates or updates jobbing configurations for multiple tokens for a user
+func (s *StrategyService) ConfigureJobbingStrategy(ctx context.Context, req *models.ConfigureJobbingStrategyRequest) (*models.ConfigureJobbingStrategyResponse, error) {
+	if req.UserID == "" {
+		return nil, fmt.Errorf("user_id is required")
+	}
+
+	if len(req.Configs) == 0 {
+		return nil, fmt.Errorf("at least one token configuration is required")
+	}
+
+	var savedConfigs []models.JobbingConfig
+	var errors []string
+
+	for i, tokenCfg := range req.Configs {
+		// Apply defaults
+		tokenCfg.ApplyDefaults()
+
+		// Validate
+		if err := tokenCfg.Validate(); err != nil {
+			errors = append(errors, fmt.Sprintf("config[%d]: %v", i, err))
+			continue
+		}
+
+		// Build JobbingConfig model
+		cfg := &models.JobbingConfig{
+			ID:               uuid.New(),
+			UserID:           req.UserID,
+			StrategyID:       "JOBBING",
+			Token:            tokenCfg.Token,
+			Symbol:           tokenCfg.Symbol,
+			Exchange:         tokenCfg.Exchange,
+			LowerRange:       tokenCfg.LowerRange,
+			HigherRange:      tokenCfg.HigherRange,
+			InitialBuyOffset: *tokenCfg.InitialBuyOffset,
+			DistanceContinue: *tokenCfg.DistanceContinue,
+			QuantityPerOrder: *tokenCfg.QuantityPerOrder,
+			MaxQuantity:      *tokenCfg.MaxQuantity,
+			TradingMode:      *tokenCfg.TradingMode,
+			Enabled:          *tokenCfg.Enabled,
+		}
+
+		// Save to database
+		if err := s.repo.UpsertJobbingConfig(ctx, cfg); err != nil {
+			errors = append(errors, fmt.Sprintf("token %s: failed to save: %v", tokenCfg.Token, err))
+			continue
+		}
+
+		savedConfigs = append(savedConfigs, *cfg)
+
+		// Publish Kafka event for this config
+		eventType := "CREATED"
+		existingCfg, _ := s.repo.GetJobbingConfig(ctx, req.UserID, tokenCfg.Token)
+		if existingCfg != nil {
+			eventType = "UPDATED"
+		}
+
+		if err := s.publishJobbingConfigEvent(ctx, eventType, *cfg); err != nil {
+			// Log error but don't fail the request
+			errors = append(errors, fmt.Sprintf("token %s: kafka publish warning: %v", tokenCfg.Token, err))
+		}
+	}
+
+	if len(savedConfigs) == 0 && len(errors) > 0 {
+		return nil, fmt.Errorf("failed to save any configurations: %s", strings.Join(errors, "; "))
+	}
+
+	response := &models.ConfigureJobbingStrategyResponse{
+		Success:    true,
+		Message:    "Jobbing strategy configured successfully",
+		UserID:     req.UserID,
+		Configs:    savedConfigs,
+		TotalCount: len(savedConfigs),
+	}
+
+	if len(errors) > 0 {
+		response.Message = fmt.Sprintf("Configured %d tokens with warnings: %s", len(savedConfigs), strings.Join(errors, "; "))
+	}
+
+	return response, nil
+}
+
+// GetJobbingConfigs retrieves all jobbing configurations for a user
+func (s *StrategyService) GetJobbingConfigs(ctx context.Context, userID string, enabledOnly bool) ([]models.JobbingConfig, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("user_id is required")
+	}
+
+	return s.repo.ListJobbingConfigs(ctx, userID, enabledOnly)
+}
+
+// GetJobbingConfig retrieves a single jobbing configuration for a user and token
+func (s *StrategyService) GetJobbingConfig(ctx context.Context, userID, token string) (*models.JobbingConfig, error) {
+	if userID == "" || token == "" {
+		return nil, fmt.Errorf("user_id and token are required")
+	}
+
+	return s.repo.GetJobbingConfig(ctx, userID, token)
+}
+
+// UpdateJobbingConfig updates an existing jobbing configuration
+func (s *StrategyService) UpdateJobbingConfig(ctx context.Context, req *models.UpdateJobbingConfigRequest) (*models.JobbingConfig, error) {
+	if req.UserID == "" || req.Token == "" {
+		return nil, fmt.Errorf("user_id and token are required")
+	}
+
+	// Fetch existing config
+	existing, err := s.repo.GetJobbingConfig(ctx, req.UserID, req.Token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch existing config: %w", err)
+	}
+	if existing == nil {
+		return nil, fmt.Errorf("jobbing config not found for user %s and token %s", req.UserID, req.Token)
+	}
+
+	// Apply updates
+	if req.LowerRange != nil {
+		existing.LowerRange = *req.LowerRange
+	}
+	if req.HigherRange != nil {
+		existing.HigherRange = *req.HigherRange
+	}
+	if req.InitialBuyOffset != nil {
+		existing.InitialBuyOffset = *req.InitialBuyOffset
+	}
+	if req.DistanceContinue != nil {
+		existing.DistanceContinue = *req.DistanceContinue
+	}
+	if req.QuantityPerOrder != nil {
+		existing.QuantityPerOrder = *req.QuantityPerOrder
+	}
+	if req.MaxQuantity != nil {
+		existing.MaxQuantity = *req.MaxQuantity
+	}
+	if req.TradingMode != nil {
+		existing.TradingMode = *req.TradingMode
+	}
+	if req.Enabled != nil {
+		existing.Enabled = *req.Enabled
+	}
+
+	// Validate updated config
+	if existing.LowerRange <= 0 {
+		return nil, fmt.Errorf("lower_range must be greater than 0")
+	}
+	if existing.HigherRange <= existing.LowerRange {
+		return nil, fmt.Errorf("higher_range must be greater than lower_range")
+	}
+	if existing.MaxQuantity < existing.QuantityPerOrder {
+		return nil, fmt.Errorf("max_quantity must be >= quantity_per_order")
+	}
+
+	// Save to database
+	if err := s.repo.UpsertJobbingConfig(ctx, existing); err != nil {
+		return nil, fmt.Errorf("failed to update jobbing config: %w", err)
+	}
+
+	// Publish Kafka event
+	if err := s.publishJobbingConfigEvent(ctx, "UPDATED", *existing); err != nil {
+		// Log warning but don't fail the request
+		fmt.Printf("Warning: failed to publish jobbing config update event: %v\n", err)
+	}
+
+	return existing, nil
+}
+
+// DeleteJobbingConfig deletes a jobbing configuration for a user and token
+func (s *StrategyService) DeleteJobbingConfig(ctx context.Context, userID, token string) error {
+	if userID == "" || token == "" {
+		return fmt.Errorf("user_id and token are required")
+	}
+
+	// Fetch existing config for Kafka event
+	existing, err := s.repo.GetJobbingConfig(ctx, userID, token)
+	if err != nil {
+		return fmt.Errorf("failed to fetch config before delete: %w", err)
+	}
+	if existing == nil {
+		return fmt.Errorf("jobbing config not found for user %s and token %s", userID, token)
+	}
+
+	// Delete from database
+	if err := s.repo.DeleteJobbingConfig(ctx, userID, token); err != nil {
+		return fmt.Errorf("failed to delete jobbing config: %w", err)
+	}
+
+	// Publish Kafka event
+	if err := s.publishJobbingConfigEvent(ctx, "DELETED", *existing); err != nil {
+		// Log warning but don't fail the request
+		fmt.Printf("Warning: failed to publish jobbing config delete event: %v\n", err)
+	}
+
+	return nil
+}
+
+// EnableJobbingConfig enables a jobbing configuration
+func (s *StrategyService) EnableJobbingConfig(ctx context.Context, userID, token string) error {
+	if err := s.repo.UpdateJobbingConfigStatus(ctx, userID, token, true); err != nil {
+		return err
+	}
+
+	// Fetch updated config for Kafka event
+	cfg, err := s.repo.GetJobbingConfig(ctx, userID, token)
+	if err != nil {
+		return fmt.Errorf("failed to fetch config after enable: %w", err)
+	}
+
+	// Publish Kafka event
+	if err := s.publishJobbingConfigEvent(ctx, "ENABLED", *cfg); err != nil {
+		fmt.Printf("Warning: failed to publish jobbing config enable event: %v\n", err)
+	}
+
+	return nil
+}
+
+// DisableJobbingConfig disables a jobbing configuration
+func (s *StrategyService) DisableJobbingConfig(ctx context.Context, userID, token string) error {
+	if err := s.repo.UpdateJobbingConfigStatus(ctx, userID, token, false); err != nil {
+		return err
+	}
+
+	// Fetch updated config for Kafka event
+	cfg, err := s.repo.GetJobbingConfig(ctx, userID, token)
+	if err != nil {
+		return fmt.Errorf("failed to fetch config after disable: %w", err)
+	}
+
+	// Publish Kafka event
+	if err := s.publishJobbingConfigEvent(ctx, "DISABLED", *cfg); err != nil {
+		fmt.Printf("Warning: failed to publish jobbing config disable event: %v\n", err)
+	}
+
+	return nil
+}
+
+// publishJobbingConfigEvent publishes a jobbing configuration event to Kafka
+func (s *StrategyService) publishJobbingConfigEvent(ctx context.Context, eventType string, cfg models.JobbingConfig) error {
+	if !s.jobbingKafkaEnabled {
+		return nil // Kafka disabled, skip
+	}
+
+	event := models.JobbingConfigEvent{
+		EventType: eventType,
+		Timestamp: time.Now(),
+		UserID:    cfg.UserID, // Top-level for consumer compatibility
+		Token:     cfg.Token,  // Top-level for consumer compatibility
+		Config:    cfg,
+	}
+
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal jobbing config event: %w", err)
+	}
+
+	msg := kafka.Message{
+		Key:   []byte(cfg.UserID + ":" + cfg.Token),
+		Value: eventJSON,
+		Headers: []kafka.Header{
+			{Key: "event_type", Value: []byte(eventType)},
+			{Key: "user_id", Value: []byte(cfg.UserID)},
+			{Key: "token", Value: []byte(cfg.Token)},
+			{Key: "timestamp", Value: []byte(time.Now().Format(time.RFC3339))},
+		},
+	}
+
+	if err := s.jobbingWriter.WriteMessages(ctx, msg); err != nil {
+		return fmt.Errorf("failed to write jobbing config event to Kafka: %w", err)
 	}
 
 	return nil

@@ -14,7 +14,6 @@ import (
 	"github.com/RohitIndira/Algo-Treading/pkg/database/postgres"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/config"
-	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
@@ -58,8 +57,6 @@ func main() {
 	// Initialize Kafka writers
 	var kafkaWriter *kafka.Writer
 	var jobbingWriter *kafka.Writer
-	var cash52wWriter *kafka.Writer
-	var cash52wConsumer *consumer.Cash52WConfigConsumer
 	if cfg.Kafka.Enabled {
 		kafkaWriter = kafka.NewWriter(kafka.WriterConfig{
 			Brokers:      cfg.Kafka.Brokers,
@@ -87,39 +84,12 @@ func main() {
 			defer jobbingWriter.Close()
 			lgr.Info("Kafka writer initialized for jobbing configs", zap.String("topic", cfg.Kafka.JobbingTopic))
 		}
-
-		// Optional dedicated writer for Cash 52W strategy configs so
-		// downstream services can subscribe to a focused stream.
-		if cfg.Kafka.Cash52WConfigTopic != "" && cfg.Kafka.Cash52WConfigTopic != cfg.Kafka.Topic {
-			cash52wWriter = kafka.NewWriter(kafka.WriterConfig{
-				Brokers:      cfg.Kafka.Brokers,
-				Topic:        cfg.Kafka.Cash52WConfigTopic,
-				Balancer:     &kafka.LeastBytes{},
-				RequiredAcks: int(kafka.RequireOne),
-				Async:        false,
-				BatchSize:    1,
-				BatchTimeout: 10 * time.Millisecond,
-			})
-			defer cash52wWriter.Close()
-			lgr.Info("Kafka writer initialized for Cash52W configs", zap.String("topic", cfg.Kafka.Cash52WConfigTopic))
-
-			// Also start a consumer to keep the cash52w_configs table in sync
-			// from the user-configs.cash52w topic. This ensures that 52W
-			// configuration can be rebuilt purely from Kafka events if needed.
-			cash52wConsumer = consumer.NewCash52WConfigConsumer(
-				cfg.Kafka.Brokers,
-				cfg.Kafka.Cash52WConfigTopic,
-				"user-config-cash52w-sync-v1",
-				repo,
-				lgr.Logger,
-			)
-		}
 	} else {
 		lgr.Warn("Kafka is disabled")
 	}
 
 	// Initialize service
-	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic, jobbingWriter, cfg.Kafka.JobbingTopic, cash52wWriter, cfg.Kafka.Cash52WConfigTopic)
+	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic, jobbingWriter, cfg.Kafka.JobbingTopic)
 
 	// Initialize gRPC server
 	grpcServer := grpc.NewServer(
@@ -150,15 +120,6 @@ func main() {
 
 	lgr.Info("User Config Service started successfully")
 
-	// Start Cash52W config consumer if configured
-	if cash52wConsumer != nil {
-		go func() {
-			if err := cash52wConsumer.Start(context.Background()); err != nil {
-				lgr.Error("Cash52W config consumer exited with error", zap.Error(err))
-			}
-		}()
-	}
-
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -183,13 +144,6 @@ func main() {
 		grpcServer.Stop()
 	case <-stopped:
 		lgr.Info("Server stopped gracefully")
-	}
-
-	// Close Kafka consumer
-	if cash52wConsumer != nil {
-		if err := cash52wConsumer.Close(); err != nil {
-			lgr.Warn("Failed to close Cash52W config consumer", zap.Error(err))
-		}
 	}
 
 	lgr.Info("User Config Service shut down complete")

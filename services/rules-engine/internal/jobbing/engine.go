@@ -26,9 +26,16 @@ type Config struct {
 
 	// Initial offset from LTP for first BUY order (e.g., 0.01)
 	InitialBuyOffset float64
+	// Initial offset from LTP for first SELL order (e.g., 0.01)
+	InitialSellOffset float64
 
 	// Distance between consecutive orders (e.g., 0.01)
 	DistanceContinue float64
+
+	// Profit and loss thresholds
+	ProfitTargetPct float64
+	StopLossPct     float64
+	EnableSellLogic bool
 
 	// Quantity per order
 	QuantityPerOrder int32
@@ -44,23 +51,75 @@ type Config struct {
 // strategy. These can be loaded dynamically from the user-config service
 // instead of (or in addition to) global defaults provided via env/config.
 type UserTokenConfig struct {
-	LowerRange       float64
-	HigherRange      float64
-	InitialBuyOffset float64
-	DistanceContinue float64
-	QuantityPerOrder int32
-	MaxQuantity      int32
+	LowerRange        float64
+	HigherRange       float64
+	InitialBuyOffset  float64 // Offset below LTP for BUY orders
+	InitialSellOffset float64 // Offset above LTP for SELL orders
+	DistanceContinue  float64 // Distance between consecutive orders
+	QuantityPerOrder  int32
+	MaxQuantity       int32   // Max total position size
+	ProfitTargetPct   float64 // Profit % to trigger SELL orders (default 0.5%)
+	StopLossPct       float64 // Stop loss % to trigger SELL orders (default 2.0%)
+	EnableSellLogic   bool    // Enable automatic SELL order generation
+
+	// Phase B: Advanced Risk Management
+	MaxDailyLoss        float64 // Max daily loss limit (default 5000.0)
+	MaxPositionValue    float64 // Max position value limit (default 100000.0)
+	TrailingStopPct     float64 // Trailing stop percentage (default 1.0%)
+	TimeBasedExitMins   int32   // Time-based exit in minutes (default 60)
+	EnableTrailingStop  bool    // Enable trailing stop functionality
+	EnableTimeBasedExit bool    // Enable time-based position exit
+
+	// Risk Multipliers
+	VolatilityMultiplier float64 // Adjust quantities based on volatility (default 1.0)
+	SpreadMultiplier     float64 // Adjust based on bid-ask spread (default 1.0)
 }
 
 // userTokenState tracks the state for a specific user-token combination
 type userTokenState struct {
-	Token            string
-	Symbol           string
-	Exchange         string
-	TotalQuantityBuy int32    // Total quantity bought so far
-	LastOrderPrice   float64  // Last price at which order was placed
-	ActiveOrders     []string // List of active order IDs
-	LastUpdated      time.Time
+	Token    string
+	Symbol   string
+	Exchange string
+	// Position tracking
+	TotalQuantityBuy   int32   // Total quantity bought (pending + filled)
+	TotalQuantitySell  int32   // Total quantity sold
+	FilledQuantityBuy  int32   // Actually filled buy quantity
+	FilledQuantitySell int32   // Actually filled sell quantity
+	NetPosition        int32   // FilledQuantityBuy - FilledQuantitySell
+	AverageEntryPrice  float64 // Average entry price of held positions
+	// Order state
+	LastBuyOrderPrice  float64  // Last price at which BUY order was placed
+	LastSellOrderPrice float64  // Last price at which SELL order was placed
+	ActiveBuyOrders    []string // List of active BUY order IDs
+	ActiveSellOrders   []string // List of active SELL order IDs
+	LastUpdated        time.Time
+
+	// Phase B: Real-time P&L and Performance Tracking
+	RealizedPnL   float64 // Cumulative realized profit/loss
+	UnrealizedPnL float64 // Current unrealized P&L based on LTP
+	TotalPnL      float64 // Total P&L (realized + unrealized)
+	CurrentLTP    float64 // Current Last Traded Price
+	HighWaterMark float64 // Highest profit achieved today
+	MaxDrawdown   float64 // Maximum drawdown from high water mark
+	DailyPnL      float64 // Daily P&L (resets daily)
+
+	// Performance Metrics
+	TotalTrades   int32   // Total number of completed trades
+	WinningTrades int32   // Number of profitable trades
+	LosingTrades  int32   // Number of loss-making trades
+	WinRate       float64 // Winning percentage
+	AvgWin        float64 // Average winning trade amount
+	AvgLoss       float64 // Average losing trade amount
+	ProfitFactor  float64 // Gross profit / Gross loss
+
+	// Risk Management State
+	PositionStartTime time.Time // When position was first opened
+	TrailingStopPrice float64   // Current trailing stop price
+	DailyLossLimit    bool      // Whether daily loss limit is breached
+	RiskLevel         string    // Current risk level: LOW, MEDIUM, HIGH
+
+	// Intraday Session Reset
+	LastResetDate time.Time // Last date when daily metrics were reset
 }
 
 // userState tracks all token states for a user
@@ -101,6 +160,9 @@ func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publish
 	if cfg.InitialBuyOffset <= 0 {
 		cfg.InitialBuyOffset = 0.01
 	}
+	if cfg.InitialSellOffset <= 0 {
+		cfg.InitialSellOffset = 0.01
+	}
 	if cfg.DistanceContinue <= 0 {
 		cfg.DistanceContinue = 0.01
 	}
@@ -110,6 +172,16 @@ func NewEngine(cfg Config, riskClient *risk.Client, rabbitPub *publisher.Publish
 	if cfg.MaxQuantity <= 0 {
 		cfg.MaxQuantity = 10
 	}
+	if cfg.ProfitTargetPct <= 0 {
+		cfg.ProfitTargetPct = 0.5 // 0.5% profit target
+	}
+	if cfg.StopLossPct <= 0 {
+		cfg.StopLossPct = 2.0 // 2% stop loss
+	}
+	cfg.EnableSellLogic = true // Enable SELL logic by default
+
+	// Phase B: Set advanced risk management defaults
+	logger.Info("Initializing Phase B enhancements - advanced risk management and performance tracking")
 
 	// normalize user IDs
 	users := make([]string, 0, len(cfg.UserIDs))
@@ -183,12 +255,41 @@ func (e *Engine) getTokenState(userID, token string) *userTokenState {
 
 	tokenSt, ok := st.TokenStates[token]
 	if !ok {
+		now := time.Now()
 		tokenSt = &userTokenState{
-			Token:            token,
-			TotalQuantityBuy: 0,
-			LastOrderPrice:   0,
-			ActiveOrders:     make([]string, 0),
-			LastUpdated:      time.Now(),
+			Token:              token,
+			TotalQuantityBuy:   0,
+			TotalQuantitySell:  0,
+			FilledQuantityBuy:  0,
+			FilledQuantitySell: 0,
+			NetPosition:        0,
+			AverageEntryPrice:  0,
+			LastBuyOrderPrice:  0,
+			LastSellOrderPrice: 0,
+			ActiveBuyOrders:    make([]string, 0),
+			ActiveSellOrders:   make([]string, 0),
+			LastUpdated:        now,
+
+			// Phase B: Initialize P&L and performance tracking
+			RealizedPnL:       0,
+			UnrealizedPnL:     0,
+			TotalPnL:          0,
+			CurrentLTP:        0,
+			HighWaterMark:     0,
+			MaxDrawdown:       0,
+			DailyPnL:          0,
+			TotalTrades:       0,
+			WinningTrades:     0,
+			LosingTrades:      0,
+			WinRate:           0,
+			AvgWin:            0,
+			AvgLoss:           0,
+			ProfitFactor:      0,
+			PositionStartTime: now,
+			TrailingStopPrice: 0,
+			DailyLossLimit:    false,
+			RiskLevel:         "LOW",
+			LastResetDate:     now,
 		}
 		st.TokenStates[token] = tokenSt
 	}
@@ -199,6 +300,9 @@ func (e *Engine) getTokenState(userID, token string) *userTokenState {
 // and a set of tokens. This is typically called from the rules-engine main
 // process after loading strategies from the user-config service.
 func (e *Engine) SetJobbingConfig(userID string, tokens []string, cfg UserTokenConfig) {
+	// Phase B: Set defaults for advanced parameters
+	e.SetUserTokenConfigDefaults(&cfg)
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -228,6 +332,211 @@ func (e *Engine) SetJobbingConfig(userID string, tokens []string, cfg UserTokenC
 			e.tokenUsers[t] = usersForToken
 		}
 		usersForToken[userID] = struct{}{}
+	}
+}
+
+// RemoveJobbingConfig removes jobbing configuration for a specific user and token
+func (e *Engine) RemoveJobbingConfig(userID string, token string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Remove from userConfigs
+	if userCfg, ok := e.userConfigs[userID]; ok {
+		delete(userCfg, token)
+		// If user has no more configs, remove the user entry
+		if len(userCfg) == 0 {
+			delete(e.userConfigs, userID)
+		}
+	}
+
+	// Remove from tokenUsers reverse index
+	if usersForToken, ok := e.tokenUsers[token]; ok {
+		delete(usersForToken, userID)
+		// If no more users for this token, remove the token entry
+		if len(usersForToken) == 0 {
+			delete(e.tokenUsers, token)
+		}
+	}
+
+	e.logger.Info("Removed jobbing config",
+		zap.String("user_id", userID),
+		zap.String("token", token))
+}
+
+// Phase B: Advanced Risk Management and Performance Tracking Methods
+
+// SetUserTokenConfigDefaults ensures Phase B parameters have proper defaults
+func (e *Engine) SetUserTokenConfigDefaults(cfg *UserTokenConfig) {
+	if cfg.MaxDailyLoss <= 0 {
+		cfg.MaxDailyLoss = 5000.0 // Default 5000 daily loss limit
+	}
+	if cfg.MaxPositionValue <= 0 {
+		cfg.MaxPositionValue = 100000.0 // Default 100k position value limit
+	}
+	if cfg.TrailingStopPct <= 0 {
+		cfg.TrailingStopPct = 1.0 // Default 1% trailing stop
+	}
+	if cfg.TimeBasedExitMins <= 0 {
+		cfg.TimeBasedExitMins = 60 // Default 60 minutes
+	}
+	if cfg.VolatilityMultiplier <= 0 {
+		cfg.VolatilityMultiplier = 1.0 // Default no adjustment
+	}
+	if cfg.SpreadMultiplier <= 0 {
+		cfg.SpreadMultiplier = 1.0 // Default no adjustment
+	}
+}
+
+// UpdatePnL calculates and updates real-time P&L for a position
+func (e *Engine) UpdatePnL(tokenState *userTokenState, currentLTP float64) {
+	if tokenState == nil {
+		return
+	}
+
+	tokenState.CurrentLTP = currentLTP
+
+	// Calculate unrealized P&L
+	if tokenState.NetPosition != 0 && tokenState.AverageEntryPrice > 0 {
+		positionValue := float64(tokenState.NetPosition) * tokenState.AverageEntryPrice
+		currentValue := float64(tokenState.NetPosition) * currentLTP
+		tokenState.UnrealizedPnL = currentValue - positionValue
+	} else {
+		tokenState.UnrealizedPnL = 0
+	}
+
+	// Calculate total P&L
+	tokenState.TotalPnL = tokenState.RealizedPnL + tokenState.UnrealizedPnL
+
+	// Update high water mark and drawdown
+	if tokenState.TotalPnL > tokenState.HighWaterMark {
+		tokenState.HighWaterMark = tokenState.TotalPnL
+	}
+
+	currentDrawdown := tokenState.HighWaterMark - tokenState.TotalPnL
+	if currentDrawdown > tokenState.MaxDrawdown {
+		tokenState.MaxDrawdown = currentDrawdown
+	}
+
+	// Update daily P&L (assuming daily reset happens elsewhere)
+	tokenState.DailyPnL = tokenState.TotalPnL
+}
+
+// CheckRiskLimits validates if trading should continue based on risk parameters
+func (e *Engine) CheckRiskLimits(userID, token string, cfg UserTokenConfig, tokenState *userTokenState) (bool, string) {
+	// Check daily loss limit
+	if tokenState.DailyPnL <= -cfg.MaxDailyLoss {
+		tokenState.DailyLossLimit = true
+		tokenState.RiskLevel = "HIGH"
+		return false, "Daily loss limit exceeded"
+	}
+
+	// Check position value limit
+	if tokenState.NetPosition > 0 && tokenState.CurrentLTP > 0 {
+		positionValue := float64(tokenState.NetPosition) * tokenState.CurrentLTP
+		if positionValue > cfg.MaxPositionValue {
+			tokenState.RiskLevel = "HIGH"
+			return false, "Position value limit exceeded"
+		}
+	}
+
+	// Check maximum quantity limit
+	if tokenState.NetPosition >= cfg.MaxQuantity {
+		return false, "Maximum quantity limit reached"
+	}
+
+	// Update risk level based on current metrics
+	if tokenState.MaxDrawdown > cfg.MaxDailyLoss*0.5 {
+		tokenState.RiskLevel = "MEDIUM"
+	} else if tokenState.MaxDrawdown > cfg.MaxDailyLoss*0.2 {
+		tokenState.RiskLevel = "LOW"
+	}
+
+	return true, ""
+}
+
+// CheckTrailingStop checks if trailing stop should trigger a sell
+func (e *Engine) CheckTrailingStop(cfg UserTokenConfig, tokenState *userTokenState) bool {
+	if !cfg.EnableTrailingStop || tokenState.NetPosition <= 0 || tokenState.CurrentLTP <= 0 {
+		return false
+	}
+
+	// Initialize trailing stop price on first profitable position
+	if tokenState.TrailingStopPrice == 0 && tokenState.UnrealizedPnL > 0 {
+		trailingOffset := tokenState.CurrentLTP * (cfg.TrailingStopPct / 100.0)
+		tokenState.TrailingStopPrice = tokenState.CurrentLTP - trailingOffset
+	}
+
+	// Update trailing stop price if current price moved favorably
+	if tokenState.TrailingStopPrice > 0 {
+		trailingOffset := tokenState.CurrentLTP * (cfg.TrailingStopPct / 100.0)
+		newTrailingPrice := tokenState.CurrentLTP - trailingOffset
+		if newTrailingPrice > tokenState.TrailingStopPrice {
+			tokenState.TrailingStopPrice = newTrailingPrice
+		}
+
+		// Check if current price hit trailing stop
+		if tokenState.CurrentLTP <= tokenState.TrailingStopPrice {
+			return true
+		}
+	}
+
+	return false
+}
+
+// CheckTimeBasedExit checks if position should be closed based on time limits
+func (e *Engine) CheckTimeBasedExit(cfg UserTokenConfig, tokenState *userTokenState) bool {
+	if !cfg.EnableTimeBasedExit || tokenState.NetPosition <= 0 {
+		return false
+	}
+
+	// Check if position has been held longer than time limit
+	currentTime := time.Now()
+	positionDuration := currentTime.Sub(tokenState.PositionStartTime)
+	timeLimit := time.Duration(cfg.TimeBasedExitMins) * time.Minute
+
+	return positionDuration > timeLimit
+}
+
+// UpdatePerformanceMetrics updates trading performance statistics
+func (e *Engine) UpdatePerformanceMetrics(tokenState *userTokenState, tradeResult float64) {
+	tokenState.TotalTrades++
+
+	if tradeResult > 0 {
+		tokenState.WinningTrades++
+		tokenState.AvgWin = ((tokenState.AvgWin * float64(tokenState.WinningTrades-1)) + tradeResult) / float64(tokenState.WinningTrades)
+	} else if tradeResult < 0 {
+		tokenState.LosingTrades++
+		tokenState.AvgLoss = ((tokenState.AvgLoss * float64(tokenState.LosingTrades-1)) + tradeResult) / float64(tokenState.LosingTrades)
+	}
+
+	// Update win rate
+	if tokenState.TotalTrades > 0 {
+		tokenState.WinRate = (float64(tokenState.WinningTrades) / float64(tokenState.TotalTrades)) * 100
+	}
+
+	// Update profit factor
+	grossProfit := tokenState.AvgWin * float64(tokenState.WinningTrades)
+	grossLoss := math.Abs(tokenState.AvgLoss * float64(tokenState.LosingTrades))
+	if grossLoss > 0 {
+		tokenState.ProfitFactor = grossProfit / grossLoss
+	}
+}
+
+// ResetDailyMetrics resets daily P&L and performance metrics for new trading session
+func (e *Engine) ResetDailyMetrics(tokenState *userTokenState) {
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	lastResetDate := tokenState.LastResetDate.Format("2006-01-02")
+
+	// Only reset if it's a new trading day
+	if today != lastResetDate {
+		tokenState.DailyPnL = 0
+		tokenState.HighWaterMark = 0
+		tokenState.MaxDrawdown = 0
+		tokenState.DailyLossLimit = false
+		tokenState.TrailingStopPrice = 0
+		tokenState.RiskLevel = "LOW"
+		tokenState.LastResetDate = now
 	}
 }
 
@@ -327,12 +636,16 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 	// Start from global defaults and override with per-user+token config if
 	// available. This allows a mix of env-based and dynamic configurations.
 	cfg := UserTokenConfig{
-		LowerRange:       e.cfg.LowerRange,
-		HigherRange:      e.cfg.HigherRange,
-		InitialBuyOffset: e.cfg.InitialBuyOffset,
-		DistanceContinue: e.cfg.DistanceContinue,
-		QuantityPerOrder: e.cfg.QuantityPerOrder,
-		MaxQuantity:      e.cfg.MaxQuantity,
+		LowerRange:        e.cfg.LowerRange,
+		HigherRange:       e.cfg.HigherRange,
+		InitialBuyOffset:  e.cfg.InitialBuyOffset,
+		InitialSellOffset: e.cfg.InitialSellOffset,
+		DistanceContinue:  e.cfg.DistanceContinue,
+		QuantityPerOrder:  e.cfg.QuantityPerOrder,
+		MaxQuantity:       e.cfg.MaxQuantity,
+		ProfitTargetPct:   e.cfg.ProfitTargetPct,
+		StopLossPct:       e.cfg.StopLossPct,
+		EnableSellLogic:   e.cfg.EnableSellLogic,
 	}
 	if userCfg, ok := e.getConfig(userID, token); ok {
 		if userCfg.LowerRange > 0 {
@@ -344,6 +657,9 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		if userCfg.InitialBuyOffset > 0 {
 			cfg.InitialBuyOffset = userCfg.InitialBuyOffset
 		}
+		if userCfg.InitialSellOffset > 0 {
+			cfg.InitialSellOffset = userCfg.InitialSellOffset
+		}
 		if userCfg.DistanceContinue > 0 {
 			cfg.DistanceContinue = userCfg.DistanceContinue
 		}
@@ -353,6 +669,35 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		if userCfg.MaxQuantity > 0 {
 			cfg.MaxQuantity = userCfg.MaxQuantity
 		}
+		if userCfg.ProfitTargetPct > 0 {
+			cfg.ProfitTargetPct = userCfg.ProfitTargetPct
+		}
+		if userCfg.StopLossPct > 0 {
+			cfg.StopLossPct = userCfg.StopLossPct
+		}
+		cfg.EnableSellLogic = userCfg.EnableSellLogic
+
+		// Phase B: Load advanced risk management parameters from user config
+		if userCfg.MaxDailyLoss > 0 {
+			cfg.MaxDailyLoss = userCfg.MaxDailyLoss
+		}
+		if userCfg.MaxPositionValue > 0 {
+			cfg.MaxPositionValue = userCfg.MaxPositionValue
+		}
+		if userCfg.TrailingStopPct > 0 {
+			cfg.TrailingStopPct = userCfg.TrailingStopPct
+		}
+		if userCfg.TimeBasedExitMins > 0 {
+			cfg.TimeBasedExitMins = userCfg.TimeBasedExitMins
+		}
+		if userCfg.VolatilityMultiplier > 0 {
+			cfg.VolatilityMultiplier = userCfg.VolatilityMultiplier
+		}
+		if userCfg.SpreadMultiplier > 0 {
+			cfg.SpreadMultiplier = userCfg.SpreadMultiplier
+		}
+		cfg.EnableTrailingStop = userCfg.EnableTrailingStop
+		cfg.EnableTimeBasedExit = userCfg.EnableTimeBasedExit
 	}
 
 	// Check if LTP is within configured range
@@ -368,6 +713,82 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 
 	tokenState := e.getTokenState(userID, token)
 
+	// Phase B: Advanced Position Management and Risk Control
+
+	// Apply Phase B defaults to config if needed
+	e.SetUserTokenConfigDefaults(&cfg)
+
+	// Reset daily metrics if new trading day
+	e.ResetDailyMetrics(tokenState)
+
+	// Update real-time P&L with current market price
+	e.UpdatePnL(tokenState, ltp)
+
+	// Check risk limits before any trading decisions
+	canTrade, riskReason := e.CheckRiskLimits(userID, token, cfg, tokenState)
+	if !canTrade {
+		e.logger.Warn("Trading blocked due to risk limits",
+			zap.String("user_id", userID),
+			zap.String("symbol", ev.StockData.Symbol),
+			zap.String("reason", riskReason),
+			zap.String("risk_level", tokenState.RiskLevel),
+			zap.Float64("daily_pnl", tokenState.DailyPnL))
+		return nil
+	}
+
+	// Phase B: Check exit conditions first (trailing stop, time-based exit)
+	shouldExitPosition := false
+	exitReason := ""
+
+	if tokenState.NetPosition > 0 {
+		// Check trailing stop
+		if e.CheckTrailingStop(cfg, tokenState) {
+			shouldExitPosition = true
+			exitReason = "trailing_stop"
+		}
+
+		// Check time-based exit
+		if !shouldExitPosition && e.CheckTimeBasedExit(cfg, tokenState) {
+			shouldExitPosition = true
+			exitReason = "time_limit"
+		}
+
+		// If exit condition triggered, place SELL order for entire position
+		if shouldExitPosition {
+			exitQty := tokenState.NetPosition
+			sellPrice := ltp // Market price exit
+
+			e.logger.Info("Exiting position due to Phase B exit condition",
+				zap.String("user_id", userID),
+				zap.String("symbol", ev.StockData.Symbol),
+				zap.String("exit_reason", exitReason),
+				zap.Int32("exit_qty", exitQty),
+				zap.Float64("exit_price", sellPrice),
+				zap.Float64("unrealized_pnl", tokenState.UnrealizedPnL))
+
+			return e.placeOrder(ctx, userID, token, ev, cfg, sellPrice, exitQty, "SELL", tokenState)
+		}
+	}
+
+	// Handle BUY logic - place buy orders when conditions are right
+	if err := e.handleBuyLogic(ctx, userID, token, ev, cfg, tokenState); err != nil {
+		e.logger.Error("Failed to handle BUY logic", zap.Error(err))
+	}
+
+	// Handle SELL logic - exit positions when profitable or stop loss
+	if cfg.EnableSellLogic {
+		if err := e.handleSellLogic(ctx, userID, token, ev, cfg, tokenState); err != nil {
+			e.logger.Error("Failed to handle SELL logic", zap.Error(err))
+		}
+	}
+
+	return nil
+}
+
+// handleBuyLogic implements the original BUY order placement logic
+func (e *Engine) handleBuyLogic(ctx context.Context, userID, token string, ev *models.JobbingMarketDepthEvent, cfg UserTokenConfig, tokenState *userTokenState) error {
+	ltp := ev.MarketData.LastTradedPrice
+
 	// Check if max quantity reached
 	if tokenState.TotalQuantityBuy >= cfg.MaxQuantity {
 		e.logger.Debug("Max quantity reached for token",
@@ -378,14 +799,14 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		return nil
 	}
 
-	// Calculate order price
+	// Calculate BUY order price
 	var orderPrice float64
-	if tokenState.LastOrderPrice == 0 {
+	if tokenState.LastBuyOrderPrice == 0 {
 		// First order: LTP - InitialBuyOffset
 		orderPrice = ltp - cfg.InitialBuyOffset
 	} else {
-		// Subsequent orders: LastOrderPrice - DistanceContinue
-		orderPrice = tokenState.LastOrderPrice - cfg.DistanceContinue
+		// Subsequent orders: LastBuyOrderPrice - DistanceContinue
+		orderPrice = tokenState.LastBuyOrderPrice - cfg.DistanceContinue
 	}
 
 	// Round to 2 decimal places
@@ -393,7 +814,7 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 
 	// Ensure order price is within range
 	if orderPrice < cfg.LowerRange {
-		e.logger.Debug("Calculated order price below lower range",
+		e.logger.Debug("Calculated BUY order price below lower range",
 			zap.String("user_id", userID),
 			zap.String("symbol", ev.StockData.Symbol),
 			zap.Float64("order_price", orderPrice),
@@ -403,7 +824,7 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 
 	// Check market depth conditions for better execution
 	if !e.validateMarketDepth(ev, orderPrice) {
-		e.logger.Debug("Market depth conditions not favorable",
+		e.logger.Debug("Market depth conditions not favorable for BUY",
 			zap.String("user_id", userID),
 			zap.String("symbol", ev.StockData.Symbol),
 			zap.Float64("spread_pct", ev.MarketData.DepthMetrics.SpreadPct))
@@ -417,6 +838,85 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		qty = remainingQty
 	}
 
+	return e.placeOrder(ctx, userID, token, ev, cfg, orderPrice, qty, "BUY", tokenState)
+}
+
+// handleSellLogic implements SELL order placement for position exit
+func (e *Engine) handleSellLogic(ctx context.Context, userID, token string, ev *models.JobbingMarketDepthEvent, cfg UserTokenConfig, tokenState *userTokenState) error {
+	ltp := ev.MarketData.LastTradedPrice
+
+	// Check if we have any positions to sell
+	if tokenState.NetPosition <= 0 {
+		return nil // No positions to sell
+	}
+
+	// Calculate if we should exit based on profit or loss
+	avgEntryPrice := tokenState.AverageEntryPrice
+	currentPnLPct := ((ltp - avgEntryPrice) / avgEntryPrice) * 100
+
+	shouldExit := false
+	exitReason := ""
+
+	// Check profit target
+	if currentPnLPct >= cfg.ProfitTargetPct {
+		shouldExit = true
+		exitReason = "PROFIT_TARGET"
+	}
+
+	// Check stop loss
+	if currentPnLPct <= -cfg.StopLossPct {
+		shouldExit = true
+		exitReason = "STOP_LOSS"
+	}
+
+	if !shouldExit {
+		return nil // No exit condition met
+	}
+
+	// Calculate SELL order price
+	var orderPrice float64
+	if tokenState.LastSellOrderPrice == 0 {
+		// First SELL order: LTP + InitialSellOffset
+		orderPrice = ltp + cfg.InitialSellOffset
+	} else {
+		// Subsequent SELL orders: LastSellOrderPrice + DistanceContinue
+		orderPrice = tokenState.LastSellOrderPrice + cfg.DistanceContinue
+	}
+
+	// Round to 2 decimal places
+	orderPrice = math.Round(orderPrice*100) / 100
+
+	// Ensure SELL order price is within range
+	if orderPrice > cfg.HigherRange {
+		e.logger.Debug("Calculated SELL order price above higher range",
+			zap.String("user_id", userID),
+			zap.String("symbol", ev.StockData.Symbol),
+			zap.Float64("order_price", orderPrice),
+			zap.Float64("higher_range", cfg.HigherRange))
+		return nil
+	}
+
+	// Calculate quantity to sell (sell all position)
+	qty := tokenState.NetPosition
+	if qty > cfg.QuantityPerOrder {
+		qty = cfg.QuantityPerOrder // Limit to max quantity per order
+	}
+
+	e.logger.Info("Placing SELL order for position exit",
+		zap.String("user_id", userID),
+		zap.String("symbol", ev.StockData.Symbol),
+		zap.String("exit_reason", exitReason),
+		zap.Float64("pnl_pct", currentPnLPct),
+		zap.Float64("avg_entry_price", avgEntryPrice),
+		zap.Float64("current_ltp", ltp),
+		zap.Int32("position_size", tokenState.NetPosition),
+		zap.Int32("sell_qty", qty))
+
+	return e.placeOrder(ctx, userID, token, ev, cfg, orderPrice, qty, "SELL", tokenState)
+}
+
+// placeOrder handles the common order placement logic for both BUY and SELL
+func (e *Engine) placeOrder(ctx context.Context, userID, token string, ev *models.JobbingMarketDepthEvent, cfg UserTokenConfig, orderPrice float64, qty int32, side string, tokenState *userTokenState) error {
 	// Build order request
 	orderReq := &models.OrderRequest{
 		OrderID:      uuid.New().String(),
@@ -428,12 +928,10 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		Token:        int64(ev.StockData.StockCode),
 		Symbol:       ev.StockData.Symbol,
 		Exchange:     strings.ToUpper(ev.StockData.Exchange),
-		OrderType:    "LIMIT", // Jobbing uses LIMIT orders
-		OrderSide:    "BUY",
+		OrderType:    "LIMIT",
+		OrderSide:    side,
 		Quantity:     qty,
 		Price:        orderPrice,
-		// Jobbing strategy typically doesn't use SL/TP per order
-		// as it relies on rapid entry/exit based on price movements
 		StopLoss:     0,
 		TakeProfit:   0,
 		Timestamp:    time.Now(),
@@ -450,10 +948,10 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 			UserID:       userID,
 			StrategyName: "Jobbing Strategy",
 			RiskLimits: models.RiskLimits{
-				MaxDailyTrades:  100, // Jobbing requires many trades
+				MaxDailyTrades:  100,
 				MaxLossPerDay:   10000,
-				MaxPositionSize: float64(e.cfg.MaxQuantity) * orderPrice,
-				MaxPerTradeRisk: float64(qty) * orderPrice * 0.02, // 2% per trade
+				MaxPositionSize: float64(cfg.MaxQuantity) * orderPrice,
+				MaxPerTradeRisk: float64(qty) * orderPrice * 0.02,
 				PositionSizing:  "FIXED",
 			},
 		}
@@ -463,8 +961,9 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 			e.logger.Error("Risk check failed for jobbing order",
 				zap.Error(err),
 				zap.String("user_id", userID),
-				zap.String("symbol", ev.StockData.Symbol))
-			return nil
+				zap.String("symbol", ev.StockData.Symbol),
+				zap.String("side", side))
+			return err
 		}
 		orderReq.RiskApproved = riskResp.Approved
 		orderReq.RiskScore = riskResp.RiskScore
@@ -472,6 +971,7 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 			e.logger.Warn("Jobbing order rejected by risk",
 				zap.String("user_id", userID),
 				zap.String("symbol", ev.StockData.Symbol),
+				zap.String("side", side),
 				zap.Float64("risk_score", riskResp.RiskScore))
 			return nil
 		}
@@ -485,7 +985,8 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		if err := e.kafkaPub.PublishTradeSignal(ctx, orderReq); err != nil {
 			e.logger.Error("Failed to publish jobbing trade signal to Kafka",
 				zap.Error(err),
-				zap.String("order_id", orderReq.OrderID))
+				zap.String("order_id", orderReq.OrderID),
+				zap.String("side", side))
 		}
 	}
 
@@ -494,11 +995,17 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		return fmt.Errorf("failed to publish jobbing order: %w", err)
 	}
 
-	// Update token state
+	// Update token state based on order side
 	e.mu.Lock()
-	tokenState.TotalQuantityBuy += qty
-	tokenState.LastOrderPrice = orderPrice
-	tokenState.ActiveOrders = append(tokenState.ActiveOrders, orderReq.OrderID)
+	if side == "BUY" {
+		tokenState.TotalQuantityBuy += qty
+		tokenState.LastBuyOrderPrice = orderPrice
+		tokenState.ActiveBuyOrders = append(tokenState.ActiveBuyOrders, orderReq.OrderID)
+	} else if side == "SELL" {
+		tokenState.TotalQuantitySell += qty
+		tokenState.LastSellOrderPrice = orderPrice
+		tokenState.ActiveSellOrders = append(tokenState.ActiveSellOrders, orderReq.OrderID)
+	}
 	tokenState.LastUpdated = time.Now()
 	tokenState.Symbol = ev.StockData.Symbol
 	tokenState.Exchange = orderReq.Exchange
@@ -511,11 +1018,13 @@ func (e *Engine) handleForUser(ctx context.Context, userID string, ev *models.Jo
 		zap.String("user_id", userID),
 		zap.String("symbol", ev.StockData.Symbol),
 		zap.String("exchange", orderReq.Exchange),
+		zap.String("side", side),
 		zap.Int32("quantity", qty),
 		zap.Float64("order_price", orderPrice),
-		zap.Float64("ltp", ltp),
+		zap.Float64("ltp", ev.MarketData.LastTradedPrice),
 		zap.Int32("total_qty_bought", tokenState.TotalQuantityBuy),
-		zap.Int32("max_qty", e.cfg.MaxQuantity))
+		zap.Int32("total_qty_sold", tokenState.TotalQuantitySell),
+		zap.Int32("net_position", tokenState.NetPosition))
 
 	return nil
 }
@@ -538,6 +1047,109 @@ func (e *Engine) validateMarketDepth(ev *models.JobbingMarketDepthEvent, orderPr
 	}
 
 	return true
+}
+
+// HandleOrderFill processes order fill notifications and updates position state
+func (e *Engine) HandleOrderFill(orderID string, userID string, token string, side string, executedQty int32, executedPrice float64) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	tokenState := e.getTokenState(userID, token)
+
+	if side == "BUY" {
+		// Update position for BUY fill
+		oldPosition := tokenState.FilledQuantityBuy
+		oldAvgPrice := tokenState.AverageEntryPrice
+
+		// Update filled quantities
+		tokenState.FilledQuantityBuy += executedQty
+
+		// Calculate new average entry price
+		if oldPosition == 0 {
+			tokenState.AverageEntryPrice = executedPrice
+		} else {
+			totalValue := (float64(oldPosition) * oldAvgPrice) + (float64(executedQty) * executedPrice)
+			tokenState.AverageEntryPrice = totalValue / float64(tokenState.FilledQuantityBuy)
+		}
+
+		// Remove from active orders
+		for i, activeOrderID := range tokenState.ActiveBuyOrders {
+			if activeOrderID == orderID {
+				tokenState.ActiveBuyOrders = append(tokenState.ActiveBuyOrders[:i], tokenState.ActiveBuyOrders[i+1:]...)
+				break
+			}
+		}
+
+		e.logger.Info("BUY order filled",
+			zap.String("user_id", userID),
+			zap.String("token", token),
+			zap.String("order_id", orderID),
+			zap.Int32("executed_qty", executedQty),
+			zap.Float64("executed_price", executedPrice),
+			zap.Float64("avg_entry_price", tokenState.AverageEntryPrice),
+			zap.Int32("total_filled_buy", tokenState.FilledQuantityBuy))
+
+	} else if side == "SELL" {
+		// Update position for SELL fill
+		oldBuyQty := tokenState.FilledQuantityBuy
+
+		tokenState.FilledQuantitySell += executedQty
+
+		// Phase B: Calculate realized P&L for this SELL transaction
+		if tokenState.AverageEntryPrice > 0 && oldBuyQty > 0 {
+			tradeResult := float64(executedQty) * (executedPrice - tokenState.AverageEntryPrice)
+			tokenState.RealizedPnL += tradeResult
+			tokenState.DailyPnL += tradeResult
+
+			// Update performance metrics
+			e.UpdatePerformanceMetrics(tokenState, tradeResult)
+
+			// Reset trailing stop and position start time if position closed
+			if tokenState.FilledQuantityBuy == tokenState.FilledQuantitySell {
+				tokenState.TrailingStopPrice = 0
+				tokenState.PositionStartTime = time.Now() // Reset for next position
+			}
+
+			e.logger.Info("SELL order filled with P&L calculation",
+				zap.String("user_id", userID),
+				zap.String("token", token),
+				zap.String("order_id", orderID),
+				zap.Int32("executed_qty", executedQty),
+				zap.Float64("executed_price", executedPrice),
+				zap.Float64("avg_entry_price", tokenState.AverageEntryPrice),
+				zap.Float64("trade_result", tradeResult),
+				zap.Float64("realized_pnl", tokenState.RealizedPnL),
+				zap.Int32("total_filled_sell", tokenState.FilledQuantitySell),
+				zap.Float64("win_rate", tokenState.WinRate),
+				zap.String("risk_level", tokenState.RiskLevel))
+		}
+
+		// Remove from active orders
+		for i, activeOrderID := range tokenState.ActiveSellOrders {
+			if activeOrderID == orderID {
+				tokenState.ActiveSellOrders = append(tokenState.ActiveSellOrders[:i], tokenState.ActiveSellOrders[i+1:]...)
+				break
+			}
+		}
+	}
+
+	// Update net position
+	tokenState.NetPosition = tokenState.FilledQuantityBuy - tokenState.FilledQuantitySell
+	tokenState.LastUpdated = time.Now()
+
+	// Phase B: Update trailing stop price if position opened/increased
+	if side == "BUY" && tokenState.NetPosition > 0 {
+		tokenState.PositionStartTime = time.Now()
+	}
+
+	e.logger.Debug("Order fill processed - position updated",
+		zap.String("user_id", userID),
+		zap.String("token", token),
+		zap.Int32("net_position", tokenState.NetPosition),
+		zap.Float64("total_pnl", tokenState.TotalPnL),
+		zap.Int32("total_trades", tokenState.TotalTrades))
+
+	return nil
 }
 
 // publishAllocation emits the current allocation snapshot for jobbing strategy
@@ -600,6 +1212,108 @@ func (e *Engine) GetStats() map[string]interface{} {
 		"quantity_per_order": e.cfg.QuantityPerOrder,
 		"max_quantity":       e.cfg.MaxQuantity,
 	}
+
+	// Phase B: Enhanced statistics with P&L and performance metrics
+	totalUsers := 0
+	totalPositions := 0
+	totalTrades := int32(0)
+	totalWinningTrades := int32(0)
+	totalRealizedPnL := 0.0
+	totalUnrealizedPnL := 0.0
+	totalDailyPnL := 0.0
+	totalMaxDrawdown := 0.0
+	highRiskUsers := 0
+	mediumRiskUsers := 0
+	lowRiskUsers := 0
+	userStats := make(map[string]interface{})
+
+	for userID, userState := range e.userState {
+		totalUsers++
+		userPnL := 0.0
+		userPositions := 0
+		userTotalTrades := int32(0)
+		userWinRate := 0.0
+		userTokens := make(map[string]interface{})
+
+		for token, tokenState := range userState.TokenStates {
+			if tokenState.NetPosition != 0 {
+				totalPositions++
+				userPositions++
+			}
+
+			totalTrades += tokenState.TotalTrades
+			totalWinningTrades += tokenState.WinningTrades
+			totalRealizedPnL += tokenState.RealizedPnL
+			totalUnrealizedPnL += tokenState.UnrealizedPnL
+			totalDailyPnL += tokenState.DailyPnL
+			totalMaxDrawdown += tokenState.MaxDrawdown
+			userPnL += tokenState.TotalPnL
+			userTotalTrades += tokenState.TotalTrades
+			userWinRate = tokenState.WinRate
+
+			// Risk level counting
+			switch tokenState.RiskLevel {
+			case "HIGH":
+				highRiskUsers++
+			case "MEDIUM":
+				mediumRiskUsers++
+			case "LOW":
+				lowRiskUsers++
+			}
+
+			userTokens[token] = map[string]interface{}{
+				"symbol":              tokenState.Symbol,
+				"net_position":        tokenState.NetPosition,
+				"realized_pnl":        tokenState.RealizedPnL,
+				"unrealized_pnl":      tokenState.UnrealizedPnL,
+				"total_pnl":           tokenState.TotalPnL,
+				"daily_pnl":           tokenState.DailyPnL,
+				"total_trades":        tokenState.TotalTrades,
+				"winning_trades":      tokenState.WinningTrades,
+				"win_rate":            tokenState.WinRate,
+				"avg_win":             tokenState.AvgWin,
+				"avg_loss":            tokenState.AvgLoss,
+				"profit_factor":       tokenState.ProfitFactor,
+				"max_drawdown":        tokenState.MaxDrawdown,
+				"risk_level":          tokenState.RiskLevel,
+				"trailing_stop_price": tokenState.TrailingStopPrice,
+				"daily_loss_limit":    tokenState.DailyLossLimit,
+				"current_ltp":         tokenState.CurrentLTP,
+			}
+		}
+
+		userStats[userID] = map[string]interface{}{
+			"total_pnl":    userPnL,
+			"positions":    userPositions,
+			"total_trades": userTotalTrades,
+			"win_rate":     userWinRate,
+			"tokens":       userTokens,
+		}
+	}
+
+	// Calculate overall win rate
+	overallWinRate := 0.0
+	if totalTrades > 0 {
+		overallWinRate = (float64(totalWinningTrades) / float64(totalTrades)) * 100
+	}
+
+	stats["phase_b_metrics"] = map[string]interface{}{
+		"total_realized_pnl":   totalRealizedPnL,
+		"total_unrealized_pnl": totalUnrealizedPnL,
+		"total_daily_pnl":      totalDailyPnL,
+		"total_positions":      totalPositions,
+		"total_trades":         totalTrades,
+		"winning_trades":       totalWinningTrades,
+		"overall_win_rate":     overallWinRate,
+		"total_max_drawdown":   totalMaxDrawdown,
+		"risk_distribution": map[string]interface{}{
+			"high_risk_users":   highRiskUsers,
+			"medium_risk_users": mediumRiskUsers,
+			"low_risk_users":    lowRiskUsers,
+		},
+	}
+
+	stats["user_details"] = userStats
 
 	return stats
 }

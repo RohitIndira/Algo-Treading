@@ -109,13 +109,29 @@ $topics = @(
 
 foreach ($topic in $topics) {
     Write-Host "Creating topic: $topic"
-    docker exec trading-kafka kafka-topics `
-        --create `
-        --bootstrap-server localhost:9092 `
-        --replication-factor 1 `
-        --partitions 3 `
-        --topic $topic `
-        --if-not-exists 2>$null
+    
+    if ($topic -eq "market.data.live") {
+        # Configure market.data.live with 1-day retention as per requirements
+        # Delete old data after 24 hours, keep latest ticks for real-time trading
+        docker exec trading-kafka kafka-topics `
+            --create `
+            --bootstrap-server localhost:9092 `
+            --replication-factor 1 `
+            --partitions 3 `
+            --topic $topic `
+            --config cleanup.policy=delete `
+            --config retention.ms=86400000 `
+            --config segment.ms=3600000 `
+            --if-not-exists 2>$null
+    } else {
+        docker exec trading-kafka kafka-topics `
+            --create `
+            --bootstrap-server localhost:9092 `
+            --replication-factor 1 `
+            --partitions 3 `
+            --topic $topic `
+            --if-not-exists 2>$null
+    }
 
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Topic $topic ready" -ForegroundColor $GREEN

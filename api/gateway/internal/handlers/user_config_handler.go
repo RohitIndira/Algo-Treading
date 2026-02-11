@@ -8,17 +8,10 @@ import (
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
-	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
-
-func cash52wStableStrategyID(userID string) string {
-	// Must match user-config service stable id logic:
-	// uuid.NewSHA1(uuid.NameSpaceOID, []byte("CASH_52W_HIGH:"+user_id))
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("CASH_52W_HIGH:"+userID)).String()
-}
 
 type UserConfigHandler struct {
 	client *grpc_clients.UserConfigClient
@@ -28,102 +21,6 @@ func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHand
 	return &UserConfigHandler{
 		client: client,
 	}
-}
-
-// ConfigureCash52WeekStrategy handles POST /api/v1/strategies/cash52w/configure
-// This is a high-level endpoint for the managed Cash 52-week High strategy.
-// Frontend sends a simple JSON payload with user_id, enabled and a few
-// numeric fields; the backend fills in detailed trade_config/risk_limits.
-func (h *UserConfigHandler) ConfigureCash52WeekStrategy(w http.ResponseWriter, r *http.Request) {
-	// For the managed Cash 52W strategy we keep the public JSON payload
-	// intentionally minimal so that callers don't have to understand all
-	// low-level fields. The backend will apply sensible defaults for
-	// everything else.
-	//
-	// Accepted JSON fields:
-	//   - user_id          (string, required)
-	//   - enabled          (bool, required)
-	//   - capital_per_stock (float, optional; default ~20000 if <= 0)
-	//   - trading_mode     (string, optional; "LIVE" or "PAPER", default LIVE)
-	//
-	// We also accept camelCase "tradingMode" for convenience.
-	var body struct {
-		UserID          string  `json:"user_id"`
-		Enabled         bool    `json:"enabled"`
-		CapitalPerStock float64 `json:"capital_per_stock"`
-		TradingModeSnake string `json:"trading_mode"`
-		TradingModeCamel string `json:"tradingMode"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
-		return
-	}
-
-	if body.UserID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id is required")
-		return
-	}
-
-	// Prefer explicit snake_case field, but fall back to camelCase if needed.
-	tradingMode := body.TradingModeSnake
-	if tradingMode == "" {
-		tradingMode = body.TradingModeCamel
-	}
-
-	req := &pb.ConfigureCash52WeekStrategyRequest{
-		UserId:          body.UserID,
-		Enabled:         body.Enabled,
-		CapitalPerStock: body.CapitalPerStock,
-		TradingMode:     tradingMode,
-	}
-
-	resp, err := h.client.ConfigureCash52WeekStrategy(r.Context(), req)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to configure 52w strategy: "+err.Error())
-		return
-	}
-
-	if !resp.Success {
-		if resp.Error != nil {
-			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
-		} else {
-			respondWithError(w, http.StatusBadRequest, "Failed to configure 52w strategy")
-		}
-		return
-	}
-
-	// Return a minimal JSON response for the managed 52W strategy instead
-	// of the full generic Strategy payload. Frontend callers only care
-	// about the high-level configuration they just set/applied.
-	strategy := resp.GetStrategy()
-	if strategy == nil {
-		respondWithError(w, http.StatusInternalServerError, "52w strategy missing in response")
-		return
-	}
-
-	// Derive capital_per_stock from trade_config.max_position_size, which
-	// is where the backend stores this value for the managed 52W strategy.
-	capital := 0.0
-	if strategy.TradeConfig != nil {
-		capital = strategy.TradeConfig.MaxPositionSize
-	}
-
-	out := struct {
-		Success         bool    `json:"success"`
-		UserID          string  `json:"user_id"`
-		Enabled         bool    `json:"enabled"`
-		CapitalPerStock float64 `json:"capital_per_stock"`
-		TradingMode     string  `json:"trading_mode"`
-	}{
-		Success:         resp.Success,
-		UserID:          strategy.UserId,
-		Enabled:         strategy.Active,
-		CapitalPerStock: capital,
-		TradingMode:     strategy.TradingMode,
-	}
-
-	respondWithJSON(w, http.StatusOK, out)
 }
 
 // CreateStrategy handles POST /api/v1/strategies
@@ -187,48 +84,7 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Special case: managed CASH_52W_HIGH is stored in cash52w_configs and does
-	// not exist as a generic strategies row. Frontend still calls
-	// DELETE /strategies/{strategy_id}?user_id=... using the stable UUID.
-	// We translate that into a disable call.
-	if strategyID == cash52wStableStrategyID(userID) {
-		// Disable (delete config row) via the managed endpoint.
-		req := &pb.ConfigureCash52WeekStrategyRequest{
-			UserId:  userID,
-			Enabled: false,
-		}
-		resp, err := h.client.ConfigureCash52WeekStrategy(r.Context(), req)
-		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, "Failed to disable cash52w strategy: "+err.Error())
-			return
-		}
-		if !resp.Success {
-			if resp.Error != nil {
-				respondWithError(w, http.StatusBadRequest, resp.Error.Message)
-				return
-			}
-			respondWithError(w, http.StatusBadRequest, "Failed to disable cash52w strategy")
-			return
-		}
-
-		// Mirror the minimal JSON response used by ConfigureCash52WeekStrategy.
-		strategy := resp.GetStrategy()
-		capital := 0.0
-		if strategy != nil && strategy.TradeConfig != nil {
-			capital = strategy.TradeConfig.MaxPositionSize
-		}
-		respondWithJSON(w, http.StatusOK, map[string]any{
-			"success":           true,
-			"strategy_id":       strategyID,
-			"user_id":           userID,
-			"enabled":           false,
-			"capital_per_stock": capital,
-			"trading_mode":      func() string { if strategy != nil { return strategy.TradingMode }; return "" }(),
-		})
-		return
-	}
-
-	// Default: delete generic strategy via user-config service.
+	// Delete generic strategy via user-config service.
 	req := &pb.DeleteStrategyRequest{StrategyId: strategyID, UserId: userID}
 	resp, err := h.client.DeleteStrategy(r.Context(), req)
 	if err != nil {
@@ -451,4 +307,343 @@ func respondWithProtoJSON(w http.ResponseWriter, code int, msg proto.Message) {
 
 func respondWithError(w http.ResponseWriter, code int, message string) {
 	respondWithJSON(w, code, map[string]string{"error": message})
+}
+
+// ========================================================================
+// Jobbing Strategy REST API Handlers
+// ========================================================================
+
+// ConfigureJobbingStrategy handles POST /api/v1/strategies/jobbing/configure
+func (h *UserConfigHandler) ConfigureJobbingStrategy(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		UserID  string `json:"user_id"`
+		Configs []struct {
+			Token            string   `json:"token"`
+			Symbol           string   `json:"symbol"`
+			Exchange         string   `json:"exchange"`
+			LowerRange       float64  `json:"lower_range"`
+			HigherRange      float64  `json:"higher_range"`
+			InitialBuyOffset *float64 `json:"initial_buy_offset,omitempty"`
+			DistanceContinue *float64 `json:"distance_continue,omitempty"`
+			QuantityPerOrder *int32   `json:"quantity_per_order,omitempty"`
+			MaxQuantity      *int32   `json:"max_quantity,omitempty"`
+			TradingMode      *string  `json:"trading_mode,omitempty"`
+			Enabled          *bool    `json:"enabled,omitempty"`
+		} `json:"configs"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if body.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	if len(body.Configs) == 0 {
+		respondWithError(w, http.StatusBadRequest, "at least one token configuration is required")
+		return
+	}
+
+	// Convert to proto
+	protoConfigs := make([]*pb.JobbingTokenConfig, len(body.Configs))
+	for i, cfg := range body.Configs {
+		protoConfig := &pb.JobbingTokenConfig{
+			Token:       cfg.Token,
+			Symbol:      cfg.Symbol,
+			Exchange:    cfg.Exchange,
+			LowerRange:  cfg.LowerRange,
+			HigherRange: cfg.HigherRange,
+		}
+		if cfg.InitialBuyOffset != nil {
+			protoConfig.InitialBuyOffset = *cfg.InitialBuyOffset
+		}
+		if cfg.DistanceContinue != nil {
+			protoConfig.DistanceContinue = *cfg.DistanceContinue
+		}
+		if cfg.QuantityPerOrder != nil {
+			protoConfig.QuantityPerOrder = *cfg.QuantityPerOrder
+		}
+		if cfg.MaxQuantity != nil {
+			protoConfig.MaxQuantity = *cfg.MaxQuantity
+		}
+		if cfg.TradingMode != nil {
+			protoConfig.TradingMode = *cfg.TradingMode
+		}
+		if cfg.Enabled != nil {
+			protoConfig.Enabled = *cfg.Enabled
+		}
+		protoConfigs[i] = protoConfig
+	}
+
+	req := &pb.ConfigureJobbingStrategyRequest{
+		UserId:  body.UserID,
+		Configs: protoConfigs,
+	}
+
+	resp, err := h.client.ConfigureJobbingStrategy(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to configure jobbing strategy: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to configure jobbing strategy")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// GetJobbingConfigs handles GET /api/v1/strategies/jobbing
+func (h *UserConfigHandler) GetJobbingConfigs(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
+		return
+	}
+
+	enabledOnly := r.URL.Query().Get("enabled_only") == "true"
+
+	req := &pb.GetJobbingConfigsRequest{
+		UserId:      userID,
+		EnabledOnly: enabledOnly,
+	}
+
+	resp, err := h.client.GetJobbingConfigs(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to retrieve jobbing configs: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to retrieve jobbing configs")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// GetJobbingConfig handles GET /api/v1/strategies/jobbing/{token}
+func (h *UserConfigHandler) GetJobbingConfig(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	token := vars["token"]
+
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
+		return
+	}
+
+	req := &pb.GetJobbingConfigRequest{
+		UserId: userID,
+		Token:  token,
+	}
+
+	resp, err := h.client.GetJobbingConfig(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to retrieve jobbing config: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			code := http.StatusBadRequest
+			if resp.Error.Code == "NOT_FOUND" {
+				code = http.StatusNotFound
+			}
+			respondWithError(w, code, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to retrieve jobbing config")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// UpdateJobbingConfig handles PUT /api/v1/strategies/jobbing/{token}
+func (h *UserConfigHandler) UpdateJobbingConfig(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	token := vars["token"]
+
+	var body struct {
+		UserID           string   `json:"user_id"`
+		LowerRange       *float64 `json:"lower_range,omitempty"`
+		HigherRange      *float64 `json:"higher_range,omitempty"`
+		InitialBuyOffset *float64 `json:"initial_buy_offset,omitempty"`
+		DistanceContinue *float64 `json:"distance_continue,omitempty"`
+		QuantityPerOrder *int32   `json:"quantity_per_order,omitempty"`
+		MaxQuantity      *int32   `json:"max_quantity,omitempty"`
+		TradingMode      *string  `json:"trading_mode,omitempty"`
+		Enabled          *bool    `json:"enabled,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if body.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	req := &pb.UpdateJobbingConfigRequest{
+		UserId:           body.UserID,
+		Token:            token,
+		LowerRange:       body.LowerRange,
+		HigherRange:      body.HigherRange,
+		InitialBuyOffset: body.InitialBuyOffset,
+		DistanceContinue: body.DistanceContinue,
+		QuantityPerOrder: body.QuantityPerOrder,
+		MaxQuantity:      body.MaxQuantity,
+		TradingMode:      body.TradingMode,
+		Enabled:          body.Enabled,
+	}
+
+	resp, err := h.client.UpdateJobbingConfig(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to update jobbing config: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to update jobbing config")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// DeleteJobbingConfig handles DELETE /api/v1/strategies/jobbing/{token}
+func (h *UserConfigHandler) DeleteJobbingConfig(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	token := vars["token"]
+
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
+		return
+	}
+
+	req := &pb.DeleteJobbingConfigRequest{
+		UserId: userID,
+		Token:  token,
+	}
+
+	resp, err := h.client.DeleteJobbingConfig(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to delete jobbing config: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to delete jobbing config")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// EnableJobbingConfig handles POST /api/v1/strategies/jobbing/{token}/enable
+func (h *UserConfigHandler) EnableJobbingConfig(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	token := vars["token"]
+
+	var body struct {
+		UserID string `json:"user_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if body.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	req := &pb.EnableJobbingConfigRequest{
+		UserId: body.UserID,
+		Token:  token,
+	}
+
+	resp, err := h.client.EnableJobbingConfig(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to enable jobbing config: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to enable jobbing config")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
+}
+
+// DisableJobbingConfig handles POST /api/v1/strategies/jobbing/{token}/disable
+func (h *UserConfigHandler) DisableJobbingConfig(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	token := vars["token"]
+
+	var body struct {
+		UserID string `json:"user_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	if body.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	req := &pb.DisableJobbingConfigRequest{
+		UserId: body.UserID,
+		Token:  token,
+	}
+
+	resp, err := h.client.DisableJobbingConfig(r.Context(), req)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to disable jobbing config: "+err.Error())
+		return
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		} else {
+			respondWithError(w, http.StatusBadRequest, "Failed to disable jobbing config")
+		}
+		return
+	}
+
+	respondWithProtoJSON(w, http.StatusOK, resp)
 }

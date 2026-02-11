@@ -27,12 +27,7 @@ type KafkaConfig struct {
 	Topic   string
 	// JobbingTopic is an optional dedicated topic for jobbing strategy
 	// configuration events. By default it is "jobbing.configs".
-	JobbingTopic       string
-	// Cash52WConfigTopic is an optional dedicated topic for the managed
-	// Cash 52-week High strategy configuration events. By default it is
-	// "user-configs.cash52w" so rules-engine (or other services) can
-	// subscribe to a focused stream with only 52W configs.
-	Cash52WConfigTopic string
+	JobbingTopic string
 }
 
 // Load loads configuration from environment variables
@@ -49,11 +44,10 @@ func Load() (*Config, error) {
 			Database: getEnv("DB_NAME", "trading_db"),
 		},
 		Kafka: KafkaConfig{
-			Enabled:           getEnvAsBool("KAFKA_ENABLED", true),
-			Brokers:           getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
-			Topic:             getEnv("KAFKA_TOPIC", "user-configs"),
-			JobbingTopic:      getEnv("KAFKA_JOBBING_TOPIC", "jobbing.configs"),
-			Cash52WConfigTopic: getEnv("KAFKA_CASH52W_TOPIC", "user-configs.cash52w"),
+			Enabled:      getEnvAsBool("KAFKA_ENABLED", true),
+			Brokers:      getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
+			Topic:        getEnv("KAFKA_TOPIC", "user-configs"),
+			JobbingTopic: getEnv("KAFKA_JOBBING_TOPIC", "jobbing.configs"),
 		},
 		LogLevel: getEnv("LOG_LEVEL", "INFO"),
 	}
