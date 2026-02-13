@@ -87,9 +87,7 @@ echo "${YELLOW}Step 5: Creating required topics for all services...${NC}"
 topics=(
 	"user-configs"              # User Config Service - generic strategy updates
 	"user-configs.cash52w"      # User Config Service - 52W-only config events
-	"news-events"               # Legacy/news topic (KT docs)
-	"market.data.news"          # Data Ingestion -> Rules Engine (news-based events)
-	"market.data.live"          # Live market depth (B2C bridge) -> Rules Engine jobbing
+	"exit-signals.52w"          # Rules Engine 52W engine -> Trade Execution (52W exit signals)
 	"market.data.52w_breakouts" # Redis 52W watcher -> Rules Engine 52W engine
 	"trade-signals"             # Rules Engine -> Trade Execution (ALL BUY/SELL signals including exits)
 	"position-states"           # Rules Engine -> Position lifecycle tracking (OPEN/PARTIAL_EXIT/CLOSED)
@@ -98,7 +96,6 @@ topics=(
 	"order-updates"             # Trade Execution -> frontend/services (order status)
 	"portfolio.allocations"     # Rules Engine 52W engine -> allocation snapshots
 	"portfolio.realtime.52w"    # Rules Engine 52W realtime portfolio valuations -> UI/analytics
-	"jobbing.configs"           # (Planned) Jobbing strategy configs broadcast
 	"paper-executions.52w"      # Paper Execution Service - simulated 52W fills/partial exits
 	"paper-pnl.52w"             # Paper Execution Service - optional aggregated 52W PnL snapshots
 )

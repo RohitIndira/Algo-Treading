@@ -123,7 +123,7 @@ func main() {
 	var configPublisher *publisher.ConfigPublisher
 	if cfg.Kafka.Enabled {
 		var err error
-		configPublisher, err = publisher.NewConfigPublisher(cfg.Kafka.Brokers, "user-config-updates", lgr)
+		configPublisher, err = publisher.NewConfigPublisher(cfg.Kafka.Brokers, cfg.Kafka.Cash52WConfigTopic, lgr)
 		if err != nil {
 			lgr.Fatal("Failed to create config publisher", zap.Error(err))
 		}

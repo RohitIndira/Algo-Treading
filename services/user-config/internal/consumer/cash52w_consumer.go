@@ -11,15 +11,23 @@ import (
 	"go.uber.org/zap"
 )
 
-// cash52WeekConfigEvent mirrors the compact 52W config event published by
+// cash52WeekConfigEvent mirrors the complete 52W config event published by
 // the StrategyService to the user-configs.cash52w topic.
 type cash52WeekConfigEvent struct {
-	EventType       string  `json:"event_type"`
-	UserID          string  `json:"user_id"`
-	Enabled         bool    `json:"enabled"`
-	CapitalPerStock float64 `json:"capital_per_stock"`
-	TradingMode     string  `json:"trading_mode"`
-	Timestamp       int64   `json:"timestamp"`
+	EventType       string                  `json:"event_type"`
+	UserID          string                  `json:"user_id"`
+	Enabled         bool                    `json:"enabled"`
+	TotalCapital    float64                 `json:"total_capital"`
+	CapitalPerStock float64                 `json:"capital_per_stock"`
+	MaxStocks       int                     `json:"max_stocks"`
+	AutoRebalance   bool                    `json:"auto_rebalance"`
+	TradingMode     string                  `json:"trading_mode"`
+	StopLossLevels  models.StopLossLevels   `json:"stop_loss_levels"`
+	ProfitLevels    models.ProfitLevels     `json:"profit_levels"`
+	ForceExitAll    bool                    `json:"force_exit_all"`
+	ForceExitStocks []string                `json:"force_exit_stocks"`
+	PauseNewEntries bool                    `json:"pause_new_entries"`
+	Timestamp       int64                   `json:"timestamp"`
 }
 
 // Cash52WConfigConsumer consumes 52W-only config events from Kafka and keeps
@@ -82,8 +90,16 @@ func (c *Cash52WConfigConsumer) Start(ctx context.Context) error {
 		cfg := &models.Cash52WConfig{
 			UserID:          ev.UserID,
 			Enabled:         ev.Enabled,
+			TotalCapital:    ev.TotalCapital,
 			CapitalPerStock: ev.CapitalPerStock,
+			MaxStocks:       ev.MaxStocks,
+			AutoRebalance:   ev.AutoRebalance,
 			TradingMode:     ev.TradingMode,
+			StopLossLevels:  ev.StopLossLevels,
+			ProfitLevels:    ev.ProfitLevels,
+			ForceExitAll:    ev.ForceExitAll,
+			ForceExitStocks: ev.ForceExitStocks,
+			PauseNewEntries: ev.PauseNewEntries,
 		}
 
 		switch ev.EventType {

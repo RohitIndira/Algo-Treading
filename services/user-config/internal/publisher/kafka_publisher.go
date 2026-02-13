@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
@@ -12,12 +13,12 @@ import (
 )
 
 // ConfigPublisher publishes user configuration updates to Kafka
-// This enables rules-engine to maintain an in-memory cache without DB reads
+// m2 flush 15ngine you need to go and find majer bug there 
 //
 // ARCHITECTURE:
 // 1. User updates config via API Gateway
 // 2. user-config saves to PostgreSQL
-// 3. user-config publishes to Kafka topic: user-config-updates
+// 3. user-config publishes to Kafka topic: user-configs.cash52w
 // 4. rules-engine consumes and updates in-memory ConfigStore
 // 5. rules-engine uses cached config (ZERO DB reads during trading!)
 type ConfigPublisher struct {
@@ -55,13 +56,33 @@ func NewConfigPublisher(brokers []string, topic string, lgr *logger.Logger) (*Co
 
 // PublishConfigUpdate publishes a configuration update event
 func (p *ConfigPublisher) PublishConfigUpdate(ctx context.Context, config *models.Cash52WConfig) error {
-	// Serialize config to JSON
-	data, err := json.Marshal(config)
+	// Create event wrapper with event_type and ALL config fields
+	now := time.Now()
+	event := map[string]interface{}{
+		"event_type":        "UPDATE",
+		"user_id":           config.UserID,
+		"enabled":           config.Enabled,
+		"total_capital":     config.TotalCapital,
+		"capital_per_stock": config.CapitalPerStock,
+		"max_stocks":        config.MaxStocks,
+		"auto_rebalance":    config.AutoRebalance,
+		"trading_mode":      config.TradingMode,
+		"stop_loss_levels":  config.StopLossLevels,
+		"profit_levels":     config.ProfitLevels,
+		"force_exit_all":    config.ForceExitAll,
+		"force_exit_stocks": config.ForceExitStocks,
+		"pause_new_entries": config.PauseNewEntries,
+		"updated_at":        now,
+		"version":           config.Version,
+	}
+
+	// Serialize event to JSON
+	data, err := json.Marshal(event)
 	if err != nil {
-		p.logger.Error("Failed to marshal config",
+		p.logger.Error("Failed to marshal config event",
 			zap.String("user_id", config.UserID),
 			zap.Error(err))
-		return fmt.Errorf("failed to marshal config: %w", err)
+		return fmt.Errorf("failed to marshal config event: %w", err)
 	}
 
 	// Create Kafka message

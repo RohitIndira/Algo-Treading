@@ -83,11 +83,24 @@ func (c *Cash52WConfigConsumer) Start(ctx context.Context) error {
 		var ev cash52w.ConfigEvent
 		if err := json.Unmarshal(msg.Value, &ev); err != nil {
 			c.logger.Error("Failed to unmarshal Cash52W ConfigEvent",
-				zap.Error(err))
+				zap.Error(err),
+				zap.ByteString("raw_message", msg.Value))
 			continue
 		}
 
+		c.logger.Info("📬 Received 52W config event from Kafka",
+			zap.String("user_id", ev.UserID),
+			zap.Bool("enabled", ev.Enabled),
+			zap.String("trading_mode", ev.TradingMode),
+			zap.Float64("capital_per_stock", ev.CapitalPerStock),
+			zap.Int("max_stocks", ev.MaxStocks),
+			zap.Time("updated_at", ev.UpdatedAt))
+
 		c.store.ApplyEvent(ev)
+		
+		c.logger.Info("✅ ConfigStore updated",
+			zap.String("user_id", ev.UserID),
+			zap.Bool("enabled", ev.Enabled))
 	}
 }
 

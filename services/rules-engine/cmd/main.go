@@ -337,7 +337,7 @@ func main() {
 	logger.Info("✅ Rules Engine Service Started Successfully")
 	logger.Info("=============================================================")
 	logger.Info("Listening for:")
-	logger.Info("  • 52W breakouts:       market:52w-breakouts")
+	logger.Info("  • 52W breakouts:       market.data.52w_breakouts")
 	logger.Info("  • User configurations: user-configs.cash52w")
 	logger.Info("Publishing to:")
 	logger.Info("  • Trade signals:       trade-signals")
