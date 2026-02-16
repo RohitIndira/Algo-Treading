@@ -201,8 +201,8 @@ func LoadConfig() (*Config, error) {
 		},
 
 		Redis: RedisConfig{
-			Addrs:        getEnvAsSlice("REDIS_ADDRS", []string{"65.20.83.31:6379"}),
-			Password:     getEnv("REDIS_PASSWORD", ""),
+			Addrs:        getEnvAsSlice("REDIS_ADDRS", []string{"15.207.203.46:6379"}),
+			Password:     getEnv("REDIS_PASSWORD", "R3d1s@Prod#2026"),
 			DB:           getEnvAsInt("REDIS_DB", 0),
 			PoolSize:     getEnvAsInt("REDIS_POOL_SIZE", 100),
 			MinIdleConns: getEnvAsInt("REDIS_MIN_IDLE_CONNS", 10),

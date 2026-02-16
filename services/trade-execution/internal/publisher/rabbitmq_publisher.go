@@ -21,13 +21,14 @@ type RabbitMQPublisher struct {
 	confirmChan chan amqp.Confirmation
 }
 
-// OrderMessage represents the order message format expected by odin-api-wrapper
+// OrderMessage represents the order message format for the RabbitMQ consumer (OrderRequest)
 type OrderMessage struct {
+	RequestID  string  `json:"request_id"`
 	OrderID    string  `json:"order_id"`
 	UserID     string  `json:"user_id"`
 	StrategyID string  `json:"strategy_id"`
 	EventID    string  `json:"event_id,omitempty"`
-	Token      int64   `json:"token"` // Stock code
+	StockCode  int64   `json:"stock_code"`
 	Symbol     string  `json:"symbol"`
 	Exchange   string  `json:"exchange"`
 	OrderType  string  `json:"order_type"` // MARKET or LIMIT
@@ -38,6 +39,17 @@ type OrderMessage struct {
 	TakeProfit float64 `json:"take_profit,omitempty"`
 	Validity   string  `json:"validity"`
 	Timestamp  string  `json:"timestamp"`
+
+	// Authentication data (required by consumer validation)
+	BearerToken string `json:"bearer_token"`
+	AppId       string `json:"app_id"`
+	Source      string `json:"source"`
+
+	// Risk and product fields
+	RiskApproved  bool    `json:"risk_approved"`
+	ProductType   string  `json:"product_type"`
+	StopLossType  string  `json:"stop_loss_type"`
+	TrailingSLPct float64 `json:"trailing_sl_pct"`
 }
 
 // NewRabbitMQPublisher creates a new RabbitMQ publisher
@@ -98,21 +110,43 @@ func NewRabbitMQPublisher(url, exchange, routingKey string, logger *zap.Logger) 
 
 // PublishOrder publishes an order to RabbitMQ for odin-api-wrapper to consume
 func (p *RabbitMQPublisher) PublishOrder(ctx context.Context, order *models.Order) error {
-	// Convert Order to OrderMessage format expected by odin-api-wrapper
+	// Convert Order to OrderMessage format matching the consumer's OrderRequest struct
 	orderMsg := OrderMessage{
-		OrderID:    order.OrderID.String(),
-		UserID:     order.UserID,
-		StrategyID: order.StrategyID,
-		EventID:    order.EventID.String(),
-		Token:      order.StockCode,
-		Symbol:     order.Symbol,
-		Exchange:   string(order.Exchange),
-		OrderType:  string(order.OrderType),
-		OrderSide:  string(order.OrderSide),
-		Quantity:   order.Quantity,
-		Price:      *order.Price,
-		Validity:   order.Validity,
-		Timestamp:  time.Now().Format(time.RFC3339),
+		RequestID:    order.OrderID.String(),
+		OrderID:      order.OrderID.String(),
+		UserID:       order.UserID,
+		StrategyID:   order.StrategyID,
+		EventID:      order.EventID.String(),
+		StockCode:    order.StockCode,
+		Symbol:       order.Symbol,
+		Exchange:     string(order.Exchange),
+		OrderType:    string(order.OrderType),
+		OrderSide:    string(order.OrderSide),
+		Quantity:     order.Quantity,
+		Price:        *order.Price,
+		Validity:     order.Validity,
+		Timestamp:    time.Now().Format(time.RFC3339),
+		RiskApproved: order.RiskApproved,
+		ProductType:  order.ProductType,
+	}
+
+	// Populate authentication data
+	if order.BearerToken != nil {
+		orderMsg.BearerToken = *order.BearerToken
+	}
+	if order.AppId != nil {
+		orderMsg.AppId = *order.AppId
+	}
+	if order.Source != nil {
+		orderMsg.Source = *order.Source
+	}
+
+	// Populate stop loss configuration
+	if order.StopLossType != nil {
+		orderMsg.StopLossType = *order.StopLossType
+	}
+	if order.TrailingSLPct != nil {
+		orderMsg.TrailingSLPct = *order.TrailingSLPct
 	}
 
 	if order.StopLoss != nil {

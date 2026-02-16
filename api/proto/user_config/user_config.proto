@@ -134,8 +134,16 @@ message TradeConfig {
   // Example: 1.0 means trail by 1% as price moves in favorable direction
   double trailing_sl_pct = 11;
   
-  // Product type (INTRADAY, DELIVERY, CASH)
-  string product_type = 12;
+  // Product type
+  common.ProductType product_type = 12;
+  
+  // Indira-specific fields
+  string instrument = 13;      // Instrument type: "STK", "OPT", "FUT", "IDX"
+  int32 lot_size = 14;         // Lot size (default: 1 for stocks)
+  int32 disclosed_qty = 15;    // Disclosed quantity (0 = not disclosed)
+  bool amo = 16;               // After Market Order flag
+  double bracket_order_stop_loss = 17;   // Bracket order stop loss (optional)
+  double bracket_order_target = 18;      // Bracket order target (optional)
 }
 
 // Risk management limits
@@ -209,15 +217,9 @@ message CreateStrategyRequest {
     TradeConfig trade_config = 5;
     RiskLimits risk_limits = 6;
     bool activate_immediately = 7;
-    string bearer_token = 8;
-    string app_id = 9;
-    string source = 10;
     
-    // Add these new fields for Indira Securities
-    string indira_user_id = 11;  // e.g., "ISPL19122"
-    string indira_app_id = 12;   // Application ID from frontend
-    string indira_source = 13;   // "IOS", "AND", or "WEB"
-    string indira_token = 14;    // JWT bearer token
+    // Indira Securities authentication
+    common.IndiraAuthContext indira_auth = 8;
 }
 
 message CreateStrategyResponse {
@@ -321,31 +323,10 @@ message GetStrategiesByIDsResponse {
   common.Error error = 3;
 }
 
+// Update user credentials (Indira Securities authentication)
 message UpdateUserCredentialsRequest {
     string user_id = 1;
-    string bearer_token = 2;
-    string app_id = 3;
-    string source = 4;
-    
-    // Add these new fields for Indira Securities
-    string indira_user_id = 5;  // e.g., "ISPL19122"
-    string indira_app_id = 6;   // Application ID from frontend
-    string indira_source = 7;   // "IOS", "AND", or "WEB"
-    string indira_token = 8;    // JWT bearer token
-}
-
-message GetUserCredentialsResponse {
-    bool success = 1;
-    string bearer_token = 2;
-    string app_id = 3;
-    string source = 4;
-    common.Error error = 5;
-    
-    // Add these new fields for Indira Securities
-    string indira_user_id = 6;  // e.g., "ISPL19122"
-    string indira_app_id = 7;   // Application ID from frontend
-    string indira_source = 8;   // "IOS", "AND", or "WEB"
-    string indira_token = 9;    // JWT bearer token
+    common.IndiraAuthContext indira_auth = 2;
 }
 
 message UpdateUserCredentialsResponse {
@@ -353,14 +334,13 @@ message UpdateUserCredentialsResponse {
   common.Error error = 2;
 }
 
+// Get user credentials for order execution
 message GetUserCredentialsRequest {
   string user_id = 1;
 }
 
 message GetUserCredentialsResponse {
   bool success = 1;
-  string bearer_token = 2;
-  string app_id = 3;
-  string source = 4;
-  common.Error error = 5;
+  common.IndiraAuthContext indira_auth = 2;
+  common.Error error = 3;
 }

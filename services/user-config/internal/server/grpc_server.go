@@ -36,9 +36,13 @@ func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStr
 		TradeConfig:         protoTradeConfigToModel(req.TradeConfig),
 		RiskLimits:          protoRiskLimitsToModel(req.RiskLimits),
 		ActivateImmediately: req.ActivateImmediately,
-		BearerToken:         req.BearerToken,
-		AppId:               req.AppId,
-		Source:              req.Source,
+	}
+
+	// Extract Indira auth context if provided
+	if req.IndiraAuth != nil {
+		modelReq.BearerToken = req.IndiraAuth.BearerToken
+		modelReq.AppId = req.IndiraAuth.AppId
+		modelReq.Source = req.IndiraAuth.Source
 	}
 
 	// Create strategy
@@ -339,12 +343,12 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 
 	sentiments := make(pq.StringArray, len(proto.Sentiments))
 	for i, s := range proto.Sentiments {
-		sentiments[i] = s.String()
+		sentiments[i] = sentimentToString(s)
 	}
 
 	exchanges := make(pq.StringArray, len(proto.Exchanges))
 	for i, e := range proto.Exchanges {
-		exchanges[i] = e.String()
+		exchanges[i] = exchangeToString(e)
 	}
 
 	stockCodes := make(pq.Int64Array, len(proto.StockCodes))
@@ -375,24 +379,99 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 	return cond
 }
 
+// Helper functions to convert protobuf enums to short string codes
+func orderTypeToString(ot common.OrderType) string {
+	switch ot {
+	case common.OrderType_ORDER_TYPE_MARKET:
+		return "MARKET"
+	case common.OrderType_ORDER_TYPE_LIMIT:
+		return "LIMIT"
+	case common.OrderType_ORDER_TYPE_STOP_LOSS:
+		return "STOP_LOSS"
+	case common.OrderType_ORDER_TYPE_STOP_LOSS_MARKET:
+		return "STOP_LOSS_MKT"
+	default:
+		return "MARKET"
+	}
+}
+
+func exchangeToString(ex common.Exchange) string {
+	switch ex {
+	case common.Exchange_EXCHANGE_NSE:
+		return "NSE"
+	case common.Exchange_EXCHANGE_BSE:
+		return "BSE"
+	default:
+		return "NSE"
+	}
+}
+
+func orderSideToString(os common.OrderSide) string {
+	switch os {
+	case common.OrderSide_ORDER_SIDE_BUY:
+		return "BUY"
+	case common.OrderSide_ORDER_SIDE_SELL:
+		return "SELL"
+	default:
+		return "BUY"
+	}
+}
+
+func productTypeToString(pt common.ProductType) string {
+	switch pt {
+	case common.ProductType_PRODUCT_TYPE_INTRADAY:
+		return "INTRADAY"
+	case common.ProductType_PRODUCT_TYPE_DELIVERY:
+		return "DELIVERY"
+	case common.ProductType_PRODUCT_TYPE_CASH:
+		return "CASH"
+	default:
+		return "INTRADAY"
+	}
+}
+
+func stopLossTypeToString(slt pb.StopLossType) string {
+	switch slt {
+	case pb.StopLossType_FIXED:
+		return "FIXED"
+	case pb.StopLossType_TRAILING:
+		return "TRAILING"
+	default:
+		return "FIXED"
+	}
+}
+
+func positionSizingToString(ps common.PositionSizing) string {
+	switch ps {
+	case common.PositionSizing_POSITION_SIZING_FIXED:
+		return "FIXED"
+	case common.PositionSizing_POSITION_SIZING_PERCENTAGE:
+		return "PERCENTAGE"
+	case common.PositionSizing_POSITION_SIZING_RISK_BASED:
+		return "RISK_BASED"
+	default:
+		return "FIXED"
+	}
+}
+
 func protoTradeConfigToModel(proto *pb.TradeConfig) *models.TradeConfig {
 	if proto == nil {
 		return nil
 	}
 
 	config := &models.TradeConfig{
-		OrderType:       proto.OrderType.String(),
+		OrderType:       orderTypeToString(proto.OrderType),
 		Quantity:        proto.Quantity,
 		MaxPositionSize: &proto.MaxPositionSize,
 		StopLossPct:     &proto.StopLossPct,
 		TakeProfitPct:   &proto.TakeProfitPct,
-		Exchange:        proto.Exchange.String(),
-		OrderSide:       proto.OrderSide.String(),
+		Exchange:        exchangeToString(proto.Exchange),
+		OrderSide:       orderSideToString(proto.OrderSide),
 		LimitPrice:      &proto.LimitPrice,
 		Validity:        proto.Validity,
-		StopLossType:    proto.StopLossType.String(),
+		StopLossType:    stopLossTypeToString(proto.StopLossType),
 		TrailingSLPct:   &proto.TrailingSlPct,
-		ProductType:     proto.ProductType,
+		ProductType:     productTypeToString(proto.ProductType),
 	}
 
 	return config
@@ -406,7 +485,7 @@ func protoRiskLimitsToModel(proto *pb.RiskLimits) *models.RiskLimits {
 	limits := &models.RiskLimits{
 		MaxDailyTrades:          &proto.MaxDailyTrades,
 		MaxLossPerDay:           &proto.MaxLossPerDay,
-		PositionSizing:          proto.PositionSizing.String(),
+		PositionSizing:          positionSizingToString(proto.PositionSizing),
 		MaxPortfolioExposurePct: &proto.MaxPortfolioExposurePct,
 		MaxPerTradeRisk:         &proto.MaxPerTradeRisk,
 		EnableRiskChecks:        proto.EnableRiskChecks,
@@ -453,12 +532,12 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 
 	sentiments := make([]common.Sentiment, len(model.Sentiments))
 	for i, s := range model.Sentiments {
-		sentiments[i] = common.Sentiment(common.Sentiment_value[s])
+		sentiments[i] = stringToSentiment(s)
 	}
 
 	exchanges := make([]common.Exchange, len(model.Exchanges))
 	for i, e := range model.Exchanges {
-		exchanges[i] = common.Exchange(common.Exchange_value[e])
+		exchanges[i] = stringToExchange(e)
 	}
 
 	stockCodes := make([]int64, len(model.StockCodes))
@@ -491,18 +570,120 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 	return cond
 }
 
+// Helper functions to convert short string codes back to protobuf enums
+func stringToOrderType(s string) common.OrderType {
+	switch s {
+	case "MARKET":
+		return common.OrderType_ORDER_TYPE_MARKET
+	case "LIMIT":
+		return common.OrderType_ORDER_TYPE_LIMIT
+	case "STOP_LOSS":
+		return common.OrderType_ORDER_TYPE_STOP_LOSS
+	case "STOP_LOSS_MKT":
+		return common.OrderType_ORDER_TYPE_STOP_LOSS_MARKET
+	default:
+		return common.OrderType_ORDER_TYPE_MARKET
+	}
+}
+
+func stringToExchange(s string) common.Exchange {
+	switch s {
+	case "NSE":
+		return common.Exchange_EXCHANGE_NSE
+	case "BSE":
+		return common.Exchange_EXCHANGE_BSE
+	default:
+		return common.Exchange_EXCHANGE_NSE
+	}
+}
+
+func stringToOrderSide(s string) common.OrderSide {
+	switch s {
+	case "BUY":
+		return common.OrderSide_ORDER_SIDE_BUY
+	case "SELL":
+		return common.OrderSide_ORDER_SIDE_SELL
+	default:
+		return common.OrderSide_ORDER_SIDE_BUY
+	}
+}
+
+func stringToProductType(s string) common.ProductType {
+	switch s {
+	case "INTRADAY":
+		return common.ProductType_PRODUCT_TYPE_INTRADAY
+	case "DELIVERY":
+		return common.ProductType_PRODUCT_TYPE_DELIVERY
+	case "CASH":
+		return common.ProductType_PRODUCT_TYPE_CASH
+	default:
+		return common.ProductType_PRODUCT_TYPE_INTRADAY
+	}
+}
+
+func stringToStopLossType(s string) pb.StopLossType {
+	switch s {
+	case "FIXED":
+		return pb.StopLossType_FIXED
+	case "TRAILING":
+		return pb.StopLossType_TRAILING
+	default:
+		return pb.StopLossType_FIXED
+	}
+}
+
+func stringToPositionSizing(s string) common.PositionSizing {
+	switch s {
+	case "FIXED":
+		return common.PositionSizing_POSITION_SIZING_FIXED
+	case "PERCENTAGE":
+		return common.PositionSizing_POSITION_SIZING_PERCENTAGE
+	case "RISK_BASED":
+		return common.PositionSizing_POSITION_SIZING_RISK_BASED
+	default:
+		return common.PositionSizing_POSITION_SIZING_FIXED
+	}
+}
+
+// Helper functions for sentiments and exchanges (short codes)
+func sentimentToString(s common.Sentiment) string {
+	switch s {
+	case common.Sentiment_SENTIMENT_POSITIVE:
+		return "POSITIVE"
+	case common.Sentiment_SENTIMENT_NEUTRAL:
+		return "NEUTRAL"
+	case common.Sentiment_SENTIMENT_NEGATIVE:
+		return "NEGATIVE"
+	default:
+		return "POSITIVE"
+	}
+}
+
+func stringToSentiment(s string) common.Sentiment {
+	switch s {
+	case "POSITIVE":
+		return common.Sentiment_SENTIMENT_POSITIVE
+	case "NEUTRAL":
+		return common.Sentiment_SENTIMENT_NEUTRAL
+	case "NEGATIVE":
+		return common.Sentiment_SENTIMENT_NEGATIVE
+	default:
+		return common.Sentiment_SENTIMENT_POSITIVE
+	}
+}
+
 func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
 	if model == nil {
 		return nil
 	}
 
 	config := &pb.TradeConfig{
-		OrderType:   common.OrderType(common.OrderType_value[model.OrderType]),
+		OrderType:   stringToOrderType(model.OrderType),
 		Quantity:    model.Quantity,
-		Exchange:    common.Exchange(common.Exchange_value[model.Exchange]),
-		OrderSide:   common.OrderSide(common.OrderSide_value[model.OrderSide]),
+		Exchange:    stringToExchange(model.Exchange),
+		OrderSide:   stringToOrderSide(model.OrderSide),
 		Validity:    model.Validity,
-		ProductType: model.ProductType,
+		ProductType: stringToProductType(model.ProductType),
 	}
 
 	if model.MaxPositionSize != nil {
@@ -518,7 +699,7 @@ func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
 		config.LimitPrice = *model.LimitPrice
 	}
 	if model.StopLossType != "" {
-		config.StopLossType = pb.StopLossType(pb.StopLossType_value[model.StopLossType])
+		config.StopLossType = stringToStopLossType(model.StopLossType)
 	}
 	if model.TrailingSLPct != nil {
 		config.TrailingSlPct = *model.TrailingSLPct
@@ -533,7 +714,7 @@ func modelRiskLimitsToProto(model *models.RiskLimits) *pb.RiskLimits {
 	}
 
 	limits := &pb.RiskLimits{
-		PositionSizing:      common.PositionSizing(common.PositionSizing_value[model.PositionSizing]),
+		PositionSizing:      stringToPositionSizing(model.PositionSizing),
 		EnableRiskChecks:    model.EnableRiskChecks,
 		EnableAutoSquareOff: model.EnableAutoSquareOff,
 		AutoSquareOffTime:   model.AutoSquareOffTime,

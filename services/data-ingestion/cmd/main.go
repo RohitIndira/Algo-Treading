@@ -11,6 +11,7 @@ import (
 	kafkapkg "github.com/RohitIndira/Algo-Treading/pkg/kafka"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/config"
+	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/data"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/watcher"
 
@@ -61,11 +62,24 @@ func main() {
 	// Create publisher wrapper
 	pub := publisher.NewKafkaPublisher(producer, cfg.KafkaTopic)
 
+	// Initialize Redis Manager
+	redisMgr, err := data.NewRedisManager(cfg.RedisURI, cfg.RedisPassword, cfg.RedisDB, lgr, mongoClient)
+	if err != nil {
+		lgr.Fatal("failed to create redis manager", zap.Error(err))
+	}
+	defer redisMgr.Close()
+
+	// Start Redis Scheduler for Company Master Data
+	// Run in background with a separate context that is cancelled on shutdown
+	schedCtx, schedCancel := context.WithCancel(context.Background())
+	defer schedCancel()
+	redisMgr.StartScheduler(schedCtx, mongoClient)
+
 	// Start watcher
 	ctxRun, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
 
-	w, err := watcher.NewMongoWatcher(mongoClient, cfg.MongoCollection, pub, lgr)
+	w, err := watcher.NewMongoWatcher(mongoClient, cfg.MongoCollection, redisMgr, pub, lgr)
 	if err != nil {
 		lgr.Fatal("failed to create watcher", zap.Error(err))
 	}

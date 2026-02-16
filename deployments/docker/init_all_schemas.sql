@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS user_credentials (
     indira_app_id VARCHAR(100),
     indira_source VARCHAR(10),
     indira_bearer_token TEXT,
+    -- Active flag for credential (added for index)
+    is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_user

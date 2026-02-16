@@ -76,7 +76,7 @@ func main() {
 		Durable:       true,
 	}
 
-	rabbitConsumer, err := consumer.NewRabbitMQConsumer(consumerCfg, orderExecutor, orderRepo)
+	rabbitConsumer, err := consumer.NewRabbitMQConsumer(consumerCfg, orderExecutor, orderRepo, credsRepo)
 	if err != nil {
 		log.Fatalf("Failed to initialize RabbitMQ consumer: %v", err)
 	}

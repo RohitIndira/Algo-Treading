@@ -99,6 +99,24 @@ enum Sentiment {
   SENTIMENT_NEGATIVE = 3;
 }
 
+// Indira authentication context
+// Used for authenticating with Indira Securities API
+message IndiraAuthContext {
+  string user_id = 1;       // Indira user ID (e.g., "ISPL19122")
+  string app_id = 2;        // Application ID from frontend
+  string client_id = 3;     // Client ID (optional)
+  string source = 4;        // Source platform: "IOS", "AND", "WEB"
+  string bearer_token = 5;  // JWT bearer token from frontend/login
+}
+
+// Product type for orders
+enum ProductType {
+  PRODUCT_TYPE_UNSPECIFIED = 0;
+  PRODUCT_TYPE_INTRADAY = 1;  // Intraday/MIS
+  PRODUCT_TYPE_DELIVERY = 2;  // Delivery/CNC
+  PRODUCT_TYPE_CASH = 3;      // Cash
+}
+
 // Exchange types
 enum Exchange {
   EXCHANGE_UNSPECIFIED = 0;

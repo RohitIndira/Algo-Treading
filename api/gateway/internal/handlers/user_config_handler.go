@@ -35,21 +35,33 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 	if bearerToken != "" {
 		// Remove "Bearer " prefix if present
 		bearerToken = strings.TrimPrefix(bearerToken, "Bearer ")
-		req.BearerToken = bearerToken
 	}
 
 	appId := r.Header.Get("appId")
-	if appId != "" {
-		req.AppId = appId
+	source := r.Header.Get("source")
+	userIdHeader := r.Header.Get("userId")
+
+	// Initialize IndiraAuth if not already set
+	if req.IndiraAuth == nil {
+		req.IndiraAuth = &common.IndiraAuthContext{}
 	}
 
-	source := r.Header.Get("source")
+	// Set auth fields from headers
+	if bearerToken != "" {
+		req.IndiraAuth.BearerToken = bearerToken
+	}
+	if appId != "" {
+		req.IndiraAuth.AppId = appId
+	}
 	if source != "" {
-		req.Source = source
+		req.IndiraAuth.Source = source
+	}
+	if userIdHeader != "" {
+		req.IndiraAuth.UserId = userIdHeader
 	}
 
 	// Validate authentication data
-	if req.BearerToken == "" || req.AppId == "" || req.Source == "" {
+	if req.IndiraAuth.BearerToken == "" || req.IndiraAuth.AppId == "" || req.IndiraAuth.Source == "" {
 		respondWithError(w, http.StatusBadRequest, "Missing authentication headers: Authorization, appId, and source are required")
 		return
 	}

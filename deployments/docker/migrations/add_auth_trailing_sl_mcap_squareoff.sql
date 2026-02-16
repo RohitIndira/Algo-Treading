@@ -14,15 +14,15 @@ ADD COLUMN IF NOT EXISTS max_market_cap DECIMAL(15,2);
 COMMENT ON COLUMN strategy_conditions.min_market_cap IS 'Minimum market cap filter in crores';
 COMMENT ON COLUMN strategy_conditions.max_market_cap IS 'Maximum market cap filter in crores';
 
--- Add stop loss type and trailing configuration to trade_config table
-ALTER TABLE IF EXISTS trade_config
+-- Add stop loss type and trailing configuration to trade_configs table
+ALTER TABLE IF EXISTS trade_configs
 ADD COLUMN IF NOT EXISTS stop_loss_type VARCHAR(20) DEFAULT 'FIXED',
 ADD COLUMN IF NOT EXISTS trailing_sl_pct DECIMAL(5,2) DEFAULT 0.0,
 ADD COLUMN IF NOT EXISTS product_type VARCHAR(20) DEFAULT 'INTRADAY';
 
-COMMENT ON COLUMN trade_config.stop_loss_type IS 'Stop loss type: FIXED or TRAILING';
-COMMENT ON COLUMN trade_config.trailing_sl_pct IS 'Trailing stop loss percentage (only for TRAILING type)';
-COMMENT ON COLUMN trade_config.product_type IS 'Product type: INTRADAY, DELIVERY, CASH';
+COMMENT ON COLUMN trade_configs.stop_loss_type IS 'Stop loss type: FIXED or TRAILING';
+COMMENT ON COLUMN trade_configs.trailing_sl_pct IS 'Trailing stop loss percentage (only for TRAILING type)';
+COMMENT ON COLUMN trade_configs.product_type IS 'Product type: INTRADAY, DELIVERY, CASH';
 
 -- Add auto square-off configuration to risk_limits table
 ALTER TABLE IF EXISTS risk_limits
@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS user_credentials (
 
 CREATE INDEX IF NOT EXISTS idx_user_credentials_user_id ON user_credentials(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_credentials_updated_at ON user_credentials(updated_at);
+
+-- If an existing `user_credentials` table was created by the base schema with a
+-- different column layout, add the migration columns if they don't exist.
+ALTER TABLE IF EXISTS user_credentials
+    ADD COLUMN IF NOT EXISTS bearer_token TEXT,
+    ADD COLUMN IF NOT EXISTS app_id VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS source VARCHAR(20),
+    ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;
 
 COMMENT ON TABLE user_credentials IS 'Stores user authentication credentials for broker API integration';
 COMMENT ON COLUMN user_credentials.bearer_token IS 'JWT bearer token from frontend';
@@ -85,7 +93,7 @@ WHERE product_type = 'INTRADAY' AND status IN ('FILLED', 'PARTIALLY_FILLED');
 -- ===========================================================================
 
 -- Add constraint for stop loss type
-ALTER TABLE IF EXISTS trade_config 
+ALTER TABLE IF EXISTS trade_configs 
 DROP CONSTRAINT IF EXISTS chk_stop_loss_type,
 ADD CONSTRAINT chk_stop_loss_type CHECK (stop_loss_type IN ('FIXED', 'TRAILING'));
 
@@ -94,7 +102,7 @@ DROP CONSTRAINT IF EXISTS chk_stop_loss_type,
 ADD CONSTRAINT chk_stop_loss_type CHECK (stop_loss_type IN ('FIXED', 'TRAILING'));
 
 -- Add constraint for product type
-ALTER TABLE IF EXISTS trade_config
+ALTER TABLE IF EXISTS trade_configs
 DROP CONSTRAINT IF EXISTS chk_product_type,
 ADD CONSTRAINT chk_product_type CHECK (product_type IN ('INTRADAY', 'DELIVERY', 'CASH'));
 
@@ -190,8 +198,16 @@ CREATE TRIGGER trg_update_user_credentials_timestamp
 -- 8. Grant permissions (adjust as needed for your setup)
 -- ===========================================================================
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON user_credentials TO trade_execution_user;
-GRANT SELECT ON orders_requiring_monitoring TO trade_execution_user;
+-- Attempt to grant permissions only if role exists; skip otherwise.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trade_execution_user') THEN
+        EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON user_credentials TO trade_execution_user';
+        EXECUTE 'GRANT SELECT ON orders_requiring_monitoring TO trade_execution_user';
+    ELSE
+        RAISE NOTICE 'role "trade_execution_user" not found; skipping GRANT statements.';
+    END IF;
+END$$;
 
 -- ===========================================================================
 -- 9. Sample data for testing (optional - comment out in production)

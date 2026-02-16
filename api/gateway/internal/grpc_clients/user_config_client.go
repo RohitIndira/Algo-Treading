@@ -25,7 +25,7 @@ func NewUserConfigClient(addr string, timeout time.Duration) (*UserConfigClient,
 	return &UserConfigClient{
 		client:  pb.NewUserConfigServiceClient(conn),
 		conn:    conn,
-		timeout: timeout,
+		timeout: timeout,	
 	}, nil
 }
 

@@ -28,6 +28,10 @@ type Config struct {
 	WorkerCount int
 	MaxRetries  int
 	// timeouts
+	RedisURI      string
+	RedisPassword string
+	RedisDB       int
+
 	MongoConnectTimeout time.Duration
 }
 
@@ -54,6 +58,13 @@ func Load() *Config {
 		coll = "NewsImpactDashboard"
 	}
 
+	redisURI := os.Getenv("REDIS_URI")
+	if redisURI == "" {
+		redisURI = "localhost:6379"
+	}
+
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+
 	workerCount := 4
 	maxRetries := 3
 
@@ -61,6 +72,9 @@ func Load() *Config {
 		MongoURI:            getEnv("MONGO_URI", "mongodb://localhost:27017"),
 		MongoDatabase:       db,
 		MongoCollection:     coll,
+		RedisURI:            redisURI,
+		RedisPassword:       redisPassword,
+		RedisDB:             0, // Default DB
 		KafkaBrokers:        strings.Split(brokers, ","),
 		KafkaTopic:          topic,
 		WorkerCount:         workerCount,

@@ -78,7 +78,13 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 		if err != nil {
 			lastErr = err
 			order.RetryCount++
-			log.Printf("Failed to place order %s: %v", order.OrderID, err)
+			log.Printf("Failed to place order %s (attempt %d): %v", order.OrderID, attempt+1, err)
+			if attempt == e.maxRetries {
+				log.Printf("❌ BROKER CONNECTION ERROR - Max retries exhausted. Check:")
+				log.Printf("  1. Is INDIRA_BASE_URL environment variable set?")
+				log.Printf("  2. Is the broker backend running at that URL?")
+				log.Printf("  3. Is the network connection working?")
+			}
 			continue
 		}
 

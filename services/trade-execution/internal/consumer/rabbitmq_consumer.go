@@ -14,6 +14,14 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// userCredentials holds broker credentials fetched from the database
+type userCredentials struct {
+	userId      string
+	appId       string
+	source      string
+	bearerToken string
+}
+
 // RabbitMQConsumer handles consuming messages from RabbitMQ
 type RabbitMQConsumer struct {
 	conn          *amqp.Connection
@@ -22,6 +30,7 @@ type RabbitMQConsumer struct {
 	prefetchCount int
 	executor      *executor.OrderExecutor
 	repo          repository.OrderRepository
+	credsRepo     repository.CredentialsRepository
 	workerCount   int
 	shutdownChan  chan struct{}
 }
@@ -39,7 +48,7 @@ type Config struct {
 }
 
 // NewRabbitMQConsumer creates a new RabbitMQ consumer
-func NewRabbitMQConsumer(cfg Config, exec *executor.OrderExecutor, repo repository.OrderRepository) (*RabbitMQConsumer, error) {
+func NewRabbitMQConsumer(cfg Config, exec *executor.OrderExecutor, repo repository.OrderRepository, credsRepo repository.CredentialsRepository) (*RabbitMQConsumer, error) {
 	conn, err := amqp.Dial(cfg.URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
@@ -126,6 +135,7 @@ func NewRabbitMQConsumer(cfg Config, exec *executor.OrderExecutor, repo reposito
 		prefetchCount: cfg.PrefetchCount,
 		executor:      exec,
 		repo:          repo,
+		credsRepo:     credsRepo,
 		workerCount:   cfg.WorkerCount,
 		shutdownChan:  make(chan struct{}),
 	}, nil
@@ -210,7 +220,28 @@ func (c *RabbitMQConsumer) processMessage(ctx context.Context, msg amqp.Delivery
 		return
 	}
 
-	log.Printf("Worker %d: Processing order request %s for user %s", workerID, orderReq.RequestID, orderReq.UserID)
+	log.Printf("Worker %d: Processing order request %s for user %s (stock_code=%d, exchange=%s, symbol=%s)",
+		workerID, orderReq.RequestID, orderReq.UserID, orderReq.StockCode, orderReq.Exchange, orderReq.Symbol)
+
+	// If auth data is missing, try to fetch from the credentials repository
+	if orderReq.BearerToken == "" || orderReq.AppId == "" || orderReq.Source == "" {
+		log.Printf("Worker %d: Auth data missing in message, fetching credentials from database for user %s", workerID, orderReq.UserID)
+		creds, err := c.fetchCredentials(ctx, orderReq.UserID)
+		if err != nil {
+			log.Printf("Worker %d: failed to fetch credentials for user %s: %v", workerID, orderReq.UserID, err)
+		} else {
+			if orderReq.BearerToken == "" {
+				orderReq.BearerToken = creds.bearerToken
+			}
+			if orderReq.AppId == "" {
+				orderReq.AppId = creds.appId
+			}
+			if orderReq.Source == "" {
+				orderReq.Source = creds.source
+			}
+			log.Printf("Worker %d: Credentials fetched from database for user %s", workerID, orderReq.UserID)
+		}
+	}
 
 	// Validate request
 	if err := c.validateOrderRequest(&orderReq); err != nil {
@@ -218,6 +249,7 @@ func (c *RabbitMQConsumer) processMessage(ctx context.Context, msg amqp.Delivery
 		msg.Nack(false, false) // Send to DLQ
 		return
 	}
+
 
 	// Convert to internal order model
 	order := c.convertToOrder(&orderReq)
@@ -353,6 +385,25 @@ func (c *RabbitMQConsumer) convertToOrder(req *models.OrderRequest) *models.Orde
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+}
+
+// fetchCredentials retrieves broker credentials from the database for a given user
+func (c *RabbitMQConsumer) fetchCredentials(ctx context.Context, userID string) (*userCredentials, error) {
+	if c.credsRepo == nil {
+		return nil, fmt.Errorf("credentials repository not configured")
+	}
+
+	userId, appId, source, bearerToken, err := c.credsRepo.GetIndiraCredentials(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get credentials: %w", err)
+	}
+
+	return &userCredentials{
+		userId:      userId,
+		appId:       appId,
+		source:      source,
+		bearerToken: bearerToken,
+	}, nil
 }
 
 // Shutdown gracefully shuts down the consumer

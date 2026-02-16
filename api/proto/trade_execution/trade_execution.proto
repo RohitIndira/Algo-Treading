@@ -63,7 +63,7 @@ message Order {
   common.OrderStatus status = 15;
   
   // Indira API integration
-  string indira_order_id = 16;  // Order ID from Indira Securities API
+  string indira_order_id = 16;  // Order ID from Indira Securities API (ordId)
   string indira_response = 17;  // Raw response from Indira API
   
   // Execution details
@@ -84,6 +84,14 @@ message Order {
   
   // Metadata
   map<string, string> metadata = 28;
+  
+  // Indira-specific fields
+  string exchange_token = 29;   // Exchange token for Indira API (excToken)
+  string instrument = 30;       // Instrument type: "STK", "OPT", "FUT", "IDX"
+  int32 lot_size = 31;          // Lot size for the instrument
+  int32 disclosed_qty = 32;     // Disclosed quantity
+  bool amo = 33;                // After Market Order flag
+  common.ProductType product_type = 34;  // Product type
 }
 
 // Order request message (published to RabbitMQ by Rules Engine)
@@ -123,6 +131,14 @@ message OrderRequest {
   
   // Retry information
   int32 retry_count = 18;
+  
+  // Indira-specific fields
+  string exchange_token = 19;  // Exchange token (excToken)
+  string instrument = 20;      // Instrument type
+  int32 lot_size = 21;         // Lot size
+  int32 disclosed_qty = 22;    // Disclosed quantity
+  bool amo = 23;               // After Market Order
+  common.ProductType product_type = 24;
 }
 
 // Get order status request
@@ -178,6 +194,9 @@ message CancelOrderRequest {
   string order_id = 1;
   string user_id = 2;  // For authorization
   string reason = 3;   // Cancellation reason
+  
+  // Indira auth context for order cancellation
+  common.IndiraAuthContext indira_auth = 4;
 }
 
 message CancelOrderResponse {
@@ -197,6 +216,11 @@ message ModifyOrderRequest {
   optional double new_price = 4;
   optional common.OrderType new_order_type = 5;
   optional string new_validity = 6;
+  optional double new_trigger_price = 7;
+  optional int32 new_disclosed_qty = 8;
+  
+  // Indira auth context for order modification
+  common.IndiraAuthContext indira_auth = 9;
 }
 
 message ModifyOrderResponse {
