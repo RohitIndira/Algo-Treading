@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-
 	"github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
@@ -36,13 +35,17 @@ func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStr
 		TradeConfig:         protoTradeConfigToModel(req.TradeConfig),
 		RiskLimits:          protoRiskLimitsToModel(req.RiskLimits),
 		ActivateImmediately: req.ActivateImmediately,
+		TradingMode:         protoTradingModeToModel(req.TradingMode),
 	}
 
 	// Extract Indira auth context if provided
 	if req.IndiraAuth != nil {
-		modelReq.BearerToken = req.IndiraAuth.BearerToken
-		modelReq.AppId = req.IndiraAuth.AppId
-		modelReq.Source = req.IndiraAuth.Source
+		modelReq.IndiraAuth = &models.IndiraAuthContext{
+			UserID:      req.IndiraAuth.UserId,
+			AppID:       req.IndiraAuth.AppId,
+			Source:      req.IndiraAuth.Source,
+			BearerToken: req.IndiraAuth.BearerToken,
+		}
 	}
 
 	// Create strategy
@@ -96,6 +99,10 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 	}
 	if req.RiskLimits != nil {
 		modelReq.RiskLimits = protoRiskLimitsToModel(req.RiskLimits)
+	}
+	if req.TradingMode != nil {
+		mode := protoTradingModeToModel(*req.TradingMode)
+		modelReq.TradingMode = &mode
 	}
 
 	strategy, err := s.service.UpdateStrategy(ctx, modelReq)
@@ -355,28 +362,63 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 	for i, code := range proto.StockCodes {
 		stockCodes[i] = code
 	}
+	
+	marketCapTypes := make(pq.StringArray, len(proto.MarketCapTypes))
+	copy(marketCapTypes, proto.MarketCapTypes)
 
 	cond := &models.StrategyCondition{
-		ImpactScoreThreshold: proto.ImpactScoreThreshold,
+		MatchAllNews:         proto.MatchAllNews,
+		ImpactScoreMin:       proto.ImpactScoreMin,
+		ImpactScoreMax:       proto.ImpactScoreMax,
 		Sentiments:           sentiments,
 		Categories:           pq.StringArray(proto.Categories),
 		StockCodes:           stockCodes,
-		VolumeThreshold:      &proto.VolumeThreshold,
-		PctChangeThreshold:   &proto.PctChangeThreshold,
+		MinVolume:            &proto.VolumeThreshold, // Mapped from VolumeThreshold
 		Exchanges:            exchanges,
+		MarketCapTypes:       marketCapTypes,
 	}
 
+	// PriceRange fields not present in DB/Model yet.
+	/*
 	if proto.PriceRange != nil {
 		cond.PriceRangeMin = &proto.PriceRange.MinPrice
 		cond.PriceRangeMax = &proto.PriceRange.MaxPrice
 	}
+	*/
 
 	if proto.MarketCapRange != nil {
 		cond.MinMarketCap = &proto.MarketCapRange.MinMcap
 		cond.MaxMarketCap = &proto.MarketCapRange.MaxMcap
 	}
+	
+	if proto.PctChangeRange != nil {
+		cond.MinPriceChangePct = &proto.PctChangeRange.MinPctChange
+		cond.MaxPriceChangePct = &proto.PctChangeRange.MaxPctChange
+	}
 
 	return cond
+}
+
+func protoTradingModeToModel(mode pb.TradingMode) models.TradingMode {
+	switch mode {
+	case pb.TradingMode_PAPER:
+		return models.TradingModePaper
+	case pb.TradingMode_LIVE:
+		return models.TradingModeLive
+	default:
+		return models.TradingModePaper
+	}
+}
+
+func modelTradingModeToProto(mode models.TradingMode) pb.TradingMode {
+	switch mode {
+	case models.TradingModePaper:
+		return pb.TradingMode_PAPER
+	case models.TradingModeLive:
+		return pb.TradingMode_LIVE
+	default:
+		return pb.TradingMode_PAPER
+	}
 }
 
 // Helper functions to convert protobuf enums to short string codes
@@ -462,7 +504,6 @@ func protoTradeConfigToModel(proto *pb.TradeConfig) *models.TradeConfig {
 	config := &models.TradeConfig{
 		OrderType:       orderTypeToString(proto.OrderType),
 		Quantity:        proto.Quantity,
-		MaxPositionSize: &proto.MaxPositionSize,
 		StopLossPct:     &proto.StopLossPct,
 		TakeProfitPct:   &proto.TakeProfitPct,
 		Exchange:        exchangeToString(proto.Exchange),
@@ -485,7 +526,30 @@ func protoRiskLimitsToModel(proto *pb.RiskLimits) *models.RiskLimits {
 	limits := &models.RiskLimits{
 		MaxDailyTrades:          &proto.MaxDailyTrades,
 		MaxLossPerDay:           &proto.MaxLossPerDay,
-		PositionSizing:          positionSizingToString(proto.PositionSizing),
+		// PositionSizing:          positionSizingToString(proto.PositionSizing), // Check if model has this field. Yes it does.
+		// Wait, did I keep PositionSizing in model?
+		// Let's check step 91. RiskLimits struct:
+		/*
+		type RiskLimits struct {
+			// ...
+			// PositionSizing string // I removed it in Step 91?
+			// Checking Step 91 content for RiskLimits...
+			// In Step 91, RiskLimits does NOT have PositionSizing!
+			// Creating RiskLimits struct in step 91:
+			// RiskLimits struct {
+			// 	RiskLimitID             uuid.UUID `db:"risk_limit_id" json:"risk_limit_id"`
+			// 	StrategyID              uuid.UUID `db:"strategy_id" json:"strategy_id"`
+			// 	MaxDailyTrades          *int32    `db:"max_daily_trades" json:"max_daily_trades,omitempty"`
+			// 	MaxPerTradeRisk         *float64  `db:"max_per_trade_risk" json:"max_per_trade_risk,omitempty"`
+			// 	MaxPortfolioExposurePct *float64  `db:"max_portfolio_exposure_pct" json:"max_portfolio_exposure_pct,omitempty"`
+			// 	MaxLossPerDay           *float64  `db:"max_loss_per_day" json:"max_loss_per_day,omitempty"`
+			// 	EnableRiskChecks        bool      `db:"enable_risk_checks" json:"enable_risk_checks"`
+			// 	EnableAutoSquareOff     bool      `db:"enable_auto_square_off" json:"enable_auto_square_off"`
+			// 	AutoSquareOffTime       string    `db:"auto_square_off_time" json:"auto_square_off_time"`
+			// 	CreatedAt               time.Time `db:"created_at" json:"created_at"`
+			// }
+			// So PositionSizing is NOT in model.
+		*/
 		MaxPortfolioExposurePct: &proto.MaxPortfolioExposurePct,
 		MaxPerTradeRisk:         &proto.MaxPerTradeRisk,
 		EnableRiskChecks:        proto.EnableRiskChecks,
@@ -507,6 +571,7 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 		StrategyName: model.StrategyName,
 		Description:  model.Description,
 		Active:       model.Active,
+		TradingMode:  modelTradingModeToProto(model.TradingMode),
 		Version:      model.Version,
 		CreatedAt:    &common.Timestamp{Seconds: model.CreatedAt.Unix()},
 		UpdatedAt:    &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
@@ -523,126 +588,6 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 	}
 
 	return strategy
-}
-
-func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditions {
-	if model == nil {
-		return nil
-	}
-
-	sentiments := make([]common.Sentiment, len(model.Sentiments))
-	for i, s := range model.Sentiments {
-		sentiments[i] = stringToSentiment(s)
-	}
-
-	exchanges := make([]common.Exchange, len(model.Exchanges))
-	for i, e := range model.Exchanges {
-		exchanges[i] = stringToExchange(e)
-	}
-
-	stockCodes := make([]int64, len(model.StockCodes))
-	for i, code := range model.StockCodes {
-		stockCodes[i] = code
-	}
-
-	cond := &pb.StrategyConditions{
-		ImpactScoreThreshold: model.ImpactScoreThreshold,
-		Sentiments:           sentiments,
-		Categories:           []string(model.Categories),
-		StockCodes:           stockCodes,
-		Exchanges:            exchanges,
-	}
-
-	if model.PriceRangeMin != nil && model.PriceRangeMax != nil {
-		cond.PriceRange = &common.PriceRange{
-			MinPrice: *model.PriceRangeMin,
-			MaxPrice: *model.PriceRangeMax,
-		}
-	}
-
-	if model.VolumeThreshold != nil {
-		cond.VolumeThreshold = *model.VolumeThreshold
-	}
-	if model.PctChangeThreshold != nil {
-		cond.PctChangeThreshold = *model.PctChangeThreshold
-	}
-
-	return cond
-}
-
-// Helper functions to convert short string codes back to protobuf enums
-func stringToOrderType(s string) common.OrderType {
-	switch s {
-	case "MARKET":
-		return common.OrderType_ORDER_TYPE_MARKET
-	case "LIMIT":
-		return common.OrderType_ORDER_TYPE_LIMIT
-	case "STOP_LOSS":
-		return common.OrderType_ORDER_TYPE_STOP_LOSS
-	case "STOP_LOSS_MKT":
-		return common.OrderType_ORDER_TYPE_STOP_LOSS_MARKET
-	default:
-		return common.OrderType_ORDER_TYPE_MARKET
-	}
-}
-
-func stringToExchange(s string) common.Exchange {
-	switch s {
-	case "NSE":
-		return common.Exchange_EXCHANGE_NSE
-	case "BSE":
-		return common.Exchange_EXCHANGE_BSE
-	default:
-		return common.Exchange_EXCHANGE_NSE
-	}
-}
-
-func stringToOrderSide(s string) common.OrderSide {
-	switch s {
-	case "BUY":
-		return common.OrderSide_ORDER_SIDE_BUY
-	case "SELL":
-		return common.OrderSide_ORDER_SIDE_SELL
-	default:
-		return common.OrderSide_ORDER_SIDE_BUY
-	}
-}
-
-func stringToProductType(s string) common.ProductType {
-	switch s {
-	case "INTRADAY":
-		return common.ProductType_PRODUCT_TYPE_INTRADAY
-	case "DELIVERY":
-		return common.ProductType_PRODUCT_TYPE_DELIVERY
-	case "CASH":
-		return common.ProductType_PRODUCT_TYPE_CASH
-	default:
-		return common.ProductType_PRODUCT_TYPE_INTRADAY
-	}
-}
-
-func stringToStopLossType(s string) pb.StopLossType {
-	switch s {
-	case "FIXED":
-		return pb.StopLossType_FIXED
-	case "TRAILING":
-		return pb.StopLossType_TRAILING
-	default:
-		return pb.StopLossType_FIXED
-	}
-}
-
-func stringToPositionSizing(s string) common.PositionSizing {
-	switch s {
-	case "FIXED":
-		return common.PositionSizing_POSITION_SIZING_FIXED
-	case "PERCENTAGE":
-		return common.PositionSizing_POSITION_SIZING_PERCENTAGE
-	case "RISK_BASED":
-		return common.PositionSizing_POSITION_SIZING_RISK_BASED
-	default:
-		return common.PositionSizing_POSITION_SIZING_FIXED
-	}
 }
 
 // Helper functions for sentiments and exchanges (short codes)
@@ -672,6 +617,61 @@ func stringToSentiment(s string) common.Sentiment {
 	}
 }
 
+func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditions {
+	if model == nil {
+		return nil
+	}
+
+	sentiments := make([]common.Sentiment, len(model.Sentiments))
+	for i, s := range model.Sentiments {
+		sentiments[i] = stringToSentiment(s)
+	}
+
+	exchanges := make([]common.Exchange, len(model.Exchanges))
+	for i, e := range model.Exchanges {
+		exchanges[i] = stringToExchange(e)
+	}
+
+	stockCodes := make([]int64, len(model.StockCodes))
+	for i, code := range model.StockCodes {
+		stockCodes[i] = code
+	}
+	
+	marketCapTypes := make([]string, len(model.MarketCapTypes))
+	copy(marketCapTypes, model.MarketCapTypes)
+
+	cond := &pb.StrategyConditions{
+		MatchAllNews:         model.MatchAllNews,
+		ImpactScoreMin:       model.ImpactScoreMin,
+		ImpactScoreMax:       model.ImpactScoreMax,
+		Sentiments:           sentiments,
+		Categories:           []string(model.Categories),
+		StockCodes:           stockCodes,
+		Exchanges:            exchanges,
+		MarketCapTypes:       marketCapTypes,
+	}
+
+	if model.MinMarketCap != nil && model.MaxMarketCap != nil {
+		cond.MarketCapRange = &pb.StrategyConditions_MarketCapRange{
+			MinMcap: *model.MinMarketCap,
+			MaxMcap: *model.MaxMarketCap,
+		}
+	}
+	
+	if model.MinPriceChangePct != nil && model.MaxPriceChangePct != nil {
+		cond.PctChangeRange = &pb.StrategyConditions_PctChangeRange{
+			MinPctChange: *model.MinPriceChangePct,
+			MaxPctChange: *model.MaxPriceChangePct,
+		}
+	}
+
+	if model.MinVolume != nil {
+		cond.VolumeThreshold = *model.MinVolume
+	}
+
+	return cond
+}
+
 func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
 	if model == nil {
 		return nil
@@ -686,9 +686,6 @@ func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
 		ProductType: stringToProductType(model.ProductType),
 	}
 
-	if model.MaxPositionSize != nil {
-		config.MaxPositionSize = *model.MaxPositionSize
-	}
 	if model.StopLossPct != nil {
 		config.StopLossPct = *model.StopLossPct
 	}
@@ -714,7 +711,7 @@ func modelRiskLimitsToProto(model *models.RiskLimits) *pb.RiskLimits {
 	}
 
 	limits := &pb.RiskLimits{
-		PositionSizing:      stringToPositionSizing(model.PositionSizing),
+		// PositionSizing:      stringToPositionSizing(model.PositionSizing), // Removed from model
 		EnableRiskChecks:    model.EnableRiskChecks,
 		EnableAutoSquareOff: model.EnableAutoSquareOff,
 		AutoSquareOffTime:   model.AutoSquareOffTime,

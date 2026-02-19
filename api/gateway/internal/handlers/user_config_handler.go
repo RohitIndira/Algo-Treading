@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/dto"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
@@ -24,8 +25,8 @@ func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHand
 
 // CreateStrategy handles POST /api/v1/strategies
 func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Request) {
-	var req pb.CreateStrategyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	var reqDTO dto.CreateStrategyRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
 		return
 	}
@@ -33,7 +34,6 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 	// Extract authentication headers from frontend
 	bearerToken := r.Header.Get("Authorization")
 	if bearerToken != "" {
-		// Remove "Bearer " prefix if present
 		bearerToken = strings.TrimPrefix(bearerToken, "Bearer ")
 	}
 
@@ -41,32 +41,59 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 	source := r.Header.Get("source")
 	userIdHeader := r.Header.Get("userId")
 
-	// Initialize IndiraAuth if not already set
-	if req.IndiraAuth == nil {
-		req.IndiraAuth = &common.IndiraAuthContext{}
-	}
+	// --- Security & Validation Checks ---
 
-	// Set auth fields from headers
-	if bearerToken != "" {
-		req.IndiraAuth.BearerToken = bearerToken
-	}
-	if appId != "" {
-		req.IndiraAuth.AppId = appId
-	}
-	if source != "" {
-		req.IndiraAuth.Source = source
-	}
-	if userIdHeader != "" {
-		req.IndiraAuth.UserId = userIdHeader
-	}
-
-	// Validate authentication data
-	if req.IndiraAuth.BearerToken == "" || req.IndiraAuth.AppId == "" || req.IndiraAuth.Source == "" {
-		respondWithError(w, http.StatusBadRequest, "Missing authentication headers: Authorization, appId, and source are required")
+	// 1. Header Validation
+	if bearerToken == "" || appId == "" || source == "" || userIdHeader == "" {
+		respondWithError(w, http.StatusUnauthorized, "Missing authentication headers: Authorization, appId, source, and userId are required")
 		return
 	}
 
-	resp, err := h.client.CreateStrategy(r.Context(), &req)
+	// 2. IDOR Protection: Body UserID must match Header UserID
+	if reqDTO.UserID != "" && reqDTO.UserID != userIdHeader {
+		respondWithError(w, http.StatusForbidden, "User ID mismatch between header and body")
+		return
+	}
+	// Force body UserID to match header if empty
+	reqDTO.UserID = userIdHeader
+
+	// 3. Input Sanitization (Basic)
+	// Implement stricter sanitization if needed. For now, we rely on Type safety and SQL parameters in backend.
+	// But we can check for obviously bad characters in strings if we wanted to.
+
+	// 4. Logic Validation
+	if reqDTO.StrategyName == "" {
+		respondWithError(w, http.StatusBadRequest, "Strategy name is required")
+		return
+	}
+	if reqDTO.Conditions != nil {
+		if reqDTO.Conditions.MinMarketCap > reqDTO.Conditions.MaxMarketCap && reqDTO.Conditions.MaxMarketCap > 0 {
+			respondWithError(w, http.StatusBadRequest, "Min Market Cap cannot be greater than Max Market Cap")
+			return
+		}
+		// Add more range checks here
+	}
+
+	// Map DTO to Proto
+	pbReq := &pb.CreateStrategyRequest{
+		UserId:              reqDTO.UserID,
+		StrategyName:        reqDTO.StrategyName,
+		Description:         reqDTO.Description,
+		ActivateImmediately: reqDTO.ActivateImmediately,
+		TradingMode:         mapTradingMode(reqDTO.TradingMode),
+		Conditions:          dtoConditionsToProto(reqDTO.Conditions),
+		TradeConfig:         dtoTradeConfigToProto(reqDTO.TradeConfig),
+		RiskLimits:          dtoRiskLimitsToProto(reqDTO.RiskLimits),
+		IndiraAuth: &common.IndiraAuthContext{
+			UserId:      userIdHeader,
+			AppId:       appId,
+			Source:      source,
+			BearerToken: bearerToken,
+		},
+	}
+
+	// Call Service
+	resp, err := h.client.CreateStrategy(r.Context(), pbReq)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to create strategy: "+err.Error())
 		return
@@ -85,16 +112,30 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
 
-	var req pb.UpdateStrategyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	var reqDTO dto.UpdateStrategyRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
 		return
 	}
 
-	// Override strategy_id from URL
-	req.StrategyId = strategyID
+	userIdHeader := r.Header.Get("userId")
+	if userIdHeader == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
 
-	resp, err := h.client.UpdateStrategy(r.Context(), &req)
+	// IDOR Protection
+	if reqDTO.UserID != "" && reqDTO.UserID != userIdHeader {
+		respondWithError(w, http.StatusForbidden, "User ID mismatch between header and body")
+		return
+	}
+	reqDTO.UserID = userIdHeader
+
+	// Map DTO to Proto
+	pbReq := dtoUpdateStrategyToProto(&reqDTO)
+	pbReq.StrategyId = strategyID
+
+	resp, err := h.client.UpdateStrategy(r.Context(), pbReq)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to update strategy: "+err.Error())
 		return
@@ -131,11 +172,12 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		statusCode := mapErrorCodeToHTTPStatus(resp.Error.Code)
+		respondWithError(w, statusCode, resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // GetStrategy handles GET /api/v1/strategies/{strategy_id}
@@ -161,7 +203,8 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusNotFound, resp.Error.Message)
+		statusCode := mapErrorCodeToHTTPStatus(resp.Error.Code)
+		respondWithError(w, statusCode, resp.Error.Message)
 		return
 	}
 

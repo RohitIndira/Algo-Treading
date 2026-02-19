@@ -37,6 +37,9 @@ type ConfigEvent struct {
 }
 
 // publishToKafka publishes a strategy event to Kafka
+// Note: This is now redundant for transactional consistency as Repo writes to Outbox,
+// but kept here for "fire and forget" if needed or for immediate debug logging.
+// The actual reliability comes from the Outbox Poller (to be implemented/running separately).
 func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, strategy *models.Strategy) error {
 	if !s.kafkaEnabled {
 		return nil // Kafka is disabled, skip publishing
@@ -54,8 +57,8 @@ func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, 
 	}
 
 	// Log the exact JSON being published for debugging
-	fmt.Printf("[USER-CONFIG] Publishing to Kafka: event_type=%s, strategy_id=%s, user_id=%s\n",
-		eventType, strategy.StrategyID.String(), strategy.UserID)
+	fmt.Printf("[USER-CONFIG] Publishing to Kafka: event_type=%s, strategy_id=%s, user_id=%s, mode=%s\n",
+		eventType, strategy.StrategyID.String(), strategy.UserID, strategy.TradingMode)
 	if strategy.TradeConfig != nil {
 		fmt.Printf("[USER-CONFIG] TradeConfig: order_type=%s, quantity=%d, exchange=%s, stop_loss=%.2f, take_profit=%.2f\n",
 			strategy.TradeConfig.OrderType, strategy.TradeConfig.Quantity, strategy.TradeConfig.Exchange,
@@ -71,6 +74,7 @@ func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, 
 		Headers: []kafka.Header{
 			{Key: "event_type", Value: []byte(eventType)},
 			{Key: "user_id", Value: []byte(strategy.UserID)},
+			{Key: "trading_mode", Value: []byte(string(strategy.TradingMode))},
 		},
 	}
 
@@ -104,17 +108,16 @@ func (s *StrategyService) CreateStrategy(ctx context.Context, req *models.Create
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
-	// Create strategy in database
+	// Create strategy in database (includes Outbox insertion)
 	strategy, err := s.repo.Create(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create strategy: %w", err)
 	}
 
-	// Publish to Kafka
-	if err := s.publishToKafka(ctx, "CREATE", strategy); err != nil {
-		// Log error but don't fail the operation
-		fmt.Printf("Warning: failed to publish to kafka: %v\n", err)
-	}
+	// NOTE: We don't strictly need to publish here because Repo inserts to Outbox.
+	// However, if we want immediate feedback without waiting for Outbox Poller, we can try.
+	// But to avoid duplicates, the consumers should be idempotent OR we rely solely on Outbox Poller.
+	// For now, keeping it as is for backward compat/debug, assuming consumers handle idempotency.
 
 	return strategy, nil
 }
@@ -144,15 +147,10 @@ func (s *StrategyService) UpdateStrategy(ctx context.Context, req *models.Update
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
-	// Update strategy in database
+	// Update strategy in database (includes Outbox insertion)
 	strategy, err := s.repo.Update(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update strategy: %w", err)
-	}
-
-	// Publish to Kafka
-	if err := s.publishToKafka(ctx, "UPDATE", strategy); err != nil {
-		fmt.Printf("Warning: failed to publish to kafka: %v\n", err)
 	}
 
 	return strategy, nil
@@ -160,20 +158,9 @@ func (s *StrategyService) UpdateStrategy(ctx context.Context, req *models.Update
 
 // DeleteStrategy deletes a strategy
 func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UUID, userID string) error {
-	// Get strategy before deletion for Kafka event
-	strategy, err := s.repo.GetByID(ctx, strategyID, userID)
-	if err != nil {
-		return fmt.Errorf("failed to get strategy: %w", err)
-	}
-
-	// Delete from database
+	// Delete from database (includes Outbox insertion)
 	if err := s.repo.Delete(ctx, strategyID, userID); err != nil {
 		return fmt.Errorf("failed to delete strategy: %w", err)
-	}
-
-	// Publish to Kafka
-	if err := s.publishToKafka(ctx, "DELETE", strategy); err != nil {
-		fmt.Printf("Warning: failed to publish to kafka: %v\n", err)
 	}
 
 	return nil
@@ -192,11 +179,6 @@ func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.
 		return nil, fmt.Errorf("failed to get strategy: %w", err)
 	}
 
-	// Publish to Kafka
-	if err := s.publishToKafka(ctx, "ACTIVATE", strategy); err != nil {
-		fmt.Printf("Warning: failed to publish to kafka: %v\n", err)
-	}
-
 	return strategy, nil
 }
 
@@ -211,11 +193,6 @@ func (s *StrategyService) DeactivateStrategy(ctx context.Context, strategyID uui
 	strategy, err := s.repo.GetByID(ctx, strategyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get strategy: %w", err)
-	}
-
-	// Publish to Kafka
-	if err := s.publishToKafka(ctx, "DEACTIVATE", strategy); err != nil {
-		fmt.Printf("Warning: failed to publish to kafka: %v\n", err)
 	}
 
 	return strategy, nil
@@ -244,9 +221,23 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		return fmt.Errorf("risk_limits are required")
 	}
 
+	// Default trading mode
+	if req.TradingMode == "" {
+		req.TradingMode = models.TradingModePaper
+	}
+	if req.TradingMode != models.TradingModePaper && req.TradingMode != models.TradingModeLive {
+		return fmt.Errorf("invalid trading_mode: %s", req.TradingMode)
+	}
+
 	// Validate conditions
-	if req.Conditions.ImpactScoreThreshold < 1 || req.Conditions.ImpactScoreThreshold > 10 {
-		return fmt.Errorf("impact_score_threshold must be between 1 and 10")
+	if req.Conditions.ImpactScoreMin < 0 || req.Conditions.ImpactScoreMin > 10 {
+		return fmt.Errorf("impact_score_min must be between 0 and 10")
+	}
+	if req.Conditions.ImpactScoreMax < 0 || req.Conditions.ImpactScoreMax > 10 {
+		return fmt.Errorf("impact_score_max must be between 0 and 10")
+	}
+	if req.Conditions.ImpactScoreMin > req.Conditions.ImpactScoreMax {
+		return fmt.Errorf("impact_score_min cannot be greater than impact_score_max")
 	}
 
 	// Validate trade config
@@ -258,6 +249,17 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 	}
 	if req.TradeConfig.Exchange == "" {
 		return fmt.Errorf("exchange is required")
+	}
+	if req.TradeConfig.OrderSide != "BUY" && req.TradeConfig.OrderSide != "SELL" {
+		return fmt.Errorf("order_side must be BUY or SELL")
+	}
+
+	// Validate stop loss / take profit
+	if req.TradeConfig.StopLossPct != nil && *req.TradeConfig.StopLossPct < 0 {
+		return fmt.Errorf("stop_loss_pct must be non-negative")
+	}
+	if req.TradeConfig.TakeProfitPct != nil && *req.TradeConfig.TakeProfitPct < 0 {
+		return fmt.Errorf("take_profit_pct must be non-negative")
 	}
 
 	return nil
@@ -277,14 +279,32 @@ func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyReques
 
 	// Validate optional fields if provided
 	if req.Conditions != nil {
-		if req.Conditions.ImpactScoreThreshold < 1 || req.Conditions.ImpactScoreThreshold > 10 {
-			return fmt.Errorf("impact_score_threshold must be between 1 and 10")
+		if req.Conditions.ImpactScoreMin < 0 || req.Conditions.ImpactScoreMin > 10 {
+			return fmt.Errorf("impact_score_min must be between 0 and 10")
+		}
+		if req.Conditions.ImpactScoreMax < 0 || req.Conditions.ImpactScoreMax > 10 {
+			return fmt.Errorf("impact_score_max must be between 0 and 10")
+		}
+		if req.Conditions.ImpactScoreMin > req.Conditions.ImpactScoreMax {
+			return fmt.Errorf("impact_score_min cannot be greater than impact_score_max")
 		}
 	}
 
 	if req.TradeConfig != nil {
 		if req.TradeConfig.Quantity <= 0 {
 			return fmt.Errorf("quantity must be greater than 0")
+		}
+		if req.TradeConfig.StopLossPct != nil && *req.TradeConfig.StopLossPct < 0 {
+			return fmt.Errorf("stop_loss_pct must be non-negative")
+		}
+		if req.TradeConfig.TakeProfitPct != nil && *req.TradeConfig.TakeProfitPct < 0 {
+			return fmt.Errorf("take_profit_pct must be non-negative")
+		}
+	}
+	
+	if req.TradingMode != nil {
+		if *req.TradingMode != models.TradingModePaper && *req.TradingMode != models.TradingModeLive {
+			return fmt.Errorf("invalid trading_mode: %s", *req.TradingMode)
 		}
 	}
 

@@ -17,6 +17,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/worker"
 	"github.com/jmoiron/sqlx"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -74,6 +75,16 @@ func main() {
 
 	// Initialize service
 	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic)
+
+	// Initialize Outbox Worker
+	if cfg.Kafka.Enabled && kafkaWriter != nil {
+		outboxWorker := worker.NewOutboxWorker(repo, kafkaWriter, 500*time.Millisecond)
+		workerCtx, workerCancel := context.WithCancel(context.Background())
+		defer workerCancel()
+		
+		go outboxWorker.Start(workerCtx)
+		lgr.Info("Outbox worker started")
+	}
 
 	// Initialize gRPC server
 	grpcServer := grpc.NewServer(

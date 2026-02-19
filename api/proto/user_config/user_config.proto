@@ -43,52 +43,56 @@ service UserConfigService {
   rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
 }
 
+// Trading Mode
+enum TradingMode {
+  TRADING_MODE_UNSPECIFIED = 0;
+  PAPER = 1; // Simulated trading
+  LIVE = 2;  // Real money trading
+}
+
 // Strategy condition filters
 message StrategyConditions {
-  // Match ALL news events (overrides all other conditions except impact_score_threshold)
-  // Set this to true to create a catch-all strategy
-  // Example: User sends "/all" to match every news event
+  // Match ALL news events (overrides all other conditions)
   bool match_all_news = 1;
   
-  // Impact score threshold (1-10)
-  // Even with match_all_news=true, news must meet minimum impact score
-  int32 impact_score_threshold = 2;
+  // Impact score range (0-100)
+  int32 impact_score_min = 2;
+  int32 impact_score_max = 3;
   
   // Sentiment filters (positive, neutral, negative)
-  // Ignored if match_all_news=true
-  repeated common.Sentiment sentiments = 3;
+  repeated common.Sentiment sentiments = 4;
   
   // News categories to monitor
-  // Ignored if match_all_news=true
-  repeated string categories = 4;
+  repeated string categories = 5;
   
   // Specific stocks to monitor (stock codes)
-  // Ignored if match_all_news=true
-  repeated int64 stock_codes = 5;
+  repeated int64 stock_codes = 6;
   
   // Price range filter
-  // Ignored if match_all_news=true
-  common.PriceRange price_range = 6;
+  common.PriceRange price_range = 7;
   
-  // Minimum trading volume threshold
-  // Ignored if match_all_news=true
-  int64 volume_threshold = 7;
-  
-  // Percentage change threshold (trigger if stock moves by this %)
-  // Ignored if match_all_news=true
-  double pct_change_threshold = 8;
-  
-  // Exchanges to monitor
-  // Ignored if match_all_news=true
-  repeated common.Exchange exchanges = 9;
+  // Market Cap Type (Small, Mid, Large)
+  repeated string market_cap_types = 8;
   
   // Market cap range filter (in crores)
-  // Ignored if match_all_news=true
   message MarketCapRange {
     double min_mcap = 1; // Minimum market cap in crores
     double max_mcap = 2; // Maximum market cap in crores
   }
-  MarketCapRange market_cap_range = 10;
+  MarketCapRange market_cap_range = 9;
+  
+  // Minimum trading volume threshold
+  int64 volume_threshold = 10;
+  
+  // Percentage change threshold range (trigger if stock moves within/outside this range)
+  message PctChangeRange {
+      double min_pct_change = 1;
+      double max_pct_change = 2;
+  }
+  PctChangeRange pct_change_range = 11;
+  
+  // Exchanges to monitor
+  repeated common.Exchange exchanges = 12;
 }
 
 // Stop loss type enumeration
@@ -103,65 +107,62 @@ message TradeConfig {
   // Order type (MARKET, LIMIT, etc.)
   common.OrderType order_type = 1;
   
-  // Fixed quantity to trade
-  int32 quantity = 2;
+  // Product type (INTRADAY, DELIVERY)
+  common.ProductType product_type = 2;
   
-  // Maximum position size (in rupees)
-  double max_position_size = 3;
+  // Validity (DAY, IOC)
+  string validity = 3;
   
-  // Stop loss percentage
-  double stop_loss_pct = 4;
-  
-  // Take profit percentage
-  double take_profit_pct = 5;
+  // Quantity to trade (Fixed quantity)
+  int32 quantity = 4;
   
   // Primary exchange for execution
-  common.Exchange exchange = 6;
+  common.Exchange exchange = 5;
   
   // Order side (BUY/SELL)
-  common.OrderSide order_side = 7;
+  common.OrderSide order_side = 6;
   
-  // Limit price (for LIMIT orders, optional)
-  double limit_price = 8;
+  // Stop loss percentage
+  double stop_loss_pct = 7;
   
-  // Validity (DAY, IOC, etc.)
-  string validity = 9;
+  // Take profit percentage
+  double take_profit_pct = 8;
   
   // Stop loss type (FIXED or TRAILING)
-  StopLossType stop_loss_type = 10;
+  StopLossType stop_loss_type = 9;
   
   // Trailing stop loss percentage (only applies when stop_loss_type=TRAILING)
-  // Example: 1.0 means trail by 1% as price moves in favorable direction
-  double trailing_sl_pct = 11;
+  double trailing_sl_pct = 10;
   
-  // Product type
-  common.ProductType product_type = 12;
-  
+  // Limit price (for LIMIT orders, optional)
+  double limit_price = 11;
+
   // Indira-specific fields
-  string instrument = 13;      // Instrument type: "STK", "OPT", "FUT", "IDX"
-  int32 lot_size = 14;         // Lot size (default: 1 for stocks)
-  int32 disclosed_qty = 15;    // Disclosed quantity (0 = not disclosed)
-  bool amo = 16;               // After Market Order flag
-  double bracket_order_stop_loss = 17;   // Bracket order stop loss (optional)
-  double bracket_order_target = 18;      // Bracket order target (optional)
+  string instrument = 12;      // Instrument type: "STK", "OPT", "FUT", "IDX"
+  int32 lot_size = 13;         // Lot size (default: 1 for stocks)
+  int32 disclosed_qty = 14;    // Disclosed quantity (0 = not disclosed)
+  bool amo = 15;               // After Market Order flag
+  double bracket_order_stop_loss = 16;   // Bracket order stop loss (optional)
+  double bracket_order_target = 17;      // Bracket order target (optional)
+  double max_position_size = 18; // Included for backward compatibility/validation
 }
 
 // Risk management limits
 message RiskLimits {
+  // Strategy ID link
+  string strategy_id = 1;
+
   // Maximum number of trades per day
-  int32 max_daily_trades = 1;
+  int32 max_daily_trades = 2;
   
-  // Maximum loss allowed per day (in rupees)
-  double max_loss_per_day = 2;
-  
-  // Position sizing strategy
-  common.PositionSizing position_sizing = 3;
+  // Maximum risk per trade (in rupees)
+  double max_per_trade_risk = 3;
   
   // Maximum portfolio exposure percentage
   double max_portfolio_exposure_pct = 4;
   
-  // Maximum per-trade risk (in rupees)
-  double max_per_trade_risk = 5;
+  // Maximum loss allowed per day (in rupees)
+  double max_loss_per_day = 5;
   
   // Enable risk checks
   bool enable_risk_checks = 6;
@@ -169,8 +170,11 @@ message RiskLimits {
   // Enable auto square-off at market close
   bool enable_auto_square_off = 7;
   
-  // Auto square-off time (format: "15:05" for 3:05 PM)
+  // Auto square-off time (format: "HH:MM" e.g., "15:05")
   string auto_square_off_time = 8;
+
+  // Position sizing strategy
+  common.PositionSizing position_sizing = 9;
 }
 
 // Trading strategy definition
@@ -190,23 +194,26 @@ message Strategy {
   // Is strategy active
   bool active = 5;
   
+  // Trading Mode (Paper or Live)
+  TradingMode trading_mode = 6;
+  
   // Strategy conditions
-  StrategyConditions conditions = 6;
+  StrategyConditions conditions = 7;
   
   // Trade configuration
-  TradeConfig trade_config = 7;
+  TradeConfig trade_config = 8;
   
   // Risk limits
-  RiskLimits risk_limits = 8;
+  RiskLimits risk_limits = 9;
   
   // Creation timestamp
-  common.Timestamp created_at = 9;
+  common.Timestamp created_at = 10;
   
   // Last update timestamp
-  common.Timestamp updated_at = 10;
+  common.Timestamp updated_at = 11;
   
   // Version for optimistic locking
-  int32 version = 11;
+  int32 version = 12;
 }
 
 message CreateStrategyRequest {
@@ -217,9 +224,10 @@ message CreateStrategyRequest {
     TradeConfig trade_config = 5;
     RiskLimits risk_limits = 6;
     bool activate_immediately = 7;
+    TradingMode trading_mode = 8;
     
     // Indira Securities authentication
-    common.IndiraAuthContext indira_auth = 8;
+    common.IndiraAuthContext indira_auth = 9;
 }
 
 message CreateStrategyResponse {
@@ -239,9 +247,10 @@ message UpdateStrategyRequest {
   optional StrategyConditions conditions = 5;
   optional TradeConfig trade_config = 6;
   optional RiskLimits risk_limits = 7;
+  optional TradingMode trading_mode = 8;
   
   // Version for optimistic locking
-  int32 version = 8;
+  int32 version = 9;
 }
 
 message UpdateStrategyResponse {
