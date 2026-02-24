@@ -140,7 +140,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	outboxQuery := `
 		INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 		VALUES ($1, $2, $3)`
-	
+
 	_, err = tx.ExecContext(ctx, outboxQuery, strategy.StrategyID, "STRATEGY_CREATED", payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert into execution outbox: %w", err)
@@ -368,7 +368,7 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 			outboxQuery := `
 				INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 				VALUES ($1, $2, $3)`
-			
+
 			_, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", payload)
 			if ctxErr != nil {
 				return nil, fmt.Errorf("failed to insert into execution outbox: %w", ctxErr)
@@ -396,10 +396,11 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 		UPDATE strategies 
 		SET deleted_at = CURRENT_TIMESTAMP, active = false, updated_at = CURRENT_TIMESTAMP 
 		WHERE strategy_id = $1 AND user_id = $2 
-		RETURNING strategy_id`
-	
+		RETURNING strategy_id, version`
+
 	var deletedID uuid.UUID
-	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&deletedID)
+	var currentVersion int32
+	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&deletedID, &currentVersion)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("strategy not found")
@@ -411,6 +412,7 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 	eventPayload := map[string]interface{}{
 		"strategy_id": strategyID,
 		"user_id":     userID,
+		"version":     uint64(currentVersion),
 		"active":      false,
 		"deleted":     true,
 	}
@@ -418,7 +420,7 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 	outboxQuery := `
 		INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 		VALUES ($1, $2, $3)`
-	
+
 	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DELETED", payload)
 	if err != nil {
 		return fmt.Errorf("failed to insert into execution outbox: %w", err)
@@ -436,15 +438,21 @@ func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID,
 	}
 	defer tx.Rollback()
 
-	query := `UPDATE strategies SET active = true, updated_at = CURRENT_TIMESTAMP WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id`
+	query := `UPDATE strategies SET active = true, updated_at = CURRENT_TIMESTAMP WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
 	var updatedID uuid.UUID
-	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID)
+	var currentVersion int32
+	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)
 	if err != nil {
 		return fmt.Errorf("failed to activate strategy: %w", err)
 	}
 
 	// Outbox
-	eventPayload := map[string]interface{}{"strategy_id": strategyID, "active": true}
+	eventPayload := map[string]interface{}{
+		"strategy_id": strategyID,
+		"user_id":     userID,
+		"version":     uint64(currentVersion),
+		"active":      true,
+	}
 	payload, _ := json.Marshal(eventPayload)
 	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
 	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_ACTIVATED", payload)
@@ -463,15 +471,21 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 	}
 	defer tx.Rollback()
 
-	query := `UPDATE strategies SET active = false, updated_at = CURRENT_TIMESTAMP WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id`
+	query := `UPDATE strategies SET active = false, updated_at = CURRENT_TIMESTAMP WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
 	var updatedID uuid.UUID
-	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID)
+	var currentVersion int32
+	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)
 	if err != nil {
 		return fmt.Errorf("failed to deactivate strategy: %w", err)
 	}
 
 	// Outbox
-	eventPayload := map[string]interface{}{"strategy_id": strategyID, "active": false}
+	eventPayload := map[string]interface{}{
+		"strategy_id": strategyID,
+		"user_id":     userID,
+		"version":     uint64(currentVersion),
+		"active":      false,
+	}
 	payload, _ := json.Marshal(eventPayload)
 	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
 	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DEACTIVATED", payload)

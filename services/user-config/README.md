@@ -161,7 +161,7 @@ DB_SSLMODE=disable
 # Kafka Configuration
 KAFKA_ENABLED=true
 KAFKA_BROKERS=localhost:9092
-KAFKA_TOPIC=user-configs
+KAFKA_TOPIC=user-config-events
 
 # Logging
 LOG_LEVEL=INFO  # DEBUG, INFO, WARN, ERROR
@@ -180,7 +180,7 @@ LOG_LEVEL=INFO  # DEBUG, INFO, WARN, ERROR
 | `DB_SSLMODE` | SSL mode | disable | No |
 | `KAFKA_ENABLED` | Enable Kafka publishing | true | No |
 | `KAFKA_BROKERS` | Kafka broker addresses | localhost:9092 | If Kafka enabled |
-| `KAFKA_TOPIC` | Kafka topic name | user-configs | If Kafka enabled |
+| `KAFKA_TOPIC` | Kafka topic name | user-config-events | If Kafka enabled |
 | `LOG_LEVEL` | Logging level | INFO | No |
 
 ## 🏃 Running the Service
@@ -352,7 +352,7 @@ The service publishes strategy configuration events to Kafka for consumption by 
 
 #### Kafka Topic
 
-Default topic: `user-configs`
+Default topic: `user-config-events`
 
 #### Consumer Integration
 

@@ -44,7 +44,7 @@ func Load() (*Config, error) {
 		Kafka: KafkaConfig{
 			Enabled: getEnvAsBool("KAFKA_ENABLED", true),
 			Brokers: getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
-			Topic:   getEnv("KAFKA_TOPIC", "user-configs"),
+			Topic:   getEnv("KAFKA_TOPIC", "user-config-events"),
 		},
 		LogLevel: getEnv("LOG_LEVEL", "INFO"),
 	}

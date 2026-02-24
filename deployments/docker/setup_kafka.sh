@@ -85,7 +85,7 @@ echo "${YELLOW}Step 5: Creating required topics for all services...${NC}"
 
 # Comprehensive array of all topics needed for the trading system
 topics=(
-    "user-configs"          # User Config Service - strategy updates
+    "user-config-events"         # User Config Service - strategy updates
     "news-events"           # Data Ingestion - incoming market news
     "trade-signals"         # Rules Engine - matched trading signals
     "trade-executions"      # Trade Execution - execution results
