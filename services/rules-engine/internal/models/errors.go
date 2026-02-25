@@ -23,9 +23,6 @@ var (
 	ErrInvalidPrice   = errors.New("invalid price")
 
 	// Processing errors
-	ErrNoMatchFound       = errors.New("no match found")
-	ErrRiskCheckFailed    = errors.New("risk check failed")
-	ErrPublishFailed      = errors.New("failed to publish order")
-	ErrCacheMiss          = errors.New("cache miss")
-	ErrElasticsearchQuery = errors.New("elasticsearch query failed")
+	ErrNoMatchFound = errors.New("no match found")
+	ErrCacheMiss    = errors.New("cache miss")
 )

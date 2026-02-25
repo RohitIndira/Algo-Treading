@@ -3,6 +3,7 @@ package config
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -10,9 +11,40 @@ import (
 )
 
 func init() {
-	// Load .env file if it exists
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using environment variables")
+	// Load .env file (best effort).
+	//
+	// We try multiple locations to avoid a common dev pitfall:
+	// running the binary from a different working directory.
+	//
+	// Priority:
+	//  1) ./.env               (current working dir)
+	//  2) <serviceRoot>/.env   (parent of ./bin)
+	//
+	// If nothing is found, we continue with OS env vars + defaults.
+	pathsToTry := []string{}
+
+	if wd, err := os.Getwd(); err == nil {
+		pathsToTry = append(pathsToTry, filepath.Join(wd, ".env"))
+	}
+
+	if exe, err := os.Executable(); err == nil {
+		// exe is typically .../services/data-ingestion/bin/data-ingestion
+		// service root is one level up from bin
+		serviceRoot := filepath.Dir(filepath.Dir(exe))
+		pathsToTry = append(pathsToTry, filepath.Join(serviceRoot, ".env"))
+	}
+
+	loaded := false
+	for _, p := range pathsToTry {
+		if err := godotenv.Overload(p); err == nil {
+			log.Printf("Loaded .env from %s", p)
+			loaded = true
+			break
+		}
+	}
+
+	if !loaded {
+		log.Println("No .env file found in expected locations, using environment variables")
 	}
 }
 
@@ -45,7 +77,7 @@ func Load() *Config {
 	topic := os.Getenv("KAFKA_TOPIC_NEWS")
 	if topic == "" {
 		// follow repo convention
-		topic = "market.data.news"
+		topic = "news-events"
 	}
 
 	db := os.Getenv("MONGO_DATABASE")

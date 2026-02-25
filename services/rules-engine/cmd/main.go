@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -12,26 +13,27 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/config"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/consumer"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/index"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
+	intkafka "github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/kafka"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/sync"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/userconfig"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/startup"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/utils"
 
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
 
 func main() {
-	// Load .env file if it exists
-	if err := godotenv.Load(); err != nil {
-		// .env file not found is not an error - we can use system env vars
-		fmt.Printf("Note: .env file not found, using system environment variables\n")
-	}
+	loadEnv()
+
+	// Create context bound to OS signals
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	// Load configuration
 	cfg, err := config.LoadConfig()
@@ -50,6 +52,22 @@ func main() {
 		zap.String("version", cfg.ServiceVersion),
 		zap.String("environment", cfg.Environment),
 		zap.Int("grpc_port", cfg.GRPCPort))
+
+	// Step 2: Initialize empty config store
+	store := configstore.New()
+
+	// Step 3: Connect to User Config gRPC with retry (hard requirement)
+	ucClient, err := startup.NewUserConfigClient(ctx, cfg.UserConfigGRPCAddr)
+	if err != nil {
+		logger.Fatal("FATAL: cannot connect to User Config gRPC", zap.Error(err))
+	}
+	defer ucClient.Close()
+
+	// Step 4: BulkLoad all active strategies (blocks)
+	bootstrapper := startup.NewBootstrapper(ucClient, store, logger)
+	if err := bootstrapper.Run(ctx); err != nil {
+		logger.Fatal("FATAL: bootstrap failed", zap.Error(err))
+	}
 
 	// Initialize matching statistics
 	stats := models.NewMatchingStats()
@@ -74,7 +92,7 @@ func main() {
 		logger.Info("Trade signal repository initialized successfully")
 	}
 
-	// Initialize Redis cache
+	// Initialize Redis cache (kept for LTP lookup + Pub/Sub)
 	logger.Info("Initializing Redis cache...")
 	redisCache, err := cache.NewRedisCache(
 		cfg.Redis.Addrs,
@@ -90,76 +108,7 @@ func main() {
 		logger.Fatal("Failed to initialize Redis cache", zap.Error(err))
 	}
 	defer redisCache.Close()
-
-	strategyCache := cache.NewStrategyCache(redisCache, cfg.Redis.CacheTTL, logger)
 	logger.Info("Redis cache initialized successfully")
-
-	// Initialize Elasticsearch indexer
-	logger.Info("Initializing Elasticsearch indexer...")
-	indexer, err := index.NewIndexer(
-		cfg.Elasticsearch.URLs,
-		cfg.Elasticsearch.Username,
-		cfg.Elasticsearch.Password,
-		cfg.Elasticsearch.IndexName,
-		logger,
-	)
-	if err != nil {
-		logger.Fatal("Failed to initialize Elasticsearch indexer", zap.Error(err))
-	}
-	defer indexer.Close()
-	logger.Info("Elasticsearch indexer initialized successfully")
-
-	// Initialize strategy syncer (loads strategies from Kafka user-configs topic)
-	logger.Info("Initializing strategy syncer...")
-	strategySyncer := sync.NewStrategySyncer(
-		cfg.Kafka.Brokers,
-		"user-configs",                  // Topic where user-config service publishes strategy events
-		"rules-engine-strategy-sync-v2", // Changed group to avoid replaying old DELETE events
-		indexer,
-		strategyCache,
-		logger,
-	)
-	defer strategySyncer.Close()
-	logger.Info("Strategy syncer initialized successfully")
-
-	// Initialize query engine
-	queryEngine := index.NewQueryEngine(
-		indexer.GetClient(),
-		cfg.Elasticsearch.IndexName,
-		cfg.Elasticsearch.Timeout,
-		logger,
-	)
-
-	// Initialize user-config client for fetching strategies
-	logger.Info("Initializing user-config client...")
-	userConfigClient, err := userconfig.NewClient(userconfig.Config{
-		Address:          cfg.GRPCClients.UserConfigService.Address,
-		Timeout:          cfg.GRPCClients.UserConfigService.Timeout,
-		MaxRetries:       cfg.GRPCClients.UserConfigService.MaxRetries,
-		RetryBackoff:     cfg.GRPCClients.UserConfigService.RetryBackoff,
-		KeepAlive:        cfg.GRPCClients.UserConfigService.KeepAlive,
-		KeepAliveTimeout: cfg.GRPCClients.UserConfigService.KeepAliveTimeout,
-	}, logger)
-	if err != nil {
-		logger.Warn("Failed to initialize user-config client - will rely only on cache",
-			zap.Error(err))
-		userConfigClient = nil
-	} else {
-		defer userConfigClient.Close()
-		logger.Info("User-config client initialized successfully")
-	}
-
-	// Initialize matcher
-	logger.Info("Initializing matcher engine...")
-	matcherEngine := matcher.NewMatcher(
-		queryEngine,
-		strategyCache,
-		userConfigClient,
-		cfg.Performance.MinMatchScore,
-		cfg.Performance.MaxConcurrentMatches,
-		logger,
-	)
-	logger.Info("Matcher engine initialized successfully")
 
 	// Initialize risk management client
 	logger.Info("Initializing risk management client...")
@@ -179,15 +128,6 @@ func main() {
 		defer riskClient.Close()
 		logger.Info("Risk management client initialized successfully")
 	}
-
-	// Initialize RabbitMQ publisher
-	logger.Info("Initializing RabbitMQ publisher...")
-	rabbitPub, err := publisher.NewPublisher(&cfg.RabbitMQ, logger)
-	if err != nil {
-		logger.Fatal("Failed to initialize RabbitMQ publisher", zap.Error(err))
-	}
-	defer rabbitPub.Close()
-	logger.Info("RabbitMQ publisher initialized successfully")
 
 	// Initialize Kafka publisher for trade-signals topic
 	logger.Info("Initializing Kafka publisher for trade-signals...")
@@ -219,39 +159,44 @@ func main() {
 		zap.String("status", marketHours.GetMarketStatus()))
 
 	// Initialize event handler
-	handler := consumer.NewHandler(matcherEngine, rabbitPub, kafkaPub, signalRepo, riskClient, redisCache, strategyCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours)
+	eng := engine.New(store, engine.Config{Workers: cfg.Performance.WorkerCount}, logger)
+	eng.Start(ctx)
+	// RabbitMQ is intentionally not initialized (Kafka-only publishing).
+	handler := consumer.NewHandler(eng, nil, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours)
 
-	// Initialize Kafka consumer
-	logger.Info("Initializing Kafka consumer...")
-	kafkaConsumer, err := consumer.NewConsumer(&cfg.Kafka, handler, stats, logger)
-	if err != nil {
-		logger.Fatal("Failed to initialize Kafka consumer", zap.Error(err))
-	}
-	defer kafkaConsumer.Close()
-	logger.Info("Kafka consumer initialized successfully")
+	// Step 5: Start config consumer BEFORE news consumer
+	configReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        cfg.Kafka.Brokers,
+		Topic:          cfg.Kafka.UserConfigTopic,
+		GroupID:        cfg.Kafka.UserConfigGroup,
+		MinBytes:       1,
+		MaxBytes:       10e6,
+		CommitInterval: time.Second,
+		StartOffset:    startOffsetFor(cfg.Kafka.ConfigOffsetReset, kafka.FirstOffset),
+	})
+	configConsumer := intkafka.NewConfigConsumer(configReader, store)
 
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Step 6: Start news consumer AFTER config consumer
+	newsReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        cfg.Kafka.Brokers,
+		Topic:          cfg.Kafka.Topic,
+		GroupID:        cfg.Kafka.ConsumerGroup,
+		MinBytes:       1,
+		MaxBytes:       cfg.Kafka.MaxBytes,
+		CommitInterval: cfg.Kafka.CommitInterval,
+		StartOffset:    startOffsetFor(cfg.Kafka.StartOffset, kafka.LastOffset),
+		MaxWait:        time.Second,
+	})
+	newsConsumer := intkafka.NewNewsConsumer(newsReader, handler, logger)
 
-	// Start strategy syncer (loads from Kafka user-configs topic)
-	go func() {
-		logger.Info("Starting strategy syncer from Kafka user-configs topic...")
-		if err := strategySyncer.Start(ctx); err != nil {
-			logger.Error("Strategy syncer error", zap.Error(err))
-		}
-	}()
+	lc := StartLive(ctx, eng, configConsumer, newsConsumer, configReader)
+	<-lc.ConfigConsumerStarted
+	logger.Info("Config consumer started")
+	<-lc.NewsConsumerStarted
+	logger.Info("News consumer started — system is LIVE")
 
-	// Start consuming market events from Kafka
-	go func() {
-		logger.Info("Starting to consume market events from Kafka",
-			zap.String("topic", cfg.Kafka.Topic),
-			zap.String("consumer_group", cfg.Kafka.ConsumerGroup))
-
-		if err := kafkaConsumer.Start(ctx); err != nil {
-			logger.Error("Kafka consumer error", zap.Error(err))
-		}
-	}()
+	// TODO: Start existing gRPC server (if any) - currently none in rules-engine.
+	// TODO: Start existing Redis Pub/Sub publisher - handled in consumer handler via redisCache.Publish.
 
 	// Log periodic statistics
 	go func() {
@@ -261,19 +206,12 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				syncStats := strategySyncer.GetStats()
 				logger.Info("Matching statistics",
 					zap.Int64("events_processed", stats.TotalEventsProcessed),
 					zap.Int64("matches_found", stats.TotalMatchesFound),
 					zap.Int64("orders_generated", stats.TotalOrdersGenerated),
 					zap.Int64("cache_hits", stats.CacheHits),
 					zap.Int64("cache_misses", stats.CacheMisses))
-				logger.Info("Strategy sync statistics",
-					zap.Int64("strategies_synced", syncStats.TotalProcessed),
-					zap.Int64("created", syncStats.Created),
-					zap.Int64("updated", syncStats.Updated),
-					zap.Int64("deleted", syncStats.Deleted),
-					zap.Int64("sync_errors", syncStats.Errors))
 			case <-ctx.Done():
 				return
 			}
@@ -281,16 +219,16 @@ func main() {
 	}()
 
 	logger.Info("Rules Engine Service started successfully",
-		zap.Int("worker_count", cfg.Performance.WorkerCount),
-		zap.Float64("min_match_score", cfg.Performance.MinMatchScore))
+		zap.Int("worker_count", cfg.Performance.WorkerCount))
 
-	// Wait for interrupt signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	// Wait for shutdown signal
+	<-ctx.Done()
+	logger.Info("Shutdown received — stopping news consumer then draining worker pool")
 
-	<-sigCh
-	logger.Info("Received shutdown signal, starting graceful shutdown...") // Cancel context to stop all goroutines
-	cancel()
+	// Stop news consumer first (stop submitting new jobs), drain engine, then stop config consumer.
+	lc.StopNewsFirstThenDrainEngineThenStopConfig()
+	logger.Info("Worker pool drained")
+	logger.Info("Config consumer stopped")
 
 	// Give some time for graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -307,4 +245,34 @@ func main() {
 		zap.Int64("total_errors", stats.EvaluationErrors+stats.KafkaErrors+stats.RabbitMQErrors))
 
 	logger.Info("Rules Engine Service shutdown complete")
+}
+
+func loadEnv() {
+	// Try current working directory first.
+	if err := godotenv.Overload(".env"); err == nil {
+		fmt.Printf("Loaded .env from %s\n", filepath.Join(".", ".env"))
+		return
+	}
+
+	// Try directory of the running binary (so ./bin/rules-engine finds ../.env).
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), ".env")
+		if err := godotenv.Overload(candidate); err == nil {
+			fmt.Printf("Loaded .env from %s\n", candidate)
+			return
+		}
+	}
+
+	fmt.Printf("Note: .env file not found, using system environment variables\n")
+}
+
+func startOffsetFor(v string, defaultOffset int64) int64 {
+	switch v {
+	case "earliest":
+		return kafka.FirstOffset
+	case "latest":
+		return kafka.LastOffset
+	default:
+		return defaultOffset
+	}
 }

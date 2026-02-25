@@ -23,10 +23,6 @@ type MatchingStats struct {
 	CacheHits   int64
 	CacheMisses int64
 
-	// Elasticsearch statistics
-	ESQueries          int64
-	TotalESQueryTimeMs int64
-
 	// Error statistics
 	EvaluationErrors int64
 	KafkaErrors      int64
@@ -96,12 +92,6 @@ func (s *MatchingStats) IncrementCacheMisses() {
 	atomic.AddInt64(&s.CacheMisses, 1)
 }
 
-// AddESQueryTime atomically adds ES query time
-func (s *MatchingStats) AddESQueryTime(durationMs int64) {
-	atomic.AddInt64(&s.TotalESQueryTimeMs, durationMs)
-	atomic.AddInt64(&s.ESQueries, 1)
-}
-
 // IncrementEvaluationErrors atomically increments evaluation errors
 func (s *MatchingStats) IncrementEvaluationErrors() {
 	atomic.AddInt64(&s.EvaluationErrors, 1)
@@ -156,16 +146,6 @@ func (s *MatchingStats) GetAvgEvaluationTime() float64 {
 		return 0
 	}
 	total := atomic.LoadInt64(&s.TotalEvaluationTimeMs)
-	return float64(total) / float64(count)
-}
-
-// GetAvgESQueryTime returns average ES query time
-func (s *MatchingStats) GetAvgESQueryTime() float64 {
-	count := atomic.LoadInt64(&s.ESQueries)
-	if count == 0 {
-		return 0
-	}
-	total := atomic.LoadInt64(&s.TotalESQueryTimeMs)
 	return float64(total) / float64(count)
 }
 
@@ -249,8 +229,6 @@ func (s *MatchingStats) Reset() {
 	atomic.StoreInt64(&s.EvaluationCount, 0)
 	atomic.StoreInt64(&s.CacheHits, 0)
 	atomic.StoreInt64(&s.CacheMisses, 0)
-	atomic.StoreInt64(&s.ESQueries, 0)
-	atomic.StoreInt64(&s.TotalESQueryTimeMs, 0)
 	atomic.StoreInt64(&s.EvaluationErrors, 0)
 	atomic.StoreInt64(&s.KafkaErrors, 0)
 	atomic.StoreInt64(&s.RabbitMQErrors, 0)

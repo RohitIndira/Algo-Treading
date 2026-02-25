@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"strconv"
+
 	"github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
@@ -332,6 +334,54 @@ func (s *UserConfigServer) GetStrategiesByIDs(ctx context.Context, req *pb.GetSt
 	}, nil
 }
 
+// GetAllActiveStrategies returns ALL active strategies in a paginated manner.
+// This is used by Rule Engine at startup for BulkLoad.
+func (s *UserConfigServer) GetAllActiveStrategies(ctx context.Context, req *pb.GetAllActiveStrategiesRequest) (*pb.GetAllActiveStrategiesResponse, error) {
+	pageSize := int(req.GetPageSize())
+	if pageSize <= 0 {
+		pageSize = 500
+	}
+	if pageSize > 2000 {
+		pageSize = 2000
+	}
+
+	offset := 0
+	if req.GetPageToken() != "" {
+		o, err := strconv.Atoi(req.GetPageToken())
+		if err != nil || o < 0 {
+			return &pb.GetAllActiveStrategiesResponse{
+				Success: false,
+				Error:   &common.Error{Code: "INVALID_PAGE_TOKEN", Message: "page_token must be an integer offset"},
+			}, nil
+		}
+		offset = o
+	}
+
+	strategies, err := s.service.ListAllActiveStrategies(ctx, pageSize, offset)
+	if err != nil {
+		return &pb.GetAllActiveStrategiesResponse{
+			Success: false,
+			Error:   &common.Error{Code: "LIST_FAILED", Message: err.Error()},
+		}, nil
+	}
+
+	protoStrategies := make([]*pb.Strategy, 0, len(strategies))
+	for _, st := range strategies {
+		protoStrategies = append(protoStrategies, modelStrategyToProto(st))
+	}
+
+	nextToken := ""
+	if len(strategies) == pageSize {
+		nextToken = strconv.Itoa(offset + pageSize)
+	}
+
+	return &pb.GetAllActiveStrategiesResponse{
+		Success:       true,
+		Strategies:    protoStrategies,
+		NextPageToken: nextToken,
+	}, nil
+}
+
 // HealthCheck performs a health check
 func (s *UserConfigServer) HealthCheck(ctx context.Context, req *common.HealthCheckRequest) (*common.HealthCheckResponse, error) {
 	return &common.HealthCheckResponse{
@@ -362,35 +412,35 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 	for i, code := range proto.StockCodes {
 		stockCodes[i] = code
 	}
-	
+
 	marketCapTypes := make(pq.StringArray, len(proto.MarketCapTypes))
 	copy(marketCapTypes, proto.MarketCapTypes)
 
 	cond := &models.StrategyCondition{
-		MatchAllNews:         proto.MatchAllNews,
-		ImpactScoreMin:       proto.ImpactScoreMin,
-		ImpactScoreMax:       proto.ImpactScoreMax,
-		Sentiments:           sentiments,
-		Categories:           pq.StringArray(proto.Categories),
-		StockCodes:           stockCodes,
-		MinVolume:            &proto.VolumeThreshold, // Mapped from VolumeThreshold
-		Exchanges:            exchanges,
-		MarketCapTypes:       marketCapTypes,
+		MatchAllNews:   proto.MatchAllNews,
+		ImpactScoreMin: proto.ImpactScoreMin,
+		ImpactScoreMax: proto.ImpactScoreMax,
+		Sentiments:     sentiments,
+		Categories:     pq.StringArray(proto.Categories),
+		StockCodes:     stockCodes,
+		MinVolume:      &proto.VolumeThreshold, // Mapped from VolumeThreshold
+		Exchanges:      exchanges,
+		MarketCapTypes: marketCapTypes,
 	}
 
 	// PriceRange fields not present in DB/Model yet.
 	/*
-	if proto.PriceRange != nil {
-		cond.PriceRangeMin = &proto.PriceRange.MinPrice
-		cond.PriceRangeMax = &proto.PriceRange.MaxPrice
-	}
+		if proto.PriceRange != nil {
+			cond.PriceRangeMin = &proto.PriceRange.MinPrice
+			cond.PriceRangeMax = &proto.PriceRange.MaxPrice
+		}
 	*/
 
 	if proto.MarketCapRange != nil {
 		cond.MinMarketCap = &proto.MarketCapRange.MinMcap
 		cond.MaxMarketCap = &proto.MarketCapRange.MaxMcap
 	}
-	
+
 	if proto.PctChangeRange != nil {
 		cond.MinPriceChangePct = &proto.PctChangeRange.MinPctChange
 		cond.MaxPriceChangePct = &proto.PctChangeRange.MaxPctChange
@@ -502,17 +552,17 @@ func protoTradeConfigToModel(proto *pb.TradeConfig) *models.TradeConfig {
 	}
 
 	config := &models.TradeConfig{
-		OrderType:       orderTypeToString(proto.OrderType),
-		Quantity:        proto.Quantity,
-		StopLossPct:     &proto.StopLossPct,
-		TakeProfitPct:   &proto.TakeProfitPct,
-		Exchange:        exchangeToString(proto.Exchange),
-		OrderSide:       orderSideToString(proto.OrderSide),
-		LimitPrice:      &proto.LimitPrice,
-		Validity:        proto.Validity,
-		StopLossType:    stopLossTypeToString(proto.StopLossType),
-		TrailingSLPct:   &proto.TrailingSlPct,
-		ProductType:     productTypeToString(proto.ProductType),
+		OrderType:     orderTypeToString(proto.OrderType),
+		Quantity:      proto.Quantity,
+		StopLossPct:   &proto.StopLossPct,
+		TakeProfitPct: &proto.TakeProfitPct,
+		Exchange:      exchangeToString(proto.Exchange),
+		OrderSide:     orderSideToString(proto.OrderSide),
+		LimitPrice:    &proto.LimitPrice,
+		Validity:      proto.Validity,
+		StopLossType:  stopLossTypeToString(proto.StopLossType),
+		TrailingSLPct: &proto.TrailingSlPct,
+		ProductType:   productTypeToString(proto.ProductType),
 	}
 
 	return config
@@ -524,31 +574,31 @@ func protoRiskLimitsToModel(proto *pb.RiskLimits) *models.RiskLimits {
 	}
 
 	limits := &models.RiskLimits{
-		MaxDailyTrades:          &proto.MaxDailyTrades,
-		MaxLossPerDay:           &proto.MaxLossPerDay,
+		MaxDailyTrades: &proto.MaxDailyTrades,
+		MaxLossPerDay:  &proto.MaxLossPerDay,
 		// PositionSizing:          positionSizingToString(proto.PositionSizing), // Check if model has this field. Yes it does.
 		// Wait, did I keep PositionSizing in model?
 		// Let's check step 91. RiskLimits struct:
 		/*
-		type RiskLimits struct {
-			// ...
-			// PositionSizing string // I removed it in Step 91?
-			// Checking Step 91 content for RiskLimits...
-			// In Step 91, RiskLimits does NOT have PositionSizing!
-			// Creating RiskLimits struct in step 91:
-			// RiskLimits struct {
-			// 	RiskLimitID             uuid.UUID `db:"risk_limit_id" json:"risk_limit_id"`
-			// 	StrategyID              uuid.UUID `db:"strategy_id" json:"strategy_id"`
-			// 	MaxDailyTrades          *int32    `db:"max_daily_trades" json:"max_daily_trades,omitempty"`
-			// 	MaxPerTradeRisk         *float64  `db:"max_per_trade_risk" json:"max_per_trade_risk,omitempty"`
-			// 	MaxPortfolioExposurePct *float64  `db:"max_portfolio_exposure_pct" json:"max_portfolio_exposure_pct,omitempty"`
-			// 	MaxLossPerDay           *float64  `db:"max_loss_per_day" json:"max_loss_per_day,omitempty"`
-			// 	EnableRiskChecks        bool      `db:"enable_risk_checks" json:"enable_risk_checks"`
-			// 	EnableAutoSquareOff     bool      `db:"enable_auto_square_off" json:"enable_auto_square_off"`
-			// 	AutoSquareOffTime       string    `db:"auto_square_off_time" json:"auto_square_off_time"`
-			// 	CreatedAt               time.Time `db:"created_at" json:"created_at"`
-			// }
-			// So PositionSizing is NOT in model.
+			type RiskLimits struct {
+				// ...
+				// PositionSizing string // I removed it in Step 91?
+				// Checking Step 91 content for RiskLimits...
+				// In Step 91, RiskLimits does NOT have PositionSizing!
+				// Creating RiskLimits struct in step 91:
+				// RiskLimits struct {
+				// 	RiskLimitID             uuid.UUID `db:"risk_limit_id" json:"risk_limit_id"`
+				// 	StrategyID              uuid.UUID `db:"strategy_id" json:"strategy_id"`
+				// 	MaxDailyTrades          *int32    `db:"max_daily_trades" json:"max_daily_trades,omitempty"`
+				// 	MaxPerTradeRisk         *float64  `db:"max_per_trade_risk" json:"max_per_trade_risk,omitempty"`
+				// 	MaxPortfolioExposurePct *float64  `db:"max_portfolio_exposure_pct" json:"max_portfolio_exposure_pct,omitempty"`
+				// 	MaxLossPerDay           *float64  `db:"max_loss_per_day" json:"max_loss_per_day,omitempty"`
+				// 	EnableRiskChecks        bool      `db:"enable_risk_checks" json:"enable_risk_checks"`
+				// 	EnableAutoSquareOff     bool      `db:"enable_auto_square_off" json:"enable_auto_square_off"`
+				// 	AutoSquareOffTime       string    `db:"auto_square_off_time" json:"auto_square_off_time"`
+				// 	CreatedAt               time.Time `db:"created_at" json:"created_at"`
+				// }
+				// So PositionSizing is NOT in model.
 		*/
 		MaxPortfolioExposurePct: &proto.MaxPortfolioExposurePct,
 		MaxPerTradeRisk:         &proto.MaxPerTradeRisk,
@@ -636,19 +686,19 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 	for i, code := range model.StockCodes {
 		stockCodes[i] = code
 	}
-	
+
 	marketCapTypes := make([]string, len(model.MarketCapTypes))
 	copy(marketCapTypes, model.MarketCapTypes)
 
 	cond := &pb.StrategyConditions{
-		MatchAllNews:         model.MatchAllNews,
-		ImpactScoreMin:       model.ImpactScoreMin,
-		ImpactScoreMax:       model.ImpactScoreMax,
-		Sentiments:           sentiments,
-		Categories:           []string(model.Categories),
-		StockCodes:           stockCodes,
-		Exchanges:            exchanges,
-		MarketCapTypes:       marketCapTypes,
+		MatchAllNews:   model.MatchAllNews,
+		ImpactScoreMin: model.ImpactScoreMin,
+		ImpactScoreMax: model.ImpactScoreMax,
+		Sentiments:     sentiments,
+		Categories:     []string(model.Categories),
+		StockCodes:     stockCodes,
+		Exchanges:      exchanges,
+		MarketCapTypes: marketCapTypes,
 	}
 
 	if model.MinMarketCap != nil && model.MaxMarketCap != nil {
@@ -657,7 +707,7 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 			MaxMcap: *model.MaxMarketCap,
 		}
 	}
-	
+
 	if model.MinPriceChangePct != nil && model.MaxPriceChangePct != nil {
 		cond.PctChangeRange = &pb.StrategyConditions_PctChangeRange{
 			MinPctChange: *model.MinPriceChangePct,

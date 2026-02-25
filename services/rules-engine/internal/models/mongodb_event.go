@@ -8,37 +8,42 @@ import (
 
 // MongoDBEvent represents the actual MongoDB document structure
 type MongoDBEvent struct {
-	ID            interface{}            `json:"_id"`
-	Stock         interface{}            `json:"stock"`    // Can be string or number
-	Code          interface{}            `json:"code"`     // NSE stock code (when NSE is active)
-	BSECode       interface{}            `json:"bsecode"`  // BSE stock code (when only BSE is active)
-	Token         interface{}            `json:"token"`    // Token field set by data-ingestion (code for NSE, bsecode for BSE)
-	Symbol        string                 `json:"symbol"`   // Stock symbol
-	Exchange      string                 `json:"exchange"` // Exchange (NSE/BSE)
-	NewsID        string                 `json:"news_id"`
-	NewsLink      string                 `json:"news link"` // Note: space in field name
-	Impact        string                 `json:"impact"`
-	ImpactScore   interface{}            `json:"impact score"` // Note: space in field name
-	Sentiment     string                 `json:"sentiment"`
-	Category      string                 `json:"category"`
-	ShortSummary  string                 `json:"short summary"` // Note: space in field name
-	DtTm          interface{}            `json:"dt_tm"`
-	Company       string                 `json:"company"`     // ISIN
-	CompanyName   string                 `json:"companyname"` // Company name
-	SymbolMap     map[string]interface{} `json:"symbolmap"`
-	LastTraded    interface{}            `json:"LastTradedPrice"`
-	PctChange     interface{}            `json:"pct_change"`
-	DocumentDate  string                 `json:"document_date"`
-	NewsFirst     interface{}            `json:"NewsFirstPrice"`
-	NewsPctChange interface{}            `json:"news_pct_change"`
-	PriceMap      map[string]interface{} `json:"pricemap"`
+	ID              interface{}            `json:"_id"`
+	Stock           interface{}            `json:"stock"`    // Can be string or number
+	Code            interface{}            `json:"code"`     // NSE stock code (when NSE is active)
+	NSECode         interface{}            `json:"nsecode"`  // Alternate NSE code field
+	BSECode         interface{}            `json:"bsecode"`  // BSE stock code (when only BSE is active)
+	Token           interface{}            `json:"token"`    // Token field set by data-ingestion (code for NSE, bsecode for BSE)
+	Symbol          string                 `json:"symbol"`   // Stock symbol
+	Exchange        string                 `json:"exchange"` // Exchange (NSE/BSE)
+	NewsID          string                 `json:"news_id"`
+	NewsIDAlt       string                 `json:"newsid"`
+	NewsLink        string                 `json:"news link"` // Note: space in field name
+	Impact          string                 `json:"impact"`
+	ImpactScore     interface{}            `json:"impact score"` // Note: space in field name
+	ImpactScoreAlt  interface{}            `json:"impactscore"`
+	Sentiment       string                 `json:"sentiment"`
+	Category        string                 `json:"category"`
+	ShortSummary    string                 `json:"short summary"` // Note: space in field name
+	DtTm            interface{}            `json:"dt_tm"`
+	DtTmAlt         interface{}            `json:"dttm"`
+	Company         string                 `json:"company"`     // ISIN
+	CompanyName     string                 `json:"companyname"` // Company name
+	SymbolMap       map[string]interface{} `json:"symbolmap"`
+	LastTraded      interface{}            `json:"LastTradedPrice"`
+	PctChange       interface{}            `json:"pct_change"`
+	DocumentDate    string                 `json:"document_date"`
+	DocumentDateAlt string                 `json:"documentdate"`
+	NewsFirst       interface{}            `json:"NewsFirstPrice"`
+	NewsPctChange   interface{}            `json:"news_pct_change"`
+	PriceMap        map[string]interface{} `json:"pricemap"`
 }
 
 // ToMarketEvent converts MongoDB event to MarketEvent
 func (m *MongoDBEvent) ToMarketEvent() (*MarketEvent, error) {
 	event := &MarketEvent{}
 
-	// Extract event_id from MongoDB _id
+	// Extract event_id: prefer producer-supplied news id
 	event.EventID = m.extractEventID()
 	if event.EventID == "" {
 		return nil, fmt.Errorf("failed to extract event ID")
@@ -66,6 +71,13 @@ func (m *MongoDBEvent) ToMarketEvent() (*MarketEvent, error) {
 }
 
 func (m *MongoDBEvent) extractEventID() string {
+	if m.NewsIDAlt != "" {
+		return m.NewsIDAlt
+	}
+	if m.NewsID != "" {
+		return m.NewsID
+	}
+
 	if m.ID == nil {
 		return ""
 	}
@@ -82,6 +94,11 @@ func (m *MongoDBEvent) extractEventID() string {
 }
 
 func (m *MongoDBEvent) extractTimestamp() time.Time {
+	if m.DtTm == nil && m.DtTmAlt != nil {
+		// accept alternate field
+		t := m.DtTmAlt
+		m.DtTm = t
+	}
 	if m.DtTm == nil {
 		return time.Now()
 	}
@@ -136,6 +153,9 @@ func (m *MongoDBEvent) mapStockData() StockData {
 	// NSE code from 'code' field
 	if m.Code != nil {
 		sd.NSECode = m.toInt64(m.Code)
+	}
+	if sd.NSECode == 0 && m.NSECode != nil {
+		sd.NSECode = m.toInt64(m.NSECode)
 	}
 
 	// BSE code from 'bsecode' field
@@ -202,7 +222,11 @@ func (m *MongoDBEvent) extractCompanyName() string {
 func (m *MongoDBEvent) mapNewsData() NewsData {
 	// Parse document date
 	var docDate time.Time
-	if m.DocumentDate != "" {
+	docDateStr := m.DocumentDate
+	if docDateStr == "" {
+		docDateStr = m.DocumentDateAlt
+	}
+	if docDateStr != "" {
 		// Try multiple formats
 		formats := []string{
 			"2006-01-02 15:04:05",
@@ -210,7 +234,7 @@ func (m *MongoDBEvent) mapNewsData() NewsData {
 			"2006-01-02T15:04:05Z",
 		}
 		for _, format := range formats {
-			if t, err := time.Parse(format, m.DocumentDate); err == nil {
+			if t, err := time.Parse(format, docDateStr); err == nil {
 				docDate = t
 				break
 			}
@@ -218,7 +242,7 @@ func (m *MongoDBEvent) mapNewsData() NewsData {
 	}
 
 	return NewsData{
-		NewsID:       m.NewsID,
+		NewsID:       firstNonEmpty(m.NewsIDAlt, m.NewsID),
 		NewsLink:     m.NewsLink,
 		Category:     m.Category,
 		ShortSummary: m.ShortSummary,
@@ -227,11 +251,24 @@ func (m *MongoDBEvent) mapNewsData() NewsData {
 }
 
 func (m *MongoDBEvent) mapAnalysis() Analysis {
+	impactScore := m.ImpactScore
+	if impactScore == nil {
+		impactScore = m.ImpactScoreAlt
+	}
 	return Analysis{
 		Sentiment:   m.Sentiment,
 		Impact:      m.Impact,
-		ImpactScore: int32(m.toInt64(m.ImpactScore)),
+		ImpactScore: int32(m.toInt64(impactScore)),
 	}
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func (m *MongoDBEvent) mapMarketData() MarketData {
