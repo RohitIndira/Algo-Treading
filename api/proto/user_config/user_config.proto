@@ -32,6 +32,10 @@ service UserConfigService {
   
   // Get user strategies in bulk (for internal services)
   rpc GetStrategiesByIDs(GetStrategiesByIDsRequest) returns (GetStrategiesByIDsResponse);
+
+  // Bulk-load ALL active strategies (for Rule Engine startup)
+  // NOTE: This is paginated to avoid huge responses.
+  rpc GetAllActiveStrategies(GetAllActiveStrategiesRequest) returns (GetAllActiveStrategiesResponse);
   
   // Update user credentials (bearer token, app_id, source)
   rpc UpdateUserCredentials(UpdateUserCredentialsRequest) returns (UpdateUserCredentialsResponse);
@@ -41,6 +45,19 @@ service UserConfigService {
   
   // Health check
   rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+}
+
+// Get all active strategies (paginated)
+message GetAllActiveStrategiesRequest {
+  int32 page_size = 1;   // recommended: 500
+  string page_token = 2; // opaque cursor; empty for first page
+}
+
+message GetAllActiveStrategiesResponse {
+  bool success = 1;
+  repeated Strategy strategies = 2;
+  string next_page_token = 3; // empty means last page
+  common.Error error = 4;
 }
 
 // Trading Mode

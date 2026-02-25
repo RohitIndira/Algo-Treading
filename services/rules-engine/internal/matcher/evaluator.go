@@ -90,8 +90,15 @@ func (e *Evaluator) evaluateMatchAllStrategy(event *models.MarketEvent, strategy
 func (e *Evaluator) evaluateImpactScore(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
 	condition := "impact_score"
 
-	// Event impact score must be >= strategy threshold
-	if event.Analysis.ImpactScore >= strategy.Conditions.ImpactScoreThreshold {
+	min := strategy.Conditions.ImpactScoreMin
+	max := strategy.Conditions.ImpactScoreMax
+	// if max is unset (0), treat as 10
+	if max == 0 {
+		max = 10
+	}
+
+	// Event impact score must be within [min,max]
+	if event.Analysis.ImpactScore >= min && event.Analysis.ImpactScore <= max {
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 
 		// Score based on how much the impact exceeds threshold
@@ -234,23 +241,46 @@ func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *model
 	condition := "pct_change"
 
 	absPctChange := math.Abs(event.MarketData.PctChange)
-	threshold := strategy.Conditions.PctChangeThreshold
+	min := strategy.Conditions.MinPctChange
+	max := strategy.Conditions.MaxPctChange
 
-	// If threshold is 0, no percent change filter
-	if threshold == 0 {
+	// If both are 0, no percent change filter
+	if min == 0 && max == 0 {
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 		result.ConditionScores[condition] = 100.0
 		return
 	}
+	// if max is 0, treat as infinity
+	if max == 0 {
+		max = math.MaxFloat64
+	}
 
-	// Absolute percent change must be >= threshold
-	if absPctChange >= threshold {
+	// Absolute percent change must be within [min,max]
+	if absPctChange >= min && absPctChange <= max {
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 
-		// Score based on how much change exceeds threshold
-		// Diminishing returns after 2x threshold
-		ratio := absPctChange / threshold
-		score := math.Min(ratio, 2.0) / 2.0 * 100.0
+		// Score based on how far into range it is. If max is infinity, score by min.
+		if max == math.MaxFloat64 {
+			ratio := 1.0
+			if min > 0 {
+				ratio = absPctChange / min
+			}
+			score := math.Min(ratio, 2.0) / 2.0 * 100.0
+			result.ConditionScores[condition] = score
+			return
+		}
+		span := max - min
+		if span <= 0 {
+			result.ConditionScores[condition] = 100.0
+			return
+		}
+		score := (absPctChange - min) / span * 100.0
+		if score < 0 {
+			score = 0
+		}
+		if score > 100 {
+			score = 100
+		}
 		result.ConditionScores[condition] = score
 	} else {
 		result.FailedConditions = append(result.FailedConditions, condition)

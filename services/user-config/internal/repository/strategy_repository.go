@@ -17,6 +17,55 @@ type StrategyRepository struct {
 	db *sqlx.DB
 }
 
+// ListAllActive returns a page of active, non-deleted strategies.
+// Ordered by updated_at DESC for stable pagination.
+func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offset int) ([]*models.Strategy, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	strategies := []*models.Strategy{}
+	query := `
+		SELECT *
+		FROM strategies
+		WHERE active = true AND deleted_at IS NULL
+		ORDER BY updated_at DESC
+		LIMIT $1 OFFSET $2`
+
+	if err := r.db.SelectContext(ctx, &strategies, query, limit, offset); err != nil {
+		return nil, fmt.Errorf("failed to list active strategies: %w", err)
+	}
+
+	// Load related data for each strategy
+	for _, strategy := range strategies {
+		condition := &models.StrategyCondition{}
+		condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
+		err := r.db.GetContext(ctx, condition, condQuery, strategy.StrategyID)
+		if err == nil {
+			strategy.Conditions = condition
+		}
+
+		tradeConfig := &models.TradeConfig{}
+		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
+		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
+		if err == nil {
+			strategy.TradeConfig = tradeConfig
+		}
+
+		riskLimits := &models.RiskLimits{}
+		riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = $1`
+		err = r.db.GetContext(ctx, riskLimits, riskQuery, strategy.StrategyID)
+		if err == nil {
+			strategy.RiskLimits = riskLimits
+		}
+	}
+
+	return strategies, nil
+}
+
 // NewStrategyRepository creates a new strategy repository
 func NewStrategyRepository(db *sqlx.DB) *StrategyRepository {
 	return &StrategyRepository{db: db}

@@ -20,11 +20,11 @@ type Config struct {
 	// Kafka Configuration
 	Kafka KafkaConfig
 
+	// User Config gRPC (bootstrap source-of-truth)
+	UserConfigGRPCAddr string
+
 	// PostgreSQL Configuration (for loading strategies)
 	PostgreSQL PostgreSQLConfig
-
-	// Elasticsearch Configuration
-	Elasticsearch ElasticsearchConfig
 
 	// Redis Configuration
 	Redis RedisConfig
@@ -48,8 +48,11 @@ type Config struct {
 // KafkaConfig holds Kafka-specific configuration
 type KafkaConfig struct {
 	Brokers           []string
-	Topic             string
-	ConsumerGroup     string
+	Topic             string // news topic
+	ConsumerGroup     string // news group
+	UserConfigTopic   string // config topic
+	UserConfigGroup   string // config group
+	ConfigOffsetReset string // earliest/latest
 	StartOffset       string // "earliest" or "latest"
 	CommitInterval    time.Duration
 	MaxBytes          int
@@ -66,18 +69,6 @@ type PostgreSQLConfig struct {
 	Password string
 	Database string
 	SSLMode  string
-}
-
-// ElasticsearchConfig holds Elasticsearch-specific configuration
-type ElasticsearchConfig struct {
-	URLs                []string
-	Username            string
-	Password            string
-	IndexName           string
-	MaxRetries          int
-	RetryBackoff        time.Duration
-	HealthCheckInterval time.Duration
-	Timeout             time.Duration
 }
 
 // RedisConfig holds Redis-specific configuration
@@ -134,11 +125,9 @@ type PerformanceConfig struct {
 	MaxBatchSize            int
 	ProcessingTimeout       time.Duration
 	MaxConcurrentMatches    int
-	ESQueryTimeout          time.Duration
 	CacheRefreshInterval    time.Duration
 	CircuitBreakerThreshold int
 	CircuitBreakerTimeout   time.Duration
-	MinMatchScore           float64
 }
 
 // LoggingConfig holds logging configuration
@@ -170,8 +159,11 @@ func LoadConfig() (*Config, error) {
 
 		Kafka: KafkaConfig{
 			Brokers:           getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
-			Topic:             getEnv("KAFKA_TOPIC", "market.data.news"),
-			ConsumerGroup:     getEnv("KAFKA_CONSUMER_GROUP", "rules-engine-group"),
+			Topic:             getEnv("KAFKA_TOPIC", "news-events"),
+			ConsumerGroup:     getEnv("NEWS_CONSUMER_GROUP_ID", getEnv("KAFKA_CONSUMER_GROUP", "rule-engine-news-processor")),
+			UserConfigTopic:   getEnv("CONFIG_KAFKA_TOPIC", "user-config-events"),
+			UserConfigGroup:   getEnv("CONFIG_CONSUMER_GROUP_ID", "rule-engine-config-sync"),
+			ConfigOffsetReset: getEnv("CONFIG_KAFKA_OFFSET_RESET", "earliest"),
 			StartOffset:       getEnv("KAFKA_START_OFFSET", "latest"),
 			CommitInterval:    getEnvAsDuration("KAFKA_COMMIT_INTERVAL", 1*time.Second),
 			MaxBytes:          getEnvAsInt("KAFKA_MAX_BYTES", 10485760), // 10MB
@@ -189,20 +181,17 @@ func LoadConfig() (*Config, error) {
 			SSLMode:  getEnv("POSTGRES_SSLMODE", "disable"),
 		},
 
-		Elasticsearch: ElasticsearchConfig{
-			URLs:                getEnvAsSlice("ELASTICSEARCH_URLS", []string{"http://localhost:9200"}),
-			Username:            getEnv("ELASTICSEARCH_USERNAME", ""),
-			Password:            getEnv("ELASTICSEARCH_PASSWORD", ""),
-			IndexName:           getEnv("ELASTICSEARCH_INDEX", "user_strategies"),
-			MaxRetries:          getEnvAsInt("ELASTICSEARCH_MAX_RETRIES", 3),
-			RetryBackoff:        getEnvAsDuration("ELASTICSEARCH_RETRY_BACKOFF", 1*time.Second),
-			HealthCheckInterval: getEnvAsDuration("ELASTICSEARCH_HEALTH_CHECK_INTERVAL", 30*time.Second),
-			Timeout:             getEnvAsDuration("ELASTICSEARCH_TIMEOUT", 5*time.Second),
-		},
-
 		Redis: RedisConfig{
-			Addrs:        getEnvAsSlice("REDIS_ADDRS", []string{"15.207.203.46:6379"}),
-			Password:     getEnv("REDIS_PASSWORD", "R3d1s@Prod#2026"),
+			Addrs: func() []string {
+				// Backward compatible:
+				// - REDIS_ADDRS=host:port,host2:port2
+				// - REDIS_URI=host:port (or comma-separated)
+				if uri := getEnv("REDIS_URI", ""); uri != "" {
+					return strings.Split(uri, ",")
+				}
+				return getEnvAsSlice("REDIS_ADDRS", []string{"localhost:6379"})
+			}(),
+			Password:     getEnv("REDIS_PASSWORD", ""),
 			DB:           getEnvAsInt("REDIS_DB", 0),
 			PoolSize:     getEnvAsInt("REDIS_POOL_SIZE", 100),
 			MinIdleConns: getEnvAsInt("REDIS_MIN_IDLE_CONNS", 10),
@@ -254,11 +243,9 @@ func LoadConfig() (*Config, error) {
 			MaxBatchSize:            getEnvAsInt("MAX_BATCH_SIZE", 100),
 			ProcessingTimeout:       getEnvAsDuration("PROCESSING_TIMEOUT", 30*time.Second),
 			MaxConcurrentMatches:    getEnvAsInt("MAX_CONCURRENT_MATCHES", 100),
-			ESQueryTimeout:          getEnvAsDuration("ES_QUERY_TIMEOUT", 2*time.Second),
 			CacheRefreshInterval:    getEnvAsDuration("CACHE_REFRESH_INTERVAL", 1*time.Minute),
 			CircuitBreakerThreshold: getEnvAsInt("CIRCUIT_BREAKER_THRESHOLD", 5),
 			CircuitBreakerTimeout:   getEnvAsDuration("CIRCUIT_BREAKER_TIMEOUT", 60*time.Second),
-			MinMatchScore:           getEnvAsFloat("MIN_MATCH_SCORE", 20.0),
 		},
 
 		Logging: LoggingConfig{
@@ -276,6 +263,8 @@ func LoadConfig() (*Config, error) {
 			Timezone:     getEnv("MARKET_TIMEZONE", "Asia/Kolkata"),
 			EnforceHours: getEnvAsBool("MARKET_ENFORCE_HOURS", true),
 		},
+
+		UserConfigGRPCAddr: getEnv("USER_CONFIG_GRPC_ADDR", getEnv("USER_CONFIG_SERVICE_ADDR", "localhost:50051")),
 	}
 
 	// Validate configuration
@@ -297,17 +286,17 @@ func (c *Config) Validate() error {
 	if c.Kafka.ConsumerGroup == "" {
 		return fmt.Errorf("kafka consumer group cannot be empty")
 	}
-	if len(c.Elasticsearch.URLs) == 0 {
-		return fmt.Errorf("elasticsearch URLs cannot be empty")
+	if c.Kafka.UserConfigTopic == "" {
+		return fmt.Errorf("config kafka topic cannot be empty")
 	}
-	if c.Elasticsearch.IndexName == "" {
-		return fmt.Errorf("elasticsearch index name cannot be empty")
+	if c.Kafka.UserConfigGroup == "" {
+		return fmt.Errorf("config consumer group cannot be empty")
+	}
+	if c.UserConfigGRPCAddr == "" {
+		return fmt.Errorf("USER_CONFIG_GRPC_ADDR cannot be empty")
 	}
 	if len(c.Redis.Addrs) == 0 {
 		return fmt.Errorf("redis addresses cannot be empty")
-	}
-	if c.RabbitMQ.URL == "" {
-		return fmt.Errorf("rabbitmq URL cannot be empty")
 	}
 	if c.GRPCClients.UserConfigService.Address == "" {
 		return fmt.Errorf("user config service address cannot be empty")
@@ -317,9 +306,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Performance.WorkerCount <= 0 {
 		return fmt.Errorf("worker count must be positive")
-	}
-	if c.Performance.MinMatchScore < 0 || c.Performance.MinMatchScore > 100 {
-		return fmt.Errorf("min match score must be between 0 and 100")
 	}
 	return nil
 }

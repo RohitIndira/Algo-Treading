@@ -10,7 +10,9 @@ type Strategy struct {
 	StrategyID   string      `json:"strategy_id" bson:"strategy_id"`
 	UserID       string      `json:"user_id" bson:"user_id"`
 	StrategyName string      `json:"strategy_name" bson:"strategy_name"`
+	Version      uint64      `json:"version" bson:"version"`
 	Active       bool        `json:"active" bson:"active"`
+	TradingMode  string      `json:"trading_mode" bson:"trading_mode"`
 	Conditions   Conditions  `json:"conditions" bson:"conditions"`
 	TradeConfig  TradeConfig `json:"trade_config" bson:"trade_config"`
 	RiskLimits   RiskLimits  `json:"risk_limits" bson:"risk_limits"`
@@ -23,17 +25,26 @@ type Strategy struct {
 	Source      string `json:"source" bson:"source"`             // Source platform
 }
 
+// StrategyConfig is the canonical in-memory configuration object used by the
+// rules-engine configstore and bootstrapper.
+//
+// It is currently identical to Strategy.
+type StrategyConfig = Strategy
+
 // Conditions represents the conditions for a strategy
 type Conditions struct {
-	MatchAllNews         bool           `json:"match_all_news" bson:"match_all_news"`
-	ImpactScoreThreshold int32          `json:"impact_score_threshold" bson:"impact_score_threshold"`
-	Sentiments           []string       `json:"sentiments" bson:"sentiments"`
-	Categories           []string       `json:"categories" bson:"categories"`
-	Stocks               []int64        `json:"stocks" bson:"stocks"`
-	PriceRange           PriceRange     `json:"price_range" bson:"price_range"`
-	VolumeThreshold      int64          `json:"volume_threshold" bson:"volume_threshold"`
-	PctChangeThreshold   float64        `json:"pct_change_threshold" bson:"pct_change_threshold"`
-	MarketCapRange       MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
+	MatchAllNews    bool           `json:"match_all_news" bson:"match_all_news"`
+	ImpactScoreMin  int32          `json:"impact_score_min" bson:"impact_score_min"`
+	ImpactScoreMax  int32          `json:"impact_score_max" bson:"impact_score_max"`
+	Sentiments      []string       `json:"sentiments" bson:"sentiments"`
+	Categories      []string       `json:"categories" bson:"categories"`
+	Stocks          []int64        `json:"stocks" bson:"stocks"`
+	PriceRange      PriceRange     `json:"price_range" bson:"price_range"` // legacy; may be unset
+	VolumeThreshold int64          `json:"volume_threshold" bson:"volume_threshold"`
+	MinPctChange    float64        `json:"min_pct_change" bson:"min_pct_change"`
+	MaxPctChange    float64        `json:"max_pct_change" bson:"max_pct_change"`
+	Exchanges       []string       `json:"exchanges" bson:"exchanges"`
+	MarketCapRange  MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
 }
 
 // PriceRange represents price range filter
@@ -56,6 +67,9 @@ type TradeConfig struct {
 	StopLossPct     float64 `json:"stop_loss_pct" bson:"stop_loss_pct"`
 	TakeProfitPct   float64 `json:"take_profit_pct" bson:"take_profit_pct"`
 	Exchange        string  `json:"exchange" bson:"exchange"`
+	OrderSide       string  `json:"order_side" bson:"order_side"`           // BUY/SELL
+	Validity        string  `json:"validity" bson:"validity"`               // DAY/IOC
+	LimitPrice      float64 `json:"limit_price" bson:"limit_price"`         // LIMIT only
 	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING
 	TrailingSLPct   float64 `json:"trailing_sl_pct" bson:"trailing_sl_pct"` // Trailing SL percentage
 	ProductType     string  `json:"product_type" bson:"product_type"`       // INTRADAY, DELIVERY, CASH
@@ -72,49 +86,8 @@ type RiskLimits struct {
 	AutoSquareOffTime   string  `json:"auto_square_off_time" bson:"auto_square_off_time"` // "15:05" format
 }
 
-// ElasticsearchStrategy represents a strategy indexed in Elasticsearch
-type ElasticsearchStrategy struct {
-	StrategyID     string   `json:"strategy_id"`
-	UserID         string   `json:"user_id"`
-	StrategyName   string   `json:"strategy_name"`
-	Active         bool     `json:"active"`
-	MatchAllNews   bool     `json:"match_all_news"`
-	ImpactScoreMin int32    `json:"impact_score_min"`
-	Sentiments     []string `json:"sentiments"`
-	Categories     []string `json:"categories"`
-	Stocks         []int64  `json:"stocks"`
-	PriceMin       float64  `json:"price_min"`
-	PriceMax       float64  `json:"price_max"`
-	VolumeMin      int64    `json:"volume_min"`
-	PctChangeMin   float64  `json:"pct_change_min"`
-	Exchange       string   `json:"exchange"`
-	MaxDailyTrades int32    `json:"max_daily_trades"`
-	MaxLossPerDay  float64  `json:"max_loss_per_day"`
-	UpdatedAt      int64    `json:"updated_at"` // Unix timestamp
-}
-
-// ToElasticsearchStrategy converts Strategy to ElasticsearchStrategy
-func (s *Strategy) ToElasticsearchStrategy() *ElasticsearchStrategy {
-	return &ElasticsearchStrategy{
-		StrategyID:     s.StrategyID,
-		UserID:         s.UserID,
-		StrategyName:   s.StrategyName,
-		Active:         s.Active,
-		MatchAllNews:   s.Conditions.MatchAllNews,
-		ImpactScoreMin: s.Conditions.ImpactScoreThreshold,
-		Sentiments:     s.Conditions.Sentiments,
-		Categories:     s.Conditions.Categories,
-		Stocks:         s.Conditions.Stocks,
-		PriceMin:       s.Conditions.PriceRange.MinPrice,
-		PriceMax:       s.Conditions.PriceRange.MaxPrice,
-		VolumeMin:      s.Conditions.VolumeThreshold,
-		PctChangeMin:   s.Conditions.PctChangeThreshold,
-		Exchange:       normalizeExchange(s.TradeConfig.Exchange),
-		MaxDailyTrades: s.RiskLimits.MaxDailyTrades,
-		MaxLossPerDay:  s.RiskLimits.MaxLossPerDay,
-		UpdatedAt:      s.UpdatedAt.Unix(),
-	}
-}
+// NOTE: ElasticsearchStrategy + ToElasticsearchStrategy removed.
+// Rules Engine no longer uses Elasticsearch.
 
 // normalizeExchange removes the EXCHANGE_ prefix if present
 // Converts "EXCHANGE_NSE" -> "NSE", "EXCHANGE_BSE" -> "BSE"
@@ -131,11 +104,11 @@ func (s *Strategy) Validate() error {
 	if s.UserID == "" {
 		return ErrInvalidUserID
 	}
-	if s.Conditions.ImpactScoreThreshold < 0 || s.Conditions.ImpactScoreThreshold > 10 {
+	if s.Conditions.ImpactScoreMin < 0 || s.Conditions.ImpactScoreMin > 10 {
 		return ErrInvalidImpactScore
 	}
-	if len(s.Conditions.Sentiments) == 0 {
-		return ErrInvalidSentiments
+	if s.Conditions.ImpactScoreMax < 0 || s.Conditions.ImpactScoreMax > 10 {
+		return ErrInvalidImpactScore
 	}
 	if s.TradeConfig.Quantity <= 0 {
 		return ErrInvalidQuantity
@@ -143,6 +116,7 @@ func (s *Strategy) Validate() error {
 	if s.TradeConfig.OrderType != "MARKET" && s.TradeConfig.OrderType != "LIMIT" {
 		return ErrInvalidOrderType
 	}
+	// NOTE: Sentiments/categories/stocks can be empty to mean "match all".
 	return nil
 }
 

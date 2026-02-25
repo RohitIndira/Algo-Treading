@@ -203,6 +203,11 @@ func (s *StrategyService) GetStrategiesByIDs(ctx context.Context, strategyIDs []
 	return s.repo.GetByIDs(ctx, strategyIDs)
 }
 
+// ListAllActiveStrategies returns active, non-deleted strategies for startup bulk-load.
+func (s *StrategyService) ListAllActiveStrategies(ctx context.Context, limit, offset int) ([]*models.Strategy, error) {
+	return s.repo.ListAllActive(ctx, limit, offset)
+}
+
 // validateCreateRequest validates a create strategy request
 func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyRequest) error {
 	if req.UserID == "" {
@@ -301,7 +306,7 @@ func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyReques
 			return fmt.Errorf("take_profit_pct must be non-negative")
 		}
 	}
-	
+
 	if req.TradingMode != nil {
 		if *req.TradingMode != models.TradingModePaper && *req.TradingMode != models.TradingModeLive {
 			return fmt.Errorf("invalid trading_mode: %s", *req.TradingMode)

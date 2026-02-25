@@ -5,10 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
@@ -19,82 +18,99 @@ import (
 
 // Handler handles market events
 type Handler struct {
-	matcher       *matcher.Matcher
-	rabbitPubl    *publisher.Publisher
-	kafkaPubl     *publisher.KafkaPublisher
-	signalRepo    *repository.TradeSignalRepository
-	riskClient    *risk.Client
-	redisCache    *cache.RedisCache
-	strategyCache *cache.StrategyCache
-	stats         *models.MatchingStats
-	logger        *zap.Logger
-	marketHours   *utils.MarketHours
-	enforceHours  bool
+	engine       *engine.Engine
+	rabbitPubl   *publisher.Publisher
+	kafkaPubl    *publisher.KafkaPublisher
+	signalRepo   *repository.TradeSignalRepository
+	riskClient   *risk.Client
+	redisCache   *cache.RedisCache
+	stats        *models.MatchingStats
+	logger       *zap.Logger
+	marketHours  *utils.MarketHours
+	enforceHours bool
 }
 
 // NewHandler creates a new event handler
 func NewHandler(
-	matcher *matcher.Matcher,
+	eng *engine.Engine,
 	rabbitPubl *publisher.Publisher,
 	kafkaPubl *publisher.KafkaPublisher,
 	signalRepo *repository.TradeSignalRepository,
 	riskClient *risk.Client,
 	redisCache *cache.RedisCache,
-	strategyCache *cache.StrategyCache,
 	stats *models.MatchingStats,
 	logger *zap.Logger,
 	marketHours *utils.MarketHours,
 	enforceHours bool,
 ) *Handler {
 	return &Handler{
-		matcher:       matcher,
-		rabbitPubl:    rabbitPubl,
-		kafkaPubl:     kafkaPubl,
-		signalRepo:    signalRepo,
-		riskClient:    riskClient,
-		redisCache:    redisCache,
-		strategyCache: strategyCache,
-		stats:         stats,
-		logger:        logger,
-		marketHours:   marketHours,
-		enforceHours:  enforceHours,
+		engine:       eng,
+		rabbitPubl:   rabbitPubl,
+		kafkaPubl:    kafkaPubl,
+		signalRepo:   signalRepo,
+		riskClient:   riskClient,
+		redisCache:   redisCache,
+		stats:        stats,
+		logger:       logger,
+		marketHours:  marketHours,
+		enforceHours: enforceHours,
 	}
 }
 
 // HandleEvent processes a market event
 func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) error {
+	h.stats.IncrementEventsProcessed()
+
 	// Check if market is open before generating trade signals (only if enforcement is enabled)
 	if h.enforceHours && !h.marketHours.IsMarketOpen() {
 		status := h.marketHours.GetMarketStatus()
-		h.logger.Debug("Skipping trade signal generation - market is closed",
+		h.logger.Info("Skipping trade signal generation - market is closed",
 			zap.String("event_id", event.EventID),
 			zap.String("market_status", status),
 			zap.Time("event_timestamp", event.Timestamp))
 		return nil
 	}
 
-	h.logger.Debug("Handling event",
+	h.logger.Info("Handling event",
 		zap.String("event_id", event.EventID),
 		zap.Int64("stock_code", event.StockData.StockCode),
 		zap.String("symbol", event.StockData.Symbol),
-		zap.Int32("impact_score", event.Analysis.ImpactScore))
+		zap.String("exchange", event.StockData.Exchange),
+		zap.String("category", event.NewsData.Category),
+		zap.String("sentiment", event.Analysis.GetSentimentValue()),
+		zap.Int32("impact_score", event.Analysis.ImpactScore),
+		zap.Float64("pct_change", event.MarketData.PctChange),
+		zap.Int64("volume", event.MarketData.PriceMap.Volume),
+	)
 
-	// Match event against strategies
-	matches, err := h.matcher.MatchEvent(ctx, event)
+	// Evaluate event against in-memory snapshot
+	matches, err := h.engine.EvaluateEvent(ctx, event)
 	if err != nil {
 		h.stats.IncrementEvaluationErrors()
 		return fmt.Errorf("failed to match event: %w", err)
 	}
 
 	if len(matches) == 0 {
-		h.logger.Debug("No matches found for event",
-			zap.String("event_id", event.EventID))
+		h.logger.Info("No strategies matched event (exact-match semantics)",
+			zap.String("event_id", event.EventID),
+			zap.Int64("stock_code", event.StockData.StockCode),
+			zap.String("symbol", event.StockData.Symbol))
 		return nil
 	}
 
-	h.logger.Info("Event matched strategies",
+	h.logger.Info("Event matched strategies (exact-match semantics)",
 		zap.String("event_id", event.EventID),
 		zap.Int("match_count", len(matches)))
+	for _, m := range matches {
+		h.logger.Info("Matched strategy",
+			zap.String("event_id", event.EventID),
+			zap.String("user_id", m.UserID),
+			zap.String("strategy_id", m.StrategyID),
+			zap.String("strategy_name", m.StrategyName),
+			zap.Strings("matched_conditions", m.MatchedConditions),
+			zap.Float64("score_observability", m.MatchScore),
+		)
+	}
 
 	// Record statistics
 	h.stats.IncrementMatchesFound()
@@ -213,7 +229,7 @@ func (h *Handler) getLTPFromRedis(ctx context.Context, stockData models.StockDat
 
 // processMatch processes a single match
 func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, event *models.MarketEvent) error {
-	// Use the full strategy from the match (already includes trade_config from Kafka user-configs topic)
+	// Use the full strategy from the match (already includes trade_config from in-memory config store)
 	strategy := match.Strategy
 	if strategy == nil {
 		h.logger.Error("Strategy is nil in match, cannot generate order",
@@ -231,8 +247,8 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return fmt.Errorf("strategy %s has invalid quantity: %d", strategy.StrategyID, strategy.TradeConfig.Quantity)
 	}
 
-	// Log strategy configuration being used from Kafka
-	h.logger.Info("Using strategy configuration from Kafka user-configs",
+	// Log strategy configuration being used
+	h.logger.Info("Using strategy configuration from in-memory config store",
 		zap.String("strategy_id", strategy.StrategyID),
 		zap.String("user_id", strategy.UserID),
 		zap.Int32("quantity", strategy.TradeConfig.Quantity),
@@ -361,9 +377,11 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	}
 
 	// 4. Publish order to RabbitMQ
-	if err := h.rabbitPubl.PublishOrder(ctx, orderReq); err != nil {
-		h.stats.IncrementRabbitMQErrors()
-		return fmt.Errorf("failed to publish order: %w", err)
+	if h.rabbitPubl != nil {
+		if err := h.rabbitPubl.PublishOrder(ctx, orderReq); err != nil {
+			h.stats.IncrementRabbitMQErrors()
+			return fmt.Errorf("failed to publish order: %w", err)
+		}
 	}
 
 	h.stats.IncrementOrdersGenerated()
@@ -375,63 +393,6 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		zap.Int64("stock_code", orderReq.StockCode),
 		zap.Float64("match_score", orderReq.MatchScore),
 		zap.Float64("price", orderReq.Price))
-
-	// Publish match event to Redis for real-time WebSocket updates
-	if err := h.publishMatchEvent(ctx, orderReq, event, match); err != nil {
-		h.logger.Error("Failed to publish match event to Redis",
-			zap.Error(err),
-			zap.String("user_id", orderReq.UserID))
-		// Don't fail the order, just log the error
-	}
-
-	return nil
-}
-
-// publishMatchEvent publishes match event to Redis Pub/Sub for real-time updates
-func (h *Handler) publishMatchEvent(ctx context.Context, orderReq *models.OrderRequest, event *models.MarketEvent, match *models.RuleMatch) error {
-	// Create match event payload
-	matchEvent := map[string]interface{}{
-		"order_id":      orderReq.OrderID,
-		"user_id":       orderReq.UserID,
-		"strategy_id":   orderReq.StrategyID,
-		"strategy_name": match.StrategyName,
-		"event_id":      event.EventID,
-		"stock_code":    orderReq.StockCode,
-		"token":         orderReq.Token,
-		"symbol":        orderReq.Symbol,
-		"exchange":      orderReq.Exchange,
-		"match_score":   orderReq.MatchScore,
-		"impact_score":  orderReq.ImpactScore,
-		"sentiment":     orderReq.Sentiment,
-		"news_category": orderReq.NewsCategory,
-		"news_title":    event.NewsData.ShortSummary,
-		"news_content":  event.NewsData.ShortSummary,
-		"news_link":     event.NewsData.NewsLink,
-		"order_price":   orderReq.Price,
-		"stop_loss":     orderReq.StopLoss,
-		"take_profit":   orderReq.TakeProfit,
-		"order_status":  "PENDING",
-		"risk_approved": orderReq.RiskApproved,
-		"timestamp":     time.Now().Unix(),
-		"time_ago":      "just now",
-	}
-
-	// Convert to JSON
-	jsonData, err := json.Marshal(matchEvent)
-	if err != nil {
-		return fmt.Errorf("failed to marshal match event: %w", err)
-	}
-
-	// Publish to Redis channel: user:{user_id}:matches
-	channel := fmt.Sprintf("user:%s:matches", orderReq.UserID)
-	err = h.redisCache.Publish(ctx, channel, string(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to publish to Redis channel %s: %w", channel, err)
-	}
-
-	h.logger.Debug("Published match event to Redis",
-		zap.String("channel", channel),
-		zap.String("order_id", orderReq.OrderID))
 
 	return nil
 }
