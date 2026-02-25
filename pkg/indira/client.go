@@ -45,6 +45,7 @@ type AuthContext struct {
 	ClientId    string // Client ID (optional)
 	Source      string // Source platform: IOS, AND, WEB
 	BearerToken string // JWT bearer token from frontend
+	SSO         bool   // Single Sign-On session flag
 }
 
 // Config holds client configuration
@@ -65,10 +66,21 @@ func NewClient(config Config) *Client {
 		timeout = DefaultTimeout
 	}
 
+	// Optimize HTTP Transport for high-frequency trading
+	// 1. connection pooling: keep more idle connections open to avoid re-establishing TCP/TLS handshakes
+	// 2. per-host limits: max out the limits since we primarily talk to Indira's load balancer
+	t := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+	}
+
 	return &Client{
 		baseURL: config.BaseURL,
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Transport: t,
+			Timeout:   timeout,
 		},
 	}
 }
@@ -116,6 +128,9 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	}
 	if auth.BearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
+	}
+	if auth.SSO {
+		req.Header.Set("sso", "True")
 	}
 
 	// Execute request

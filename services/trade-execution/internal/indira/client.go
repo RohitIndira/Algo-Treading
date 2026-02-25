@@ -12,16 +12,19 @@ import (
 // ExecutionClient wraps Indira API for trade execution
 // This client is stateless and thread-safe for concurrent use by multiple users
 type ExecutionClient struct {
-	client *indiraClient.Client
+	client    *indiraClient.Client
+	wsManager *indiraClient.WSManager
 }
 
 // NewExecutionClient creates a new execution client for Indira Securities
 // The client is stateless and can handle multiple users concurrently
 func NewExecutionClient() *ExecutionClient {
 	client := indiraClient.NewDefaultClient()
+	wsManager := indiraClient.NewWSManager(client)
 
 	return &ExecutionClient{
-		client: client,
+		client:    client,
+		wsManager: wsManager,
 	}
 }
 
@@ -70,6 +73,22 @@ func (c *ExecutionClient) GetOrderStatus(ctx context.Context, orderID string, au
 
 	// Return the most recent status (last item in trail)
 	return trail[len(trail)-1], nil
+}
+
+// SubscribeOrderStatus starts or gets the WebSocket connection for a user and returns a channel pouring real-time order updates
+// This is the fastest method to get order statuses. The framework will automatically handle reconnects and heartbeats.
+func (c *ExecutionClient) SubscribeOrderStatus(ctx context.Context, auth *indiraClient.AuthContext) (<-chan *indiraClient.WSOrderStatus, error) {
+	if auth == nil || auth.UserId == "" {
+		return nil, fmt.Errorf("auth context and UserId required for websocket subscription")
+	}
+
+	wsClient, err := c.wsManager.GetOrCreateClient(ctx, auth)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get websocket client: %w", err)
+	}
+
+	// wsClient.Updates is a buffered channel filled asynchronously by the background goroutines
+	return wsClient.Updates, nil
 }
 
 // CancelOrder cancels an order
@@ -166,13 +185,31 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 	}
 
 	// Set bracket order fields if present
-	if order.TargetPrice != nil {
+	if order.TargetPrice != nil && order.StopLoss != nil {
+		// If both Target and StopLoss are provided, this is a Bracket Order
 		tgtPrice := *order.TargetPrice
 		req.BoTgtPrice = &tgtPrice
-	}
-	if order.StopLoss != nil {
+
 		stpLoss := *order.StopLoss
 		req.BoStpLoss = &stpLoss
+
+		// Ensure Product Type is set to BRACKET_ORDER as required by Indira API
+		req.PrdType = "BRACKET_ORDER"
+
+		// For Bracket Orders, Indira API often requires the TriggerPrice to be used
+		// as the stop-loss trigger if it's a Limit Bracket Order.
+		// Following the provided cURL example:
+		// "prdType": "BRACKET_ORDER",
+		// "limitPrice": 0.0,
+		// "triggerPrice": 11.05,       <- This is the entry trigger for Stop-loss or just the current price threshold
+		// "boStpLoss": 0.0,            <- Stop loss difference or absolute? The snippet had 0.0, but usually it's absolute.
+		// "boTgtPrice": 12.0
+		// We will populate BoStpLoss and BoTgtPrice exactly as provided by the internal model.
+	} else {
+		// Ensure pointers are explicitly nil if not a bracket order to match omitempty (if applicable)
+		var defaultZero float64 = 0.0
+		req.BoTgtPrice = &defaultZero
+		req.BoStpLoss = &defaultZero
 	}
 
 	return req, nil

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/RohitIndira/Algo-Treading/pkg/database/postgres"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
@@ -26,6 +27,11 @@ import (
 )
 
 func main() {
+	// Load .env file if it exists
+	if err := godotenv.Load(); err != nil {
+		fmt.Printf("Note: .env file not found, using system environment variables\n")
+	}
+
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
