@@ -443,7 +443,7 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 	// Soft delete: Update deleted_at and set active = false
 	query := `
 		UPDATE strategies 
-		SET deleted_at = CURRENT_TIMESTAMP, active = false, updated_at = CURRENT_TIMESTAMP 
+		SET deleted_at = CURRENT_TIMESTAMP, active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1 
 		WHERE strategy_id = $1 AND user_id = $2 
 		RETURNING strategy_id, version`
 
@@ -487,7 +487,7 @@ func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID,
 	}
 	defer tx.Rollback()
 
-	query := `UPDATE strategies SET active = true, updated_at = CURRENT_TIMESTAMP WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
+	query := `UPDATE strategies SET active = true, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
 	var updatedID uuid.UUID
 	var currentVersion int32
 	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)
@@ -520,7 +520,7 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 	}
 	defer tx.Rollback()
 
-	query := `UPDATE strategies SET active = false, updated_at = CURRENT_TIMESTAMP WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
+	query := `UPDATE strategies SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
 	var updatedID uuid.UUID
 	var currentVersion int32
 	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)

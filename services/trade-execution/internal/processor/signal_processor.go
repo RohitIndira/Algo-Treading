@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -25,21 +27,26 @@ type BrokerExecutionResult struct {
 	Brokerage       float64
 	ExchangeCharges float64
 	Timestamp       time.Time
+	// Auth for WebSocket subscription (only set on successful placement)
+	UserID      string
+	Auth        *indiraClient.AuthContext
 }
 
 // SignalProcessor processes trade signals and publishes results
 type SignalProcessor struct {
-	broker    BrokerExecutor
-	publisher *publisher.KafkaPublisher
-	logger    *zap.Logger
+	broker        BrokerExecutor
+	publisher     *publisher.KafkaPublisher
+	statusService *statusservice.OrderStatusService
+	logger        *zap.Logger
 }
 
 // NewSignalProcessor creates a new signal processor
-func NewSignalProcessor(broker BrokerExecutor, publisher *publisher.KafkaPublisher, logger *zap.Logger) *SignalProcessor {
+func NewSignalProcessor(broker BrokerExecutor, publisher *publisher.KafkaPublisher, statusService *statusservice.OrderStatusService, logger *zap.Logger) *SignalProcessor {
 	return &SignalProcessor{
-		broker:    broker,
-		publisher: publisher,
-		logger:    logger,
+		broker:        broker,
+		publisher:     publisher,
+		statusService: statusService,
+		logger:        logger,
 	}
 }
 
@@ -62,6 +69,15 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 
 // handleExecutionSuccess handles successful order execution
 func (p *SignalProcessor) handleExecutionSuccess(ctx context.Context, signal *models.TradeSignal, brokerResult *BrokerExecutionResult) error {
+	// Start WebSocket subscription for real-time status updates (per user, idempotent)
+	if p.statusService != nil && brokerResult.Auth != nil {
+		if err := p.statusService.StartSubscription(ctx, signal.UserID, brokerResult.Auth); err != nil {
+			p.logger.Warn("Failed to start WS subscription for user (order still placed)",
+				zap.String("user_id", signal.UserID),
+				zap.Error(err))
+		}
+	}
+
 	executionID := uuid.New().String()
 
 	// Calculate financial details

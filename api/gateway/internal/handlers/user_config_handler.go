@@ -11,6 +11,8 @@ import (
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/gorilla/mux"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type UserConfigHandler struct {
@@ -177,7 +179,10 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Strategy deleted successfully",
+	})
 }
 
 // GetStrategy handles GET /api/v1/strategies/{strategy_id}
@@ -274,8 +279,13 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Fall back to userId header if body is missing user_id
 	if reqBody.UserID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		reqBody.UserID = r.Header.Get("userId")
+	}
+
+	if reqBody.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required (in body or userId header)")
 		return
 	}
 
@@ -312,8 +322,13 @@ func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Fall back to userId header if body is missing user_id
 	if reqBody.UserID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		reqBody.UserID = r.Header.Get("userId")
+	}
+
+	if reqBody.UserID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required (in body or userId header)")
 		return
 	}
 
@@ -351,7 +366,19 @@ func (h *UserConfigHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 
 // Helper functions
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	response, err := json.Marshal(payload)
+	var response []byte
+	var err error
+
+	if msg, ok := payload.(proto.Message); ok {
+		marshaler := protojson.MarshalOptions{
+			UseProtoNames:   true,
+			EmitUnpopulated: true,
+		}
+		response, err = marshaler.Marshal(msg)
+	} else {
+		response, err = json.Marshal(payload)
+	}
+
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error":"Failed to marshal response"}`))

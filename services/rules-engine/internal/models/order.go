@@ -44,6 +44,9 @@ type OrderRequest struct {
 
 	// Product type
 	ProductType string `json:"product_type"` // INTRADAY, DELIVERY, CASH
+
+	// Trading mode
+	TradingMode string `json:"trading_mode"` // PAPER or LIVE
 }
 
 // RuleMatch represents a successful rule match
@@ -119,6 +122,9 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 
 		// Product type
 		ProductType: productType,
+
+		// Trading mode
+		TradingMode: strategy.TradingMode,
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
@@ -14,15 +15,17 @@ import (
 // StrategyService handles business logic for strategies
 type StrategyService struct {
 	repo         *repository.StrategyRepository
+	credsRepo    repository.CredentialsRepository
 	kafkaWriter  *kafka.Writer
 	kafkaTopic   string
 	kafkaEnabled bool
 }
 
 // NewStrategyService creates a new strategy service
-func NewStrategyService(repo *repository.StrategyRepository, kafkaWriter *kafka.Writer, kafkaTopic string) *StrategyService {
+func NewStrategyService(repo *repository.StrategyRepository, credsRepo repository.CredentialsRepository, kafkaWriter *kafka.Writer, kafkaTopic string) *StrategyService {
 	return &StrategyService{
 		repo:         repo,
+		credsRepo:    credsRepo,
 		kafkaWriter:  kafkaWriter,
 		kafkaTopic:   kafkaTopic,
 		kafkaEnabled: kafkaWriter != nil,
@@ -114,10 +117,22 @@ func (s *StrategyService) CreateStrategy(ctx context.Context, req *models.Create
 		return nil, fmt.Errorf("failed to create strategy: %w", err)
 	}
 
-	// NOTE: We don't strictly need to publish here because Repo inserts to Outbox.
-	// However, if we want immediate feedback without waiting for Outbox Poller, we can try.
-	// But to avoid duplicates, the consumers should be idempotent OR we rely solely on Outbox Poller.
-	// For now, keeping it as is for backward compat/debug, assuming consumers handle idempotency.
+	// Persist Indira broker credentials so trade-execution can authenticate orders.
+	// This is best-effort: a failure here does NOT abort the strategy creation.
+	if req.IndiraAuth != nil && req.IndiraAuth.BearerToken != "" {
+		if err := s.credsRepo.StoreIndiraCredentials(
+			ctx,
+			req.UserID,
+			req.IndiraAuth.UserID,
+			req.IndiraAuth.AppID,
+			req.IndiraAuth.Source,
+			req.IndiraAuth.BearerToken,
+		); err != nil {
+			log.Printf("[WARN] user-config: failed to store credentials for user %s: %v", req.UserID, err)
+		} else {
+			log.Printf("[INFO] user-config: stored Indira credentials for user %s", req.UserID)
+		}
+	}
 
 	return strategy, nil
 }

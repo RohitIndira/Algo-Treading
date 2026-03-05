@@ -9,10 +9,12 @@ import (
 
 // Config holds all configuration for the service
 type Config struct {
-	Server   ServerConfig
-	Database postgres.Config
-	Kafka    KafkaConfig
-	LogLevel string
+	Server      ServerConfig
+	Database    postgres.Config
+	ExecutionDB postgres.Config // second connection → trading_execution DB (for user_credentials)
+	Kafka       KafkaConfig
+	LogLevel    string
+	EncryptionKey string
 }
 
 // ServerConfig holds server configuration
@@ -41,12 +43,21 @@ func Load() (*Config, error) {
 			Database: getEnv("DB_NAME", "trading_db"),
 			SSLMode:  getEnv("DB_SSLMODE", "disable"),
 		},
+		ExecutionDB: postgres.Config{
+			Host:     getEnv("EXECUTION_DB_HOST", "localhost"),
+			Port:     getEnvAsInt("EXECUTION_DB_PORT", 5432),
+			User:     getEnv("EXECUTION_DB_USER", "postgres"),
+			Password: getEnv("EXECUTION_DB_PASSWORD", "postgres"),
+			Database: getEnv("EXECUTION_DB_NAME", "trading_execution"),
+			SSLMode:  getEnv("EXECUTION_DB_SSLMODE", "disable"),
+		},
 		Kafka: KafkaConfig{
 			Enabled: getEnvAsBool("KAFKA_ENABLED", true),
 			Brokers: getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
 			Topic:   getEnv("KAFKA_TOPIC", "user-config-events"),
 		},
-		LogLevel: getEnv("LOG_LEVEL", "INFO"),
+		LogLevel:      getEnv("LOG_LEVEL", "INFO"),
+		EncryptionKey: getEnv("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef"),
 	}
 
 	return cfg, nil

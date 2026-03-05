@@ -106,7 +106,8 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) e
 		zap.String("symbol", signal.Symbol),
 		zap.Int64("stock_code", signal.StockCode),
 		zap.String("order_type", signal.OrderType),
-		zap.Float64("price", signal.Price))
+		zap.Float64("price", signal.Price),
+		zap.String("trading_mode", signal.TradingMode))
 
 	// Process the signal
 	if err := c.processor.ProcessTradeSignal(ctx, &signal); err != nil {

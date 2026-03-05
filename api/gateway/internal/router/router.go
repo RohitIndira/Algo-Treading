@@ -11,6 +11,7 @@ import (
 func NewRouter(
 	userConfigHandler *handlers.UserConfigHandler,
 	websocketHandler *handlers.WebSocketHandler,
+	paperHandler *handlers.PaperTradingHandler,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
 
@@ -40,6 +41,21 @@ func NewRouter(
 
 	// User strategies
 	api.HandleFunc("/users/{user_id}/strategies", userConfigHandler.ListUserStrategies).Methods("GET")
+
+	// Paper trading REST endpoints
+	if paperHandler != nil {
+		api.HandleFunc("/paper-trades/positions", paperHandler.GetPaperPositions).Methods("GET")
+		api.HandleFunc("/paper-trades/closed-orders", paperHandler.GetClosedPaperOrders).Methods("GET")
+		api.HandleFunc("/paper-trades/force-exit-all", paperHandler.ForceExitAll).Methods("POST")
+		api.HandleFunc("/paper-trades/ws-info", paperHandler.GetPaperWSInfo).Methods("GET")
+		// Live orders endpoints
+		api.HandleFunc("/live-orders", paperHandler.GetLiveOrders).Methods("GET")
+		api.HandleFunc("/live-orders/closed-orders", paperHandler.GetClosedLiveOrders).Methods("GET")
+		api.HandleFunc("/live-orders/force-exit-all", paperHandler.ForceExitAllLive).Methods("POST")
+		api.HandleFunc("/live-orders/indira-positions", paperHandler.GetIndiraPositions).Methods("GET")
+		// Dashboard
+		api.HandleFunc("/dashboard-stats", paperHandler.GetDashboardStats).Methods("GET")
+	}
 
 	// WebSocket routes for live match feed
 	r.HandleFunc("/ws/matches", websocketHandler.HandleMatchesFeed)        // Single user

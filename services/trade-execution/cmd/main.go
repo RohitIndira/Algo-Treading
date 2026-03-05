@@ -14,12 +14,16 @@ import (
 	_ "github.com/lib/pq"
 	"go.uber.org/zap"
 
+	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/paper"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
 )
 
 func main() {
@@ -46,61 +50,42 @@ func main() {
 
 	// Initialize repositories
 	orderRepo := repository.NewOrderRepository(db)
-	credsRepo := repository.NewCredentialsRepository(db)
+	credsRepo := repository.NewCredentialsRepository(db, cfg.EncryptionKey)
 	log.Println("✓ Repository layer initialized")
 
 	// Initialize Indira client (stateless, supports multiple users)
 	indiraClient := indira.NewExecutionClient()
 	log.Println("✓ Indira API client initialized")
 
-	// Initialize executor with credentials repository
+	// Initialize Kafka publisher for trade-executions and order-updates topics
+	log.Println("Initializing Kafka publisher...")
+	logger, _ := initLogger()
+	kafkaPub := publisher.NewKafkaPublisher(cfg.KafkaBrokers, logger)
+	defer kafkaPub.Close()
+	log.Println("✓ Kafka publisher initialized")
+
+	// Initialize Order Status Service (WebSocket-based real-time order updates)
+	// The backend opens one WS connection per user to Indira after placing their first order.
+	log.Println("Initializing WebSocket Order Status Service...")
+	statusService := statusservice.NewOrderStatusService(indiraClient, orderRepo, kafkaPub, logger)
+	log.Println("✓ Order Status Service initialized")
+
+	// Initialize executor with credentials repository, Kafka publisher, and status service.
+	// The executor owns: retries, WS subscription start, and Kafka order-update publishing.
 	orderExecutor := executor.NewOrderExecutor(
 		orderRepo,
 		credsRepo,
 		indiraClient,
+		kafkaPub,
+		statusService,
 		cfg.MaxRetries,
 		cfg.RetryDelay,
 	)
 	log.Println("✓ Order executor initialized")
 
-	// Initialize RabbitMQ consumer
-	log.Println("Connecting to RabbitMQ...")
-	consumerCfg := consumer.Config{
-		URL:           cfg.RabbitMQURL,
-		QueueName:     cfg.QueueName,
-		Exchange:      cfg.Exchange,
-		ExchangeType:  "topic",
-		RoutingKey:    cfg.RoutingKey,
-		PrefetchCount: cfg.PrefetchCount,
-		WorkerCount:   cfg.WorkerCount,
-		Durable:       true,
-	}
-
-	rabbitConsumer, err := consumer.NewRabbitMQConsumer(consumerCfg, orderExecutor, orderRepo, credsRepo)
-	if err != nil {
-		log.Fatalf("Failed to initialize RabbitMQ consumer: %v", err)
-	}
-	defer rabbitConsumer.Shutdown()
-	log.Println("✓ RabbitMQ consumer initialized")
-
-	// Initialize RabbitMQ publisher for odin-api-wrapper
-	log.Println("Initializing RabbitMQ publisher for odin-api-wrapper...")
-	logger, _ := initLogger()
-	rabbitPublisher, err := publisher.NewRabbitMQPublisher(
-		cfg.RabbitMQURL,
-		cfg.Exchange,
-		cfg.RoutingKey,
-		logger,
-	)
-	if err != nil {
-		log.Fatalf("Failed to initialize RabbitMQ publisher: %v", err)
-	}
-	defer rabbitPublisher.Close()
-	log.Println("✓ RabbitMQ publisher initialized")
-
-	// Initialize Kafka consumer for trade-signals
-	log.Println("Initializing Kafka consumer...")
-	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, rabbitPublisher)
+	// Initialize Kafka signal consumer (trade-signals topic → SignalProcessor)
+	log.Println("Initializing Kafka consumer for trade-signals...")
+	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, kafkaPub, statusService)
 	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger)
 	defer kafkaConsumer.Close()
 	log.Println("✓ Kafka consumer initialized")
@@ -109,23 +94,132 @@ func main() {
 	grpcServer := server.NewServer(orderRepo, orderExecutor, cfg.GRPCPort)
 	log.Println("✓ gRPC server initialized")
 
+	// ── Paper Trading Layer ────────────────────────────────────────────────────
+	log.Println("Initializing Paper Trading layer...")
+	paperWSServer := paper.NewPaperWSServer(orderRepo)
+
+	// Wire Indira positions fetcher — used by the /ws/live-orders/indira-positions endpoint.
+	// Converts pkg/indira.Position → paper.BrokerPosition so the paper package stays decoupled.
+	paperWSServer.SetPositionsFetcher(func(ctx context.Context, bearerToken, appId, userId, source string) ([]paper.BrokerPosition, error) {
+		auth := &indiraPkg.AuthContext{
+			UserId:      userId,
+			AppId:       appId,
+			Source:      source,
+			BearerToken: bearerToken,
+		}
+		positions, err := indiraClient.GetPositions(ctx, auth)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]paper.BrokerPosition, len(positions))
+		for i, p := range positions {
+			result[i] = paper.BrokerPosition{
+				Symbol:        p.Symbol,
+				Exchange:      p.Exc,
+				ProductType:   p.PrdType,
+				NetQty:        p.NetQty,
+				BuyQty:        p.BuyQty,
+				SellQty:       p.SellQty,
+				BuyAvgPrice:   p.BuyAvgPrice,
+				SellAvgPrice:  p.SellAvgPrice,
+				CurrentPrice:  p.CurrentPrice,
+				PnL:           p.PnL,
+				PnLPercentage: p.PnLPercentage,
+			}
+		}
+		return result, nil
+	})
+
+	// Link OrderExecutor → live orders WS so the frontend gets real-time order events.
+	// This is called only for LIVE (non-paper) orders after broker placement.
+	orderExecutor.SetWSBroadcaster(func(userID string, eventType string, order *models.Order) {
+		paperWSServer.BroadcastLiveOrder(userID, paper.LiveOrderUpdate{
+			Type:   eventType,
+			UserID: userID,
+			Order:  order,
+		})
+	})
+
+	// Link OrderStatusService → live orders WS so every status change received from
+	// the Indira broker WebSocket (SUBMITTED→FILLED, PARTIALLY_FILLED, REJECTED, etc.)
+	// is pushed to the frontend immediately without requiring a page refresh.
+	statusService.SetWSBroadcaster(func(userID string, order *models.Order) {
+		paperWSServer.BroadcastLiveOrder(userID, paper.LiveOrderUpdate{
+			Type:   "order_update",
+			UserID: userID,
+			Order:  order,
+		})
+	})
+
+	// Initialize Redis price client — used for accurate order fill prices and PnL fallback.
+	// Non-fatal: if Redis is unavailable the service still runs, just without the Redis fallback.
+	redisPrices, redisErr := paper.NewRedisPriceClient(cfg.RedisAddr, cfg.RedisPassword)
+	var priceLookup executor.PriceLookup
+	if redisErr != nil {
+		log.Printf("[paper] Redis price client unavailable (non-fatal): %v", redisErr)
+		log.Println("[paper] Order fills will use signal price; PnL shown only when WSS is live")
+	} else {
+		log.Printf("✓ Redis price client connected (%s)", cfg.RedisAddr)
+		priceLookup = redisPrices
+	}
+
+	paperExec := executor.NewPaperOrderExecutor(orderRepo, kafkaPub, priceLookup)
+	orderExecutor.SetPaperExecutor(paperExec)
+
+	var paperMonitorRef *paper.PaperTradeMonitor
+	
+	paperExec.OnPaperFilled = func(order *models.Order) {
+		if paperMonitorRef != nil {
+			paperMonitorRef.AddOrder(order)
+		}
+	}
+
+	paperMarketClient := paper.NewPaperMarketClient(
+		cfg.PaperMarketWSURL,
+		func(symbol string, ltp float64) {
+			if paperMonitorRef != nil {
+				paperMonitorRef.OnPriceUpdate(symbol, ltp)
+			}
+		},
+	)
+	paperMonitor := paper.NewPaperTradeMonitor(orderRepo, paperExec, paperWSServer, paperMarketClient, redisPrices)
+	paperMonitorRef = paperMonitor
+	paperWSServer.SetMonitor(paperMonitor)
+	log.Println("✓ Paper trading layer initialized")
+	// ─────────────────────────────────────────────────────────────────────────
+
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start Kafka consumer for trade-signals
+	// Start market data WSS client (paper trading price feed)
 	go func() {
-		log.Println("Starting Kafka consumer...")
-		if err := kafkaConsumer.Start(ctx); err != nil {
-			log.Printf("Kafka consumer error: %v", err)
+		log.Println("Starting paper market WSS client...")
+		paperMarketClient.Start(ctx)
+	}()
+
+	// Load active paper orders and subscribe symbols
+	go func() {
+		time.Sleep(2 * time.Second) // wait for WSS to connect
+		if err := paperMonitor.Initialize(ctx); err != nil {
+			log.Printf("[paper] Monitor init error (non-fatal): %v", err)
 		}
 	}()
 
-	// Start RabbitMQ consumer
+	// Start paper trading WebSocket server for frontend
 	go func() {
-		log.Println("Starting RabbitMQ consumer...")
-		if err := rabbitConsumer.Start(ctx); err != nil {
-			log.Fatalf("RabbitMQ consumer error: %v", err)
+		paperWSAddr := fmt.Sprintf(":%d", cfg.PaperWSPort)
+		log.Printf("Starting paper trading WS server on %s", paperWSAddr)
+		if err := paperWSServer.StartHTTPServer(ctx, paperWSAddr); err != nil {
+			log.Printf("Paper WS server stopped: %v", err)
+		}
+	}()
+
+	// Start Kafka consumer — primary intake path (rules-engine trade-signals)
+	go func() {
+		log.Println("Starting Kafka consumer (trade-signals)...")
+		if err := kafkaConsumer.Start(ctx); err != nil {
+			log.Printf("Kafka consumer error: %v", err)
 		}
 	}()
 
@@ -168,19 +262,26 @@ func main() {
 
 // Config holds service configuration
 type Config struct {
-	GRPCPort      int
-	RabbitMQURL   string
-	QueueName     string
-	Exchange      string
-	RoutingKey    string
-	PrefetchCount int
-	WorkerCount   int
-	KafkaBrokers  []string
-	KafkaGroupID  string
-	KafkaTopic    string
-	MaxRetries    int
-	RetryDelay    time.Duration
-	PostgresURL   string
+	GRPCPort         int
+	RabbitMQURL      string
+	QueueName        string
+	Exchange         string
+	RoutingKey       string
+	PrefetchCount    int
+	WorkerCount      int
+	KafkaBrokers     []string
+	KafkaGroupID     string
+	KafkaTopic       string
+	MaxRetries       int
+	RetryDelay       time.Duration
+	PostgresURL      string
+	EncryptionKey    string
+	// Paper Trading
+	PaperWSPort      int
+	PaperMarketWSURL string
+	// Redis (market price feed)
+	RedisAddr     string
+	RedisPassword string
 }
 
 func loadConfig() Config {
@@ -193,19 +294,24 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		GRPCPort:      getEnvInt("SERVICE_PORT", 9004),
-		RabbitMQURL:   getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
-		QueueName:     getEnv("RABBITMQ_QUEUE", "trade.executions"),
-		Exchange:      getEnv("RABBITMQ_EXCHANGE", "trade.execution"),
-		RoutingKey:    getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
-		PrefetchCount: getEnvInt("RABBITMQ_PREFETCH", 10),
-		WorkerCount:   getEnvInt("WORKER_COUNT", 10),
-		KafkaBrokers:  kafkaBrokers,
-		KafkaGroupID:  getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
-		KafkaTopic:    getEnv("KAFKA_TOPIC", "trade-signals"),
-		MaxRetries:    getEnvInt("MAX_RETRIES", 3),
-		RetryDelay:    time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
-		PostgresURL:   buildPostgresURL(),
+		GRPCPort:         getEnvInt("SERVICE_PORT", 9004),
+		RabbitMQURL:      getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
+		QueueName:        getEnv("RABBITMQ_QUEUE", "trade.executions"),
+		Exchange:         getEnv("RABBITMQ_EXCHANGE", "trade.execution"),
+		RoutingKey:       getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
+		PrefetchCount:    getEnvInt("RABBITMQ_PREFETCH", 10),
+		WorkerCount:      getEnvInt("WORKER_COUNT", 10),
+		KafkaBrokers:     kafkaBrokers,
+		KafkaGroupID:     getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
+		KafkaTopic:       getEnv("KAFKA_TOPIC", "trade-signals"),
+		MaxRetries:       getEnvInt("MAX_RETRIES", 3),
+		RetryDelay:       time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
+		PostgresURL:      buildPostgresURL(),
+		EncryptionKey:    getEnv("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef"),
+		PaperWSPort:      getEnvInt("PAPER_WS_PORT", 8081),
+		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", "wss://stockkaskwebsocket.indiratrade.com/enhanced-stream"),
+		RedisAddr:        getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:    getEnv("REDIS_PASSWORD", "R3d1s@Prod"),
 	}
 }
 

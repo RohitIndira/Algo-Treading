@@ -117,7 +117,7 @@ func protoToModel(ps *proto.Strategy) (*models.StrategyConfig, error) {
 		UserID:       ps.UserId,
 		StrategyName: ps.StrategyName,
 		Active:       ps.Active,
-		TradingMode:  ps.TradingMode.String(),
+		TradingMode:  normalizeTradingMode(ps.TradingMode.String()),
 		Version:      uint64(ps.Version),
 	}
 	if ps.CreatedAt != nil {
@@ -244,6 +244,17 @@ func normalizeStopLossType(v string) string {
 		return "TRAILING"
 	default:
 		return "FIXED"
+	}
+}
+
+func normalizeTradingMode(v string) string {
+	switch v {
+	case "TRADING_MODE_LIVE", "LIVE":
+		return "LIVE"
+	case "TRADING_MODE_PAPER", "PAPER":
+		return "PAPER"
+	default:
+		return "PAPER" // Safe default
 	}
 }
 

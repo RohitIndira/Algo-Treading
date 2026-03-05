@@ -2,6 +2,7 @@ package matcher
 
 import (
 	"math"
+	"strings"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"go.uber.org/zap"
@@ -125,7 +126,7 @@ func (e *Evaluator) evaluateSentiment(event *models.MarketEvent, strategy *model
 	eventSentiment := event.Analysis.GetSentimentValue()
 
 	for _, sentiment := range strategy.Conditions.Sentiments {
-		if sentiment == eventSentiment {
+		if strings.EqualFold(sentiment, eventSentiment) {
 			result.MatchedConditions = append(result.MatchedConditions, condition)
 			result.ConditionScores[condition] = 100.0
 			return

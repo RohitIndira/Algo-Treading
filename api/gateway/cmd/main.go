@@ -68,6 +68,9 @@ func main() {
 	// Initialize WebSocket handler
 	websocketHandler := handlers.NewWebSocketHandler(redisClient, logger)
 
+	// Initialize Paper Trading handler
+	paperTradingHandler := handlers.NewPaperTradingHandler(cfg.Services.TradeExecutionPaperURL)
+
 	// CORS config
 	corsConfig := middleware.CORSConfig{
 		AllowedOrigins: cfg.CORS.AllowedOrigins,
@@ -76,7 +79,7 @@ func main() {
 	}
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

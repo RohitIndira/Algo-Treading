@@ -128,6 +128,18 @@ type ExecutionDetails struct {
 	TotalAmount   string    `json:"total_amount"`
 	Charges       string    `json:"charges"`
 	BrokerRef     string    `json:"broker_ref"`
+
+	// Raw WS broker data
+	TradedQty       int    `json:"traded_qty,omitempty"`
+	PendingQty      int    `json:"pending_qty,omitempty"`
+	OriginalQty     int    `json:"original_qty,omitempty"`
+	ExchangeOrderNo string `json:"exchange_order_no,omitempty"` // OrderNumber from WS
+	OrderEntryTime  string `json:"order_entry_time,omitempty"`  // OrderEntryTime from WS
+	LastModifiedAt  string `json:"last_modified_at,omitempty"`  // LastModifiedTimeStamp from WS
+	Product         string `json:"product,omitempty"`           // e.g. INTRADAY
+	OrderValidity   string `json:"order_validity,omitempty"`    // e.g. DAY
+	Reason          string `json:"reason,omitempty"`            // Rejection/cancel reason from WS
+	TriggerPrice    string `json:"trigger_price,omitempty"`     // For SL orders
 }
 
 // StrategyContext contains strategy information for updates
@@ -184,4 +196,7 @@ type TradeSignal struct {
 
 	// Product type
 	ProductType string `json:"product_type"` // INTRADAY, DELIVERY, CASH
+
+	// Trading mode
+	TradingMode string `json:"trading_mode"` // PAPER or LIVE
 }

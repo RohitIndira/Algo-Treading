@@ -129,9 +129,8 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	if auth.BearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
 	}
-	if auth.SSO {
-		req.Header.Set("sso", "True")
-	}
+	// Always send SSO as true by default
+	req.Header.Set("sso", "true")
 
 	// Execute request
 	resp, err := c.httpClient.Do(req)
@@ -159,6 +158,12 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 			Success: resp.StatusCode >= 200 && resp.StatusCode < 300,
 			Data:    json.RawMessage(responseBody),
 		}, nil
+	}
+
+	// If the API didn't wrap the payload in a "data" property, make the raw body
+	// available in the Data field so callers can unmarshal the entire response structurally.
+	if len(stdResp.Data) == 0 && len(responseBody) > 0 {
+		stdResp.Data = json.RawMessage(responseBody)
 	}
 
 	return &stdResp, nil

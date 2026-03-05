@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"sync"
 	"time"
 
@@ -17,7 +16,7 @@ const (
 	writeWait = 10 * time.Second
 
 	// Time allowed to read the next pong message from the peer.
-	pongWait = 60 * time.Second 
+	pongWait = 60 * time.Second
 
 	// Send pings to peer with this period. Must be less than pongWait.
 	// PDF requires a heartbeat every 50 seconds.
@@ -28,33 +27,38 @@ const (
 
 	wsEndpoint = "wss://livemiddleware.indiratrade.com/order-notify/websocket"
 	wsTokenAPI = "/order-notify/ws/createWsToken"
+
+	// tokenRefreshPeriod refreshes the WS token proactively before the typical 1-hour expiry.
+	tokenRefreshPeriod = 50 * time.Minute
 )
 
-// WSClient manages a WebSocket connection for a single user
+// WSClient manages a WebSocket connection for a single user.
 type WSClient struct {
-	client     *Client
-	auth       *AuthContext
+	client *Client
+	auth   *AuthContext
+
+	// mu protects conn, stopCh, IsActive, isClosed, OrderToken.
+	mu         sync.Mutex
 	conn       *websocket.Conn
-	mu         sync.Mutex // Protects the connection
-	
-	Updates    chan *WSOrderStatus
 	stopCh     chan struct{}
-	Wg         sync.WaitGroup
 	IsActive   bool
+	isClosed   bool // set by Close(); prevents any further reconnects
 	OrderToken string
+
+	Updates chan *WSOrderStatus
+	Wg      sync.WaitGroup
 }
 
-// NewWSClient creates a new WebSocket client for a specific user
+// NewWSClient creates a new WebSocket client for a specific user.
 func NewWSClient(httpClient *Client, auth *AuthContext) *WSClient {
 	return &WSClient{
 		client:  httpClient,
 		auth:    auth,
-		Updates: make(chan *WSOrderStatus, 100), // Buffered channel for live updates
-		stopCh:  make(chan struct{}),
+		Updates: make(chan *WSOrderStatus, 100),
 	}
 }
 
-// GetWebSocketToken hits the REST API to exchange the user's session token for a WebSocket Order Token
+// GetWebSocketToken hits the REST API to exchange the user's session token for a WebSocket Order Token.
 func (w *WSClient) GetWebSocketToken(ctx context.Context) (string, error) {
 	resp, err := w.client.doRequest(ctx, w.auth, "GET", wsTokenAPI, nil)
 	if err != nil {
@@ -73,165 +77,249 @@ func (w *WSClient) GetWebSocketToken(ctx context.Context) (string, error) {
 	return tokenResp.Result[0].OrderToken, nil
 }
 
-// Connect starts the WebSocket connection and background loops
+// Connect starts the WebSocket connection and background loops.
+// Should be called once per WSClient instance.
 func (w *WSClient) Connect(ctx context.Context) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.IsActive {
-		return nil // Already connected
+	if w.IsActive || w.isClosed {
+		w.mu.Unlock()
+		return nil
 	}
+	w.mu.Unlock()
 
-	// 1. Get Token
-	token, err := w.w.GetWebSocketToken(ctx)
+	// Fetch token outside the lock (network call).
+	token, err := w.GetWebSocketToken(ctx)
 	if err != nil {
 		return err
 	}
-	w.OrderToken = token
 
-	// 2. Dial WebSocket
-	dialer := websocket.DefaultDialer
-	conn, _, err := dialer.Dial(wsEndpoint, nil)
-	if err != nil {
-		return fmt.Errorf("websocket dial failed: %w", err)
+	w.mu.Lock()
+	if w.isClosed {
+		w.mu.Unlock()
+		return fmt.Errorf("client has been permanently closed")
 	}
-	w.conn = conn
+	w.OrderToken = token
+	initialStopCh, err := w.dialLocked()
+	w.mu.Unlock()
 
-	// 3. Send Connection Auth String (Plain Text JSON)
+	if err != nil {
+		return err
+	}
+
+	// Start the monitor goroutine exactly once — it handles all future reconnects.
+	w.Wg.Add(1)
+	go w.monitorReconnect(initialStopCh)
+
+	log.Printf("[ws] Client connected for user: %s", w.auth.UserId)
+	return nil
+}
+
+// dialLocked opens the WebSocket connection, sends auth, and starts read/write pumps.
+// Must be called with w.mu held. w.OrderToken must already be set.
+// Returns the stopCh for the new session.
+func (w *WSClient) dialLocked() (chan struct{}, error) {
+	conn, _, err := websocket.DefaultDialer.Dial(wsEndpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("websocket dial failed: %w", err)
+	}
+
+	// Send auth message.
 	authReq := WSConnectionRequest{
 		UserId:     w.auth.UserId,
 		OrderToken: w.OrderToken,
 	}
 	authBytes, _ := json.Marshal(authReq)
-	
-	// Write auth message
-	err = w.conn.WriteMessage(websocket.TextMessage, authBytes)
-	if err != nil {
-		w.conn.Close()
-		return fmt.Errorf("failed to send ws auth message: %w", err)
+	if err := conn.WriteMessage(websocket.TextMessage, authBytes); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to send ws auth message: %w", err)
 	}
 
+	stopCh := make(chan struct{})
+	w.conn = conn
+	w.stopCh = stopCh
 	w.IsActive = true
-	w.stopCh = make(chan struct{})
 
-	// 4. Start Pumps
+	// Start pumps with their own references — prevents stale-conn writes after reconnect.
 	w.Wg.Add(2)
-	go w.readPump()
-	go w.writePump()
+	go w.readPump(conn)
+	go w.writePump(conn, stopCh)
 
-	// 5. Auto-Reconnect Monitor
-	w.Wg.Add(1)
-	go w.monitorReconnect()
-
-	log.Printf("WS Client Connected for user: %s", w.auth.UserId)
-	return nil
+	return stopCh, nil
 }
 
-// Close gracefully stops the WebSocket connection
+// Close gracefully stops the WebSocket connection and prevents future reconnects.
 func (w *WSClient) Close() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if !w.IsActive {
+	if w.isClosed {
+		w.mu.Unlock()
 		return
 	}
+	w.isClosed = true
 	w.IsActive = false
-	close(w.stopCh)
-	if w.conn != nil {
-		w.conn.Close()
+	stopCh := w.stopCh
+	conn := w.conn
+	w.mu.Unlock()
+
+	// Close outside the lock to avoid deadlocks with goroutines that need the mutex.
+	if stopCh != nil {
+		close(stopCh)
 	}
-	w.Wg.Wait() // Wait for pumps to stop
-	// close(w.Updates) // Leave it up to caller to manage destruction if needed
+	if conn != nil {
+		conn.Close()
+	}
+	w.Wg.Wait()
 }
 
-func (w *WSClient) readPump() {
+// readPump reads messages from the given conn. Owns its own conn reference —
+// safe against reconnects that replace w.conn.
+func (w *WSClient) readPump(conn *websocket.Conn) {
 	defer func() {
 		w.Wg.Done()
-		w.conn.Close()
-		w.IsActive = false
+		conn.Close()
+		w.mu.Lock()
+		// Only mark inactive if this pump's conn is still the current one.
+		if w.conn == conn {
+			w.IsActive = false
+		}
+		w.mu.Unlock()
 	}()
 
-	w.conn.SetReadLimit(maxMessageSize)
-	// PDF doesn't mention pong, it's text heartbeat, but we set a read deadline anyway
-	w.conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetReadLimit(maxMessageSize)
+	conn.SetReadDeadline(time.Now().Add(pongWait))
 
 	for {
-		_, message, err := w.conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WS read error user %s: %v", w.auth.UserId, err)
+				log.Printf("[ws] Read error user %s: %v", w.auth.UserId, err)
 			}
 			break
 		}
-		
-		w.conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetReadDeadline(time.Now().Add(pongWait))
 
-		// Try parsing order status
 		var orderStatus WSOrderStatus
-		if err := json.Unmarshal(message, &orderStatus); err == nil && orderStatus.OrderSequenceNumber != 0 {
-			// Successfully parsed an order update. Push to channel non-blocking
+		if err := json.Unmarshal(message, &orderStatus); err == nil &&
+			(orderStatus.UniqueCode != "" || orderStatus.OrderStatus != "") {
 			select {
 			case w.Updates <- &orderStatus:
 			default:
-				log.Printf("WS Updates channel full for user %s, dropping message", w.auth.UserId)
+				log.Printf("[ws] Updates channel full for user %s, dropping message", w.auth.UserId)
 			}
 		} else {
-			// Could be the { "status":"Ok" } connection response
-			log.Printf("WS info msg user %s: %s", w.auth.UserId, string(message))
+			log.Printf("[ws] Info msg user %s: %s", w.auth.UserId, string(message))
 		}
 	}
 }
 
-func (w *WSClient) writePump() {
+// writePump sends heartbeats on the given conn and stops when stopCh is closed.
+// Owns its own conn and stopCh references — safe against reconnects.
+func (w *WSClient) writePump(conn *websocket.Conn, stopCh chan struct{}) {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		w.conn.Close()
+		conn.Close()
 		w.Wg.Done()
 	}()
 
 	for {
 		select {
-		case <-w.stopCh:
-			// Send close message gracefully
-			w.conn.WriteMessage(websocket.CloseMessage, []byte{})
+		case <-stopCh:
+			conn.WriteMessage(websocket.CloseMessage, []byte{})
 			return
 		case <-ticker.C:
-			// Send heartbeat
-			w.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			hb := WSHeartbeat{
-				UserId:    w.auth.UserId,
-				Heartbeat: "h",
-			}
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			hb := WSHeartbeat{UserId: w.auth.UserId, Heartbeat: "h"}
 			hbBytes, _ := json.Marshal(hb)
-			if err := w.conn.WriteMessage(websocket.TextMessage, hbBytes); err != nil {
+			if err := conn.WriteMessage(websocket.TextMessage, hbBytes); err != nil {
 				return
 			}
+			conn.SetWriteDeadline(time.Time{})
 		}
 	}
 }
 
-// monitorReconnect automatically reconnects if the read/write pumps die while the client should be active
-func (w *WSClient) monitorReconnect() {
+// monitorReconnect auto-reconnects when the connection drops and proactively refreshes
+// the token. Started exactly once by Connect — must NOT be called elsewhere.
+// initialStopCh is the stopCh of the first session, used as the initial select target.
+func (w *WSClient) monitorReconnect(initialStopCh chan struct{}) {
 	defer w.Wg.Done()
+
+	tokenRefreshTicker := time.NewTicker(tokenRefreshPeriod)
+	defer tokenRefreshTicker.Stop()
+
+	// currentStopCh tracks the stopCh of the active session so we exit when Close() fires.
+	currentStopCh := initialStopCh
 
 	for {
 		select {
-		case <-w.stopCh:
-			return // Expected shutdown
-		case <-time.After(5 * time.Second): // Poll state every 5s
+		case <-currentStopCh:
+			// stopCh was closed — check if this is a permanent shutdown.
 			w.mu.Lock()
-			active := w.IsActive
+			closed := w.isClosed
+			w.mu.Unlock()
+			if closed {
+				return
+			}
+			// Not permanent (shouldn't normally happen) — update reference and continue.
+			w.mu.Lock()
+			currentStopCh = w.stopCh
 			w.mu.Unlock()
 
-			if !active {
-				log.Printf("WS Auto-reconnecting for user %s...", w.auth.UserId)
-				err := w.Connect(context.Background())
-				if err != nil {
-					log.Printf("WS Reconnect failed for user %s: %v", w.auth.UserId, err)
-				}
-				// If it successfully Connects, Connect() spawns new pumps and returns, but this monitor keeps running
+		case <-tokenRefreshTicker.C:
+			// Proactively refresh token so the next reconnect uses a fresh one.
+			w.mu.Lock()
+			closed := w.isClosed
+			w.mu.Unlock()
+			if closed {
+				return
 			}
+			if token, err := w.GetWebSocketToken(context.Background()); err == nil {
+				w.mu.Lock()
+				w.OrderToken = token
+				w.mu.Unlock()
+				log.Printf("[ws] Token proactively refreshed for user %s", w.auth.UserId)
+			} else {
+				log.Printf("[ws] Token refresh failed for user %s: %v", w.auth.UserId, err)
+			}
+
+		case <-time.After(5 * time.Second):
+			w.mu.Lock()
+			active := w.IsActive
+			closed := w.isClosed
+			w.mu.Unlock()
+
+			if closed {
+				return
+			}
+			if active {
+				continue
+			}
+
+			log.Printf("[ws] Auto-reconnecting for user %s...", w.auth.UserId)
+
+			// Fetch fresh token outside the lock (network call).
+			token, err := w.GetWebSocketToken(context.Background())
+			if err != nil {
+				log.Printf("[ws] Token fetch failed for user %s: %v", w.auth.UserId, err)
+				continue
+			}
+
+			w.mu.Lock()
+			if w.isClosed {
+				w.mu.Unlock()
+				return
+			}
+			w.OrderToken = token
+			newStopCh, dialErr := w.dialLocked()
+			w.mu.Unlock()
+
+			if dialErr != nil {
+				log.Printf("[ws] Reconnect failed for user %s: %v", w.auth.UserId, dialErr)
+				continue
+			}
+
+			currentStopCh = newStopCh
+			log.Printf("[ws] Reconnected for user %s", w.auth.UserId)
 		}
 	}
 }

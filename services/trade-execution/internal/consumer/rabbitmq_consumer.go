@@ -382,6 +382,10 @@ func (c *RabbitMQConsumer) convertToOrder(req *models.OrderRequest) *models.Orde
 		StopLossType:  &req.StopLossType,
 		TrailingSLPct: &req.TrailingSLPct,
 
+		// Trading mode mapping
+		TradingMode:  req.TradingMode,
+		IsPaperTrade: req.TradingMode == "PAPER",
+
 		CreatedAt: now,
 		UpdatedAt: now,
 	}

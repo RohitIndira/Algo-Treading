@@ -46,24 +46,35 @@ func (c *Client) GetPositions(ctx context.Context, auth *AuthContext) ([]Positio
 	}
 
 	var positions []Position
-	if err := json.Unmarshal(resp.Data, &positions); err != nil {
-		// Try alternative format
-		var altResp map[string]interface{}
-		if err2 := json.Unmarshal(resp.Data, &altResp); err2 == nil {
-			if positionsData, ok := altResp["positions"]; ok {
-				positionsBytes, _ := json.Marshal(positionsData)
-				if err3 := json.Unmarshal(positionsBytes, &positions); err3 != nil {
-					return nil, fmt.Errorf("failed to parse positions: %w", err)
-				}
-			} else {
-				return nil, fmt.Errorf("failed to parse positions: %w", err)
+	if err := json.Unmarshal(resp.Data, &positions); err == nil {
+		return positions, nil
+	}
+
+	// Response is a JSON object — try common key names used by Indira API.
+	var altResp map[string]interface{}
+	if err2 := json.Unmarshal(resp.Data, &altResp); err2 != nil {
+		return nil, fmt.Errorf("failed to parse positions: %w", err2)
+	}
+
+	for _, key := range []string{"positions", "positionBook", "data", "position"} {
+		if posData, ok := altResp[key]; ok {
+			posBytes, _ := json.Marshal(posData)
+			var parsed []Position
+			if err3 := json.Unmarshal(posBytes, &parsed); err3 == nil {
+				return parsed, nil
 			}
-		} else {
-			return nil, fmt.Errorf("failed to parse positions: %w", err)
 		}
 	}
 
-	return positions, nil
+	// Check for an explicit API error in the response.
+	if status, _ := altResp["status"].(string); status == "error" {
+		if msg, _ := altResp["message"].(string); msg != "" {
+			return nil, fmt.Errorf("positions API error: %s", msg)
+		}
+	}
+
+	// No recognised position data found — likely no open positions today.
+	return []Position{}, nil
 }
 
 // ConvertPosition converts position type (e.g., INTRADAY to DELIVERY)

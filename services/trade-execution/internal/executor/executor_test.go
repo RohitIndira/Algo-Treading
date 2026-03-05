@@ -36,6 +36,18 @@ func (m *mockRepo) GetOpenOrders(ctx context.Context) ([]*models.Order, error) {
 func (m *mockRepo) GetTrailingStopLossOrders(ctx context.Context) ([]*models.Order, error) {
 	return nil, nil
 }
+func (m *mockRepo) GetAllActivePaperOrders(ctx context.Context) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetFilledPaperOrdersBySymbol(ctx context.Context, symbol string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetFilledPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) UpdatePaperTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	return nil
+}
 
 // credentials repo mock (not used in these tests)
 type mockCredsRepo struct{}

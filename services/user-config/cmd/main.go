@@ -56,6 +56,16 @@ func main() {
 
 	lgr.Info("Database connection established")
 
+	// Connect to the trade-execution DB (trading_execution) to store/read user credentials
+	execDBClient, err := postgres.New(cfg.ExecutionDB)
+	if err != nil {
+		lgr.Warn("Failed to connect to execution DB — credentials will NOT be saved", zap.Error(err))
+	}
+	if execDBClient != nil {
+		defer execDBClient.Close()
+		lgr.Info("Execution DB connection established", zap.String("db", cfg.ExecutionDB.Database))
+	}
+
 	// Initialize Kafka writer
 	var kafkaWriter *kafka.Writer
 	if cfg.Kafka.Enabled {
@@ -79,8 +89,19 @@ func main() {
 	sqlxDB := sqlx.NewDb(dbClient.DB, "postgres")
 	repo := repository.NewStrategyRepository(sqlxDB)
 
+	// Initialize credentials repository (writes to trading_execution DB)
+	var credsRepo repository.CredentialsRepository
+	if execDBClient != nil {
+		execSqlxDB := sqlx.NewDb(execDBClient.DB, "postgres")
+		credsRepo = repository.NewCredentialsRepository(execSqlxDB, cfg.EncryptionKey)
+		lgr.Info("Credentials repository initialized (trading_execution)")
+	} else {
+		credsRepo = repository.NewNoopCredentialsRepository()
+		lgr.Warn("Using no-op credentials repository — credentials will not be persisted")
+	}
+
 	// Initialize service
-	svc := service.NewStrategyService(repo, kafkaWriter, cfg.Kafka.Topic)
+	svc := service.NewStrategyService(repo, credsRepo, kafkaWriter, cfg.Kafka.Topic)
 
 	// Initialize Outbox Worker
 	if cfg.Kafka.Enabled && kafkaWriter != nil {

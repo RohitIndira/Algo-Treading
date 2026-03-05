@@ -9,29 +9,39 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
 	"github.com/google/uuid"
 )
 
-// SignalProcessor processes trade signals from Kafka
+// SignalProcessor processes trade signals from Kafka.
+// This is the primary entry point for all orders from the rules-engine.
 type SignalProcessor struct {
-	executor        *OrderExecutor
-	orderRepo       repository.OrderRepository
-	rabbitPublisher *publisher.RabbitMQPublisher
+	executor  *OrderExecutor
+	orderRepo repository.OrderRepository
+	kafkaPub  *publisher.KafkaPublisher
 }
 
-// NewSignalProcessor creates a new trade signal processor
-func NewSignalProcessor(executor *OrderExecutor, orderRepo repository.OrderRepository, rabbitPublisher *publisher.RabbitMQPublisher) *SignalProcessor {
+// NewSignalProcessor creates a new trade signal processor.
+func NewSignalProcessor(
+	executor *OrderExecutor,
+	orderRepo repository.OrderRepository,
+	kafkaPub *publisher.KafkaPublisher,
+	// statusSvc is now wired inside OrderExecutor — no longer needed here
+	_ *statusservice.OrderStatusService,
+) *SignalProcessor {
 	return &SignalProcessor{
-		executor:        executor,
-		orderRepo:       orderRepo,
-		rabbitPublisher: rabbitPublisher,
+		executor:  executor,
+		orderRepo: orderRepo,
+		kafkaPub:  kafkaPub,
 	}
 }
 
-// ProcessTradeSignal processes a trade signal from Kafka
+// ProcessTradeSignal processes a trade signal from Kafka — hot path.
+// DB persistence is synchronous; Indira API call is critical path.
+// WS subscription and Kafka publishing are handled inside OrderExecutor.
 func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models.TradeSignal) error {
-	log.Printf("Processing trade signal: OrderID=%s, UserID=%s, Symbol=%s, Price=%.2f",
-		signal.OrderID, signal.UserID, signal.Symbol, signal.Price)
+	log.Printf("Processing trade signal: OrderID=%s UserID=%s Symbol=%s Price=%.2f TradingMode=%q",
+		signal.OrderID, signal.UserID, signal.Symbol, signal.Price, signal.TradingMode)
 
 	// Convert TradeSignal to Order
 	order, err := p.convertSignalToOrder(signal)
@@ -39,37 +49,26 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 		return fmt.Errorf("failed to convert signal to order: %w", err)
 	}
 
-	// Save order to database
+	// Persist order to DB synchronously so subsequent Update calls can find the row.
 	if err := p.orderRepo.Create(ctx, order); err != nil {
-		return fmt.Errorf("failed to save order: %w", err)
+		log.Printf("DB Error: failed to save order %s: %v", order.OrderID, err)
+		// Non-fatal — continue to attempt broker placement.
 	}
 
-	log.Printf("Order %s saved to database with status %s", order.OrderID, order.Status)
-
-	// Publish order to RabbitMQ for odin-api-wrapper to execute
-	if p.rabbitPublisher != nil {
-		if err := p.rabbitPublisher.PublishOrder(ctx, order); err != nil {
-			log.Printf("Failed to publish order %s to RabbitMQ: %v", order.OrderID, err)
-			return fmt.Errorf("failed to publish order to RabbitMQ: %w", err)
-		}
-		log.Printf("✓ Order %s published to RabbitMQ for execution", order.OrderID)
-	} else {
-		log.Printf("⚠️ RabbitMQ publisher not configured, executing order directly")
-		// Fallback to direct execution if RabbitMQ publisher is not configured
-		if err := p.executor.ExecuteOrder(ctx, order); err != nil {
-			log.Printf("Failed to execute order %s: %v", order.OrderID, err)
-			return fmt.Errorf("failed to execute order: %w", err)
-		}
+	// Execute via Indira API.
+	// OrderExecutor handles: credentials, retries, WS subscription, and Kafka publishing.
+	if err := p.executor.ExecuteOrder(ctx, order); err != nil {
+		return fmt.Errorf("order execution failed: %w", err)
 	}
 
-	log.Printf("✓ Successfully processed and executed trade signal: OrderID=%s, Symbol=%s",
-		signal.OrderID, signal.Symbol)
+	log.Printf("✓ Order %s submitted for user %s symbol %s", signal.OrderID, signal.UserID, signal.Symbol)
 	return nil
 }
 
-// convertSignalToOrder converts a TradeSignal from Kafka to an Order model
+
+
+// convertSignalToOrder converts a TradeSignal from Kafka to an Order model.
 func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*models.Order, error) {
-	// Parse UUIDs
 	orderID, err := uuid.Parse(signal.OrderID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid order_id: %w", err)
@@ -77,41 +76,43 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 
 	eventID := uuid.Nil
 	if signal.EventID != "" {
-		eventID, err = uuid.Parse(signal.EventID)
-		if err != nil {
-			log.Printf("Warning: invalid event_id %s, using nil UUID", signal.EventID)
-			eventID = uuid.Nil
+		if parsed, parseErr := uuid.Parse(signal.EventID); parseErr == nil {
+			eventID = parsed
 		}
 	}
 
 	now := time.Now()
 
-	// Determine order side based on sentiment or default to BUY
 	orderSide := models.OrderSideBuy
 	if signal.Sentiment == "BEARISH" || signal.Sentiment == "NEGATIVE" {
 		orderSide = models.OrderSideSell
 	}
 
-	// Convert float64 values to pointers
 	price := signal.Price
 	stopLoss := signal.StopLoss
 	takeProfit := signal.TakeProfit
 	riskScore := 0.0
 
-	// Default product type to INTRADAY if not specified
 	productType := signal.ProductType
 	if productType == "" {
 		productType = "INTRADAY"
 	}
-
-	// Default stop loss type to FIXED if not specified
 	stopLossType := signal.StopLossType
 	if stopLossType == "" {
 		stopLossType = "FIXED"
 	}
+	_ = stopLossType // stored in DB via order fields below
 
-	// Create Order model
-	order := &models.Order{
+	// Normalize trading mode: treat empty as PAPER (safe default —
+	// strategies default to PAPER in user-config; empty here indicates
+	// a misconfiguration rather than a deliberate LIVE request).
+	tradingMode := signal.TradingMode
+	if tradingMode == "" {
+		log.Printf("[WARN] Signal %s has empty TradingMode — defaulting to PAPER. Check strategy config in rules-engine.", signal.OrderID)
+		tradingMode = "PAPER"
+	}
+
+	return &models.Order{
 		OrderID:      orderID,
 		UserID:       signal.UserID,
 		StrategyID:   signal.StrategyID,
@@ -125,29 +126,24 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 		Price:        &price,
 		StopLoss:     &stopLoss,
 		TakeProfit:   &takeProfit,
-		Validity:     "DAY", // Default validity
+		Validity:     "DAY",
 		ProductType:  productType,
 		Status:       models.StatusReceived,
-		RiskApproved: true, // Signals from rules-engine are already risk-approved
+		RiskApproved: true,
 		RiskScore:    &riskScore,
 		RetryCount:   0,
 		CreatedAt:    now,
 		UpdatedAt:    now,
-
-		// Authentication data from signal (originally from strategy)
-		BearerToken: stringPtr(signal.BearerToken),
-		AppId:       stringPtr(signal.AppId),
-		Source:      stringPtr(signal.Source),
-	}
-
-	log.Printf("Converted signal to order: ID=%s, Side=%s, Qty=%d, Price=%.2f, Auth=%v",
-		order.OrderID, order.OrderSide, order.Quantity, *order.Price,
-		signal.BearerToken != "" && signal.AppId != "" && signal.Source != "")
-
-	return order, nil
+		BearerToken:  stringPtr(signal.BearerToken),
+		AppId:        stringPtr(signal.AppId),
+		Source:       stringPtr(signal.Source),
+		// Paper trading
+		IsPaperTrade: tradingMode == "PAPER",
+		TradingMode:  tradingMode,
+	}, nil
 }
 
-// stringPtr converts a string to a pointer
+// stringPtr converts a non-empty string to a pointer; returns nil for empty strings.
 func stringPtr(s string) *string {
 	if s == "" {
 		return nil

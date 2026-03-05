@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -37,9 +38,7 @@ func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, a
 		return "", fmt.Errorf("failed to convert order: %w", err)
 	}
 
-	log.Printf("Placing order for user %s: Symbol=%s, Action=%s, Qty=%d, Type=%s",
-		auth.UserId, orderReq.Symbol, orderReq.OrdAction, orderReq.Qty, orderReq.OrdType)
-
+	log.Printf("Placing order for user %s: Symbol=%s",auth.UserId, orderReq.Symbol)
 	// Call Indira API
 	resp, err := c.client.PlaceOrder(ctx, auth, orderReq)
 	if err != nil {
@@ -50,6 +49,9 @@ func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, a
 	orderID := resp.OrderId
 	if orderID == "" {
 		orderID = resp.OrdId
+	}
+	if orderID == "" {
+		return "", fmt.Errorf("broker accepted request but returned no order ID (message: %s)", resp.Message)
 	}
 
 	log.Printf("✓ Order placed successfully: OrderID=%s", orderID)
@@ -139,6 +141,38 @@ func (c *ExecutionClient) GetHoldings(ctx context.Context, auth *indiraClient.Au
 	return c.client.GetHoldings(ctx, auth)
 }
 
+// GetOrderBook retrieves the full order book from the broker.
+func (c *ExecutionClient) GetOrderBook(ctx context.Context, auth *indiraClient.AuthContext) ([]indiraClient.OrderBook, error) {
+	return c.client.GetOrderBook(ctx, auth)
+}
+
+// FindRecentOrder checks the broker order book for an order matching symbol, side (BUY/SELL), and qty.
+// Used for idempotency: on network timeout we don't know if the order was placed; this checks before retrying.
+// Returns the broker order ID and true if a match is found.
+func (c *ExecutionClient) FindRecentOrder(ctx context.Context, auth *indiraClient.AuthContext, symbol, side string, qty int) (string, bool) {
+	orders, err := c.client.GetOrderBook(ctx, auth)
+	if err != nil {
+		log.Printf("[idempotency] order book fetch failed (cannot check duplicate): %v", err)
+		return "", false
+	}
+
+	sideUpper := strings.ToUpper(side)
+	symUpper := strings.ToUpper(symbol)
+	for _, o := range orders {
+		if !strings.EqualFold(o.OrdAction, sideUpper) || o.Qty != qty {
+			continue
+		}
+		// Broker symbol may be "STK_TCS_EQ_NSE_11536"; our symbol is "TCS".
+		oSymUpper := strings.ToUpper(o.Symbol)
+		if oSymUpper == symUpper || strings.Contains(oSymUpper, symUpper) {
+			log.Printf("[idempotency] Found matching order in broker book: %s (symbol=%s side=%s qty=%d)",
+				o.OrdId, o.Symbol, o.OrdAction, o.Qty)
+			return o.OrdId, true
+		}
+	}
+	return "", false
+}
+
 // ============ Internal Conversion Methods ============
 
 func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraClient.PlaceOrderRequest, error) {
@@ -184,29 +218,15 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		req.TriggerPrice = *order.StopLoss
 	}
 
-	// Set bracket order fields if present
-	if order.TargetPrice != nil && order.StopLoss != nil {
-		// If both Target and StopLoss are provided, this is a Bracket Order
-		tgtPrice := *order.TargetPrice
+	// Only send bracket order fields when the product type is explicitly BRACKET_ORDER.
+	// SL/TP on the internal order model are used by the paper/live monitor — they must
+	// NOT automatically override the product type sent to the broker.
+	if order.ProductType == "BRACKET_ORDER" && order.TakeProfit != nil && order.StopLoss != nil {
+		tgtPrice := *order.TakeProfit
 		req.BoTgtPrice = &tgtPrice
-
 		stpLoss := *order.StopLoss
 		req.BoStpLoss = &stpLoss
-
-		// Ensure Product Type is set to BRACKET_ORDER as required by Indira API
-		req.PrdType = "BRACKET_ORDER"
-
-		// For Bracket Orders, Indira API often requires the TriggerPrice to be used
-		// as the stop-loss trigger if it's a Limit Bracket Order.
-		// Following the provided cURL example:
-		// "prdType": "BRACKET_ORDER",
-		// "limitPrice": 0.0,
-		// "triggerPrice": 11.05,       <- This is the entry trigger for Stop-loss or just the current price threshold
-		// "boStpLoss": 0.0,            <- Stop loss difference or absolute? The snippet had 0.0, but usually it's absolute.
-		// "boTgtPrice": 12.0
-		// We will populate BoStpLoss and BoTgtPrice exactly as provided by the internal model.
 	} else {
-		// Ensure pointers are explicitly nil if not a bracket order to match omitempty (if applicable)
 		var defaultZero float64 = 0.0
 		req.BoTgtPrice = &defaultZero
 		req.BoStpLoss = &defaultZero

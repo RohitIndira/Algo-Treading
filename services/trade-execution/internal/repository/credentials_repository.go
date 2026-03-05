@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/crypto"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -19,11 +20,15 @@ type CredentialsRepository interface {
 }
 
 type credentialsRepository struct {
-	db *sqlx.DB
+	db            *sqlx.DB
+	encryptionKey string
 }
 
-func NewCredentialsRepository(db *sqlx.DB) CredentialsRepository {
-	return &credentialsRepository{db: db}
+func NewCredentialsRepository(db *sqlx.DB, encryptionKey string) CredentialsRepository {
+	return &credentialsRepository{
+		db:            db,
+		encryptionKey: encryptionKey,
+	}
 }
 
 func (r *credentialsRepository) StoreIndiraCredentials(ctx context.Context, userID, userId, appId, source, bearerToken string) error {
@@ -40,8 +45,13 @@ func (r *credentialsRepository) StoreIndiraCredentials(ctx context.Context, user
         RETURNING id
     `
 
-	_, err := r.db.ExecContext(ctx, query,
-		userID, userId, appId, source, bearerToken)
+	encryptedToken, err := crypto.Encrypt(bearerToken, r.encryptionKey)
+	if err != nil {
+		return err
+	}
+
+	_, err = r.db.ExecContext(ctx, query,
+		userID, userId, appId, source, encryptedToken)
 	return err
 }
 
@@ -64,7 +74,12 @@ func (r *credentialsRepository) GetIndiraCredentials(ctx context.Context, userID
 		return "", "", "", "", err
 	}
 
-	return userId, appId, source, bearerToken, nil
+	decryptedToken, err := crypto.Decrypt(bearerToken, r.encryptionKey)
+	if err != nil {
+		return "", "", "", "", err
+	}
+
+	return userId, appId, source, decryptedToken, nil
 }
 
 var ErrCredentialsNotFound = errors.New("credentials not found")

@@ -2,33 +2,64 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
+	"github.com/google/uuid"
 )
 
 // OrderExecutor handles order execution logic
 type OrderExecutor struct {
-	repo         repository.OrderRepository
-	credsRepo    repository.CredentialsRepository
-	indiraClient *indira.ExecutionClient
-	maxRetries   int
-	retryDelay   time.Duration
+	repo           repository.OrderRepository
+	credsRepo      repository.CredentialsRepository
+	indiraClient   *indira.ExecutionClient
+	kafkaPub       *publisher.KafkaPublisher
+	statusSvc      *statusservice.OrderStatusService
+	paperExecutor  *PaperOrderExecutor
+	wsBroadcaster  func(userID string, eventType string, order *models.Order)
+	maxRetries     int
+	retryDelay     time.Duration
 }
 
-// NewOrderExecutor creates a new order executor
-func NewOrderExecutor(repo repository.OrderRepository, credsRepo repository.CredentialsRepository, indiraClient *indira.ExecutionClient, maxRetries int, retryDelay time.Duration) *OrderExecutor {
+// SetWSBroadcaster sets the callback for broadcasting new orders to the frontend WebSocket
+func (e *OrderExecutor) SetWSBroadcaster(broadcaster func(userID string, eventType string, order *models.Order)) {
+	e.wsBroadcaster = broadcaster
+}
+
+// SetPaperExecutor overrides the paper executor
+func (e *OrderExecutor) SetPaperExecutor(paperExec *PaperOrderExecutor) {
+	e.paperExecutor = paperExec
+}
+
+// NewOrderExecutor creates a new order executor.
+// kafkaPub and statusSvc may be nil (graceful degradation).
+func NewOrderExecutor(
+	repo repository.OrderRepository,
+	credsRepo repository.CredentialsRepository,
+	indiraClient *indira.ExecutionClient,
+	kafkaPub *publisher.KafkaPublisher,
+	statusSvc *statusservice.OrderStatusService,
+	maxRetries int,
+	retryDelay time.Duration,
+) *OrderExecutor {
 	return &OrderExecutor{
-		repo:         repo,
-		credsRepo:    credsRepo,
-		indiraClient: indiraClient,
-		maxRetries:   maxRetries,
-		retryDelay:   retryDelay,
+		repo:          repo,
+		credsRepo:     credsRepo,
+		indiraClient:  indiraClient,
+		kafkaPub:      kafkaPub,
+		statusSvc:     statusSvc,
+		paperExecutor: NewPaperOrderExecutor(repo, kafkaPub, nil),
+		maxRetries:    maxRetries,
+		retryDelay:    retryDelay,
 	}
 }
 
@@ -36,7 +67,8 @@ func NewOrderExecutor(repo repository.OrderRepository, credsRepo repository.Cred
 // In services/trade-execution/internal/executor/executor.go
 
 func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) error {
-	log.Printf("Executing order %s for user %s", order.OrderID, order.UserID)
+	log.Printf("Executing order %s for user %s [trading_mode=%q is_paper=%v]",
+		order.OrderID, order.UserID, order.TradingMode, order.IsPaperTrade)
 
 	// Verify risk approval
 	if !order.RiskApproved {
@@ -44,26 +76,57 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 		return e.rejectOrder(ctx, order, "Risk not approved")
 	}
 
-	// Update status to PENDING
-	order.Status = models.StatusPending
-	if err := e.repo.Update(ctx, order); err != nil {
-		return fmt.Errorf("failed to update order status to PENDING: %w", err)
+	// ── PAPER TRADING: bypass broker entirely ──────────────────────────────
+	if order.IsPaperTrade {
+		log.Printf("[paper] Routing order %s to paper executor (mode=%q)", order.OrderID, order.TradingMode)
+		return e.paperExecutor.ExecutePaperOrder(ctx, order)
+	}
+	// ───────────────────────────────────────────────────────────────────────
+	if order.TradingMode == "" {
+		log.Printf("[WARN] Order %s has empty TradingMode — routing LIVE. Verify strategy TradingMode in rules-engine configstore.", order.OrderID)
 	}
 
-	// Get Indira credentials from the order (passed from frontend)
-	// Note: UserID is a non-pointer string on the Order model
-	if order.UserID == "" || order.AppId == nil || order.Source == nil || order.BearerToken == nil {
-		return e.failOrder(ctx, order, "Missing Indira Securities authentication data")
+	// Update status to PENDING asynchronously to avoid blocking the hot path
+	go func() {
+		orderCopy := *order
+		orderCopy.Status = models.StatusPending
+		if err := e.repo.Update(context.Background(), &orderCopy); err != nil {
+			log.Printf("Background DB Error: failed to update order %s status to PENDING: %v", orderCopy.OrderID, err)
+		}
+	}()
+
+	// Get Indira credentials: prefer values carried on the order (from frontend),
+	// but fall back to the DB credentials store for signals from the rules engine
+	// that don't carry per-request auth data.
+	var auth *indiraClient.AuthContext
+
+	if order.UserID != "" && order.AppId != nil && order.Source != nil && order.BearerToken != nil {
+		// Credentials were embedded in the signal — use them directly.
+		auth = &indiraClient.AuthContext{
+			UserId:      order.UserID,
+			AppId:       *order.AppId,
+			Source:      *order.Source,
+			BearerToken: *order.BearerToken,
+		}
+	} else {
+		// Fall back: load credentials from the DB for this user.
+		if e.credsRepo == nil {
+			return e.failOrder(ctx, order, "Missing Indira Securities authentication data and no credentials repository available")
+		}
+		userId, appId, source, bearerToken, err := e.credsRepo.GetIndiraCredentials(ctx, order.UserID)
+		if err != nil {
+			return e.failOrder(ctx, order, "Missing Indira Securities authentication data: "+err.Error())
+		}
+		log.Printf("Loaded DB credentials for user %s", order.UserID)
+		auth = &indiraClient.AuthContext{
+			UserId:      userId,
+			AppId:       appId,
+			Source:      source,
+			BearerToken: bearerToken,
+		}
 	}
 
-	auth := &indiraClient.AuthContext{
-		UserId:      order.UserID,
-		AppId:       *order.AppId,
-		Source:      *order.Source,
-		BearerToken: *order.BearerToken,
-	}
-
-	// Execute order with retries
+	// Execute order with retries + idempotency guard.
 	var lastErr error
 	for attempt := 0; attempt <= e.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -71,6 +134,23 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 			delay := e.retryDelay * time.Duration(attempt)
 			log.Printf("Retrying order %s, attempt %d after %v", order.OrderID, attempt, delay)
 			time.Sleep(delay)
+
+			// Before retrying after a timeout, check if the order was already placed.
+			// A timeout means the request may have reached the broker even though we got no response.
+			// Placing again would create a duplicate position.
+			if isTimeoutError(lastErr) {
+				log.Printf("[idempotency] Timeout on attempt %d for order %s — checking broker order book before retry",
+					attempt, order.OrderID)
+				if foundID, ok := e.indiraClient.FindRecentOrder(
+					ctx, auth, order.Symbol, string(order.OrderSide), int(order.Quantity),
+				); ok {
+					log.Printf("[idempotency] Order %s already exists at broker as %s — skipping retry",
+						order.OrderID, foundID)
+					order.IndiraOrderID = &foundID
+					return e.handleSuccessfulPlacement(ctx, order, foundID, auth)
+				}
+				log.Printf("[idempotency] Order %s not found in broker book — safe to retry", order.OrderID)
+			}
 		}
 
 		// Place order via Indira API
@@ -90,7 +170,7 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 
 		// Order placed successfully - store the Indira order ID
 		order.IndiraOrderID = &orderID
-		return e.handleSuccessfulPlacement(ctx, order, orderID)
+		return e.handleSuccessfulPlacement(ctx, order, orderID, auth)
 	}
 
 	// All retries exhausted
@@ -98,23 +178,52 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 	return e.failOrder(ctx, order, fmt.Sprintf("Max retries exceeded: %v", lastErr))
 }
 
-func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *models.Order, indiraOrderID string) error {
+func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *models.Order, indiraOrderID string, auth *indiraClient.AuthContext) error {
+	// Update local memory
 	now := time.Now()
 	order.Status = models.StatusSubmitted
 	order.SubmittedAt = &now
-
-	// Store the Indira order ID returned from API
 	order.IndiraOrderID = &indiraOrderID
 
-	if err := e.repo.Update(ctx, order); err != nil {
-		return fmt.Errorf("failed to update order after placement: %w", err)
+	// Perform DB updates + publish order-update in a background goroutine
+	go func() {
+		bgCtx := context.Background()
+		orderCopy := *order
+
+		if err := e.repo.Update(bgCtx, &orderCopy); err != nil {
+			log.Printf("Background DB Error: failed to update order %s after placement: %v", orderCopy.OrderID, err)
+			// Continue — still want to publish Kafka event and start WS
+		}
+
+		// Record execution event in DB
+		e.repo.RecordExecutionEvent(bgCtx, orderCopy.OrderID, "SUBMITTED", map[string]interface{}{
+			"indira_order_id": indiraOrderID,
+			"timestamp":       now,
+		})
+
+		// Publish ORDER_SUBMITTED to Kafka order-updates topic
+		e.publishOrderUpdate(bgCtx, &orderCopy, "ORDER_SUBMITTED", "MEDIUM",
+			"Order Submitted",
+			fmt.Sprintf("Order for %s submitted to broker (ref: %s)", orderCopy.Symbol, indiraOrderID))
+	}()
+
+	// Start backend-side WebSocket subscription to Indira for real-time order status.
+	// This is idempotent — no-op if already subscribed for this user.
+	if e.statusSvc != nil && auth != nil {
+		go func() {
+			if err := e.statusSvc.StartSubscription(context.Background(), order.UserID, auth); err != nil {
+				log.Printf("[executor] WS subscription for user %s failed (non-fatal): %v", order.UserID, err)
+			}
+		}()
+	} else if e.statusSvc == nil {
+		log.Printf("[executor] statusSvc not configured — skipping WS subscription for order %s", order.OrderID)
+	} else {
+		log.Printf("[executor] Missing auth on order %s — cannot start WS subscription", order.OrderID)
 	}
 
-	// Record execution event
-	e.repo.RecordExecutionEvent(ctx, order.OrderID, "SUBMITTED", map[string]interface{}{
-		"indira_order_id": indiraOrderID,
-		"timestamp":       now,
-	})
+	if e.wsBroadcaster != nil {
+		e.wsBroadcaster(order.UserID, "new_order", order)
+	}
 
 	log.Printf("Order %s submitted successfully with indira_order_id: %s", order.OrderID, indiraOrderID)
 	return nil
@@ -127,14 +236,18 @@ func (e *OrderExecutor) rejectOrder(ctx context.Context, order *models.Order, re
 	order.RejectionReason = &reason
 
 	if err := e.repo.Update(ctx, order); err != nil {
-		return fmt.Errorf("failed to update rejected order: %w", err)
+		log.Printf("[executor] failed to update rejected order %s in DB: %v", order.OrderID, err)
 	}
 
-	// Record rejection event
 	e.repo.RecordExecutionEvent(ctx, order.OrderID, "REJECTED", map[string]interface{}{
 		"reason":    reason,
 		"timestamp": time.Now(),
 	})
+
+	// Publish ORDER_REJECTED to Kafka
+	e.publishOrderUpdate(ctx, order, "ORDER_REJECTED", "HIGH",
+		"Order Rejected ✗",
+		fmt.Sprintf("Order for %s was rejected: %s", order.Symbol, reason))
 
 	return fmt.Errorf("order rejected: %s", reason)
 }
@@ -146,48 +259,79 @@ func (e *OrderExecutor) failOrder(ctx context.Context, order *models.Order, erro
 	order.ErrorMessage = &errorMsg
 
 	if err := e.repo.Update(ctx, order); err != nil {
-		return fmt.Errorf("failed to update failed order: %w", err)
+		log.Printf("[executor] failed to update failed order %s in DB: %v", order.OrderID, err)
 	}
 
-	// Record failure event
 	e.repo.RecordExecutionEvent(ctx, order.OrderID, "FAILED", map[string]interface{}{
 		"error":     errorMsg,
 		"timestamp": time.Now(),
 	})
 
+	// Publish ORDER_FAILED to Kafka
+	e.publishOrderUpdate(ctx, order, "ORDER_FAILED", "HIGH",
+		"Order Failed ✗",
+		fmt.Sprintf("Order for %s failed: %s", order.Symbol, errorMsg))
+
 	return fmt.Errorf("order failed: %s", errorMsg)
 }
 
-// PollOrderStatus polls Indira for order status updates
-func (e *OrderExecutor) PollOrderStatus(ctx context.Context, order *models.Order) error {
-	if order.IndiraOrderID == nil {
-		return fmt.Errorf("no Indira order ID for order %s", order.OrderID)
+// publishOrderUpdate publishes a lightweight order-update notification to the Kafka order-updates topic.
+// Safe to call even if kafkaPub is nil (degraded mode — logs and skips).
+func (e *OrderExecutor) publishOrderUpdate(ctx context.Context, order *models.Order, updateType, priority, title, message string) {
+	if e.kafkaPub == nil {
+		log.Printf("[executor] kafkaPub not configured — skipping order-update for %s (%s)", order.OrderID, updateType)
+		return
 	}
-
-	log.Printf("Polling status for order %s (indira_order_id: %s)", order.OrderID, *order.IndiraOrderID)
-
-	// Need AuthContext to poll status
-	if order.BearerToken == nil || order.AppId == nil || order.Source == nil {
-		return fmt.Errorf("missing authentication data for status polling")
+	now := time.Now()
+	update := &models.OrderUpdate{
+		UpdateID:  uuid.New().String(),
+		OrderID:   order.OrderID.String(),
+		UserID:    order.UserID,
+		CreatedAt: now,
+		ExpiresAt: now.Add(1 * time.Hour),
+		UpdateType: updateType,
+		Priority:   priority,
+		Title:      title,
+		Message:    message,
+		Status:     string(order.Status),
+		OrderSummary: models.OrderSummary{
+			Stock:     order.Symbol,
+			Action:    string(order.OrderSide),
+			Quantity:  order.Quantity,
+			Exchange:  string(order.Exchange),
+			OrderType: string(order.OrderType),
+		},
+		NotificationChannels: models.NotificationChannels{
+			Push:  true,
+			Email: false,
+			InApp: true,
+		},
 	}
-
-	auth := &indiraClient.AuthContext{
-		UserId:      order.UserID,
-		BearerToken: *order.BearerToken,
-		AppId:       *order.AppId,
-		Source:      *order.Source,
+	if order.Price != nil {
+		update.OrderSummary.Price = fmt.Sprintf("₹%.2f", *order.Price)
+	} else {
+		update.OrderSummary.Price = "MARKET"
 	}
-
-	_, err := e.indiraClient.GetOrderStatus(ctx, *order.IndiraOrderID, auth)
-	if err != nil {
-		return fmt.Errorf("failed to get order status: %w", err)
+	if err := e.kafkaPub.PublishOrderUpdate(ctx, update); err != nil {
+		log.Printf("[executor] failed to publish order-update (%s) for order %s: %v", updateType, order.OrderID, err)
+	} else {
+		log.Printf("[executor] ✓ Published order-update: type=%s order=%s user=%s symbol=%s",
+			updateType, order.OrderID, order.UserID, order.Symbol)
 	}
+}
 
-	// TODO: Parse response and update order based on status
-	// This depends on the actual Indira API response structure
-
-	log.Printf("Order %s status updated from Indira API", order.OrderID)
-	return e.repo.Update(ctx, order)
+// isTimeoutError returns true if err represents a network timeout or context deadline exceeded.
+// On timeout, the broker may have received the order even though we got no response —
+// so we must check the order book before retrying to avoid duplicates.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // CancelOrder cancels an order

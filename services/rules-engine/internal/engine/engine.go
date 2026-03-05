@@ -166,11 +166,13 @@ func (e *Engine) evaluateOne(ctx context.Context, event *models.MarketEvent, str
 	// Exact match semantics: all evaluated conditions must pass.
 	// We still compute score for observability, but it is NOT used to gate matches.
 	if !res.IsFullMatch() {
-		e.logger.Debug("Strategy did not fully match event",
+		e.logger.Info("Strategy did not fully match event",
 			zap.String("event_id", event.EventID),
 			zap.String("user_id", strategy.UserID),
 			zap.String("strategy_id", strategy.StrategyID),
-			zap.Strings("failed", res.FailedConditions),
+			zap.String("strategy_name", strategy.StrategyName),
+			zap.Strings("matched_conditions", res.MatchedConditions),
+			zap.Strings("failed_conditions", res.FailedConditions),
 		)
 		return nil, nil
 	}

@@ -79,9 +79,11 @@ type Order struct {
 	// Order status
 	Status OrderStatus `json:"status" db:"status"`
 
-	// Broker API integration (Indira Securities)
+	// Broker API integration (Indira Securities / Odin)
 	IndiraOrderID  *string `json:"indira_order_id,omitempty" db:"indira_order_id"` // Indira API order ID
 	IndiraResponse *string `json:"indira_response,omitempty" db:"indira_response"` // Indira API response
+	OdinOrderID    *string `json:"odin_order_id,omitempty" db:"odin_order_id"`     // Odin API order ID
+	OdinResponse   *string `json:"odin_response,omitempty" db:"odin_response"`     // Odin API response
 
 	// Frontend auth data (passed from frontend for Indira API calls)
 	BearerToken *string `json:"bearer_token,omitempty" db:"bearer_token"` // JWT bearer token from frontend
@@ -95,6 +97,16 @@ type Order struct {
 
 	// Auto square-off flag
 	IsSquareOffOrder bool `json:"is_square_off_order" db:"is_square_off_order"` // Flag for auto square-off orders
+
+	// Paper trading fields
+	IsPaperTrade    bool     `json:"is_paper_trade" db:"is_paper_trade"`               // True for paper trade orders
+	TradingMode     string   `json:"trading_mode" db:"trading_mode"`                    // PAPER or LIVE
+	PaperExitPrice  *float64 `json:"paper_exit_price,omitempty" db:"paper_exit_price"` // Exit price for paper positions
+	PaperPnL        *float64 `json:"paper_pnl,omitempty" db:"paper_pnl"`               // Final P&L for paper positions
+
+	// Live trading exit fields
+	LiveExitPrice *float64 `json:"live_exit_price,omitempty" db:"live_exit_price"` // Exit price for live positions (force-exit)
+	LivePnL       *float64 `json:"live_pnl,omitempty" db:"live_pnl"`               // Final P&L for live positions (force-exit)
 
 	// Execution details
 	FilledQuantity int32    `json:"filled_quantity" db:"filled_quantity"`
@@ -149,6 +161,9 @@ type OrderRequest struct {
 	StopLossType  string  `json:"stop_loss_type"`  // "FIXED" or "TRAILING"
 	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing stop loss percentage
 	ProductType   string  `json:"product_type"`    // INTRADAY, DELIVERY, CASH
+
+	// Trading mode from strategy
+	TradingMode string `json:"trading_mode"` // PAPER or LIVE
 }
 
 // ExecutionEvent represents an order execution event
