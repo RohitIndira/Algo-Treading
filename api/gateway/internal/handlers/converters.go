@@ -42,6 +42,8 @@ func mapProductType(productType string) common.ProductType {
 		return common.ProductType_PRODUCT_TYPE_DELIVERY
 	case "CASH":
 		return common.ProductType_PRODUCT_TYPE_CASH
+	case "BRACKET", "BRACKET_ORDER", "BO":
+		return common.ProductType_PRODUCT_TYPE_BRACKET
 	default:
 		return common.ProductType_PRODUCT_TYPE_UNSPECIFIED
 	}

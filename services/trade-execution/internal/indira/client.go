@@ -206,30 +206,46 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		TriggerPrice: 0,
 	}
 
-	// Set price for limit orders
-	if order.Price != nil {
-		req.LimitPrice = *order.Price
-	}
+	isBracket := order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO"
 
-	// Set trigger price for stop loss orders
-	if (order.OrderType == models.OrderTypeStopLoss ||
-		order.OrderType == models.OrderTypeStopLossMarket) &&
-		order.StopLoss != nil {
-		req.TriggerPrice = *order.StopLoss
-	}
+	if isBracket {
+		// Bracket Order (BO) price rules per Indira API spec:
+		// - MARKET BO: limitPrice=0, triggerPrice=user SL price, boTgtPrice=user TP price, boStpLoss=0
+		// - LIMIT BO:  limitPrice=entry limit, triggerPrice=user SL price, boTgtPrice=user TP price, boStpLoss=0
+		// triggerPrice is the stop-loss leg trigger; boTgtPrice is the target; boStpLoss=0 (not used).
+		// All prices must be rounded to the nearest NSE tick (0.05) to avoid EG003.
+		if order.OrderType == models.OrderTypeMarket {
+			req.LimitPrice = 0
+		} else if order.Price != nil {
+			req.LimitPrice = indiraClient.RoundToTick(*order.Price)
+		}
 
-	// Only send bracket order fields when the product type is explicitly BRACKET_ORDER.
-	// SL/TP on the internal order model are used by the paper/live monitor — they must
-	// NOT automatically override the product type sent to the broker.
-	if order.ProductType == "BRACKET_ORDER" && order.TakeProfit != nil && order.StopLoss != nil {
-		tgtPrice := *order.TakeProfit
-		req.BoTgtPrice = &tgtPrice
-		stpLoss := *order.StopLoss
-		req.BoStpLoss = &stpLoss
+		var zero float64 = 0.0
+		req.BoStpLoss = &zero // always 0 for BO — SL is carried via triggerPrice
+
+		if order.StopLoss != nil {
+			req.TriggerPrice = indiraClient.RoundToTick(*order.StopLoss) // user's stop loss price
+		}
+		if order.TakeProfit != nil {
+			tgt := indiraClient.RoundToTick(*order.TakeProfit)
+			req.BoTgtPrice = &tgt // user's target price
+		} else {
+			req.BoTgtPrice = &zero
+		}
 	} else {
-		var defaultZero float64 = 0.0
-		req.BoTgtPrice = &defaultZero
-		req.BoStpLoss = &defaultZero
+		// Non-bracket orders: set limitPrice for all order types (broker ignores it for Market)
+		if order.Price != nil {
+			req.LimitPrice = indiraClient.RoundToTick(*order.Price)
+		}
+		// Trigger price for stop loss orders
+		if (order.OrderType == models.OrderTypeStopLoss ||
+			order.OrderType == models.OrderTypeStopLossMarket) &&
+			order.StopLoss != nil {
+			req.TriggerPrice = indiraClient.RoundToTick(*order.StopLoss)
+		}
+		var zero float64 = 0.0
+		req.BoTgtPrice = &zero
+		req.BoStpLoss = &zero
 	}
 
 	return req, nil

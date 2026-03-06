@@ -44,7 +44,7 @@ type StrategyConditions struct {
 // TradeConfig represents JSON trade configuration
 type TradeConfig struct {
 	OrderType       string  `json:"order_type"` // "MARKET", "LIMIT"
-	ProductType     string  `json:"product_type"` // "INTRADAY", "DELIVERY"
+	ProductType     string  `json:"product_type"` // "INTRADAY", "DELIVERY", "BRACKET"
 	Validity        string  `json:"validity"`
 	Quantity        int32   `json:"quantity"`
 	Exchange        string  `json:"exchange"`

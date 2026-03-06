@@ -9,6 +9,7 @@ require (
 	github.com/RohitIndira/Algo-Treading/api/proto/common v0.0.0
 	github.com/RohitIndira/Algo-Treading/api/proto/user_config v0.0.0-00010101000000-000000000000
 	github.com/RohitIndira/Algo-Treading/pkg/logger v0.0.0-00010101000000-000000000000
+	github.com/joho/godotenv v1.5.1
 	github.com/google/uuid v1.6.0
 	github.com/jmoiron/sqlx v1.3.5
 	github.com/lib/pq v1.10.9

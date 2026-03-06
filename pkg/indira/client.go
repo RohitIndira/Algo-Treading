@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"time"
@@ -99,8 +100,10 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	}
 
 	var reqBody io.Reader
+	var jsonBody []byte
 	if body != nil {
-		jsonBody, err := json.Marshal(body)
+		var err error
+		jsonBody, err = json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal request body: %w", err)
 		}
@@ -108,6 +111,7 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	}
 
 	url := c.baseURL + path
+	log.Printf("[indira] → %s %s  body=%s", method, path, string(jsonBody))
 	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -146,6 +150,7 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	}
 
 	// Check HTTP status code
+	log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(responseBody))
 	}

@@ -104,6 +104,9 @@ type PaperWSServer struct {
 	repo             repository.OrderRepository
 	monitor          *PaperTradeMonitor // set after monitor is created
 	positionsFetcher PositionsFetcher   // set via SetPositionsFetcher
+	// startBrokerWS is wired in main.go to statusService.StartSubscription so the paper
+	// package doesn't import statusservice and create an import cycle.
+	startBrokerWS func(ctx context.Context, userID, bearerToken, appID, source string) error
 
 	// Paper trade clients: userID -> conn -> per-conn write mutex
 	clients map[string]map[*websocket.Conn]*sync.Mutex
@@ -133,6 +136,13 @@ func (s *PaperWSServer) SetPositionsFetcher(fn PositionsFetcher) {
 	s.positionsFetcher = fn
 }
 
+// SetStatusService wires the broker WS subscription starter.
+// fn must call statusService.StartSubscription under the hood.
+// Called from main.go to avoid import cycles between paper ↔ statusservice.
+func (s *PaperWSServer) SetStatusService(fn func(ctx context.Context, userID, bearerToken, appID, source string) error) {
+	s.startBrokerWS = fn
+}
+
 // RegisterRoutes registers all paper trading and live order HTTP/WebSocket endpoints onto a mux.
 func (s *PaperWSServer) RegisterRoutes(mux *http.ServeMux) {
 	// Paper trading
@@ -145,6 +155,7 @@ func (s *PaperWSServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/ws/live-orders/closed-orders", s.handleGetClosedLiveOrders)
 	mux.HandleFunc("/ws/live-orders/force-exit-all", s.handleForceExitAllLive)
 	mux.HandleFunc("/ws/live-orders/indira-positions", s.handleIndiraPositions)
+	mux.HandleFunc("/ws/live-orders/subscribe-broker-ws", s.handleSubscribeBrokerWS)
 	// Dashboard
 	mux.HandleFunc("/ws/dashboard-stats", s.handleGetDashboardStats)
 }
@@ -706,6 +717,55 @@ func (s *PaperWSServer) unregisterLiveClient(userID string, conn *websocket.Conn
 			delete(s.liveClients, userID)
 		}
 	}
+}
+
+// handleSubscribeBrokerWS starts the per-user Indira broker WebSocket subscription immediately
+// when a strategy is created/activated, so real-time order status updates begin before the
+// first order is placed.
+//
+// POST /ws/live-orders/subscribe-broker-ws
+// Headers: Authorization (Bearer token), appId, source, userId
+func (s *PaperWSServer) handleSubscribeBrokerWS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.startBrokerWS == nil {
+		// Not fatal — live trading WS subscription not configured (e.g. paper-only mode)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true,"note":"broker ws not configured"}`))
+		return
+	}
+
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+	if userID == "" {
+		http.Error(w, `{"error":"user_id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	bearerToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	appID := r.Header.Get("appId")
+	source := r.Header.Get("source")
+
+	if bearerToken == "" || appID == "" || source == "" {
+		http.Error(w, `{"error":"Authorization, appId and source headers required"}`, http.StatusUnauthorized)
+		return
+	}
+
+	if err := s.startBrokerWS(r.Context(), userID, bearerToken, appID, source); err != nil {
+		log.Printf("[subscribe-broker-ws] failed for user %s: %v", userID, err)
+		http.Error(w, `{"error":"failed to start broker ws subscription"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[subscribe-broker-ws] started Indira WS subscription for user %s (strategy activated)", userID)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"ok":true}`))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

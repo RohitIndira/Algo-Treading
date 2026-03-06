@@ -115,6 +115,7 @@ enum ProductType {
   PRODUCT_TYPE_INTRADAY = 1;  // Intraday/MIS
   PRODUCT_TYPE_DELIVERY = 2;  // Delivery/CNC
   PRODUCT_TYPE_CASH = 3;      // Cash
+  PRODUCT_TYPE_BRACKET = 4;   // Bracket Order (BO)
 }
 
 // Exchange types

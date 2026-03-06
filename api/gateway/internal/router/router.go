@@ -53,6 +53,7 @@ func NewRouter(
 		api.HandleFunc("/live-orders/closed-orders", paperHandler.GetClosedLiveOrders).Methods("GET")
 		api.HandleFunc("/live-orders/force-exit-all", paperHandler.ForceExitAllLive).Methods("POST")
 		api.HandleFunc("/live-orders/indira-positions", paperHandler.GetIndiraPositions).Methods("GET")
+		api.HandleFunc("/live-orders/subscribe-broker-ws", paperHandler.SubscribeBrokerWS).Methods("POST")
 		// Dashboard
 		api.HandleFunc("/dashboard-stats", paperHandler.GetDashboardStats).Methods("GET")
 	}

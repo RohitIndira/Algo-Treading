@@ -517,6 +517,8 @@ func productTypeToString(pt common.ProductType) string {
 		return "DELIVERY"
 	case common.ProductType_PRODUCT_TYPE_CASH:
 		return "CASH"
+	case common.ProductType_PRODUCT_TYPE_BRACKET:
+		return "BRACKET"
 	default:
 		return "INTRADAY"
 	}

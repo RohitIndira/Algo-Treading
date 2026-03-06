@@ -2,6 +2,7 @@ package indira
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -83,6 +84,8 @@ func MapProductType(productType string) string {
 		return "CASH"
 	case "MTF", "M":
 		return "MTF"
+	case "BRACKET", "BRACKET_ORDER", "BO":
+		return "BRACKET_ORDER" // Bracket Order — Indira API prdType per spec
 	default:
 		return "INTRADAY" // Default to intraday
 	}
@@ -144,4 +147,20 @@ func DetermineSeries(exchange, instrument string) string {
 		return "FO" // Futures & Options
 	}
 	return "EQ" // Equity
+}
+
+// RoundToTick rounds a price to the nearest valid NSE price tick.
+// NSE equity tick size: 0.05 for prices >= ₹1, 0.01 for prices < ₹1.
+// Floating-point result is clamped to 2 decimal places to avoid drift.
+func RoundToTick(price float64) float64 {
+	if price <= 0 {
+		return price
+	}
+	tick := 0.05
+	if price < 1.0 {
+		tick = 0.01
+	}
+	rounded := math.Round(price/tick) * tick
+	// Clamp to 2 decimal places to eliminate floating-point noise (e.g. 1299.5000000001)
+	return math.Round(rounded*100) / 100
 }

@@ -151,6 +151,18 @@ func main() {
 		})
 	})
 
+	// Wire StatusService.StartSubscription into PaperWSServer so the
+	// POST /ws/live-orders/subscribe-broker-ws endpoint can start the Indira
+	// WS subscription when a strategy is created/activated — before the first order fires.
+	paperWSServer.SetStatusService(func(ctx context.Context, userID, bearerToken, appID, source string) error {
+		return statusService.StartSubscription(ctx, userID, &indiraPkg.AuthContext{
+			UserId:      userID,
+			AppId:       appID,
+			Source:      source,
+			BearerToken: bearerToken,
+		})
+	})
+
 	// Initialize Redis price client — used for accurate order fill prices and PnL fallback.
 	// Non-fatal: if Redis is unavailable the service still runs, just without the Redis fallback.
 	redisPrices, redisErr := paper.NewRedisPriceClient(cfg.RedisAddr, cfg.RedisPassword)

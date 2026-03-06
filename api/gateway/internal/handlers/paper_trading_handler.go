@@ -247,6 +247,45 @@ func (h *PaperTradingHandler) GetIndiraPositions(w http.ResponseWriter, r *http.
 	w.Write(body)
 }
 
+// SubscribeBrokerWS handles POST /api/v1/live-orders/subscribe-broker-ws
+// Tells trade-execution to open the per-user Indira WS immediately on strategy activate.
+func (h *PaperTradingHandler) SubscribeBrokerWS(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	targetURL := fmt.Sprintf("%s/ws/live-orders/subscribe-broker-ws?user_id=%s", h.tradeExecBaseURL, userID)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, nil)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	for _, hdr := range []string{"Authorization", "appId", "appid", "userId", "source"} {
+		if val := r.Header.Get(hdr); val != "" {
+			req.Header.Set(hdr, val)
+		}
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
 // GetPaperWSInfo returns the WebSocket URL the frontend should connect to.
 // GET /api/v1/paper-trades/ws-info
 func (h *PaperTradingHandler) GetPaperWSInfo(w http.ResponseWriter, r *http.Request) {
