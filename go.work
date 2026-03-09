@@ -4,6 +4,7 @@ use (
 	.
 	./api/gateway
 	./api/proto/common
+	./api/proto/indira_wrapper
 	./api/proto/risk_management
 	./api/proto/rules_engine
 	./api/proto/trade_execution
@@ -11,6 +12,7 @@ use (
 	./pkg/indira
 	./pkg/logger
 	./services/data-ingestion
+	./services/indira-wrapper
 	./services/risk-management
 	./services/rules-engine
 	./services/trade-execution

@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package indira_wrapper;
+
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/indira_wrapper";
+
+// AUTH NOTE:
+// Every request carries auth fields (user_id, app_id, token, source).
+// The wrapper is STATELESS — it never stores tokens.
+
+// ─── PLACE ORDER ──────────────────────────────────────────────
+message PlaceOrderRequest {
+  string client_order_id = 1;
+  string symbol = 2;
+  int64 exc_token = 3;
+  string exc = 4;
+  string ord_action = 5;
+  string ord_validity = 6;
+  string ord_type = 7;
+  string prd_type = 8;
+  double limit_price = 9;
+  double trigger_price = 10;
+  int32 qty = 11;
+  string instrument = 12;
+  bool amo = 13;
+  string user_id = 14;
+  string app_id = 15;
+  string token = 16;
+  string source = 17;
+}
+
+message PlaceOrderResponse {
+  string broker_order_id = 1;
+  string ord_status = 2;
+  string rej_reason = 3;
+  bool success = 4;
+  string error_message = 5;
+}
+
+// ─── CANCEL ORDER ─────────────────────────────────────────────
+message CancelOrderRequest {
+  string broker_order_id = 1;
+  string symbol = 2;
+  string exc = 3;
+  string user_id = 4;
+  string app_id = 5;
+  string token = 6;
+  string source = 7;
+}
+
+message CancelOrderResponse {
+  string broker_order_id = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+// ─── MODIFY ORDER ─────────────────────────────────────────────
+message ModifyOrderRequest {
+  string broker_order_id = 1;
+  string symbol = 2;
+  string ord_action = 3;
+  string ord_validity = 4;
+  string exchange_token = 5;
+  string exc = 6;
+  int32 qty = 7;
+  int32 traded_qty = 8;
+  double limit_price = 9;
+  double trigger_price = 10;
+  string ord_type = 11;
+  string prd_type = 12;
+  string instrument = 13;
+  string user_id = 14;
+  string app_id = 15;
+  string token = 16;
+  string source = 17;
+}
+
+message ModifyOrderResponse {
+  string broker_order_id = 1;
+  string ord_status = 2;
+  bool success = 3;
+  string error_message = 4;
+}
+
+// ─── QUERY ORDER ──────────────────────────────────────────────
+message QueryOrderRequest {
+  string broker_order_id = 1;
+  string user_id = 2;
+  string app_id = 3;
+  string token = 4;
+  string source = 5;
+}
+
+message QueryOrderResponse {
+  string broker_order_id = 1;
+  string status = 2;
+  int32 qty = 3;
+  int32 traded_qty = 4;
+  int32 remain_qty = 5;
+  double price = 6;
+  string rej_reason = 7;
+  bool found = 8;
+  bool success = 9;
+  string error_message = 10;
+}
+
+// ─── GET POSITIONS ─────────────────────────────────────────────
+message GetPositionsRequest {
+  string user_id = 1;
+  string app_id = 2;
+  string token = 3;
+  string source = 4;
+}
+
+message Position {
+  string symbol = 1;
+  string disp_sym = 2;
+  string prd_type = 3;
+  string type = 4;
+  double ltp = 5;
+  double net_pnl = 6;
+  int32 net_qty = 7;
+  double buy_avg = 8;
+  double sell_avg = 9;
+  bool square_off = 10;
+}
+
+message GetPositionsResponse {
+  repeated Position positions = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+// ─── GET FUND LIMITS ───────────────────────────────────────────
+message GetFundLimitsRequest {
+  string user_id = 1;
+  string app_id = 2;
+  string token = 3;
+  string source = 4;
+}
+
+message GetFundLimitsResponse {
+  double available_margin = 1;
+  double utilized_margin = 2;
+  double deposit = 3;
+  bool success = 4;
+  string error_message = 5;
+}
+
+// ─── WSS ORDER EVENT ──────────────────────────────────────────
+message OrderEvent {
+  string broker_order_id = 1;
+  string event_type = 2;
+  string raw_status = 3;
+  int32 traded_qty = 4;
+  double traded_price = 5;
+  string rej_reason = 6;
+  int64 timestamp_ns = 7;
+  string raw_payload = 8;
+}
+
+message SubscribeOrderEventsRequest {
+  string user_id = 1;
+  string app_id = 2;
+  string token = 3;
+  string source = 4;
+}
+
+message WSSStatusRequest {}
+
+message WSSStatusResponse {
+  bool connected = 1;
+  string status_message = 2;
+  int64 last_event_ns = 3;
+  int64 events_received = 4;
+}
+
+service IndiraWrapperService {
+  rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse);
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+  rpc ModifyOrder(ModifyOrderRequest) returns (ModifyOrderResponse);
+  rpc QueryOrder(QueryOrderRequest) returns (QueryOrderResponse);
+  rpc GetPositions(GetPositionsRequest) returns (GetPositionsResponse);
+  rpc GetFundLimits(GetFundLimitsRequest) returns (GetFundLimitsResponse);
+
+  rpc SubscribeOrderEvents(SubscribeOrderEventsRequest) returns (stream OrderEvent);
+  rpc GetWSSStatus(WSSStatusRequest) returns (WSSStatusResponse);
+}

@@ -15,6 +15,9 @@ func (c *Client) PlaceOrder(ctx context.Context, auth *AuthContext, req *PlaceOr
 	if err != nil {
 		return nil, fmt.Errorf("place order request failed: %w", err)
 	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("place order broker error: %s", resp.InfoMsg)
+	}
 
 	// Parse response
 	var orderResp PlaceOrderResponse
@@ -62,6 +65,9 @@ func (c *Client) ModifyOrder(ctx context.Context, auth *AuthContext, req *Modify
 	if err != nil {
 		return fmt.Errorf("modify order request failed: %w", err)
 	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return fmt.Errorf("modify order broker error: %s", resp.InfoMsg)
+	}
 
 	// Check response
 	var result map[string]interface{}
@@ -83,6 +89,9 @@ func (c *Client) CancelOrder(ctx context.Context, auth *AuthContext, req *Cancel
 	resp, err := c.doRequest(ctx, auth, "POST", "/order-services/api/order/v1/cancel-order", req)
 	if err != nil {
 		return fmt.Errorf("cancel order request failed: %w", err)
+	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return fmt.Errorf("cancel order broker error: %s", resp.InfoMsg)
 	}
 
 	// Check response
@@ -106,6 +115,9 @@ func (c *Client) GetBrokerageCharges(ctx context.Context, auth *AuthContext, req
 	if err != nil {
 		return nil, fmt.Errorf("brokerage charges request failed: %w", err)
 	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("brokerage charges broker error: %s", resp.InfoMsg)
+	}
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(resp.Data, &result); err != nil {
@@ -121,6 +133,9 @@ func (c *Client) GetOrderBook(ctx context.Context, auth *AuthContext) ([]OrderBo
 	resp, err := c.doRequest(ctx, auth, "GET", "/portfolio-services/api/order/v1/order-book", nil)
 	if err != nil {
 		return nil, fmt.Errorf("order book request failed: %w", err)
+	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("order book broker error: %s", resp.InfoMsg)
 	}
 
 	var orders []OrderBook
@@ -151,6 +166,9 @@ func (c *Client) GetOrderTrail(ctx context.Context, auth *AuthContext, req *Orde
 	if err != nil {
 		return nil, fmt.Errorf("order trail request failed: %w", err)
 	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("order trail broker error: %s", resp.InfoMsg)
+	}
 
 	var trail []map[string]interface{}
 	if err := json.Unmarshal(resp.Data, &trail); err != nil {
@@ -175,6 +193,9 @@ func (c *Client) GetTradeBook(ctx context.Context, auth *AuthContext, orderIds .
 	resp, err := c.doRequest(ctx, auth, "POST", path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("trade book request failed: %w", err)
+	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("trade book broker error: %s", resp.InfoMsg)
 	}
 
 	var trades []TradeBook

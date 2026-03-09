@@ -130,6 +130,8 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	if auth.Source != "" {
 		req.Header.Set("source", auth.Source)
 	}
+	// Required for SSO sessions.
+	req.Header.Set("sso", "true")
 	if auth.BearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
 	}

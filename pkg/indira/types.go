@@ -5,8 +5,25 @@ import (
 	"fmt"
 )
 
-// StandardResponse represents the standard API response format
+// StandardResponse represents the standard API response format.
+//
+// Indira broker endpoints commonly return:
+//
+//	{"infoID":"0","infoMsg":"SUCCESS","timestamp":...,"data":{...}}
+//
+// Some other endpoints may return:
+//
+//	{"success":true,"data":...}
+//	{"status":"error","message":"..."}
+//
+// This struct is intentionally permissive and captures the union.
 type StandardResponse struct {
+	// Broker-style
+	InfoID    string `json:"infoID,omitempty"`
+	InfoMsg   string `json:"infoMsg,omitempty"`
+	Timestamp int64  `json:"timestamp,omitempty"`
+
+	// Generic-style
 	Success bool            `json:"success,omitempty"`
 	Data    json.RawMessage `json:"data,omitempty"`
 	Error   *ErrorInfo      `json:"error,omitempty"`
@@ -65,6 +82,10 @@ type PlaceOrderResponse struct {
 	OrdId   string `json:"ordId,omitempty"`
 	Message string `json:"message,omitempty"`
 	Status  string `json:"status,omitempty"`
+
+	// Broker-style fields (populated when available)
+	OrdStatus string `json:"ordStatus,omitempty"`
+	RejReason string `json:"rejReason,omitempty"`
 }
 
 // ModifyOrderRequest represents a request to modify an order

@@ -39,24 +39,23 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 }
 
 // PublishTradeSignal publishes a trade signal to Kafka
-func (p *KafkaPublisher) PublishTradeSignal(ctx context.Context, orderReq *models.OrderRequest) error {
+func (p *KafkaPublisher) PublishTradeSignal(ctx context.Context, signal *models.TradeSignal) error {
 	// Convert to JSON
-	orderJSON, err := json.Marshal(orderReq)
+	signalJSON, err := json.Marshal(signal)
 	if err != nil {
-		return fmt.Errorf("failed to marshal order: %w", err)
+		return fmt.Errorf("failed to marshal signal: %w", err)
 	}
 
 	// Create Kafka message
 	msg := kafka.Message{
-		Key:   []byte(orderReq.OrderID),
-		Value: orderJSON,
+		Key:   []byte(signal.UserID),
+		Value: signalJSON,
 		Headers: []kafka.Header{
-			{Key: "order_id", Value: []byte(orderReq.OrderID)},
-			{Key: "user_id", Value: []byte(orderReq.UserID)},
-			{Key: "strategy_id", Value: []byte(orderReq.StrategyID)},
-			{Key: "event_id", Value: []byte(orderReq.EventID)},
-			{Key: "order_type", Value: []byte(orderReq.OrderType)},
-			{Key: "timestamp", Value: []byte(orderReq.Timestamp.Format(time.RFC3339))},
+			{Key: "user_id", Value: []byte(signal.UserID)},
+			{Key: "strategy_id", Value: []byte(signal.StrategyID)},
+			{Key: "news_id", Value: []byte(signal.NewsID)},
+			{Key: "trading_mode", Value: []byte(signal.TradingMode)},
+			{Key: "timestamp", Value: []byte(time.Now().UTC().Format(time.RFC3339Nano))},
 		},
 	}
 
@@ -66,10 +65,9 @@ func (p *KafkaPublisher) PublishTradeSignal(ctx context.Context, orderReq *model
 	}
 
 	p.logger.Debug("Trade signal published to Kafka",
-		zap.String("order_id", orderReq.OrderID),
-		zap.String("user_id", orderReq.UserID),
-		zap.Int64("stock_code", orderReq.StockCode),
-		zap.String("symbol", orderReq.Symbol))
+		zap.String("user_id", signal.UserID),
+		zap.String("strategy_id", signal.StrategyID),
+		zap.Int64("stock_code", signal.StockCode))
 
 	return nil
 }

@@ -15,6 +15,9 @@ func (c *Client) GetAccountInfo(ctx context.Context, auth *AuthContext) (*Accoun
 	if err != nil {
 		return nil, fmt.Errorf("account info request failed: %w", err)
 	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("account info broker error: %s", resp.InfoMsg)
+	}
 
 	var accountInfo AccountInfo
 	if err := json.Unmarshal(resp.Data, &accountInfo); err != nil {
@@ -30,6 +33,9 @@ func (c *Client) GetFundLimit(ctx context.Context, auth *AuthContext) (*FundLimi
 	resp, err := c.doRequest(ctx, auth, "GET", "/payments/api/v1/get-fund-limit", nil)
 	if err != nil {
 		return nil, fmt.Errorf("fund limit request failed: %w", err)
+	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("fund limit broker error: %s", resp.InfoMsg)
 	}
 
 	var fundLimit FundLimit

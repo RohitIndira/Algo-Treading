@@ -23,6 +23,9 @@ type Config struct {
 	// User Config gRPC (bootstrap source-of-truth)
 	UserConfigGRPCAddr string
 
+	// NATS (real-time trade signal fan-out)
+	NATSAddress string
+
 	// PostgreSQL Configuration (for loading strategies)
 	PostgreSQL PostgreSQLConfig
 
@@ -265,6 +268,7 @@ func LoadConfig() (*Config, error) {
 		},
 
 		UserConfigGRPCAddr: getEnv("USER_CONFIG_GRPC_ADDR", getEnv("USER_CONFIG_SERVICE_ADDR", "localhost:50051")),
+		NATSAddress:        getEnv("NATS_ADDRESS", "nats://localhost:4222"),
 	}
 
 	// Validate configuration
@@ -294,6 +298,9 @@ func (c *Config) Validate() error {
 	}
 	if c.UserConfigGRPCAddr == "" {
 		return fmt.Errorf("USER_CONFIG_GRPC_ADDR cannot be empty")
+	}
+	if c.NATSAddress == "" {
+		return fmt.Errorf("NATS_ADDRESS cannot be empty")
 	}
 	if len(c.Redis.Addrs) == 0 {
 		return fmt.Errorf("redis addresses cannot be empty")

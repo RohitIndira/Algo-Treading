@@ -72,6 +72,14 @@ func main() {
 	// Initialize matching statistics
 	stats := models.NewMatchingStats()
 
+	// Connect NATS publisher (FATAL if cannot connect)
+	natsPub, err := publisher.NewNATSPublisher(cfg.NATSAddress)
+	if err != nil {
+		logger.Fatal("FATAL: cannot connect to NATS", zap.String("address", cfg.NATSAddress), zap.Error(err))
+	}
+	defer natsPub.Close()
+	logger.Info("NATS publisher connected", zap.String("address", cfg.NATSAddress))
+
 	// Initialize PostgreSQL repository for trade signal tracking
 	logger.Info("Initializing PostgreSQL trade signal repository...")
 	signalRepo, err := repository.NewTradeSignalRepository(
@@ -158,11 +166,33 @@ func main() {
 	logger.Info("Market hours initialized",
 		zap.String("status", marketHours.GetMarketStatus()))
 
-	// Initialize event handler
+	// Signal emit callback — called for every strategy that passes all filters.
+	onSignal := func(ctx context.Context, match *models.RuleMatch, event *models.MarketEvent) {
+		signal := ruleMatchToTradeSignal(match, event)
+
+		// Publish to NATS — real-time fan-out
+		if err := natsPub.PublishSignal(ctx, signal); err != nil {
+			logger.Warn("NATS publish failed",
+				zap.String("user_id", signal.UserID),
+				zap.String("strategy_id", signal.StrategyID),
+				zap.Error(err),
+			)
+		}
+
+		// Publish to Kafka — audit trail
+		if err := kafkaPub.PublishTradeSignal(ctx, signal); err != nil {
+			logger.Warn("Kafka signal publish failed",
+				zap.String("user_id", signal.UserID),
+				zap.String("strategy_id", signal.StrategyID),
+				zap.Error(err),
+			)
+		}
+	}
+
+	// Initialize engine + handler
 	eng := engine.New(store, engine.Config{Workers: cfg.Performance.WorkerCount}, logger)
 	eng.Start(ctx)
-	// RabbitMQ is intentionally not initialized (Kafka-only publishing).
-	handler := consumer.NewHandler(eng, nil, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours)
+	handler := consumer.NewEngineHandler(eng, onSignal)
 
 	// Step 5: Start config consumer BEFORE news consumer
 	configReader := kafka.NewReader(kafka.ReaderConfig{
@@ -274,5 +304,34 @@ func startOffsetFor(v string, defaultOffset int64) int64 {
 		return kafka.LastOffset
 	default:
 		return defaultOffset
+	}
+}
+
+func ruleMatchToTradeSignal(match *models.RuleMatch, event *models.MarketEvent) *models.TradeSignal {
+	// Defensive nil handling
+	var strat *models.Strategy
+	if match != nil {
+		strat = match.Strategy
+	}
+	if strat == nil {
+		strat = &models.Strategy{}
+	}
+
+	newsID := ""
+	stockCode := int64(0)
+	if event != nil {
+		newsID = event.NewsData.NewsID
+		stockCode = event.StockData.StockCode
+	}
+
+	return &models.TradeSignal{
+		UserID:      strat.UserID,
+		StrategyID:  strat.StrategyID,
+		NewsID:      newsID,
+		TradingMode: strat.TradingMode,
+		StockCode:   stockCode,
+		GeneratedAt: time.Now().UnixNano(),
+		TradeConfig: strat.TradeConfig,
+		RiskLimits:  strat.RiskLimits,
 	}
 }

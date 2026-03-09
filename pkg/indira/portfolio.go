@@ -15,6 +15,9 @@ func (c *Client) GetHoldings(ctx context.Context, auth *AuthContext) ([]Holding,
 	if err != nil {
 		return nil, fmt.Errorf("holdings request failed: %w", err)
 	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("holdings broker error: %s", resp.InfoMsg)
+	}
 
 	var holdings []Holding
 	if err := json.Unmarshal(resp.Data, &holdings); err != nil {
@@ -43,6 +46,9 @@ func (c *Client) GetPositions(ctx context.Context, auth *AuthContext) ([]Positio
 	resp, err := c.doRequest(ctx, auth, "GET", "/portfolio-services/api/portfolio/v1/position-book", nil)
 	if err != nil {
 		return nil, fmt.Errorf("positions request failed: %w", err)
+	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, fmt.Errorf("positions broker error: %s", resp.InfoMsg)
 	}
 
 	var positions []Position
@@ -83,6 +89,9 @@ func (c *Client) ConvertPosition(ctx context.Context, auth *AuthContext, req *Co
 	resp, err := c.doRequest(ctx, auth, "POST", "/portfolio-services/api/portfolio/v1/convert-position", req)
 	if err != nil {
 		return fmt.Errorf("convert position request failed: %w", err)
+	}
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return fmt.Errorf("convert position broker error: %s", resp.InfoMsg)
 	}
 
 	// Check response
