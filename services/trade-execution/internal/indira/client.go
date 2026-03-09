@@ -237,14 +237,18 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		if order.Price != nil {
 			req.LimitPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.Price))
 		}
-		// Trigger price for stop loss orders
-		if (order.OrderType == models.OrderTypeStopLoss ||
-			order.OrderType == models.OrderTypeStopLossMarket) &&
-			order.StopLoss != nil {
+		// Always send stop loss to Indira if present (live orders always carry SL).
+		if order.StopLoss != nil {
 			req.TriggerPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.StopLoss))
 		}
+		// Always send take profit to Indira if present (live orders always carry TP).
 		var zero indiraClient.Price2DP = 0.0
-		req.BoTgtPrice = &zero
+		if order.TakeProfit != nil {
+			tgt := indiraClient.Price2DP(indiraClient.RoundToTick(*order.TakeProfit))
+			req.BoTgtPrice = &tgt
+		} else {
+			req.BoTgtPrice = &zero
+		}
 		req.BoStpLoss = &zero
 	}
 
