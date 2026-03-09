@@ -156,6 +156,12 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 		// Place order via Indira API
 		orderID, err := e.indiraClient.PlaceOrder(ctx, order, auth)
 		if err != nil {
+			// Broker business rejections (e.g. EG003) are deterministic — retrying won't help.
+			var brokerErr *indiraClient.BrokerBusinessError
+			if errors.As(err, &brokerErr) {
+				log.Printf("❌ Broker rejected order %s (no retry): %v", order.OrderID, brokerErr)
+				return e.failOrder(ctx, order, brokerErr.Error())
+			}
 			lastErr = err
 			order.RetryCount++
 			log.Printf("Failed to place order %s (attempt %d): %v", order.OrderID, attempt+1, err)

@@ -8,11 +8,27 @@ import (
 	"go.uber.org/zap"
 )
 
+// PctChangeStatus describes how the event's price change % compares to the strategy range.
+// - "within_range": absPctChange is in [min, max]  → place order immediately
+// - "below_min":    absPctChange < min             → place LIMIT order at the min-% target price
+// - "above_max":    absPctChange > max             → skip trade (condition failed)
+// - "":             no pct-change filter was set on this strategy
+type PctChangeStatus string
+
+const (
+	PctChangeWithinRange PctChangeStatus = "within_range"
+	PctChangeBelowMin    PctChangeStatus = "below_min"
+	PctChangeAboveMax    PctChangeStatus = "above_max"
+)
+
 // EvaluationResult holds the result of strategy evaluation
 type EvaluationResult struct {
 	MatchedConditions []string
 	FailedConditions  []string
 	ConditionScores   map[string]float64
+	// PctChangeStatus carries the three-way result of the pct-change check so
+	// the handler can decide between an immediate MARKET order and a pending LIMIT order.
+	PctChangeStatus PctChangeStatus
 }
 
 // Evaluator evaluates strategies against events
@@ -237,7 +253,13 @@ func (e *Evaluator) evaluateVolume(event *models.MarketEvent, strategy *models.S
 	}
 }
 
-// evaluatePctChange evaluates percent change condition
+// evaluatePctChange evaluates percent change condition.
+//
+// Three outcomes:
+//   - above_max  → condition FAILS  (trade skipped)
+//   - within_range → condition PASSES, MARKET order (existing behaviour)
+//   - below_min  → condition PASSES, LIMIT order at the min-% target price
+//     The handler reads result.PctChangeStatus to decide which order type to use.
 func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
 	condition := "pct_change"
 
@@ -245,32 +267,44 @@ func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *model
 	min := strategy.Conditions.MinPctChange
 	max := strategy.Conditions.MaxPctChange
 
-	// If both are 0, no percent change filter
+	// If both are 0, no percent change filter — auto-pass.
 	if min == 0 && max == 0 {
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 		result.ConditionScores[condition] = 100.0
 		return
 	}
-	// if max is 0, treat as infinity
-	if max == 0 {
-		max = math.MaxFloat64
+	// Treat unset max as infinity.
+	effectiveMax := max
+	if effectiveMax == 0 {
+		effectiveMax = math.MaxFloat64
 	}
 
-	// Absolute percent change must be within [min,max]
-	if absPctChange >= min && absPctChange <= max {
+	// Case 3 – above max: skip trade.
+	if absPctChange > effectiveMax {
+		result.PctChangeStatus = PctChangeAboveMax
+		result.FailedConditions = append(result.FailedConditions, condition)
+		result.ConditionScores[condition] = 0
+		e.logger.Info("pct_change above max — trade skipped",
+			zap.Float64("abs_pct_change", absPctChange),
+			zap.Float64("max_pct_change", effectiveMax),
+			zap.String("strategy_id", strategy.StrategyID))
+		return
+	}
+
+	// Case 1 – within [min, max]: place order immediately.
+	if absPctChange >= min {
+		result.PctChangeStatus = PctChangeWithinRange
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 
-		// Score based on how far into range it is. If max is infinity, score by min.
-		if max == math.MaxFloat64 {
+		if effectiveMax == math.MaxFloat64 {
 			ratio := 1.0
 			if min > 0 {
 				ratio = absPctChange / min
 			}
-			score := math.Min(ratio, 2.0) / 2.0 * 100.0
-			result.ConditionScores[condition] = score
+			result.ConditionScores[condition] = math.Min(ratio, 2.0) / 2.0 * 100.0
 			return
 		}
-		span := max - min
+		span := effectiveMax - min
 		if span <= 0 {
 			result.ConditionScores[condition] = 100.0
 			return
@@ -283,10 +317,18 @@ func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *model
 			score = 100
 		}
 		result.ConditionScores[condition] = score
-	} else {
-		result.FailedConditions = append(result.FailedConditions, condition)
-		result.ConditionScores[condition] = 0
+		return
 	}
+
+	// Case 2 – below min: still a match, but handler must place a LIMIT order.
+	// The order price will be set to the level where the stock reaches min%.
+	result.PctChangeStatus = PctChangeBelowMin
+	result.MatchedConditions = append(result.MatchedConditions, condition)
+	result.ConditionScores[condition] = 50.0 // partial score; order is pending entry
+	e.logger.Info("pct_change below min — LIMIT order will be placed at target price",
+		zap.Float64("abs_pct_change", absPctChange),
+		zap.Float64("min_pct_change", min),
+		zap.String("strategy_id", strategy.StrategyID))
 }
 
 // evaluateExchange evaluates exchange condition

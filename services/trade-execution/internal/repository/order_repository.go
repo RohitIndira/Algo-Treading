@@ -46,6 +46,9 @@ type OrderRepository interface {
 	GetClosedLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error
 	CancelAllLiveOrdersByUser(ctx context.Context, userID string) error
+	// Strategy-level cancellation (used on deactivate/delete)
+	GetActiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error)
+	CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error
 	// Dashboard stats
 	GetDashboardStats(ctx context.Context, userID string, isPaper bool) (*DashboardStats, error)
 }
@@ -512,6 +515,42 @@ func (r *orderRepository) GetDashboardStats(ctx context.Context, userID string, 
 	}
 
 	return stats, nil
+}
+
+// GetActiveOrdersByStrategy returns all non-terminal orders for a given strategy.
+func (r *orderRepository) GetActiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE strategy_id = $1
+		AND user_id = $2
+		AND status NOT IN ('CANCELLED', 'REJECTED')
+		ORDER BY created_at ASC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, strategyID, userID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get active orders for strategy %s: %w", strategyID, err)
+	}
+	return orders, nil
+}
+
+// CancelAllOrdersByStrategy cancels all active orders (both paper and live) for a given strategy.
+// Used when a strategy is deactivated or deleted to ensure no positions remain open.
+func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error {
+	query := `
+		UPDATE orders SET
+			status = 'CANCELLED',
+			rejection_reason = 'Strategy deactivated or deleted',
+			updated_at = $1
+		WHERE strategy_id = $2
+		AND user_id = $3
+		AND status NOT IN ('CANCELLED', 'REJECTED')
+	`
+	_, err := r.db.ExecContext(ctx, query, time.Now(), strategyID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to cancel orders for strategy %s user %s: %w", strategyID, userID, err)
+	}
+	return nil
 }
 
 // UpdatePaperTradeExit marks a paper order as exited with the given price and PnL

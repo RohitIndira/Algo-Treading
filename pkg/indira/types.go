@@ -1,6 +1,9 @@
 package indira
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // StandardResponse represents the standard API response format
 type StandardResponse struct {
@@ -9,6 +12,9 @@ type StandardResponse struct {
 	Error   *ErrorInfo      `json:"error,omitempty"`
 	Message string          `json:"message,omitempty"`
 	Status  string          `json:"status,omitempty"`
+	// Indira business-error fields (e.g. EG003 "Price Not in multiple of PriceTick")
+	InfoID  string `json:"infoID,omitempty"`
+	InfoMsg string `json:"infoMsg,omitempty"`
 }
 
 // ErrorInfo represents error information
@@ -17,26 +23,40 @@ type ErrorInfo struct {
 	Message string `json:"message,omitempty"`
 }
 
+// BrokerBusinessError is a deterministic broker rejection (e.g. EG003).
+// It signals callers NOT to retry — the request will fail identically every time.
+type BrokerBusinessError struct {
+	Code    string
+	Message string
+}
+
+func (e *BrokerBusinessError) Error() string {
+	return fmt.Sprintf("broker rejected order [%s]: %s", e.Code, e.Message)
+}
+
 // ============ Order Types ============
 
-// PlaceOrderRequest represents a request to place an order
+// PlaceOrderRequest represents a request to place an order.
+// Price fields use Price2DP so they always serialize to exactly 2 decimal places,
+// preventing Indira EG003 "Price Not in multiple of PriceTick" caused by float64
+// representation (e.g. 5911.3 stored as 5911.2999... → broker gets 591129 paise ≠ multiple of 5).
 type PlaceOrderRequest struct {
-	Symbol       string   `json:"symbol"`       // e.g., "STK_TCS_EQ_NSE_11536"
-	ExcToken     string   `json:"excToken"`     // Exchange token, e.g., "11536"
-	Exc          string   `json:"exc"`          // Exchange, e.g., "NSE"
-	OrdAction    string   `json:"ordAction"`    // "BUY" or "SELL"
-	OrdValidity  string   `json:"ordValidity"`  // "DAY", "IOC"
-	OrdType      string   `json:"ordType"`      // "Market", "Limit", "SL", "SL-M"
-	PrdType      string   `json:"prdType"`      // "INTRADAY", "DELIVERY", "CASH"
-	LimitPrice   float64  `json:"limitPrice"`   // Limit price for limit orders
-	TriggerPrice float64  `json:"triggerPrice"` // Trigger price for stop loss orders
-	Qty          int      `json:"qty"`          // Quantity
-	DisQty       int      `json:"disQty"`       // Disclosed quantity
-	LotSize      int      `json:"lotSize"`      // Lot size
-	Instrument   string   `json:"instrument"`   // "STK", "OPT", "FUT", "IDX"
-	Amo          bool     `json:"amo"`          // After Market Order
-	BoStpLoss    *float64 `json:"boStpLoss"`    // Bracket order stop loss
-	BoTgtPrice   *float64 `json:"boTgtPrice"`   // Bracket order target price
+	Symbol       string    `json:"symbol"`       // e.g., "STK_TCS_EQ_NSE_11536"
+	ExcToken     string    `json:"excToken"`     // Exchange token, e.g., "11536"
+	Exc          string    `json:"exc"`          // Exchange, e.g., "NSE"
+	OrdAction    string    `json:"ordAction"`    // "BUY" or "SELL"
+	OrdValidity  string    `json:"ordValidity"`  // "DAY", "IOC"
+	OrdType      string    `json:"ordType"`      // "Market", "Limit", "SL", "SL-M"
+	PrdType      string    `json:"prdType"`      // "INTRADAY", "DELIVERY", "CASH"
+	LimitPrice   Price2DP  `json:"limitPrice"`   // Limit price — emits "5911.30" not "5911.3"
+	TriggerPrice Price2DP  `json:"triggerPrice"` // Trigger price — always 2 decimal places
+	Qty          int       `json:"qty"`          // Quantity
+	DisQty       int       `json:"disQty"`       // Disclosed quantity
+	LotSize      int       `json:"lotSize"`      // Lot size
+	Instrument   string    `json:"instrument"`   // "STK", "OPT", "FUT", "IDX"
+	Amo          bool      `json:"amo"`          // After Market Order
+	BoStpLoss    *Price2DP `json:"boStpLoss"`    // Bracket order stop loss
+	BoTgtPrice   *Price2DP `json:"boTgtPrice"`   // Bracket order target price
 }
 
 // PlaceOrderResponse represents the response from placing an order

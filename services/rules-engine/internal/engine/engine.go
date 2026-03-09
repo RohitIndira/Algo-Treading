@@ -190,6 +190,7 @@ func (e *Engine) evaluateOne(ctx context.Context, event *models.MarketEvent, str
 		ApprovedByRisk:    false,
 		Timestamp:         time.Now(),
 		EventID:           event.EventID,
+		PctChangeStatus:   string(res.PctChangeStatus),
 	}
 	_ = ctx
 	return match, nil

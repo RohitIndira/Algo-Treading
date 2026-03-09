@@ -47,6 +47,12 @@ type OrderRequest struct {
 
 	// Trading mode
 	TradingMode string `json:"trading_mode"` // PAPER or LIVE
+
+	// PctChangeStatus records why this order was generated as MARKET vs LIMIT.
+	// "within_range" → immediate MARKET order (price change already in strategy range).
+	// "below_min"    → pending LIMIT order; Price is the computed target entry price.
+	// ""             → no pct-change filter was active (treated as within_range).
+	PctChangeStatus string `json:"pct_change_status"`
 }
 
 // RuleMatch represents a successful rule match
@@ -62,6 +68,10 @@ type RuleMatch struct {
 	OrderRequestID    string    `json:"order_request_id"`
 	Timestamp         time.Time `json:"timestamp"`
 	EventID           string    `json:"event_id"`
+	// PctChangeStatus is forwarded from EvaluationResult so the handler can
+	// distinguish an immediate MARKET order (within_range / "") from a pending
+	// LIMIT order (below_min).
+	PctChangeStatus string `json:"pct_change_status"`
 }
 
 // NewOrderRequest creates a new order request from a match and event
@@ -151,7 +161,7 @@ func (o *OrderRequest) Validate() error {
 	if o.Price <= 0 {
 		return ErrInvalidPrice
 	}
-	if o.OrderType != "MARKET" && o.OrderType != "LIMIT" {
+	if o.OrderType != "MARKET" && o.OrderType != "LIMIT" && o.OrderType != "BRACKET" {
 		return ErrInvalidOrderType
 	}
 	return nil

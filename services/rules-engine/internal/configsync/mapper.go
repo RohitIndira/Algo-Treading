@@ -104,6 +104,8 @@ func normalizeOrderType(v string) string {
 		return "MARKET"
 	case "ORDER_TYPE_LIMIT", "LIMIT":
 		return "LIMIT"
+	case "ORDER_TYPE_BRACKET", "BRACKET":
+		return "BRACKET"
 	default:
 		// safe default
 		return "MARKET"

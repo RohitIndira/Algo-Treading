@@ -41,7 +41,13 @@ func (c *Client) PlaceOrder(ctx context.Context, auth *AuthContext, req *PlaceOr
 		}
 	}
 
-	// Check if order placement was successful
+	// Check for Indira business errors (e.g. EG003 "Price Not in multiple of PriceTick").
+	// These use infoID/infoMsg fields, not status/message.
+	if resp.InfoID != "" {
+		return nil, &BrokerBusinessError{Code: resp.InfoID, Message: resp.InfoMsg}
+	}
+
+	// Check generic error status
 	if orderResp.Status == "error" {
 		return &orderResp, fmt.Errorf("order placement failed: %s", orderResp.Message)
 	}

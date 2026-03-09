@@ -6,6 +6,23 @@ import (
 	"strings"
 )
 
+// Price2DP is a float64 that always serializes to JSON with exactly 2 decimal places.
+//
+// Problem: float64 cannot represent most decimal prices exactly.
+// e.g. 5911.3 is stored as 5911.2999999...818 in memory.
+// When Go's json encoder writes this as "5911.3", the Indira broker's backend
+// parses it, multiplies by 100 using integer truncation → 591129 (not 591130),
+// and 591129 % 5 = 4 ≠ 0 → EG003 "Price Not in multiple of PriceTick".
+//
+// Fix: emit "5911.30" (not "5911.3"). fmt.Sprintf("%.2f", 5911.2999...) correctly
+// rounds to "5911.30", so the broker receives an unambiguous 2-decimal value.
+type Price2DP float64
+
+// MarshalJSON implements json.Marshaler.
+func (p Price2DP) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf("%.2f", float64(p))), nil
+}
+
 // SymbolBuilder helps build Indira-format symbols
 type SymbolBuilder struct {
 	Instrument string // STK, OPT, FUT, IDX

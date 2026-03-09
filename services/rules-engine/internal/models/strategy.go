@@ -113,7 +113,7 @@ func (s *Strategy) Validate() error {
 	if s.TradeConfig.Quantity <= 0 {
 		return ErrInvalidQuantity
 	}
-	if s.TradeConfig.OrderType != "MARKET" && s.TradeConfig.OrderType != "LIMIT" {
+	if s.TradeConfig.OrderType != "MARKET" && s.TradeConfig.OrderType != "LIMIT" && s.TradeConfig.OrderType != "BRACKET" {
 		return ErrInvalidOrderType
 	}
 	// NOTE: Sentiments/categories/stocks can be empty to mean "match all".

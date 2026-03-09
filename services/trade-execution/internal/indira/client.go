@@ -212,38 +212,38 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		// Bracket Order (BO) price rules per Indira API spec:
 		// - MARKET BO: limitPrice=0, triggerPrice=user SL price, boTgtPrice=user TP price, boStpLoss=0
 		// - LIMIT BO:  limitPrice=entry limit, triggerPrice=user SL price, boTgtPrice=user TP price, boStpLoss=0
-		// triggerPrice is the stop-loss leg trigger; boTgtPrice is the target; boStpLoss=0 (not used).
-		// All prices must be rounded to the nearest NSE tick (0.05) to avoid EG003.
+		// All prices use Price2DP so they serialize to exactly 2 decimal places → avoids EG003.
 		if order.OrderType == models.OrderTypeMarket {
 			req.LimitPrice = 0
 		} else if order.Price != nil {
-			req.LimitPrice = indiraClient.RoundToTick(*order.Price)
+			req.LimitPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.Price))
 		}
 
-		var zero float64 = 0.0
+		var zero indiraClient.Price2DP = 0.0
 		req.BoStpLoss = &zero // always 0 for BO — SL is carried via triggerPrice
 
 		if order.StopLoss != nil {
-			req.TriggerPrice = indiraClient.RoundToTick(*order.StopLoss) // user's stop loss price
+			req.TriggerPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.StopLoss))
 		}
 		if order.TakeProfit != nil {
-			tgt := indiraClient.RoundToTick(*order.TakeProfit)
-			req.BoTgtPrice = &tgt // user's target price
+			tgt := indiraClient.Price2DP(indiraClient.RoundToTick(*order.TakeProfit))
+			req.BoTgtPrice = &tgt
 		} else {
 			req.BoTgtPrice = &zero
 		}
 	} else {
-		// Non-bracket orders: set limitPrice for all order types (broker ignores it for Market)
+		// Non-bracket orders: limitPrice for limit/SL orders; broker ignores it for Market.
+		// Price2DP ensures the JSON value is "5911.30" not "5911.3", preventing EG003.
 		if order.Price != nil {
-			req.LimitPrice = indiraClient.RoundToTick(*order.Price)
+			req.LimitPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.Price))
 		}
 		// Trigger price for stop loss orders
 		if (order.OrderType == models.OrderTypeStopLoss ||
 			order.OrderType == models.OrderTypeStopLossMarket) &&
 			order.StopLoss != nil {
-			req.TriggerPrice = indiraClient.RoundToTick(*order.StopLoss)
+			req.TriggerPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.StopLoss))
 		}
-		var zero float64 = 0.0
+		var zero indiraClient.Price2DP = 0.0
 		req.BoTgtPrice = &zero
 		req.BoStpLoss = &zero
 	}

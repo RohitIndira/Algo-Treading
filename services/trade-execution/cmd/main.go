@@ -90,6 +90,12 @@ func main() {
 	defer kafkaConsumer.Close()
 	log.Println("✓ Kafka consumer initialized")
 
+	// Initialize strategy events consumer (user-config-events → close positions on deactivate/delete)
+	log.Println("Initializing Kafka consumer for user-config-events...")
+	strategyEventsConsumer := consumer.NewStrategyEventsConsumer(cfg.KafkaBrokers, orderRepo, orderExecutor, logger)
+	defer strategyEventsConsumer.Close()
+	log.Println("✓ Strategy events consumer initialized")
+
 	// Initialize gRPC server
 	grpcServer := server.NewServer(orderRepo, orderExecutor, cfg.GRPCPort)
 	log.Println("✓ gRPC server initialized")
@@ -232,6 +238,14 @@ func main() {
 		log.Println("Starting Kafka consumer (trade-signals)...")
 		if err := kafkaConsumer.Start(ctx); err != nil {
 			log.Printf("Kafka consumer error: %v", err)
+		}
+	}()
+
+	// Start strategy events consumer — closes positions on strategy deactivate/delete
+	go func() {
+		log.Println("Starting Kafka consumer (user-config-events)...")
+		if err := strategyEventsConsumer.Start(ctx); err != nil {
+			log.Printf("Strategy events consumer error: %v", err)
 		}
 	}()
 
