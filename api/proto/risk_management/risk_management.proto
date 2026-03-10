@@ -1,0 +1,257 @@
+syntax = "proto3";
+
+package risk_management;
+
+import "api/proto/common/common.proto";
+
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/risk_management";
+
+// Risk Management Service
+// Provides pre-trade risk checks and post-trade monitoring
+service RiskManagementService {
+  // Perform pre-trade risk checks before order submission
+  rpc CheckPreTradeRisk(PreTradeRiskRequest) returns (PreTradeRiskResponse);
+  
+  // Update risk metrics after trade execution
+  rpc UpdatePostTradeMetrics(PostTradeMetricsRequest) returns (PostTradeMetricsResponse);
+  
+  // Get current risk metrics for a user
+  rpc GetRiskMetrics(GetRiskMetricsRequest) returns (GetRiskMetricsResponse);
+  
+  // Set custom risk limits for a user
+  rpc SetRiskLimits(SetRiskLimitsRequest) returns (SetRiskLimitsResponse);
+  
+  // Reset daily risk counters (typically called at EOD)
+  rpc ResetDailyCounters(ResetDailyCountersRequest) returns (ResetDailyCountersResponse);
+  
+  // Get user positions
+  rpc GetUserPositions(GetUserPositionsRequest) returns (GetUserPositionsResponse);
+  
+  // Health check
+  rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+}
+
+// Pre-trade risk check request
+message PreTradeRiskRequest {
+  // User ID
+  string user_id = 1;
+  
+  // Strategy ID
+  string strategy_id = 2;
+  
+  // Stock information
+  int64 stock_code = 3;
+  common.Exchange exchange = 4;
+  
+  // Order details
+  common.OrderType order_type = 5;
+  common.OrderSide order_side = 6;
+  int32 quantity = 7;
+  double price = 8;
+  
+  // Stop loss and take profit
+  double stop_loss = 9;
+  double take_profit = 10;
+  
+  // Risk limits from strategy
+  int32 max_daily_trades = 11;
+  double max_loss_per_day = 12;
+  double max_position_size = 13;
+  double max_per_trade_risk = 14;
+}
+
+// Risk violation types
+enum RiskViolationType {
+  RISK_VIOLATION_NONE = 0;
+  RISK_VIOLATION_DAILY_TRADE_LIMIT = 1;
+  RISK_VIOLATION_DAILY_LOSS_LIMIT = 2;
+  RISK_VIOLATION_POSITION_SIZE_LIMIT = 3;
+  RISK_VIOLATION_PER_TRADE_RISK_LIMIT = 4;
+  RISK_VIOLATION_DUPLICATE_ORDER = 5;
+  RISK_VIOLATION_INSUFFICIENT_MARGIN = 6;
+  RISK_VIOLATION_CIRCUIT_BREAKER = 7;
+  RISK_VIOLATION_CONCENTRATION_LIMIT = 8;
+}
+
+// Risk violation details
+message RiskViolation {
+  RiskViolationType type = 1;
+  string message = 2;
+  double current_value = 3;
+  double limit_value = 4;
+}
+
+// Pre-trade risk check response
+message PreTradeRiskResponse {
+  // Risk check passed or failed
+  bool approved = 1;
+  
+  // List of violations if any
+  repeated RiskViolation violations = 2;
+  
+  // Risk score (0-100, higher = riskier)
+  double risk_score = 3;
+  
+  // Suggested actions
+  repeated string suggestions = 4;
+  
+  // Error if any
+  common.Error error = 5;
+}
+
+// Post-trade metrics update request
+message PostTradeMetricsRequest {
+  // User ID
+  string user_id = 1;
+  
+  // Order ID
+  string order_id = 2;
+  
+  // Stock information
+  int64 stock_code = 3;
+  common.Exchange exchange = 4;
+  
+  // Trade details
+  common.OrderSide order_side = 5;
+  int32 filled_quantity = 6;
+  double filled_price = 7;
+  double commission = 8;
+  
+  // PnL if closing position
+  double realized_pnl = 9;
+  
+  // Timestamp
+  common.Timestamp executed_at = 10;
+}
+
+message PostTradeMetricsResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+// Current position for a stock
+message Position {
+  int64 stock_code = 1;
+  common.Exchange exchange = 2;
+  string symbol = 3;
+  
+  // Position details
+  int32 quantity = 4;
+  double average_price = 5;
+  double current_price = 6;
+  
+  // PnL
+  double unrealized_pnl = 7;
+  double unrealized_pnl_pct = 8;
+  
+  // Investment value
+  double invested_value = 9;
+  double current_value = 10;
+  
+  // Last updated
+  common.Timestamp updated_at = 11;
+}
+
+// User risk metrics
+message RiskMetrics {
+  string user_id = 1;
+  
+  // Daily counters
+  int32 daily_trade_count = 2;
+  double daily_loss = 3;
+  double daily_profit = 4;
+  double daily_net_pnl = 5;
+  
+  // Position metrics
+  int32 open_positions_count = 6;
+  double total_invested_value = 7;
+  double total_current_value = 8;
+  double total_unrealized_pnl = 9;
+  
+  // Portfolio metrics
+  double portfolio_exposure_pct = 10;
+  double largest_position_pct = 11;
+  
+  // Risk indicators
+  double current_drawdown_pct = 12;
+  double max_drawdown_pct = 13;
+  double sharpe_ratio = 14;
+  
+  // Violations today
+  int32 violation_count = 15;
+  repeated RiskViolation recent_violations = 16;
+  
+  // Timestamp
+  common.Timestamp last_updated = 17;
+}
+
+// Get risk metrics request
+message GetRiskMetricsRequest {
+  string user_id = 1;
+}
+
+message GetRiskMetricsResponse {
+  bool success = 1;
+  RiskMetrics metrics = 2;
+  repeated Position positions = 3;
+  common.Error error = 4;
+}
+
+// Custom risk limits
+message CustomRiskLimits {
+  string user_id = 1;
+  
+  // Daily limits
+  optional int32 max_daily_trades = 2;
+  optional double max_daily_loss = 3;
+  
+  // Position limits
+  optional double max_position_size = 4;
+  optional double max_portfolio_exposure_pct = 5;
+  optional double max_concentration_pct = 6;
+  
+  // Per-trade limits
+  optional double max_per_trade_risk = 7;
+  
+  // Circuit breaker
+  optional double circuit_breaker_loss_pct = 8;
+  
+  // Timestamps
+  common.Timestamp created_at = 9;
+  common.Timestamp updated_at = 10;
+}
+
+// Set risk limits request
+message SetRiskLimitsRequest {
+  CustomRiskLimits limits = 1;
+}
+
+message SetRiskLimitsResponse {
+  bool success = 1;
+  CustomRiskLimits limits = 2;
+  common.Error error = 3;
+}
+
+// Reset daily counters request
+message ResetDailyCountersRequest {
+  string user_id = 1;  // If empty, resets for all users
+}
+
+message ResetDailyCountersResponse {
+  bool success = 1;
+  int32 users_reset = 2;
+  common.Error error = 3;
+}
+
+// Get user positions request
+message GetUserPositionsRequest {
+  string user_id = 1;
+  bool include_closed = 2;  // Include closed positions from today
+}
+
+message GetUserPositionsResponse {
+  bool success = 1;
+  repeated Position positions = 2;
+  common.Error error = 3;
+}

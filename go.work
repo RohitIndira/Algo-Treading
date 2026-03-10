@@ -1,0 +1,18 @@
+go 1.25.4
+
+use (
+	.
+	./api/gateway
+	./api/proto/common
+	./api/proto/risk_management
+	./api/proto/rules_engine
+	./api/proto/trade_execution
+	./api/proto/user_config
+	./pkg/indira
+	./pkg/logger
+	./services/data-ingestion
+	./services/risk-management
+	./services/rules-engine
+	./services/trade-execution
+	./services/user-config
+)

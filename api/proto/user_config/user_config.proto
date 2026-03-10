@@ -1,0 +1,372 @@
+syntax = "proto3";
+
+package user_config;
+
+import "api/proto/common/common.proto";
+
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/user_config";
+
+// User Configuration Service
+// Manages user trading strategies and preferences
+service UserConfigService {
+  // Create a new trading strategy
+  rpc CreateStrategy(CreateStrategyRequest) returns (CreateStrategyResponse);
+  
+  // Update an existing strategy
+  rpc UpdateStrategy(UpdateStrategyRequest) returns (UpdateStrategyResponse);
+  
+  // Delete a strategy
+  rpc DeleteStrategy(DeleteStrategyRequest) returns (DeleteStrategyResponse);
+  
+  // Get a specific strategy
+  rpc GetStrategy(GetStrategyRequest) returns (GetStrategyResponse);
+  
+  // List all strategies for a user
+  rpc ListUserStrategies(ListUserStrategiesRequest) returns (ListUserStrategiesResponse);
+  
+  // Activate a strategy
+  rpc ActivateStrategy(ActivateStrategyRequest) returns (ActivateStrategyResponse);
+  
+  // Deactivate a strategy
+  rpc DeactivateStrategy(DeactivateStrategyRequest) returns (DeactivateStrategyResponse);
+  
+  // Get user strategies in bulk (for internal services)
+  rpc GetStrategiesByIDs(GetStrategiesByIDsRequest) returns (GetStrategiesByIDsResponse);
+
+  // Bulk-load ALL active strategies (for Rule Engine startup)
+  // NOTE: This is paginated to avoid huge responses.
+  rpc GetAllActiveStrategies(GetAllActiveStrategiesRequest) returns (GetAllActiveStrategiesResponse);
+  
+  // Update user credentials (bearer token, app_id, source)
+  rpc UpdateUserCredentials(UpdateUserCredentialsRequest) returns (UpdateUserCredentialsResponse);
+  
+  // Get user credentials for order execution
+  rpc GetUserCredentials(GetUserCredentialsRequest) returns (GetUserCredentialsResponse);
+  
+  // Health check
+  rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+}
+
+// Get all active strategies (paginated)
+message GetAllActiveStrategiesRequest {
+  int32 page_size = 1;   // recommended: 500
+  string page_token = 2; // opaque cursor; empty for first page
+}
+
+message GetAllActiveStrategiesResponse {
+  bool success = 1;
+  repeated Strategy strategies = 2;
+  string next_page_token = 3; // empty means last page
+  common.Error error = 4;
+}
+
+// Trading Mode
+enum TradingMode {
+  TRADING_MODE_UNSPECIFIED = 0;
+  PAPER = 1; // Simulated trading
+  LIVE = 2;  // Real money trading
+}
+
+// Strategy condition filters
+message StrategyConditions {
+  // Match ALL news events (overrides all other conditions)
+  bool match_all_news = 1;
+  
+  // Impact score range (0-100)
+  int32 impact_score_min = 2;
+  int32 impact_score_max = 3;
+  
+  // Sentiment filters (positive, neutral, negative)
+  repeated common.Sentiment sentiments = 4;
+  
+  // News categories to monitor
+  repeated string categories = 5;
+  
+  // Specific stocks to monitor (stock codes)
+  repeated int64 stock_codes = 6;
+  
+  // Price range filter
+  common.PriceRange price_range = 7;
+  
+  // Market Cap Type (Small, Mid, Large)
+  repeated string market_cap_types = 8;
+  
+  // Market cap range filter (in crores)
+  message MarketCapRange {
+    double min_mcap = 1; // Minimum market cap in crores
+    double max_mcap = 2; // Maximum market cap in crores
+  }
+  MarketCapRange market_cap_range = 9;
+  
+  // Minimum trading volume threshold
+  int64 volume_threshold = 10;
+  
+  // Percentage change threshold range (trigger if stock moves within/outside this range)
+  message PctChangeRange {
+      double min_pct_change = 1;
+      double max_pct_change = 2;
+  }
+  PctChangeRange pct_change_range = 11;
+  
+  // Exchanges to monitor
+  repeated common.Exchange exchanges = 12;
+}
+
+// Stop loss type enumeration
+enum StopLossType {
+  STOP_LOSS_TYPE_UNSPECIFIED = 0;
+  FIXED = 1;     // Fixed stop loss percentage
+  TRAILING = 2;  // Trailing stop loss that moves with profit
+}
+
+// Trade execution configuration
+message TradeConfig {
+  // Order type (MARKET, LIMIT, etc.)
+  common.OrderType order_type = 1;
+  
+  // Product type (INTRADAY, DELIVERY)
+  common.ProductType product_type = 2;
+  
+  // Validity (DAY, IOC)
+  string validity = 3;
+  
+  // Quantity to trade (Fixed quantity)
+  int32 quantity = 4;
+  
+  // Primary exchange for execution
+  common.Exchange exchange = 5;
+  
+  // Order side (BUY/SELL)
+  common.OrderSide order_side = 6;
+  
+  // Stop loss percentage
+  double stop_loss_pct = 7;
+  
+  // Take profit percentage
+  double take_profit_pct = 8;
+  
+  // Stop loss type (FIXED or TRAILING)
+  StopLossType stop_loss_type = 9;
+  
+  // Trailing stop loss percentage (only applies when stop_loss_type=TRAILING)
+  double trailing_sl_pct = 10;
+  
+  // Limit price (for LIMIT orders, optional)
+  double limit_price = 11;
+
+  // Indira-specific fields
+  string instrument = 12;      // Instrument type: "STK", "OPT", "FUT", "IDX"
+  int32 lot_size = 13;         // Lot size (default: 1 for stocks)
+  int32 disclosed_qty = 14;    // Disclosed quantity (0 = not disclosed)
+  bool amo = 15;               // After Market Order flag
+  double bracket_order_stop_loss = 16;   // Bracket order stop loss (optional)
+  double bracket_order_target = 17;      // Bracket order target (optional)
+  double max_position_size = 18; // Included for backward compatibility/validation
+}
+
+// Risk management limits
+message RiskLimits {
+  // Strategy ID link
+  string strategy_id = 1;
+
+  // Maximum number of trades per day
+  int32 max_daily_trades = 2;
+  
+  // Maximum risk per trade (in rupees)
+  double max_per_trade_risk = 3;
+  
+  // Maximum portfolio exposure percentage
+  double max_portfolio_exposure_pct = 4;
+  
+  // Maximum loss allowed per day (in rupees)
+  double max_loss_per_day = 5;
+  
+  // Enable risk checks
+  bool enable_risk_checks = 6;
+  
+  // Enable auto square-off at market close
+  bool enable_auto_square_off = 7;
+  
+  // Auto square-off time (format: "HH:MM" e.g., "15:05")
+  string auto_square_off_time = 8;
+
+  // Position sizing strategy
+  common.PositionSizing position_sizing = 9;
+}
+
+// Trading strategy definition
+message Strategy {
+  // Unique strategy ID
+  string strategy_id = 1;
+  
+  // User ID who owns this strategy
+  string user_id = 2;
+  
+  // Strategy name
+  string strategy_name = 3;
+  
+  // Strategy description
+  string description = 4;
+  
+  // Is strategy active
+  bool active = 5;
+  
+  // Trading Mode (Paper or Live)
+  TradingMode trading_mode = 6;
+  
+  // Strategy conditions
+  StrategyConditions conditions = 7;
+  
+  // Trade configuration
+  TradeConfig trade_config = 8;
+  
+  // Risk limits
+  RiskLimits risk_limits = 9;
+  
+  // Creation timestamp
+  common.Timestamp created_at = 10;
+  
+  // Last update timestamp
+  common.Timestamp updated_at = 11;
+  
+  // Version for optimistic locking
+  int32 version = 12;
+}
+
+message CreateStrategyRequest {
+    string user_id = 1;
+    string strategy_name = 2;
+    string description = 3;
+    StrategyConditions conditions = 4;
+    TradeConfig trade_config = 5;
+    RiskLimits risk_limits = 6;
+    bool activate_immediately = 7;
+    TradingMode trading_mode = 8;
+    
+    // Indira Securities authentication
+    common.IndiraAuthContext indira_auth = 9;
+}
+
+message CreateStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// Update strategy request
+message UpdateStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;
+  
+  // Optional fields - only provided fields will be updated
+  optional string strategy_name = 3;
+  optional string description = 4;
+  optional StrategyConditions conditions = 5;
+  optional TradeConfig trade_config = 6;
+  optional RiskLimits risk_limits = 7;
+  optional TradingMode trading_mode = 8;
+  
+  // Version for optimistic locking
+  int32 version = 9;
+}
+
+message UpdateStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// Delete strategy request
+message DeleteStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message DeleteStrategyResponse {
+  bool success = 1;
+  string message = 2;
+  common.Error error = 3;
+}
+
+// Get strategy request
+message GetStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message GetStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// List user strategies request
+message ListUserStrategiesRequest {
+  string user_id = 1;
+  bool active_only = 2;  // Filter to only active strategies
+  common.PaginationRequest pagination = 3;
+}
+
+message ListUserStrategiesResponse {
+  bool success = 1;
+  repeated Strategy strategies = 2;
+  common.PaginationResponse pagination = 3;
+  common.Error error = 4;
+}
+
+// Activate strategy request
+message ActivateStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message ActivateStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// Deactivate strategy request
+message DeactivateStrategyRequest {
+  string strategy_id = 1;
+  string user_id = 2;  // For authorization
+}
+
+message DeactivateStrategyResponse {
+  bool success = 1;
+  Strategy strategy = 2;
+  common.Error error = 3;
+}
+
+// Get strategies by IDs (for internal services)
+message GetStrategiesByIDsRequest {
+  repeated string strategy_ids = 1;
+}
+
+message GetStrategiesByIDsResponse {
+  bool success = 1;
+  repeated Strategy strategies = 2;
+  common.Error error = 3;
+}
+
+// Update user credentials (Indira Securities authentication)
+message UpdateUserCredentialsRequest {
+    string user_id = 1;
+    common.IndiraAuthContext indira_auth = 2;
+}
+
+message UpdateUserCredentialsResponse {
+  bool success = 1;
+  common.Error error = 2;
+}
+
+// Get user credentials for order execution
+message GetUserCredentialsRequest {
+  string user_id = 1;
+}
+
+message GetUserCredentialsResponse {
+  bool success = 1;
+  common.IndiraAuthContext indira_auth = 2;
+  common.Error error = 3;
+}
