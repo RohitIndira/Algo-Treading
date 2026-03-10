@@ -21,15 +21,24 @@ import (
 	"go.uber.org/zap"
 )
 
-// OrderStatusService listens to WebSocket updates and updates orders
+// OrderStatusService listens to a single shared WebSocket connection and
+// routes order-status updates to the correct user by WSOrderStatus.UserID.
+// All active users share one TCP connection to Indira instead of one per user.
 type OrderStatusService struct {
 	execClient    *inexec.ExecutionClient
 	repo          repository.OrderRepository
 	publisher     *publisher.KafkaPublisher
 	logger        *zap.Logger
-	mu            sync.RWMutex
-	subscribers   map[string]context.CancelFunc
 	wsBroadcaster func(userID string, order *models.Order)
+
+	// Single shared WS client. Protected by wsMu for first-connect init only.
+	wsMu     sync.Mutex
+	wsClient *indiraClient.WSClient // nil until first StartSubscription
+
+	// subscriberAuths: userID → *indiraClient.AuthContext
+	// Serves two purposes: (1) tracks who is subscribed, (2) enables re-subscription
+	// after a reconnect using the stored auth context.
+	subscriberAuths sync.Map
 }
 
 // SetWSBroadcaster wires a callback so live order status changes are pushed
@@ -41,61 +50,93 @@ func (s *OrderStatusService) SetWSBroadcaster(fn func(userID string, order *mode
 // NewOrderStatusService creates a new order status service
 func NewOrderStatusService(execClient *inexec.ExecutionClient, repo repository.OrderRepository, pub *publisher.KafkaPublisher, logger *zap.Logger) *OrderStatusService {
 	return &OrderStatusService{
-		execClient:  execClient,
-		repo:        repo,
-		publisher:   pub,
-		logger:      logger,
-		subscribers: make(map[string]context.CancelFunc),
+		execClient: execClient,
+		repo:       repo,
+		publisher:  pub,
+		logger:     logger,
 	}
 }
 
-// StartSubscription begins listening to WebSocket updates for a specific user.
-// It is idempotent: calling it multiple times for the same user is a no-op.
+// StartSubscription subscribes userID to the shared WS connection.
+// The first call establishes the connection; subsequent calls send a
+// WSConnectionRequest message on the existing connection. Idempotent.
 func (s *OrderStatusService) StartSubscription(ctx context.Context, userID string, auth *indiraClient.AuthContext) error {
-	s.mu.Lock()
-	if _, exists := s.subscribers[userID]; exists {
-		s.mu.Unlock()
-		s.logger.Info("Already subscribed to WS for user", zap.String("user_id", userID))
+	// Always refresh stored auth (bearer token may have rotated).
+	authCopy := *auth
+	s.subscriberAuths.Store(userID, &authCopy)
+
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+
+	if s.wsClient == nil {
+		// First user — establish the shared connection.
+		wsClient, err := s.execClient.GetSharedWSClient(ctx, auth)
+		if err != nil {
+			s.subscriberAuths.Delete(userID)
+			return fmt.Errorf("failed to connect shared WS: %w", err)
+		}
+		s.wsClient = wsClient
+		// Re-subscribe all stored users after any reconnect.
+		s.wsClient.OnReconnected = s.resubscribeAll
+		// Single goroutine fans out all updates from one channel.
+		go s.processUpdates(ctx)
+		s.logger.Info("Shared WS established", zap.String("first_user", userID))
 		return nil
 	}
 
-	userCtx, cancel := context.WithCancel(ctx)
-	s.subscribers[userID] = cancel
-	s.mu.Unlock()
-
-	updates, err := s.execClient.SubscribeOrderStatus(userCtx, auth)
-	if err != nil {
-		s.StopSubscription(userID)
-		return fmt.Errorf("failed to subscribe: %w", err)
+	// Subsequent user — subscribe on the live connection.
+	if err := s.wsClient.Subscribe(ctx, auth); err != nil {
+		return fmt.Errorf("subscribe user %s on shared WS: %w", userID, err)
 	}
-
-	s.logger.Info("Started WS subscription for user", zap.String("user_id", userID))
-	go s.processUpdates(userCtx, userID, updates)
+	s.logger.Info("User subscribed on shared WS", zap.String("user_id", userID))
 	return nil
 }
 
-// StopSubscription stops listening for a user
+// StopSubscription removes a user from the subscription map.
+// The shared WS connection stays open for remaining users.
 func (s *OrderStatusService) StopSubscription(userID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if cancel, exists := s.subscribers[userID]; exists {
-		cancel()
-		delete(s.subscribers, userID)
-	}
+	s.subscriberAuths.Delete(userID)
+	s.logger.Info("Unsubscribed user from shared WS", zap.String("user_id", userID))
 }
 
-func (s *OrderStatusService) processUpdates(ctx context.Context, userID string, updates <-chan *indiraClient.WSOrderStatus) {
+// resubscribeAll is called by WSClient.OnReconnected after a reconnect.
+// It re-sends WSConnectionRequest for every stored user so Indira resumes
+// streaming their updates on the new session.
+func (s *OrderStatusService) resubscribeAll() {
+	s.logger.Info("Shared WS reconnected — re-subscribing all users")
+	s.subscriberAuths.Range(func(key, value any) bool {
+		userID := key.(string)
+		auth := value.(*indiraClient.AuthContext)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := s.wsClient.Subscribe(ctx, auth); err != nil {
+				s.logger.Error("Re-subscribe after reconnect failed",
+					zap.String("user_id", userID), zap.Error(err))
+			}
+		}()
+		return true
+	})
+}
+
+// processUpdates reads from the shared WS channel and dispatches each update
+// to a goroutine so DB operations never block the read loop.
+// Started exactly once when the shared connection is established.
+func (s *OrderStatusService) processUpdates(ctx context.Context) {
+	s.logger.Info("Shared WS update processor started")
 	for {
 		select {
 		case <-ctx.Done():
+			s.logger.Info("WS update processor shutting down")
 			return
-		case wsStatus, ok := <-updates:
+		case wsStatus, ok := <-s.wsClient.Updates:
 			if !ok {
-				s.logger.Warn("WS updates channel closed for user", zap.String("user_id", userID))
-				s.StopSubscription(userID)
+				// Updates channel is never closed by WSClient; this branch
+				// is a safety net only.
+				s.logger.Warn("Shared WS updates channel closed unexpectedly")
 				return
 			}
-			s.handleStatusUpdate(ctx, wsStatus)
+			go s.handleStatusUpdate(ctx, wsStatus)
 		}
 	}
 }

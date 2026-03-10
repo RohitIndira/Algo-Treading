@@ -19,15 +19,15 @@ import (
 
 // OrderExecutor handles order execution logic
 type OrderExecutor struct {
-	repo           repository.OrderRepository
-	credsRepo      repository.CredentialsRepository
-	indiraClient   *indira.ExecutionClient
-	kafkaPub       *publisher.KafkaPublisher
-	statusSvc      *statusservice.OrderStatusService
-	paperExecutor  *PaperOrderExecutor
-	wsBroadcaster  func(userID string, eventType string, order *models.Order)
-	maxRetries     int
-	retryDelay     time.Duration
+	repo          repository.OrderRepository
+	credsCache    *CredentialsCache // in-memory credential store; avoids per-order DB hit
+	indiraClient  *indira.ExecutionClient
+	kafkaPub      *publisher.KafkaPublisher
+	statusSvc     *statusservice.OrderStatusService
+	paperExecutor *PaperOrderExecutor
+	wsBroadcaster func(userID string, eventType string, order *models.Order)
+	maxRetries    int
+	retryDelay    time.Duration
 }
 
 // SetWSBroadcaster sets the callback for broadcasting new orders to the frontend WebSocket
@@ -42,6 +42,8 @@ func (e *OrderExecutor) SetPaperExecutor(paperExec *PaperOrderExecutor) {
 
 // NewOrderExecutor creates a new order executor.
 // kafkaPub and statusSvc may be nil (graceful degradation).
+// credsRepo is wrapped in a CredentialsCache so credentials are only fetched
+// from the DB once per user and then served from memory on every subsequent order.
 func NewOrderExecutor(
 	repo repository.OrderRepository,
 	credsRepo repository.CredentialsRepository,
@@ -53,7 +55,7 @@ func NewOrderExecutor(
 ) *OrderExecutor {
 	return &OrderExecutor{
 		repo:          repo,
-		credsRepo:     credsRepo,
+		credsCache:    NewCredentialsCache(credsRepo),
 		indiraClient:  indiraClient,
 		kafkaPub:      kafkaPub,
 		statusSvc:     statusSvc,
@@ -109,15 +111,15 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 			BearerToken: *order.BearerToken,
 		}
 	} else {
-		// Fall back: load credentials from the DB for this user.
-		if e.credsRepo == nil {
-			return e.failOrder(ctx, order, "Missing Indira Securities authentication data and no credentials repository available")
+		// Fall back: load credentials from cache (DB on first miss) for this user.
+		if e.credsCache == nil {
+			return e.failOrder(ctx, order, "Missing Indira Securities authentication data and no credentials cache available")
 		}
-		userId, appId, source, bearerToken, err := e.credsRepo.GetIndiraCredentials(ctx, order.UserID)
+		userId, appId, source, bearerToken, err := e.credsCache.Get(ctx, order.UserID)
 		if err != nil {
 			return e.failOrder(ctx, order, "Missing Indira Securities authentication data: "+err.Error())
 		}
-		log.Printf("Loaded DB credentials for user %s", order.UserID)
+		log.Printf("Loaded credentials for user %s (cache or DB)", order.UserID)
 		auth = &indiraClient.AuthContext{
 			UserId:      userId,
 			AppId:       appId,

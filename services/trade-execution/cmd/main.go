@@ -85,8 +85,8 @@ func main() {
 
 	// Initialize Kafka signal consumer (trade-signals topic → SignalProcessor)
 	log.Println("Initializing Kafka consumer for trade-signals...")
-	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, kafkaPub, statusService)
-	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger)
+	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, kafkaPub, statusService, logger)
+	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger, cfg.WorkerCount)
 	defer kafkaConsumer.Close()
 	log.Println("✓ Kafka consumer initialized")
 
@@ -326,7 +326,7 @@ func loadConfig() Config {
 		Exchange:         getEnv("RABBITMQ_EXCHANGE", "trade.execution"),
 		RoutingKey:       getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
 		PrefetchCount:    getEnvInt("RABBITMQ_PREFETCH", 10),
-		WorkerCount:      getEnvInt("WORKER_COUNT", 10),
+		WorkerCount:      getEnvInt("WORKER_COUNT", 50),
 		KafkaBrokers:     kafkaBrokers,
 		KafkaGroupID:     getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
 		KafkaTopic:       getEnv("KAFKA_TOPIC", "trade-signals"),

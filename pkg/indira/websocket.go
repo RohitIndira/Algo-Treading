@@ -32,7 +32,11 @@ const (
 	tokenRefreshPeriod = 50 * time.Minute
 )
 
-// WSClient manages a WebSocket connection for a single user.
+// WSClient manages a WebSocket connection.
+// In shared-connection mode the same WSClient is used for multiple users:
+// additional users subscribe via Subscribe(ctx, auth), which sends a
+// WSConnectionRequest on the live connection; the server fans updates back
+// on the same stream with each message carrying the UserID field for routing.
 type WSClient struct {
 	client *Client
 	auth   *AuthContext
@@ -46,7 +50,12 @@ type WSClient struct {
 	OrderToken string
 
 	Updates chan *WSOrderStatus
+	sendCh  chan []byte // outbound subscription/control messages
 	Wg      sync.WaitGroup
+
+	// OnReconnected is called in a new goroutine after every successful reconnect.
+	// Used by statusservice to re-subscribe additional users after a drop. May be nil.
+	OnReconnected func()
 }
 
 // NewWSClient creates a new WebSocket client for a specific user.
@@ -55,6 +64,49 @@ func NewWSClient(httpClient *Client, auth *AuthContext) *WSClient {
 		client:  httpClient,
 		auth:    auth,
 		Updates: make(chan *WSOrderStatus, 100),
+		sendCh:  make(chan []byte, 64),
+	}
+}
+
+// Subscribe authenticates an additional user on the shared connection.
+// It fetches a per-user WS order token then sends WSConnectionRequest
+// over the existing live connection. Safe to call concurrently.
+func (w *WSClient) Subscribe(ctx context.Context, auth *AuthContext) error {
+	resp, err := w.client.doRequest(ctx, auth, "GET", wsTokenAPI, nil)
+	if err != nil {
+		return fmt.Errorf("get WS token for user %s: %w", auth.UserId, err)
+	}
+	var tokenResp WebSocketTokenResponse
+	if err := json.Unmarshal(resp.Data, &tokenResp); err != nil {
+		return fmt.Errorf("unmarshal WS token: %w", err)
+	}
+	if len(tokenResp.Result) == 0 || tokenResp.Result[0].OrderToken == "" {
+		return fmt.Errorf("no order token received for user %s", auth.UserId)
+	}
+	return w.SendMessage(WSConnectionRequest{
+		UserId:     auth.UserId,
+		OrderToken: tokenResp.Result[0].OrderToken,
+	})
+}
+
+// SendMessage enqueues a payload to be written on the active WS connection.
+// Returns an error if the client is inactive or the send buffer is full.
+func (w *WSClient) SendMessage(payload interface{}) error {
+	w.mu.Lock()
+	active := w.IsActive
+	w.mu.Unlock()
+	if !active {
+		return fmt.Errorf("ws client is not active")
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal ws message: %w", err)
+	}
+	select {
+	case w.sendCh <- data:
+		return nil
+	default:
+		return fmt.Errorf("ws send buffer full — dropping message")
 	}
 }
 
@@ -211,7 +263,7 @@ func (w *WSClient) readPump(conn *websocket.Conn) {
 	}
 }
 
-// writePump sends heartbeats on the given conn and stops when stopCh is closed.
+// writePump sends heartbeats and queued outbound messages on the given conn.
 // Owns its own conn and stopCh references — safe against reconnects.
 func (w *WSClient) writePump(conn *websocket.Conn, stopCh chan struct{}) {
 	ticker := time.NewTicker(pingPeriod)
@@ -226,6 +278,12 @@ func (w *WSClient) writePump(conn *websocket.Conn, stopCh chan struct{}) {
 		case <-stopCh:
 			conn.WriteMessage(websocket.CloseMessage, []byte{})
 			return
+		case payload := <-w.sendCh:
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				return
+			}
+			conn.SetWriteDeadline(time.Time{})
 		case <-ticker.C:
 			conn.SetWriteDeadline(time.Now().Add(writeWait))
 			hb := WSHeartbeat{UserId: w.auth.UserId, Heartbeat: "h"}
@@ -320,6 +378,10 @@ func (w *WSClient) monitorReconnect(initialStopCh chan struct{}) {
 
 			currentStopCh = newStopCh
 			log.Printf("[ws] Reconnected for user %s", w.auth.UserId)
+
+			if w.OnReconnected != nil {
+				go w.OnReconnected()
+			}
 		}
 	}
 }

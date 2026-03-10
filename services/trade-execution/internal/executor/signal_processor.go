@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -11,6 +10,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // SignalProcessor processes trade signals from Kafka.
@@ -19,6 +19,7 @@ type SignalProcessor struct {
 	executor  *OrderExecutor
 	orderRepo repository.OrderRepository
 	kafkaPub  *publisher.KafkaPublisher
+	logger    *zap.Logger
 }
 
 // NewSignalProcessor creates a new trade signal processor.
@@ -28,11 +29,13 @@ func NewSignalProcessor(
 	kafkaPub *publisher.KafkaPublisher,
 	// statusSvc is now wired inside OrderExecutor — no longer needed here
 	_ *statusservice.OrderStatusService,
+	logger *zap.Logger,
 ) *SignalProcessor {
 	return &SignalProcessor{
 		executor:  executor,
 		orderRepo: orderRepo,
 		kafkaPub:  kafkaPub,
+		logger:    logger,
 	}
 }
 
@@ -40,8 +43,12 @@ func NewSignalProcessor(
 // DB persistence is synchronous; Indira API call is critical path.
 // WS subscription and Kafka publishing are handled inside OrderExecutor.
 func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models.TradeSignal) error {
-	log.Printf("Processing trade signal: OrderID=%s UserID=%s Symbol=%s Price=%.2f TradingMode=%q",
-		signal.OrderID, signal.UserID, signal.Symbol, signal.Price, signal.TradingMode)
+	p.logger.Info("Processing trade signal",
+		zap.String("order_id", signal.OrderID),
+		zap.String("user_id", signal.UserID),
+		zap.String("symbol", signal.Symbol),
+		zap.Float64("price", signal.Price),
+		zap.String("trading_mode", signal.TradingMode))
 
 	// Convert TradeSignal to Order
 	order, err := p.convertSignalToOrder(signal)
@@ -51,8 +58,9 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 
 	// Persist order to DB synchronously so subsequent Update calls can find the row.
 	if err := p.orderRepo.Create(ctx, order); err != nil {
-		log.Printf("DB Error: failed to save order %s: %v", order.OrderID, err)
-		// Non-fatal — continue to attempt broker placement.
+		p.logger.Error("DB: failed to save order (non-fatal, continuing to broker)",
+			zap.String("order_id", order.OrderID.String()),
+			zap.Error(err))
 	}
 
 	// Execute via Indira API.
@@ -61,7 +69,10 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 		return fmt.Errorf("order execution failed: %w", err)
 	}
 
-	log.Printf("✓ Order %s submitted for user %s symbol %s", signal.OrderID, signal.UserID, signal.Symbol)
+	p.logger.Info("Order submitted",
+		zap.String("order_id", signal.OrderID),
+		zap.String("user_id", signal.UserID),
+		zap.String("symbol", signal.Symbol))
 	return nil
 }
 
@@ -108,7 +119,8 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 	// a misconfiguration rather than a deliberate LIVE request).
 	tradingMode := signal.TradingMode
 	if tradingMode == "" {
-		log.Printf("[WARN] Signal %s has empty TradingMode — defaulting to PAPER. Check strategy config in rules-engine.", signal.OrderID)
+		p.logger.Warn("Signal has empty TradingMode — defaulting to PAPER. Check strategy config in rules-engine.",
+			zap.String("order_id", signal.OrderID))
 		tradingMode = "PAPER"
 	}
 

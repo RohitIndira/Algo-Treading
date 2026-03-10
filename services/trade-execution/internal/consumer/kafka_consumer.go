@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sync"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -21,16 +23,21 @@ type KafkaConsumer struct {
 	reader    *kafka.Reader
 	processor TradeSignalProcessor
 	logger    *zap.Logger
+	workers   int
 }
 
-// NewKafkaConsumer creates a new Kafka consumer for trade signals
-func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalProcessor, logger *zap.Logger) *KafkaConsumer {
+// NewKafkaConsumer creates a new Kafka consumer for trade signals.
+// workers controls the maximum number of messages processed concurrently.
+func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalProcessor, logger *zap.Logger, workers int) *KafkaConsumer {
+	if workers <= 0 {
+		workers = 50
+	}
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
 		Topic:          "trade-signals",
 		GroupID:        groupID,
-		MinBytes:       1,
-		MaxBytes:       10e6, // 10MB
+		MinBytes:       10e3,  // 10KB — allows micro-batching at the broker level
+		MaxBytes:       10e6,  // 10MB
 		CommitInterval: time.Second,
 		StartOffset:    kafka.LastOffset,
 	})
@@ -38,53 +45,79 @@ func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalPro
 	logger.Info("Kafka consumer initialized",
 		zap.Strings("brokers", brokers),
 		zap.String("topic", "trade-signals"),
-		zap.String("group_id", groupID))
+		zap.String("group_id", groupID),
+		zap.Int("workers", workers))
 
 	return &KafkaConsumer{
 		reader:    reader,
 		processor: processor,
 		logger:    logger,
+		workers:   workers,
 	}
 }
 
-// Start starts consuming trade signals
+// Start consumes trade signals with bounded concurrency.
+// Up to c.workers messages are processed in parallel; fetch errors use
+// exponential backoff (100ms → 30s) instead of a fixed 1s sleep.
 func (c *KafkaConsumer) Start(ctx context.Context) error {
-	c.logger.Info("Starting Kafka consumer for trade-signals")
+	c.logger.Info("Starting Kafka consumer for trade-signals", zap.Int("workers", c.workers))
+
+	sem := make(chan struct{}, c.workers)
+	var wg sync.WaitGroup
+
+	const (
+		initBackoff = 100 * time.Millisecond
+		maxBackoff  = 30 * time.Second
+	)
+	backoff := initBackoff
 
 	for {
 		select {
 		case <-ctx.Done():
+			wg.Wait()
 			c.logger.Info("Kafka consumer shutting down")
 			return nil
 		default:
-			// Read message
-			msg, err := c.reader.FetchMessage(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					// Context cancelled, exit gracefully
-					return nil
-				}
-				c.logger.Error("Failed to fetch message", zap.Error(err))
-				time.Sleep(time.Second)
-				continue
-			}
+		}
 
-			// Process message
-			if err := c.processMessage(ctx, msg); err != nil {
+		msg, err := c.reader.FetchMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				wg.Wait()
+				return nil
+			}
+			c.logger.Error("Failed to fetch message", zap.Error(err), zap.Duration("retry_in", backoff))
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				wg.Wait()
+				return nil
+			}
+			backoff = time.Duration(math.Min(float64(backoff*2), float64(maxBackoff)))
+			continue
+		}
+		backoff = initBackoff // reset on successful fetch
+
+		// Acquire a worker slot (blocks when all workers are busy).
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(m kafka.Message) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := c.processMessage(ctx, m); err != nil {
 				c.logger.Error("Failed to process message",
 					zap.Error(err),
-					zap.String("topic", msg.Topic),
-					zap.Int("partition", msg.Partition),
-					zap.Int64("offset", msg.Offset))
-				// Don't commit if processing failed
-				continue
+					zap.String("topic", m.Topic),
+					zap.Int("partition", m.Partition),
+					zap.Int64("offset", m.Offset))
+				return // skip commit on failure
 			}
 
-			// Commit message
-			if err := c.reader.CommitMessages(ctx, msg); err != nil {
+			if err := c.reader.CommitMessages(ctx, m); err != nil {
 				c.logger.Error("Failed to commit message", zap.Error(err))
 			}
-		}
+		}(msg)
 	}
 }
 
