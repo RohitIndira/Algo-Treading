@@ -111,7 +111,8 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	}
 
 	url := c.baseURL + path
-	log.Printf("[indira] → %s %s  body=%s", method, path, string(jsonBody))
+	log.Printf("[indira] → %s %s", method, path)
+	// log.Printf("[indira] → %s %s  body=%s", method, path, string(jsonBody))
 	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -150,6 +151,7 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	}
 
 	// Check HTTP status code
+	// log.Printf("[indira] ← %s %s  status=%d", method, path, resp.StatusCode)
 	log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(responseBody))

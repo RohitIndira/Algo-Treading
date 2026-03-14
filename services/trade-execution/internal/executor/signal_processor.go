@@ -8,6 +8,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -16,10 +17,11 @@ import (
 // SignalProcessor processes trade signals from Kafka.
 // This is the primary entry point for all orders from the rules-engine.
 type SignalProcessor struct {
-	executor  *OrderExecutor
-	orderRepo repository.OrderRepository
-	kafkaPub  *publisher.KafkaPublisher
-	logger    *zap.Logger
+	executor     *OrderExecutor
+	orderRepo    repository.OrderRepository
+	kafkaPub     *publisher.KafkaPublisher
+	priceMonitor *scheduler.PriceMonitor
+	logger       *zap.Logger
 }
 
 // NewSignalProcessor creates a new trade signal processor.
@@ -39,6 +41,11 @@ func NewSignalProcessor(
 	}
 }
 
+// SetPriceMonitor sets the price monitor for routing below_min orders.
+func (p *SignalProcessor) SetPriceMonitor(pm *scheduler.PriceMonitor) {
+	p.priceMonitor = pm
+}
+
 // ProcessTradeSignal processes a trade signal from Kafka — hot path.
 // DB persistence is synchronous; Indira API call is critical path.
 // WS subscription and Kafka publishing are handled inside OrderExecutor.
@@ -50,6 +57,20 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 		zap.Float64("price", signal.Price),
 		zap.String("trading_mode", signal.TradingMode))
 
+	// Idempotency check: skip if this order was already processed.
+	// On restart, Kafka may replay uncommitted signals — this prevents duplicate execution.
+	orderID, err := uuid.Parse(signal.OrderID)
+	if err != nil {
+		return fmt.Errorf("invalid order_id in signal: %w", err)
+	}
+	existing, err := p.orderRepo.GetByID(ctx, orderID)
+	if err == nil && existing != nil {
+		p.logger.Info("Signal already processed, skipping duplicate",
+			zap.String("order_id", signal.OrderID),
+			zap.String("existing_status", string(existing.Status)))
+		return nil
+	}
+
 	// Convert TradeSignal to Order
 	order, err := p.convertSignalToOrder(signal)
 	if err != nil {
@@ -58,9 +79,35 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 
 	// Persist order to DB synchronously so subsequent Update calls can find the row.
 	if err := p.orderRepo.Create(ctx, order); err != nil {
-		p.logger.Error("DB: failed to save order (non-fatal, continuing to broker)",
+		p.logger.Error("DB: failed to save order — aborting to prevent duplicate execution",
 			zap.String("order_id", order.OrderID.String()),
 			zap.Error(err))
+		return fmt.Errorf("failed to persist order: %w", err)
+	}
+
+	// Route: if this is a below_min order (STOP_LOSS + BRACKET), send to price
+	// monitor instead of placing immediately. The monitor watches Redis LTP and
+	// places a bracket order when the target price is reached.
+	isBelowMin := order.OrderType == models.OrderTypeStopLoss &&
+		(order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO")
+
+	if isBelowMin && p.priceMonitor != nil && !order.IsPaperTrade {
+		targetPrice := 0.0
+		if order.Price != nil {
+			targetPrice = *order.Price
+		}
+		if targetPrice <= 0 {
+			return fmt.Errorf("below_min order %s has no target price", order.OrderID)
+		}
+
+		p.priceMonitor.Watch(order, targetPrice)
+
+		p.logger.Info("Order routed to price monitor (below_min)",
+			zap.String("order_id", signal.OrderID),
+			zap.String("user_id", signal.UserID),
+			zap.String("symbol", signal.Symbol),
+			zap.Float64("target_price", targetPrice))
+		return nil
 	}
 
 	// Execute via Indira API.

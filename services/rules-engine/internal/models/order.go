@@ -83,9 +83,13 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 	stopLoss := price * (1 - strategy.TradeConfig.StopLossPct/100)
 	takeProfit := price * (1 + strategy.TradeConfig.TakeProfitPct/100)
 
-	// Default product type to INTRADAY if not specified
+	// Default product type to INTRADAY if not specified.
+	// When OrderType is BRACKET, ensure ProductType is also BRACKET so the
+	// downstream convertToIndiraRequest correctly builds bracket order legs.
 	productType := strategy.TradeConfig.ProductType
-	if productType == "" {
+	if strategy.TradeConfig.OrderType == "BRACKET" {
+		productType = "BRACKET"
+	} else if productType == "" {
 		productType = "INTRADAY"
 	}
 
@@ -161,7 +165,7 @@ func (o *OrderRequest) Validate() error {
 	if o.Price <= 0 {
 		return ErrInvalidPrice
 	}
-	if o.OrderType != "MARKET" && o.OrderType != "LIMIT" && o.OrderType != "BRACKET" {
+	if o.OrderType != "MARKET" && o.OrderType != "LIMIT" && o.OrderType != "BRACKET" && o.OrderType != "STOP_LOSS" {
 		return ErrInvalidOrderType
 	}
 	return nil

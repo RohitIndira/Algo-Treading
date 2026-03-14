@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
@@ -136,6 +137,28 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 			delay := e.retryDelay * time.Duration(attempt)
 			log.Printf("Retrying order %s, attempt %d after %v", order.OrderID, attempt, delay)
 			time.Sleep(delay)
+
+			// On 401 / session-expired, invalidate the cached credentials and
+			// reload from DB. The frontend may have refreshed the token in the
+			// meantime, so the DB copy could be newer than our cache.
+			if isSessionExpiredError(lastErr) && e.credsCache != nil {
+				log.Printf("[auth] Session expired for user %s — invalidating cached credentials and reloading from DB", order.UserID)
+				e.credsCache.Invalidate(order.UserID)
+				userId, appId, source, bearerToken, err := e.credsCache.Get(ctx, order.UserID)
+				if err != nil {
+					log.Printf("[auth] Failed to reload credentials for user %s: %v", order.UserID, err)
+				} else if bearerToken != auth.BearerToken {
+					log.Printf("[auth] ✓ Got refreshed bearer token for user %s — retrying with new credentials", order.UserID)
+					auth = &indiraClient.AuthContext{
+						UserId:      userId,
+						AppId:       appId,
+						Source:      source,
+						BearerToken: bearerToken,
+					}
+				} else {
+					log.Printf("[auth] ⚠ Bearer token unchanged in DB for user %s — retry will likely fail again (token not yet refreshed by frontend)", order.UserID)
+				}
+			}
 
 			// Before retrying after a timeout, check if the order was already placed.
 			// A timeout means the request may have reached the broker even though we got no response.
@@ -340,6 +363,17 @@ func isTimeoutError(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// isSessionExpiredError returns true if the error indicates a 401 / session-expired
+// response from the broker. This means the cached bearer token is stale and the
+// credentials cache should be invalidated so a fresh token is loaded from the DB.
+func isSessionExpiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "HTTP error 401") || strings.Contains(msg, "Session expired")
 }
 
 // CancelOrder cancels an order

@@ -49,6 +49,8 @@ type OrderRepository interface {
 	// Strategy-level cancellation (used on deactivate/delete)
 	GetActiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error)
 	CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error
+	// Price monitor: pending STOP_LOSS orders waiting for price trigger
+	GetPendingMonitorOrders(ctx context.Context) ([]*models.Order, error)
 	// Dashboard stats
 	GetDashboardStats(ctx context.Context, userID string, isPaper bool) (*DashboardStats, error)
 }
@@ -343,14 +345,15 @@ func (r *orderRepository) GetFilledPaperOrdersByUser(ctx context.Context, userID
 	return orders, nil
 }
 
-// GetLiveOrdersByUser retrieves active live (non-paper) orders for a user
+// GetLiveOrdersByUser retrieves live (non-paper) orders for a user.
+// Includes CANCELLED so exited positions still appear in the Indira positions view.
 func (r *orderRepository) GetLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	orders := make([]*models.Order, 0)
 	query := `
 		SELECT * FROM orders
 		WHERE user_id = $1
 		AND is_paper_trade = false
-		AND status IN ('FILLED', 'PARTIALLY_FILLED', 'RECEIVED', 'PENDING', 'SUBMITTED')
+		AND status IN ('FILLED', 'PARTIALLY_FILLED', 'RECEIVED', 'PENDING', 'SUBMITTED', 'CANCELLED')
 		ORDER BY created_at DESC
 	`
 	err := r.db.SelectContext(ctx, &orders, query, userID)
@@ -432,6 +435,26 @@ func (r *orderRepository) UpdateLiveTradeExit(ctx context.Context, orderID uuid.
 		return fmt.Errorf("live order not found: %s", orderID)
 	}
 	return nil
+}
+
+// GetPendingMonitorOrders retrieves all PENDING orders with STOP_LOSS type and BRACKET product
+// that are waiting for the price monitor to trigger them. Used for restart recovery.
+func (r *orderRepository) GetPendingMonitorOrders(ctx context.Context) ([]*models.Order, error) {
+	var orders []*models.Order
+	query := `
+		SELECT * FROM orders
+		WHERE status IN ('RECEIVED', 'PENDING')
+		AND order_type = 'STOP_LOSS'
+		AND product_type IN ('BRACKET', 'BRACKET_ORDER', 'BO')
+		AND is_paper_trade = false
+		AND indira_order_id IS NULL
+		ORDER BY created_at ASC
+	`
+	err := r.db.SelectContext(ctx, &orders, query)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get pending monitor orders: %w", err)
+	}
+	return orders, nil
 }
 
 // GetDashboardStats returns aggregated stats for a user in the given mode.

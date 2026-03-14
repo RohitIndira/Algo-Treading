@@ -28,13 +28,20 @@ type strategyEvent struct {
 	Version    uint64          `json:"version"`
 }
 
+// OrderUnwatcher removes orders from the price monitor watch list.
+// Implemented by *scheduler.PriceMonitor.
+type OrderUnwatcher interface {
+	UnwatchByStrategy(strategyID string) int
+}
+
 // StrategyEventsConsumer listens to user-config-events and closes all open
 // positions / cancels all pending orders when a strategy is deactivated or deleted.
 type StrategyEventsConsumer struct {
-	reader    *kafka.Reader
-	orderRepo repository.OrderRepository
-	executor  *executor.OrderExecutor
-	logger    *zap.Logger
+	reader       *kafka.Reader
+	orderRepo    repository.OrderRepository
+	executor     *executor.OrderExecutor
+	priceMonitor OrderUnwatcher // nil-safe: may be unset if PriceMonitor is disabled
+	logger       *zap.Logger
 }
 
 // NewStrategyEventsConsumer creates a consumer for the user-config-events topic.
@@ -64,6 +71,11 @@ func NewStrategyEventsConsumer(
 		executor:  exec,
 		logger:    logger,
 	}
+}
+
+// SetPriceMonitor wires the price monitor so orders are unwatched on strategy deactivation.
+func (c *StrategyEventsConsumer) SetPriceMonitor(pm OrderUnwatcher) {
+	c.priceMonitor = pm
 }
 
 // Start begins consuming user-config-events. Blocks until ctx is cancelled.
@@ -133,6 +145,17 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 		zap.String("event_type", string(ev.Type)),
 		zap.String("strategy_id", ev.StrategyID),
 		zap.String("user_id", ev.UserID))
+
+	// Step 0: immediately remove all orders for this strategy from the price
+	// monitor watch list so no new triggers fire while we cancel.
+	if c.priceMonitor != nil {
+		removed := c.priceMonitor.UnwatchByStrategy(ev.StrategyID)
+		if removed > 0 {
+			c.logger.Info("Unwatched price-monitored orders for deactivated strategy",
+				zap.String("strategy_id", ev.StrategyID),
+				zap.Int("removed", removed))
+		}
+	}
 
 	orders, err := c.orderRepo.GetActiveOrdersByStrategy(ctx, ev.StrategyID, ev.UserID)
 	if err != nil {

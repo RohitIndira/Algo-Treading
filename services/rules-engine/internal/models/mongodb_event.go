@@ -282,10 +282,11 @@ func (m *MongoDBEvent) mapMarketData() MarketData {
 	// Map price map
 	if m.PriceMap != nil {
 		md.PriceMap = PriceMap{
-			Open:   m.toFloat64(m.PriceMap["Open"]),
-			High:   m.toFloat64(m.PriceMap["High"]),
-			Low:    m.toFloat64(m.PriceMap["Low"]),
-			Volume: m.toInt64(m.PriceMap["Volume"]),
+			Open:      m.toFloat64(m.PriceMap["Open"]),
+			High:      m.toFloat64(m.PriceMap["High"]),
+			Low:       m.toFloat64(m.PriceMap["Low"]),
+			Volume:    m.toInt64(m.PriceMap["Volume"]),
+			PrevClose: m.toFloat64(m.PriceMap["PrevClose"]),
 		}
 	}
 

@@ -54,6 +54,8 @@ func NewRouter(
 		api.HandleFunc("/live-orders/force-exit-all", paperHandler.ForceExitAllLive).Methods("POST")
 		api.HandleFunc("/live-orders/indira-positions", paperHandler.GetIndiraPositions).Methods("GET")
 		api.HandleFunc("/live-orders/subscribe-broker-ws", paperHandler.SubscribeBrokerWS).Methods("POST")
+		api.HandleFunc("/live-orders/price-watches", paperHandler.GetPriceWatches).Methods("GET")
+		api.HandleFunc("/live-orders/cancel-price-watch", paperHandler.CancelPriceWatch).Methods("POST")
 		// Dashboard
 		api.HandleFunc("/dashboard-stats", paperHandler.GetDashboardStats).Methods("GET")
 	}

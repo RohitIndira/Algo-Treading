@@ -55,8 +55,8 @@ type PlaceOrderRequest struct {
 	LotSize      int       `json:"lotSize"`      // Lot size
 	Instrument   string    `json:"instrument"`   // "STK", "OPT", "FUT", "IDX"
 	Amo          bool      `json:"amo"`          // After Market Order
-	BoStpLoss    *Price2DP `json:"boStpLoss"`    // Bracket order stop loss
-	BoTgtPrice   *Price2DP `json:"boTgtPrice"`   // Bracket order target price
+	BoStpLoss    *Price2DP `json:"boStpLoss,omitempty"`    // Bracket order stop loss
+	BoTgtPrice   *Price2DP `json:"boTgtPrice,omitempty"`   // Bracket order target price
 }
 
 // PlaceOrderResponse represents the response from placing an order
@@ -166,24 +166,43 @@ type Holding struct {
 }
 
 // Position represents a position in the position book
+// PositionSymbol is the nested "symbol" object inside each Indira position.
+type PositionSymbol struct {
+	Symbol      string `json:"symbol,omitempty"`      // e.g. "STK_MOTHERSON_EQ_NSE_4204"
+	DispSym     string `json:"dispSym,omitempty"`     // e.g. "MOTHERSON"
+	BaseSym     string `json:"baseSym,omitempty"`     // e.g. "MOTHERSON"
+	Instrument  string `json:"instrument,omitempty"`  // e.g. "STK"
+	Exc         string `json:"exc,omitempty"`         // e.g. "NSE"
+	ExcTkn      int    `json:"excTkn,omitempty"`      // e.g. 4204
+	TradingSym  string `json:"tradingSymbol,omitempty"` // e.g. "MOTHERSON-EQ"
+	Series      string `json:"series,omitempty"`
+	TickSize    string `json:"tickSize,omitempty"`
+	Multiplier  string `json:"multiplier,omitempty"`
+	CompanyName string `json:"companyName,omitempty"`
+	ISIN        string `json:"isin,omitempty"`
+	Pdc         string `json:"pdc,omitempty"` // previous day close
+}
+
 type Position struct {
-	Symbol        string  `json:"symbol,omitempty"`
-	Exc           string  `json:"exc,omitempty"`
-	ExcToken      string  `json:"excToken,omitempty"`
-	PrdType       string  `json:"prdType,omitempty"`
-	NetQty        int     `json:"netQty,omitempty"`
-	BuyQty        int     `json:"buyQty,omitempty"`
-	SellQty       int     `json:"sellQty,omitempty"`
-	BuyAvgPrice   float64 `json:"buyAvgPrice,omitempty"`
-	SellAvgPrice  float64 `json:"sellAvgPrice,omitempty"`
-	CurrentPrice  float64 `json:"currentPrice,omitempty"`
-	PnL           float64 `json:"pnl,omitempty"`
-	PnLPercentage float64 `json:"pnlPercentage,omitempty"`
-	Instrument    string  `json:"instrument,omitempty"`
-	DayBuyQty     int     `json:"dayBuyQty,omitempty"`
-	DaySellQty    int     `json:"daySellQty,omitempty"`
-	CFBuyQty      int     `json:"cfBuyQty,omitempty"`
-	CFSellQty     int     `json:"cfSellQty,omitempty"`
+	Symbol        PositionSymbol `json:"symbol"`
+	PrdType       string         `json:"prdType,omitempty"`
+	Type          string         `json:"type,omitempty"` // "DAILY" or "EXPIRY"
+	NetQty        int            `json:"netQty"`
+	BuyQty        int            `json:"buyQty"`
+	SellQty       int            `json:"sellQty"`
+	BuyAvgPrice   float64        `json:"buyAvgPrice"`
+	SellAvgPrice  float64        `json:"sellAvgPrice"`
+	LTP           float64        `json:"ltp"`           // last traded price
+	NetPnL        float64        `json:"netPnl"`        // net P&L
+	PnLPerc       float64        `json:"pnlPerc"`       // P&L percentage
+	AvgPrice      float64        `json:"avgPrice"`
+	BuyAmt        float64        `json:"buyAmt"`
+	SellAmt       float64        `json:"sellAmt"`
+	OrdAction     string         `json:"ordAction,omitempty"` // "BUY" or "SELL"
+	DayBuyQty     int            `json:"dayBuyQty"`
+	DaySellQty    int            `json:"daySellQty"`
+	CFBuyQty      int            `json:"cfBuyQty"`
+	CFSellQty     int            `json:"cfSellQty"`
 }
 
 // ConvertPositionRequest represents a request to convert position

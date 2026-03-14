@@ -22,6 +22,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/paper"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
 )
@@ -90,6 +91,7 @@ func main() {
 	defer kafkaConsumer.Close()
 	log.Println("✓ Kafka consumer initialized")
 
+
 	// Initialize strategy events consumer (user-config-events → close positions on deactivate/delete)
 	log.Println("Initializing Kafka consumer for user-config-events...")
 	strategyEventsConsumer := consumer.NewStrategyEventsConsumer(cfg.KafkaBrokers, orderRepo, orderExecutor, logger)
@@ -117,21 +119,68 @@ func main() {
 		if err != nil {
 			return nil, err
 		}
-		result := make([]paper.BrokerPosition, len(positions))
-		for i, p := range positions {
-			result[i] = paper.BrokerPosition{
-				Symbol:        p.Symbol,
-				Exchange:      p.Exc,
+		// Deduplicate: Indira returns both DAILY and EXPIRY rows per symbol.
+		// Keep only DAILY to avoid showing the same position twice.
+		seen := make(map[string]bool, len(positions))
+		result := make([]paper.BrokerPosition, 0, len(positions))
+		for _, p := range positions {
+			if p.Type != "DAILY" {
+				continue // skip EXPIRY rows — DAILY has the same data
+			}
+			// Use dispSym for display; fall back to baseSym or full symbol string.
+			sym := p.Symbol.DispSym
+			if sym == "" {
+				sym = p.Symbol.BaseSym
+			}
+			if sym == "" {
+				sym = p.Symbol.Symbol
+			}
+			key := sym + "|" + p.Symbol.Exc + "|" + p.PrdType
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			// Calculate P&L when broker returns 0.
+			pnl := p.NetPnL
+			if pnl == 0 && p.BuyQty > 0 && p.SellQty > 0 {
+				// Closed position: realized P&L = (sellAvg - buyAvg) * traded qty
+				tradedQty := p.SellQty
+				if p.BuyQty < tradedQty {
+					tradedQty = p.BuyQty
+				}
+				pnl = (p.SellAvgPrice - p.BuyAvgPrice) * float64(tradedQty)
+			} else if pnl == 0 && p.NetQty != 0 && p.LTP > 0 {
+				// Open position: unrealized P&L using LTP
+				if p.NetQty > 0 {
+					pnl = (p.LTP - p.BuyAvgPrice) * float64(p.NetQty)
+				} else {
+					pnl = (p.SellAvgPrice - p.LTP) * float64(-p.NetQty)
+				}
+			}
+			pnlPct := p.PnLPerc
+			if pnlPct == 0 && pnl != 0 && p.BuyAvgPrice > 0 {
+				tradedQty := p.BuyQty
+				if p.SellQty > 0 && p.SellQty < tradedQty {
+					tradedQty = p.SellQty
+				}
+				pnlPct = (pnl / (p.BuyAvgPrice * float64(tradedQty))) * 100
+			}
+
+			result = append(result, paper.BrokerPosition{
+				Symbol:        sym,
+				Exchange:      p.Symbol.Exc,
 				ProductType:   p.PrdType,
 				NetQty:        p.NetQty,
 				BuyQty:        p.BuyQty,
 				SellQty:       p.SellQty,
 				BuyAvgPrice:   p.BuyAvgPrice,
 				SellAvgPrice:  p.SellAvgPrice,
-				CurrentPrice:  p.CurrentPrice,
-				PnL:           p.PnL,
-				PnLPercentage: p.PnLPercentage,
-			}
+				CurrentPrice:  p.LTP,
+				PnL:           pnl,
+				PnLPercentage: pnlPct,
+				ExcTkn:        p.Symbol.ExcTkn,
+			})
 		}
 		return result, nil
 	})
@@ -169,16 +218,22 @@ func main() {
 		})
 	})
 
-	// Initialize Redis price client — used for accurate order fill prices and PnL fallback.
-	// Non-fatal: if Redis is unavailable the service still runs, just without the Redis fallback.
+	// Initialize Redis price client — used for accurate order fill prices, PnL fallback,
+	// and dynamic tick size lookup for limit order price rounding.
+	// Non-fatal: if Redis is unavailable the service still runs with hardcoded tick sizes.
 	redisPrices, redisErr := paper.NewRedisPriceClient(cfg.RedisAddr, cfg.RedisPassword)
 	var priceLookup executor.PriceLookup
 	if redisErr != nil {
 		log.Printf("[paper] Redis price client unavailable (non-fatal): %v", redisErr)
 		log.Println("[paper] Order fills will use signal price; PnL shown only when WSS is live")
+		log.Println("[paper] Tick size will use hardcoded NSE defaults (0.05/0.01)")
 	} else {
 		log.Printf("✓ Redis price client connected (%s)", cfg.RedisAddr)
 		priceLookup = redisPrices
+		// Wire Redis tick size lookup into the Indira execution client
+		indiraClient.SetTickSizeLookup(redisPrices)
+		indiraClient.SetDPRLookup(redisPrices)
+		log.Println("✓ Dynamic tick size + DPR lookup enabled (Redis market data)")
 	}
 
 	paperExec := executor.NewPaperOrderExecutor(orderRepo, kafkaPub, priceLookup)
@@ -206,6 +261,26 @@ func main() {
 	log.Println("✓ Paper trading layer initialized")
 	// ─────────────────────────────────────────────────────────────────────────
 
+	// Initialize PriceMonitor for below_min orders (Case 2).
+	// Monitors Redis LTP and triggers bracket order placement when target price is reached.
+	var priceMonitorRef *scheduler.PriceMonitor
+	if redisPrices != nil {
+		priceMonitorRef = scheduler.NewPriceMonitor(
+			redisPrices,   // satisfies scheduler.LTPProvider (GetLTP + GetLTPs)
+			orderRepo,
+			kafkaPub,
+			orderExecutor, // satisfies scheduler.OrderExecutorFunc interface
+			500*time.Millisecond, // poll interval
+		)
+		signalProcessor.SetPriceMonitor(priceMonitorRef)
+		strategyEventsConsumer.SetPriceMonitor(priceMonitorRef)
+		paperWSServer.SetPriceMonitor(priceMonitorRef)
+		priceMonitorRef.SetOnTickDone(paperWSServer.BroadcastPriceWatches)
+		log.Println("✓ Price Monitor initialized (500ms poll interval)")
+	} else {
+		log.Println("⚠ Price Monitor disabled (Redis not available) — below_min orders will be placed immediately")
+	}
+
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -232,6 +307,16 @@ func main() {
 			log.Printf("Paper WS server stopped: %v", err)
 		}
 	}()
+
+	// Start PriceMonitor for below_min orders
+	if priceMonitorRef != nil {
+		go func() {
+			log.Println("Starting Price Monitor...")
+			if err := priceMonitorRef.Start(ctx); err != nil {
+				log.Printf("Price Monitor error: %v", err)
+			}
+		}()
+	}
 
 	// Start Kafka consumer — primary intake path (rules-engine trade-signals)
 	go func() {
@@ -336,8 +421,8 @@ func loadConfig() Config {
 		EncryptionKey:    getEnv("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef"),
 		PaperWSPort:      getEnvInt("PAPER_WS_PORT", 8081),
 		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", "wss://stockkaskwebsocket.indiratrade.com/enhanced-stream"),
-		RedisAddr:        getEnv("REDIS_ADDR", "localhost:6379"),
-		RedisPassword:    getEnv("REDIS_PASSWORD", "R3d1s@Prod"),
+		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
+		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
 	}
 }
 

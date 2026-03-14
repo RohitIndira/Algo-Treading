@@ -6,16 +6,20 @@ import (
 	"log"
 	"time"
 
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 )
+
+// OrderExecutorFunc executes an order at the broker. Implemented by executor.OrderExecutor.
+type OrderExecutorFunc interface {
+	ExecuteOrder(ctx context.Context, order *models.Order) error
+}
 
 // AutoSquareOffScheduler manages automatic square-off of positions at market close
 type AutoSquareOffScheduler struct {
 	orderRepo     repository.OrderRepository
 	credsRepo     repository.CredentialsRepository
-	orderExecutor *executor.OrderExecutor
+	orderExecutor OrderExecutorFunc
 	squareOffTime string // Format: "15:05" for 3:05 PM
 	stopChan      chan struct{}
 }
@@ -24,7 +28,7 @@ type AutoSquareOffScheduler struct {
 func NewAutoSquareOffScheduler(
 	orderRepo repository.OrderRepository,
 	credsRepo repository.CredentialsRepository,
-	orderExecutor *executor.OrderExecutor,
+	orderExecutor OrderExecutorFunc,
 	squareOffTime string,
 ) *AutoSquareOffScheduler {
 	if squareOffTime == "" {

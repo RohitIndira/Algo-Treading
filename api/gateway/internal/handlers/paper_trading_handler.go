@@ -286,6 +286,68 @@ func (h *PaperTradingHandler) SubscribeBrokerWS(w http.ResponseWriter, r *http.R
 	w.Write(body)
 }
 
+// CancelPriceWatch handles POST /api/v1/live-orders/cancel-price-watch
+// Cancels one or more orders being monitored by the PriceMonitor.
+func (h *PaperTradingHandler) CancelPriceWatch(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("userId")
+	if userID == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
+
+	// Read original body, inject user_id from auth header
+	bodyBytes, _ := io.ReadAll(r.Body)
+	var payload map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	payload["user_id"] = userID
+	enriched, _ := json.Marshal(payload)
+
+	resp, err := http.Post(
+		h.tradeExecBaseURL+"/ws/live-orders/cancel-price-watch",
+		"application/json",
+		io.NopCloser(newReaderFrom(enriched)),
+	)
+	if err != nil {
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// GetPriceWatches handles GET /api/v1/live-orders/price-watches?user_id=xxx
+// Returns all orders the PriceMonitor is currently watching for this user.
+func (h *PaperTradingHandler) GetPriceWatches(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	url := fmt.Sprintf("%s/ws/live-orders/price-watches?user_id=%s", h.tradeExecBaseURL, userID)
+	resp, err := http.Get(url)
+	if err != nil {
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
 // GetPaperWSInfo returns the WebSocket URL the frontend should connect to.
 // GET /api/v1/paper-trades/ws-info
 func (h *PaperTradingHandler) GetPaperWSInfo(w http.ResponseWriter, r *http.Request) {

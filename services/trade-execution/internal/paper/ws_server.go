@@ -11,6 +11,8 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -41,10 +43,11 @@ type PaperUpdate struct {
 
 // LiveOrderUpdate is the message sent to frontend clients over the live orders WebSocket.
 type LiveOrderUpdate struct {
-	Type   string          `json:"type"`             // connected | initial_orders | order_update | force_exit_done
-	UserID string          `json:"user_id,omitempty"`
-	Orders []*models.Order `json:"orders,omitempty"` // For initial_orders
-	Order  *models.Order   `json:"order,omitempty"`  // For order_update
+	Type         string                     `json:"type"`                    // connected | initial_orders | order_update | force_exit_done | price_watches_snapshot | price_watch_cancelled
+	UserID       string                     `json:"user_id,omitempty"`
+	Orders       []*models.Order            `json:"orders,omitempty"`        // For initial_orders
+	Order        *models.Order              `json:"order,omitempty"`         // For order_update
+	PriceWatches []scheduler.WatchSnapshot  `json:"price_watches,omitempty"` // For price_watches_snapshot
 }
 
 // BrokerPosition is a position returned by the Indira broker API.
@@ -61,6 +64,7 @@ type BrokerPosition struct {
 	CurrentPrice  float64 `json:"current_price"`
 	PnL           float64 `json:"pnl"`
 	PnLPercentage float64 `json:"pnl_percentage"`
+	ExcTkn        int     `json:"exc_tkn,omitempty"`
 }
 
 // EnrichedAlgoPosition is a broker position filtered and enriched with our algo order metadata.
@@ -77,6 +81,7 @@ type EnrichedAlgoPosition struct {
 	CurrentPrice  float64 `json:"current_price"`
 	BrokerPnL     float64 `json:"broker_pnl"`
 	BrokerPnLPct  float64 `json:"broker_pnl_pct"`
+	ExcTkn        int     `json:"exc_tkn,omitempty"`
 	// Our algo order metadata
 	OrderID       string  `json:"order_id,omitempty"`
 	StrategyID    string  `json:"strategy_id,omitempty"`
@@ -107,6 +112,10 @@ type PaperWSServer struct {
 	// startBrokerWS is wired in main.go to statusService.StartSubscription so the paper
 	// package doesn't import statusservice and create an import cycle.
 	startBrokerWS func(ctx context.Context, userID, bearerToken, appID, source string) error
+
+	// priceMonitor exposes the watch snapshot for the "price watches" UI panel.
+	priceMonitor       *scheduler.PriceMonitor
+	lastWatchBroadcast time.Time // throttle WS broadcasts
 
 	// Paper trade clients: userID -> conn -> per-conn write mutex
 	clients map[string]map[*websocket.Conn]*sync.Mutex
@@ -143,6 +152,11 @@ func (s *PaperWSServer) SetStatusService(fn func(ctx context.Context, userID, be
 	s.startBrokerWS = fn
 }
 
+// SetPriceMonitor wires the PriceMonitor for the price-watches endpoint.
+func (s *PaperWSServer) SetPriceMonitor(pm *scheduler.PriceMonitor) {
+	s.priceMonitor = pm
+}
+
 // RegisterRoutes registers all paper trading and live order HTTP/WebSocket endpoints onto a mux.
 func (s *PaperWSServer) RegisterRoutes(mux *http.ServeMux) {
 	// Paper trading
@@ -156,6 +170,8 @@ func (s *PaperWSServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/ws/live-orders/force-exit-all", s.handleForceExitAllLive)
 	mux.HandleFunc("/ws/live-orders/indira-positions", s.handleIndiraPositions)
 	mux.HandleFunc("/ws/live-orders/subscribe-broker-ws", s.handleSubscribeBrokerWS)
+	mux.HandleFunc("/ws/live-orders/price-watches", s.handleGetPriceWatches)
+	mux.HandleFunc("/ws/live-orders/cancel-price-watch", s.handleCancelPriceWatch)
 	// Dashboard
 	mux.HandleFunc("/ws/dashboard-stats", s.handleGetDashboardStats)
 }
@@ -389,6 +405,16 @@ func (s *PaperWSServer) handleLiveOrdersWS(w http.ResponseWriter, r *http.Reques
 		})
 	}
 
+	// Send initial price watches snapshot
+	if s.priceMonitor != nil {
+		watches := s.priceMonitor.GetWatchSnapshot(userID)
+		conn.WriteJSON(LiveOrderUpdate{
+			Type:         "price_watches_snapshot",
+			UserID:       userID,
+			PriceWatches: watches,
+		})
+	}
+
 	connMu := s.registerLiveClient(userID, conn)
 	defer s.unregisterLiveClient(userID, conn)
 
@@ -614,25 +640,9 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// 3. Filter broker positions to only algo-placed ones, enriching with order metadata.
+	// 3. Show ALL broker positions, enriching with algo order metadata when available.
 	result := make([]EnrichedAlgoPosition, 0, len(brokerPositions))
 	for _, bp := range brokerPositions {
-		if bp.NetQty == 0 {
-			continue // skip flat positions
-		}
-		// Match broker symbol (e.g. "STK_TCS_EQ_NSE_11536") against our symbol ("TCS").
-		bpSymUpper := strings.ToUpper(bp.Symbol)
-		var matchedOrder *models.Order
-		for sym, o := range symbolToOrder {
-			if bpSymUpper == sym || strings.Contains(bpSymUpper, sym) || strings.Contains(sym, bpSymUpper) {
-				matchedOrder = o
-				break
-			}
-		}
-		if matchedOrder == nil {
-			continue // not placed by our algo — skip
-		}
-
 		ep := EnrichedAlgoPosition{
 			Symbol:       bp.Symbol,
 			Exchange:     bp.Exchange,
@@ -645,20 +655,29 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 			CurrentPrice: bp.CurrentPrice,
 			BrokerPnL:    bp.PnL,
 			BrokerPnLPct: bp.PnLPercentage,
-			// Algo order metadata
-			OrderID:     matchedOrder.OrderID.String(),
-			StrategyID:  matchedOrder.StrategyID,
-			OrderSide:   string(matchedOrder.OrderSide),
-			FilledQty:   matchedOrder.FilledQuantity,
-			TradingMode: matchedOrder.TradingMode,
-			Status:      string(matchedOrder.Status),
+			ExcTkn:       bp.ExcTkn,
 		}
-		if matchedOrder.IndiraOrderID != nil {
-			ep.IndiraOrderID = *matchedOrder.IndiraOrderID
+
+		// Try to match broker symbol against our algo orders for enrichment.
+		bpSymUpper := strings.ToUpper(bp.Symbol)
+		for sym, o := range symbolToOrder {
+			if bpSymUpper == sym || strings.Contains(bpSymUpper, sym) || strings.Contains(sym, bpSymUpper) {
+				ep.OrderID = o.OrderID.String()
+				ep.StrategyID = o.StrategyID
+				ep.OrderSide = string(o.OrderSide)
+				ep.FilledQty = o.FilledQuantity
+				ep.TradingMode = o.TradingMode
+				ep.Status = string(o.Status)
+				if o.IndiraOrderID != nil {
+					ep.IndiraOrderID = *o.IndiraOrderID
+				}
+				if o.FilledPrice != nil {
+					ep.FilledPrice = *o.FilledPrice
+				}
+				break
+			}
 		}
-		if matchedOrder.FilledPrice != nil {
-			ep.FilledPrice = *matchedOrder.FilledPrice
-		}
+
 		result = append(result, ep)
 	}
 
@@ -667,7 +686,7 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 		"success":        true,
 		"positions":      result,
 		"total_broker":   len(brokerPositions),
-		"total_filtered": len(result),
+		"total_algo":     len(symbolToOrder),
 	})
 }
 
@@ -766,6 +785,119 @@ func (s *PaperWSServer) handleSubscribeBrokerWS(w http.ResponseWriter, r *http.R
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"ok":true}`))
+}
+
+// BroadcastPriceWatches sends the current price watch snapshot to all connected live WS clients.
+// Called by PriceMonitor after each checkPrices tick. Throttled to max once per 2 seconds
+// to avoid flooding the WebSocket (checkPrices runs every 500ms).
+func (s *PaperWSServer) BroadcastPriceWatches() {
+	if s.priceMonitor == nil {
+		return
+	}
+
+	now := time.Now()
+	if now.Sub(s.lastWatchBroadcast) < 2*time.Second {
+		return
+	}
+	s.lastWatchBroadcast = now
+
+	s.liveMu.RLock()
+	userIDs := make([]string, 0, len(s.liveClients))
+	for uid := range s.liveClients {
+		userIDs = append(userIDs, uid)
+	}
+	s.liveMu.RUnlock()
+
+	if len(userIDs) == 0 {
+		return
+	}
+
+	for _, uid := range userIDs {
+		watches := s.priceMonitor.GetWatchSnapshot(uid)
+		s.BroadcastLiveOrder(uid, LiveOrderUpdate{
+			Type:         "price_watches_snapshot",
+			UserID:       uid,
+			PriceWatches: watches,
+		})
+	}
+}
+
+// handleGetPriceWatches returns all orders the PriceMonitor is currently watching for a user.
+// GET /ws/live-orders/price-watches?user_id=xxx
+func (s *PaperWSServer) handleGetPriceWatches(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.priceMonitor == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"watches": []struct{}{},
+		})
+		return
+	}
+
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "user_id is required", http.StatusBadRequest)
+		return
+	}
+
+	watches := s.priceMonitor.GetWatchSnapshot(userID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"watches":     watches,
+		"total_count": s.priceMonitor.WatchCount(),
+	})
+}
+
+// handleCancelPriceWatch cancels one or more price watches for a user.
+// POST /ws/live-orders/cancel-price-watch  body: {"user_id":"xxx", "order_ids":["uuid1","uuid2"]}
+func (s *PaperWSServer) handleCancelPriceWatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.priceMonitor == nil {
+		http.Error(w, "price monitor not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var body struct {
+		UserID   string   `json:"user_id"`
+		OrderIDs []string `json:"order_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UserID == "" || len(body.OrderIDs) == 0 {
+		http.Error(w, `{"error":"user_id and order_ids are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	parsedIDs := make([]uuid.UUID, 0, len(body.OrderIDs))
+	for _, raw := range body.OrderIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			http.Error(w, `{"error":"invalid order_id: `+raw+`"}`, http.StatusBadRequest)
+			return
+		}
+		parsedIDs = append(parsedIDs, id)
+	}
+
+	cancelled := s.priceMonitor.CancelWatchBatch(r.Context(), parsedIDs, body.UserID)
+
+	// Broadcast updated order list to live WS clients so UI reflects cancellation immediately
+	s.BroadcastLiveOrder(body.UserID, LiveOrderUpdate{
+		Type:   "price_watch_cancelled",
+		UserID: body.UserID,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"cancelled": cancelled,
+		"requested": len(parsedIDs),
+	})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

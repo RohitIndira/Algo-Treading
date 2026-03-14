@@ -90,10 +90,11 @@ type MarketData struct {
 
 // PriceMap contains OHLCV data
 type PriceMap struct {
-	Open   float64 `json:"open"`
-	High   float64 `json:"high"`
-	Low    float64 `json:"low"`
-	Volume int64   `json:"volume"`
+	Open      float64 `json:"open"`
+	High      float64 `json:"high"`
+	Low       float64 `json:"low"`
+	Volume    int64   `json:"volume"`
+	PrevClose float64 `json:"prev_close"`
 }
 
 // Validate validates a market event

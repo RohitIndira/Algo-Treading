@@ -228,9 +228,9 @@ func (h *Handler) getLTPFromRedis(ctx context.Context, stockData models.StockDat
 	return 0, fmt.Errorf("LTP not found in Redis for stock %s (NSE:%d, BSE:%d) (tried exchanges: %v)", stockData.Symbol, stockData.NSECode, stockData.BSECode, exchanges)
 }
 
-// getOpenFromRedis retrieves today's open price from Redis.
-// Uses the same key pattern as getLTPFromRedis but reads the "open" field.
-func (h *Handler) getOpenFromRedis(ctx context.Context, stockData models.StockData) (float64, error) {
+// getPrevCloseFromRedis retrieves the previous close price from Redis.
+// Uses the same key pattern as getLTPFromRedis but reads the "prev_close" field.
+func (h *Handler) getPrevCloseFromRedis(ctx context.Context, stockData models.StockData) (float64, error) {
 	exchangeLower := strings.ToLower(stockData.Exchange)
 	exchangeLower = strings.TrimSuffix(exchangeLower, "_eq")
 
@@ -263,30 +263,30 @@ func (h *Handler) getOpenFromRedis(ctx context.Context, stockData models.StockDa
 		}
 
 		var marketData struct {
-			Open float64 `json:"open"`
+			PrevClose float64 `json:"prev_close"`
 		}
 		if err := json.Unmarshal([]byte(jsonData), &marketData); err != nil {
 			lastErr = fmt.Errorf("failed to parse market data JSON for key %s: %w", key, err)
 			continue
 		}
-		if marketData.Open <= 0 {
-			lastErr = fmt.Errorf("invalid open price %.2f for token %d on %s", marketData.Open, token, exch)
+		if marketData.PrevClose <= 0 {
+			lastErr = fmt.Errorf("invalid prev_close price %.2f for token %d on %s", marketData.PrevClose, token, exch)
 			continue
 		}
 
-		h.logger.Debug("Successfully retrieved open price from Redis",
+		h.logger.Debug("Successfully retrieved prev_close price from Redis",
 			zap.String("key", key),
 			zap.Int64("token", token),
 			zap.String("exchange", exch),
-			zap.Float64("open", marketData.Open))
+			zap.Float64("prev_close", marketData.PrevClose))
 
-		return marketData.Open, nil
+		return marketData.PrevClose, nil
 	}
 
 	if lastErr != nil {
-		return 0, fmt.Errorf("open price not found in Redis for stock %s (NSE:%d, BSE:%d): %w", stockData.Symbol, stockData.NSECode, stockData.BSECode, lastErr)
+		return 0, fmt.Errorf("prev_close not found in Redis for stock %s (NSE:%d, BSE:%d): %w", stockData.Symbol, stockData.NSECode, stockData.BSECode, lastErr)
 	}
-	return 0, fmt.Errorf("open price not found in Redis for stock %s (NSE:%d, BSE:%d)", stockData.Symbol, stockData.NSECode, stockData.BSECode)
+	return 0, fmt.Errorf("prev_close not found in Redis for stock %s (NSE:%d, BSE:%d)", stockData.Symbol, stockData.NSECode, stockData.BSECode)
 }
 
 // processMatch processes a single match
@@ -361,44 +361,84 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	}
 
 	// ── Price-change case routing ────────────────────────────────────────────
-	// Case 2: price change is below the strategy minimum.
-	// Instead of skipping, place a LIMIT (bracket) order at the price level where
-	// the stock would reach exactly the minimum % change threshold from today's open.
+	// Case 1 (within_range): price is between min% and max% — execute immediately
+	//   using BRACKET + LIMIT. Limit price = LTP × 1.005 (0.5% above current
+	//   price to cross the spread and fill instantly).
+	//   StopLoss and TakeProfit are computed from the buying (limit) price.
 	//
-	//   limitPrice = todayOpen × (1 + minPctChange / 100)
+	// Case 2 (below_min): price hasn't reached min% yet — place a pending
+	//   STOP_LOSS + BRACKET order. The PriceMonitor watches Redis LTP and
+	//   triggers placement when the stock reaches the min-% target level.
+	//   Limit price = prevClose × (1 + minPct/100) × 1.005 (0.5% buffer).
+	//   StopLoss and TakeProfit are computed from the buying (limit) price.
 	//
-	// Case 1 (within_range / ""): use the strategy's configured order type as-is.
 	// Case 3 (above_max): the evaluator already marks this as a failed condition,
 	//   so the match is dropped before reaching this function.
+	//
+	// For both Case 1 and Case 2, stoploss and target are calculated from the
+	// buying price (limit price) using user-configured StopLossPct and TakeProfitPct.
 	orderReq.PctChangeStatus = match.PctChangeStatus
+
+	if match.PctChangeStatus == "within_range" {
+		ltp := orderReq.Price
+
+		// Immediate execution: BRACKET + LIMIT order.
+		// Limit price = LTP + 0.5% to ensure the order crosses the spread and fills instantly.
+		rawLimit := ltp * 1.005
+		paise := int64(math.Round(rawLimit * 100))
+		paise = ((paise + 2) / 5) * 5 // round to NSE tick (0.05)
+		limitPrice := float64(paise) / 100.0
+
+		orderReq.OrderType = "LIMIT"
+		orderReq.ProductType = "BRACKET"
+		orderReq.Price = limitPrice
+		// StopLoss and TakeProfit from buying price (limit price)
+		orderReq.StopLoss = limitPrice * (1 - strategy.TradeConfig.StopLossPct/100)
+		orderReq.TakeProfit = limitPrice * (1 + strategy.TradeConfig.TakeProfitPct/100)
+
+		h.logger.Info("Case 1: pct_change within range — immediate BRACKET+LIMIT order",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.String("order_type", orderReq.OrderType),
+			zap.Float64("current_pct_change", event.MarketData.PctChange),
+			zap.Float64("ltp", ltp),
+			zap.Float64("limit_price", limitPrice),
+			zap.Float64("stop_loss", orderReq.StopLoss),
+			zap.Float64("take_profit", orderReq.TakeProfit))
+	}
+
 	if match.PctChangeStatus == "below_min" {
 		minPct := strategy.Conditions.MinPctChange
 		ltp := orderReq.Price
 
-		// Prefer today's open from the event; if missing (news events carry no OHLCV),
-		// fetch it from Redis where the live market feed stores the full OHLCV.
-		todayOpen := event.MarketData.PriceMap.Open
-		if todayOpen <= 0 {
-			if redisOpen, err := h.getOpenFromRedis(ctx, event.StockData); err == nil {
-				todayOpen = redisOpen
+		// Prefer prev_close from the event; if missing (news events carry no OHLCV),
+		// fetch it from Redis where the live market feed stores the full market data.
+		prevClose := event.MarketData.PriceMap.PrevClose
+		if prevClose <= 0 {
+			if redisPrevClose, err := h.getPrevCloseFromRedis(ctx, event.StockData); err == nil {
+				prevClose = redisPrevClose
 			} else {
-				h.logger.Warn("Could not fetch open price from Redis, falling back to LTP",
+				h.logger.Warn("Could not fetch prev_close from Redis, falling back to LTP",
 					zap.String("symbol", event.StockData.Symbol),
 					zap.Float64("ltp", ltp),
 					zap.Error(err))
 			}
 		}
 
-		// Fall back to LTP only if open is still unavailable.
-		referencePrice := todayOpen
+		// Fall back to LTP only if prev_close is still unavailable.
+		referencePrice := prevClose
 		if referencePrice <= 0 {
 			referencePrice = ltp
 		}
 
-		// limitPrice = the price at which the stock will have moved exactly minPct% from today's open,
-		// rounded to the nearest NSE tick (0.05) using integer paise arithmetic.
-		// We use int64 paise to avoid float64 drift: e.g. 5911.3 → 591130 paise → 5911.30 exactly.
-		rawLimit := referencePrice * (1 + minPct/100)
+		// targetMonitorPrice = the price at which the stock will have moved exactly minPct% from prev_close.
+		// This is the price level that the PriceMonitor watches for.
+		targetMonitorPrice := referencePrice * (1 + minPct/100)
+
+		// limitPrice = targetMonitorPrice + 0.5% buffer.
+		// When the PriceMonitor triggers (LTP reaches targetMonitorPrice), the order is placed
+		// at this slightly higher limit to cross the spread and fill immediately.
+		// Rounded to the nearest NSE tick (0.05) using integer paise arithmetic.
+		rawLimit := targetMonitorPrice * 1.005
 		paise := int64(math.Round(rawLimit * 100))
 		// Round paise to nearest 5 (= 0.05 tick)
 		paise = ((paise + 2) / 5) * 5
@@ -407,29 +447,35 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			h.logger.Error("Computed limit price is invalid, skipping order",
 				zap.String("strategy_id", strategy.StrategyID),
 				zap.Float64("ltp", ltp),
-				zap.Float64("today_open", todayOpen),
+				zap.Float64("prev_close", prevClose),
 				zap.Float64("min_pct_change", minPct))
 			return fmt.Errorf("invalid limit price computed for stock %s", event.StockData.Symbol)
 		}
 
-		// Preserve BRACKET order type if the user configured it; otherwise use LIMIT.
-		// BRACKET already carries stop-loss and take-profit, so the price floor logic
-		// still applies — we just don't downgrade the order type.
-		if orderReq.OrderType != "BRACKET" {
-			orderReq.OrderType = "LIMIT"
-		}
-		orderReq.Price = limitPrice
+		// Always use SL (stop-limit) + BRACKET_ORDER for below_min orders.
+		// A plain LIMIT BUY above market fills immediately — SL prevents that
+		// by keeping the order pending until price reaches the trigger level.
+		// BRACKET_ORDER adds automatic SL and target legs on fill.
+		// The Price field stores the target_monitor_price for the PriceMonitor to watch.
+		// The limit price (with 0.5% buffer) is applied when the monitor triggers.
+		orderReq.OrderType = "STOP_LOSS"
+		orderReq.ProductType = "BRACKET"
+		orderReq.Price = targetMonitorPrice // PriceMonitor watches this level
+		// StopLoss and TakeProfit from buying price (limit price with 0.5% buffer)
 		orderReq.StopLoss = limitPrice * (1 - strategy.TradeConfig.StopLossPct/100)
 		orderReq.TakeProfit = limitPrice * (1 + strategy.TradeConfig.TakeProfitPct/100)
 
-		h.logger.Info("Case 2: pct_change below min — order placed at target price",
+		h.logger.Info("Case 2: pct_change below min — order sent to price monitor",
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("order_type", orderReq.OrderType),
 			zap.Float64("current_pct_change", event.MarketData.PctChange),
 			zap.Float64("min_pct_change", minPct),
 			zap.Float64("ltp", ltp),
-			zap.Float64("today_open", todayOpen),
-			zap.Float64("limit_price", limitPrice))
+			zap.Float64("prev_close", prevClose),
+			zap.Float64("target_monitor_price", targetMonitorPrice),
+			zap.Float64("limit_price_with_buffer", limitPrice),
+			zap.Float64("stop_loss", orderReq.StopLoss),
+			zap.Float64("take_profit", orderReq.TakeProfit))
 	}
 
 	// Validate order request
