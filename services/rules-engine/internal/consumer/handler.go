@@ -378,6 +378,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	// For both Case 1 and Case 2, stoploss and target are calculated from the
 	// buying price (limit price) using user-configured StopLossPct and TakeProfitPct.
 	orderReq.PctChangeStatus = match.PctChangeStatus
+	orderReq.CurrentPctChange = event.MarketData.PctChange
 
 	if match.PctChangeStatus == "within_range" {
 		ltp := orderReq.Price
@@ -465,14 +466,23 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		orderReq.StopLoss = limitPrice * (1 - strategy.TradeConfig.StopLossPct/100)
 		orderReq.TakeProfit = limitPrice * (1 + strategy.TradeConfig.TakeProfitPct/100)
 
+		// Compute max monitor price so the PriceMonitor skips the order if
+		// the stock overshoots past max_pct_change.
+		maxPct := strategy.Conditions.MaxPctChange
+		if maxPct > 0 {
+			orderReq.MaxMonitorPrice = referencePrice * (1 + maxPct/100)
+		}
+
 		h.logger.Info("Case 2: pct_change below min — order sent to price monitor",
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("order_type", orderReq.OrderType),
 			zap.Float64("current_pct_change", event.MarketData.PctChange),
 			zap.Float64("min_pct_change", minPct),
+			zap.Float64("max_pct_change", maxPct),
 			zap.Float64("ltp", ltp),
 			zap.Float64("prev_close", prevClose),
 			zap.Float64("target_monitor_price", targetMonitorPrice),
+			zap.Float64("max_monitor_price", orderReq.MaxMonitorPrice),
 			zap.Float64("limit_price_with_buffer", limitPrice),
 			zap.Float64("stop_loss", orderReq.StopLoss),
 			zap.Float64("take_profit", orderReq.TakeProfit))

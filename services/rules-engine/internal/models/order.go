@@ -53,6 +53,14 @@ type OrderRequest struct {
 	// "below_min"    → pending LIMIT order; Price is the computed target entry price.
 	// ""             → no pct-change filter was active (treated as within_range).
 	PctChangeStatus string `json:"pct_change_status"`
+
+	// CurrentPctChange is the stock's percentage change at the time the order was created.
+	CurrentPctChange float64 `json:"current_pct_change,omitempty"`
+
+	// MaxMonitorPrice is the price level corresponding to max_pct_change.
+	// The PriceMonitor must NOT trigger the order if LTP exceeds this level.
+	// 0 means no upper bound.
+	MaxMonitorPrice float64 `json:"max_monitor_price,omitempty"`
 }
 
 // RuleMatch represents a successful rule match

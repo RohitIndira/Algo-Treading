@@ -3,7 +3,6 @@ package processor
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
@@ -127,23 +126,18 @@ func (p *SignalProcessor) handleExecutionSuccess(ctx context.Context, signal *mo
 		MatchScore:        signal.MatchScore,
 	}
 
-	// Publish both results concurrently — they are independent.
+	// Publish both results concurrently in background — don't block the response.
 	orderUpdate := p.createOrderUpdate(signal, executionResult, true)
-	var wg sync.WaitGroup
-	wg.Add(2)
 	go func() {
-		defer wg.Done()
 		if err := p.publisher.PublishExecutionResult(ctx, executionResult); err != nil {
 			p.logger.Error("Failed to publish execution result", zap.Error(err))
 		}
 	}()
 	go func() {
-		defer wg.Done()
 		if err := p.publisher.PublishOrderUpdate(ctx, orderUpdate); err != nil {
 			p.logger.Error("Failed to publish order update", zap.Error(err))
 		}
 	}()
-	wg.Wait()
 
 	p.logger.Info("Trade signal processed successfully",
 		zap.String("order_id", signal.OrderID),
@@ -182,23 +176,18 @@ func (p *SignalProcessor) handleExecutionFailure(ctx context.Context, signal *mo
 		ErrorMessage:      execError.Error(),
 	}
 
-	// Publish both failure results concurrently.
+	// Publish both failure results in background — don't block the response.
 	orderUpdate := p.createOrderUpdate(signal, executionResult, false)
-	var wg sync.WaitGroup
-	wg.Add(2)
 	go func() {
-		defer wg.Done()
 		if err := p.publisher.PublishExecutionResult(ctx, executionResult); err != nil {
 			p.logger.Error("Failed to publish failure result", zap.Error(err))
 		}
 	}()
 	go func() {
-		defer wg.Done()
 		if err := p.publisher.PublishOrderUpdate(ctx, orderUpdate); err != nil {
 			p.logger.Error("Failed to publish failure update", zap.Error(err))
 		}
 	}()
-	wg.Wait()
 
 	p.logger.Error("Trade signal execution failed",
 		zap.String("order_id", signal.OrderID),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,12 +13,14 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/lifecycle"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/paper"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
@@ -46,7 +49,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
 	log.Println("✓ Connected to PostgreSQL")
 
 	// Initialize repositories
@@ -62,7 +64,6 @@ func main() {
 	log.Println("Initializing Kafka publisher...")
 	logger, _ := initLogger()
 	kafkaPub := publisher.NewKafkaPublisher(cfg.KafkaBrokers, logger)
-	defer kafkaPub.Close()
 	log.Println("✓ Kafka publisher initialized")
 
 	// Initialize Order Status Service (WebSocket-based real-time order updates)
@@ -84,18 +85,32 @@ func main() {
 	)
 	log.Println("✓ Order executor initialized")
 
+	// Pre-warm credentials cache with active live-trading users so the first
+	// order per user hits memory instead of DB + decrypt.
+	go func() {
+		warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer warmCancel()
+		userIDs, err := orderRepo.GetDistinctActiveUserIDs(warmCtx)
+		if err != nil {
+			log.Printf("[credentials] Cache warm-up skipped: %v", err)
+			return
+		}
+		if len(userIDs) > 0 {
+			orderExecutor.CredentialsCache().Warm(warmCtx, userIDs)
+			log.Printf("✓ Credentials cache warmed for %d active users", len(userIDs))
+		}
+	}()
+
 	// Initialize Kafka signal consumer (trade-signals topic → SignalProcessor)
 	log.Println("Initializing Kafka consumer for trade-signals...")
 	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, kafkaPub, statusService, logger)
 	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger, cfg.WorkerCount)
-	defer kafkaConsumer.Close()
 	log.Println("✓ Kafka consumer initialized")
 
 
 	// Initialize strategy events consumer (user-config-events → close positions on deactivate/delete)
 	log.Println("Initializing Kafka consumer for user-config-events...")
 	strategyEventsConsumer := consumer.NewStrategyEventsConsumer(cfg.KafkaBrokers, orderRepo, orderExecutor, logger)
-	defer strategyEventsConsumer.Close()
 	log.Println("✓ Strategy events consumer initialized")
 
 	// Initialize gRPC server
@@ -270,13 +285,13 @@ func main() {
 			orderRepo,
 			kafkaPub,
 			orderExecutor, // satisfies scheduler.OrderExecutorFunc interface
-			500*time.Millisecond, // poll interval
+			100*time.Millisecond, // poll interval (reduced from 500ms for lower latency)
 		)
 		signalProcessor.SetPriceMonitor(priceMonitorRef)
 		strategyEventsConsumer.SetPriceMonitor(priceMonitorRef)
 		paperWSServer.SetPriceMonitor(priceMonitorRef)
 		priceMonitorRef.SetOnTickDone(paperWSServer.BroadcastPriceWatches)
-		log.Println("✓ Price Monitor initialized (500ms poll interval)")
+		log.Println("✓ Price Monitor initialized (100ms poll interval)")
 	} else {
 		log.Println("⚠ Price Monitor disabled (Redis not available) — below_min orders will be placed immediately")
 	}
@@ -284,6 +299,53 @@ func main() {
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// ── Lifecycle: ordered graceful shutdown ──────────────────────────────────
+	lc := lifecycle.New(cancel, 15*time.Second)
+
+	// Register components in shutdown order:
+	// 1. Stop accepting new signals (Kafka consumers)
+	lc.Register(lifecycle.Component{
+		Name:    "Kafka consumer (trade-signals)",
+		StopFn:  kafkaConsumer.Stop,
+		CloseFn: kafkaConsumer.Close,
+	})
+	lc.RegisterCloseable("Kafka consumer (user-config-events)", strategyEventsConsumer)
+	// 2. gRPC server (drain RPCs)
+	lc.RegisterStoppable("gRPC server", grpcServer)
+	// 3. Kafka publisher (flush writes)
+	lc.RegisterCloseable("Kafka publisher", kafkaPub)
+	// 4. PostgreSQL (release connections)
+	lc.Register(lifecycle.Component{
+		Name:    "PostgreSQL",
+		CloseFn: db.Close,
+	})
+
+	// ── Prometheus metrics HTTP server ───────────────────────────────────────
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	metricsServer := &http.Server{
+		Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
+		Handler: metricsMux,
+	}
+	go func() {
+		log.Printf("Starting Prometheus metrics server on :%d/metrics", cfg.MetricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Metrics server error: %v", err)
+		}
+	}()
+	lc.Register(lifecycle.Component{
+		Name: "Metrics HTTP server",
+		StopFn: func() {
+			shutCtx, c := context.WithTimeout(context.Background(), 3*time.Second)
+			defer c()
+			metricsServer.Shutdown(shutCtx)
+		},
+	})
 
 	// Start market data WSS client (paper trading price feed)
 	go func() {
@@ -348,9 +410,9 @@ func main() {
 	log.Println("========================================")
 	log.Println("✓ Trade Execution Service Started")
 	log.Printf("  - gRPC Server: localhost:%d", cfg.GRPCPort)
-	log.Printf("  - RabbitMQ Queue: %s", cfg.QueueName)
+	log.Printf("  - Metrics:     localhost:%d/metrics", cfg.MetricsPort)
 	log.Printf("  - Kafka Topic: %s (Group: %s)", cfg.KafkaTopic, cfg.KafkaGroupID)
-	log.Printf("  - Workers: %d", cfg.WorkerCount)
+	log.Printf("  - Workers: %d (bounded pool)", cfg.WorkerCount)
 	log.Println("========================================")
 
 	// Wait for interrupt signal
@@ -359,12 +421,9 @@ func main() {
 	sig := <-sigChan
 
 	log.Printf("\nReceived signal: %v", sig)
-	log.Println("Initiating graceful shutdown...")
 
-	cancel()
-
-	// Give time for graceful shutdown
-	time.Sleep(5 * time.Second)
+	// Ordered graceful shutdown via lifecycle manager
+	lc.Shutdown()
 
 	log.Println("========================================")
 	log.Println("Trade Execution Service stopped")
@@ -393,6 +452,8 @@ type Config struct {
 	// Redis (market price feed)
 	RedisAddr     string
 	RedisPassword string
+	// Observability
+	MetricsPort int
 }
 
 func loadConfig() Config {
@@ -411,7 +472,7 @@ func loadConfig() Config {
 		Exchange:         getEnv("RABBITMQ_EXCHANGE", "trade.execution"),
 		RoutingKey:       getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
 		PrefetchCount:    getEnvInt("RABBITMQ_PREFETCH", 10),
-		WorkerCount:      getEnvInt("WORKER_COUNT", 50),
+		WorkerCount:      getEnvInt("WORKER_COUNT", 100),
 		KafkaBrokers:     kafkaBrokers,
 		KafkaGroupID:     getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
 		KafkaTopic:       getEnv("KAFKA_TOPIC", "trade-signals"),
@@ -423,6 +484,7 @@ func loadConfig() Config {
 		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", "wss://stockkaskwebsocket.indiratrade.com/enhanced-stream"),
 		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
 		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
+		MetricsPort:      getEnvInt("METRICS_PORT", 9090),
 	}
 }
 
@@ -432,9 +494,10 @@ func initPostgres(cfg Config) (*sqlx.DB, error) {
 		return nil, err
 	}
 
-	// Configure connection pool
-	db.SetMaxOpenConns(getEnvInt("MAX_OPEN_CONNS", 25))
-	db.SetMaxIdleConns(getEnvInt("MAX_IDLE_CONNS", 5))
+	// Configure connection pool — defaults should be >= WORKER_COUNT to avoid
+	// worker threads blocking on DB connection acquisition.
+	db.SetMaxOpenConns(getEnvInt("MAX_OPEN_CONNS", 120))
+	db.SetMaxIdleConns(getEnvInt("MAX_IDLE_CONNS", 60))
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	// Test connection

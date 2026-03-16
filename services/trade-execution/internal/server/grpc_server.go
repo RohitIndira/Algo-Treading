@@ -22,9 +22,10 @@ import (
 // Server implements the TradeExecutionService gRPC server
 type Server struct {
 	pb.UnimplementedTradeExecutionServiceServer
-	repo     repository.OrderRepository
-	executor *executor.OrderExecutor
-	port     int
+	repo       repository.OrderRepository
+	executor   *executor.OrderExecutor
+	port       int
+	grpcServer *grpc.Server // stored for graceful shutdown
 }
 
 // NewServer creates a new gRPC server
@@ -43,14 +44,23 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	grpcServer := grpc.NewServer()
-	pb.RegisterTradeExecutionServiceServer(grpcServer, s)
+	s.grpcServer = grpc.NewServer()
+	pb.RegisterTradeExecutionServiceServer(s.grpcServer, s)
 
 	// Register reflection service for grpcurl
-	reflection.Register(grpcServer)
+	reflection.Register(s.grpcServer)
 
 	log.Printf("gRPC server listening on port %d", s.port)
-	return grpcServer.Serve(lis)
+	return s.grpcServer.Serve(lis)
+}
+
+// Stop performs a graceful shutdown — drains in-flight RPCs, then stops.
+func (s *Server) Stop() {
+	if s.grpcServer != nil {
+		log.Println("[grpc] Initiating graceful stop...")
+		s.grpcServer.GracefulStop()
+		log.Println("[grpc] Graceful stop complete")
+	}
 }
 
 // GetOrderStatus retrieves order status by ID

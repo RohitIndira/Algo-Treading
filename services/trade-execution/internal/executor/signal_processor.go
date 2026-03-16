@@ -197,8 +197,10 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 		AppId:        stringPtr(signal.AppId),
 		Source:       stringPtr(signal.Source),
 		// Paper trading
-		IsPaperTrade: tradingMode == "PAPER",
-		TradingMode:  tradingMode,
+		IsPaperTrade:     tradingMode == "PAPER",
+		TradingMode:      tradingMode,
+		CurrentPctChange: signal.CurrentPctChange,
+		MaxMonitorPrice:  signal.MaxMonitorPrice,
 	}, nil
 }
 

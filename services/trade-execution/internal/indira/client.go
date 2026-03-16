@@ -301,14 +301,24 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 
 	indiraSymbol := symbolBuilder.BuildSymbol()
 
-	// Resolve tick size from Redis market data; 0 means fallback to hardcoded defaults.
-	tickSize := c.resolveTickSize(symbolBuilder.Exchange, order.StockCode)
+	// Resolve tick size and DPR concurrently — these are independent Redis lookups.
+	var tickSize float64
+	var dprLower, dprUpper float64
+	var lookupWg sync.WaitGroup
+	lookupWg.Add(2)
+	go func() {
+		defer lookupWg.Done()
+		tickSize = c.resolveTickSize(symbolBuilder.Exchange, order.StockCode)
+	}()
+	go func() {
+		defer lookupWg.Done()
+		dprLower, dprUpper = c.resolveDPR(symbolBuilder.Exchange, order.StockCode)
+	}()
+	lookupWg.Wait()
+
 	round := func(price float64) float64 {
 		return c.roundPrice(price, tickSize)
 	}
-
-	// Resolve DPR (Daily Price Range / circuit limits) from Redis.
-	dprLower, dprUpper := c.resolveDPR(symbolBuilder.Exchange, order.StockCode)
 	clamp := func(price float64) float64 {
 		return clampDPR(price, dprLower, dprUpper)
 	}
@@ -425,14 +435,24 @@ func (c *ExecutionClient) convertToIndiraModifyRequest(order *models.Order) (*in
 		OffMktFlag:    false,
 	}
 
-	// Resolve tick size from Redis for accurate price rounding
-	tickSize := c.resolveTickSize(symbolBuilder.Exchange, order.StockCode)
+	// Resolve tick size and DPR concurrently — independent Redis lookups.
+	var tickSize float64
+	var dprLower, dprUpper float64
+	var modLookupWg sync.WaitGroup
+	modLookupWg.Add(2)
+	go func() {
+		defer modLookupWg.Done()
+		tickSize = c.resolveTickSize(symbolBuilder.Exchange, order.StockCode)
+	}()
+	go func() {
+		defer modLookupWg.Done()
+		dprLower, dprUpper = c.resolveDPR(symbolBuilder.Exchange, order.StockCode)
+	}()
+	modLookupWg.Wait()
+
 	round := func(price float64) float64 {
 		return c.roundPrice(price, tickSize)
 	}
-
-	// Resolve DPR and create round+clamp helper
-	dprLower, dprUpper := c.resolveDPR(symbolBuilder.Exchange, order.StockCode)
 	roundClamp := func(price float64) float64 {
 		return clampDPR(round(price), dprLower, dprUpper)
 	}

@@ -108,6 +108,14 @@ type Order struct {
 	LiveExitPrice *float64 `json:"live_exit_price,omitempty" db:"live_exit_price"` // Exit price for live positions (force-exit)
 	LivePnL       *float64 `json:"live_pnl,omitempty" db:"live_pnl"`               // Final P&L for live positions (force-exit)
 
+	// CurrentPctChange is the stock's percentage change at the time the order was created.
+	CurrentPctChange float64 `json:"current_pct_change,omitempty" db:"current_pct_change"`
+
+	// MaxMonitorPrice is the price ceiling for the PriceMonitor.
+	// If LTP exceeds this level, the monitor must NOT trigger the order.
+	// 0 means no upper bound.
+	MaxMonitorPrice float64 `json:"max_monitor_price,omitempty" db:"max_monitor_price"`
+
 	// Signal deduplication
 	SignalID *uuid.UUID `json:"signal_id,omitempty" db:"signal_id"` // Originating trade signal UUID (for idempotency)
 

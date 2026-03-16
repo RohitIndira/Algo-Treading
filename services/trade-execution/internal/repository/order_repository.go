@@ -53,6 +53,9 @@ type OrderRepository interface {
 	GetPendingMonitorOrders(ctx context.Context) ([]*models.Order, error)
 	// Dashboard stats
 	GetDashboardStats(ctx context.Context, userID string, isPaper bool) (*DashboardStats, error)
+	// GetDistinctActiveUserIDs returns unique user IDs that have non-terminal live orders.
+	// Used on startup to pre-warm the credentials cache.
+	GetDistinctActiveUserIDs(ctx context.Context) ([]string, error)
 }
 
 type orderRepository struct {
@@ -595,4 +598,18 @@ func (r *orderRepository) UpdatePaperTradeExit(ctx context.Context, orderID uuid
 		return fmt.Errorf("paper order not found: %s", orderID)
 	}
 	return nil
+}
+
+// GetDistinctActiveUserIDs returns unique user IDs that have non-terminal live orders.
+func (r *orderRepository) GetDistinctActiveUserIDs(ctx context.Context) ([]string, error) {
+	query := `
+		SELECT DISTINCT user_id FROM orders
+		WHERE is_paper_trade = false
+		AND status NOT IN ('CANCELLED', 'REJECTED', 'FAILED')
+	`
+	var userIDs []string
+	if err := r.db.SelectContext(ctx, &userIDs, query); err != nil {
+		return nil, fmt.Errorf("failed to get distinct active user IDs: %w", err)
+	}
+	return userIDs, nil
 }

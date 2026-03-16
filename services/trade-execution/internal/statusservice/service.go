@@ -14,6 +14,7 @@ import (
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	inexec "github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -103,6 +104,7 @@ func (s *OrderStatusService) StopSubscription(userID string) {
 // It re-sends WSConnectionRequest for every stored user so Indira resumes
 // streaming their updates on the new session.
 func (s *OrderStatusService) resubscribeAll() {
+	metrics.BrokerWSReconnects.Inc()
 	s.logger.Info("Shared WS reconnected — re-subscribing all users")
 	s.subscriberAuths.Range(func(key, value any) bool {
 		userID := key.(string)
@@ -169,6 +171,18 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	// Skip if nothing useful changed
 	if order.Status == newStatus {
 		return
+	}
+
+	metrics.StatusUpdatesReceived.WithLabelValues(string(newStatus)).Inc()
+
+	// Track fills and rejections
+	switch newStatus {
+	case models.StatusFilled:
+		metrics.FillsTotal.WithLabelValues("live").Inc()
+	case models.StatusRejected:
+		metrics.RejectionsTotal.WithLabelValues("rejected").Inc()
+	case models.StatusCancelled:
+		metrics.RejectionsTotal.WithLabelValues("cancelled").Inc()
 	}
 
 	order.Status = newStatus

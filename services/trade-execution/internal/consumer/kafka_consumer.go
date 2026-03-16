@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sync"
+	"strconv"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/workerpool"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
@@ -23,6 +25,7 @@ type KafkaConsumer struct {
 	reader    *kafka.Reader
 	processor TradeSignalProcessor
 	logger    *zap.Logger
+	pool      *workerpool.Pool
 	workers   int
 }
 
@@ -30,7 +33,7 @@ type KafkaConsumer struct {
 // workers controls the maximum number of messages processed concurrently.
 func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalProcessor, logger *zap.Logger, workers int) *KafkaConsumer {
 	if workers <= 0 {
-		workers = 50
+		workers = 100
 	}
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
@@ -38,9 +41,11 @@ func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalPro
 		GroupID:        groupID,
 		MinBytes:       10e3,  // 10KB — allows micro-batching at the broker level
 		MaxBytes:       10e6,  // 10MB
-		CommitInterval: time.Second,
+		CommitInterval: 100 * time.Millisecond,
 		StartOffset:    kafka.LastOffset,
 	})
+
+	pool := workerpool.New(workers, workers*4)
 
 	logger.Info("Kafka consumer initialized",
 		zap.Strings("brokers", brokers),
@@ -52,18 +57,15 @@ func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalPro
 		reader:    reader,
 		processor: processor,
 		logger:    logger,
+		pool:      pool,
 		workers:   workers,
 	}
 }
 
-// Start consumes trade signals with bounded concurrency.
-// Up to c.workers messages are processed in parallel; fetch errors use
-// exponential backoff (100ms → 30s) instead of a fixed 1s sleep.
+// Start consumes trade signals with bounded concurrency via the worker pool.
+// Fetch errors use exponential backoff (100ms → 30s).
 func (c *KafkaConsumer) Start(ctx context.Context) error {
 	c.logger.Info("Starting Kafka consumer for trade-signals", zap.Int("workers", c.workers))
-
-	sem := make(chan struct{}, c.workers)
-	var wg sync.WaitGroup
 
 	const (
 		initBackoff = 100 * time.Millisecond
@@ -74,8 +76,9 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			wg.Wait()
-			c.logger.Info("Kafka consumer shutting down")
+			c.logger.Info("Kafka consumer shutting down — draining worker pool")
+			c.pool.Stop()
+			c.logger.Info("Kafka consumer worker pool drained")
 			return nil
 		default:
 		}
@@ -83,14 +86,14 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 		msg, err := c.reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				wg.Wait()
+				c.pool.Stop()
 				return nil
 			}
 			c.logger.Error("Failed to fetch message", zap.Error(err), zap.Duration("retry_in", backoff))
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
-				wg.Wait()
+				c.pool.Stop()
 				return nil
 			}
 			backoff = time.Duration(math.Min(float64(backoff*2), float64(maxBackoff)))
@@ -98,26 +101,29 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 		}
 		backoff = initBackoff // reset on successful fetch
 
-		// Acquire a worker slot (blocks when all workers are busy).
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(m kafka.Message) {
-			defer wg.Done()
-			defer func() { <-sem }()
+		metrics.KafkaMessagesReceived.WithLabelValues("trade-signals").Inc()
+		metrics.KafkaConsumerLag.WithLabelValues("trade-signals", strconv.Itoa(msg.Partition)).Set(float64(msg.HighWaterMark - msg.Offset))
 
-			if err := c.processMessage(ctx, m); err != nil {
+		// Update worker pool metrics
+		metrics.WorkerPoolActive.Set(float64(c.pool.Active()))
+		metrics.WorkerPoolQueued.Set(float64(c.pool.Queued()))
+
+		// Submit to bounded worker pool (blocks if queue is full).
+		c.pool.Submit(func() {
+			if err := c.processMessage(ctx, msg); err != nil {
+				metrics.KafkaProcessingErrors.WithLabelValues("trade-signals").Inc()
 				c.logger.Error("Failed to process message",
 					zap.Error(err),
-					zap.String("topic", m.Topic),
-					zap.Int("partition", m.Partition),
-					zap.Int64("offset", m.Offset))
+					zap.String("topic", msg.Topic),
+					zap.Int("partition", msg.Partition),
+					zap.Int64("offset", msg.Offset))
 				return // skip commit on failure
 			}
 
-			if err := c.reader.CommitMessages(ctx, m); err != nil {
+			if err := c.reader.CommitMessages(ctx, msg); err != nil {
 				c.logger.Error("Failed to commit message", zap.Error(err))
 			}
-		}(msg)
+		})
 	}
 }
 
@@ -151,6 +157,11 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) e
 		zap.String("order_id", signal.OrderID))
 
 	return nil
+}
+
+// Stop drains the worker pool (blocks until in-flight tasks complete).
+func (c *KafkaConsumer) Stop() {
+	c.pool.Stop()
 }
 
 // Close closes the Kafka consumer

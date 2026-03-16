@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
@@ -117,21 +118,18 @@ type PaperWSServer struct {
 	priceMonitor       *scheduler.PriceMonitor
 	lastWatchBroadcast time.Time // throttle WS broadcasts
 
-	// Paper trade clients: userID -> conn -> per-conn write mutex
-	clients map[string]map[*websocket.Conn]*sync.Mutex
-	mu      sync.RWMutex
+	// Paper trade clients: sync.Map[userID string → *sync.Map[*websocket.Conn → *sync.Mutex]]
+	// Lock-free reads on the hot path (Broadcast).
+	clients sync.Map
 
-	// Live order clients: userID -> conn -> per-conn write mutex
-	liveClients map[string]map[*websocket.Conn]*sync.Mutex
-	liveMu      sync.RWMutex
+	// Live order clients: sync.Map[userID string → *sync.Map[*websocket.Conn → *sync.Mutex]]
+	liveClients sync.Map
 }
 
 // NewPaperWSServer creates the WebSocket server.
 func NewPaperWSServer(repo repository.OrderRepository) *PaperWSServer {
 	return &PaperWSServer{
-		repo:        repo,
-		clients:     make(map[string]map[*websocket.Conn]*sync.Mutex),
-		liveClients: make(map[string]map[*websocket.Conn]*sync.Mutex),
+		repo: repo,
 	}
 }
 
@@ -315,18 +313,17 @@ func (s *PaperWSServer) handleForceExitAll(w http.ResponseWriter, r *http.Reques
 
 // Broadcast sends a PaperUpdate to all WebSocket connections for a given user.
 func (s *PaperWSServer) Broadcast(userID string, update PaperUpdate) {
-	s.mu.RLock()
-	conns := make(map[*websocket.Conn]*sync.Mutex, len(s.clients[userID]))
-	for c, mu := range s.clients[userID] {
-		conns[c] = mu
-	}
-	s.mu.RUnlock()
-
-	if len(conns) == 0 {
+	connMapVal, ok := s.clients.Load(userID)
+	if !ok {
 		return
 	}
+	connMap := connMapVal.(*sync.Map)
 
-	for conn, mu := range conns {
+	metrics.WSMessagesSent.WithLabelValues("paper", update.Type).Inc()
+
+	connMap.Range(func(key, value any) bool {
+		conn := key.(*websocket.Conn)
+		mu := value.(*sync.Mutex)
 		mu.Lock()
 		conn.SetWriteDeadline(time.Now().Add(writeWait))
 		err := conn.WriteJSON(update)
@@ -336,28 +333,33 @@ func (s *PaperWSServer) Broadcast(userID string, update PaperUpdate) {
 			log.Printf("[paper-ws] Failed to send to user %s: %v — removing conn", userID, err)
 			s.unregisterClient(userID, conn)
 		}
-	}
+		return true
+	})
 }
 
 func (s *PaperWSServer) registerClient(userID string, conn *websocket.Conn) *sync.Mutex {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.clients[userID] == nil {
-		s.clients[userID] = make(map[*websocket.Conn]*sync.Mutex)
-	}
 	mu := &sync.Mutex{}
-	s.clients[userID][conn] = mu
+	connMapVal, _ := s.clients.LoadOrStore(userID, &sync.Map{})
+	connMap := connMapVal.(*sync.Map)
+	connMap.Store(conn, mu)
+	metrics.WSActiveConnections.WithLabelValues("paper").Inc()
 	return mu
 }
 
 func (s *PaperWSServer) unregisterClient(userID string, conn *websocket.Conn) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.clients[userID] != nil {
-		delete(s.clients[userID], conn)
-		if len(s.clients[userID]) == 0 {
-			delete(s.clients, userID)
-		}
+	connMapVal, ok := s.clients.Load(userID)
+	if !ok {
+		return
+	}
+	connMap := connMapVal.(*sync.Map)
+	connMap.Delete(conn)
+	metrics.WSActiveConnections.WithLabelValues("paper").Dec()
+
+	// Clean up empty user entry
+	empty := true
+	connMap.Range(func(_, _ any) bool { empty = false; return false })
+	if empty {
+		s.clients.Delete(userID)
 	}
 }
 
@@ -658,23 +660,33 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 			ExcTkn:       bp.ExcTkn,
 		}
 
-		// Try to match broker symbol against our algo orders for enrichment.
+		// Match broker symbol against algo orders: try exact match first (O(1)),
+		// then fall back to substring scan only if exact match misses.
 		bpSymUpper := strings.ToUpper(bp.Symbol)
-		for sym, o := range symbolToOrder {
-			if bpSymUpper == sym || strings.Contains(bpSymUpper, sym) || strings.Contains(sym, bpSymUpper) {
-				ep.OrderID = o.OrderID.String()
-				ep.StrategyID = o.StrategyID
-				ep.OrderSide = string(o.OrderSide)
-				ep.FilledQty = o.FilledQuantity
-				ep.TradingMode = o.TradingMode
-				ep.Status = string(o.Status)
-				if o.IndiraOrderID != nil {
-					ep.IndiraOrderID = *o.IndiraOrderID
+		o, matched := symbolToOrder[bpSymUpper]
+		if !matched {
+			// Fallback: substring match for broker symbols that differ slightly
+			// (e.g. "RELIANCE-EQ" vs "RELIANCE"). Only runs on cache miss.
+			for sym, candidate := range symbolToOrder {
+				if strings.Contains(bpSymUpper, sym) || strings.Contains(sym, bpSymUpper) {
+					o = candidate
+					matched = true
+					break
 				}
-				if o.FilledPrice != nil {
-					ep.FilledPrice = *o.FilledPrice
-				}
-				break
+			}
+		}
+		if matched {
+			ep.OrderID = o.OrderID.String()
+			ep.StrategyID = o.StrategyID
+			ep.OrderSide = string(o.OrderSide)
+			ep.FilledQty = o.FilledQuantity
+			ep.TradingMode = o.TradingMode
+			ep.Status = string(o.Status)
+			if o.IndiraOrderID != nil {
+				ep.IndiraOrderID = *o.IndiraOrderID
+			}
+			if o.FilledPrice != nil {
+				ep.FilledPrice = *o.FilledPrice
 			}
 		}
 
@@ -692,18 +704,17 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 
 // BroadcastLiveOrder sends a LiveOrderUpdate to all connected live order WS clients for a user.
 func (s *PaperWSServer) BroadcastLiveOrder(userID string, update LiveOrderUpdate) {
-	s.liveMu.RLock()
-	conns := make(map[*websocket.Conn]*sync.Mutex, len(s.liveClients[userID]))
-	for c, mu := range s.liveClients[userID] {
-		conns[c] = mu
-	}
-	s.liveMu.RUnlock()
-
-	if len(conns) == 0 {
+	connMapVal, ok := s.liveClients.Load(userID)
+	if !ok {
 		return
 	}
+	connMap := connMapVal.(*sync.Map)
 
-	for conn, mu := range conns {
+	metrics.WSMessagesSent.WithLabelValues("live", update.Type).Inc()
+
+	connMap.Range(func(key, value any) bool {
+		conn := key.(*websocket.Conn)
+		mu := value.(*sync.Mutex)
 		mu.Lock()
 		conn.SetWriteDeadline(time.Now().Add(writeWait))
 		err := conn.WriteJSON(update)
@@ -713,28 +724,33 @@ func (s *PaperWSServer) BroadcastLiveOrder(userID string, update LiveOrderUpdate
 			log.Printf("[live-ws] Failed to send to user %s: %v — removing conn", userID, err)
 			s.unregisterLiveClient(userID, conn)
 		}
-	}
+		return true
+	})
 }
 
 func (s *PaperWSServer) registerLiveClient(userID string, conn *websocket.Conn) *sync.Mutex {
-	s.liveMu.Lock()
-	defer s.liveMu.Unlock()
-	if s.liveClients[userID] == nil {
-		s.liveClients[userID] = make(map[*websocket.Conn]*sync.Mutex)
-	}
 	mu := &sync.Mutex{}
-	s.liveClients[userID][conn] = mu
+	connMapVal, _ := s.liveClients.LoadOrStore(userID, &sync.Map{})
+	connMap := connMapVal.(*sync.Map)
+	connMap.Store(conn, mu)
+	metrics.WSActiveConnections.WithLabelValues("live").Inc()
 	return mu
 }
 
 func (s *PaperWSServer) unregisterLiveClient(userID string, conn *websocket.Conn) {
-	s.liveMu.Lock()
-	defer s.liveMu.Unlock()
-	if s.liveClients[userID] != nil {
-		delete(s.liveClients[userID], conn)
-		if len(s.liveClients[userID]) == 0 {
-			delete(s.liveClients, userID)
-		}
+	connMapVal, ok := s.liveClients.Load(userID)
+	if !ok {
+		return
+	}
+	connMap := connMapVal.(*sync.Map)
+	connMap.Delete(conn)
+	metrics.WSActiveConnections.WithLabelValues("live").Dec()
+
+	// Clean up empty user entry
+	empty := true
+	connMap.Range(func(_, _ any) bool { empty = false; return false })
+	if empty {
+		s.liveClients.Delete(userID)
 	}
 }
 
@@ -801,12 +817,11 @@ func (s *PaperWSServer) BroadcastPriceWatches() {
 	}
 	s.lastWatchBroadcast = now
 
-	s.liveMu.RLock()
-	userIDs := make([]string, 0, len(s.liveClients))
-	for uid := range s.liveClients {
-		userIDs = append(userIDs, uid)
-	}
-	s.liveMu.RUnlock()
+	var userIDs []string
+	s.liveClients.Range(func(key, _ any) bool {
+		userIDs = append(userIDs, key.(string))
+		return true
+	})
 
 	if len(userIDs) == 0 {
 		return

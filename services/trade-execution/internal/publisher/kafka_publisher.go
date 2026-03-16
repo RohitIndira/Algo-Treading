@@ -20,24 +20,39 @@ type KafkaPublisher struct {
 
 // NewKafkaPublisher creates a new Kafka publisher
 func NewKafkaPublisher(brokers []string, logger *zap.Logger) *KafkaPublisher {
-	// Writer for trade-executions topic
+	// Writer for trade-executions topic — async to avoid blocking the order
+	// execution hot path. Errors are logged via Completion callback.
 	executionWriter := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
 		Topic:        "trade-executions",
 		Balancer:     &kafka.LeastBytes{},
 		BatchSize:    10,
 		BatchTimeout: 10 * time.Millisecond,
-		Async:        false, // Synchronous for reliability
+		Async:        true,
+		Completion: func(messages []kafka.Message, err error) {
+			if err != nil {
+				logger.Error("Async Kafka write failed (trade-executions)",
+					zap.Int("messages", len(messages)),
+					zap.Error(err))
+			}
+		},
 	}
 
-	// Writer for order-updates topic
+	// Writer for order-updates topic — async for the same reason.
 	updatesWriter := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
 		Topic:        "order-updates",
 		Balancer:     &kafka.LeastBytes{},
 		BatchSize:    10,
 		BatchTimeout: 10 * time.Millisecond,
-		Async:        false,
+		Async:        true,
+		Completion: func(messages []kafka.Message, err error) {
+			if err != nil {
+				logger.Error("Async Kafka write failed (order-updates)",
+					zap.Int("messages", len(messages)),
+					zap.Error(err))
+			}
+		},
 	}
 
 	logger.Info("Kafka publishers initialized",

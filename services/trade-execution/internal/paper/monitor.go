@@ -11,7 +11,6 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
-	"github.com/google/uuid"
 )
 
 const (
@@ -49,9 +48,8 @@ type PaperTradeMonitor struct {
 	wssLastSeen map[string]time.Time
 	priceMu     sync.RWMutex
 
-	// track orders currently being exited to avoid duplicates
-	exiting   map[uuid.UUID]bool
-	exitingMu sync.Mutex
+	// track orders currently being exited to avoid duplicates (sync.Map[uuid.UUID → bool])
+	exiting sync.Map
 }
 
 // NewPaperTradeMonitor creates a new monitor.
@@ -69,11 +67,10 @@ func NewPaperTradeMonitor(
 		wsServer:     wsServer,
 		marketClient: marketClient,
 		redisPrices:  redisPrices,
-		orderCache:   make(map[string][]*models.Order),
-		symbolMeta:   make(map[string]symbolMeta),
-		latestLTP:    make(map[string]float64),
-		wssLastSeen:  make(map[string]time.Time),
-		exiting:      make(map[uuid.UUID]bool),
+		orderCache:  make(map[string][]*models.Order),
+		symbolMeta:  make(map[string]symbolMeta),
+		latestLTP:   make(map[string]float64),
+		wssLastSeen: make(map[string]time.Time),
 	}
 }
 
@@ -192,10 +189,7 @@ func (m *PaperTradeMonitor) OnPriceUpdate(symbol string, ltp float64) {
 	ctx := context.Background()
 
 	for _, order := range orders {
-		m.exitingMu.Lock()
-		alreadyExiting := m.exiting[order.OrderID]
-		m.exitingMu.Unlock()
-		if alreadyExiting {
+		if _, alreadyExiting := m.exiting.Load(order.OrderID); alreadyExiting {
 			continue
 		}
 
@@ -215,9 +209,7 @@ func (m *PaperTradeMonitor) OnPriceUpdate(symbol string, ltp float64) {
 		}
 
 		if reason != "" {
-			m.exitingMu.Lock()
-			m.exiting[order.OrderID] = true
-			m.exitingMu.Unlock()
+			m.exiting.Store(order.OrderID, true)
 
 			// Broadcast the triggering LTP as a final pnl_update BEFORE the exit so
 			// the user can see the exact price that crossed SL/TP in the open positions view.
@@ -314,10 +306,7 @@ func (m *PaperTradeMonitor) tickRedisPnL(ctx context.Context) {
 
 		// Broadcast PnL update — no SL/TP check (WSS only)
 		for _, order := range s.orders {
-			m.exitingMu.Lock()
-			alreadyExiting := m.exiting[order.OrderID]
-			m.exitingMu.Unlock()
-			if alreadyExiting {
+			if _, alreadyExiting := m.exiting.Load(order.OrderID); alreadyExiting {
 				continue
 			}
 
@@ -356,13 +345,9 @@ func (m *PaperTradeMonitor) ForceExitAll(ctx context.Context, userID string) err
 
 	var wg sync.WaitGroup
 	for _, order := range orders {
-		m.exitingMu.Lock()
-		if m.exiting[order.OrderID] {
-			m.exitingMu.Unlock()
+		if _, already := m.exiting.LoadOrStore(order.OrderID, true); already {
 			continue
 		}
-		m.exiting[order.OrderID] = true
-		m.exitingMu.Unlock()
 
 		exitPrice := m.resolveExitPrice(ctx, order)
 		wg.Add(1)
@@ -418,11 +403,7 @@ func (m *PaperTradeMonitor) resolveExitPrice(ctx context.Context, order *models.
 
 // exitPosition performs the actual DB update and WebSocket broadcast for an exit.
 func (m *PaperTradeMonitor) exitPosition(ctx context.Context, order *models.Order, exitPrice float64, reason string) {
-	defer func() {
-		m.exitingMu.Lock()
-		delete(m.exiting, order.OrderID)
-		m.exitingMu.Unlock()
-	}()
+	defer m.exiting.Delete(order.OrderID)
 
 	if err := m.paperExec.ExitPaperPosition(ctx, order, exitPrice, reason); err != nil {
 		log.Printf("[paper-monitor] Failed to exit position %s: %v — removing from cache to prevent retry loop", order.OrderID, err)

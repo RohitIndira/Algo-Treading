@@ -199,4 +199,12 @@ type TradeSignal struct {
 
 	// Trading mode
 	TradingMode string `json:"trading_mode"` // PAPER or LIVE
+
+	// CurrentPctChange is the stock's percentage change at the time the signal was created.
+	CurrentPctChange float64 `json:"current_pct_change,omitempty"`
+
+	// MaxMonitorPrice is the price level corresponding to max_pct_change.
+	// The PriceMonitor must NOT trigger the order if LTP exceeds this level.
+	// 0 means no upper bound.
+	MaxMonitorPrice float64 `json:"max_monitor_price,omitempty"`
 }

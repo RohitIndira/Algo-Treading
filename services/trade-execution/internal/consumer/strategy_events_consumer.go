@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
@@ -162,8 +163,9 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 		return fmt.Errorf("closeStrategyPositions: fetch orders: %w", err)
 	}
 
-	// Step 1: cancel broker-submitted live orders individually so the exchange
-	// receives the cancellation request.
+	// Step 1: cancel broker-submitted live orders concurrently so the exchange
+	// receives cancellation requests in parallel (each is an independent API call).
+	var wg sync.WaitGroup
 	for _, order := range orders {
 		if order.IsPaperTrade {
 			continue // paper orders have no broker state; handled by bulk cancel below
@@ -175,15 +177,19 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 			continue // FILLED, RECEIVED, PENDING — broker API not applicable
 		}
 
-		reason := "Strategy deactivated or deleted"
-		if cancelErr := c.executor.CancelOrder(ctx, order, reason); cancelErr != nil {
-			// Log but do not abort — we still want to clean up remaining orders.
-			c.logger.Error("Broker cancellation failed for order",
-				zap.String("order_id", order.OrderID.String()),
-				zap.String("indira_order_id", *order.IndiraOrderID),
-				zap.Error(cancelErr))
-		}
+		wg.Add(1)
+		go func(o *models.Order) {
+			defer wg.Done()
+			reason := "Strategy deactivated or deleted"
+			if cancelErr := c.executor.CancelOrder(ctx, o, reason); cancelErr != nil {
+				c.logger.Error("Broker cancellation failed for order",
+					zap.String("order_id", o.OrderID.String()),
+					zap.String("indira_order_id", *o.IndiraOrderID),
+					zap.Error(cancelErr))
+			}
+		}(order)
 	}
+	wg.Wait()
 
 	// Step 2: bulk-cancel anything still not in a terminal state (paper orders,
 	// pre-broker live orders, FILLED positions, and any broker cancel that failed above).

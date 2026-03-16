@@ -7,10 +7,12 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -29,6 +31,11 @@ type OrderExecutor struct {
 	wsBroadcaster func(userID string, eventType string, order *models.Order)
 	maxRetries    int
 	retryDelay    time.Duration
+}
+
+// CredentialsCache returns the internal credentials cache for pre-warming on startup.
+func (e *OrderExecutor) CredentialsCache() *CredentialsCache {
+	return e.credsCache
 }
 
 // SetWSBroadcaster sets the callback for broadcasting new orders to the frontend WebSocket
@@ -70,19 +77,35 @@ func NewOrderExecutor(
 // In services/trade-execution/internal/executor/executor.go
 
 func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) error {
+	start := time.Now()
+	mode := "live"
+	if order.IsPaperTrade {
+		mode = "paper"
+	}
+	defer func() {
+		metrics.OrderLatency.WithLabelValues(mode).Observe(time.Since(start).Seconds())
+	}()
+
 	log.Printf("Executing order %s for user %s [trading_mode=%q is_paper=%v]",
 		order.OrderID, order.UserID, order.TradingMode, order.IsPaperTrade)
 
 	// Verify risk approval
 	if !order.RiskApproved {
 		log.Printf("Order %s not approved by risk management", order.OrderID)
+		metrics.OrdersTotal.WithLabelValues("rejected", mode).Inc()
 		return e.rejectOrder(ctx, order, "Risk not approved")
 	}
 
 	// ── PAPER TRADING: bypass broker entirely ──────────────────────────────
 	if order.IsPaperTrade {
 		log.Printf("[paper] Routing order %s to paper executor (mode=%q)", order.OrderID, order.TradingMode)
-		return e.paperExecutor.ExecutePaperOrder(ctx, order)
+		err := e.paperExecutor.ExecutePaperOrder(ctx, order)
+		if err != nil {
+			metrics.OrdersTotal.WithLabelValues("failed", mode).Inc()
+		} else {
+			metrics.OrdersTotal.WithLabelValues("submitted", mode).Inc()
+		}
+		return err
 	}
 	// ───────────────────────────────────────────────────────────────────────
 	if order.TradingMode == "" {
@@ -133,10 +156,16 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 	var lastErr error
 	for attempt := 0; attempt <= e.maxRetries; attempt++ {
 		if attempt > 0 {
-			// Exponential backoff
+			metrics.BrokerRetries.Inc()
+			// Exponential backoff — use select so the worker is released
+			// immediately if the context is cancelled (e.g. shutdown).
 			delay := e.retryDelay * time.Duration(attempt)
 			log.Printf("Retrying order %s, attempt %d after %v", order.OrderID, attempt, delay)
-			time.Sleep(delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 
 			// On 401 / session-expired, invalidate the cached credentials and
 			// reload from DB. The frontend may have refreshed the token in the
@@ -185,7 +214,17 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 			var brokerErr *indiraClient.BrokerBusinessError
 			if errors.As(err, &brokerErr) {
 				log.Printf("❌ Broker rejected order %s (no retry): %v", order.OrderID, brokerErr)
+				metrics.BrokerErrors.WithLabelValues("business").Inc()
+				metrics.OrdersTotal.WithLabelValues("failed", "live").Inc()
 				return e.failOrder(ctx, order, brokerErr.Error())
+			}
+			// Classify error for metrics
+			if isTimeoutError(err) {
+				metrics.BrokerErrors.WithLabelValues("timeout").Inc()
+			} else if isSessionExpiredError(err) {
+				metrics.BrokerErrors.WithLabelValues("auth").Inc()
+			} else {
+				metrics.BrokerErrors.WithLabelValues("network").Inc()
 			}
 			lastErr = err
 			order.RetryCount++
@@ -201,11 +240,13 @@ func (e *OrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) e
 
 		// Order placed successfully - store the Indira order ID
 		order.IndiraOrderID = &orderID
+		metrics.OrdersTotal.WithLabelValues("submitted", "live").Inc()
 		return e.handleSuccessfulPlacement(ctx, order, orderID, auth)
 	}
 
 	// All retries exhausted
 	log.Printf("Max retries exhausted for order %s", order.OrderID)
+	metrics.OrdersTotal.WithLabelValues("failed", "live").Inc()
 	return e.failOrder(ctx, order, fmt.Sprintf("Max retries exceeded: %v", lastErr))
 }
 
@@ -216,26 +257,38 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 	order.SubmittedAt = &now
 	order.IndiraOrderID = &indiraOrderID
 
-	// Perform DB updates + publish order-update in a background goroutine
+	// Perform DB updates + publish order-update concurrently in background.
+	// All three operations are independent — run them in parallel.
 	go func() {
 		bgCtx := context.Background()
 		orderCopy := *order
 
-		if err := e.repo.Update(bgCtx, &orderCopy); err != nil {
-			log.Printf("Background DB Error: failed to update order %s after placement: %v", orderCopy.OrderID, err)
-			// Continue — still want to publish Kafka event and start WS
-		}
+		var wg sync.WaitGroup
+		wg.Add(3)
 
-		// Record execution event in DB
-		e.repo.RecordExecutionEvent(bgCtx, orderCopy.OrderID, "SUBMITTED", map[string]interface{}{
-			"indira_order_id": indiraOrderID,
-			"timestamp":       now,
-		})
+		go func() {
+			defer wg.Done()
+			if err := e.repo.Update(bgCtx, &orderCopy); err != nil {
+				log.Printf("Background DB Error: failed to update order %s after placement: %v", orderCopy.OrderID, err)
+			}
+		}()
 
-		// Publish ORDER_SUBMITTED to Kafka order-updates topic
-		e.publishOrderUpdate(bgCtx, &orderCopy, "ORDER_SUBMITTED", "MEDIUM",
-			"Order Submitted",
-			fmt.Sprintf("Order for %s submitted to broker (ref: %s)", orderCopy.Symbol, indiraOrderID))
+		go func() {
+			defer wg.Done()
+			e.repo.RecordExecutionEvent(bgCtx, orderCopy.OrderID, "SUBMITTED", map[string]interface{}{
+				"indira_order_id": indiraOrderID,
+				"timestamp":       now,
+			})
+		}()
+
+		go func() {
+			defer wg.Done()
+			e.publishOrderUpdate(bgCtx, &orderCopy, "ORDER_SUBMITTED", "MEDIUM",
+				"Order Submitted",
+				fmt.Sprintf("Order for %s submitted to broker (ref: %s)", orderCopy.Symbol, indiraOrderID))
+		}()
+
+		wg.Wait()
 	}()
 
 	// Start backend-side WebSocket subscription to Indira for real-time order status.

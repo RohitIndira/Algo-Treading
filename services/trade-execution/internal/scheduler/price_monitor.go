@@ -37,6 +37,7 @@ const maxTriggerAttempts = 3
 type watchEntry struct {
 	order           *models.Order
 	targetPrice     float64 // LTP must reach this level to trigger
+	maxPrice        float64 // LTP must NOT exceed this level (0 = no upper bound)
 	triggered       int32   // atomic: 1 = already triggered
 	triggerAttempts int32   // atomic: number of times trigger+execute has been attempted
 	stockKey        string  // cached "exchange:token" key for deduplication
@@ -80,7 +81,7 @@ func NewPriceMonitor(
 	checkInterval time.Duration,
 ) *PriceMonitor {
 	if checkInterval <= 0 {
-		checkInterval = 500 * time.Millisecond
+		checkInterval = 100 * time.Millisecond
 	}
 
 	numWorkers := runtime.NumCPU()
@@ -111,6 +112,7 @@ func (pm *PriceMonitor) SetOnTickDone(fn func()) {
 
 // Watch registers an order for price monitoring.
 // targetPrice is the price level at which the order should be triggered.
+// The order's MaxMonitorPrice field provides the upper bound (0 = no limit).
 // The order's current Price field should contain the target_monitor_price.
 func (pm *PriceMonitor) Watch(order *models.Order, targetPrice float64) {
 	pm.mu.Lock()
@@ -124,11 +126,17 @@ func (pm *PriceMonitor) Watch(order *models.Order, targetPrice float64) {
 	pm.watches[order.OrderID] = &watchEntry{
 		order:       order,
 		targetPrice: targetPrice,
+		maxPrice:    order.MaxMonitorPrice,
 		stockKey:    stockKey(string(order.Exchange), order.StockCode),
 	}
 
-	log.Printf("[price-monitor] ▶ Watching %s:%s (order=%s user=%s strategy=%s) target=%.2f",
-		order.Exchange, order.Symbol, order.OrderID, order.UserID, order.StrategyID, targetPrice)
+	if order.MaxMonitorPrice > 0 {
+		log.Printf("[price-monitor] ▶ Watching %s:%s (order=%s user=%s strategy=%s) target=%.2f max=%.2f",
+			order.Exchange, order.Symbol, order.OrderID, order.UserID, order.StrategyID, targetPrice, order.MaxMonitorPrice)
+	} else {
+		log.Printf("[price-monitor] ▶ Watching %s:%s (order=%s user=%s strategy=%s) target=%.2f (no max)",
+			order.Exchange, order.Symbol, order.OrderID, order.UserID, order.StrategyID, targetPrice)
+	}
 }
 
 // Unwatch removes an order from monitoring.
@@ -308,6 +316,37 @@ func (pm *PriceMonitor) evaluateEntry(ctx context.Context, entry *watchEntry, lt
 
 	if !conditionMet {
 		return
+	}
+
+	// Check upper bound: if LTP has overshot past maxPrice, skip the order.
+	// This prevents triggering when the stock has moved beyond the user's
+	// max_pct_change threshold (e.g., min=0.5%, max=2% but stock jumped to 3%).
+	if entry.maxPrice > 0 {
+		exceeded := false
+		if isBuy {
+			exceeded = ltp > entry.maxPrice
+		} else {
+			exceeded = ltp < entry.maxPrice
+		}
+		if exceeded {
+			log.Printf("[price-monitor] ✗ SKIPPED %s:%s (order=%s) LTP=%.2f exceeded max=%.2f — removing from watch",
+				entry.order.Exchange, entry.order.Symbol, entry.order.OrderID, ltp, entry.maxPrice)
+			// Mark as triggered to prevent re-evaluation, then unwatch
+			atomic.StoreInt32(&entry.triggered, 1)
+			go func() {
+				pm.Unwatch(entry.order.OrderID)
+				// Mark as CANCELLED in DB
+				if pm.orderRepo != nil {
+					pm.orderRepo.UpdateStatus(ctx, entry.order.OrderID, models.StatusCancelled)
+					pm.orderRepo.RecordExecutionEvent(ctx, entry.order.OrderID, "PRICE_EXCEEDED_MAX", map[string]interface{}{
+						"ltp":       ltp,
+						"max_price": entry.maxPrice,
+						"target":    entry.targetPrice,
+					})
+				}
+			}()
+			return
+		}
 	}
 
 	// Atomically claim this trigger (prevents duplicate execution)
@@ -508,6 +547,7 @@ type WatchSnapshot struct {
 	OrderType   string  `json:"order_type"`
 	ProductType string  `json:"product_type"`
 	TargetPrice float64 `json:"target_price"`
+	MaxPrice    float64 `json:"max_price,omitempty"`
 	StopLoss    float64 `json:"stop_loss,omitempty"`
 	TakeProfit  float64 `json:"take_profit,omitempty"`
 	Quantity    int32   `json:"quantity"`
@@ -538,6 +578,7 @@ func (pm *PriceMonitor) GetWatchSnapshot(userID string) []WatchSnapshot {
 			OrderType:   string(e.order.OrderType),
 			ProductType: e.order.ProductType,
 			TargetPrice: e.targetPrice,
+			MaxPrice:    e.maxPrice,
 			Quantity:    e.order.Quantity,
 			Triggered:   atomic.LoadInt32(&e.triggered) != 0,
 			Attempts:    atomic.LoadInt32(&e.triggerAttempts),
