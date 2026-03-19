@@ -636,7 +636,7 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 	for _, order := range algoOrders {
 		sym := strings.ToUpper(order.Symbol)
 		existing, exists := symbolToOrder[sym]
-		if !exists || (order.Status == models.StatusFilled && existing.Status != models.StatusFilled) {
+		if !exists || (models.IsFilledStatus(order.Status) && !models.IsFilledStatus(existing.Status)) {
 			cp := *order
 			symbolToOrder[sym] = &cp
 		}

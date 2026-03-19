@@ -173,8 +173,8 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 		if order.IndiraOrderID == nil {
 			continue // not yet submitted to broker; bulk cancel is sufficient
 		}
-		if order.Status != models.StatusSubmitted && order.Status != models.StatusPartiallyFilled {
-			continue // FILLED, RECEIVED, PENDING — broker API not applicable
+		if models.IsTerminalStatus(order.Status) {
+			continue // terminal status — broker API not applicable
 		}
 
 		wg.Add(1)

@@ -111,8 +111,9 @@ func (r *orderRepository) Update(ctx context.Context, order *models.Order) error
 			total_cost = $7, submitted_at = $8, executed_at = $9,
 			error_message = $10, rejection_reason = $11, retry_count = $12,
 			is_paper_trade = $13, trading_mode = $14,
-			updated_at = $15
-		WHERE order_id = $16
+			broker_status = $15, broker_ws_data = $16, exchange_order_number = $17,
+			updated_at = $18
+		WHERE order_id = $19
 	`
 
 	result, err := r.db.ExecContext(ctx, query,
@@ -121,6 +122,7 @@ func (r *orderRepository) Update(ctx context.Context, order *models.Order) error
 		order.TotalCost, order.SubmittedAt, order.ExecutedAt,
 		order.ErrorMessage, order.RejectionReason, order.RetryCount,
 		order.IsPaperTrade, order.TradingMode,
+		order.BrokerStatus, order.BrokerWSData, order.ExchangeOrderNumber,
 		time.Now(), order.OrderID,
 	)
 
@@ -161,10 +163,10 @@ func (r *orderRepository) GetByOdinOrderID(ctx context.Context, odinOrderID stri
 	return r.GetByIndiraOrderID(ctx, odinOrderID)
 }
 
-// GetByIndiraOrderID retrieves an order by Indira order ID
+// GetByIndiraOrderID retrieves an order by Indira order ID, Odin order ID, or exchange order number.
 func (r *orderRepository) GetByIndiraOrderID(ctx context.Context, indiraOrderID string) (*models.Order, error) {
 	var order models.Order
-	query := `SELECT * FROM orders WHERE indira_order_id = $1 OR odin_order_id = $1`
+	query := `SELECT * FROM orders WHERE indira_order_id = $1 OR odin_order_id = $1 OR exchange_order_number = $1`
 
 	err := r.db.GetContext(ctx, &order, query, indiraOrderID)
 	if err == sql.ErrNoRows {
@@ -259,7 +261,7 @@ func (r *orderRepository) GetOpenOrders(ctx context.Context) ([]*models.Order, e
 	var orders []*models.Order
 	query := `
 		SELECT * FROM orders
-		WHERE status IN ('FILLED', 'PARTIALLY_FILLED')
+		WHERE status IN ('FILLED', 'PARTIALLY_FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED')
 		AND product_type = 'INTRADAY'
 		AND is_square_off_order = false
 		AND is_paper_trade = false
@@ -279,7 +281,7 @@ func (r *orderRepository) GetTrailingStopLossOrders(ctx context.Context) ([]*mod
 	var orders []*models.Order
 	query := `
 		SELECT * FROM orders
-		WHERE status IN ('FILLED', 'PARTIALLY_FILLED')
+		WHERE status IN ('FILLED', 'PARTIALLY_FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED')
 		AND stop_loss_type = 'TRAILING'
 		AND trailing_sl_pct > 0
 		AND is_paper_trade = false
@@ -300,7 +302,7 @@ func (r *orderRepository) GetAllActivePaperOrders(ctx context.Context) ([]*model
 	query := `
 		SELECT * FROM orders
 		WHERE is_paper_trade = true
-		AND status = 'FILLED'
+		AND status IN ('FILLED', 'EXECUTED', 'TRADED')
 		AND paper_exit_price IS NULL
 		ORDER BY created_at ASC
 	`
@@ -317,7 +319,7 @@ func (r *orderRepository) GetFilledPaperOrdersBySymbol(ctx context.Context, symb
 	query := `
 		SELECT * FROM orders
 		WHERE is_paper_trade = true
-		AND status = 'FILLED'
+		AND status IN ('FILLED', 'EXECUTED', 'TRADED')
 		AND paper_exit_price IS NULL
 		AND symbol = $1
 		ORDER BY created_at ASC
@@ -337,7 +339,7 @@ func (r *orderRepository) GetFilledPaperOrdersByUser(ctx context.Context, userID
 		SELECT * FROM orders
 		WHERE user_id = $1
 		AND is_paper_trade = true
-		AND status IN ('FILLED', 'RECEIVED', 'PENDING', 'SUBMITTED')
+		AND status IN ('FILLED', 'EXECUTED', 'TRADED', 'RECEIVED', 'PENDING', 'SUBMITTED')
 		AND paper_exit_price IS NULL
 		ORDER BY created_at DESC
 	`
@@ -356,7 +358,7 @@ func (r *orderRepository) GetLiveOrdersByUser(ctx context.Context, userID string
 		SELECT * FROM orders
 		WHERE user_id = $1
 		AND is_paper_trade = false
-		AND status IN ('FILLED', 'PARTIALLY_FILLED', 'RECEIVED', 'PENDING', 'SUBMITTED', 'CANCELLED')
+		AND status IN ('FILLED', 'PARTIALLY_FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED', 'RECEIVED', 'PENDING', 'SUBMITTED', 'CANCELLED')
 		ORDER BY created_at DESC
 	`
 	err := r.db.SelectContext(ctx, &orders, query, userID)
@@ -511,7 +513,7 @@ func (r *orderRepository) GetDashboardStats(ctx context.Context, userID string, 
 			FROM orders
 			WHERE user_id = $1
 			  AND is_paper_trade = false
-			  AND status IN ('FILLED', 'PARTIALLY_FILLED', 'RECEIVED', 'PENDING', 'SUBMITTED', 'CANCELLED')
+			  AND status IN ('FILLED', 'PARTIALLY_FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED', 'RECEIVED', 'PENDING', 'SUBMITTED', 'CANCELLED')
 		`, userID).Scan(&stats.TotalInvested, &stats.CurrentInvested, &stats.RealizedPnL, &stats.OpenCount, &stats.ClosedCount)
 		if err != nil {
 			// live_exit_price column may not exist if migration 005 hasn't been applied yet;
@@ -532,7 +534,7 @@ func (r *orderRepository) GetDashboardStats(ctx context.Context, userID string, 
 				FROM orders
 				WHERE user_id = $1
 				  AND is_paper_trade = false
-				  AND status IN ('FILLED', 'PARTIALLY_FILLED', 'RECEIVED', 'PENDING', 'SUBMITTED', 'CANCELLED')
+				  AND status IN ('FILLED', 'PARTIALLY_FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED', 'RECEIVED', 'PENDING', 'SUBMITTED', 'CANCELLED')
 			`, userID).Scan(&stats.TotalInvested, &stats.CurrentInvested, &stats.RealizedPnL, &stats.OpenCount, &stats.ClosedCount)
 			if fallbackErr != nil {
 				return nil, fmt.Errorf("dashboard stats live: %w", err)
@@ -550,7 +552,7 @@ func (r *orderRepository) GetActiveOrdersByStrategy(ctx context.Context, strateg
 		SELECT * FROM orders
 		WHERE strategy_id = $1
 		AND user_id = $2
-		AND status NOT IN ('CANCELLED', 'REJECTED')
+		AND status NOT IN ('CANCELLED', 'REJECTED', 'A.REJECTED')
 		ORDER BY created_at ASC
 	`
 	err := r.db.SelectContext(ctx, &orders, query, strategyID, userID)
@@ -570,7 +572,7 @@ func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strateg
 			updated_at = $1
 		WHERE strategy_id = $2
 		AND user_id = $3
-		AND status NOT IN ('CANCELLED', 'REJECTED')
+		AND status NOT IN ('CANCELLED', 'REJECTED', 'A.REJECTED')
 	`
 	_, err := r.db.ExecContext(ctx, query, time.Now(), strategyID, userID)
 	if err != nil {
@@ -605,7 +607,7 @@ func (r *orderRepository) GetDistinctActiveUserIDs(ctx context.Context) ([]strin
 	query := `
 		SELECT DISTINCT user_id FROM orders
 		WHERE is_paper_trade = false
-		AND status NOT IN ('CANCELLED', 'REJECTED', 'FAILED')
+		AND status NOT IN ('CANCELLED', 'REJECTED', 'A.REJECTED', 'FAILED')
 	`
 	var userIDs []string
 	if err := r.db.SelectContext(ctx, &userIDs, query); err != nil {

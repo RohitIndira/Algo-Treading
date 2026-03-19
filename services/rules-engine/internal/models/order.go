@@ -82,14 +82,16 @@ type RuleMatch struct {
 	PctChangeStatus string `json:"pct_change_status"`
 }
 
-// NewOrderRequest creates a new order request from a match and event
+// NewOrderRequest creates a new order request template from a match and event.
+//
+// Price, StopLoss, and TakeProfit are set to zero here. The handler is
+// responsible for resolving the final entry price (with tick-size rounding
+// from Redis) and computing SL/TP from the exact buying price. This ensures:
+//   - SL/TP always match the user's configured percentages exactly (modulo tick rounding)
+//   - All rounding uses the actual tick_size from the exchange feed, not a hardcoded value
+//   - The entry price accounts for spread buffers and case-specific adjustments
 func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *OrderRequest {
 	orderID := uuid.New().String()
-
-	// Calculate stop loss and take profit
-	price := event.MarketData.LastTradedPrice
-	stopLoss := price * (1 - strategy.TradeConfig.StopLossPct/100)
-	takeProfit := price * (1 + strategy.TradeConfig.TakeProfitPct/100)
 
 	// Default product type to INTRADAY if not specified.
 	// When OrderType is BRACKET, ensure ProductType is also BRACKET so the
@@ -120,17 +122,17 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		OrderType:    strategy.TradeConfig.OrderType,
 		OrderSide:    "BUY", // Default to BUY
 		Quantity:     strategy.TradeConfig.Quantity,
-		Price:        price,
-		StopLoss:     stopLoss,
-		TakeProfit:   takeProfit,
-		Validity:     "DAY", // Default to DAY order
+		Price:        0, // Resolved by handler with tick-size rounding
+		StopLoss:     0, // Computed by handler from final entry price
+		TakeProfit:   0, // Computed by handler from final entry price
+		Validity:     "DAY",
 		Timestamp:    time.Now(),
 		MatchScore:   match.MatchScore,
 		ImpactScore:  event.Analysis.ImpactScore,
 		Sentiment:    event.Analysis.Sentiment,
 		NewsCategory: event.NewsData.Category,
-		RiskApproved: false, // Will be set by risk management service
-		RiskScore:    0.0,   // Will be set by risk management service
+		RiskApproved: false,
+		RiskScore:    0.0,
 		RetryCount:   0,
 
 		// Authentication data from strategy

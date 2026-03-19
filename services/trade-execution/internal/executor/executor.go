@@ -434,7 +434,7 @@ func (e *OrderExecutor) CancelOrder(ctx context.Context, order *models.Order, re
 	log.Printf("Cancelling order %s: %s", order.OrderID, reason)
 
 	// Check if order can be cancelled
-	if order.Status == models.StatusFilled || order.Status == models.StatusCancelled {
+	if models.IsTerminalStatus(order.Status) {
 		return fmt.Errorf("order cannot be cancelled (status: %s)", order.Status)
 	}
 

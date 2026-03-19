@@ -78,5 +78,7 @@ type WSOrderStatus struct {
 	OrderValidity         string  `json:"OrderValidity"`
 	LastModifiedTime      string  `json:"LastModifiedTime"`
 	CPID                  string  `json:"CP_ID"`
+	ModifyBit             int     `json:"ModifyBit"`
+	SLLimitPrice          float64 `json:"SLLimitPrice"`
 	OrderTimeStamp        string  `json:"OrderTimeStamp"`
 }

@@ -363,11 +363,7 @@ func (pm *PriceMonitor) evaluateEntry(ctx context.Context, entry *watchEntry, lt
 
 // isTerminalStatus returns true if the order status means no further execution should happen.
 func isTerminalStatus(s models.OrderStatus) bool {
-	switch s {
-	case models.StatusFilled, models.StatusCancelled, models.StatusFailed, models.StatusRejected:
-		return true
-	}
-	return false
+	return models.IsTerminalStatus(s)
 }
 
 // triggerOrder updates the order with the current LTP and calls the executor.

@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +21,26 @@ const (
 	StatusCancelled       OrderStatus = "CANCELLED"
 	StatusFailed          OrderStatus = "FAILED"
 )
+
+// IsFilledStatus returns true if the status represents a filled order
+// (includes both internal and broker status strings).
+func IsFilledStatus(s OrderStatus) bool {
+	switch strings.ToUpper(string(s)) {
+	case "FILLED", "EXECUTED", "TRADED":
+		return true
+	}
+	return false
+}
+
+// IsTerminalStatus returns true if the order is in a terminal state
+// and cannot be modified or cancelled.
+func IsTerminalStatus(s OrderStatus) bool {
+	switch strings.ToUpper(string(s)) {
+	case "FILLED", "EXECUTED", "TRADED", "CANCELLED", "REJECTED", "A.REJECTED", "FAILED", "EXPIRED":
+		return true
+	}
+	return false
+}
 
 // OrderType represents order type
 type OrderType string
@@ -84,6 +105,11 @@ type Order struct {
 	IndiraResponse *string `json:"indira_response,omitempty" db:"indira_response"` // Indira API response
 	OdinOrderID    *string `json:"odin_order_id,omitempty" db:"odin_order_id"`     // Odin API order ID
 	OdinResponse   *string `json:"odin_response,omitempty" db:"odin_response"`     // Odin API response
+
+	// Raw broker WebSocket data — stored exactly as received, no mapping/transformation
+	BrokerStatus       *string `json:"broker_status,omitempty" db:"broker_status"`               // Raw status from broker WS (e.g. "EXECUTED", "PENDING", "CANCELLED")
+	BrokerWSData       *string `json:"broker_ws_data,omitempty" db:"broker_ws_data"`              // Full raw JSON from broker WS
+	ExchangeOrderNumber *string `json:"exchange_order_number,omitempty" db:"exchange_order_number"` // Exchange order number (OrderNumber from WS)
 
 	// Frontend auth data (passed from frontend for Indira API calls)
 	BearerToken *string `json:"bearer_token,omitempty" db:"bearer_token"` // JWT bearer token from frontend

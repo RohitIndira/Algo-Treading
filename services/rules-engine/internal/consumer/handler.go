@@ -2,10 +2,8 @@ package consumer
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"math"
-	"strings"
+	"sync"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
@@ -25,6 +23,7 @@ type Handler struct {
 	signalRepo   *repository.TradeSignalRepository
 	riskClient   *risk.Client
 	redisCache   *cache.RedisCache
+	tickCache    *TickSizeCache
 	stats        *models.MatchingStats
 	logger       *zap.Logger
 	marketHours  *utils.MarketHours
@@ -51,6 +50,7 @@ func NewHandler(
 		signalRepo:   signalRepo,
 		riskClient:   riskClient,
 		redisCache:   redisCache,
+		tickCache:    NewTickSizeCache(),
 		stats:        stats,
 		logger:       logger,
 		marketHours:  marketHours,
@@ -58,7 +58,12 @@ func NewHandler(
 	}
 }
 
-// HandleEvent processes a market event
+// HandleEvent processes a market event.
+//
+// Parallel processing: strategy evaluation and market-data prefetch run
+// concurrently so the Redis round-trip is hidden behind the CPU work of
+// evaluating strategies. By the time matches are ready, the market data
+// (LTP, prev_close, tick_size) is already available.
 func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) error {
 	h.stats.IncrementEventsProcessed()
 
@@ -84,19 +89,75 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 		zap.Int64("volume", event.MarketData.PriceMap.Volume),
 	)
 
-	// Evaluate event against in-memory snapshot
-	matches, err := h.engine.EvaluateEvent(ctx, event)
-	if err != nil {
-		h.stats.IncrementEvaluationErrors()
-		return fmt.Errorf("failed to match event: %w", err)
+	// ── Parallel: strategy evaluation + market data prefetch ────────────
+	// Both are independent and IO/CPU-bound respectively. Running them
+	// concurrently hides the Redis latency behind the evaluation work.
+	type evalResult struct {
+		matches []*models.RuleMatch
+		err     error
+	}
+	type mdResult struct {
+		data *MarketDataResult
+		err  error
 	}
 
+	var (
+		evalRes evalResult
+		mdRes   mdResult
+		wg      sync.WaitGroup
+	)
+
+	// Goroutine 1: evaluate strategies (CPU-bound, uses worker pool internally)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		evalRes.matches, evalRes.err = h.engine.EvaluateEvent(ctx, event)
+	}()
+
+	// Goroutine 2: prefetch market data from Redis (IO-bound, single GET)
+	// Check tick-size cache first; if hit, we can skip the Redis call when
+	// the event already carries a valid LTP.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Always fetch full market data: we need LTP (if event lacks it),
+		// prev_close (for below_min case), and tick_size.
+		// If tick_size is already cached, we still need LTP/prev_close.
+		md, err := getMarketDataFromRedis(ctx, h.redisCache, event.StockData, h.logger)
+		if err != nil {
+			mdRes.err = err
+			return
+		}
+		mdRes.data = md
+		// Update tick-size cache for future use.
+		h.tickCache.Set(event.StockData.StockCode, md.TickSize)
+	}()
+
+	wg.Wait()
+
+	// Handle evaluation errors.
+	if evalRes.err != nil {
+		h.stats.IncrementEvaluationErrors()
+		return fmt.Errorf("failed to match event: %w", evalRes.err)
+	}
+
+	matches := evalRes.matches
 	if len(matches) == 0 {
 		h.logger.Info("No strategies matched event (exact-match semantics)",
 			zap.String("event_id", event.EventID),
 			zap.Int64("stock_code", event.StockData.StockCode),
 			zap.String("symbol", event.StockData.Symbol))
 		return nil
+	}
+
+	// Market data is required for order construction. If the prefetch failed
+	// and the event itself doesn't carry a usable LTP, we cannot proceed.
+	if mdRes.err != nil && event.MarketData.LastTradedPrice <= 0 {
+		h.logger.Error("Market data prefetch failed and event has no LTP",
+			zap.String("event_id", event.EventID),
+			zap.String("symbol", event.StockData.Symbol),
+			zap.Error(mdRes.err))
+		return fmt.Errorf("no market data available for stock %s: %w", event.StockData.Symbol, mdRes.err)
 	}
 
 	h.logger.Info("Event matched strategies (exact-match semantics)",
@@ -120,9 +181,9 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 		h.stats.RecordStockMatch(event.StockData.StockCode, event.StockData.Symbol)
 	}
 
-	// Process each match
+	// Process each match with preloaded market data.
 	for _, match := range matches {
-		if err := h.processMatch(ctx, match, event); err != nil {
+		if err := h.processMatch(ctx, match, event, mdRes.data); err != nil {
 			h.logger.Error("Failed to process match",
 				zap.Error(err),
 				zap.String("strategy_id", match.StrategyID),
@@ -135,163 +196,17 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 	return nil
 }
 
-// getLTPFromRedis retrieves Last Traded Price from Redis
-// Redis key pattern: market:{exchange}:{token}
-// Example: market:nse:10227 or market:bse:532259
-func (h *Handler) getLTPFromRedis(ctx context.Context, stockData models.StockData) (float64, error) {
-	// Normalize exchange to lowercase for Redis key
-	exchangeLower := strings.ToLower(stockData.Exchange)
-
-	// Remove _EQ suffix if present (NSE_EQ -> nse, BSE_EQ -> bse)
-	exchangeLower = strings.TrimSuffix(exchangeLower, "_eq")
-
-	// Always try both NSE and BSE to maximize chances of finding the stock
-	// Priority order: specified exchange first, then the other one
-	exchanges := []string{"nse", "bse"}
-	if exchangeLower == "bse" {
-		exchanges = []string{"bse", "nse"}
-	}
-
-	var lastErr error
-	for _, exch := range exchanges {
-		// Use the correct exchange-specific code
-		var token int64
-		if exch == "nse" {
-			token = stockData.NSECode
-		} else {
-			token = stockData.BSECode
-		}
-
-		// Skip if this exchange doesn't have a valid code
-		if token <= 0 {
-			h.logger.Debug("No valid code for exchange, skipping",
-				zap.String("exchange", exch),
-				zap.Int64("stock_code", stockData.StockCode))
-			continue
-		}
-
-		// Construct Redis key: market:{exchange}:{token}
-		key := fmt.Sprintf("market:%s:%d", exch, token)
-
-		// Get value from Redis
-		jsonData, err := h.redisCache.Get(ctx, key)
-		if err != nil {
-			// If it's a cache miss, try the next exchange
-			if err == models.ErrCacheMiss {
-				h.logger.Debug("LTP not found in Redis for exchange, trying next",
-					zap.String("key", key),
-					zap.String("exchange", exch))
-				lastErr = err
-				continue
-			}
-			lastErr = fmt.Errorf("redis get error for key %s: %w", key, err)
-			continue
-		}
-
-		// Parse JSON to extract LTP
-		var marketData struct {
-			LTP float64 `json:"ltp"`
-		}
-
-		if err := json.Unmarshal([]byte(jsonData), &marketData); err != nil {
-			lastErr = fmt.Errorf("failed to parse market data JSON for key %s: %w", key, err)
-			continue
-		}
-
-		if marketData.LTP <= 0 {
-			lastErr = fmt.Errorf("invalid LTP value %.2f for token %d on %s", marketData.LTP, token, exch)
-			continue
-		}
-
-		h.logger.Debug("Successfully retrieved LTP from Redis",
-			zap.String("key", key),
-			zap.Int64("token", token),
-			zap.String("exchange", exch),
-			zap.Int64("nse_code", stockData.NSECode),
-			zap.Int64("bse_code", stockData.BSECode),
-			zap.Float64("ltp", marketData.LTP))
-
-		return marketData.LTP, nil
-	}
-
-	// If we get here, stock not found on either exchange
-	h.logger.Warn("Stock not found in Redis on any exchange",
-		zap.Int64("stock_code", stockData.StockCode),
-		zap.Int64("nse_code", stockData.NSECode),
-		zap.Int64("bse_code", stockData.BSECode),
-		zap.String("symbol", stockData.Symbol),
-		zap.Strings("tried_exchanges", exchanges))
-
-	if lastErr != nil {
-		return 0, fmt.Errorf("LTP not found in Redis for stock %s (NSE:%d, BSE:%d) (tried exchanges: %v): %w", stockData.Symbol, stockData.NSECode, stockData.BSECode, exchanges, lastErr)
-	}
-	return 0, fmt.Errorf("LTP not found in Redis for stock %s (NSE:%d, BSE:%d) (tried exchanges: %v)", stockData.Symbol, stockData.NSECode, stockData.BSECode, exchanges)
-}
-
-// getPrevCloseFromRedis retrieves the previous close price from Redis.
-// Uses the same key pattern as getLTPFromRedis but reads the "prev_close" field.
-func (h *Handler) getPrevCloseFromRedis(ctx context.Context, stockData models.StockData) (float64, error) {
-	exchangeLower := strings.ToLower(stockData.Exchange)
-	exchangeLower = strings.TrimSuffix(exchangeLower, "_eq")
-
-	exchanges := []string{"nse", "bse"}
-	if exchangeLower == "bse" {
-		exchanges = []string{"bse", "nse"}
-	}
-
-	var lastErr error
-	for _, exch := range exchanges {
-		var token int64
-		if exch == "nse" {
-			token = stockData.NSECode
-		} else {
-			token = stockData.BSECode
-		}
-		if token <= 0 {
-			continue
-		}
-
-		key := fmt.Sprintf("market:%s:%d", exch, token)
-		jsonData, err := h.redisCache.Get(ctx, key)
-		if err != nil {
-			if err == models.ErrCacheMiss {
-				lastErr = err
-				continue
-			}
-			lastErr = fmt.Errorf("redis get error for key %s: %w", key, err)
-			continue
-		}
-
-		var marketData struct {
-			PrevClose float64 `json:"prev_close"`
-		}
-		if err := json.Unmarshal([]byte(jsonData), &marketData); err != nil {
-			lastErr = fmt.Errorf("failed to parse market data JSON for key %s: %w", key, err)
-			continue
-		}
-		if marketData.PrevClose <= 0 {
-			lastErr = fmt.Errorf("invalid prev_close price %.2f for token %d on %s", marketData.PrevClose, token, exch)
-			continue
-		}
-
-		h.logger.Debug("Successfully retrieved prev_close price from Redis",
-			zap.String("key", key),
-			zap.Int64("token", token),
-			zap.String("exchange", exch),
-			zap.Float64("prev_close", marketData.PrevClose))
-
-		return marketData.PrevClose, nil
-	}
-
-	if lastErr != nil {
-		return 0, fmt.Errorf("prev_close not found in Redis for stock %s (NSE:%d, BSE:%d): %w", stockData.Symbol, stockData.NSECode, stockData.BSECode, lastErr)
-	}
-	return 0, fmt.Errorf("prev_close not found in Redis for stock %s (NSE:%d, BSE:%d)", stockData.Symbol, stockData.NSECode, stockData.BSECode)
-}
-
-// processMatch processes a single match
-func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, event *models.MarketEvent) error {
-	// Use the full strategy from the match (already includes trade_config from in-memory config store)
+// processMatch builds and publishes an order for a single strategy match.
+//
+// The preloaded MarketDataResult (md) contains LTP, prev_close, and tick_size
+// fetched in a single Redis GET during HandleEvent's parallel prefetch phase.
+// This eliminates redundant Redis calls and ensures all price rounding uses
+// the actual tick size from the exchange feed, not a hardcoded default.
+//
+// Percentage accuracy: SL and TP are always computed from the final buying
+// price (the limit price the order will actually execute at), ensuring the
+// user's configured percentage is applied exactly (subject to tick rounding).
+func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, event *models.MarketEvent, md *MarketDataResult) error {
 	strategy := match.Strategy
 	if strategy == nil {
 		h.logger.Error("Strategy is nil in match, cannot generate order",
@@ -300,7 +215,6 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return fmt.Errorf("strategy is nil in match")
 	}
 
-	// Validate strategy has complete trade configuration
 	if strategy.TradeConfig.Quantity <= 0 {
 		h.logger.Error("Strategy has invalid quantity in trade_config",
 			zap.String("strategy_id", strategy.StrategyID),
@@ -309,7 +223,47 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return fmt.Errorf("strategy %s has invalid quantity: %d", strategy.StrategyID, strategy.TradeConfig.Quantity)
 	}
 
-	// Log strategy configuration being used
+	// ── Resolve tick size ───────────────────────────────────────────────
+	// Source of truth: Redis market data JSON (tick_size field).
+	// Cached in TickSizeCache after the first fetch for low-latency reuse.
+	var tickSize float64
+	if md != nil {
+		tickSize = md.TickSize
+	}
+	if tickSize <= 0 {
+		// Try the in-memory cache (populated by a previous event for this stock).
+		if cached, ok := h.tickCache.Get(event.StockData.StockCode); ok && cached > 0 {
+			tickSize = cached
+		}
+	}
+	if tickSize <= 0 {
+		h.logger.Error("tick_size not available from Redis or cache, cannot place order",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.String("symbol", event.StockData.Symbol),
+			zap.Int64("stock_code", event.StockData.StockCode))
+		return fmt.Errorf("tick_size not available for stock %s", event.StockData.Symbol)
+	}
+
+	// ── Resolve LTP ─────────────────────────────────────────────────────
+	// Priority: event LTP > Redis LTP (from prefetched md).
+	ltp := event.MarketData.LastTradedPrice
+	if ltp <= 0 && md != nil {
+		ltp = md.LTP
+	}
+	if ltp <= 0 {
+		h.logger.Error("No LTP available from event or Redis",
+			zap.String("event_id", event.EventID),
+			zap.String("symbol", event.StockData.Symbol))
+		return fmt.Errorf("no price available for stock %s", event.StockData.Symbol)
+	}
+
+	// ── Resolve prev_close ──────────────────────────────────────────────
+	prevClose := event.MarketData.PriceMap.PrevClose
+	if prevClose <= 0 && md != nil {
+		prevClose = md.PrevClose
+	}
+
+	// Log resolved market data.
 	h.logger.Info("Using strategy configuration from in-memory config store",
 		zap.String("strategy_id", strategy.StrategyID),
 		zap.String("user_id", strategy.UserID),
@@ -320,82 +274,43 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		zap.Float64("stop_loss_pct", strategy.TradeConfig.StopLossPct),
 		zap.Float64("take_profit_pct", strategy.TradeConfig.TakeProfitPct))
 
-	// Create order request
+	h.logger.Info("Resolved market data for order",
+		zap.String("symbol", event.StockData.Symbol),
+		zap.Int64("stock_code", event.StockData.StockCode),
+		zap.Float64("ltp", ltp),
+		zap.Float64("prev_close", prevClose),
+		zap.Float64("tick_size", tickSize),
+		zap.String("ltp_source", ltpSource(event, md)))
+
+	// ── Create order request (template — SL/TP filled below) ────────────
 	orderReq := models.NewOrderRequest(match, event, strategy)
+	orderReq.Price = ltp // will be overridden below for Case 1/2
 
-	// Ensure we have a valid LTP — needed for both MARKET and LIMIT price computation.
-	if orderReq.Price <= 0 {
-		if event.MarketData.LastTradedPrice > 0 {
-			orderReq.Price = event.MarketData.LastTradedPrice
-			h.logger.Debug("Using LTP from event data",
-				zap.Int64("token", orderReq.Token),
-				zap.Int64("stock_code", event.StockData.StockCode),
-				zap.String("exchange", event.StockData.Exchange),
-				zap.Float64("price", orderReq.Price))
-		} else {
-			price, err := h.getLTPFromRedis(ctx, event.StockData)
-			if err != nil {
-				h.logger.Error("Failed to get LTP from Redis, skipping order",
-					zap.String("event_id", event.EventID),
-					zap.Int64("stock_code", event.StockData.StockCode),
-					zap.Int64("nse_code", event.StockData.NSECode),
-					zap.Int64("bse_code", event.StockData.BSECode),
-					zap.String("symbol", event.StockData.Symbol),
-					zap.String("exchange", event.StockData.Exchange),
-					zap.Error(err))
-				return fmt.Errorf("no price available for stock %s", event.StockData.Symbol)
-			}
-			orderReq.Price = price
-			h.logger.Info("Using LTP from Redis",
-				zap.Int64("stock_code", event.StockData.StockCode),
-				zap.Int64("nse_code", event.StockData.NSECode),
-				zap.Int64("bse_code", event.StockData.BSECode),
-				zap.String("symbol", event.StockData.Symbol),
-				zap.String("exchange", event.StockData.Exchange),
-				zap.Float64("price", price))
-		}
-
-		// Recalculate stop loss and take profit using the resolved LTP.
-		orderReq.StopLoss = orderReq.Price * (1 - strategy.TradeConfig.StopLossPct/100)
-		orderReq.TakeProfit = orderReq.Price * (1 + strategy.TradeConfig.TakeProfitPct/100)
-	}
-
-	// ── Price-change case routing ────────────────────────────────────────────
-	// Case 1 (within_range): price is between min% and max% — execute immediately
-	//   using BRACKET + LIMIT. Limit price = LTP × 1.005 (0.5% above current
-	//   price to cross the spread and fill instantly).
-	//   StopLoss and TakeProfit are computed from the buying (limit) price.
-	//
-	// Case 2 (below_min): price hasn't reached min% yet — place a pending
-	//   STOP_LOSS + BRACKET order. The PriceMonitor watches Redis LTP and
-	//   triggers placement when the stock reaches the min-% target level.
-	//   Limit price = prevClose × (1 + minPct/100) × 1.005 (0.5% buffer).
-	//   StopLoss and TakeProfit are computed from the buying (limit) price.
-	//
-	// Case 3 (above_max): the evaluator already marks this as a failed condition,
-	//   so the match is dropped before reaching this function.
-	//
-	// For both Case 1 and Case 2, stoploss and target are calculated from the
-	// buying price (limit price) using user-configured StopLossPct and TakeProfitPct.
+	// ── Price-change case routing ───────────────────────────────────────
+	// entryPrice = the limit price the order will actually execute at.
+	// slBasePrice = the price from which SL/TP percentages are computed.
+	// In most cases entryPrice == slBasePrice, except Case 2 where the
+	// order.Price is set to targetMonitorPrice (for the PriceMonitor) but
+	// SL/TP are based on the limit price the monitor will use.
 	orderReq.PctChangeStatus = match.PctChangeStatus
 	orderReq.CurrentPctChange = event.MarketData.PctChange
 
-	if match.PctChangeStatus == "within_range" {
-		ltp := orderReq.Price
+	slPct := strategy.TradeConfig.StopLossPct
+	tpPct := strategy.TradeConfig.TakeProfitPct
 
-		// Immediate execution: BRACKET + LIMIT order.
-		// Limit price = LTP + 0.5% to ensure the order crosses the spread and fills instantly.
-		rawLimit := ltp * 1.005
-		paise := int64(math.Round(rawLimit * 100))
-		paise = ((paise + 2) / 5) * 5 // round to NSE tick (0.05)
-		limitPrice := float64(paise) / 100.0
+	switch match.PctChangeStatus {
+	case "within_range":
+		// ── Case 1: immediate BRACKET + LIMIT execution ─────────────
+		// Limit price = LTP + 0.5% buffer to cross the spread.
+		limitPrice := roundToTickSize(ltp*1.005, tickSize)
 
 		orderReq.OrderType = "LIMIT"
 		orderReq.ProductType = "BRACKET"
 		orderReq.Price = limitPrice
-		// StopLoss and TakeProfit from buying price (limit price)
-		orderReq.StopLoss = limitPrice * (1 - strategy.TradeConfig.StopLossPct/100)
-		orderReq.TakeProfit = limitPrice * (1 + strategy.TradeConfig.TakeProfitPct/100)
+
+		// SL/TP from buying (limit) price — exact user percentage.
+		orderReq.StopLoss = roundToTickSize(limitPrice*(1-slPct/100), tickSize)
+		orderReq.TakeProfit = roundToTickSize(limitPrice*(1+tpPct/100), tickSize)
 
 		h.logger.Info("Case 1: pct_change within range — immediate BRACKET+LIMIT order",
 			zap.String("strategy_id", strategy.StrategyID),
@@ -403,47 +318,30 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			zap.Float64("current_pct_change", event.MarketData.PctChange),
 			zap.Float64("ltp", ltp),
 			zap.Float64("limit_price", limitPrice),
+			zap.Float64("tick_size", tickSize),
+			zap.Float64("stop_loss_pct", slPct),
+			zap.Float64("take_profit_pct", tpPct),
 			zap.Float64("stop_loss", orderReq.StopLoss),
 			zap.Float64("take_profit", orderReq.TakeProfit))
-	}
 
-	if match.PctChangeStatus == "below_min" {
+	case "below_min":
+		// ── Case 2: pending STOP_LOSS + BRACKET order ───────────────
 		minPct := strategy.Conditions.MinPctChange
-		ltp := orderReq.Price
 
-		// Prefer prev_close from the event; if missing (news events carry no OHLCV),
-		// fetch it from Redis where the live market feed stores the full market data.
-		prevClose := event.MarketData.PriceMap.PrevClose
-		if prevClose <= 0 {
-			if redisPrevClose, err := h.getPrevCloseFromRedis(ctx, event.StockData); err == nil {
-				prevClose = redisPrevClose
-			} else {
-				h.logger.Warn("Could not fetch prev_close from Redis, falling back to LTP",
-					zap.String("symbol", event.StockData.Symbol),
-					zap.Float64("ltp", ltp),
-					zap.Error(err))
-			}
-		}
-
-		// Fall back to LTP only if prev_close is still unavailable.
+		// Reference price for target calculation.
 		referencePrice := prevClose
 		if referencePrice <= 0 {
+			h.logger.Warn("prev_close unavailable, falling back to LTP as reference",
+				zap.String("symbol", event.StockData.Symbol),
+				zap.Float64("ltp", ltp))
 			referencePrice = ltp
 		}
 
-		// targetMonitorPrice = the price at which the stock will have moved exactly minPct% from prev_close.
-		// This is the price level that the PriceMonitor watches for.
+		// targetMonitorPrice = price at exactly minPct% above prev_close.
 		targetMonitorPrice := referencePrice * (1 + minPct/100)
 
-		// limitPrice = targetMonitorPrice + 0.5% buffer.
-		// When the PriceMonitor triggers (LTP reaches targetMonitorPrice), the order is placed
-		// at this slightly higher limit to cross the spread and fill immediately.
-		// Rounded to the nearest NSE tick (0.05) using integer paise arithmetic.
-		rawLimit := targetMonitorPrice * 1.005
-		paise := int64(math.Round(rawLimit * 100))
-		// Round paise to nearest 5 (= 0.05 tick)
-		paise = ((paise + 2) / 5) * 5
-		limitPrice := float64(paise) / 100.0
+		// limitPrice = target + 0.5% buffer, tick-rounded.
+		limitPrice := roundToTickSize(targetMonitorPrice*1.005, tickSize)
 		if limitPrice <= 0 {
 			h.logger.Error("Computed limit price is invalid, skipping order",
 				zap.String("strategy_id", strategy.StrategyID),
@@ -453,21 +351,15 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			return fmt.Errorf("invalid limit price computed for stock %s", event.StockData.Symbol)
 		}
 
-		// Always use SL (stop-limit) + BRACKET_ORDER for below_min orders.
-		// A plain LIMIT BUY above market fills immediately — SL prevents that
-		// by keeping the order pending until price reaches the trigger level.
-		// BRACKET_ORDER adds automatic SL and target legs on fill.
-		// The Price field stores the target_monitor_price for the PriceMonitor to watch.
-		// The limit price (with 0.5% buffer) is applied when the monitor triggers.
 		orderReq.OrderType = "STOP_LOSS"
 		orderReq.ProductType = "BRACKET"
 		orderReq.Price = targetMonitorPrice // PriceMonitor watches this level
-		// StopLoss and TakeProfit from buying price (limit price with 0.5% buffer)
-		orderReq.StopLoss = limitPrice * (1 - strategy.TradeConfig.StopLossPct/100)
-		orderReq.TakeProfit = limitPrice * (1 + strategy.TradeConfig.TakeProfitPct/100)
 
-		// Compute max monitor price so the PriceMonitor skips the order if
-		// the stock overshoots past max_pct_change.
+		// SL/TP from the actual buying price (limit price with buffer).
+		orderReq.StopLoss = roundToTickSize(limitPrice*(1-slPct/100), tickSize)
+		orderReq.TakeProfit = roundToTickSize(limitPrice*(1+tpPct/100), tickSize)
+
+		// Max monitor price (upper bound).
 		maxPct := strategy.Conditions.MaxPctChange
 		if maxPct > 0 {
 			orderReq.MaxMonitorPrice = referencePrice * (1 + maxPct/100)
@@ -481,19 +373,28 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			zap.Float64("max_pct_change", maxPct),
 			zap.Float64("ltp", ltp),
 			zap.Float64("prev_close", prevClose),
+			zap.Float64("reference_price", referencePrice),
 			zap.Float64("target_monitor_price", targetMonitorPrice),
 			zap.Float64("max_monitor_price", orderReq.MaxMonitorPrice),
 			zap.Float64("limit_price_with_buffer", limitPrice),
+			zap.Float64("tick_size", tickSize),
+			zap.Float64("stop_loss_pct", slPct),
+			zap.Float64("take_profit_pct", tpPct),
 			zap.Float64("stop_loss", orderReq.StopLoss),
 			zap.Float64("take_profit", orderReq.TakeProfit))
+
+	default:
+		// ── No pct_change filter: SL/TP from LTP directly ───────────
+		orderReq.StopLoss = roundToTickSize(ltp*(1-slPct/100), tickSize)
+		orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
 	}
 
-	// Validate order request
+	// ── Validate order ──────────────────────────────────────────────────
 	if err := orderReq.Validate(); err != nil {
 		return fmt.Errorf("invalid order request: %w", err)
 	}
 
-	// 1. Check risk management BEFORE publishing
+	// ── Risk management check ───────────────────────────────────────────
 	// TODO: TEMPORARILY BYPASSED FOR TESTING - REMOVE THIS BEFORE PRODUCTION
 	if false && h.riskClient != nil {
 		riskResp, err := h.riskClient.CheckPreTradeRisk(ctx, orderReq, strategy)
@@ -501,11 +402,9 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			h.logger.Error("Risk check failed",
 				zap.Error(err),
 				zap.String("order_id", orderReq.OrderID))
-			// Set as not approved if risk check fails
 			orderReq.RiskApproved = false
-			orderReq.RiskScore = 100.0 // High risk score for failures
+			orderReq.RiskScore = 100.0
 		} else {
-			// Update order with risk check results
 			orderReq.RiskApproved = riskResp.Approved
 			orderReq.RiskScore = riskResp.RiskScore
 
@@ -515,55 +414,61 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 					zap.String("user_id", orderReq.UserID),
 					zap.Float64("risk_score", riskResp.RiskScore),
 					zap.Int("violations", len(riskResp.Violations)))
-
-				// Log violations
 				for _, violation := range riskResp.Violations {
 					h.logger.Debug("Risk violation",
 						zap.String("order_id", orderReq.OrderID),
 						zap.String("type", violation.Type.String()),
 						zap.String("message", violation.Message))
 				}
-				// Don't publish rejected orders
 				return nil
 			}
 		}
 	} else {
-		// TESTING MODE: Bypassing risk checks - Auto-approving all orders
 		h.logger.Warn("RISK CHECK BYPASSED FOR TESTING - Auto-approving order",
 			zap.String("order_id", orderReq.OrderID))
 		orderReq.RiskApproved = true
 		orderReq.RiskScore = 0.0
 	}
 
-	// 2. Save order to PostgreSQL (for tracking)
+	// ── Publish order (parallel: DB + Kafka, then RabbitMQ) ─────────────
+	// DB save and Kafka publish are independent, so run them concurrently.
+	var pubWg sync.WaitGroup
+
 	if h.signalRepo != nil {
-		if err := h.signalRepo.SaveTradeSignal(ctx, orderReq); err != nil {
-			h.logger.Error("Failed to save trade signal to database",
-				zap.Error(err),
-				zap.String("order_id", orderReq.OrderID))
-			// Continue anyway - don't fail the order
-		} else {
-			h.logger.Debug("Trade signal saved to PostgreSQL",
-				zap.String("order_id", orderReq.OrderID),
-				zap.String("status", "PENDING"))
-		}
+		pubWg.Add(1)
+		go func() {
+			defer pubWg.Done()
+			if err := h.signalRepo.SaveTradeSignal(ctx, orderReq); err != nil {
+				h.logger.Error("Failed to save trade signal to database",
+					zap.Error(err),
+					zap.String("order_id", orderReq.OrderID))
+			} else {
+				h.logger.Debug("Trade signal saved to PostgreSQL",
+					zap.String("order_id", orderReq.OrderID),
+					zap.String("status", "PENDING"))
+			}
+		}()
 	}
 
-	// 3. Publish to Kafka "trade-signals" topic
 	if h.kafkaPubl != nil {
-		if err := h.kafkaPubl.PublishTradeSignal(ctx, orderReq); err != nil {
-			h.logger.Error("Failed to publish to Kafka trade-signals",
-				zap.Error(err),
-				zap.String("order_id", orderReq.OrderID))
-			// Continue anyway - don't fail the order
-		} else {
-			h.logger.Debug("Trade signal published to Kafka",
-				zap.String("order_id", orderReq.OrderID),
-				zap.String("topic", "trade-signals"))
-		}
+		pubWg.Add(1)
+		go func() {
+			defer pubWg.Done()
+			if err := h.kafkaPubl.PublishTradeSignal(ctx, orderReq); err != nil {
+				h.logger.Error("Failed to publish to Kafka trade-signals",
+					zap.Error(err),
+					zap.String("order_id", orderReq.OrderID))
+			} else {
+				h.logger.Debug("Trade signal published to Kafka",
+					zap.String("order_id", orderReq.OrderID),
+					zap.String("topic", "trade-signals"))
+			}
+		}()
 	}
 
-	// 4. Publish order to RabbitMQ
+	pubWg.Wait()
+
+	// RabbitMQ publish is critical — failure stops the order.
 	if h.rabbitPubl != nil {
 		if err := h.rabbitPubl.PublishOrder(ctx, orderReq); err != nil {
 			h.stats.IncrementRabbitMQErrors()
@@ -577,9 +482,28 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		zap.String("order_id", orderReq.OrderID),
 		zap.String("user_id", orderReq.UserID),
 		zap.String("strategy_id", orderReq.StrategyID),
+		zap.String("symbol", orderReq.Symbol),
 		zap.Int64("stock_code", orderReq.StockCode),
-		zap.Float64("match_score", orderReq.MatchScore),
-		zap.Float64("price", orderReq.Price))
+		zap.String("order_type", orderReq.OrderType),
+		zap.String("product_type", orderReq.ProductType),
+		zap.Float64("price", orderReq.Price),
+		zap.Float64("stop_loss", orderReq.StopLoss),
+		zap.Float64("take_profit", orderReq.TakeProfit),
+		zap.Float64("stop_loss_pct", slPct),
+		zap.Float64("take_profit_pct", tpPct),
+		zap.Float64("tick_size", tickSize),
+		zap.Float64("match_score", orderReq.MatchScore))
 
 	return nil
+}
+
+// ltpSource returns a human-readable label for where the LTP came from.
+func ltpSource(event *models.MarketEvent, md *MarketDataResult) string {
+	if event.MarketData.LastTradedPrice > 0 {
+		return "event"
+	}
+	if md != nil && md.LTP > 0 {
+		return "redis"
+	}
+	return "none"
 }

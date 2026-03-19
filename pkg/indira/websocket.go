@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +57,11 @@ type WSClient struct {
 	// OnReconnected is called in a new goroutine after every successful reconnect.
 	// Used by statusservice to re-subscribe additional users after a drop. May be nil.
 	OnReconnected func()
+
+	// OnAuthRefresh is called when a 401 is received during token fetch, indicating
+	// the stored BearerToken has expired. The callback should return a fresh AuthContext
+	// (e.g. from the DB credentials cache). May be nil — if unset, 401s are not recoverable.
+	OnAuthRefresh func(userID string) (*AuthContext, error)
 }
 
 // NewWSClient creates a new WebSocket client for a specific user.
@@ -296,6 +302,32 @@ func (w *WSClient) writePump(conn *websocket.Conn, stopCh chan struct{}) {
 	}
 }
 
+// tryAuthRefresh checks if err is a 401 and, if OnAuthRefresh is set, calls it to
+// update w.auth with fresh credentials from the DB. Returns true if auth was refreshed.
+func (w *WSClient) tryAuthRefresh(err error) bool {
+	if err == nil || w.OnAuthRefresh == nil {
+		return false
+	}
+	if !strings.Contains(err.Error(), "HTTP error 401") {
+		return false
+	}
+	log.Printf("[ws] 401 detected for user %s — attempting auth refresh from DB", w.auth.UserId)
+	newAuth, refreshErr := w.OnAuthRefresh(w.auth.UserId)
+	if refreshErr != nil {
+		log.Printf("[ws] Auth refresh failed for user %s: %v", w.auth.UserId, refreshErr)
+		return false
+	}
+	if newAuth.BearerToken == w.auth.BearerToken {
+		log.Printf("[ws] Auth refresh returned same token for user %s — frontend may not have re-logged in yet", w.auth.UserId)
+		return false
+	}
+	w.mu.Lock()
+	w.auth = newAuth
+	w.mu.Unlock()
+	log.Printf("[ws] Auth refreshed for user %s — retrying with new credentials", w.auth.UserId)
+	return true
+}
+
 // monitorReconnect auto-reconnects when the connection drops and proactively refreshes
 // the token. Started exactly once by Connect — must NOT be called elsewhere.
 // initialStopCh is the stopCh of the first session, used as the initial select target.
@@ -336,6 +368,16 @@ func (w *WSClient) monitorReconnect(initialStopCh chan struct{}) {
 				w.OrderToken = token
 				w.mu.Unlock()
 				log.Printf("[ws] Token proactively refreshed for user %s", w.auth.UserId)
+			} else if w.tryAuthRefresh(err) {
+				// Auth was refreshed after 401 — retry token fetch immediately.
+				if token, err2 := w.GetWebSocketToken(context.Background()); err2 == nil {
+					w.mu.Lock()
+					w.OrderToken = token
+					w.mu.Unlock()
+					log.Printf("[ws] Token proactively refreshed for user %s (after auth refresh)", w.auth.UserId)
+				} else {
+					log.Printf("[ws] Token refresh still failed for user %s after auth refresh: %v", w.auth.UserId, err2)
+				}
 			} else {
 				log.Printf("[ws] Token refresh failed for user %s: %v", w.auth.UserId, err)
 			}
@@ -358,8 +400,14 @@ func (w *WSClient) monitorReconnect(initialStopCh chan struct{}) {
 			// Fetch fresh token outside the lock (network call).
 			token, err := w.GetWebSocketToken(context.Background())
 			if err != nil {
-				log.Printf("[ws] Token fetch failed for user %s: %v", w.auth.UserId, err)
-				continue
+				// On 401, try refreshing credentials from DB and retry once.
+				if w.tryAuthRefresh(err) {
+					token, err = w.GetWebSocketToken(context.Background())
+				}
+				if err != nil {
+					log.Printf("[ws] Token fetch failed for user %s: %v", w.auth.UserId, err)
+					continue
+				}
 			}
 
 			w.mu.Lock()

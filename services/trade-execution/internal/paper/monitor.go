@@ -335,7 +335,7 @@ func (m *PaperTradeMonitor) ForceExitAll(ctx context.Context, userID string) err
 	// yet open positions, or re-exiting orders that were already closed.
 	var orders []*models.Order
 	for _, o := range allOrders {
-		if o.Status == models.StatusFilled && o.FilledPrice != nil && o.PaperExitPrice == nil {
+		if models.IsFilledStatus(o.Status) && o.FilledPrice != nil && o.PaperExitPrice == nil {
 			orders = append(orders, o)
 		}
 	}

@@ -5,8 +5,8 @@ package statusservice
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +28,7 @@ import (
 type OrderStatusService struct {
 	execClient    *inexec.ExecutionClient
 	repo          repository.OrderRepository
+	credsRepo     repository.CredentialsRepository
 	publisher     *publisher.KafkaPublisher
 	logger        *zap.Logger
 	wsBroadcaster func(userID string, order *models.Order)
@@ -48,11 +49,14 @@ func (s *OrderStatusService) SetWSBroadcaster(fn func(userID string, order *mode
 	s.wsBroadcaster = fn
 }
 
-// NewOrderStatusService creates a new order status service
-func NewOrderStatusService(execClient *inexec.ExecutionClient, repo repository.OrderRepository, pub *publisher.KafkaPublisher, logger *zap.Logger) *OrderStatusService {
+// NewOrderStatusService creates a new order status service.
+// credsRepo may be nil — if set, enables auto-refresh of expired broker
+// credentials on the shared WebSocket connection (avoids persistent 401 loops).
+func NewOrderStatusService(execClient *inexec.ExecutionClient, repo repository.OrderRepository, credsRepo repository.CredentialsRepository, pub *publisher.KafkaPublisher, logger *zap.Logger) *OrderStatusService {
 	return &OrderStatusService{
 		execClient: execClient,
 		repo:       repo,
+		credsRepo:  credsRepo,
 		publisher:  pub,
 		logger:     logger,
 	}
@@ -79,6 +83,9 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 		s.wsClient = wsClient
 		// Re-subscribe all stored users after any reconnect.
 		s.wsClient.OnReconnected = s.resubscribeAll
+		// On 401, reload credentials from DB so the WS can recover
+		// without waiting for the user to place a new order.
+		s.wsClient.OnAuthRefresh = s.refreshAuthFromDB
 		// Single goroutine fans out all updates from one channel.
 		go s.processUpdates(ctx)
 		s.logger.Info("Shared WS established", zap.String("first_user", userID))
@@ -98,6 +105,30 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 func (s *OrderStatusService) StopSubscription(userID string) {
 	s.subscriberAuths.Delete(userID)
 	s.logger.Info("Unsubscribed user from shared WS", zap.String("user_id", userID))
+}
+
+// refreshAuthFromDB reloads credentials from the DB for the given user.
+// Called by WSClient.OnAuthRefresh when a 401 is detected during token fetch.
+func (s *OrderStatusService) refreshAuthFromDB(userID string) (*indiraClient.AuthContext, error) {
+	if s.credsRepo == nil {
+		return nil, fmt.Errorf("no credentials repository configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	userId, appId, source, bearerToken, err := s.credsRepo.GetIndiraCredentials(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load credentials for user %s: %w", userID, err)
+	}
+	newAuth := &indiraClient.AuthContext{
+		UserId:      userId,
+		AppId:       appId,
+		Source:      source,
+		BearerToken: bearerToken,
+	}
+	// Also update subscriberAuths so resubscribeAll uses the fresh token.
+	s.subscriberAuths.Store(userID, newAuth)
+	s.logger.Info("Refreshed auth from DB for WS reconnect", zap.String("user_id", userID))
+	return newAuth, nil
 }
 
 // resubscribeAll is called by WSClient.OnReconnected after a reconnect.
@@ -156,8 +187,9 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 
 	s.logger.Debug("WS order update",
 		zap.String("id", indiraID),
-		zap.String("status", wsStatus.OrderStatus),
-		zap.String("symbol", wsStatus.Symbol))
+		zap.String("broker_status", wsStatus.OrderStatus),
+		zap.String("symbol", wsStatus.Symbol),
+		zap.Int("seq", wsStatus.OrderSequenceNumber))
 
 	order, err := s.repo.GetByIndiraOrderID(ctx, indiraID)
 	if err != nil {
@@ -165,57 +197,125 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		return
 	}
 
-	newStatus := mapIndiraStatus(wsStatus.OrderStatus)
-	previousStatus := order.Status
+	// ── Store raw broker data exactly as received ──────────────────────────
+	// Serialize full WS payload to JSON for audit/debugging
+	rawJSON, _ := json.Marshal(wsStatus)
+	rawJSONStr := string(rawJSON)
+	order.BrokerWSData = &rawJSONStr
 
-	// Skip if nothing useful changed
-	if order.Status == newStatus {
-		return
+	// Store raw broker status string without any mapping
+	brokerStatus := wsStatus.OrderStatus
+	order.BrokerStatus = &brokerStatus
+
+	// Store exchange order number
+	if wsStatus.OrderNumber != "" && wsStatus.OrderNumber != "0" {
+		order.ExchangeOrderNumber = &wsStatus.OrderNumber
 	}
 
-	metrics.StatusUpdatesReceived.WithLabelValues(string(newStatus)).Inc()
+	// ── Use broker status directly — no mapping ───────────────────────────
+	// The broker sends statuses like PENDING, EXECUTED, CANCELLED etc.
+	// We store and show exactly what the broker sends.
+	brokerStatusUpper := strings.ToUpper(strings.TrimSpace(wsStatus.OrderStatus))
+	newStatus := models.OrderStatus(brokerStatusUpper)
+	previousStatus := order.Status
 
-	// Track fills and rejections
-	switch newStatus {
-	case models.StatusFilled:
+	// Record every WS event in execution_events for full audit trail
+	s.repo.RecordExecutionEvent(ctx, order.OrderID, "BROKER_WS_UPDATE", map[string]interface{}{
+		"broker_status":         wsStatus.OrderStatus,
+		"previous_status":       string(previousStatus),
+		"symbol":                wsStatus.Symbol,
+		"order_number":          wsStatus.OrderNumber,
+		"unique_code":           wsStatus.UniqueCode,
+		"traded_qty":            wsStatus.TradedQTY,
+		"traded_price":          wsStatus.TradedPrice,
+		"order_price":           wsStatus.OrderPrice,
+		"trigger_price":         wsStatus.TriggerPrice,
+		"pending_qty":           wsStatus.PendingQty,
+		"order_original_qty":    wsStatus.OrderOriginalQty,
+		"product":               wsStatus.Product,
+		"order_type":            wsStatus.OrderType,
+		"buy_sell":              wsStatus.BuySell,
+		"reason":                wsStatus.Reason,
+		"order_entry_time":      wsStatus.OrderEntryTime,
+		"last_modified":         wsStatus.LastModifiedTimeStamp,
+		"order_seq":             wsStatus.OrderSequenceNumber,
+		"message_seq":           wsStatus.MessageSequenceNumber,
+		"decimal_locator":       wsStatus.DecimalLocator,
+		"exchange":              wsStatus.Exchange,
+		"misc":                  wsStatus.Misc,
+		"initiated_by":          wsStatus.InitiatedBy,
+		"modified_by":           wsStatus.ModifiedBy,
+		"exchange_algo_id":      wsStatus.ExchangeAlgoID,
+		"exchange_account_code": wsStatus.ExchangeAccountCode,
+		"timestamp":             time.Now(),
+	})
+
+	// Metrics
+	metrics.StatusUpdatesReceived.WithLabelValues(brokerStatusUpper).Inc()
+	switch brokerStatusUpper {
+	case "EXECUTED", "TRADED":
 		metrics.FillsTotal.WithLabelValues("live").Inc()
-	case models.StatusRejected:
+	case "REJECTED", "A.REJECTED":
 		metrics.RejectionsTotal.WithLabelValues("rejected").Inc()
-	case models.StatusCancelled:
+	case "CANCELLED":
 		metrics.RejectionsTotal.WithLabelValues("cancelled").Inc()
 	}
 
+	// Set status to exactly what broker sent
 	order.Status = newStatus
 
-	if newStatus == models.StatusFilled || newStatus == models.StatusPartiallyFilled {
-		if qty, err := strconv.Atoi(wsStatus.TradedQTY); err == nil {
-			order.FilledQuantity = int32(qty)
-		}
-		if price, err := strconv.ParseFloat(wsStatus.TradedPrice, 64); err == nil && price > 0 {
-			order.FilledPrice = &price
-		}
+	// Extract fill details using DecimalLocator for correct price
+	dl := decimalLocator(wsStatus.DecimalLocator)
+
+	// Always update traded qty and price from broker
+	if qty, err := strconv.Atoi(wsStatus.TradedQTY); err == nil {
+		order.FilledQuantity = int32(qty)
+	}
+	if price, err := strconv.ParseFloat(wsStatus.TradedPrice, 64); err == nil && price > 0 {
+		order.FilledPrice = &price
+	}
+
+	// Mark execution time for filled orders
+	if brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED" {
 		now := time.Now()
 		order.ExecutedAt = &now
 	}
 
-	if newStatus == models.StatusRejected || newStatus == models.StatusCancelled {
+	// Update order price from broker
+	if wsStatus.OrderPrice != "" {
+		if oprice, err := strconv.ParseFloat(wsStatus.OrderPrice, 64); err == nil && oprice > 0 {
+			order.Price = &oprice
+		}
+	}
+
+	// Store trigger price from broker (apply DecimalLocator)
+	if wsStatus.TriggerPrice > 0 {
+		tp := wsStatus.TriggerPrice / dl
+		order.StopLoss = &tp
+	}
+
+	// Store rejection/cancellation reason
+	if wsStatus.Reason != "" {
 		reason := wsStatus.Reason
 		order.RejectionReason = &reason
 	}
 
 	if err := s.repo.Update(ctx, order); err != nil {
-		s.logger.Error("Failed to update order status from WS",
+		s.logger.Error("Failed to update order from WS",
 			zap.Error(err),
 			zap.String("order_id", order.OrderID.String()))
 		return
 	}
 
-	s.logger.Info("Order status updated from WS",
+	s.logger.Info("Order updated from broker WS",
 		zap.String("order_id", order.OrderID.String()),
 		zap.String("prev", string(previousStatus)),
-		zap.String("new", string(newStatus)))
+		zap.String("broker_status", brokerStatusUpper),
+		zap.String("traded_qty", wsStatus.TradedQTY),
+		zap.String("traded_price", wsStatus.TradedPrice),
+		zap.String("order_number", wsStatus.OrderNumber))
 
-	// Push the updated order to all connected /ws/live-orders clients immediately.
+	// Push to all connected /ws/live-orders clients immediately
 	if s.wsBroadcaster != nil {
 		orderCopy := *order
 		s.wsBroadcaster(orderCopy.UserID, &orderCopy)
@@ -224,10 +324,25 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	s.publishNotification(ctx, order, wsStatus)
 }
 
+// decimalLocator returns the divisor encoded in the WS DecimalLocator field.
+// E.g. "100" means raw prices must be divided by 100 to get the actual value.
+// Returns 1 when the field is empty or unparseable (no-op divisor).
+func decimalLocator(dl string) float64 {
+	if dl == "" {
+		return 1
+	}
+	if v, err := strconv.ParseFloat(dl, 64); err == nil && v > 0 {
+		return v
+	}
+	return 1
+}
+
 func (s *OrderStatusService) publishNotification(ctx context.Context, order *models.Order, wsStatus *indiraClient.WSOrderStatus) {
 	if s.publisher == nil {
 		return
 	}
+
+	dl := decimalLocator(wsStatus.DecimalLocator)
 
 	// Parse WS numeric fields
 	tradedQty := 0
@@ -242,7 +357,7 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 	}
 	triggerPriceStr := ""
 	if wsStatus.TriggerPrice > 0 {
-		triggerPriceStr = fmt.Sprintf("₹%.2f", wsStatus.TriggerPrice)
+		triggerPriceStr = fmt.Sprintf("₹%.2f", wsStatus.TriggerPrice/dl)
 	}
 
 	// Broker ref: prefer UniqueCode (system order ID), fall back to OrderNumber
@@ -290,8 +405,10 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		update.OrderSummary.Price = "MARKET"
 	}
 
-	switch order.Status {
-	case models.StatusFilled:
+	// Use raw broker status for notification type
+	brokerStatusUpper := strings.ToUpper(strings.TrimSpace(wsStatus.OrderStatus))
+	switch brokerStatusUpper {
+	case "EXECUTED", "TRADED":
 		update.UpdateType = "EXECUTION_SUCCESS"
 		update.Priority = "HIGH"
 		update.Title = "Order Executed ✓"
@@ -307,7 +424,7 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		update.StatusEmoji = "✅"
 		update.StatusColor = "#00C851"
 
-	case models.StatusPartiallyFilled:
+	case "PARTIALLY TRADED", "PARTIALLY EXECUTED":
 		update.UpdateType = "PARTIAL_FILL"
 		update.Priority = "MEDIUM"
 		update.Title = "Order Partially Filled"
@@ -319,7 +436,7 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		update.StatusEmoji = "🔶"
 		update.StatusColor = "#FFBB33"
 
-	case models.StatusRejected:
+	case "REJECTED", "A.REJECTED":
 		update.UpdateType = "ORDER_REJECTED"
 		update.Priority = "HIGH"
 		update.Title = "Order Rejected ✗"
@@ -329,7 +446,7 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		update.StatusColor = "#FF4444"
 		execDetails.Reason = wsStatus.Reason
 
-	case models.StatusCancelled:
+	case "CANCELLED":
 		update.UpdateType = "ORDER_CANCELLED"
 		update.Priority = "MEDIUM"
 		update.Title = "Order Cancelled"
@@ -339,8 +456,23 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		update.StatusColor = "#FFBB33"
 		execDetails.Reason = wsStatus.Reason
 
+	case "PENDING":
+		update.UpdateType = "ORDER_PENDING"
+		update.Priority = "LOW"
+		update.Title = "Order Pending"
+		update.Message = fmt.Sprintf("Your %s order is pending", order.Symbol)
+		update.DetailedMessage = fmt.Sprintf("Pending | Ref: %s | Entry: %s", brokerRef, wsStatus.OrderEntryTime)
+		update.StatusEmoji = "⏳"
+		update.StatusColor = "#33B5E5"
+
 	default:
-		return // Don't flood with intermediate status notifications
+		// For any other broker status, still publish a generic notification
+		update.UpdateType = "ORDER_STATUS_UPDATE"
+		update.Priority = "LOW"
+		update.Title = fmt.Sprintf("Order %s", brokerStatusUpper)
+		update.Message = fmt.Sprintf("Your %s order status: %s", order.Symbol, brokerStatusUpper)
+		update.StatusEmoji = "ℹ️"
+		update.StatusColor = "#33B5E5"
 	}
 
 	if err := s.publisher.PublishOrderUpdate(ctx, update); err != nil {
@@ -358,31 +490,3 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 	}
 }
 
-// mapIndiraStatus converts a raw Indira WS status string into our internal OrderStatus.
-// Based on actual observations:
-//   - "A.REJECTED"       → REJECTED
-//   - "ADMIN PENDING "   → PENDING
-//   - "TRADED"           → FILLED
-//   - "PARTIALLY TRADED" → PARTIALLY_FILLED
-//   - "CANCELLED"        → CANCELLED
-//   - "OPEN"             → SUBMITTED
-func mapIndiraStatus(indiraStatus string) models.OrderStatus {
-	s := strings.ToUpper(strings.TrimSpace(indiraStatus))
-	switch {
-	case strings.Contains(s, "REJECTED"):
-		return models.StatusRejected
-	case strings.Contains(s, "CANCELLED"):
-		return models.StatusCancelled
-	case strings.Contains(s, "PARTIALLY TRADED") || strings.Contains(s, "PARTIAL"):
-		return models.StatusPartiallyFilled
-	case s == "TRADED" || strings.Contains(s, "COMPLETE"):
-		return models.StatusFilled
-	case strings.Contains(s, "PENDING"), strings.Contains(s, "ADMIN PENDING"):
-		return models.StatusPending
-	case strings.Contains(s, "OPEN"), strings.Contains(s, "SUBMITTED"):
-		return models.StatusSubmitted
-	default:
-		log.Printf("[statusservice] Unmapped Indira WS status: %q – defaulting to PENDING", s)
-		return models.StatusPending
-	}
-}
