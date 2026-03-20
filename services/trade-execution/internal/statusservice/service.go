@@ -22,6 +22,12 @@ import (
 	"go.uber.org/zap"
 )
 
+// OCOHandler is called on every broker WS status update to check if the order
+// belongs to an OCO group and act accordingly (place legs, cancel counterpart).
+type OCOHandler interface {
+	HandleBrokerUpdate(ctx context.Context, order *models.Order, brokerStatus string)
+}
+
 // OrderStatusService listens to a single shared WebSocket connection and
 // routes order-status updates to the correct user by WSOrderStatus.UserID.
 // All active users share one TCP connection to Indira instead of one per user.
@@ -32,6 +38,7 @@ type OrderStatusService struct {
 	publisher     *publisher.KafkaPublisher
 	logger        *zap.Logger
 	wsBroadcaster func(userID string, order *models.Order)
+	ocoHandler    OCOHandler // OCO order management hook
 
 	// Single shared WS client. Protected by wsMu for first-connect init only.
 	wsMu     sync.Mutex
@@ -47,6 +54,14 @@ type OrderStatusService struct {
 // to the frontend immediately via /ws/live-orders.
 func (s *OrderStatusService) SetWSBroadcaster(fn func(userID string, order *models.Order)) {
 	s.wsBroadcaster = fn
+}
+
+// SetOCOHandler wires the OCO manager so every broker WS status update is
+// checked for OCO group membership. This is the hook that enables:
+//   - Entry fill → place SL+TP legs
+//   - SL leg fill → cancel TP leg (and vice versa)
+func (s *OrderStatusService) SetOCOHandler(handler OCOHandler) {
+	s.ocoHandler = handler
 }
 
 // NewOrderStatusService creates a new order status service.
@@ -319,6 +334,14 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	if s.wsBroadcaster != nil {
 		orderCopy := *order
 		s.wsBroadcaster(orderCopy.UserID, &orderCopy)
+	}
+
+	// ── OCO hook: check if this order is part of an OCO group ────────────
+	// On entry fill → place SL+TP legs. On leg fill → cancel counterpart.
+	// Runs in its own goroutine so it never blocks the WS read loop.
+	if s.ocoHandler != nil {
+		orderCopy := *order
+		go s.ocoHandler.HandleBrokerUpdate(context.Background(), &orderCopy, brokerStatusUpper)
 	}
 
 	s.publishNotification(ctx, order, wsStatus)

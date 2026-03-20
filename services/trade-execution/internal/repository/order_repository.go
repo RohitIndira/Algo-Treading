@@ -56,6 +56,9 @@ type OrderRepository interface {
 	// GetDistinctActiveUserIDs returns unique user IDs that have non-terminal live orders.
 	// Used on startup to pre-warm the credentials cache.
 	GetDistinctActiveUserIDs(ctx context.Context) ([]string, error)
+	// OCO (One-Cancels-the-Other) queries
+	GetActiveOCOOrders(ctx context.Context) ([]*models.Order, error)
+	GetOCOGroupOrders(ctx context.Context, groupID uuid.UUID) ([]*models.Order, error)
 }
 
 type orderRepository struct {
@@ -614,4 +617,41 @@ func (r *orderRepository) GetDistinctActiveUserIDs(ctx context.Context) ([]strin
 		return nil, fmt.Errorf("failed to get distinct active user IDs: %w", err)
 	}
 	return userIDs, nil
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// OCO (One-Cancels-the-Other) queries
+// ════════════════════════════════════════════════════════════════════════════
+
+// GetActiveOCOOrders returns all non-terminal orders that belong to an OCO group.
+// Used on startup to reconstruct in-memory OCO state.
+func (r *orderRepository) GetActiveOCOOrders(ctx context.Context) ([]*models.Order, error) {
+	var orders []*models.Order
+	query := `
+		SELECT * FROM orders
+		WHERE oco_group_id IS NOT NULL
+		AND status NOT IN ('CANCELLED', 'REJECTED', 'A.REJECTED', 'FAILED')
+		AND is_paper_trade = false
+		ORDER BY created_at ASC
+	`
+	err := r.db.SelectContext(ctx, &orders, query)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get active OCO orders: %w", err)
+	}
+	return orders, nil
+}
+
+// GetOCOGroupOrders returns all orders belonging to a specific OCO group.
+func (r *orderRepository) GetOCOGroupOrders(ctx context.Context, groupID uuid.UUID) ([]*models.Order, error) {
+	var orders []*models.Order
+	query := `
+		SELECT * FROM orders
+		WHERE oco_group_id = $1
+		ORDER BY created_at ASC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, groupID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get OCO group orders: %w", err)
+	}
+	return orders, nil
 }

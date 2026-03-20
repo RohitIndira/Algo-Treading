@@ -142,6 +142,11 @@ type Order struct {
 	// 0 means no upper bound.
 	MaxMonitorPrice float64 `json:"max_monitor_price,omitempty" db:"max_monitor_price"`
 
+	// OCO (One-Cancels-the-Other) group tracking
+	OCOGroupID    *uuid.UUID `json:"oco_group_id,omitempty" db:"oco_group_id"`       // Links all orders in one OCO group
+	OCORole       *string    `json:"oco_role,omitempty" db:"oco_role"`               // ENTRY, SL_LEG, or TP_LEG
+	ParentOrderID *uuid.UUID `json:"parent_order_id,omitempty" db:"parent_order_id"` // Child legs point to entry order
+
 	// Signal deduplication
 	SignalID *uuid.UUID `json:"signal_id,omitempty" db:"signal_id"` // Originating trade signal UUID (for idempotency)
 

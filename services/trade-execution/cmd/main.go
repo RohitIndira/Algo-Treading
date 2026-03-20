@@ -22,6 +22,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/lifecycle"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/oco"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/paper"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -296,6 +297,56 @@ func main() {
 		log.Println("⚠ Price Monitor disabled (Redis not available) — below_min orders will be placed immediately")
 	}
 
+	// ── OCO (One-Cancels-the-Other) Layer ─────────────────────────────────
+	log.Println("Initializing OCO order management layer...")
+	ocoManager := oco.NewOCOManager(orderRepo, indiraClient)
+
+	// Wire OCO manager → frontend WS so OCO events appear in real-time
+	ocoManager.SetWSBroadcaster(func(userID string, eventType string, order *models.Order) {
+		if order != nil {
+			paperWSServer.BroadcastLiveOrder(userID, paper.LiveOrderUpdate{
+				Type:   eventType,
+				UserID: userID,
+				Order:  order,
+			})
+		}
+	})
+
+	// Wire OCO handler into StatusService — every broker WS event is checked
+	// for OCO group membership (entry fill → place legs, leg fill → cancel other)
+	statusService.SetOCOHandler(ocoManager)
+
+	// OCO market data WSS client (enhanced-stream binary, primary price source for trailing SL)
+	ocoMarketClient := oco.NewOCOMarketClient(cfg.PaperMarketWSURL, nil) // callback wired below
+
+	// OCO Trailing SL Monitor: WSS primary, Redis fallback
+	var ocoRedisProvider oco.RedisLTPProvider
+	if redisPrices != nil {
+		ocoRedisProvider = redisPrices
+	}
+	ocoTrailingMonitor := oco.NewTrailingMonitor(ocoManager, ocoMarketClient, ocoRedisProvider, 500*time.Millisecond)
+
+	// Wire WSS price callback → trailing monitor
+	ocoMarketClient = oco.NewOCOMarketClient(cfg.PaperMarketWSURL, func(symbol string, ltp float64) {
+		ocoTrailingMonitor.OnPriceUpdate(symbol, ltp)
+	})
+	// Re-create trailing monitor with the properly wired market client
+	ocoTrailingMonitor = oco.NewTrailingMonitor(ocoManager, ocoMarketClient, ocoRedisProvider, 500*time.Millisecond)
+
+	// Reload active OCO groups from DB (restart recovery)
+	go func() {
+		reloadCtx, reloadCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer reloadCancel()
+		if err := ocoManager.Reload(reloadCtx); err != nil {
+			log.Printf("[oco] Reload failed (non-fatal): %v", err)
+		} else {
+			log.Printf("✓ OCO manager initialized (%d active groups)", ocoManager.ActiveCount())
+		}
+	}()
+
+	log.Println("✓ OCO layer initialized")
+	// ──────────────────────────────────────────────────────────────────────
+
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -379,6 +430,18 @@ func main() {
 			}
 		}()
 	}
+
+	// Start OCO market data WSS client (price feed for trailing SL)
+	go func() {
+		log.Println("Starting OCO market WSS client...")
+		ocoMarketClient.Start(ctx)
+	}()
+
+	// Start OCO trailing SL monitor
+	go func() {
+		log.Println("Starting OCO trailing SL monitor...")
+		ocoTrailingMonitor.Start(ctx)
+	}()
 
 	// Start Kafka consumer — primary intake path (rules-engine trade-signals)
 	go func() {
