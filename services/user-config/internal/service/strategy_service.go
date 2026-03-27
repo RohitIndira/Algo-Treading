@@ -223,6 +223,12 @@ func (s *StrategyService) ListAllActiveStrategies(ctx context.Context, limit, of
 	return s.repo.ListAllActive(ctx, limit, offset)
 }
 
+// DeactivateAllActiveStrategies deactivates every active strategy (used by the
+// end-of-day scheduler at market close). Returns the count of strategies deactivated.
+func (s *StrategyService) DeactivateAllActiveStrategies(ctx context.Context) (int, error) {
+	return s.repo.DeactivateAllActive(ctx)
+}
+
 // validateCreateRequest validates a create strategy request
 func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyRequest) error {
 	if req.UserID == "" {

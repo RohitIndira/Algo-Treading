@@ -43,7 +43,8 @@ func (c *Client) PlaceOrder(ctx context.Context, auth *AuthContext, req *PlaceOr
 
 	// Check for Indira business errors (e.g. EG003 "Price Not in multiple of PriceTick").
 	// These use infoID/infoMsg fields, not status/message.
-	if resp.InfoID != "" {
+	// infoID "0" means success — only treat non-zero infoID as a broker rejection.
+	if resp.InfoID != "" && resp.InfoID != "0" {
 		return nil, &BrokerBusinessError{Code: resp.InfoID, Message: resp.InfoMsg}
 	}
 
@@ -61,6 +62,11 @@ func (c *Client) ModifyOrder(ctx context.Context, auth *AuthContext, req *Modify
 	resp, err := c.doRequest(ctx, auth, "POST", "/order-services/api/order/v1/modify-order", req)
 	if err != nil {
 		return fmt.Errorf("modify order request failed: %w", err)
+	}
+
+	// Check for Indira business errors (infoID "0" = success).
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return &BrokerBusinessError{Code: resp.InfoID, Message: resp.InfoMsg}
 	}
 
 	// Check response
@@ -83,6 +89,11 @@ func (c *Client) CancelOrder(ctx context.Context, auth *AuthContext, req *Cancel
 	resp, err := c.doRequest(ctx, auth, "POST", "/order-services/api/order/v1/cancel-order", req)
 	if err != nil {
 		return fmt.Errorf("cancel order request failed: %w", err)
+	}
+
+	// Check for Indira business errors (infoID "0" = success).
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return &BrokerBusinessError{Code: resp.InfoID, Message: resp.InfoMsg}
 	}
 
 	// Check response

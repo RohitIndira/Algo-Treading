@@ -189,7 +189,7 @@ func main() {
 	})
 	newsConsumer := intkafka.NewNewsConsumer(newsReader, handler, logger)
 
-	lc := StartLive(ctx, eng, configConsumer, newsConsumer, configReader)
+	lc := StartLive(ctx, eng, configConsumer, newsConsumer, configReader, logger)
 	<-lc.ConfigConsumerStarted
 	logger.Info("Config consumer started")
 	<-lc.NewsConsumerStarted

@@ -150,9 +150,12 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Check HTTP status code
-	// log.Printf("[indira] ← %s %s  status=%d", method, path, resp.StatusCode)
-	log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
+	// Check HTTP status code — skip body for noisy position-book responses
+	if path == "/portfolio-services/api/portfolio/v1/position-book" {
+		log.Printf("[indira] ← %s %s  status=%d", method, path, resp.StatusCode)
+	} else {
+		log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(responseBody))
 	}

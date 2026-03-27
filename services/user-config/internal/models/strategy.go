@@ -64,6 +64,7 @@ type TradeConfig struct {
 	Quantity        int32     `db:"quantity" json:"quantity"`
 	Exchange        string    `db:"exchange" json:"exchange"`
 	OrderSide       string    `db:"order_side" json:"order_side"`
+	MaxPositionSize *float64  `db:"max_position_size" json:"max_position_size,omitempty"`
 	LimitPrice      *float64  `db:"limit_price" json:"limit_price,omitempty"`
 	StopLossPct     *float64  `db:"stop_loss_pct" json:"stop_loss_pct,omitempty"`
 	TakeProfitPct   *float64  `db:"take_profit_pct" json:"take_profit_pct,omitempty"`

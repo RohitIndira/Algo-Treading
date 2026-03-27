@@ -3,7 +3,6 @@ package kafka
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 
@@ -11,6 +10,8 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"go.uber.org/zap"
 )
+
+const maxHandlerRetries = 3
 
 // NewsConsumer consumes market news events and invokes the handler.
 // It supports Stop() to stop fetching new Kafka messages for graceful shutdown.
@@ -80,9 +81,23 @@ func (n *NewsConsumer) Start(ctx context.Context) error {
 			continue
 		}
 
-		if err := n.handler.HandleEvent(ctx, event); err != nil {
-			// fail-fast per event: do not commit to allow retry.
-			return fmt.Errorf("handler error: %w", err)
+		var handleErr error
+		for attempt := 1; attempt <= maxHandlerRetries; attempt++ {
+			if handleErr = n.handler.HandleEvent(ctx, event); handleErr == nil {
+				break
+			}
+			n.logger.Warn("Handler error, retrying",
+				zap.Error(handleErr),
+				zap.Int("attempt", attempt),
+				zap.Int("max_retries", maxHandlerRetries),
+				zap.String("event_id", event.EventID))
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+		if handleErr != nil {
+			n.logger.Error("Handler failed after all retries, skipping event",
+				zap.Error(handleErr),
+				zap.String("event_id", event.EventID),
+				zap.Int64("stock_code", event.StockData.StockCode))
 		}
 
 		_ = n.reader.CommitMessages(ctx, msg)

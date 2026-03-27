@@ -26,6 +26,7 @@ type DashboardStats struct {
 type OrderRepository interface {
 	Create(ctx context.Context, order *models.Order) error
 	Update(ctx context.Context, order *models.Order) error
+	ExistsByID(ctx context.Context, orderID uuid.UUID) (bool, error)
 	GetByID(ctx context.Context, orderID uuid.UUID) (*models.Order, error)
 	GetByOdinOrderID(ctx context.Context, odinOrderID string) (*models.Order, error)
 	GetByIndiraOrderID(ctx context.Context, indiraOrderID string) (*models.Order, error)
@@ -143,6 +144,16 @@ func (r *orderRepository) Update(ctx context.Context, order *models.Order) error
 	}
 
 	return nil
+}
+
+// ExistsByID checks if an order exists without loading the full row.
+func (r *orderRepository) ExistsByID(ctx context.Context, orderID uuid.UUID) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM orders WHERE order_id = $1)`, orderID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check order existence: %w", err)
+	}
+	return exists, nil
 }
 
 // GetByID retrieves an order by ID

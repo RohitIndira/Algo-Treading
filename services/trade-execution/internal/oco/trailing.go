@@ -215,9 +215,10 @@ func (c *OCOMarketClient) connect(ctx context.Context) error {
 		conn.Close()
 	}()
 
-	// Keep-alive ping every 30s (per GetLivePrice.md)
+	// Keep-alive ping every 30s (per socket.md: client→server messages are JSON)
 	pingTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
+	pingMsg, _ := json.Marshal(map[string]string{"type": "request", "action": "ping"})
 
 	msgCh := make(chan []byte, 64)
 	errCh := make(chan error, 1)
@@ -246,8 +247,7 @@ func (c *OCOMarketClient) connect(ctx context.Context) error {
 		case <-pingTicker.C:
 			c.mu.Lock()
 			if c.conn != nil {
-				// Send binary ping byte (0x04) as per GetLivePrice.md
-				_ = c.conn.WriteMessage(websocket.BinaryMessage, []byte{wsMsgPing})
+				_ = c.conn.WriteMessage(websocket.TextMessage, pingMsg)
 			}
 			c.mu.Unlock()
 		}
@@ -525,19 +525,28 @@ func (t *TrailingMonitor) OnPriceUpdate(symbol string, ltp float64) {
 
 // evaluateTrailing checks if the trailing SL should be adjusted for a group.
 func (t *TrailingMonitor) evaluateTrailing(group *OCOGroup, ltp float64) {
+	// Acquire group mutex for thread-safe HighestPrice read/write.
+	// CalculateTrailingSL reads HighestPrice/SLTriggerPrice which can be
+	// modified concurrently by handleEntryUpdate or other WS handlers.
+	mu := t.ocoManager.GetGroupMu(group.GroupID)
+	mu.Lock()
+
 	newTrigger, newLimit, shouldUpdate := group.CalculateTrailingSL(ltp)
 	if !shouldUpdate {
+		mu.Unlock()
 		return
 	}
 
-	// Update highest price in memory
+	// Update highest price in memory (protected by mutex)
 	if group.OrderSide == "BUY" && ltp > group.HighestPrice {
 		group.HighestPrice = ltp
 	} else if group.OrderSide == "SELL" && (ltp < group.HighestPrice || group.HighestPrice == 0) {
 		group.HighestPrice = ltp
 	}
 
-	// Modify the SL leg at broker
+	mu.Unlock()
+
+	// Modify the SL leg at broker (ModifySLLeg acquires its own lock)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

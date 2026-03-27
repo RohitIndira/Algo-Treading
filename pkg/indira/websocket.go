@@ -69,7 +69,7 @@ func NewWSClient(httpClient *Client, auth *AuthContext) *WSClient {
 	return &WSClient{
 		client:  httpClient,
 		auth:    auth,
-		Updates: make(chan *WSOrderStatus, 100),
+		Updates: make(chan *WSOrderStatus, 10000),
 		sendCh:  make(chan []byte, 64),
 	}
 }
@@ -256,8 +256,13 @@ func (w *WSClient) readPump(conn *websocket.Conn) {
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		var orderStatus WSOrderStatus
-		if err := json.Unmarshal(message, &orderStatus); err == nil &&
-			(orderStatus.UniqueCode != "" || orderStatus.OrderStatus != "") {
+		// Ignore unmarshal errors from type mismatches — the broker sends
+		// some fields as int in one message and string in another (e.g.
+		// Exchange, Days, ManagerID, ScripCode). The key routing fields
+		// (UniqueCode, OrderStatus) are always strings and will be
+		// populated correctly regardless of errors on other fields.
+		_ = json.Unmarshal(message, &orderStatus)
+		if orderStatus.UniqueCode != "" || orderStatus.OrderStatus != "" {
 			select {
 			case w.Updates <- &orderStatus:
 			default:

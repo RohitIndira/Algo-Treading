@@ -15,7 +15,10 @@ const (
 	StatePendingEntry OCOState = "PENDING_ENTRY"
 	// StatePlacingLegs — entry filled, SL+TP legs being placed.
 	StatePlacingLegs OCOState = "PLACING_LEGS"
-	// StateActive — both SL and TP legs placed and open at broker.
+	// StateLegsSubmitted — SL+TP legs submitted to broker API (got ordId),
+	// but NOT yet confirmed on exchange. Waiting for WS PENDING/OPEN.
+	StateLegsSubmitted OCOState = "LEGS_SUBMITTED"
+	// StateActive — both SL and TP legs confirmed on exchange via broker WS.
 	StateActive OCOState = "ACTIVE"
 	// StateSLTriggered — SL leg executed, cancelling TP.
 	StateSLTriggered OCOState = "SL_TRIGGERED"
@@ -79,9 +82,11 @@ type OCOGroup struct {
 	TrailingSLPct float64 `json:"trailing_sl_pct"` // trailing percentage (often same as SLPercent)
 
 	// ── State ───────────────────────────────────────────────────────────────
-	State        OCOState `json:"state"`
-	HighestPrice float64  `json:"highest_price,omitempty"` // for trailing SL
-	PnL          float64  `json:"pnl,omitempty"`           // realized P&L when completed
+	State          OCOState `json:"state"`
+	HighestPrice   float64  `json:"highest_price,omitempty"` // for trailing SL
+	PnL            float64  `json:"pnl,omitempty"`           // realized P&L when completed
+	SLLegConfirmed bool     `json:"sl_leg_confirmed"`        // WS confirmed SL leg on exchange
+	TPLegConfirmed bool     `json:"tp_leg_confirmed"`        // WS confirmed TP leg on exchange
 
 	// ── Stock Info (needed for leg placement & trailing) ────────────────────
 	Symbol    string `json:"symbol"`
@@ -142,39 +147,63 @@ func (g *OCOGroup) CalculateTPFromFill(fillPrice float64) float64 {
 }
 
 // CalculateTrailingSL computes a new SL trigger given the current highest price.
-// Only moves SL in the favorable direction. Returns (trigger, limit, shouldUpdate).
+// Uses proportional trailing: SL moves by the same percentage as the price.
+//
+// Example (BUY, SL=10%, trailPct=1%):
+//
+//	fill=100, SL=90, highest=100
+//	LTP → 101 (+1%): SL = 90 * (101/100) = 90.9 (+1% of SL value)
+//	LTP → 105 (+5%): SL = 90.9 * (105/101) = 94.4
+//
+// trailPct is used as minimum threshold — the SL modify order is only sent
+// to the broker when the SL has moved by at least trailPct% from its current
+// position, avoiding excessive broker API calls on small price ticks.
 func (g *OCOGroup) CalculateTrailingSL(currentLTP float64) (trigger, limit float64, shouldUpdate bool) {
 	if !g.TrailingSL || g.State != StateActive {
 		return 0, 0, false
 	}
-
-	pct := g.TrailingSLPct
-	if pct <= 0 {
-		pct = g.SLPercent // default to SL percent if trailing pct not set
+	if g.HighestPrice <= 0 || g.SLTriggerPrice <= 0 {
+		return 0, 0, false
 	}
 
 	if g.OrderSide == "BUY" {
-		// Trail upward: if LTP made new high, move SL up
+		// Only trail on new highs
 		if currentLTP <= g.HighestPrice {
 			return 0, 0, false
 		}
-		trigger = currentLTP * (1 - pct/100)
-		limit = trigger * (1 - 0.005)
-		// Only update if new trigger is higher than current
+		// Proportional: SL moves up by the same ratio as the price
+		trigger = g.SLTriggerPrice * (currentLTP / g.HighestPrice)
+		limit = trigger * (1 - 0.005) // 0.5% buffer below trigger
 		if trigger <= g.SLTriggerPrice {
 			return 0, 0, false
 		}
 	} else {
-		// Trail downward: if LTP made new low, move SL down
-		if currentLTP >= g.HighestPrice || g.HighestPrice == 0 {
+		// SELL: only trail on new lows
+		if currentLTP >= g.HighestPrice {
 			return 0, 0, false
 		}
-		trigger = currentLTP * (1 + pct/100)
-		limit = trigger * (1 + 0.005)
+		// Proportional: SL moves down by the same ratio as the price
+		trigger = g.SLTriggerPrice * (currentLTP / g.HighestPrice)
+		limit = trigger * (1 + 0.005) // 0.5% buffer above trigger
 		if trigger >= g.SLTriggerPrice {
 			return 0, 0, false
 		}
 	}
+
+	// Minimum update threshold: only send modify to broker when SL has
+	// moved by at least trailPct% from its current position.
+	minPct := g.TrailingSLPct
+	if minPct <= 0 {
+		minPct = 0.1 // default 0.1% minimum threshold
+	}
+	changePct := (trigger - g.SLTriggerPrice) / g.SLTriggerPrice * 100
+	if changePct < 0 {
+		changePct = -changePct
+	}
+	if changePct < minPct {
+		return 0, 0, false
+	}
+
 	return roundNSE(trigger), roundNSE(limit), true
 }
 

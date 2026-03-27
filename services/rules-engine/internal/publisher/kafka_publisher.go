@@ -23,9 +23,17 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 		Addr:         kafka.TCP(brokers...),
 		Topic:        topic,
 		Balancer:     &kafka.LeastBytes{},
-		BatchSize:    10,
-		BatchTimeout: 10 * time.Millisecond,
-		Async:        false, // Synchronous for reliability
+		BatchSize:    1,                       // flush each signal immediately — no batching delay
+		BatchTimeout: 1 * time.Millisecond,    // near-zero wait before flush
+		Async:        true,                    // non-blocking — avoids 50-500ms sync wait per write
+		RequiredAcks: kafka.RequireOne,         // ack from leader only (faster than all replicas)
+		Completion: func(messages []kafka.Message, err error) {
+			if err != nil {
+				logger.Error("Kafka async write failed",
+					zap.Error(err),
+					zap.Int("message_count", len(messages)))
+			}
+		},
 	}
 
 	logger.Info("Kafka publisher initialized",

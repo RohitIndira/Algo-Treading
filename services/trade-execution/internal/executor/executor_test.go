@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // minimal mock repo implementing needed methods
@@ -48,6 +50,48 @@ func (m *mockRepo) GetFilledPaperOrdersByUser(ctx context.Context, userID string
 func (m *mockRepo) UpdatePaperTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
 	return nil
 }
+func (m *mockRepo) GetClosedPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetClosedLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	return nil
+}
+func (m *mockRepo) CancelAllLiveOrdersByUser(ctx context.Context, userID string) error {
+	return nil
+}
+func (m *mockRepo) GetActiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error {
+	return nil
+}
+func (m *mockRepo) GetPendingMonitorOrders(ctx context.Context) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) ExistsByID(ctx context.Context, orderID uuid.UUID) (bool, error) {
+	return false, nil
+}
+func (m *mockRepo) GetByIndiraOrderID(ctx context.Context, indiraOrderID string) (*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetDashboardStats(ctx context.Context, userID string, isPaper bool) (*repository.DashboardStats, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetDistinctActiveUserIDs(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetActiveOCOOrders(ctx context.Context) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetOCOGroupOrders(ctx context.Context, groupID uuid.UUID) ([]*models.Order, error) {
+	return nil, nil
+}
 
 // credentials repo mock (not used in these tests)
 type mockCredsRepo struct{}
@@ -64,7 +108,7 @@ func TestExecuteOrder_MissingAuthFails(t *testing.T) {
 	repo := &mockRepo{}
 	creds := &mockCredsRepo{}
 
-	exec := NewOrderExecutor(repo, creds, nil, 0, 0)
+	exec := NewOrderExecutor(repo, creds, nil, nil, nil, zap.NewNop(), 0, 0)
 
 	order := &models.Order{
 		OrderID:      uuid.New(),
@@ -93,7 +137,7 @@ func TestExecuteOrder_NotApprovedIsRejected(t *testing.T) {
 	repo := &mockRepo{}
 	creds := &mockCredsRepo{}
 
-	exec := NewOrderExecutor(repo, creds, nil, 0, 0)
+	exec := NewOrderExecutor(repo, creds, nil, nil, nil, zap.NewNop(), 0, 0)
 
 	order := &models.Order{
 		OrderID:      uuid.New(),

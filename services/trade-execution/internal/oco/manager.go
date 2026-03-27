@@ -32,8 +32,24 @@ import (
 	"github.com/google/uuid"
 )
 
+// maxEntryRetries is how many times we retry placing the OCO entry order on transient errors (e.g. 401).
+const maxEntryRetries = 2
+
 // maxLegPlacementRetries is how many times we retry placing SL/TP legs after entry fill.
 const maxLegPlacementRetries = 3
+
+// brokerOpTimeout is the max duration for any single broker API call (place, cancel, modify).
+const brokerOpTimeout = 30 * time.Second
+
+// dbRetryAttempts is how many times async DB updates are retried before giving up.
+const dbRetryAttempts = 3
+
+// CredentialsRefresher allows the OCO manager to invalidate stale auth tokens
+// and reload fresh credentials from the database on 401 errors.
+type CredentialsRefresher interface {
+	Invalidate(userID string)
+	Get(ctx context.Context, userID string) (userId, appId, source, bearerToken string, err error)
+}
 
 // OCOManager is the central orchestrator for all OCO order groups.
 //
@@ -44,6 +60,7 @@ type OCOManager struct {
 	// ── Dependencies ────────────────────────────────────────────────────────
 	repo         repository.OrderRepository
 	indiraClient *indira.ExecutionClient
+	credsCache   CredentialsRefresher // nil-safe; when set, enables 401 auth refresh
 
 	// wsBroadcaster pushes real-time updates to the frontend WS.
 	wsBroadcaster func(userID string, eventType string, order *models.Order)
@@ -80,10 +97,71 @@ func (m *OCOManager) SetWSBroadcaster(fn func(userID string, eventType string, o
 	m.wsBroadcaster = fn
 }
 
-// getGroupMu returns the per-group mutex, creating it if needed.
-func (m *OCOManager) getGroupMu(groupID uuid.UUID) *sync.Mutex {
+// SetCredentialsCache wires the credentials cache for 401 auth-refresh on order placement.
+func (m *OCOManager) SetCredentialsCache(cc CredentialsRefresher) {
+	m.credsCache = cc
+}
+
+// isSessionExpiredError returns true if the error indicates a 401 / session-expired
+// response from the broker, meaning the bearer token is stale.
+func isSessionExpiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "HTTP error 401") || strings.Contains(msg, "Session expired")
+}
+
+// refreshAuth invalidates the cache for userID, reloads fresh credentials from DB,
+// and returns an updated AuthContext. Returns nil if refresh is unavailable or fails.
+func (m *OCOManager) refreshAuth(ctx context.Context, userID string, currentAuth *indiraClient.AuthContext) *indiraClient.AuthContext {
+	if m.credsCache == nil {
+		return nil
+	}
+	m.credsCache.Invalidate(userID)
+	userId, appId, source, bearerToken, err := m.credsCache.Get(ctx, userID)
+	if err != nil {
+		log.Printf("[oco] Auth refresh from DB failed for user %s: %v", userID, err)
+		return nil
+	}
+	// Only return new auth if the token actually changed
+	if bearerToken == currentAuth.BearerToken {
+		log.Printf("[oco] Auth refresh for user %s returned same token — cannot recover", userID)
+		return nil
+	}
+	log.Printf("[oco] Auth refreshed from DB for user %s", userID)
+	return &indiraClient.AuthContext{
+		UserId:      userId,
+		AppId:       appId,
+		Source:      source,
+		BearerToken: bearerToken,
+	}
+}
+
+// GetGroupMu returns the per-group mutex, creating it if needed.
+func (m *OCOManager) GetGroupMu(groupID uuid.UUID) *sync.Mutex {
 	val, _ := m.groupMu.LoadOrStore(groupID.String(), &sync.Mutex{})
 	return val.(*sync.Mutex)
+}
+
+// dbUpdateAsync persists an order update to DB asynchronously with retry.
+func (m *OCOManager) dbUpdateAsync(order *models.Order, label string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+		defer cancel()
+		var lastErr error
+		for attempt := 0; attempt < dbRetryAttempts; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			}
+			if err := m.repo.Update(ctx, order); err != nil {
+				lastErr = err
+				continue
+			}
+			return
+		}
+		log.Printf("[oco] DB update failed for %s after %d retries: %v", label, dbRetryAttempts, lastErr)
+	}()
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -200,15 +278,53 @@ func (m *OCOManager) CreateOCOEntry(
 		return nil, fmt.Errorf("failed to persist OCO entry order: %w", err)
 	}
 
-	// Place the entry SL order at broker
-	brokerID, err := m.indiraClient.PlaceOrder(ctx, entryOrder, auth)
-	if err != nil {
-		// Mark as failed in DB
+	// Place the entry SL order at broker with retry on 401 (session expired).
+	var brokerID string
+	var placeErr error
+	currentAuth := auth
+	for attempt := 0; attempt <= maxEntryRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+
+			// On 401, refresh credentials from DB before retrying.
+			if isSessionExpiredError(placeErr) {
+				newAuth := m.refreshAuth(ctx, userID, currentAuth)
+				if newAuth == nil {
+					break // Can't recover — stop retrying
+				}
+				currentAuth = newAuth
+				// Update the order and group with refreshed auth
+				entryOrder.BearerToken = &currentAuth.BearerToken
+				entryOrder.AppId = &currentAuth.AppId
+				entryOrder.Source = &currentAuth.Source
+			}
+		}
+
+		brokerID, placeErr = m.indiraClient.PlaceOrder(ctx, entryOrder, currentAuth)
+		if placeErr == nil {
+			break // Success
+		}
+
+		log.Printf("[oco] Entry order placement attempt %d failed for group %s: %v",
+			attempt+1, groupID, placeErr)
+
+		// Only retry on 401; other errors are not retryable here.
+		if !isSessionExpiredError(placeErr) {
+			break
+		}
+	}
+	if placeErr != nil {
 		entryOrder.Status = models.StatusFailed
-		errMsg := err.Error()
+		errMsg := placeErr.Error()
 		entryOrder.ErrorMessage = &errMsg
 		m.repo.Update(ctx, entryOrder)
-		return nil, fmt.Errorf("failed to place OCO entry order: %w", err)
+		return nil, fmt.Errorf("failed to place OCO entry order: %w", placeErr)
+	}
+
+	// If auth was refreshed, update the group's auth so legs use the fresh token.
+	if currentAuth != auth {
+		auth = currentAuth
+		group.Auth = auth
 	}
 
 	// Update order with broker ID
@@ -218,12 +334,13 @@ func (m *OCOManager) CreateOCOEntry(
 	entryOrder.SubmittedAt = &now
 	group.EntryBrokerID = brokerID
 
-	// Persist broker ID update
-	go func() {
-		if err := m.repo.Update(context.Background(), entryOrder); err != nil {
-			log.Printf("[oco] Failed to update entry order %s with broker ID: %v", entryOrderID, err)
-		}
-	}()
+	// Persist broker ID synchronously — the status service WS handler looks up
+	// orders by IndiraOrderID in the DB. If this write is async and the broker
+	// WS fires EXECUTED before the write completes, GetByIndiraOrderID fails
+	// and HandleBrokerUpdate is never called, so SL/TP legs are never placed.
+	if err := m.repo.Update(ctx, entryOrder); err != nil {
+		log.Printf("[oco] WARNING: failed to persist entry order broker ID for group %s: %v", groupID, err)
+	}
 
 	// Register in memory
 	m.groups.Store(groupID, group)
@@ -280,7 +397,7 @@ func (m *OCOManager) HandleBrokerUpdate(ctx context.Context, order *models.Order
 	group := groupVal.(*OCOGroup)
 
 	// Per-group mutex: prevents race if two events for same group arrive simultaneously
-	mu := m.getGroupMu(groupID)
+	mu := m.GetGroupMu(groupID)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -329,21 +446,38 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 		log.Printf("[oco] Entry FILLED for group %s at %.2f — placing SL+TP legs", group.GroupID, fillPrice)
 
 		// Place SL and TP legs (in background goroutine so we don't block the WS handler)
-		go m.placeOCOLegs(context.Background(), group)
+		legCtx, legCancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+		go func() {
+			defer legCancel()
+			m.placeOCOLegs(legCtx, group)
+		}()
 
 	case "REJECTED", "A.REJECTED", "CANCELLED":
 		log.Printf("[oco] Entry %s for group %s: %s", status, group.GroupID, safeString(order.RejectionReason))
 		group.State = StateFailed
 		group.UpdatedAt = time.Now()
-		m.cleanupGroup(group)
+		m.scheduleCleanup(group)
+		if m.wsBroadcaster != nil {
+			m.wsBroadcaster(group.UserID, "oco_entry_rejected", order)
+		}
 	}
 }
 
 // handleSLLegUpdate processes broker status updates for the SL leg.
 func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, order *models.Order, status string) {
 	switch status {
+	case "PENDING", "OPEN", "TRIGGER PENDING", "TRIGGER_PENDING", "AFTER MARKET ORDER REQ RECEIVED":
+		// WS confirms SL leg is on the exchange — mark as confirmed
+		if group.SLLegConfirmed {
+			return // already confirmed
+		}
+		group.SLLegConfirmed = true
+		group.UpdatedAt = time.Now()
+		log.Printf("[oco] SL leg confirmed on exchange for group %s (broker=%s)", group.GroupID, group.SLBrokerID)
+		m.checkLegsConfirmed(group)
+
 	case "EXECUTED", "TRADED":
-		if group.State != StateActive {
+		if group.State != StateActive && group.State != StateLegsSubmitted {
 			return
 		}
 
@@ -361,24 +495,24 @@ func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, ord
 		}
 
 		// Cancel TP leg
-		go m.cancelLeg(context.Background(), group, group.TPBrokerID, "TP", "SL leg executed (OCO)")
+		go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg executed (OCO)")
 
 	case "REJECTED", "A.REJECTED":
 		log.Printf("[oco] SL leg REJECTED for group %s — cancelling TP and marking failed", group.GroupID)
 		group.State = StateFailed
 		group.UpdatedAt = time.Now()
-		go m.cancelLeg(context.Background(), group, group.TPBrokerID, "TP", "SL leg rejected (OCO cleanup)")
-		go m.cleanupGroup(group)
+		go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg rejected (OCO cleanup)")
+		m.scheduleCleanup(group)
 
 	case "CANCELLED":
 		// If we cancelled it ourselves (during OCO completion), this is expected.
 		// If cancelled externally, we should also cancel the TP leg.
-		if group.State == StateActive {
+		if group.State == StateActive || group.State == StateLegsSubmitted {
 			log.Printf("[oco] SL leg CANCELLED externally for group %s — cancelling TP", group.GroupID)
 			group.State = StateCancelled
 			group.UpdatedAt = time.Now()
-			go m.cancelLeg(context.Background(), group, group.TPBrokerID, "TP", "SL leg cancelled externally (OCO)")
-			go m.cleanupGroup(group)
+			go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg cancelled externally (OCO)")
+			m.scheduleCleanup(group)
 		}
 	}
 }
@@ -386,8 +520,18 @@ func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, ord
 // handleTPLegUpdate processes broker status updates for the TP leg.
 func (m *OCOManager) handleTPLegUpdate(ctx context.Context, group *OCOGroup, order *models.Order, status string) {
 	switch status {
+	case "PENDING", "OPEN", "TRIGGER PENDING", "TRIGGER_PENDING", "AFTER MARKET ORDER REQ RECEIVED":
+		// WS confirms TP leg is on the exchange — mark as confirmed
+		if group.TPLegConfirmed {
+			return // already confirmed
+		}
+		group.TPLegConfirmed = true
+		group.UpdatedAt = time.Now()
+		log.Printf("[oco] TP leg confirmed on exchange for group %s (broker=%s)", group.GroupID, group.TPBrokerID)
+		m.checkLegsConfirmed(group)
+
 	case "EXECUTED", "TRADED":
-		if group.State != StateActive {
+		if group.State != StateActive && group.State != StateLegsSubmitted {
 			return
 		}
 
@@ -405,20 +549,46 @@ func (m *OCOManager) handleTPLegUpdate(ctx context.Context, group *OCOGroup, ord
 		}
 
 		// Cancel SL leg
-		go m.cancelLeg(context.Background(), group, group.SLBrokerID, "SL", "TP leg executed (OCO)")
+		go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg executed (OCO)")
 
 	case "REJECTED", "A.REJECTED":
-		log.Printf("[oco] TP leg REJECTED for group %s — SL leg remains active (user has SL protection)", group.GroupID)
+		log.Printf("[oco] WARNING: TP leg REJECTED for group %s — SL leg remains active (user has SL protection but NO take-profit)", group.GroupID)
 		// Don't cancel SL — user at least has stop-loss protection.
-		// Mark TP as failed but keep group active with just SL.
+		// Broadcast so the frontend can notify the user.
+		if m.wsBroadcaster != nil {
+			m.wsBroadcaster(group.UserID, "oco_tp_rejected", order)
+		}
 
 	case "CANCELLED":
-		if group.State == StateActive {
+		if group.State == StateActive || group.State == StateLegsSubmitted {
 			log.Printf("[oco] TP leg CANCELLED externally for group %s — cancelling SL", group.GroupID)
 			group.State = StateCancelled
 			group.UpdatedAt = time.Now()
-			go m.cancelLeg(context.Background(), group, group.SLBrokerID, "SL", "TP leg cancelled externally (OCO)")
-			go m.cleanupGroup(group)
+			go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg cancelled externally (OCO)")
+			m.scheduleCleanup(group)
+		}
+	}
+}
+
+// checkLegsConfirmed transitions from StateLegsSubmitted → StateActive
+// when both legs (or only SL if TP wasn't submitted) have been confirmed
+// on the exchange via broker WS status updates (PENDING/OPEN).
+// Must be called while holding the group mutex.
+func (m *OCOManager) checkLegsConfirmed(group *OCOGroup) {
+	if group.State != StateLegsSubmitted {
+		return
+	}
+
+	slOK := group.SLLegConfirmed
+	tpOK := group.TPLegConfirmed || group.TPBrokerID == "" // no TP leg to confirm
+
+	if slOK && tpOK {
+		group.State = StateActive
+		group.UpdatedAt = time.Now()
+		log.Printf("[oco] Group %s ACTIVE: both legs confirmed on exchange", group.GroupID)
+
+		if m.wsBroadcaster != nil {
+			m.wsBroadcaster(group.UserID, "oco_legs_confirmed", nil)
 		}
 	}
 }
@@ -436,6 +606,51 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 	// Calculate prices
 	slTrigger, slLimit := group.CalculateSLFromFill(fillPrice)
 	tpLimit := group.CalculateTPFromFill(fillPrice)
+
+	// Validate SL/TP price direction
+	if group.OrderSide == "BUY" {
+		if slTrigger >= fillPrice {
+			log.Printf("[oco] CRITICAL: SL trigger %.2f >= fill %.2f for BUY group %s (SLPct=%.1f%%) — aborting legs",
+				slTrigger, fillPrice, group.GroupID, group.SLPercent)
+			mu := m.GetGroupMu(group.GroupID)
+			mu.Lock()
+			group.State = StateFailed
+			group.UpdatedAt = time.Now()
+			mu.Unlock()
+			return
+		}
+		if tpLimit <= fillPrice {
+			log.Printf("[oco] CRITICAL: TP limit %.2f <= fill %.2f for BUY group %s (TPPct=%.1f%%) — aborting legs",
+				tpLimit, fillPrice, group.GroupID, group.TPPercent)
+			mu := m.GetGroupMu(group.GroupID)
+			mu.Lock()
+			group.State = StateFailed
+			group.UpdatedAt = time.Now()
+			mu.Unlock()
+			return
+		}
+	} else {
+		if slTrigger <= fillPrice {
+			log.Printf("[oco] CRITICAL: SL trigger %.2f <= fill %.2f for SELL group %s (SLPct=%.1f%%) — aborting legs",
+				slTrigger, fillPrice, group.GroupID, group.SLPercent)
+			mu := m.GetGroupMu(group.GroupID)
+			mu.Lock()
+			group.State = StateFailed
+			group.UpdatedAt = time.Now()
+			mu.Unlock()
+			return
+		}
+		if tpLimit >= fillPrice {
+			log.Printf("[oco] CRITICAL: TP limit %.2f >= fill %.2f for SELL group %s (TPPct=%.1f%%) — aborting legs",
+				tpLimit, fillPrice, group.GroupID, group.TPPercent)
+			mu := m.GetGroupMu(group.GroupID)
+			mu.Lock()
+			group.State = StateFailed
+			group.UpdatedAt = time.Now()
+			mu.Unlock()
+			return
+		}
+	}
 
 	log.Printf("[oco] Placing legs for group %s: fillPrice=%.2f SL(trigger=%.2f limit=%.2f) TP(limit=%.2f) side=%s",
 		group.GroupID, fillPrice, slTrigger, slLimit, tpLimit, exitSide)
@@ -490,17 +705,20 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 	wg.Wait()
 
 	// Lock the group for state updates
-	mu := m.getGroupMu(group.GroupID)
+	mu := m.GetGroupMu(group.GroupID)
 	mu.Lock()
 	defer mu.Unlock()
 
 	// Handle results
 	if slErr != nil && tpErr != nil {
-		// Both failed — critical failure
-		log.Printf("[oco] CRITICAL: Both legs failed for group %s: SL=%v TP=%v", group.GroupID, slErr, tpErr)
+		// Both failed — critical failure. User has an open position with NO protection.
+		log.Printf("[oco] CRITICAL: Both legs failed for group %s: SL=%v TP=%v — POSITION UNPROTECTED", group.GroupID, slErr, tpErr)
 		group.State = StateFailed
 		group.UpdatedAt = time.Now()
-		m.cleanupGroup(group)
+		m.scheduleCleanup(group)
+		if m.wsBroadcaster != nil {
+			m.wsBroadcaster(group.UserID, "oco_legs_failed", slOrder)
+		}
 		return
 	}
 
@@ -511,37 +729,43 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		m.brokerIndex.Store(tpBrokerID, group.GroupID)
 		group.State = StateFailed
 		group.UpdatedAt = time.Now()
-		go m.cancelLeg(context.Background(), group, tpBrokerID, "TP", "SL leg failed (no protection)")
+		go m.cancelLeg(group, tpBrokerID, "TP", "SL leg failed (no protection)")
+		if m.wsBroadcaster != nil {
+			m.wsBroadcaster(group.UserID, "oco_legs_failed", slOrder)
+		}
 		return
 	}
 
 	if tpErr != nil {
-		// TP failed but SL placed — user has protection. Keep SL active.
-		log.Printf("[oco] TP leg failed for group %s — SL remains active (user protected)", group.GroupID)
+		// TP failed but SL placed — user has protection via SL. Continue without TP.
+		log.Printf("[oco] TP leg failed for group %s — SL submitted, awaiting WS confirmation (user protected)", group.GroupID)
 		group.SLBrokerID = slBrokerID
 		m.brokerIndex.Store(slBrokerID, group.GroupID)
-		// Don't mark as failed — SL is active, user just won't auto-take-profit
-		group.State = StateActive
+		group.TPLegConfirmed = true // no TP leg to confirm
+		group.State = StateLegsSubmitted
 		group.UpdatedAt = time.Now()
+		if m.wsBroadcaster != nil {
+			m.wsBroadcaster(group.UserID, "oco_tp_rejected", slOrder)
+		}
 		return
 	}
 
-	// Both succeeded
+	// Both succeeded — submitted to broker, awaiting WS confirmation
 	group.SLBrokerID = slBrokerID
 	group.TPBrokerID = tpBrokerID
-	group.State = StateActive
+	group.State = StateLegsSubmitted
 	group.UpdatedAt = time.Now()
 
 	// Register broker IDs for O(1) WS lookup
 	m.brokerIndex.Store(slBrokerID, group.GroupID)
 	m.brokerIndex.Store(tpBrokerID, group.GroupID)
 
-	log.Printf("[oco] Group %s ACTIVE: SL(broker=%s trigger=%.2f) TP(broker=%s limit=%.2f)",
+	log.Printf("[oco] Group %s LEGS_SUBMITTED: SL(broker=%s trigger=%.2f) TP(broker=%s limit=%.2f) — awaiting WS confirmation",
 		group.GroupID, slBrokerID, slTrigger, tpBrokerID, tpLimit)
 
 	// Broadcast to frontend
 	if m.wsBroadcaster != nil {
-		m.wsBroadcaster(group.UserID, "oco_legs_placed", slOrder)
+		m.wsBroadcaster(group.UserID, "oco_legs_submitted", slOrder)
 	}
 }
 
@@ -588,6 +812,7 @@ func (m *OCOManager) buildLegOrder(
 }
 
 // placeLegWithRetry places a leg order at broker with retry logic.
+// On 401 (session expired), it refreshes auth from DB before retrying.
 func (m *OCOManager) placeLegWithRetry(
 	ctx context.Context,
 	order *models.Order,
@@ -596,12 +821,24 @@ func (m *OCOManager) placeLegWithRetry(
 	groupID uuid.UUID,
 ) (string, error) {
 	var lastErr error
+	currentAuth := auth
 	for attempt := 0; attempt < maxLegPlacementRetries; attempt++ {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+
+			// On 401, refresh auth from DB before retrying with stale token.
+			if isSessionExpiredError(lastErr) {
+				newAuth := m.refreshAuth(ctx, order.UserID, currentAuth)
+				if newAuth != nil {
+					currentAuth = newAuth
+					order.BearerToken = &currentAuth.BearerToken
+					order.AppId = &currentAuth.AppId
+					order.Source = &currentAuth.Source
+				}
+			}
 		}
 
-		brokerID, err := m.indiraClient.PlaceOrder(ctx, order, auth)
+		brokerID, err := m.indiraClient.PlaceOrder(ctx, order, currentAuth)
 		if err != nil {
 			lastErr = err
 			log.Printf("[oco] %s leg placement attempt %d failed for group %s: %v",
@@ -609,16 +846,15 @@ func (m *OCOManager) placeLegWithRetry(
 			continue
 		}
 
-		// Update order with broker ID
+		// Update order with broker ID — synchronous write so the status service
+		// can find this order by IndiraOrderID when the broker WS fires back.
 		order.IndiraOrderID = &brokerID
 		order.Status = models.StatusSubmitted
 		now := time.Now()
 		order.SubmittedAt = &now
-		go func() {
-			if err := m.repo.Update(context.Background(), order); err != nil {
-				log.Printf("[oco] Failed to update %s leg order in DB: %v", legName, err)
-			}
-		}()
+		if err := m.repo.Update(ctx, order); err != nil {
+			log.Printf("[oco] WARNING: failed to persist %s leg broker ID for group %s: %v", legName, groupID, err)
+		}
 
 		log.Printf("[oco] %s leg placed: broker=%s order=%s group=%s", legName, brokerID, order.OrderID, groupID)
 		return brokerID, nil
@@ -628,7 +864,9 @@ func (m *OCOManager) placeLegWithRetry(
 	order.Status = models.StatusFailed
 	errMsg := fmt.Sprintf("%s leg placement failed after %d attempts: %v", legName, maxLegPlacementRetries, lastErr)
 	order.ErrorMessage = &errMsg
-	go m.repo.Update(context.Background(), order)
+	if err := m.repo.Update(ctx, order); err != nil {
+		log.Printf("[oco] WARNING: failed to persist %s leg failure for group %s: %v", legName, groupID, err)
+	}
 
 	return "", fmt.Errorf(errMsg)
 }
@@ -637,11 +875,14 @@ func (m *OCOManager) placeLegWithRetry(
 // Cancel + Cleanup
 // ════════════════════════════════════════════════════════════════════════════
 
-// cancelLeg cancels a single leg order at the broker with retry.
-func (m *OCOManager) cancelLeg(ctx context.Context, group *OCOGroup, brokerID string, legName string, reason string) {
+// cancelLeg cancels a single leg order at the broker with retry and timeout.
+func (m *OCOManager) cancelLeg(group *OCOGroup, brokerID string, legName string, reason string) {
 	if brokerID == "" {
 		return
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+	defer cancel()
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -678,24 +919,24 @@ func (m *OCOManager) cancelLeg(ctx context.Context, group *OCOGroup, brokerID st
 	}
 }
 
-// cleanupGroup removes a terminal group from memory indices after a delay.
-// The delay allows any in-flight WS events to be processed.
-func (m *OCOManager) cleanupGroup(group *OCOGroup) {
-	time.Sleep(30 * time.Second) // allow in-flight events to drain
+// scheduleCleanup removes a terminal group from memory indices after a delay.
+// Uses time.AfterFunc so it doesn't block a goroutine during the wait.
+func (m *OCOManager) scheduleCleanup(group *OCOGroup) {
+	time.AfterFunc(30*time.Second, func() {
+		m.groups.Delete(group.GroupID)
+		if group.EntryBrokerID != "" {
+			m.brokerIndex.Delete(group.EntryBrokerID)
+		}
+		if group.SLBrokerID != "" {
+			m.brokerIndex.Delete(group.SLBrokerID)
+		}
+		if group.TPBrokerID != "" {
+			m.brokerIndex.Delete(group.TPBrokerID)
+		}
+		m.groupMu.Delete(group.GroupID.String())
 
-	m.groups.Delete(group.GroupID)
-	if group.EntryBrokerID != "" {
-		m.brokerIndex.Delete(group.EntryBrokerID)
-	}
-	if group.SLBrokerID != "" {
-		m.brokerIndex.Delete(group.SLBrokerID)
-	}
-	if group.TPBrokerID != "" {
-		m.brokerIndex.Delete(group.TPBrokerID)
-	}
-	m.groupMu.Delete(group.GroupID.String())
-
-	log.Printf("[oco] Cleaned up group %s from memory", group.GroupID)
+		log.Printf("[oco] Cleaned up group %s from memory", group.GroupID)
+	})
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -705,7 +946,7 @@ func (m *OCOManager) cleanupGroup(group *OCOGroup) {
 // ModifySLLeg modifies the SL leg order at the broker with a new trigger/limit.
 // Called by the trailing SL monitor when LTP makes a new high.
 func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigger, newLimit float64) error {
-	mu := m.getGroupMu(group.GroupID)
+	mu := m.GetGroupMu(group.GroupID)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -742,12 +983,11 @@ func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigge
 	log.Printf("[oco] Trailing SL modified for group %s: trigger %.2f→%.2f limit=%.2f highest=%.2f",
 		group.GroupID, oldTrigger, newTrigger, newLimit, group.HighestPrice)
 
-	// Persist to DB asynchronously
-	go func() {
-		if err := m.repo.Update(context.Background(), slOrder); err != nil {
-			log.Printf("[oco] Failed to persist SL modify in DB: %v", err)
-		}
-	}()
+	// Persist to DB synchronously — if the service crashes before this write,
+	// on restart we'd reload the old SL trigger while the broker has the new one.
+	if err := m.repo.Update(ctx, slOrder); err != nil {
+		log.Printf("[oco] WARNING: failed to persist SL modify for group %s: %v", group.GroupID, err)
+	}
 
 	return nil
 }
@@ -928,8 +1168,15 @@ func (m *OCOManager) inferState(orders []*models.Order) OCOState {
 		return StateCompleted
 	}
 
-	// Both legs exist and not filled
-	return StateActive
+	// Both legs exist and not filled.
+	// If legs are in SUBMITTED status (broker API returned ordId but no WS confirmation yet),
+	// return StateLegsSubmitted. If PENDING/OPEN, they're confirmed on exchange → ACTIVE.
+	slConfirmed := isConfirmedOnExchange(slStatus)
+	tpConfirmed := isConfirmedOnExchange(tpStatus) || tpStatus == ""
+	if slConfirmed && tpConfirmed {
+		return StateActive
+	}
+	return StateLegsSubmitted
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -993,7 +1240,7 @@ func (m *OCOManager) CancelGroup(ctx context.Context, groupID uuid.UUID) error {
 	}
 	group := val.(*OCOGroup)
 
-	mu := m.getGroupMu(groupID)
+	mu := m.GetGroupMu(groupID)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -1005,22 +1252,62 @@ func (m *OCOManager) CancelGroup(ctx context.Context, groupID uuid.UUID) error {
 
 	// Cancel all non-terminal broker orders
 	if group.State == StatePendingEntry && group.EntryBrokerID != "" {
-		go m.cancelLeg(context.Background(), group, group.EntryBrokerID, "ENTRY", "User cancelled OCO")
+		go m.cancelLeg(group, group.EntryBrokerID, "ENTRY", "User cancelled OCO")
 	}
-	if group.State == StateActive {
+	if group.State == StateActive || group.State == StateLegsSubmitted {
 		if group.SLBrokerID != "" {
-			go m.cancelLeg(context.Background(), group, group.SLBrokerID, "SL", "User cancelled OCO")
+			go m.cancelLeg(group, group.SLBrokerID, "SL", "User cancelled OCO")
 		}
 		if group.TPBrokerID != "" {
-			go m.cancelLeg(context.Background(), group, group.TPBrokerID, "TP", "User cancelled OCO")
+			go m.cancelLeg(group, group.TPBrokerID, "TP", "User cancelled OCO")
 		}
 	}
 
 	group.State = StateCancelled
 	group.UpdatedAt = time.Now()
-	go m.cleanupGroup(group)
+	m.scheduleCleanup(group)
 
 	return nil
+}
+
+// CancelAllGroupsByUser cancels every non-terminal OCO group for a user.
+// Called on force-exit-all or when a manual position exit is detected.
+func (m *OCOManager) CancelAllGroupsByUser(ctx context.Context, userID string) {
+	groups := m.GetGroupsByUser(userID)
+	if len(groups) == 0 {
+		return
+	}
+
+	log.Printf("[oco] Cancelling all %d active OCO groups for user %s (force exit / manual exit)", len(groups), userID)
+	for _, group := range groups {
+		if err := m.CancelGroup(ctx, group.GroupID); err != nil {
+			log.Printf("[oco] Failed to cancel group %s: %v", group.GroupID, err)
+		}
+	}
+}
+
+// CancelGroupsBySymbol cancels all non-terminal OCO groups for a user+symbol.
+// Called when a manual position exit is detected for a specific symbol.
+func (m *OCOManager) CancelGroupsBySymbol(ctx context.Context, userID string, symbol string) {
+	var toCancel []uuid.UUID
+	m.groups.Range(func(key, value any) bool {
+		group := value.(*OCOGroup)
+		if group.UserID == userID && group.Symbol == symbol && !group.State.IsTerminal() {
+			toCancel = append(toCancel, group.GroupID)
+		}
+		return true
+	})
+
+	if len(toCancel) == 0 {
+		return
+	}
+
+	log.Printf("[oco] Manual exit detected: cancelling %d OCO groups for %s/%s", len(toCancel), userID, symbol)
+	for _, gid := range toCancel {
+		if err := m.CancelGroup(ctx, gid); err != nil {
+			log.Printf("[oco] Failed to cancel group %s: %v", gid, err)
+		}
+	}
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1032,6 +1319,17 @@ func stringPtr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// isConfirmedOnExchange returns true if the order status indicates
+// the order is live on the exchange (not just submitted to broker API).
+func isConfirmedOnExchange(s models.OrderStatus) bool {
+	switch strings.ToUpper(string(s)) {
+	case "PENDING", "OPEN", "TRIGGER PENDING", "TRIGGER_PENDING",
+		"AFTER MARKET ORDER REQ RECEIVED", "PARTIALLY_FILLED", "PARTIALLY TRADED":
+		return true
+	}
+	return false
 }
 
 func safeString(s *string) string {

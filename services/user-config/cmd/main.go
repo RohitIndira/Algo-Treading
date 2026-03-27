@@ -16,6 +16,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/config"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/worker"
@@ -112,6 +113,13 @@ func main() {
 		go outboxWorker.Start(workerCtx)
 		lgr.Info("Outbox worker started")
 	}
+
+	// Start EOD deactivation scheduler (deactivates all active strategies at 15:30 IST)
+	eodScheduler := scheduler.NewEODDeactivationScheduler(svc)
+	eodCtx, eodCancel := context.WithCancel(context.Background())
+	defer eodCancel()
+	go eodScheduler.Start(eodCtx)
+	lgr.Info("EOD deactivation scheduler started")
 
 	// Initialize gRPC server
 	grpcServer := grpc.NewServer(

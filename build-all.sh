@@ -1,65 +1,81 @@
 #!/bin/bash
 
 # Master build script for all services
+# Dynamically resolves paths — works on any system/clone location
 set -e
 
-PROJECT_ROOT="/home/stockkask/algo-trading/Algo-Treading"
+# Resolve PROJECT_ROOT to the directory containing this script
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Optional cross-compilation overrides (e.g. GOOS=linux GOARCH=amd64 ./build-all.sh)
+export GOOS="${GOOS:-$(go env GOOS)}"
+export GOARCH="${GOARCH:-$(go env GOARCH)}"
 
 echo "=========================================="
 echo "Building All Services"
+echo "Project root : ${PROJECT_ROOT}"
+echo "Target OS    : ${GOOS}"
+echo "Target Arch  : ${GOARCH}"
 echo "=========================================="
 
-# Array of Go services with their paths
-declare -a GO_SERVICES=(
-    "api/gateway:API Gateway"
-    "services/user-config:User Config Service"
-    "services/risk-management:Risk Management Service"
-    "services/rules-engine:Rules Engine Service"
-    "services/trade-execution:Trade Execution Service"
-    "services/data-ingestion:Data Ingestion Service"
-)
+BUILD_ERRORS=()
+BUILT=()
 
-# Build each Go service
-for service in "${GO_SERVICES[@]}"
-do
-    IFS=':' read -r path name <<< "$service"
+# Auto-discover all services that have a build.sh
+# Looks in: api/*/build.sh and services/*/build.sh
+mapfile -t BUILD_SCRIPTS < <(find "${PROJECT_ROOT}/api" "${PROJECT_ROOT}/services" \
+    -maxdepth 2 -name "build.sh" 2>/dev/null | sort)
+
+if [ ${#BUILD_SCRIPTS[@]} -eq 0 ]; then
+    echo "No build.sh scripts found under api/ or services/"
+    exit 1
+fi
+
+for script in "${BUILD_SCRIPTS[@]}"; do
+    service_dir="$(dirname "$script")"
+    # Relative path for display
+    rel_path="${service_dir#"${PROJECT_ROOT}/"}"
+    service_name="$(basename "$service_dir")"
+
     echo ""
     echo "=========================================="
-    echo "Building: $name"
-    echo "Path: $path"
+    echo "Building : ${service_name}"
+    echo "Path     : ${rel_path}"
     echo "=========================================="
-    
-    cd "${PROJECT_ROOT}/${path}"
-    
-    if [ -f "build.sh" ]; then
+
+    (
+        cd "$service_dir"
+        chmod +x build.sh
         ./build.sh
-    else
-        echo "Warning: build.sh not found in ${path}"
-    fi
+    ) && BUILT+=("${rel_path}") || BUILD_ERRORS+=("${rel_path}")
 done
 
 echo ""
 echo "=========================================="
 echo "Build Summary"
 echo "=========================================="
-echo "Checking built binaries..."
-echo ""
 
-# Check all built binaries
-for service in "${GO_SERVICES[@]}"
-do
-    IFS=':' read -r path name <<< "$service"
-    binary_path="${PROJECT_ROOT}/${path}/bin"
-    
-    if [ -d "$binary_path" ]; then
-        echo "✓ $name:"
-        ls -lh "${binary_path}"
+# Report built binaries
+for rel_path in "${BUILT[@]}"; do
+    bin_dir="${PROJECT_ROOT}/${rel_path}/bin"
+    if [ -d "$bin_dir" ]; then
+        echo "  [OK] ${rel_path}:"
+        ls -lh "${bin_dir}"
     else
-        echo "✗ $name: No binary found"
+        echo "  [OK] ${rel_path}: (no bin/ dir — check build.sh output)"
     fi
 done
 
+# Report failures
+for rel_path in "${BUILD_ERRORS[@]}"; do
+    echo "  [FAIL] ${rel_path}: build failed"
+done
+
 echo ""
-echo "=========================================="
-echo "All builds complete!"
+if [ ${#BUILD_ERRORS[@]} -eq 0 ]; then
+    echo "All ${#BUILT[@]} service(s) built successfully for ${GOOS}/${GOARCH}."
+else
+    echo "${#BUILT[@]} succeeded, ${#BUILD_ERRORS[@]} failed."
+    exit 1
+fi
 echo "=========================================="

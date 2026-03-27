@@ -26,6 +26,9 @@ import (
 // belongs to an OCO group and act accordingly (place legs, cancel counterpart).
 type OCOHandler interface {
 	HandleBrokerUpdate(ctx context.Context, order *models.Order, brokerStatus string)
+	// CancelGroupsBySymbol cancels all active OCO groups for a user+symbol.
+	// Used when a manual position exit is detected (order not in our DB).
+	CancelGroupsBySymbol(ctx context.Context, userID string, symbol string)
 }
 
 // OrderStatusService listens to a single shared WebSocket connection and
@@ -41,8 +44,9 @@ type OrderStatusService struct {
 	ocoHandler    OCOHandler // OCO order management hook
 
 	// Single shared WS client. Protected by wsMu for first-connect init only.
-	wsMu     sync.Mutex
-	wsClient *indiraClient.WSClient // nil until first StartSubscription
+	wsMu             sync.Mutex
+	wsClient         *indiraClient.WSClient // nil until first StartSubscription
+	processorRunning bool                   // true while processUpdates goroutine is alive
 
 	// subscriberAuths: userID → *indiraClient.AuthContext
 	// Serves two purposes: (1) tracks who is subscribed, (2) enables re-subscription
@@ -101,8 +105,14 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 		// On 401, reload credentials from DB so the WS can recover
 		// without waiting for the user to place a new order.
 		s.wsClient.OnAuthRefresh = s.refreshAuthFromDB
-		// Single goroutine fans out all updates from one channel.
-		go s.processUpdates(ctx)
+	}
+
+	// Ensure the update processor goroutine is always running.
+	// Uses context.Background() because it must live for the entire
+	// service lifetime, not be tied to the caller's context.
+	if !s.processorRunning {
+		s.processorRunning = true
+		go s.processUpdates(context.Background())
 		s.logger.Info("Shared WS established", zap.String("first_user", userID))
 		return nil
 	}
@@ -172,6 +182,12 @@ func (s *OrderStatusService) resubscribeAll() {
 // Started exactly once when the shared connection is established.
 func (s *OrderStatusService) processUpdates(ctx context.Context) {
 	s.logger.Info("Shared WS update processor started")
+	defer func() {
+		s.wsMu.Lock()
+		s.processorRunning = false
+		s.wsMu.Unlock()
+		s.logger.Warn("Shared WS update processor exited — will restart on next subscription")
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -190,6 +206,11 @@ func (s *OrderStatusService) processUpdates(ctx context.Context) {
 }
 
 func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *indiraClient.WSOrderStatus) {
+	updateStart := time.Now()
+	defer func() {
+		metrics.StatusUpdateProcessDuration.Observe(time.Since(updateStart).Seconds())
+	}()
+
 	// UniqueCode is normally the System-generated order ID ("NZVND00001J2" style)
 	// OrderNumber = Exchange order number (0 when not yet matched)
 	indiraID := wsStatus.UniqueCode
@@ -200,15 +221,14 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		return
 	}
 
-	s.logger.Debug("WS order update",
-		zap.String("id", indiraID),
-		zap.String("broker_status", wsStatus.OrderStatus),
-		zap.String("symbol", wsStatus.Symbol),
-		zap.Int("seq", wsStatus.OrderSequenceNumber))
-
 	order, err := s.repo.GetByIndiraOrderID(ctx, indiraID)
 	if err != nil {
-		// Not our order (placed outside this system) – silently skip
+		// Not our order (placed outside this system).
+		// Check if this is a manual position exit — if so, cancel active OCO groups for this symbol.
+		brokerStatusUpper := strings.ToUpper(strings.TrimSpace(wsStatus.OrderStatus))
+		if (brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED") && wsStatus.Symbol != "" && s.ocoHandler != nil {
+			s.handleManualExitDetection(ctx, wsStatus)
+		}
 		return
 	}
 
@@ -280,10 +300,10 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	order.Status = newStatus
 
 	// Extract fill details using DecimalLocator for correct price
-	dl := decimalLocator(wsStatus.DecimalLocator)
+	dl := decimalLocator(string(wsStatus.DecimalLocator))
 
 	// Always update traded qty and price from broker
-	if qty, err := strconv.Atoi(wsStatus.TradedQTY); err == nil {
+	if qty, err := strconv.Atoi(string(wsStatus.TradedQTY)); err == nil {
 		order.FilledQuantity = int32(qty)
 	}
 	if price, err := strconv.ParseFloat(wsStatus.TradedPrice, 64); err == nil && price > 0 {
@@ -326,7 +346,7 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		zap.String("order_id", order.OrderID.String()),
 		zap.String("prev", string(previousStatus)),
 		zap.String("broker_status", brokerStatusUpper),
-		zap.String("traded_qty", wsStatus.TradedQTY),
+		zap.String("traded_qty", string(wsStatus.TradedQTY)),
 		zap.String("traded_price", wsStatus.TradedPrice),
 		zap.String("order_number", wsStatus.OrderNumber))
 
@@ -347,6 +367,32 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	s.publishNotification(ctx, order, wsStatus)
 }
 
+// handleManualExitDetection is called when we see an EXECUTED order that is
+// NOT in our database — this means the user placed it manually from their
+// broker app. If they have active OCO groups for that symbol, cancel them
+// to prevent orphaned SL/TP legs from triggering unwanted positions.
+func (s *OrderStatusService) handleManualExitDetection(ctx context.Context, wsStatus *indiraClient.WSOrderStatus) {
+	// Extract user ID from the WS message
+	userID := wsStatus.UCC // UCC is the client code (user ID)
+	if userID == "" {
+		return
+	}
+
+	symbol := wsStatus.Symbol
+	s.logger.Info("Manual exit detected — cancelling OCO groups for symbol",
+		zap.String("user_id", userID),
+		zap.String("symbol", symbol),
+		zap.String("unique_code", wsStatus.UniqueCode))
+
+	go s.ocoHandler.CancelGroupsBySymbol(context.Background(), userID, symbol)
+}
+
+// flexToInt converts a FlexInt to int, returning 0 on failure.
+func flexToInt(f indiraClient.FlexInt) int {
+	v, _ := strconv.Atoi(string(f))
+	return v
+}
+
 // decimalLocator returns the divisor encoded in the WS DecimalLocator field.
 // E.g. "100" means raw prices must be divided by 100 to get the actual value.
 // Returns 1 when the field is empty or unparseable (no-op divisor).
@@ -365,11 +411,11 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		return
 	}
 
-	dl := decimalLocator(wsStatus.DecimalLocator)
+	dl := decimalLocator(string(wsStatus.DecimalLocator))
 
 	// Parse WS numeric fields
 	tradedQty := 0
-	if qty, err := strconv.Atoi(wsStatus.TradedQTY); err == nil {
+	if qty, err := strconv.Atoi(string(wsStatus.TradedQTY)); err == nil {
 		tradedQty = qty
 	}
 	tradedPriceStr := ""
@@ -395,7 +441,7 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		ExecutedPrice:   tradedPriceStr,
 		BrokerRef:       brokerRef,
 		TradedQty:       tradedQty,
-		PendingQty:      wsStatus.PendingQty,
+		PendingQty:      flexToInt(wsStatus.PendingQty),
 		OriginalQty:     wsStatus.OrderOriginalQty,
 		ExchangeOrderNo: wsStatus.OrderNumber,
 		OrderEntryTime:  wsStatus.OrderEntryTime,
@@ -507,7 +553,7 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 			zap.String("broker_ref", brokerRef),
 			zap.String("traded_price", tradedPriceStr),
 			zap.Int("traded_qty", tradedQty),
-			zap.Int("pending_qty", wsStatus.PendingQty),
+			zap.Int("pending_qty", flexToInt(wsStatus.PendingQty)),
 			zap.String("reason", wsStatus.Reason),
 		)
 	}

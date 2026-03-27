@@ -545,6 +545,59 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 	return tx.Commit()
 }
 
+// DeactivateAllActive deactivates every active, non-deleted strategy in a single
+// transaction and writes one STRATEGY_DEACTIVATED outbox entry per strategy.
+// Returns the number of strategies that were deactivated.
+func (r *StrategyRepository) DeactivateAllActive(ctx context.Context) (int, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Bulk-deactivate all active strategies and capture their IDs/user/version.
+	type deactivatedRow struct {
+		StrategyID uuid.UUID `db:"strategy_id"`
+		UserID     string    `db:"user_id"`
+		Version    int64     `db:"version"`
+	}
+
+	updateQuery := `
+		UPDATE strategies
+		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
+		WHERE active = true AND deleted_at IS NULL
+		RETURNING strategy_id, user_id, version`
+
+	rows := []deactivatedRow{}
+	if err := tx.SelectContext(ctx, &rows, updateQuery); err != nil {
+		return 0, fmt.Errorf("failed to bulk-deactivate strategies: %w", err)
+	}
+
+	if len(rows) == 0 {
+		return 0, tx.Commit()
+	}
+
+	// Insert one outbox event per deactivated strategy.
+	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
+	for _, row := range rows {
+		payload, _ := json.Marshal(map[string]interface{}{
+			"strategy_id": row.StrategyID,
+			"user_id":     row.UserID,
+			"version":     row.Version,
+			"active":      false,
+		})
+		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", payload); err != nil {
+			return 0, fmt.Errorf("failed to insert outbox entry for strategy %s: %w", row.StrategyID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit bulk deactivation: %w", err)
+	}
+
+	return len(rows), nil
+}
+
 // GetByIDs retrieves multiple strategies by their IDs
 func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UUID) ([]*models.Strategy, error) {
 	if len(strategyIDs) == 0 {

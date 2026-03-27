@@ -71,7 +71,7 @@ func (c *ExecutionClient) resolveTickSize(exchange string, stockCode int64) floa
 	if c.tickSizeLookup == nil {
 		return 0
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	ts, err := c.tickSizeLookup.GetTickSize(ctx, exchange, stockCode)
 	if err != nil {
@@ -87,7 +87,7 @@ func (c *ExecutionClient) resolveDPR(exchange string, stockCode int64) (lower, u
 	if c.dprLookup == nil {
 		return 0, 0
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	lo, hi, err := c.dprLookup.GetDPR(ctx, exchange, stockCode)
 	if err != nil {
@@ -143,7 +143,7 @@ func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, a
 		return "", fmt.Errorf("broker accepted request but returned no order ID (message: %s)", resp.Message)
 	}
 
-	log.Printf("✓ Order placed successfully: OrderID=%s", orderID)
+	log.Printf("✓ Order submitted to broker: OrderID=%s (awaiting WS confirmation)", orderID)
 	return orderID, nil
 }
 

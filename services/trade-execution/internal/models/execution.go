@@ -192,6 +192,8 @@ type TradeSignal struct {
 
 	// Stop loss configuration
 	StopLossType  string  `json:"stop_loss_type"`  // "FIXED" or "TRAILING"
+	StopLossPct   float64 `json:"stop_loss_pct"`   // Original SL percentage from strategy
+	TakeProfitPct float64 `json:"take_profit_pct"` // Original TP percentage from strategy
 	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing stop loss percentage
 
 	// Product type

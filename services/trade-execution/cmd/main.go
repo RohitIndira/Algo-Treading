@@ -18,6 +18,7 @@ import (
 
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/lifecycle"
@@ -81,6 +82,7 @@ func main() {
 		indiraClient,
 		kafkaPub,
 		statusService,
+		logger,
 		cfg.MaxRetries,
 		cfg.RetryDelay,
 	)
@@ -278,43 +280,58 @@ func main() {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	// Initialize PriceMonitor for below_min orders (Case 2).
-	// Monitors Redis LTP and triggers bracket order placement when target price is reached.
+	// Primary: WebSocket (enhanced-stream) for real-time push prices.
+	// Fallback: Redis MGET polling for any tokens not covered by WSS.
 	var priceMonitorRef *scheduler.PriceMonitor
-	if redisPrices != nil {
+	var priceMonitorWSClient *marketws.Client
+	{
 		priceMonitorRef = scheduler.NewPriceMonitor(
-			redisPrices,   // satisfies scheduler.LTPProvider (GetLTP + GetLTPs)
+			redisPrices,   // Redis fallback (nil-safe)
 			orderRepo,
 			kafkaPub,
 			orderExecutor, // satisfies scheduler.OrderExecutorFunc interface
-			100*time.Millisecond, // poll interval (reduced from 500ms for lower latency)
+			100*time.Millisecond, // check interval for evaluating WSS-cached prices
 		)
+
+		// Wire WebSocket market data client as primary price source (started later with ctx)
+		priceMonitorWSClient = marketws.New(cfg.PaperMarketWSURL)
+		priceMonitorRef.SetWSClient(priceMonitorWSClient)
+		// Event-driven: WSS tick → immediate evaluation (no polling delay)
+		priceMonitorWSClient.SetOnPriceUpdate(priceMonitorRef.OnPriceUpdate)
+
 		signalProcessor.SetPriceMonitor(priceMonitorRef)
 		strategyEventsConsumer.SetPriceMonitor(priceMonitorRef)
 		paperWSServer.SetPriceMonitor(priceMonitorRef)
 		priceMonitorRef.SetOnTickDone(paperWSServer.BroadcastPriceWatches)
-		log.Println("✓ Price Monitor initialized (100ms poll interval)")
-	} else {
-		log.Println("⚠ Price Monitor disabled (Redis not available) — below_min orders will be placed immediately")
+		log.Println("✓ Price Monitor initialized (WSS primary, Redis fallback, 100ms check interval)")
 	}
 
 	// ── OCO (One-Cancels-the-Other) Layer ─────────────────────────────────
 	log.Println("Initializing OCO order management layer...")
 	ocoManager := oco.NewOCOManager(orderRepo, indiraClient)
+	ocoManager.SetCredentialsCache(orderExecutor.CredentialsCache())
 
-	// Wire OCO manager → frontend WS so OCO events appear in real-time
+	// Wire OCO manager → frontend WS so OCO events appear in real-time.
+	// Some OCO events (oco_legs_confirmed, oco_completed) have no order attached —
+	// broadcast them anyway so the UI can update OCO group state.
 	ocoManager.SetWSBroadcaster(func(userID string, eventType string, order *models.Order) {
-		if order != nil {
-			paperWSServer.BroadcastLiveOrder(userID, paper.LiveOrderUpdate{
-				Type:   eventType,
-				UserID: userID,
-				Order:  order,
-			})
-		}
+		paperWSServer.BroadcastLiveOrder(userID, paper.LiveOrderUpdate{
+			Type:   eventType,
+			UserID: userID,
+			Order:  order,
+		})
 	})
 
 	// Wire OCO handler into StatusService — every broker WS event is checked
 	// for OCO group membership (entry fill → place legs, leg fill → cancel other)
 	statusService.SetOCOHandler(ocoManager)
+
+	// Wire OCO canceller into WS server — force-exit-all cancels OCO legs too
+	paperWSServer.SetOCOCanceller(ocoManager)
+
+	// Wire OCO manager into SignalProcessor — trailing SL signals are routed
+	// to the custom OCO system instead of broker's native bracket order.
+	signalProcessor.SetOCOManager(ocoManager)
 
 	// OCO market data WSS client (enhanced-stream binary, primary price source for trailing SL)
 	ocoMarketClient := oco.NewOCOMarketClient(cfg.PaperMarketWSURL, nil) // callback wired below
@@ -421,7 +438,13 @@ func main() {
 		}
 	}()
 
-	// Start PriceMonitor for below_min orders
+	// Start PriceMonitor WSS client + price monitor for below_min orders
+	if priceMonitorWSClient != nil {
+		go func() {
+			log.Println("Starting Price Monitor WSS client...")
+			priceMonitorWSClient.Start(ctx)
+		}()
+	}
 	if priceMonitorRef != nil {
 		go func() {
 			log.Println("Starting Price Monitor...")

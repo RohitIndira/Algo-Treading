@@ -297,22 +297,32 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 	slPct := strategy.TradeConfig.StopLossPct
 	tpPct := strategy.TradeConfig.TakeProfitPct
+	isTrailingSL := strategy.TradeConfig.StopLossType == "TRAILING"
 
 	switch match.PctChangeStatus {
 	case "within_range":
-		// ── Case 1: immediate BRACKET + LIMIT execution ─────────────
+		// ── Case 1: immediate execution ──────────────────────────────
 		// Limit price = LTP + 0.5% buffer to cross the spread.
 		limitPrice := roundToTickSize(ltp*1.005, tickSize)
 
 		orderReq.OrderType = "LIMIT"
-		orderReq.ProductType = "BRACKET"
 		orderReq.Price = limitPrice
 
-		// SL/TP from buying (limit) price — exact user percentage.
-		orderReq.StopLoss = roundToTickSize(limitPrice*(1-slPct/100), tickSize)
-		orderReq.TakeProfit = roundToTickSize(limitPrice*(1+tpPct/100), tickSize)
+		if isTrailingSL {
+			// Trailing SL → route to custom OCO in trade-execution.
+			// Use INTRADAY (not BRACKET) because OCO places SL+TP legs separately.
+			orderReq.ProductType = "INTRADAY"
+		} else {
+			// Fixed SL → use broker's native bracket order.
+			orderReq.ProductType = "BRACKET"
+		}
 
-		h.logger.Info("Case 1: pct_change within range — immediate BRACKET+LIMIT order",
+		// SL/TP from the trigger price (LTP) — the actual entry target.
+		// limitPrice is just a buffer to ensure fill, not the base for risk.
+		orderReq.StopLoss = roundToTickSize(ltp*(1-slPct/100), tickSize)
+		orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
+
+		h.logger.Info("Case 1: pct_change within range — immediate order",
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("order_type", orderReq.OrderType),
 			zap.Float64("current_pct_change", event.MarketData.PctChange),
@@ -352,12 +362,20 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		}
 
 		orderReq.OrderType = "STOP_LOSS"
-		orderReq.ProductType = "BRACKET"
 		orderReq.Price = targetMonitorPrice // PriceMonitor watches this level
 
-		// SL/TP from the actual buying price (limit price with buffer).
-		orderReq.StopLoss = roundToTickSize(limitPrice*(1-slPct/100), tickSize)
-		orderReq.TakeProfit = roundToTickSize(limitPrice*(1+tpPct/100), tickSize)
+		if isTrailingSL {
+			// Trailing SL → route to custom OCO in trade-execution.
+			orderReq.ProductType = "INTRADAY"
+		} else {
+			// Fixed SL → PriceMonitor will place broker bracket order.
+			orderReq.ProductType = "BRACKET"
+		}
+
+		// SL/TP from the trigger price (targetMonitorPrice) — the actual entry target.
+		// limitPrice is just a buffer to ensure fill, not the base for risk.
+		orderReq.StopLoss = roundToTickSize(targetMonitorPrice*(1-slPct/100), tickSize)
+		orderReq.TakeProfit = roundToTickSize(targetMonitorPrice*(1+tpPct/100), tickSize)
 
 		// Max monitor price (upper bound).
 		maxPct := strategy.Conditions.MaxPctChange

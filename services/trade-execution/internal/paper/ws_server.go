@@ -98,6 +98,12 @@ type EnrichedAlgoPosition struct {
 // bearerToken, appId, userId, source come from the frontend request headers.
 type PositionsFetcher func(ctx context.Context, bearerToken, appId, userId, source string) ([]BrokerPosition, error)
 
+// OCOCanceller cancels all active OCO groups for a user.
+// Implemented by oco.OCOManager; defined here as an interface to avoid import cycles.
+type OCOCanceller interface {
+	CancelAllGroupsByUser(ctx context.Context, userID string)
+}
+
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  1024,
@@ -118,6 +124,9 @@ type PaperWSServer struct {
 	priceMonitor       *scheduler.PriceMonitor
 	lastWatchBroadcast time.Time // throttle WS broadcasts
 
+	// ocoCanceller cancels active OCO groups on force-exit.
+	ocoCanceller OCOCanceller
+
 	// Paper trade clients: sync.Map[userID string → *sync.Map[*websocket.Conn → *sync.Mutex]]
 	// Lock-free reads on the hot path (Broadcast).
 	clients sync.Map
@@ -136,6 +145,11 @@ func NewPaperWSServer(repo repository.OrderRepository) *PaperWSServer {
 // SetMonitor wires the monitor (must be called after both are created to break circular dep).
 func (s *PaperWSServer) SetMonitor(m *PaperTradeMonitor) {
 	s.monitor = m
+}
+
+// SetOCOCanceller wires the OCO canceller for force-exit cleanup.
+func (s *PaperWSServer) SetOCOCanceller(c OCOCanceller) {
+	s.ocoCanceller = c
 }
 
 // SetPositionsFetcher wires the Indira positions fetcher used by the indira-positions endpoint.
@@ -488,6 +502,11 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 		if err := s.repo.UpdateLiveTradeExit(r.Context(), order.OrderID, exitPrice, pnl); err != nil {
 			log.Printf("[live-ws] Failed to record exit for order %s: %v", order.OrderID, err)
 		}
+	}
+
+	// Cancel all active OCO groups — their SL/TP legs must be removed from exchange
+	if s.ocoCanceller != nil {
+		s.ocoCanceller.CancelAllGroupsByUser(r.Context(), body.UserID)
 	}
 
 	// Broadcast completion to all connected live order WS clients for this user

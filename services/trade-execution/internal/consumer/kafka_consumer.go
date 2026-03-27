@@ -17,7 +17,7 @@ import (
 
 // TradeSignalProcessor processes incoming trade signals
 type TradeSignalProcessor interface {
-	ProcessTradeSignal(ctx context.Context, signal *models.TradeSignal) error
+	ProcessTradeSignal(ctx context.Context, signal *models.TradeSignal, kafkaTime time.Time) error
 }
 
 // KafkaConsumer consumes trade signals from Kafka
@@ -39,9 +39,10 @@ func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalPro
 		Brokers:        brokers,
 		Topic:          "trade-signals",
 		GroupID:        groupID,
-		MinBytes:       10e3,  // 10KB — allows micro-batching at the broker level
-		MaxBytes:       10e6,  // 10MB
-		CommitInterval: 100 * time.Millisecond,
+		MinBytes:       1,                      // return immediately even for a single message
+		MaxBytes:       10e6,                    // 10MB upper bound
+		MaxWait:        50 * time.Millisecond,   // never wait more than 50ms for messages
+		CommitInterval: 50 * time.Millisecond,   // commit offsets faster
 		StartOffset:    kafka.LastOffset,
 	})
 
@@ -129,32 +130,25 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 
 // processMessage processes a single Kafka message
 func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) error {
-	c.logger.Debug("Processing trade signal message",
-		zap.Int("partition", msg.Partition),
-		zap.Int64("offset", msg.Offset))
+	// Measure delay from Kafka message timestamp to processing start
+	if !msg.Time.IsZero() {
+		metrics.SignalKafkaDelay.Observe(time.Since(msg.Time).Seconds())
+	}
 
-	// Parse trade signal
 	var signal models.TradeSignal
 	if err := json.Unmarshal(msg.Value, &signal); err != nil {
 		return fmt.Errorf("failed to unmarshal trade signal: %w", err)
 	}
 
-	c.logger.Info("Trade signal received",
-		zap.String("order_id", signal.OrderID),
-		zap.String("user_id", signal.UserID),
-		zap.String("symbol", signal.Symbol),
-		zap.Int64("stock_code", signal.StockCode),
-		zap.String("order_type", signal.OrderType),
-		zap.Float64("price", signal.Price),
-		zap.String("trading_mode", signal.TradingMode))
+	c.logger.Info("signal_received",
+		zap.String("oid", signal.OrderID),
+		zap.String("uid", signal.UserID),
+		zap.String("sym", signal.Symbol),
+		zap.String("mode", signal.TradingMode))
 
-	// Process the signal
-	if err := c.processor.ProcessTradeSignal(ctx, &signal); err != nil {
+	if err := c.processor.ProcessTradeSignal(ctx, &signal, msg.Time); err != nil {
 		return fmt.Errorf("failed to process trade signal: %w", err)
 	}
-
-	c.logger.Info("Trade signal processed successfully",
-		zap.String("order_id", signal.OrderID))
 
 	return nil
 }

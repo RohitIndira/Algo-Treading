@@ -40,6 +40,8 @@ type OrderRequest struct {
 
 	// Stop loss configuration
 	StopLossType  string  `json:"stop_loss_type"`  // "FIXED" or "TRAILING"
+	StopLossPct   float64 `json:"stop_loss_pct"`   // Original SL percentage from strategy
+	TakeProfitPct float64 `json:"take_profit_pct"` // Original TP percentage from strategy
 	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing stop loss percentage
 
 	// Product type
@@ -93,12 +95,17 @@ type RuleMatch struct {
 func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *OrderRequest {
 	orderID := uuid.New().String()
 
-	// Default product type to INTRADAY if not specified.
-	// When OrderType is BRACKET, ensure ProductType is also BRACKET so the
-	// downstream convertToIndiraRequest correctly builds bracket order legs.
+	// Resolve product type based on OrderType and StopLossType:
+	//   - Fixed SL + BRACKET OrderType  → BRACKET (broker-native bracket order)
+	//   - Trailing SL                   → INTRADAY (custom OCO manages SL/TP legs)
+	//   - Everything else               → user-configured or INTRADAY default
 	productType := strategy.TradeConfig.ProductType
 	if strategy.TradeConfig.OrderType == "BRACKET" {
-		productType = "BRACKET"
+		if strategy.TradeConfig.StopLossType == "TRAILING" {
+			productType = "INTRADAY"
+		} else {
+			productType = "BRACKET"
+		}
 	} else if productType == "" {
 		productType = "INTRADAY"
 	}
@@ -142,6 +149,8 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 
 		// Stop loss configuration
 		StopLossType:  stopLossType,
+		StopLossPct:   strategy.TradeConfig.StopLossPct,
+		TakeProfitPct: strategy.TradeConfig.TakeProfitPct,
 		TrailingSLPct: strategy.TradeConfig.TrailingSLPct,
 
 		// Product type

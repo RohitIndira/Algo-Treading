@@ -158,3 +158,67 @@ var (
 		Help:      "Number of tasks queued in the worker pool buffer.",
 	})
 )
+
+// ── Component timing (signal flow) ─────────────────────────────────────────
+// These histograms measure how long each component takes in the hot path,
+// from signal arrival to broker submission.
+
+var (
+	// SignalKafkaDelay measures the time between Kafka message timestamp
+	// and the moment we start processing it (queue + pool wait time).
+	SignalKafkaDelay = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "trade_execution",
+		Name:      "signal_kafka_delay_seconds",
+		Help:      "Delay from Kafka message timestamp to processing start.",
+		Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 5},
+	})
+
+	// SignalDBPersistDuration measures order creation (INSERT) latency.
+	SignalDBPersistDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "trade_execution",
+		Name:      "signal_db_persist_seconds",
+		Help:      "Time to persist a new order to PostgreSQL.",
+		Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5},
+	})
+
+	// SignalRouteDuration measures time in SignalProcessor routing, labeled by route.
+	SignalRouteDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "trade_execution",
+		Name:      "signal_route_seconds",
+		Help:      "Time from signal processing start to handoff to route (oco, price_monitor, executor).",
+		Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
+	}, []string{"route"})
+
+	// BrokerAPICallDuration measures a single PlaceOrder API call (no retries).
+	BrokerAPICallDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "trade_execution",
+		Name:      "broker_api_call_seconds",
+		Help:      "Duration of a single broker PlaceOrder API call (excludes retries).",
+		Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	})
+
+	// CredentialLookupDuration measures credential fetch time.
+	CredentialLookupDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "trade_execution",
+		Name:      "credential_lookup_seconds",
+		Help:      "Time to resolve broker credentials (signal, cache, or db).",
+		Buckets:   []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1},
+	}, []string{"source"}) // source = "signal" | "cache" | "db"
+
+	// SignalEndToEndDuration measures total time from Kafka message timestamp
+	// to order submitted to broker (or routed to price monitor / OCO).
+	SignalEndToEndDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "trade_execution",
+		Name:      "signal_end_to_end_seconds",
+		Help:      "Total time from Kafka message creation to order fully processed.",
+		Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	}, []string{"route"})
+
+	// StatusUpdateProcessDuration measures time to process a broker WS status update.
+	StatusUpdateProcessDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "trade_execution",
+		Name:      "status_update_process_seconds",
+		Help:      "Time to process a single broker WS status update (DB lookup + update + publish).",
+		Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5},
+	})
+)
