@@ -48,8 +48,8 @@ type PlaceOrderRequest struct {
 	OrdValidity  string    `json:"ordValidity"`  // "DAY", "IOC"
 	OrdType      string    `json:"ordType"`      // "Market", "Limit", "SL", "SL-M"
 	PrdType      string    `json:"prdType"`      // "INTRADAY", "DELIVERY", "CASH"
-	LimitPrice   Price2DP  `json:"limitPrice"`   // Limit price — emits "5911.30" not "5911.3"
-	TriggerPrice Price2DP  `json:"triggerPrice"` // Trigger price — always 2 decimal places
+	LimitPrice   Price2DP  `json:"limitPrice"`             // Limit price — emits "5911.30" not "5911.3"
+	TriggerPrice Price2DP  `json:"triggerPrice,omitempty"` // Trigger price — omitted when 0 (Limit/Market orders); broker rejects triggerPrice:0 on non-SL orders
 	Qty          int       `json:"qty"`          // Quantity
 	DisQty       int       `json:"disQty"`       // Disclosed quantity
 	LotSize      int       `json:"lotSize"`      // Lot size
@@ -133,19 +133,23 @@ type OrderTrailRequest struct {
 	Instrument string `json:"instrument"` // Instrument type
 }
 
-// TradeBook represents a trade in the trade book
+// TradeBook represents a trade in the trade book.
+// Field names match the Indira broker API response (data.trades[]).
 type TradeBook struct {
-	TradeId    string  `json:"tradeId,omitempty"`
-	OrdId      string  `json:"ordId,omitempty"`
-	Symbol     string  `json:"symbol,omitempty"`
-	Exc        string  `json:"exc,omitempty"`
-	OrdAction  string  `json:"ordAction,omitempty"`
-	Qty        int     `json:"qty,omitempty"`
-	Price      float64 `json:"price,omitempty"`
-	TradeTime  string  `json:"tradeTime,omitempty"`
-	PrdType    string  `json:"prdType,omitempty"`
-	ExcToken   string  `json:"excToken,omitempty"`
-	Instrument string  `json:"instrument,omitempty"`
+	OrdId      string      `json:"ordId,omitempty"`
+	ExchTrdId  interface{} `json:"exchTrdId,omitempty"`
+	ExchOrdId  string      `json:"exchOrdId,omitempty"`
+	PrdType    string      `json:"prdType,omitempty"`
+	OrdAction  string      `json:"ordAction,omitempty"`
+	OrdType    string      `json:"ordType,omitempty"`
+	// TradedPrice is the actual exchange fill price (authoritative).
+	TradedPrice float64 `json:"tradedPrice,omitempty"`
+	TradeTime   string  `json:"tradeTime,omitempty"` // e.g. "2026-03-30 11:57:08"
+	TradedQty   int     `json:"tradedQty,omitempty"`
+	RemainQty   int     `json:"remainQty,omitempty"`
+	Qty         int     `json:"qty,omitempty"`
+	Symbol      interface{} `json:"symbol,omitempty"` // complex object from broker
+	UndAsset    string  `json:"undAsset,omitempty"`
 }
 
 // Holding represents a holding in the portfolio

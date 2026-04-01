@@ -160,6 +160,7 @@ func (s *AutoSquareOffScheduler) createSquareOffOrder(ctx context.Context, origi
 	squareOffOrder := &models.Order{
 		UserID:       originalOrder.UserID,
 		StrategyID:   originalOrder.StrategyID,
+		StrategyName: originalOrder.StrategyName,
 		StockCode:    originalOrder.StockCode,
 		Exchange:     originalOrder.Exchange,
 		Symbol:       originalOrder.Symbol,

@@ -47,11 +47,13 @@ func NewRouter(
 		api.HandleFunc("/paper-trades/positions", paperHandler.GetPaperPositions).Methods("GET")
 		api.HandleFunc("/paper-trades/closed-orders", paperHandler.GetClosedPaperOrders).Methods("GET")
 		api.HandleFunc("/paper-trades/force-exit-all", paperHandler.ForceExitAll).Methods("POST")
+		api.HandleFunc("/paper-trades/force-exit-strategy", paperHandler.ForceExitStrategy).Methods("POST")
 		api.HandleFunc("/paper-trades/ws-info", paperHandler.GetPaperWSInfo).Methods("GET")
 		// Live orders endpoints
 		api.HandleFunc("/live-orders", paperHandler.GetLiveOrders).Methods("GET")
 		api.HandleFunc("/live-orders/closed-orders", paperHandler.GetClosedLiveOrders).Methods("GET")
 		api.HandleFunc("/live-orders/force-exit-all", paperHandler.ForceExitAllLive).Methods("POST")
+		api.HandleFunc("/live-orders/force-exit-strategy", paperHandler.ForceExitStrategyLive).Methods("POST")
 		api.HandleFunc("/live-orders/indira-positions", paperHandler.GetIndiraPositions).Methods("GET")
 		api.HandleFunc("/live-orders/subscribe-broker-ws", paperHandler.SubscribeBrokerWS).Methods("POST")
 		api.HandleFunc("/live-orders/price-watches", paperHandler.GetPriceWatches).Methods("GET")

@@ -537,12 +537,12 @@ func (t *TrailingMonitor) evaluateTrailing(group *OCOGroup, ltp float64) {
 		return
 	}
 
-	// Update highest price in memory (protected by mutex)
-	if group.OrderSide == "BUY" && ltp > group.HighestPrice {
-		group.HighestPrice = ltp
-	} else if group.OrderSide == "SELL" && (ltp < group.HighestPrice || group.HighestPrice == 0) {
-		group.HighestPrice = ltp
-	}
+	// DO NOT update HighestPrice here — it must only be advanced after the
+	// broker modify succeeds. ModifySLLeg updates both SLTriggerPrice and
+	// HighestPrice atomically under the group mutex on success.
+	// If we updated HighestPrice here and ModifySLLeg failed, the mismatch
+	// between advanced HighestPrice and stale SLTriggerPrice would permanently
+	// stall the trailing SL (changePct would never reach the threshold again).
 
 	mu.Unlock()
 
@@ -550,7 +550,7 @@ func (t *TrailingMonitor) evaluateTrailing(group *OCOGroup, ltp float64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := t.ocoManager.ModifySLLeg(ctx, group, newTrigger, newLimit); err != nil {
+	if err := t.ocoManager.ModifySLLeg(ctx, group, newTrigger, newLimit, ltp); err != nil {
 		log.Printf("[oco-trailing] Failed to modify SL for group %s: %v", group.GroupID, err)
 	}
 }

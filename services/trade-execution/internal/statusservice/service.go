@@ -29,6 +29,9 @@ type OCOHandler interface {
 	// CancelGroupsBySymbol cancels all active OCO groups for a user+symbol.
 	// Used when a manual position exit is detected (order not in our DB).
 	CancelGroupsBySymbol(ctx context.Context, userID string, symbol string)
+	// IsKnownBrokerID returns true if the broker order ID belongs to an OCO group.
+	// Used to avoid false manual-exit detection when the DB write is still in-flight.
+	IsKnownBrokerID(brokerID string) bool
 }
 
 // OrderStatusService listens to a single shared WebSocket connection and
@@ -42,6 +45,14 @@ type OrderStatusService struct {
 	logger        *zap.Logger
 	wsBroadcaster func(userID string, order *models.Order)
 	ocoHandler    OCOHandler // OCO order management hook
+
+	// tokenExpiredNotifier is called when a user's token is confirmed expired (30s retry also failed).
+	// Wired in main.go to push a token_expired event via /ws/live-orders.
+	tokenExpiredNotifier func(userID string)
+
+	// onOrderFilled is called when an order status becomes EXECUTED/TRADED.
+	// Wired in main.go to fetch and push updated positions via /ws/live-orders.
+	onOrderFilled func(userID string, auth *indiraClient.AuthContext)
 
 	// Single shared WS client. Protected by wsMu for first-connect init only.
 	wsMu             sync.Mutex
@@ -58,6 +69,34 @@ type OrderStatusService struct {
 // to the frontend immediately via /ws/live-orders.
 func (s *OrderStatusService) SetWSBroadcaster(fn func(userID string, order *models.Order)) {
 	s.wsBroadcaster = fn
+}
+
+// SetTokenExpiredNotifier wires a callback invoked when a user's broker token is
+// confirmed expired (the 30s first retry also got 401). Used to push token_expired
+// events to the frontend via /ws/live-orders so the user can be prompted to re-login.
+func (s *OrderStatusService) SetTokenExpiredNotifier(fn func(userID string)) {
+	s.tokenExpiredNotifier = fn
+}
+
+// SetOnOrderFilled wires a callback invoked after each EXECUTED/TRADED broker update.
+// The callback receives the userID and current auth so the caller can fetch and push
+// fresh positions to the frontend via /ws/live-orders.
+func (s *OrderStatusService) SetOnOrderFilled(fn func(userID string, auth *indiraClient.AuthContext)) {
+	s.onOrderFilled = fn
+}
+
+// ResumeUserSubscription supplies a fresh AuthContext after the user re-logins.
+// It updates the stored auth and tells the shared WS client to reconnect immediately.
+func (s *OrderStatusService) ResumeUserSubscription(userID string, auth *indiraClient.AuthContext) {
+	authCopy := *auth
+	s.subscriberAuths.Store(userID, &authCopy)
+	s.wsMu.Lock()
+	ws := s.wsClient
+	s.wsMu.Unlock()
+	if ws != nil {
+		ws.ResumeWithNewAuth(&authCopy)
+		s.logger.Info("Auth resume sent to WS client", zap.String("user_id", userID))
+	}
 }
 
 // SetOCOHandler wires the OCO manager so every broker WS status update is
@@ -105,6 +144,19 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 		// On 401, reload credentials from DB so the WS can recover
 		// without waiting for the user to place a new order.
 		s.wsClient.OnAuthRefresh = s.refreshAuthFromDB
+		// On confirmed token expiry (30s retry also failed), notify ALL subscribed users.
+		// The shared WS represents all users — when it can't reconnect, every user loses
+		// real-time order updates and should be prompted to re-login.
+		s.wsClient.OnTokenExpired = func(_ string) {
+			if s.tokenExpiredNotifier == nil {
+				return
+			}
+			s.subscriberAuths.Range(func(key, _ any) bool {
+				userID := key.(string)
+				go s.tokenExpiredNotifier(userID)
+				return true
+			})
+		}
 	}
 
 	// Ensure the update processor goroutine is always running.
@@ -223,13 +275,28 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 
 	order, err := s.repo.GetByIndiraOrderID(ctx, indiraID)
 	if err != nil {
-		// Not our order (placed outside this system).
-		// Check if this is a manual position exit — if so, cancel active OCO groups for this symbol.
+		// Order not in DB yet — race between background DB persist and WS callback.
+		// Retry after a short delay: our system's exit/OCO orders may still be writing.
+		isKnownOCO := s.ocoHandler != nil && s.ocoHandler.IsKnownBrokerID(indiraID)
 		brokerStatusUpper := strings.ToUpper(strings.TrimSpace(wsStatus.OrderStatus))
-		if (brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED") && wsStatus.Symbol != "" && s.ocoHandler != nil {
-			s.handleManualExitDetection(ctx, wsStatus)
+		isFill := brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED"
+
+		// Always retry once after 500ms — handles force-exit orders, OCO legs,
+		// and any other orders where the DB write races the broker WS callback.
+		time.Sleep(500 * time.Millisecond)
+		order, err = s.repo.GetByIndiraOrderID(ctx, indiraID)
+		if err != nil {
+			if isKnownOCO {
+				s.logger.Warn("OCO broker ID recognised in memory but DB lookup still failed after retry",
+					zap.String("broker_id", indiraID),
+					zap.Error(err))
+			} else if isFill && wsStatus.Symbol != "" && s.ocoHandler != nil {
+				// Genuinely not our order — manual exit from broker app.
+				s.handleManualExitDetection(ctx, wsStatus)
+			}
+			return
 		}
-		return
+		// Fall through — process the order normally below.
 	}
 
 	// ── Store raw broker data exactly as received ──────────────────────────
@@ -310,16 +377,22 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		order.FilledPrice = &price
 	}
 
-	// Mark execution time for filled orders
-	if brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED" {
-		now := time.Now()
-		order.ExecutedAt = &now
-	}
-
 	// Update order price from broker
 	if wsStatus.OrderPrice != "" {
 		if oprice, err := strconv.ParseFloat(wsStatus.OrderPrice, 64); err == nil && oprice > 0 {
 			order.Price = &oprice
+			// Fallback: if traded_price was 0 but order is filled, use order_price as fill price.
+			// Indira broker sometimes sends traded_price=0.00 even on EXECUTED status.
+			if order.FilledPrice == nil && (brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED") {
+				order.FilledPrice = &oprice
+			}
+		}
+	}
+
+	// Mark execution time using broker's OrderTimeStamp from WSS (e.g. "18-Mar-2026 15:12:30")
+	if brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED" {
+		if brokerTime := parseBrokerTime(wsStatus.OrderTimeStamp); !brokerTime.IsZero() {
+			order.ExecutedAt = &brokerTime
 		}
 	}
 
@@ -354,6 +427,15 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	if s.wsBroadcaster != nil {
 		orderCopy := *order
 		s.wsBroadcaster(orderCopy.UserID, &orderCopy)
+	}
+
+	// On fill: push updated positions to frontend via /ws/live-orders so the
+	// frontend doesn't need to poll the positions REST API.
+	if (brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED") && s.onOrderFilled != nil {
+		if authVal, ok := s.subscriberAuths.Load(order.UserID); ok {
+			auth := authVal.(*indiraClient.AuthContext)
+			go s.onOrderFilled(order.UserID, auth)
+		}
 	}
 
 	// ── OCO hook: check if this order is part of an OCO group ────────────
@@ -404,6 +486,24 @@ func decimalLocator(dl string) float64 {
 		return v
 	}
 	return 1
+}
+
+// parseBrokerTime parses an Indira broker OrderTimeStamp string into time.Time (IST).
+// Expected format: "18-Mar-2026 15:12:30" (DD-Mon-YYYY HH:MM:SS).
+// Returns zero time if the string is empty or does not match.
+func parseBrokerTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	ist, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		ist = time.FixedZone("IST", 5*3600+30*60)
+	}
+	t, err := time.ParseInLocation("02-Jan-2006 15:04:05", s, ist)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 func (s *OrderStatusService) publishNotification(ctx context.Context, order *models.Order, wsStatus *indiraClient.WSOrderStatus) {

@@ -356,6 +356,7 @@ func (c *RabbitMQConsumer) convertToOrder(req *models.OrderRequest) *models.Orde
 		OrderID:      orderID,
 		UserID:       req.UserID,
 		StrategyID:   req.StrategyID,
+		StrategyName: req.StrategyName,
 		EventID:      eventID,
 		StockCode:    req.StockCode,
 		Exchange:     models.Exchange(req.Exchange),

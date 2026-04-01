@@ -145,6 +145,33 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 	if err != nil {
 		return fmt.Errorf("order execution failed: %w", err)
 	}
+
+	// If a trailing-SL order reached Route 3 (e.g. auth was unavailable at
+	// Route 1 check but the executor resolved it from cache), the position
+	// has no OCO protection. Retroactively adopt the placed order into an
+	// OCO group so that handleEntryUpdate fires on the WS EXECUTED event
+	// and places SL/TP legs from the actual fill price.
+	if isTrailingSL && p.ocoManager != nil && order.IndiraOrderID != nil {
+		var auth *indiraClient.AuthContext
+		if order.BearerToken != nil && order.AppId != nil && order.Source != nil {
+			auth = &indiraClient.AuthContext{
+				UserId:      order.UserID,
+				BearerToken: *order.BearerToken,
+				AppId:       *order.AppId,
+				Source:      *order.Source,
+			}
+		}
+		trailPct := 0.0
+		if order.TrailingSLPct != nil {
+			trailPct = *order.TrailingSLPct
+		}
+		p.ocoManager.AdoptOrder(order, signal.StopLossPct, signal.TakeProfitPct, trailPct, auth)
+		p.logger.Info("Trailing SL order adopted into OCO after Route 3 placement",
+			zap.String("order_id", order.OrderID.String()),
+			zap.String("broker_id", *order.IndiraOrderID),
+			zap.String("symbol", order.Symbol))
+	}
+
 	return nil
 }
 
@@ -320,6 +347,7 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 		OrderID:      orderID,
 		UserID:       signal.UserID,
 		StrategyID:   signal.StrategyID,
+		StrategyName: signal.StrategyName,
 		EventID:      eventID,
 		StockCode:    signal.StockCode,
 		Exchange:     models.Exchange(signal.Exchange),

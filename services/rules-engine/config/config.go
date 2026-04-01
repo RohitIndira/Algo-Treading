@@ -43,6 +43,14 @@ type Config struct {
 
 	// Market Hours Configuration
 	MarketHours MarketHoursConfig
+
+	// MongoDB Configuration (for trading holidays)
+	MongoDB MongoDBConfig
+}
+
+// MongoDBConfig holds MongoDB connection configuration
+type MongoDBConfig struct {
+	URI string
 }
 
 // KafkaConfig holds Kafka-specific configuration
@@ -265,6 +273,10 @@ func LoadConfig() (*Config, error) {
 		},
 
 		UserConfigGRPCAddr: getEnv("USER_CONFIG_GRPC_ADDR", getEnv("USER_CONFIG_SERVICE_ADDR", "localhost:50051")),
+
+		MongoDB: MongoDBConfig{
+			URI: getEnv("MONGODB_URI", "mongodb://localhost:27017"),
+		},
 	}
 
 	// Validate configuration

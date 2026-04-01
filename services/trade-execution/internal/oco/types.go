@@ -1,6 +1,7 @@
 package oco
 
 import (
+	"context"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
@@ -103,8 +104,18 @@ type OCOGroup struct {
 	Validity    string `json:"validity"`     // DAY
 
 	// ── Strategy context ────────────────────────────────────────────────────
-	StrategyID string `json:"strategy_id,omitempty"`
-	EventID    uuid.UUID `json:"event_id,omitempty"`
+	StrategyID   string    `json:"strategy_id,omitempty"`
+	StrategyName string    `json:"strategy_name,omitempty"`
+	EventID      uuid.UUID `json:"event_id,omitempty"`
+
+	// ── Partial Fill Tracking ───────────────────────────────────────────────
+	// When the entry order partially fills (e.g., 80 of 90), SL/TP legs are
+	// placed immediately for the filled qty. A timer waits for the remaining
+	// qty to fill; if it doesn't fill in time, the remaining entry is cancelled.
+	FilledQty               int32              `json:"filled_qty,omitempty"`          // Entry qty filled so far (legs placed for this qty)
+	PartialFillActive       bool               `json:"partial_fill_active,omitempty"` // True while waiting for remaining entry qty
+	PartialFillCancelFunc   context.CancelFunc `json:"-"`                             // Cancels the partial fill timeout goroutine
+	PartialFillTimerStarted bool               `json:"-"`                             // Prevents duplicate timer starts
 
 	// ── Timestamps ──────────────────────────────────────────────────────────
 	CreatedAt time.Time `json:"created_at"`

@@ -279,8 +279,8 @@ func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *model
 		effectiveMax = math.MaxFloat64
 	}
 
-	// Case 3 – above max: skip trade.
-	if absPctChange > effectiveMax {
+	// Case 3 – at or above max: skip trade.
+	if absPctChange >= effectiveMax {
 		result.PctChangeStatus = PctChangeAboveMax
 		result.FailedConditions = append(result.FailedConditions, condition)
 		result.ConditionScores[condition] = 0

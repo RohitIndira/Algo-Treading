@@ -73,6 +73,7 @@ func (h *PaperTradingHandler) ForceExitAll(w http.ResponseWriter, r *http.Reques
 }
 
 // ForceExitAllLive handles POST /api/v1/live-orders/force-exit-all
+// Forwards auth credentials so the trade-execution service can place exit orders at the broker.
 func (h *PaperTradingHandler) ForceExitAllLive(w http.ResponseWriter, r *http.Request) {
 	userID := r.Header.Get("userId")
 	if userID == "" {
@@ -80,10 +81,116 @@ func (h *PaperTradingHandler) ForceExitAllLive(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	payload, _ := json.Marshal(map[string]string{"user_id": userID})
+	bearerToken := r.Header.Get("Authorization")
+	if len(bearerToken) > 7 && bearerToken[:7] == "Bearer " {
+		bearerToken = bearerToken[7:]
+	}
+	appId := r.Header.Get("appId")
+	source := r.Header.Get("source")
+	if source == "" {
+		source = "WEB"
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"user_id":      userID,
+		"bearer_token": bearerToken,
+		"app_id":       appId,
+		"source":       source,
+	})
 
 	resp, err := http.Post(
 		h.tradeExecBaseURL+"/ws/live-orders/force-exit-all",
+		"application/json",
+		io.NopCloser(newReaderFrom(payload)),
+	)
+	if err != nil {
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// ForceExitStrategy handles POST /api/v1/paper-trades/force-exit-strategy
+// Exits all paper positions for a specific strategy.
+func (h *PaperTradingHandler) ForceExitStrategy(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("userId")
+	if userID == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
+
+	var reqBody struct {
+		StrategyID string `json:"strategy_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil || reqBody.StrategyID == "" {
+		respondWithError(w, http.StatusBadRequest, "strategy_id is required in request body")
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"user_id":     userID,
+		"strategy_id": reqBody.StrategyID,
+	})
+
+	resp, err := http.Post(
+		h.tradeExecBaseURL+"/ws/paper-trades/force-exit-strategy",
+		"application/json",
+		io.NopCloser(newReaderFrom(payload)),
+	)
+	if err != nil {
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// ForceExitStrategyLive handles POST /api/v1/live-orders/force-exit-strategy
+// Exits all live positions for a specific strategy by placing reverse limit orders at LTP ± 1%.
+func (h *PaperTradingHandler) ForceExitStrategyLive(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("userId")
+	if userID == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
+
+	bearerToken := r.Header.Get("Authorization")
+	if len(bearerToken) > 7 && bearerToken[:7] == "Bearer " {
+		bearerToken = bearerToken[7:]
+	}
+	appId := r.Header.Get("appId")
+	source := r.Header.Get("source")
+	if source == "" {
+		source = "WEB"
+	}
+
+	var reqBody struct {
+		StrategyID string `json:"strategy_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil || reqBody.StrategyID == "" {
+		respondWithError(w, http.StatusBadRequest, "strategy_id is required in request body")
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"user_id":      userID,
+		"strategy_id":  reqBody.StrategyID,
+		"bearer_token": bearerToken,
+		"app_id":       appId,
+		"source":       source,
+	})
+
+	resp, err := http.Post(
+		h.tradeExecBaseURL+"/ws/live-orders/force-exit-strategy",
 		"application/json",
 		io.NopCloser(newReaderFrom(payload)),
 	)

@@ -44,12 +44,22 @@ type OrderRepository interface {
 	UpdatePaperTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error
 	// Live trading
 	GetLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
+	GetAllTodayLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	GetClosedLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error
 	CancelAllLiveOrdersByUser(ctx context.Context, userID string) error
 	// Strategy-level cancellation (used on deactivate/delete)
 	GetActiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error)
 	CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error
+	// Strategy-level exit: filled live orders that haven't been exited yet
+	GetFilledLiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error)
+	// GetExitablePaperOrdersByStrategy returns paper orders for a strategy that were filled
+	// (have a filled_price) but haven't been exited yet — including CANCELLED orders
+	// (e.g. after strategy deletion) so force-exit still works.
+	GetExitablePaperOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error)
+	// GetExitableLiveOrdersByStrategy is like GetFilledLiveOrdersByStrategy but also
+	// includes CANCELLED orders that had been filled, so force-exit works after deletion.
+	GetExitableLiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error)
 	// Price monitor: pending STOP_LOSS orders waiting for price trigger
 	GetPendingMonitorOrders(ctx context.Context) ([]*models.Order, error)
 	// Dashboard stats
@@ -75,7 +85,7 @@ func NewOrderRepository(db *sqlx.DB) OrderRepository {
 func (r *orderRepository) Create(ctx context.Context, order *models.Order) error {
 	query := `
 		INSERT INTO orders (
-			order_id, user_id, strategy_id, event_id,
+			order_id, user_id, strategy_id, strategy_name, event_id,
 			stock_code, exchange, symbol,
 			order_type, order_side, quantity, price,
 			stop_loss, take_profit, validity, product_type,
@@ -83,14 +93,14 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			is_paper_trade, trading_mode,
 			retry_count, created_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-			$12, $13, $14, $15, $16, $17, $18, $19, $20,
-			$21, $22, $23
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+			$13, $14, $15, $16, $17, $18, $19, $20, $21,
+			$22, $23, $24
 		)
 	`
 
 	_, err := r.db.ExecContext(ctx, query,
-		order.OrderID, order.UserID, order.StrategyID, order.EventID,
+		order.OrderID, order.UserID, order.StrategyID, order.StrategyName, order.EventID,
 		order.StockCode, order.Exchange, order.Symbol,
 		order.OrderType, order.OrderSide, order.Quantity, order.Price,
 		order.StopLoss, order.TakeProfit, order.Validity, order.ProductType,
@@ -364,20 +374,40 @@ func (r *orderRepository) GetFilledPaperOrdersByUser(ctx context.Context, userID
 	return orders, nil
 }
 
-// GetLiveOrdersByUser retrieves live (non-paper) orders for a user.
-// Includes CANCELLED so exited positions still appear in the Indira positions view.
+// GetLiveOrdersByUser retrieves today's live (non-paper) orders for a user (IST date boundary).
+// CANCELLED orders are excluded — they are surfaced separately via GetClosedLiveOrdersByUser.
 func (r *orderRepository) GetLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	orders := make([]*models.Order, 0)
 	query := `
 		SELECT * FROM orders
 		WHERE user_id = $1
 		AND is_paper_trade = false
-		AND status IN ('FILLED', 'PARTIALLY_FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED', 'RECEIVED', 'PENDING', 'SUBMITTED', 'CANCELLED')
+		AND status IN ('FILLED', 'PARTIALLY_FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED', 'RECEIVED', 'PENDING', 'SUBMITTED')
+		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
 		ORDER BY created_at DESC
 	`
 	err := r.db.SelectContext(ctx, &orders, query, userID)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to get user live orders: %w", err)
+	}
+	return orders, nil
+}
+
+// GetAllTodayLiveOrdersByUser retrieves ALL of today's live (non-paper) orders regardless of status.
+// Used for position enrichment — matching broker positions to algo orders requires seeing
+// CANCELLED orders too (orders become CANCELLED after square-off/exit).
+func (r *orderRepository) GetAllTodayLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		AND is_paper_trade = false
+		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		ORDER BY created_at DESC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, userID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get all today's live orders: %w", err)
 	}
 	return orders, nil
 }
@@ -417,14 +447,19 @@ func (r *orderRepository) GetClosedPaperOrdersByUser(ctx context.Context, userID
 	return orders, nil
 }
 
-// GetClosedLiveOrdersByUser retrieves live orders that have been force-exited (live_exit_price IS NOT NULL)
+// GetClosedLiveOrdersByUser retrieves today's closed live orders (IST date boundary).
+// Covers both force-exited orders (live_exit_price IS NOT NULL) and CANCELLED orders placed today.
 func (r *orderRepository) GetClosedLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	orders := make([]*models.Order, 0)
 	query := `
 		SELECT * FROM orders
 		WHERE user_id = $1
 		AND is_paper_trade = false
-		AND live_exit_price IS NOT NULL
+		AND (
+			live_exit_price IS NOT NULL
+			OR status = 'CANCELLED'
+		)
+		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
 		ORDER BY updated_at DESC
 	`
 	err := r.db.SelectContext(ctx, &orders, query, userID)
@@ -593,6 +628,70 @@ func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strateg
 		return fmt.Errorf("failed to cancel orders for strategy %s user %s: %w", strategyID, userID, err)
 	}
 	return nil
+}
+
+// GetFilledLiveOrdersByStrategy returns filled live orders for a strategy that haven't been exited yet.
+// Used by strategy-level force-exit to place reverse limit orders at the broker.
+func (r *orderRepository) GetFilledLiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		AND strategy_id = $2
+		AND is_paper_trade = false
+		AND status IN ('FILLED', 'EXECUTED', 'TRADED')
+		AND live_exit_price IS NULL
+		AND is_square_off_order = false
+		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		ORDER BY created_at DESC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, userID, strategyID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get filled live orders for strategy %s: %w", strategyID, err)
+	}
+	return orders, nil
+}
+
+// GetExitablePaperOrdersByStrategy returns paper orders for a strategy that were filled
+// but not yet exited — including CANCELLED orders so force-exit works after strategy deletion.
+func (r *orderRepository) GetExitablePaperOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		AND strategy_id = $2
+		AND is_paper_trade = true
+		AND filled_price IS NOT NULL
+		AND paper_exit_price IS NULL
+		ORDER BY created_at DESC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, userID, strategyID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get exitable paper orders for strategy %s: %w", strategyID, err)
+	}
+	return orders, nil
+}
+
+// GetExitableLiveOrdersByStrategy returns filled live orders for a strategy that haven't
+// been exited — including CANCELLED orders so force-exit works after strategy deletion.
+func (r *orderRepository) GetExitableLiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		AND strategy_id = $2
+		AND is_paper_trade = false
+		AND filled_price IS NOT NULL
+		AND live_exit_price IS NULL
+		AND is_square_off_order = false
+		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		ORDER BY created_at DESC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, userID, strategyID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get exitable live orders for strategy %s: %w", strategyID, err)
+	}
+	return orders, nil
 }
 
 // UpdatePaperTradeExit marks a paper order as exited with the given price and PnL

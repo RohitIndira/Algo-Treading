@@ -2,6 +2,7 @@ package indira
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -127,7 +128,11 @@ func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, a
 		return "", fmt.Errorf("failed to convert order: %w", err)
 	}
 
-	log.Printf("Placing order for user %s: Symbol=%s",auth.UserId, orderReq.Symbol)
+	if reqJSON, jsonErr := json.Marshal(orderReq); jsonErr == nil {
+		log.Printf("Placing order for user %s: Symbol=%s payload=%s", auth.UserId, orderReq.Symbol, string(reqJSON))
+	} else {
+		log.Printf("Placing order for user %s: Symbol=%s", auth.UserId, orderReq.Symbol)
+	}
 	// Call Indira API
 	resp, err := c.client.PlaceOrder(ctx, auth, orderReq)
 	if err != nil {
@@ -259,6 +264,7 @@ func (c *ExecutionClient) GetOrderBook(ctx context.Context, auth *indiraClient.A
 	return c.client.GetOrderBook(ctx, auth)
 }
 
+
 // FindRecentOrder checks the broker order book for an order matching symbol, side (BUY/SELL), and qty.
 // Used for idempotency: on network timeout we don't know if the order was placed; this checks before retrying.
 // Returns the broker order ID and true if a match is found.
@@ -383,14 +389,11 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 			// be SL so it stays pending until price hits the trigger, then fills at limitPrice.
 			req.OrdType = "SL"
 		}
-		var zero indiraClient.Price2DP = 0.0
-		if order.TakeProfit != nil {
-			tgt := indiraClient.Price2DP(roundClamp(*order.TakeProfit))
-			req.BoTgtPrice = &tgt
-		} else {
-			req.BoTgtPrice = &zero
-		}
-		req.BoStpLoss = &zero
+		// Do NOT set BoStpLoss / BoTgtPrice for plain (non-bracket) orders.
+		// The broker interprets any order carrying these fields (even as 0) as a
+		// native bracket/OCO order and requires ordType "RL" or "RL-MKT" for the
+		// main leg (EG003). Our OCO is custom-managed, so the entry is a plain
+		// SL/Limit order — no bracket fields should be sent.
 	}
 
 	return req, nil

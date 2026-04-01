@@ -3,10 +3,12 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/holiday"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
@@ -17,17 +19,18 @@ import (
 
 // Handler handles market events
 type Handler struct {
-	engine       *engine.Engine
-	rabbitPubl   *publisher.Publisher
-	kafkaPubl    *publisher.KafkaPublisher
-	signalRepo   *repository.TradeSignalRepository
-	riskClient   *risk.Client
-	redisCache   *cache.RedisCache
-	tickCache    *TickSizeCache
-	stats        *models.MatchingStats
-	logger       *zap.Logger
-	marketHours  *utils.MarketHours
-	enforceHours bool
+	engine         *engine.Engine
+	rabbitPubl     *publisher.Publisher
+	kafkaPubl      *publisher.KafkaPublisher
+	signalRepo     *repository.TradeSignalRepository
+	riskClient     *risk.Client
+	redisCache     *cache.RedisCache
+	tickCache      *TickSizeCache
+	stats          *models.MatchingStats
+	logger         *zap.Logger
+	marketHours    *utils.MarketHours
+	enforceHours   bool
+	holidayChecker *holiday.Checker
 }
 
 // NewHandler creates a new event handler
@@ -42,19 +45,21 @@ func NewHandler(
 	logger *zap.Logger,
 	marketHours *utils.MarketHours,
 	enforceHours bool,
+	holidayChecker *holiday.Checker,
 ) *Handler {
 	return &Handler{
-		engine:       eng,
-		rabbitPubl:   rabbitPubl,
-		kafkaPubl:    kafkaPubl,
-		signalRepo:   signalRepo,
-		riskClient:   riskClient,
-		redisCache:   redisCache,
-		tickCache:    NewTickSizeCache(),
-		stats:        stats,
-		logger:       logger,
-		marketHours:  marketHours,
-		enforceHours: enforceHours,
+		engine:         eng,
+		rabbitPubl:     rabbitPubl,
+		kafkaPubl:      kafkaPubl,
+		signalRepo:     signalRepo,
+		riskClient:     riskClient,
+		redisCache:     redisCache,
+		tickCache:      NewTickSizeCache(),
+		stats:          stats,
+		logger:         logger,
+		marketHours:    marketHours,
+		enforceHours:   enforceHours,
+		holidayChecker: holidayChecker,
 	}
 }
 
@@ -66,6 +71,14 @@ func NewHandler(
 // (LTP, prev_close, tick_size) is already available.
 func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) error {
 	h.stats.IncrementEventsProcessed()
+
+	// Check if today is a trading holiday (BSE/NSE) — skip all processing
+	if h.holidayChecker != nil && h.holidayChecker.IsTodayHoliday() {
+		h.logger.Info("Skipping event processing - today is a trading holiday",
+			zap.String("event_id", event.EventID),
+			zap.Time("event_timestamp", event.Timestamp))
+		return nil
+	}
 
 	// Check if market is open before generating trade signals (only if enforcement is enabled)
 	if h.enforceHours && !h.marketHours.IsMarketOpen() {
@@ -85,7 +98,7 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 		zap.String("category", event.NewsData.Category),
 		zap.String("sentiment", event.Analysis.GetSentimentValue()),
 		zap.Int32("impact_score", event.Analysis.ImpactScore),
-		zap.Float64("pct_change", event.MarketData.PctChange),
+		zap.Float64("event_pct_change", event.MarketData.PctChange),
 		zap.Int64("volume", event.MarketData.PriceMap.Volume),
 	)
 
@@ -244,17 +257,33 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return fmt.Errorf("tick_size not available for stock %s", event.StockData.Symbol)
 	}
 
-	// ── Resolve LTP ─────────────────────────────────────────────────────
-	// Priority: event LTP > Redis LTP (from prefetched md).
-	ltp := event.MarketData.LastTradedPrice
-	if ltp <= 0 && md != nil {
-		ltp = md.LTP
+	// ── Resolve LTP from Redis (source of truth for current price) ──────
+	if md == nil {
+		h.logger.Error("No Redis market data available, cannot place order",
+			zap.String("event_id", event.EventID),
+			zap.String("symbol", event.StockData.Symbol))
+		return fmt.Errorf("no market data available for stock %s", event.StockData.Symbol)
 	}
+	ltp := md.LTP
 	if ltp <= 0 {
-		h.logger.Error("No LTP available from event or Redis",
+		h.logger.Error("No LTP available from Redis",
 			zap.String("event_id", event.EventID),
 			zap.String("symbol", event.StockData.Symbol))
 		return fmt.Errorf("no price available for stock %s", event.StockData.Symbol)
+	}
+
+	// ── Re-validate pct_change against live Redis data ───────────────────
+	// The evaluator used the event's (potentially stale) pct_change.
+	// Re-check here with real-time Redis percent_change before placing.
+	if maxPct := strategy.Conditions.MaxPctChange; maxPct > 0 {
+		if absCurrent := math.Abs(md.PercentChange); absCurrent >= maxPct {
+			h.logger.Info("Skipping order — live pct_change exceeds max",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("symbol", event.StockData.Symbol),
+				zap.Float64("live_pct_change", md.PercentChange),
+				zap.Float64("max_pct_change", maxPct))
+			return nil
+		}
 	}
 
 	// ── Resolve prev_close ──────────────────────────────────────────────
@@ -293,7 +322,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	// order.Price is set to targetMonitorPrice (for the PriceMonitor) but
 	// SL/TP are based on the limit price the monitor will use.
 	orderReq.PctChangeStatus = match.PctChangeStatus
-	orderReq.CurrentPctChange = event.MarketData.PctChange
+	orderReq.CurrentPctChange = md.PercentChange
 
 	slPct := strategy.TradeConfig.StopLossPct
 	tpPct := strategy.TradeConfig.TakeProfitPct
@@ -325,7 +354,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		h.logger.Info("Case 1: pct_change within range — immediate order",
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("order_type", orderReq.OrderType),
-			zap.Float64("current_pct_change", event.MarketData.PctChange),
+			zap.Float64("current_pct_change", md.PercentChange),
 			zap.Float64("ltp", ltp),
 			zap.Float64("limit_price", limitPrice),
 			zap.Float64("tick_size", tickSize),
@@ -386,7 +415,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		h.logger.Info("Case 2: pct_change below min — order sent to price monitor",
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("order_type", orderReq.OrderType),
-			zap.Float64("current_pct_change", event.MarketData.PctChange),
+			zap.Float64("current_pct_change", md.PercentChange),
 			zap.Float64("min_pct_change", minPct),
 			zap.Float64("max_pct_change", maxPct),
 			zap.Float64("ltp", ltp),
@@ -516,10 +545,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 }
 
 // ltpSource returns a human-readable label for where the LTP came from.
-func ltpSource(event *models.MarketEvent, md *MarketDataResult) string {
-	if event.MarketData.LastTradedPrice > 0 {
-		return "event"
-	}
+func ltpSource(_ *models.MarketEvent, md *MarketDataResult) string {
 	if md != nil && md.LTP > 0 {
 		return "redis"
 	}

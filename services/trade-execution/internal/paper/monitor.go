@@ -369,6 +369,43 @@ func (m *PaperTradeMonitor) ForceExitAll(ctx context.Context, userID string) err
 	return nil
 }
 
+// ForceExitByStrategy exits all open paper positions for a given user+strategy at the best available price.
+// Uses GetExitablePaperOrdersByStrategy which includes CANCELLED orders (e.g. after strategy
+// deletion) so force-exit still works even if the strategy was deleted first.
+func (m *PaperTradeMonitor) ForceExitByStrategy(ctx context.Context, userID, strategyID string) error {
+	orders, err := m.repo.GetExitablePaperOrdersByStrategy(ctx, strategyID, userID)
+	if err != nil {
+		return fmt.Errorf("force exit strategy: failed to fetch positions: %w", err)
+	}
+
+	log.Printf("[paper-monitor] Force-exiting %d positions for user %s strategy %s",
+		len(orders), userID, strategyID)
+
+	var wg sync.WaitGroup
+	for _, order := range orders {
+		if _, already := m.exiting.LoadOrStore(order.OrderID, true); already {
+			continue
+		}
+
+		exitPrice := m.resolveExitPrice(ctx, order)
+		wg.Add(1)
+		go func(o *models.Order, price float64) {
+			defer wg.Done()
+			m.exitPosition(context.Background(), o, price, "FORCE_EXIT")
+		}(order, exitPrice)
+	}
+
+	wg.Wait()
+
+	if m.wsServer != nil {
+		m.wsServer.Broadcast(userID, PaperUpdate{
+			Type:   "force_exit_done",
+			UserID: userID,
+		})
+	}
+	return nil
+}
+
 // ResolveExitPrice is the public version of resolveExitPrice, usable by ws_server for live orders.
 func (m *PaperTradeMonitor) ResolveExitPrice(ctx context.Context, order *models.Order) float64 {
 	return m.resolveExitPrice(ctx, order)

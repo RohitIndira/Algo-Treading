@@ -17,11 +17,12 @@ import (
 // Consolidating LTP, PrevClose, and TickSize into one struct eliminates
 // redundant Redis calls on the hot path.
 type MarketDataResult struct {
-	LTP       float64
-	PrevClose float64
-	TickSize  float64
-	Exchange  string // which exchange the data came from ("nse" or "bse")
-	Token     int64  // the token used for the Redis key
+	LTP           float64
+	PrevClose     float64
+	TickSize      float64
+	PercentChange float64
+	Exchange      string // which exchange the data came from ("nse" or "bse")
+	Token         int64  // the token used for the Redis key
 }
 
 // TickSizeCache is a concurrency-safe in-memory cache for per-stock tick sizes.
@@ -99,9 +100,10 @@ func getMarketDataFromRedis(
 		}
 
 		var raw struct {
-			LTP       float64 `json:"ltp"`
-			PrevClose float64 `json:"prev_close"`
-			TickSize  float64 `json:"tick_size"`
+			LTP           float64 `json:"ltp"`
+			PrevClose     float64 `json:"prev_close"`
+			TickSize      float64 `json:"tick_size"`
+			PercentChange float64 `json:"percent_change"`
 		}
 		if err := json.Unmarshal([]byte(jsonData), &raw); err != nil {
 			lastErr = fmt.Errorf("failed to parse market data JSON for key %s: %w", key, err)
@@ -125,11 +127,12 @@ func getMarketDataFromRedis(
 			zap.Float64("tick_size", raw.TickSize))
 
 		return &MarketDataResult{
-			LTP:       raw.LTP,
-			PrevClose: raw.PrevClose,
-			TickSize:  raw.TickSize,
-			Exchange:  exch,
-			Token:     token,
+			LTP:           raw.LTP,
+			PrevClose:     raw.PrevClose,
+			TickSize:      raw.TickSize,
+			PercentChange: raw.PercentChange,
+			Exchange:      exch,
+			Token:         token,
 		}, nil
 	}
 

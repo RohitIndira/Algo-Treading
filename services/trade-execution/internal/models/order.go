@@ -32,6 +32,15 @@ func IsFilledStatus(s OrderStatus) bool {
 	return false
 }
 
+// IsPartiallyFilledStatus returns true if the status represents a partially filled order.
+func IsPartiallyFilledStatus(s OrderStatus) bool {
+	switch strings.ToUpper(string(s)) {
+	case "PARTIALLY_FILLED", "PARTIALLY TRADED", "PARTIALLY EXECUTED":
+		return true
+	}
+	return false
+}
+
 // IsTerminalStatus returns true if the order is in a terminal state
 // and cannot be modified or cancelled.
 func IsTerminalStatus(s OrderStatus) bool {
@@ -70,10 +79,11 @@ const (
 
 // Order represents a trading order
 type Order struct {
-	OrderID    uuid.UUID `json:"order_id" db:"order_id"`
-	UserID     string    `json:"user_id" db:"user_id"`
-	StrategyID string    `json:"strategy_id" db:"strategy_id"`
-	EventID    uuid.UUID `json:"event_id" db:"event_id"`
+	OrderID      uuid.UUID `json:"order_id" db:"order_id"`
+	UserID       string    `json:"user_id" db:"user_id"`
+	StrategyID   string    `json:"strategy_id" db:"strategy_id"`
+	StrategyName string    `json:"strategy_name" db:"strategy_name"`
+	EventID      uuid.UUID `json:"event_id" db:"event_id"`
 
 	// Stock information
 	StockCode int64    `json:"stock_code" db:"stock_code"`
@@ -174,10 +184,11 @@ type Order struct {
 
 // OrderRequest from RabbitMQ
 type OrderRequest struct {
-	RequestID  string   `json:"request_id"`
-	UserID     string   `json:"user_id"`
-	StrategyID string   `json:"strategy_id"`
-	EventID    string   `json:"event_id"`
+	RequestID    string   `json:"request_id"`
+	UserID       string   `json:"user_id"`
+	StrategyID   string   `json:"strategy_id"`
+	StrategyName string   `json:"strategy_name"`
+	EventID      string   `json:"event_id"`
 	StockCode  int64    `json:"stock_code"`
 	Exchange   string   `json:"exchange"`
 	Symbol     string   `json:"symbol"`

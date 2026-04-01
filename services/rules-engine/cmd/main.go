@@ -16,6 +16,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/holiday"
 	intkafka "github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/kafka"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
@@ -158,11 +159,28 @@ func main() {
 	logger.Info("Market hours initialized",
 		zap.String("status", marketHours.GetMarketStatus()))
 
+	// Initialize trading holiday checker (MongoDB)
+	logger.Info("Initializing trading holiday checker...")
+	var holidayChecker *holiday.Checker
+	holidayChecker, err = holiday.New(ctx, holiday.Config{
+		MongoURI: cfg.MongoDB.URI,
+		Timezone: cfg.MarketHours.Timezone,
+	}, logger)
+	if err != nil {
+		logger.Warn("Failed to initialize holiday checker - orders will be placed on holidays too",
+			zap.Error(err))
+		holidayChecker = nil
+	} else {
+		holidayChecker.StartAutoRefresh(ctx)
+		defer holidayChecker.Close(context.Background())
+		logger.Info("Trading holiday checker initialized successfully")
+	}
+
 	// Initialize event handler
 	eng := engine.New(store, engine.Config{Workers: cfg.Performance.WorkerCount}, logger)
 	eng.Start(ctx)
 	// RabbitMQ is intentionally not initialized (Kafka-only publishing).
-	handler := consumer.NewHandler(eng, nil, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours)
+	handler := consumer.NewHandler(eng, nil, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours, holidayChecker)
 
 	// Step 5: Start config consumer BEFORE news consumer
 	configReader := kafka.NewReader(kafka.ReaderConfig{

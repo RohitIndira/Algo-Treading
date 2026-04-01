@@ -16,6 +16,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
+	"sync"
+
+	"github.com/google/uuid"
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
@@ -213,6 +216,49 @@ func main() {
 		})
 	})
 
+	// Wire ExitOrderPlacer — used by force-exit endpoints to place reverse limit orders
+	// at LTP ± 1% (compliance: no market orders). Creates a new order in DB and executes it.
+	paperWSServer.SetExitOrderPlacer(func(ctx context.Context, originalOrder *models.Order, limitPrice float64, bearerToken, appId, source string) error {
+		reverseSide := models.OrderSideSell
+		if originalOrder.OrderSide == models.OrderSideSell {
+			reverseSide = models.OrderSideBuy
+		}
+
+		exitOrder := &models.Order{
+			OrderID:          uuid.New(),
+			UserID:           originalOrder.UserID,
+			StrategyID:       originalOrder.StrategyID,
+			StrategyName:     originalOrder.StrategyName,
+			StockCode:        originalOrder.StockCode,
+			Exchange:         originalOrder.Exchange,
+			Symbol:           originalOrder.Symbol,
+			OrderType:        models.OrderTypeLimit,
+			OrderSide:        reverseSide,
+			Quantity:         originalOrder.FilledQuantity,
+			Price:            &limitPrice,
+			Validity:         "IOC",
+			ProductType:      originalOrder.ProductType,
+			Status:           models.StatusReceived,
+			BearerToken:      &bearerToken,
+			AppId:            &appId,
+			Source:           &source,
+			RiskApproved:     true,
+			IsSquareOffOrder: true,
+			TradingMode:      "LIVE",
+			CreatedAt:        time.Now(),
+			UpdatedAt:        time.Now(),
+		}
+
+		if err := orderRepo.Create(ctx, exitOrder); err != nil {
+			return fmt.Errorf("failed to create exit order: %w", err)
+		}
+
+		log.Printf("[exit-order] Placing %s exit for %s @ %.2f (strategy=%s, original=%s)",
+			reverseSide, originalOrder.Symbol, limitPrice, originalOrder.StrategyID, originalOrder.OrderID)
+
+		return orderExecutor.ExecuteOrder(ctx, exitOrder)
+	})
+
 	// Link OrderStatusService → live orders WS so every status change received from
 	// the Indira broker WebSocket (SUBMITTED→FILLED, PARTIALLY_FILLED, REJECTED, etc.)
 	// is pushed to the frontend immediately without requiring a page refresh.
@@ -234,6 +280,56 @@ func main() {
 			Source:      source,
 			BearerToken: bearerToken,
 		})
+	})
+
+	// When the frontend sends a resume_token message on /ws/live-orders after re-login,
+	// forward the new credentials to statusService so the Indira WS can reconnect.
+	paperWSServer.SetResumeService(func(ctx context.Context, userID, bearerToken, appID, source string) error {
+		statusService.ResumeUserSubscription(userID, &indiraPkg.AuthContext{
+			UserId:      userID,
+			AppId:       appID,
+			Source:      source,
+			BearerToken: bearerToken,
+		})
+		return nil
+	})
+
+	// When the Indira WS token is confirmed expired (30s first retry also failed),
+	// push a token_expired event to the frontend via /ws/live-orders.
+	statusService.SetTokenExpiredNotifier(func(userID string) {
+		paperWSServer.BroadcastLiveOrder(userID, paper.LiveOrderUpdate{
+			Type:   "token_expired",
+			UserID: userID,
+		})
+	})
+
+	// After each order fill, push updated positions to the frontend via /ws/live-orders.
+	// Debounced per-user (300ms): rapid fills (e.g. OCO entry→SL→TP) collapse into one
+	// broker API call, always using the latest auth at fire time.
+	type positionDebounce struct {
+		mu    sync.Mutex
+		timer *time.Timer
+		auth  *indiraPkg.AuthContext
+	}
+	var positionDebouncers sync.Map // userID → *positionDebounce
+	statusService.SetOnOrderFilled(func(userID string, auth *indiraPkg.AuthContext) {
+		val, _ := positionDebouncers.LoadOrStore(userID, &positionDebounce{})
+		d := val.(*positionDebounce)
+		d.mu.Lock()
+		d.auth = auth // always keep the latest auth
+		if d.timer != nil {
+			d.timer.Stop()
+		}
+		d.timer = time.AfterFunc(300*time.Millisecond, func() {
+			d.mu.Lock()
+			latestAuth := d.auth
+			d.timer = nil
+			d.mu.Unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			paperWSServer.PushPositions(ctx, userID, latestAuth.BearerToken, latestAuth.AppId, latestAuth.Source)
+		})
+		d.mu.Unlock()
 	})
 
 	// Initialize Redis price client — used for accurate order fill prices, PnL fallback,
@@ -310,6 +406,14 @@ func main() {
 	log.Println("Initializing OCO order management layer...")
 	ocoManager := oco.NewOCOManager(orderRepo, indiraClient)
 	ocoManager.SetCredentialsCache(orderExecutor.CredentialsCache())
+
+	// Configure partial fill timeout from env (default 50s).
+	// When an entry order partially fills, SL/TP legs are placed immediately for the
+	// filled qty. This timeout controls how long to wait for the remaining qty before
+	// cancelling the unfilled portion.
+	if pfTimeout := getEnvInt("OCO_PARTIAL_FILL_TIMEOUT", 50); pfTimeout > 0 {
+		ocoManager.SetPartialFillTimeout(time.Duration(pfTimeout) * time.Second)
+	}
 
 	// Wire OCO manager → frontend WS so OCO events appear in real-time.
 	// Some OCO events (oco_legs_confirmed, oco_completed) have no order attached —

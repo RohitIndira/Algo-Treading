@@ -44,6 +44,10 @@ const brokerOpTimeout = 30 * time.Second
 // dbRetryAttempts is how many times async DB updates are retried before giving up.
 const dbRetryAttempts = 3
 
+// defaultPartialFillTimeout is how long to wait for remaining entry qty
+// after a partial fill before cancelling the unfilled portion.
+const defaultPartialFillTimeout = 50 * time.Second
+
 // CredentialsRefresher allows the OCO manager to invalidate stale auth tokens
 // and reload fresh credentials from the database on 401 errors.
 type CredentialsRefresher interface {
@@ -64,6 +68,11 @@ type OCOManager struct {
 
 	// wsBroadcaster pushes real-time updates to the frontend WS.
 	wsBroadcaster func(userID string, eventType string, order *models.Order)
+
+	// partialFillTimeout is how long to wait for remaining entry qty after a
+	// partial fill before cancelling the unfilled portion. Configurable via
+	// OCO_PARTIAL_FILL_TIMEOUT env var (default 50s).
+	partialFillTimeout time.Duration
 
 	// ── In-memory state (O(1) lookup) ───────────────────────────────────────
 	// groups: groupID (uuid.UUID) → *OCOGroup
@@ -87,8 +96,17 @@ func NewOCOManager(
 	indiraClient *indira.ExecutionClient,
 ) *OCOManager {
 	return &OCOManager{
-		repo:         repo,
-		indiraClient: indiraClient,
+		repo:               repo,
+		indiraClient:       indiraClient,
+		partialFillTimeout: defaultPartialFillTimeout,
+	}
+}
+
+// SetPartialFillTimeout sets the timeout for waiting on remaining entry qty
+// after a partial fill. If not called, defaults to 50 seconds.
+func (m *OCOManager) SetPartialFillTimeout(d time.Duration) {
+	if d > 0 {
+		m.partialFillTimeout = d
 	}
 }
 
@@ -203,7 +221,11 @@ func (m *OCOManager) CreateOCOEntry(
 	groupID := uuid.New()
 	entryOrderID := uuid.New()
 
-	// Calculate entry limit price: 0.5% buffer from trigger
+	// Entry is placed as a Limit (RL) order at the trigger price with a small buffer.
+	// The broker rejects SL as the "main leg" order type (EG003: must be RL or RL-MKT).
+	// Since the rules engine fires the signal only when price is already AT the trigger,
+	// a limit order at that price fills immediately without needing a stop-trigger mechanism.
+	// A 0.5% buffer ensures fill even if price moved slightly by the time the order arrives.
 	var entryLimitPrice float64
 	if orderSide == "BUY" {
 		entryLimitPrice = roundNSE(entryTriggerPrice * 1.005)
@@ -211,12 +233,14 @@ func (m *OCOManager) CreateOCOEntry(
 		entryLimitPrice = roundNSE(entryTriggerPrice * 0.995)
 	}
 
-	if productType == "" {
-		productType = "INTRADAY"
-	}
-	if trailingSLPct <= 0 {
-		trailingSLPct = slPercent
-	}
+	// OCO entries must always be INTRADAY — the OCO manager places SL/TP legs
+	// itself, so the broker must NOT see a bracket order (BRACKET_ORDER with
+	// boStpLoss:0 / boTgtPrice:0 causes EG003 "price could not be negative").
+	productType = "INTRADAY"
+	// NOTE: Do NOT default trailingSLPct to slPercent. TrailingSLPct is the
+	// minimum threshold for broker modify calls (to avoid API spam on tiny ticks),
+	// NOT the trailing distance. A 2%+ threshold makes the trailing SL unresponsive.
+	// CalculateTrailingSL already defaults to 0.1% when TrailingSLPct <= 0.
 
 	// Create the OCO group
 	group := &OCOGroup{
@@ -243,20 +267,20 @@ func (m *OCOManager) CreateOCOEntry(
 	}
 
 	// Build the entry order model
-	triggerPrice := roundNSE(entryTriggerPrice)
 	entryOrder := &models.Order{
 		OrderID:      entryOrderID,
 		UserID:       userID,
 		StrategyID:   strategyID,
+		StrategyName: group.StrategyName,
 		EventID:      eventID,
 		StockCode:    stockCode,
 		Exchange:     models.Exchange(exchange),
 		Symbol:       symbol,
-		OrderType:    models.OrderTypeStopLoss, // SL order
+		OrderType:    models.OrderTypeLimit, // RL (Regular Limit) — broker requires RL/RL-MKT for main leg
 		OrderSide:    models.OrderSide(orderSide),
 		Quantity:     quantity,
-		Price:        &entryLimitPrice,
-		StopLoss:     &triggerPrice, // trigger price goes here
+		Price:        &entryLimitPrice, // trigger price + 0.5% buffer for guaranteed fill
+		// No StopLoss field: sending a trigger price makes the broker see this as an SL order (EG003)
 		Validity:     "DAY",
 		ProductType:  productType,
 		Status:       models.StatusReceived,
@@ -334,20 +358,24 @@ func (m *OCOManager) CreateOCOEntry(
 	entryOrder.SubmittedAt = &now
 	group.EntryBrokerID = brokerID
 
-	// Persist broker ID synchronously — the status service WS handler looks up
-	// orders by IndiraOrderID in the DB. If this write is async and the broker
-	// WS fires EXECUTED before the write completes, GetByIndiraOrderID fails
-	// and HandleBrokerUpdate is never called, so SL/TP legs are never placed.
+	// Register in memory IMMEDIATELY — before DB persist.
+	// The broker WS can fire an EXECUTED update within milliseconds of PlaceOrder
+	// returning. If the status service receives that update before the DB write
+	// at repo.Update completes, GetByIndiraOrderID fails and the status service
+	// incorrectly triggers handleManualExitDetection, which cancels the OCO group
+	// and prevents SL/TP legs from ever being placed.
+	// By registering in memory first, the status service can check IsKnownBrokerID
+	// to avoid false manual-exit detection.
+	m.groups.Store(groupID, group)
+	m.brokerIndex.Store(brokerID, groupID)
+
+	// Persist broker ID synchronously to DB for durability.
 	if err := m.repo.Update(ctx, entryOrder); err != nil {
 		log.Printf("[oco] WARNING: failed to persist entry order broker ID for group %s: %v", groupID, err)
 	}
 
-	// Register in memory
-	m.groups.Store(groupID, group)
-	m.brokerIndex.Store(brokerID, groupID)
-
 	log.Printf("[oco] Created OCO group %s: entry=%s broker=%s symbol=%s trigger=%.2f limit=%.2f SL=%.1f%% TP=%.1f%% trailing=%v",
-		groupID, entryOrderID, brokerID, symbol, triggerPrice, entryLimitPrice, slPercent, tpPercent, trailingSL)
+		groupID, entryOrderID, brokerID, symbol, entryTriggerPrice, entryLimitPrice, slPercent, tpPercent, trailingSL)
 
 	// Broadcast to frontend
 	if m.wsBroadcaster != nil {
@@ -421,16 +449,37 @@ func (m *OCOManager) HandleBrokerUpdate(ctx context.Context, order *models.Order
 func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, order *models.Order, status string) {
 	switch status {
 	case "EXECUTED", "TRADED":
+		// ── Case A: Full fill after a partial fill — remaining qty filled ──
+		if group.PartialFillActive {
+			log.Printf("[oco] Entry FULLY FILLED after partial fill for group %s (qty=%d) — cancelling timer, modifying legs",
+				group.GroupID, group.Quantity)
+
+			// Cancel the partial fill timeout timer
+			if group.PartialFillCancelFunc != nil {
+				group.PartialFillCancelFunc()
+				group.PartialFillCancelFunc = nil
+			}
+			group.PartialFillActive = false
+			group.PartialFillTimerStarted = false
+			group.FilledQty = group.Quantity
+			group.UpdatedAt = time.Now()
+
+			// Modify SL and TP legs to full quantity
+			go m.modifyLegsQty(group, group.Quantity)
+			return
+		}
+
+		// ── Case B: Normal full fill (no prior partial) ──
 		if group.State != StatePendingEntry {
 			return // Already handled
 		}
 
-		// Capture fill price
+		// Capture fill price from the WS event.
 		fillPrice := 0.0
-		if order.FilledPrice != nil {
+		if order.Price != nil && *order.Price > 0 {
+			fillPrice = *order.Price
+		} else if order.FilledPrice != nil && *order.FilledPrice > 0 {
 			fillPrice = *order.FilledPrice
-		} else if order.Price != nil {
-			fillPrice = *order.Price // fallback
 		}
 		if fillPrice <= 0 {
 			log.Printf("[oco] WARNING: Entry fill price is 0 for group %s — cannot place legs", group.GroupID)
@@ -438,6 +487,7 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 			return
 		}
 
+		group.FilledQty = group.Quantity
 		group.EntryFillPrice = fillPrice
 		group.HighestPrice = fillPrice // initialize for trailing SL
 		group.State = StatePlacingLegs
@@ -452,7 +502,82 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 			m.placeOCOLegs(legCtx, group)
 		}()
 
+	case "PARTIALLY TRADED", "PARTIALLY EXECUTED", "PARTIALLY_FILLED":
+		filledQty := order.FilledQuantity
+		if filledQty <= 0 {
+			return
+		}
+
+		if group.State == StatePendingEntry && !group.PartialFillActive {
+			// ── First partial fill: place SL+TP legs for filled qty ──
+			log.Printf("[oco] Entry PARTIALLY FILLED for group %s: %d/%d — placing SL+TP legs for filled qty",
+				group.GroupID, filledQty, group.Quantity)
+
+			// Capture fill price from the WS event
+			fillPrice := 0.0
+			if order.Price != nil && *order.Price > 0 {
+				fillPrice = *order.Price
+			} else if order.FilledPrice != nil && *order.FilledPrice > 0 {
+				fillPrice = *order.FilledPrice
+			}
+			if fillPrice <= 0 {
+				log.Printf("[oco] WARNING: Partial fill price is 0 for group %s — cannot place legs", group.GroupID)
+				return // Don't fail the group — wait for full fill or next partial with price
+			}
+
+			group.FilledQty = filledQty
+			group.PartialFillActive = true
+			group.EntryFillPrice = fillPrice
+			group.HighestPrice = fillPrice
+			group.State = StatePlacingLegs
+			group.UpdatedAt = time.Now()
+
+			// Place SL+TP legs with partial qty, then start timeout timer
+			legCtx, legCancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+			go func() {
+				defer legCancel()
+				m.placeOCOLegs(legCtx, group)
+
+				// Start the partial fill timeout timer AFTER legs are placed.
+				// If legs failed (state=FAILED), don't start the timer.
+				mu := m.GetGroupMu(group.GroupID)
+				mu.Lock()
+				if group.State != StateFailed && group.PartialFillActive && !group.PartialFillTimerStarted {
+					group.PartialFillTimerStarted = true
+					mu.Unlock()
+					m.startPartialFillTimer(group)
+				} else {
+					mu.Unlock()
+				}
+			}()
+
+		} else if group.PartialFillActive {
+			// ── Subsequent partial fill: modify SL+TP legs to new filled qty ──
+			log.Printf("[oco] Entry additional partial fill for group %s: %d/%d (was %d) — modifying SL+TP legs",
+				group.GroupID, filledQty, group.Quantity, group.FilledQty)
+
+			group.FilledQty = filledQty
+			group.UpdatedAt = time.Now()
+
+			go m.modifyLegsQty(group, filledQty)
+		}
+
 	case "REJECTED", "A.REJECTED", "CANCELLED":
+		// If partial fill was active and entry gets cancelled, keep the legs
+		// for the already-filled qty — the position exists and needs protection.
+		if group.PartialFillActive {
+			log.Printf("[oco] Entry %s for group %s while partial fill active (filled=%d) — keeping legs, stopping timer",
+				status, group.GroupID, group.FilledQty)
+			if group.PartialFillCancelFunc != nil {
+				group.PartialFillCancelFunc()
+				group.PartialFillCancelFunc = nil
+			}
+			group.PartialFillActive = false
+			group.PartialFillTimerStarted = false
+			group.UpdatedAt = time.Now()
+			return
+		}
+
 		log.Printf("[oco] Entry %s for group %s: %s", status, group.GroupID, safeString(order.RejectionReason))
 		group.State = StateFailed
 		group.UpdatedAt = time.Now()
@@ -485,12 +610,16 @@ func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, ord
 		group.State = StateSLTriggered
 		group.UpdatedAt = time.Now()
 
-		// Calculate P&L
+		// Calculate P&L using FilledQty (accounts for partial fills)
+		pnlQty := group.Quantity
+		if group.FilledQty > 0 {
+			pnlQty = group.FilledQty
+		}
 		if order.FilledPrice != nil {
 			if group.OrderSide == "BUY" {
-				group.PnL = (*order.FilledPrice - group.EntryFillPrice) * float64(group.Quantity)
+				group.PnL = (*order.FilledPrice - group.EntryFillPrice) * float64(pnlQty)
 			} else {
-				group.PnL = (group.EntryFillPrice - *order.FilledPrice) * float64(group.Quantity)
+				group.PnL = (group.EntryFillPrice - *order.FilledPrice) * float64(pnlQty)
 			}
 		}
 
@@ -503,6 +632,19 @@ func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, ord
 		group.UpdatedAt = time.Now()
 		go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg rejected (OCO cleanup)")
 		m.scheduleCleanup(group)
+
+	case "PARTIALLY TRADED", "PARTIALLY EXECUTED", "PARTIALLY_FILLED":
+		// SL leg partially filled — treat as triggered to prevent position mismatch.
+		// Cancel TP immediately so we don't end up with both legs partially/fully filled.
+		if group.State != StateActive && group.State != StateLegsSubmitted {
+			return
+		}
+		log.Printf("[oco] SL LEG PARTIALLY FILLED for group %s (filled=%d) — cancelling TP leg to prevent mismatch",
+			group.GroupID, order.FilledQuantity)
+		group.State = StateSLTriggered
+		group.UpdatedAt = time.Now()
+
+		go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg partially filled (OCO)")
 
 	case "CANCELLED":
 		// If we cancelled it ourselves (during OCO completion), this is expected.
@@ -539,12 +681,16 @@ func (m *OCOManager) handleTPLegUpdate(ctx context.Context, group *OCOGroup, ord
 		group.State = StateTPTriggered
 		group.UpdatedAt = time.Now()
 
-		// Calculate P&L
+		// Calculate P&L using FilledQty (accounts for partial fills)
+		pnlQty := group.Quantity
+		if group.FilledQty > 0 {
+			pnlQty = group.FilledQty
+		}
 		if order.FilledPrice != nil {
 			if group.OrderSide == "BUY" {
-				group.PnL = (*order.FilledPrice - group.EntryFillPrice) * float64(group.Quantity)
+				group.PnL = (*order.FilledPrice - group.EntryFillPrice) * float64(pnlQty)
 			} else {
-				group.PnL = (group.EntryFillPrice - *order.FilledPrice) * float64(group.Quantity)
+				group.PnL = (group.EntryFillPrice - *order.FilledPrice) * float64(pnlQty)
 			}
 		}
 
@@ -558,6 +704,19 @@ func (m *OCOManager) handleTPLegUpdate(ctx context.Context, group *OCOGroup, ord
 		if m.wsBroadcaster != nil {
 			m.wsBroadcaster(group.UserID, "oco_tp_rejected", order)
 		}
+
+	case "PARTIALLY TRADED", "PARTIALLY EXECUTED", "PARTIALLY_FILLED":
+		// TP leg partially filled — treat as triggered to prevent position mismatch.
+		// Cancel SL immediately so we don't end up with both legs partially/fully filled.
+		if group.State != StateActive && group.State != StateLegsSubmitted {
+			return
+		}
+		log.Printf("[oco] TP LEG PARTIALLY FILLED for group %s (filled=%d) — cancelling SL leg to prevent mismatch",
+			group.GroupID, order.FilledQuantity)
+		group.State = StateTPTriggered
+		group.UpdatedAt = time.Now()
+
+		go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg partially filled (OCO)")
 
 	case "CANCELLED":
 		if group.State == StateActive || group.State == StateLegsSubmitted {
@@ -780,17 +939,24 @@ func (m *OCOManager) buildLegOrder(
 	role OCORole,
 ) *models.Order {
 	groupID := group.GroupID
+	// Use FilledQty for leg orders when partial fill is active (or completed).
+	// For full fills, FilledQty == Quantity so this is always correct.
+	legQty := group.Quantity
+	if group.FilledQty > 0 {
+		legQty = group.FilledQty
+	}
 	return &models.Order{
 		OrderID:      orderID,
 		UserID:       group.UserID,
 		StrategyID:   group.StrategyID,
+		StrategyName: group.StrategyName,
 		EventID:      group.EventID,
 		StockCode:    group.StockCode,
 		Exchange:     models.Exchange(group.Exchange),
 		Symbol:       group.Symbol,
 		OrderType:    orderType,
 		OrderSide:    models.OrderSide(side),
-		Quantity:     group.Quantity,
+		Quantity:     legQty,
 		Price:        price,
 		StopLoss:     triggerPrice,
 		Validity:     group.Validity,
@@ -872,6 +1038,162 @@ func (m *OCOManager) placeLegWithRetry(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Partial Fill: Timer, Modify, Cancel Remaining
+// ════════════════════════════════════════════════════════════════════════════
+
+// startPartialFillTimer starts a timer that waits partialFillTimeout for the
+// remaining entry qty to fill. If it doesn't fill in time, the remaining
+// entry order is cancelled and the SL/TP legs remain at the filled qty.
+func (m *OCOManager) startPartialFillTimer(group *OCOGroup) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	mu := m.GetGroupMu(group.GroupID)
+	mu.Lock()
+	group.PartialFillCancelFunc = cancel
+	mu.Unlock()
+
+	go func() {
+		select {
+		case <-time.After(m.partialFillTimeout):
+			// Timer expired — cancel remaining entry qty at broker
+			mu := m.GetGroupMu(group.GroupID)
+			mu.Lock()
+			if !group.PartialFillActive {
+				mu.Unlock()
+				return // Already fully filled or cancelled — nothing to do
+			}
+			group.PartialFillActive = false
+			group.PartialFillTimerStarted = false
+			group.PartialFillCancelFunc = nil
+			remainingQty := group.Quantity - group.FilledQty
+			mu.Unlock()
+
+			log.Printf("[oco] Partial fill timeout expired for group %s — cancelling remaining %d qty (filled=%d/%d)",
+				group.GroupID, remainingQty, group.FilledQty, group.Quantity)
+
+			m.cancelEntryRemaining(group)
+
+			if m.wsBroadcaster != nil {
+				m.wsBroadcaster(group.UserID, "oco_partial_fill_timeout", nil)
+			}
+
+		case <-ctx.Done():
+			// Cancelled — full fill arrived or group terminated, no action needed
+		}
+	}()
+
+	log.Printf("[oco] Partial fill timer started for group %s: %v timeout (filled=%d/%d)",
+		group.GroupID, m.partialFillTimeout, group.FilledQty, group.Quantity)
+}
+
+// cancelEntryRemaining cancels the unfilled portion of the entry order at the broker.
+// Unlike cancelLeg, this does NOT mark the group as completed — the SL/TP legs remain active.
+func (m *OCOManager) cancelEntryRemaining(group *OCOGroup) {
+	brokerID := group.EntryBrokerID
+	if brokerID == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+	defer cancel()
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+
+		err := m.indiraClient.CancelOrder(ctx, group.Exchange, brokerID, group.Symbol, group.Auth)
+		if err != nil {
+			errLower := strings.ToLower(err.Error())
+			// If already traded/cancelled, the remaining qty is gone — nothing to cancel
+			if strings.Contains(errLower, "already") ||
+				strings.Contains(errLower, "traded") ||
+				strings.Contains(errLower, "executed") {
+				log.Printf("[oco] Entry order already in terminal state for group %s — cancel not needed", group.GroupID)
+				break
+			}
+			log.Printf("[oco] Cancel remaining entry attempt %d failed (group=%s broker=%s): %v",
+				attempt+1, group.GroupID, brokerID, err)
+			continue
+		}
+
+		log.Printf("[oco] Remaining entry qty cancelled for group %s (broker=%s)", group.GroupID, brokerID)
+		break
+	}
+}
+
+// modifyLegsQty modifies the quantity on both SL and TP legs at the broker.
+// Called when additional partial fills arrive or when the entry fully fills.
+func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
+	ctx, cancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+	defer cancel()
+
+	mu := m.GetGroupMu(group.GroupID)
+	mu.Lock()
+	slBrokerID := group.SLBrokerID
+	tpBrokerID := group.TPBrokerID
+	slTrigger := group.SLTriggerPrice
+	slLimit := group.SLLimitPrice
+	tpLimit := group.TPLimitPrice
+	mu.Unlock()
+
+	log.Printf("[oco] Modifying SL+TP legs qty to %d for group %s", newQty, group.GroupID)
+
+	// Modify SL leg
+	if slBrokerID != "" {
+		slOrder := &models.Order{
+			OrderID:       group.SLOrderID,
+			IndiraOrderID: &slBrokerID,
+			StockCode:     group.StockCode,
+			Exchange:      models.Exchange(group.Exchange),
+			Symbol:        group.Symbol,
+			OrderType:     models.OrderTypeStopLoss,
+			OrderSide:     models.OrderSide(group.ExitSide()),
+			Quantity:      newQty,
+			Price:         &slLimit,
+			StopLoss:      &slTrigger,
+			Validity:      group.Validity,
+			ProductType:   group.ProductType,
+		}
+		if err := m.indiraClient.ModifyOrder(ctx, slOrder, group.Auth); err != nil {
+			log.Printf("[oco] Failed to modify SL leg qty to %d for group %s: %v", newQty, group.GroupID, err)
+		} else {
+			log.Printf("[oco] SL leg qty modified to %d for group %s (broker=%s)", newQty, group.GroupID, slBrokerID)
+			m.dbUpdateAsync(slOrder, fmt.Sprintf("SL leg qty modify group=%s", group.GroupID))
+		}
+	}
+
+	// Modify TP leg
+	if tpBrokerID != "" {
+		tpOrder := &models.Order{
+			OrderID:       group.TPOrderID,
+			IndiraOrderID: &tpBrokerID,
+			StockCode:     group.StockCode,
+			Exchange:      models.Exchange(group.Exchange),
+			Symbol:        group.Symbol,
+			OrderType:     models.OrderTypeLimit,
+			OrderSide:     models.OrderSide(group.ExitSide()),
+			Quantity:      newQty,
+			Price:         &tpLimit,
+			Validity:      group.Validity,
+			ProductType:   group.ProductType,
+		}
+		if err := m.indiraClient.ModifyOrder(ctx, tpOrder, group.Auth); err != nil {
+			log.Printf("[oco] Failed to modify TP leg qty to %d for group %s: %v", newQty, group.GroupID, err)
+		} else {
+			log.Printf("[oco] TP leg qty modified to %d for group %s (broker=%s)", newQty, group.GroupID, tpBrokerID)
+			m.dbUpdateAsync(tpOrder, fmt.Sprintf("TP leg qty modify group=%s", group.GroupID))
+		}
+	}
+
+	// Update in-memory FilledQty
+	mu.Lock()
+	group.FilledQty = newQty
+	group.UpdatedAt = time.Now()
+	mu.Unlock()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Cancel + Cleanup
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -945,13 +1267,19 @@ func (m *OCOManager) scheduleCleanup(group *OCOGroup) {
 
 // ModifySLLeg modifies the SL leg order at the broker with a new trigger/limit.
 // Called by the trailing SL monitor when LTP makes a new high.
-func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigger, newLimit float64) error {
+func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigger, newLimit, newHighestPrice float64) error {
 	mu := m.GetGroupMu(group.GroupID)
 	mu.Lock()
 	defer mu.Unlock()
 
 	if group.State != StateActive || group.SLBrokerID == "" {
 		return fmt.Errorf("group %s not in ACTIVE state or SL broker ID missing", group.GroupID)
+	}
+
+	// Use FilledQty for trailing SL modify (matches the qty legs were placed with)
+	legQty := group.Quantity
+	if group.FilledQty > 0 {
+		legQty = group.FilledQty
 	}
 
 	// Build a modify order
@@ -963,7 +1291,7 @@ func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigge
 		Symbol:        group.Symbol,
 		OrderType:     models.OrderTypeStopLoss,
 		OrderSide:     models.OrderSide(group.ExitSide()),
-		Quantity:      group.Quantity,
+		Quantity:      legQty,
 		Price:         &newLimit,
 		StopLoss:      &newTrigger,
 		Validity:      group.Validity,
@@ -974,10 +1302,18 @@ func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigge
 		return fmt.Errorf("modify SL leg failed: %w", err)
 	}
 
-	// Update in-memory state
+	// Update in-memory state ATOMICALLY — both SLTriggerPrice and HighestPrice
+	// must be updated together, and ONLY after the broker modify succeeds.
+	// If HighestPrice is advanced before ModifyOrder and the call fails,
+	// subsequent trailing calculations use a stale SLTriggerPrice against an
+	// advanced HighestPrice, producing tiny changePct values that never reach
+	// the TrailingSLPct threshold — permanently stalling the trailing SL.
 	oldTrigger := group.SLTriggerPrice
 	group.SLTriggerPrice = newTrigger
 	group.SLLimitPrice = newLimit
+	if newHighestPrice > 0 {
+		group.HighestPrice = newHighestPrice
+	}
 	group.UpdatedAt = time.Now()
 
 	log.Printf("[oco] Trailing SL modified for group %s: trigger %.2f→%.2f limit=%.2f highest=%.2f",
@@ -1034,6 +1370,13 @@ func (m *OCOManager) Reload(ctx context.Context) error {
 		if group.TPBrokerID != "" {
 			m.brokerIndex.Store(group.TPBrokerID, groupID)
 		}
+
+		// Restart partial fill timer for groups that were mid-partial-fill when service stopped.
+		if group.PartialFillActive {
+			group.PartialFillTimerStarted = true
+			m.startPartialFillTimer(group)
+		}
+
 		loaded++
 	}
 
@@ -1062,15 +1405,25 @@ func (m *OCOManager) reconstructGroup(groupID uuid.UUID, orders []*models.Order)
 			group.StockCode = o.StockCode
 			group.Quantity = o.Quantity
 			group.OrderSide = string(o.OrderSide)
+			// Restore FilledQty from DB for partial fill recovery
+			if o.FilledQuantity > 0 {
+				group.FilledQty = o.FilledQuantity
+			}
 			group.ProductType = o.ProductType
 			group.Validity = o.Validity
 			group.StrategyID = o.StrategyID
+			group.StrategyName = o.StrategyName
 			group.EventID = o.EventID
 			group.CreatedAt = o.CreatedAt
 			if o.IndiraOrderID != nil {
 				group.EntryBrokerID = *o.IndiraOrderID
 			}
-			if o.FilledPrice != nil {
+			// Use OrderPrice (order.Price) as the basis for SL/TP to avoid slippage.
+			// Fall back to TradedPrice (FilledPrice) if OrderPrice is unavailable.
+			if o.Price != nil && *o.Price > 0 {
+				group.EntryFillPrice = *o.Price
+				group.HighestPrice = *o.Price
+			} else if o.FilledPrice != nil {
 				group.EntryFillPrice = *o.FilledPrice
 				group.HighestPrice = *o.FilledPrice
 			}
@@ -1128,6 +1481,15 @@ func (m *OCOManager) reconstructGroup(groupID uuid.UUID, orders []*models.Order)
 		return nil // Don't load terminal groups
 	}
 
+	// Detect partial fill state: entry is partially filled AND legs exist.
+	// On restart, we treat this as an active partial fill and restart the timer
+	// to cancel any remaining unfilled entry qty.
+	if group.FilledQty > 0 && group.FilledQty < group.Quantity && group.SLBrokerID != "" {
+		group.PartialFillActive = true
+		log.Printf("[oco] Restored partial fill state for group %s (filled=%d/%d) — will restart timer",
+			group.GroupID, group.FilledQty, group.Quantity)
+	}
+
 	group.UpdatedAt = time.Now()
 	return group
 }
@@ -1145,13 +1507,15 @@ func (m *OCOManager) inferState(orders []*models.Order) OCOState {
 	slStatus := roleStatus[string(RoleSLLeg)]
 	tpStatus := roleStatus[string(RoleTPLeg)]
 
-	// If entry not filled yet
-	if !models.IsFilledStatus(entryStatus) && !models.IsTerminalStatus(entryStatus) {
+	// If entry not filled yet (and not partially filled with legs)
+	if !models.IsFilledStatus(entryStatus) && !models.IsTerminalStatus(entryStatus) &&
+		!models.IsPartiallyFilledStatus(entryStatus) {
 		return StatePendingEntry
 	}
 
-	// If entry is terminal but not filled
-	if models.IsTerminalStatus(entryStatus) && !models.IsFilledStatus(entryStatus) {
+	// If entry is terminal but not filled (and not partially filled)
+	if models.IsTerminalStatus(entryStatus) && !models.IsFilledStatus(entryStatus) &&
+		!models.IsPartiallyFilledStatus(entryStatus) {
 		return StateFailed
 	}
 
@@ -1286,13 +1650,13 @@ func (m *OCOManager) CancelAllGroupsByUser(ctx context.Context, userID string) {
 	}
 }
 
-// CancelGroupsBySymbol cancels all non-terminal OCO groups for a user+symbol.
-// Called when a manual position exit is detected for a specific symbol.
-func (m *OCOManager) CancelGroupsBySymbol(ctx context.Context, userID string, symbol string) {
+// CancelGroupsByStrategy cancels all non-terminal OCO groups for a user+strategy.
+// Called when the user force-exits all positions for a specific strategy.
+func (m *OCOManager) CancelGroupsByStrategy(ctx context.Context, userID, strategyID string) {
 	var toCancel []uuid.UUID
 	m.groups.Range(func(key, value any) bool {
 		group := value.(*OCOGroup)
-		if group.UserID == userID && group.Symbol == symbol && !group.State.IsTerminal() {
+		if group.UserID == userID && group.StrategyID == strategyID && !group.State.IsTerminal() {
 			toCancel = append(toCancel, group.GroupID)
 		}
 		return true
@@ -1302,12 +1666,132 @@ func (m *OCOManager) CancelGroupsBySymbol(ctx context.Context, userID string, sy
 		return
 	}
 
-	log.Printf("[oco] Manual exit detected: cancelling %d OCO groups for %s/%s", len(toCancel), userID, symbol)
+	log.Printf("[oco] Strategy exit: cancelling %d OCO groups for user %s strategy %s", len(toCancel), userID, strategyID)
 	for _, gid := range toCancel {
 		if err := m.CancelGroup(ctx, gid); err != nil {
 			log.Printf("[oco] Failed to cancel group %s: %v", gid, err)
 		}
 	}
+}
+
+// CancelGroupsBySymbol cancels non-terminal OCO groups for a user+symbol that are
+// NOT bound to a strategy. Strategy-bound groups are managed by their own lifecycle
+// (CancelGroupsByStrategy, strategy deletion/deactivation) and must not be affected
+// by blanket symbol-level cancellation — otherwise force-exiting one strategy's
+// position would cancel SL/TP for another strategy trading the same stock.
+func (m *OCOManager) CancelGroupsBySymbol(ctx context.Context, userID string, symbol string) {
+	var toCancel []uuid.UUID
+	var skippedStrategy int
+	m.groups.Range(func(key, value any) bool {
+		group := value.(*OCOGroup)
+		if group.UserID == userID && group.Symbol == symbol && !group.State.IsTerminal() {
+			// Skip strategy-bound groups — they are cancelled via CancelGroupsByStrategy.
+			if group.StrategyID != "" {
+				skippedStrategy++
+				return true
+			}
+			toCancel = append(toCancel, group.GroupID)
+		}
+		return true
+	})
+
+	if len(toCancel) == 0 {
+		if skippedStrategy > 0 {
+			log.Printf("[oco] Manual exit detected for %s/%s: skipped %d strategy-bound groups (use CancelGroupsByStrategy instead)",
+				userID, symbol, skippedStrategy)
+		}
+		return
+	}
+
+	log.Printf("[oco] Manual exit detected: cancelling %d non-strategy OCO groups for %s/%s (skipped %d strategy-bound)",
+		len(toCancel), userID, symbol, skippedStrategy)
+	for _, gid := range toCancel {
+		if err := m.CancelGroup(ctx, gid); err != nil {
+			log.Printf("[oco] Failed to cancel group %s: %v", gid, err)
+		}
+	}
+}
+
+// IsKnownBrokerID returns true if the given broker order ID belongs to an
+// active OCO group in memory. Used by the status service to avoid false
+// manual-exit detection when the DB write hasn't completed yet.
+func (m *OCOManager) IsKnownBrokerID(brokerID string) bool {
+	_, ok := m.brokerIndex.Load(brokerID)
+	return ok
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Adopt Existing Order Into OCO
+// ════════════════════════════════════════════════════════════════════════════
+
+// AdoptOrder wraps an already-placed broker order into an OCO group so that
+// when the broker WS sends EXECUTED, handleEntryUpdate fires and places
+// SL/TP legs from the actual fill price.
+//
+// This is used when a trailing-SL order couldn't be routed through
+// CreateOCOEntry (e.g. auth was unavailable at signal time) but was
+// successfully placed via the default execution path. Without adoption,
+// the position would have no SL/TP protection.
+func (m *OCOManager) AdoptOrder(
+	order *models.Order,
+	slPercent float64,
+	tpPercent float64,
+	trailingSLPct float64,
+	auth *indiraClient.AuthContext,
+) {
+	if order.IndiraOrderID == nil || *order.IndiraOrderID == "" {
+		log.Printf("[oco] AdoptOrder: no broker ID on order %s — skipping", order.OrderID)
+		return
+	}
+	brokerID := *order.IndiraOrderID
+
+	groupID := uuid.New()
+	// NOTE: Do NOT default trailingSLPct to slPercent — see CreateOCOEntry comment.
+	// CalculateTrailingSL already defaults to 0.1% when TrailingSLPct <= 0.
+
+	group := &OCOGroup{
+		GroupID:       groupID,
+		UserID:        order.UserID,
+		EntryOrderID:  order.OrderID,
+		EntryBrokerID: brokerID,
+		SLPercent:     slPercent,
+		TPPercent:     tpPercent,
+		TrailingSL:    true,
+		TrailingSLPct: trailingSLPct,
+		State:         StatePendingEntry,
+		Symbol:        order.Symbol,
+		Exchange:      string(order.Exchange),
+		StockCode:     order.StockCode,
+		Quantity:      order.Quantity,
+		OrderSide:     string(order.OrderSide),
+		Auth:          auth,
+		ProductType:   "INTRADAY",
+		Validity:      "DAY",
+		StrategyID:    order.StrategyID,
+		EventID:       order.EventID,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+
+	// Tag the order in DB so HandleBrokerUpdate can find it
+	gid := groupID
+	role := string(RoleEntry)
+	order.OCOGroupID = &gid
+	order.OCORole = &role
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := m.repo.Update(ctx, order); err != nil {
+			log.Printf("[oco] AdoptOrder: failed to tag order %s with OCO group: %v", order.OrderID, err)
+		}
+	}()
+
+	// Register in memory BEFORE any WS event can arrive
+	m.groups.Store(groupID, group)
+	m.brokerIndex.Store(brokerID, groupID)
+
+	log.Printf("[oco] Adopted order %s (broker=%s) into OCO group %s: symbol=%s SL=%.1f%% TP=%.1f%% trailing=true",
+		order.OrderID, brokerID, groupID, order.Symbol, slPercent, tpPercent)
 }
 
 // ════════════════════════════════════════════════════════════════════════════

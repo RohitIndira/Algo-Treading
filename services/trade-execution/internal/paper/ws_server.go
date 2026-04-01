@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -44,11 +45,12 @@ type PaperUpdate struct {
 
 // LiveOrderUpdate is the message sent to frontend clients over the live orders WebSocket.
 type LiveOrderUpdate struct {
-	Type         string                     `json:"type"`                    // connected | initial_orders | order_update | force_exit_done | price_watches_snapshot | price_watch_cancelled
+	Type         string                     `json:"type"`                    // connected | initial_orders | initial_closed_orders | order_update | closed_orders | force_exit_done | price_watches_snapshot | price_watch_cancelled | token_expired | positions
 	UserID       string                     `json:"user_id,omitempty"`
-	Orders       []*models.Order            `json:"orders,omitempty"`        // For initial_orders
+	Orders       []*models.Order            `json:"orders,omitempty"`        // For initial_orders, initial_closed_orders, closed_orders
 	Order        *models.Order              `json:"order,omitempty"`         // For order_update
 	PriceWatches []scheduler.WatchSnapshot  `json:"price_watches,omitempty"` // For price_watches_snapshot
+	Positions    []EnrichedAlgoPosition     `json:"positions,omitempty"`     // For positions (event-driven push after fills)
 }
 
 // BrokerPosition is a position returned by the Indira broker API.
@@ -86,23 +88,262 @@ type EnrichedAlgoPosition struct {
 	// Our algo order metadata
 	OrderID       string  `json:"order_id,omitempty"`
 	StrategyID    string  `json:"strategy_id,omitempty"`
+	StrategyName  string  `json:"strategy_name,omitempty"`
 	IndiraOrderID string  `json:"indira_order_id,omitempty"`
 	OrderSide     string  `json:"order_side,omitempty"`
 	FilledPrice   float64 `json:"filled_price,omitempty"`
 	FilledQty     int32   `json:"filled_qty,omitempty"`
 	TradingMode   string  `json:"trading_mode,omitempty"`
 	Status        string  `json:"status,omitempty"`
+	ExecutedAt    string  `json:"executed_at,omitempty"`
+}
+
+// strategyShare tracks what fraction of a broker position belongs to a strategy.
+type strategyShare struct {
+	StrategyID   string
+	StrategyName string
+	TradingMode  string
+	EntryQty     int    // qty from entry orders (used to compute ratio)
+	EntryOrderID string // earliest entry order_id
+	EntryTime    string // earliest entry time (ISO)
+	OrderSide    string // side of the entry order
+}
+
+// enrichPositions uses broker positions as the source of truth for quantities,
+// prices, exchange data, and P&L. Our orders DB is used ONLY to determine which
+// strategy each position belongs to.
+//
+// When multiple strategies trade the same symbol, the broker shows one merged
+// position. This function splits it proportionally across strategies based on
+// the entry order quantities in our DB.
+func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Order) []EnrichedAlgoPosition {
+	// Step 1: From our orders, find the FIRST BUY entry order per (symbol, strategy_id).
+	// We only look at the initial entry order to determine each strategy's share.
+	// Use a dedup key to avoid counting duplicate/retry orders.
+	type symStratKey struct {
+		Symbol     string
+		StrategyID string
+	}
+
+	shares := make(map[symStratKey]*strategyShare)
+	// Track (symbol, strategy_id, side, qty) to deduplicate identical orders
+	type dedupKey struct {
+		Symbol     string
+		StrategyID string
+		Side       string
+		Qty        int32
+	}
+	seen := make(map[dedupKey]bool)
+
+	for _, order := range algoOrders {
+		if order.IsSquareOffOrder {
+			continue
+		}
+		// Only consider entry orders (BUY side for long strategies).
+		// Skip SL/TP legs which are SELL orders for the same strategy.
+		if order.OrderSide != models.OrderSideBuy {
+			continue
+		}
+
+		sym := strings.ToUpper(order.Symbol)
+		sid := order.StrategyID
+		if sid == "" {
+			sid = "__manual__"
+		}
+
+		// Deduplicate: skip if we've already seen an identical (symbol, strategy, side, qty) order.
+		dk := dedupKey{Symbol: sym, StrategyID: sid, Side: string(order.OrderSide), Qty: order.Quantity}
+		if seen[dk] {
+			continue
+		}
+		seen[dk] = true
+
+		key := symStratKey{Symbol: sym, StrategyID: sid}
+		share, exists := shares[key]
+		if !exists {
+			share = &strategyShare{
+				StrategyID:   order.StrategyID,
+				StrategyName: order.StrategyName,
+				TradingMode:  order.TradingMode,
+				OrderSide:    string(order.OrderSide),
+			}
+			shares[key] = share
+		}
+		// Backfill strategy_name if earlier orders had it empty
+		if share.StrategyName == "" && order.StrategyName != "" {
+			share.StrategyName = order.StrategyName
+		}
+
+		share.EntryQty += int(order.Quantity)
+
+		// Track earliest entry order for metadata
+		entryTime := ""
+		if order.ExecutedAt != nil {
+			entryTime = order.ExecutedAt.Format("2006-01-02T15:04:05Z07:00")
+		} else if !order.CreatedAt.IsZero() {
+			entryTime = order.CreatedAt.Format("2006-01-02T15:04:05Z07:00")
+		}
+		if share.EntryOrderID == "" || (entryTime != "" && entryTime < share.EntryTime) {
+			share.EntryOrderID = order.OrderID.String()
+			share.EntryTime = entryTime
+		}
+	}
+
+	// Step 2: Group shares by symbol so we know which strategies trade each symbol.
+	symbolShares := make(map[string][]*strategyShare) // symbol → list of strategy shares
+	for key, share := range shares {
+		symbolShares[key.Symbol] = append(symbolShares[key.Symbol], share)
+	}
+
+	// Step 3: For each broker position, split across strategies proportionally.
+	result := make([]EnrichedAlgoPosition, 0, len(brokerPositions))
+
+	for _, bp := range brokerPositions {
+		bpSym := strings.ToUpper(bp.Symbol)
+
+		// Find matching strategies: try exact match, then substring
+		stratShares, matched := symbolShares[bpSym]
+		if !matched {
+			for sym, ss := range symbolShares {
+				if strings.Contains(bpSym, sym) || strings.Contains(sym, bpSym) {
+					stratShares = ss
+					matched = true
+					break
+				}
+			}
+		}
+
+		if !matched || len(stratShares) == 0 {
+			// No algo orders for this symbol — emit as broker-direct/manual position
+			result = append(result, EnrichedAlgoPosition{
+				Symbol:       bp.Symbol,
+				Exchange:     bp.Exchange,
+				ProductType:  bp.ProductType,
+				NetQty:       bp.NetQty,
+				BuyQty:       bp.BuyQty,
+				SellQty:      bp.SellQty,
+				BuyAvgPrice:  bp.BuyAvgPrice,
+				SellAvgPrice: bp.SellAvgPrice,
+				CurrentPrice: bp.CurrentPrice,
+				BrokerPnL:    bp.PnL,
+				BrokerPnLPct: bp.PnLPercentage,
+				ExcTkn:       bp.ExcTkn,
+			})
+			continue
+		}
+
+		if len(stratShares) == 1 {
+			// Single strategy owns the entire broker position — no splitting needed.
+			ss := stratShares[0]
+			result = append(result, EnrichedAlgoPosition{
+				Symbol:       bp.Symbol,
+				Exchange:     bp.Exchange,
+				ProductType:  bp.ProductType,
+				NetQty:       bp.NetQty,
+				BuyQty:       bp.BuyQty,
+				SellQty:      bp.SellQty,
+				BuyAvgPrice:  bp.BuyAvgPrice,
+				SellAvgPrice: bp.SellAvgPrice,
+				CurrentPrice: bp.CurrentPrice,
+				BrokerPnL:    bp.PnL,
+				BrokerPnLPct: bp.PnLPercentage,
+				ExcTkn:       bp.ExcTkn,
+				// Algo metadata
+				OrderID:      ss.EntryOrderID,
+				StrategyID:   ss.StrategyID,
+				StrategyName: ss.StrategyName,
+				OrderSide:    ss.OrderSide,
+				FilledPrice:  bp.BuyAvgPrice,
+				FilledQty:    int32(bp.BuyQty),
+				TradingMode:  ss.TradingMode,
+				Status:       "FILLED",
+				ExecutedAt:   ss.EntryTime,
+			})
+			continue
+		}
+
+		// Multiple strategies trade this symbol — split proportionally.
+		totalEntryQty := 0
+		for _, ss := range stratShares {
+			totalEntryQty += ss.EntryQty
+		}
+		if totalEntryQty == 0 {
+			totalEntryQty = 1 // avoid division by zero
+		}
+
+		// Track remainder for rounding — ensure quantities sum to broker total.
+		assignedBuyQty := 0
+		assignedSellQty := 0
+		assignedNetQty := 0
+
+		for i, ss := range stratShares {
+			ratio := float64(ss.EntryQty) / float64(totalEntryQty)
+			isLast := i == len(stratShares)-1
+
+			var splitBuyQty, splitSellQty, splitNetQty int
+			if isLast {
+				// Last strategy gets the remainder to ensure totals match broker.
+				splitBuyQty = bp.BuyQty - assignedBuyQty
+				splitSellQty = bp.SellQty - assignedSellQty
+				splitNetQty = bp.NetQty - assignedNetQty
+			} else {
+				splitBuyQty = int(math.Round(float64(bp.BuyQty) * ratio))
+				splitSellQty = int(math.Round(float64(bp.SellQty) * ratio))
+				splitNetQty = int(math.Round(float64(bp.NetQty) * ratio))
+			}
+			assignedBuyQty += splitBuyQty
+			assignedSellQty += splitSellQty
+			assignedNetQty += splitNetQty
+
+			// P&L is proportional to this strategy's share.
+			splitPnL := bp.PnL * ratio
+
+			result = append(result, EnrichedAlgoPosition{
+				Symbol:       bp.Symbol,
+				Exchange:     bp.Exchange,
+				ProductType:  bp.ProductType,
+				NetQty:       splitNetQty,
+				BuyQty:       splitBuyQty,
+				SellQty:      splitSellQty,
+				BuyAvgPrice:  bp.BuyAvgPrice,
+				SellAvgPrice: bp.SellAvgPrice,
+				CurrentPrice: bp.CurrentPrice,
+				BrokerPnL:    splitPnL,
+				BrokerPnLPct: bp.PnLPercentage,
+				ExcTkn:       bp.ExcTkn,
+				// Algo metadata
+				OrderID:      ss.EntryOrderID,
+				StrategyID:   ss.StrategyID,
+				StrategyName: ss.StrategyName,
+				OrderSide:    ss.OrderSide,
+				FilledPrice:  bp.BuyAvgPrice,
+				FilledQty:    int32(splitBuyQty),
+				TradingMode:  ss.TradingMode,
+				Status:       "FILLED",
+				ExecutedAt:   ss.EntryTime,
+			})
+		}
+	}
+
+	return result
 }
 
 // PositionsFetcher fetches live positions from the broker using the provided auth credentials.
 // bearerToken, appId, userId, source come from the frontend request headers.
 type PositionsFetcher func(ctx context.Context, bearerToken, appId, userId, source string) ([]BrokerPosition, error)
 
-// OCOCanceller cancels all active OCO groups for a user.
+
+// OCOCanceller cancels active OCO groups.
 // Implemented by oco.OCOManager; defined here as an interface to avoid import cycles.
 type OCOCanceller interface {
 	CancelAllGroupsByUser(ctx context.Context, userID string)
+	CancelGroupsByStrategy(ctx context.Context, userID, strategyID string)
 }
+
+// ExitOrderPlacer places a reverse limit order at the broker to exit a position.
+// limitPrice is LTP±1% to ensure immediate fill without using a market order (compliance).
+// Wired in main.go to OrderExecutor.
+type ExitOrderPlacer func(ctx context.Context, originalOrder *models.Order, limitPrice float64, bearerToken, appId, source string) error
 
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
@@ -119,6 +360,9 @@ type PaperWSServer struct {
 	// startBrokerWS is wired in main.go to statusService.StartSubscription so the paper
 	// package doesn't import statusservice and create an import cycle.
 	startBrokerWS func(ctx context.Context, userID, bearerToken, appID, source string) error
+	// resumeBrokerWS is wired in main.go to statusService.ResumeUserSubscription.
+	// Called when the frontend sends a resume_token message on /ws/live-orders.
+	resumeBrokerWS func(ctx context.Context, userID, bearerToken, appID, source string) error
 
 	// priceMonitor exposes the watch snapshot for the "price watches" UI panel.
 	priceMonitor       *scheduler.PriceMonitor
@@ -126,6 +370,9 @@ type PaperWSServer struct {
 
 	// ocoCanceller cancels active OCO groups on force-exit.
 	ocoCanceller OCOCanceller
+
+	// exitOrderPlacer places reverse limit orders at the broker for live position exits.
+	exitOrderPlacer ExitOrderPlacer
 
 	// Paper trade clients: sync.Map[userID string → *sync.Map[*websocket.Conn → *sync.Mutex]]
 	// Lock-free reads on the hot path (Broadcast).
@@ -152,6 +399,11 @@ func (s *PaperWSServer) SetOCOCanceller(c OCOCanceller) {
 	s.ocoCanceller = c
 }
 
+// SetExitOrderPlacer wires the callback that places reverse limit orders at the broker.
+func (s *PaperWSServer) SetExitOrderPlacer(fn ExitOrderPlacer) {
+	s.exitOrderPlacer = fn
+}
+
 // SetPositionsFetcher wires the Indira positions fetcher used by the indira-positions endpoint.
 func (s *PaperWSServer) SetPositionsFetcher(fn PositionsFetcher) {
 	s.positionsFetcher = fn
@@ -162,6 +414,13 @@ func (s *PaperWSServer) SetPositionsFetcher(fn PositionsFetcher) {
 // Called from main.go to avoid import cycles between paper ↔ statusservice.
 func (s *PaperWSServer) SetStatusService(fn func(ctx context.Context, userID, bearerToken, appID, source string) error) {
 	s.startBrokerWS = fn
+}
+
+// SetResumeService wires the broker WS resume callback.
+// fn must call statusService.ResumeUserSubscription under the hood.
+// Called from main.go; invoked when the frontend sends a resume_token message.
+func (s *PaperWSServer) SetResumeService(fn func(ctx context.Context, userID, bearerToken, appID, source string) error) {
+	s.resumeBrokerWS = fn
 }
 
 // SetPriceMonitor wires the PriceMonitor for the price-watches endpoint.
@@ -176,10 +435,12 @@ func (s *PaperWSServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/ws/paper-trades/positions", s.handleGetPositions)
 	mux.HandleFunc("/ws/paper-trades/closed-orders", s.handleGetClosedPaperOrders)
 	mux.HandleFunc("/ws/paper-trades/force-exit-all", s.handleForceExitAll)
+	mux.HandleFunc("/ws/paper-trades/force-exit-strategy", s.handleForceExitStrategyPaper)
 	// Live orders
 	mux.HandleFunc("/ws/live-orders", s.handleLiveOrdersWS)
 	mux.HandleFunc("/ws/live-orders/closed-orders", s.handleGetClosedLiveOrders)
 	mux.HandleFunc("/ws/live-orders/force-exit-all", s.handleForceExitAllLive)
+	mux.HandleFunc("/ws/live-orders/force-exit-strategy", s.handleForceExitStrategyLive)
 	mux.HandleFunc("/ws/live-orders/indira-positions", s.handleIndiraPositions)
 	mux.HandleFunc("/ws/live-orders/subscribe-broker-ws", s.handleSubscribeBrokerWS)
 	mux.HandleFunc("/ws/live-orders/price-watches", s.handleGetPriceWatches)
@@ -325,6 +586,37 @@ func (s *PaperWSServer) handleForceExitAll(w http.ResponseWriter, r *http.Reques
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
+// handleForceExitStrategyPaper force-exits all open paper positions for a specific strategy.
+// POST /ws/paper-trades/force-exit-strategy  body: {"user_id":"xxx","strategy_id":"yyy"}
+func (s *PaperWSServer) handleForceExitStrategyPaper(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		UserID     string `json:"user_id"`
+		StrategyID string `json:"strategy_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UserID == "" || body.StrategyID == "" {
+		http.Error(w, "user_id and strategy_id are required", http.StatusBadRequest)
+		return
+	}
+
+	if s.monitor == nil {
+		http.Error(w, "monitor not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	if err := s.monitor.ForceExitByStrategy(r.Context(), body.UserID, body.StrategyID); err != nil {
+		http.Error(w, "force exit strategy failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "strategy_id": body.StrategyID})
+}
+
 // Broadcast sends a PaperUpdate to all WebSocket connections for a given user.
 func (s *PaperWSServer) Broadcast(userID string, update PaperUpdate) {
 	connMapVal, ok := s.clients.Load(userID)
@@ -421,6 +713,18 @@ func (s *PaperWSServer) handleLiveOrdersWS(w http.ResponseWriter, r *http.Reques
 		})
 	}
 
+	// Send today's closed orders so the frontend doesn't need a separate REST call.
+	closedOrders, err := s.repo.GetClosedLiveOrdersByUser(r.Context(), userID)
+	if err != nil {
+		log.Printf("[live-ws] Failed to fetch initial closed orders for user %s: %v", userID, err)
+	} else {
+		conn.WriteJSON(LiveOrderUpdate{
+			Type:   "initial_closed_orders",
+			UserID: userID,
+			Orders: closedOrders,
+		})
+	}
+
 	// Send initial price watches snapshot
 	if s.priceMonitor != nil {
 		watches := s.priceMonitor.GetWatchSnapshot(userID)
@@ -450,19 +754,45 @@ func (s *PaperWSServer) handleLiveOrdersWS(w http.ResponseWriter, r *http.Reques
 		}
 	}()
 
-	// Keep connection alive — server pushes updates, client sends pings
+	// Read loop: handles inbound messages from the frontend.
+	// Currently supports:
+	//   resume_token — frontend sends new bearer token after user re-login so the
+	//                  backend Indira WS can resume without waiting for the next order.
 	for {
-		_, _, err := conn.ReadMessage()
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			break // client disconnected or read deadline exceeded
+		}
+		var inbound struct {
+			Type        string `json:"type"`
+			BearerToken string `json:"bearer_token"`
+			AppID       string `json:"app_id"`
+			Source      string `json:"source"`
+		}
+		if jsonErr := json.Unmarshal(msg, &inbound); jsonErr != nil {
+			continue
+		}
+		if inbound.Type == "resume_token" && inbound.BearerToken != "" && s.resumeBrokerWS != nil {
+			source := inbound.Source
+			if source == "" {
+				source = "WEB"
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := s.resumeBrokerWS(ctx, userID, inbound.BearerToken, inbound.AppID, source); err != nil {
+				log.Printf("[live-ws] resume_token failed for user %s: %v", userID, err)
+			} else {
+				log.Printf("[live-ws] Auth resumed for user %s via WS resume_token", userID)
+			}
+			cancel()
 		}
 	}
 
 	log.Printf("[live-ws] Client disconnected: user=%s", userID)
 }
 
-// handleForceExitAllLive cancels all active live (non-paper) orders for a user, recording exit price + PnL.
-// POST /ws/live-orders/force-exit-all  body: {"user_id":"xxx"}
+// handleForceExitAllLive square-offs all live positions for a user by placing reverse limit orders.
+// Uses LTP ± 1% as the limit price (compliance: no market orders allowed).
+// POST /ws/live-orders/force-exit-all  body: {"user_id":"xxx","bearer_token":"...","app_id":"...","source":"WEB"}
 func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -470,7 +800,10 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 	}
 
 	var body struct {
-		UserID string `json:"user_id"`
+		UserID      string `json:"user_id"`
+		BearerToken string `json:"bearer_token"`
+		AppID       string `json:"app_id"`
+		Source      string `json:"source"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UserID == "" {
 		http.Error(w, "user_id is required", http.StatusBadRequest)
@@ -483,7 +816,12 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	exitCount := 0
 	for _, order := range orders {
+		if !models.IsFilledStatus(order.Status) || order.FilledQuantity == 0 {
+			continue
+		}
+
 		exitPrice := safeF(order.FilledPrice)
 		if s.monitor != nil {
 			if p := s.monitor.ResolveExitPrice(r.Context(), order); p > 0 {
@@ -502,6 +840,16 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 		if err := s.repo.UpdateLiveTradeExit(r.Context(), order.OrderID, exitPrice, pnl); err != nil {
 			log.Printf("[live-ws] Failed to record exit for order %s: %v", order.OrderID, err)
 		}
+
+		// Place reverse limit order at LTP ± 1% for immediate fill (compliance: no market orders)
+		if s.exitOrderPlacer != nil && body.BearerToken != "" {
+			limitPrice := s.calcExitLimitPrice(order, exitPrice)
+			if err := s.exitOrderPlacer(r.Context(), order, limitPrice, body.BearerToken, body.AppID, body.Source); err != nil {
+				log.Printf("[live-ws] Failed to place exit order for %s: %v", order.OrderID, err)
+			} else {
+				exitCount++
+			}
+		}
 	}
 
 	// Cancel all active OCO groups — their SL/TP legs must be removed from exchange
@@ -509,16 +857,132 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 		s.ocoCanceller.CancelAllGroupsByUser(r.Context(), body.UserID)
 	}
 
-	// Broadcast completion to all connected live order WS clients for this user
+	// Broadcast completion then push the updated closed orders so the frontend doesn't
+	// need to REST-poll /closed-orders after receiving force_exit_done.
 	s.BroadcastLiveOrder(body.UserID, LiveOrderUpdate{
 		Type:   "force_exit_done",
 		UserID: body.UserID,
 	})
+	if closedOrders, err := s.repo.GetClosedLiveOrdersByUser(r.Context(), body.UserID); err == nil {
+		s.BroadcastLiveOrder(body.UserID, LiveOrderUpdate{
+			Type:   "closed_orders",
+			UserID: body.UserID,
+			Orders: closedOrders,
+		})
+	}
 
-	log.Printf("[live-ws] Force-exited all live orders for user %s", body.UserID)
+	log.Printf("[live-ws] Force-exited all live orders for user %s (%d exit orders placed)", body.UserID, exitCount)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "exit_orders_placed": exitCount})
+}
+
+// handleForceExitStrategyLive square-offs all live positions for a specific strategy by placing
+// reverse limit orders at LTP ± 1% (compliance: no market orders).
+// POST /ws/live-orders/force-exit-strategy  body: {"user_id":"xxx","strategy_id":"yyy","bearer_token":"...","app_id":"...","source":"WEB"}
+func (s *PaperWSServer) handleForceExitStrategyLive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		UserID      string `json:"user_id"`
+		StrategyID  string `json:"strategy_id"`
+		BearerToken string `json:"bearer_token"`
+		AppID       string `json:"app_id"`
+		Source      string `json:"source"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UserID == "" || body.StrategyID == "" {
+		http.Error(w, "user_id and strategy_id are required", http.StatusBadRequest)
+		return
+	}
+	if body.BearerToken == "" {
+		http.Error(w, "bearer_token is required for placing exit orders", http.StatusUnauthorized)
+		return
+	}
+	if s.exitOrderPlacer == nil {
+		http.Error(w, "exit order placer not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Use GetExitableLiveOrdersByStrategy which includes CANCELLED orders (e.g. after strategy
+	// deletion) so force-exit still works even if the strategy was deleted first.
+	orders, err := s.repo.GetExitableLiveOrdersByStrategy(r.Context(), body.StrategyID, body.UserID)
+	if err != nil {
+		http.Error(w, "failed to fetch strategy orders: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[live-ws] Force-exiting strategy %s for user %s: %d exitable positions", body.StrategyID, body.UserID, len(orders))
+
+	exitCount := 0
+	for _, order := range orders {
+		exitPrice := safeF(order.FilledPrice)
+		if s.monitor != nil {
+			if p := s.monitor.ResolveExitPrice(r.Context(), order); p > 0 {
+				exitPrice = p
+			}
+		}
+
+		// Record exit PnL on the original order
+		qty := float64(order.FilledQuantity)
+		var pnl float64
+		if order.OrderSide == "BUY" {
+			pnl = (exitPrice - safeF(order.FilledPrice)) * qty
+		} else {
+			pnl = (safeF(order.FilledPrice) - exitPrice) * qty
+		}
+
+		if err := s.repo.UpdateLiveTradeExit(r.Context(), order.OrderID, exitPrice, pnl); err != nil {
+			log.Printf("[live-ws] Failed to record exit for order %s: %v", order.OrderID, err)
+		}
+
+		// Place reverse limit order at LTP ± 1% for immediate fill
+		limitPrice := s.calcExitLimitPrice(order, exitPrice)
+		if err := s.exitOrderPlacer(r.Context(), order, limitPrice, body.BearerToken, body.AppID, body.Source); err != nil {
+			log.Printf("[live-ws] Failed to place exit order for %s: %v", order.OrderID, err)
+		} else {
+			exitCount++
+		}
+	}
+
+	// Cancel OCO groups for this strategy only
+	if s.ocoCanceller != nil {
+		s.ocoCanceller.CancelGroupsByStrategy(r.Context(), body.UserID, body.StrategyID)
+	}
+
+	// Broadcast completion and push updated closed orders
+	s.BroadcastLiveOrder(body.UserID, LiveOrderUpdate{
+		Type:   "force_exit_done",
+		UserID: body.UserID,
+	})
+	if closedOrders, err := s.repo.GetClosedLiveOrdersByUser(r.Context(), body.UserID); err == nil {
+		s.BroadcastLiveOrder(body.UserID, LiveOrderUpdate{
+			Type:   "closed_orders",
+			UserID: body.UserID,
+			Orders: closedOrders,
+		})
+	}
+
+	log.Printf("[live-ws] Force-exited strategy %s for user %s: %d exit orders placed", body.StrategyID, body.UserID, exitCount)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":            true,
+		"strategy_id":        body.StrategyID,
+		"exit_orders_placed": exitCount,
+	})
+}
+
+// calcExitLimitPrice returns an aggressive limit price for immediate fill.
+// BUY positions → SELL at LTP * 0.99 (1% below); SELL positions → BUY at LTP * 1.01 (1% above).
+// This avoids market orders (compliance) while ensuring the order fills instantly.
+func (s *PaperWSServer) calcExitLimitPrice(order *models.Order, ltp float64) float64 {
+	if order.OrderSide == models.OrderSideBuy {
+		return ltp * 0.99 // selling: price 1% below LTP
+	}
+	return ltp * 1.01 // buying: price 1% above LTP
 }
 
 // handleGetClosedPaperOrders returns all closed (exited) paper positions for a user.
@@ -642,82 +1106,22 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// 2. Get our algo orders so we can filter to only algo-placed positions.
-	algoOrders, err := s.repo.GetLiveOrdersByUser(r.Context(), userID)
+	// 2. Get ALL of today's algo orders (including CANCELLED) for enrichment.
+	algoOrders, err := s.repo.GetAllTodayLiveOrdersByUser(r.Context(), userID)
 	if err != nil {
 		log.Printf("[live-ws] Failed to fetch algo orders for user %s: %v", userID, err)
 		http.Error(w, "failed to fetch algo orders", http.StatusInternalServerError)
 		return
 	}
 
-	// Build symbol → latest order map (prefer FILLED over other statuses).
-	symbolToOrder := make(map[string]*models.Order, len(algoOrders))
-	for _, order := range algoOrders {
-		sym := strings.ToUpper(order.Symbol)
-		existing, exists := symbolToOrder[sym]
-		if !exists || (models.IsFilledStatus(order.Status) && !models.IsFilledStatus(existing.Status)) {
-			cp := *order
-			symbolToOrder[sym] = &cp
-		}
-	}
-
-	// 3. Show ALL broker positions, enriching with algo order metadata when available.
-	result := make([]EnrichedAlgoPosition, 0, len(brokerPositions))
-	for _, bp := range brokerPositions {
-		ep := EnrichedAlgoPosition{
-			Symbol:       bp.Symbol,
-			Exchange:     bp.Exchange,
-			ProductType:  bp.ProductType,
-			NetQty:       bp.NetQty,
-			BuyQty:       bp.BuyQty,
-			SellQty:      bp.SellQty,
-			BuyAvgPrice:  bp.BuyAvgPrice,
-			SellAvgPrice: bp.SellAvgPrice,
-			CurrentPrice: bp.CurrentPrice,
-			BrokerPnL:    bp.PnL,
-			BrokerPnLPct: bp.PnLPercentage,
-			ExcTkn:       bp.ExcTkn,
-		}
-
-		// Match broker symbol against algo orders: try exact match first (O(1)),
-		// then fall back to substring scan only if exact match misses.
-		bpSymUpper := strings.ToUpper(bp.Symbol)
-		o, matched := symbolToOrder[bpSymUpper]
-		if !matched {
-			// Fallback: substring match for broker symbols that differ slightly
-			// (e.g. "RELIANCE-EQ" vs "RELIANCE"). Only runs on cache miss.
-			for sym, candidate := range symbolToOrder {
-				if strings.Contains(bpSymUpper, sym) || strings.Contains(sym, bpSymUpper) {
-					o = candidate
-					matched = true
-					break
-				}
-			}
-		}
-		if matched {
-			ep.OrderID = o.OrderID.String()
-			ep.StrategyID = o.StrategyID
-			ep.OrderSide = string(o.OrderSide)
-			ep.FilledQty = o.FilledQuantity
-			ep.TradingMode = o.TradingMode
-			ep.Status = string(o.Status)
-			if o.IndiraOrderID != nil {
-				ep.IndiraOrderID = *o.IndiraOrderID
-			}
-			if o.FilledPrice != nil {
-				ep.FilledPrice = *o.FilledPrice
-			}
-		}
-
-		result = append(result, ep)
-	}
+	// 3. Split broker positions into per-strategy virtual positions using our orders DB.
+	result := enrichPositions(brokerPositions, algoOrders)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":        true,
-		"positions":      result,
-		"total_broker":   len(brokerPositions),
-		"total_algo":     len(symbolToOrder),
+		"success":      true,
+		"positions":    result,
+		"total_broker": len(brokerPositions),
 	})
 }
 
@@ -744,6 +1148,32 @@ func (s *PaperWSServer) BroadcastLiveOrder(userID string, update LiveOrderUpdate
 			s.unregisterLiveClient(userID, conn)
 		}
 		return true
+	})
+}
+
+// PushPositions fetches broker positions for a user and broadcasts them via /ws/live-orders.
+// Called by statusservice after each order fill so the frontend receives updated positions
+// without polling the REST API.
+func (s *PaperWSServer) PushPositions(ctx context.Context, userID, bearerToken, appId, source string) {
+	if s.positionsFetcher == nil {
+		return
+	}
+	brokerPositions, err := s.positionsFetcher(ctx, bearerToken, appId, userID, source)
+	if err != nil {
+		log.Printf("[live-ws] PushPositions: failed to fetch for user %s: %v", userID, err)
+		return
+	}
+	algoOrders, err := s.repo.GetAllTodayLiveOrdersByUser(ctx, userID)
+	if err != nil {
+		log.Printf("[live-ws] PushPositions: failed to fetch algo orders for user %s: %v", userID, err)
+		return
+	}
+
+	result := enrichPositions(brokerPositions, algoOrders)
+	s.BroadcastLiveOrder(userID, LiveOrderUpdate{
+		Type:      "positions",
+		UserID:    userID,
+		Positions: result,
 	})
 }
 

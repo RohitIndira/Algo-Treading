@@ -251,38 +251,61 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 	order.SubmittedAt = &now
 	order.IndiraOrderID = &indiraOrderID
 
-	// Background: DB updates + publish order-update concurrently.
-	go func() {
-		bgCtx := context.Background()
+	// For square-off/exit orders, save the DB record synchronously BEFORE
+	// returning. This ensures the indira_order_id is in the DB when the
+	// broker WS fires the EXECUTED callback — preventing the status service
+	// from misidentifying it as a "manual exit" and cancelling unrelated
+	// OCO groups by symbol.
+	if order.IsSquareOffOrder {
 		orderCopy := *order
-
-		var wg sync.WaitGroup
-		wg.Add(3)
-
+		if err := e.repo.Update(ctx, &orderCopy); err != nil {
+			e.logger.Error("sync_db_update_failed", zap.String("oid", orderCopy.OrderID.String()), zap.Error(err))
+		}
 		go func() {
-			defer wg.Done()
-			if err := e.repo.Update(bgCtx, &orderCopy); err != nil {
-				e.logger.Error("bg_db_update_failed", zap.String("oid", orderCopy.OrderID.String()), zap.Error(err))
-			}
-		}()
-
-		go func() {
-			defer wg.Done()
-			e.repo.RecordExecutionEvent(bgCtx, orderCopy.OrderID, "SUBMITTED", map[string]interface{}{
+			bgCtx := context.Background()
+			oc := orderCopy
+			e.repo.RecordExecutionEvent(bgCtx, oc.OrderID, "SUBMITTED", map[string]interface{}{
 				"indira_order_id": indiraOrderID,
 				"timestamp":       now,
 			})
-		}()
-
-		go func() {
-			defer wg.Done()
-			e.publishOrderUpdate(bgCtx, &orderCopy, "ORDER_SUBMITTED", "MEDIUM",
+			e.publishOrderUpdate(bgCtx, &oc, "ORDER_SUBMITTED", "MEDIUM",
 				"Order Submitted",
-				fmt.Sprintf("Order for %s submitted to broker (ref: %s)", orderCopy.Symbol, indiraOrderID))
+				fmt.Sprintf("Order for %s submitted to broker (ref: %s)", oc.Symbol, indiraOrderID))
 		}()
+	} else {
+		// Normal orders: background DB updates + publish concurrently for speed.
+		go func() {
+			bgCtx := context.Background()
+			orderCopy := *order
 
-		wg.Wait()
-	}()
+			var wg sync.WaitGroup
+			wg.Add(3)
+
+			go func() {
+				defer wg.Done()
+				if err := e.repo.Update(bgCtx, &orderCopy); err != nil {
+					e.logger.Error("bg_db_update_failed", zap.String("oid", orderCopy.OrderID.String()), zap.Error(err))
+				}
+			}()
+
+			go func() {
+				defer wg.Done()
+				e.repo.RecordExecutionEvent(bgCtx, orderCopy.OrderID, "SUBMITTED", map[string]interface{}{
+					"indira_order_id": indiraOrderID,
+					"timestamp":       now,
+				})
+			}()
+
+			go func() {
+				defer wg.Done()
+				e.publishOrderUpdate(bgCtx, &orderCopy, "ORDER_SUBMITTED", "MEDIUM",
+					"Order Submitted",
+					fmt.Sprintf("Order for %s submitted to broker (ref: %s)", orderCopy.Symbol, indiraOrderID))
+			}()
+
+			wg.Wait()
+		}()
+	}
 
 	// Start broker WS subscription (idempotent).
 	if e.statusSvc != nil && auth != nil {
