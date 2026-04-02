@@ -54,7 +54,7 @@ func NewDownloader(logger *zap.Logger) (*Downloader, error) {
 	}
 
 	bseClient := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 60 * time.Second, // BSE old archives are slow, need longer timeout
 	}
 
 	return &Downloader{
@@ -257,19 +257,41 @@ func (d *Downloader) refreshNSECookies() error {
 	return nil
 }
 
+// bseUDiFFCutover is when BSE switched from old ZIP to UDiFF CSV format.
+// Old ZIP (EQ{DDMMYY}_CSV.ZIP) works: 2006 — Jul 4, 2024
+// UDiFF CSV works: Jul 5, 2024 — present
+var bseUDiFFCutover = time.Date(2024, 7, 5, 0, 0, 0, 0, time.UTC)
+
 // DownloadBSE downloads BSE bhavcopy for a given date.
-// Tries UDiFF format first (post July 2024), then old format for historical dates.
+// Tries the correct format first based on date, with fallback to the other.
 func (d *Downloader) DownloadBSE(date time.Time) (*BhavData, error) {
-	// Try UDiFF format first (July 2024 onwards)
+	if date.Before(bseUDiFFCutover) {
+		// Pre July 2024: try old ZIP first (avoids wasting 30s on a guaranteed UDiFF 404)
+		data, err := d.downloadBSEOld(date)
+		if err == nil {
+			return data, nil
+		}
+		if IsNoDataError(err) {
+			return nil, err // Holiday — don't try UDiFF
+		}
+		// Timeout/server error — try UDiFF as fallback
+		data, err2 := d.downloadBSEUDiFF(date)
+		if err2 == nil {
+			return data, nil
+		}
+		return nil, fmt.Errorf("all BSE sources failed for %s: %w", date.Format("2006-01-02"), err)
+	}
+
+	// Post July 2024: try UDiFF first
 	data, err := d.downloadBSEUDiFF(date)
 	if err == nil {
 		return data, nil
 	}
-	d.logger.Warn("BSE UDiFF failed, trying old format",
-		zap.String("date", date.Format("2006-01-02")),
-		zap.Error(err))
+	if IsNoDataError(err) {
+		return nil, err
+	}
 
-	// Fallback: old EQ_ISINCODE format (pre-July 2024)
+	// Fallback: old ZIP format (covers transition period)
 	data, err = d.downloadBSEOld(date)
 	if err != nil {
 		return nil, fmt.Errorf("all BSE sources failed for %s: %w", date.Format("2006-01-02"), err)
