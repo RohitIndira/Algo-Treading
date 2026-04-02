@@ -21,6 +21,7 @@ USER_CONFIG_DB="trading_db"
 TRADE_EXECUTION_DB="trading_execution"
 RULES_ENGINE_DB="trading_db"  # Uses same as user-config
 USER_LOGIN_DB="trading_db"    # Uses same as user-config
+MARKET_DATA_DB="market_data"  # Historical OHLCV + 52W data
 
 # Check if PostgreSQL is installed
 echo "${BLUE}Checking PostgreSQL installation...${NC}"
@@ -80,6 +81,15 @@ if [ $? -eq 0 ]; then
     echo "${GREEN}✓ Database '$TRADE_EXECUTION_DB' created${NC}"
 else
     echo "${YELLOW}! Database '$TRADE_EXECUTION_DB' might already exist${NC}"
+fi
+
+# Create market_data (used by data-ingestion for historical OHLCV + 52W)
+echo "Creating database: $MARKET_DATA_DB"
+PGPASSWORD=$DB_PASSWORD psql -h localhost -U $DB_USER -d postgres -c "CREATE DATABASE $MARKET_DATA_DB;" 2>/dev/null
+if [ $? -eq 0 ]; then
+    echo "${GREEN}✓ Database '$MARKET_DATA_DB' created${NC}"
+else
+    echo "${YELLOW}! Database '$MARKET_DATA_DB' might already exist${NC}"
 fi
 
 # Create trading_user for trade-execution service
@@ -177,6 +187,24 @@ else
 fi
 echo ""
 
+# 4.5: Data Ingestion Service (Market Data)
+echo "${BLUE}=== Data Ingestion Service (Market Data) ===${NC}"
+MIGRATIONS_DIR="../services/data-ingestion/migrations"
+if [ -d "$MIGRATIONS_DIR" ]; then
+    for migration in $(ls $MIGRATIONS_DIR/*.sql 2>/dev/null | sort); do
+        echo "Running migration: $(basename $migration)"
+        PGPASSWORD=$DB_PASSWORD psql -h localhost -U $DB_USER -d $MARKET_DATA_DB -f "$migration"
+        if [ $? -eq 0 ]; then
+            echo "${GREEN}✓ Migration completed: $(basename $migration)${NC}"
+        else
+            echo "${RED}✗ Migration failed: $(basename $migration)${NC}"
+        fi
+    done
+else
+    echo "${YELLOW}! No migrations found for data-ingestion service${NC}"
+fi
+echo ""
+
 # Step 5: Verify tables in each database
 echo "${YELLOW}Step 5: Verifying created tables...${NC}"
 echo ""
@@ -189,6 +217,10 @@ echo "${BLUE}Tables in $TRADE_EXECUTION_DB:${NC}"
 PGPASSWORD=$DB_PASSWORD psql -h localhost -U $DB_USER -d $TRADE_EXECUTION_DB -c "\dt"
 echo ""
 
+echo "${BLUE}Tables in $MARKET_DATA_DB:${NC}"
+PGPASSWORD=$DB_PASSWORD psql -h localhost -U $DB_USER -d $MARKET_DATA_DB -c "\dt"
+echo ""
+
 # Step 6: Summary
 echo "${GREEN}================================================${NC}"
 echo "${GREEN}Database Setup Complete!${NC}"
@@ -197,6 +229,7 @@ echo ""
 echo "Databases created:"
 echo "  - $USER_CONFIG_DB (user-config, user-login-service, rules-engine)"
 echo "  - $TRADE_EXECUTION_DB (trade-execution)"
+echo "  - $MARKET_DATA_DB (data-ingestion: historical OHLCV, 52W high/low)"
 echo ""
 echo "Users created:"
 echo "  - postgres (password: postgres)"
@@ -205,5 +238,6 @@ echo ""
 echo "Connection strings:"
 echo "  User Config:     postgresql://postgres:postgres@localhost:5432/$USER_CONFIG_DB"
 echo "  Trade Execution: postgresql://trading_user:your_secure_password@localhost:5432/$TRADE_EXECUTION_DB"
+echo "  Market Data:     postgresql://postgres:postgres@localhost:5432/$MARKET_DATA_DB"
 echo ""
 echo "${YELLOW}Note: Change default passwords in production!${NC}"
