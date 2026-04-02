@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,6 +66,14 @@ type Config struct {
 	RedisDB       int
 
 	MongoConnectTimeout time.Duration
+
+	// PostgreSQL (market_data database for historical OHLCV)
+	PGHost     string
+	PGPort     int
+	PGUser     string
+	PGPassword string
+	PGDatabase string
+	PGSSLMode  string
 }
 
 // Load loads configuration from environment variables with sensible defaults
@@ -100,6 +109,8 @@ func Load() *Config {
 	workerCount := 4
 	maxRetries := 3
 
+	pgPort, _ := strconv.Atoi(getEnv("MARKET_DATA_DB_PORT", "5432"))
+
 	return &Config{
 		MongoURI:            getEnv("MONGO_URI", "mongodb://localhost:27017"),
 		MongoDatabase:       db,
@@ -112,6 +123,12 @@ func Load() *Config {
 		WorkerCount:         workerCount,
 		MaxRetries:          maxRetries,
 		MongoConnectTimeout: 10 * time.Second,
+		PGHost:              getEnv("MARKET_DATA_DB_HOST", "localhost"),
+		PGPort:              pgPort,
+		PGUser:              getEnv("MARKET_DATA_DB_USER", "postgres"),
+		PGPassword:          getEnv("MARKET_DATA_DB_PASSWORD", "postgres"),
+		PGDatabase:          getEnv("MARKET_DATA_DB_NAME", "market_data"),
+		PGSSLMode:           getEnv("MARKET_DATA_DB_SSLMODE", "disable"),
 	}
 }
 
