@@ -38,6 +38,10 @@ type WSMonitor struct {
 	// Track which stocks already broke out today (avoid duplicate DB writes)
 	breakoutToday sync.Map // key: "SYMBOL:52W_HIGH" or "SYMBOL:52W_LOW"
 
+	// O(1) split detection: prev_close per instrument (loaded from bhavcopy on startup)
+	prevClose   map[string]float64 // key: symbol → prev_close from bhavcopy
+	splitChecked sync.Map          // key: symbol → true (only check once per day)
+
 	// Stats
 	statsMu    sync.Mutex
 	tickCount  int64
@@ -85,6 +89,16 @@ func (m *WSMonitor) Start(ctx context.Context) error {
 	}
 	m.symbols = symbols
 	m.logger.Info("Loaded NSE symbols for monitoring", zap.Int("count", len(symbols)))
+
+	// Load prev_close for all instruments (for O(1) split detection)
+	m.prevClose, err = m.repo.GetAllPrevClose(ctx)
+	if err != nil {
+		m.logger.Warn("Failed to load prev_close for split detection", zap.Error(err))
+		m.prevClose = make(map[string]float64)
+	} else {
+		m.logger.Info("Loaded prev_close for O(1) split detection",
+			zap.Int("instruments", len(m.prevClose)))
+	}
 
 	// Start midnight reset goroutine (clear daily breakout tracking)
 	go m.midnightReset(ctx)
@@ -273,6 +287,9 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 	m.lastTick = time.Now()
 	m.statsMu.Unlock()
 
+	// O(1) split detection on first tick per stock
+	m.detectSplitO1(ctx, symbol, ltp)
+
 	ws52High := getFloatField(data, "week_52_high")
 	ws52Low := getFloatField(data, "week_52_low")
 	volume := getIntField(data, "volume")
@@ -332,6 +349,75 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 			Source:        "websocket",
 			BreakoutAt:    breakoutAt,
 		})
+	}
+}
+
+// detectSplitO1 detects stock splits in O(1) time using price/prev_close ratio.
+// Only checks once per stock per day. If split detected, resets instrument history.
+//
+// Common split ratios in Indian markets:
+//   1:2 → ratio ~0.50    1:5  → ratio ~0.20    2:1 reverse → ratio ~2.0
+//   1:3 → ratio ~0.33    1:10 → ratio ~0.10    3:1 reverse → ratio ~3.0
+//   1:4 → ratio ~0.25
+func (m *WSMonitor) detectSplitO1(ctx context.Context, symbol string, ltp float64) {
+	// Only check once per stock per day
+	if _, checked := m.splitChecked.LoadOrStore(symbol, true); checked {
+		return
+	}
+
+	prevClose, ok := m.prevClose[symbol]
+	if !ok || prevClose <= 0 || ltp <= 0 {
+		return
+	}
+
+	ratio := ltp / prevClose
+
+	// Check against known split ratios (pure O(1) — no loops, just comparisons)
+	var splitType string
+	switch {
+	case ratio > 0.08 && ratio < 0.12:
+		splitType = "1:10"
+	case ratio > 0.18 && ratio < 0.22:
+		splitType = "1:5"
+	case ratio > 0.23 && ratio < 0.28:
+		splitType = "1:4"
+	case ratio > 0.30 && ratio < 0.36:
+		splitType = "1:3"
+	case ratio > 0.45 && ratio < 0.55:
+		splitType = "1:2"
+	case ratio > 1.8 && ratio < 2.2:
+		splitType = "2:1 reverse"
+	case ratio > 2.8 && ratio < 3.2:
+		splitType = "3:1 reverse"
+	case ratio > 4.5 && ratio < 5.5:
+		splitType = "5:1 reverse"
+	case ratio > 9.0 && ratio < 11.0:
+		splitType = "10:1 reverse"
+	default:
+		return // No split detected
+	}
+
+	m.logger.Warn("STOCK SPLIT DETECTED (O(1))",
+		zap.String("symbol", symbol),
+		zap.String("split", splitType),
+		zap.Float64("ltp", ltp),
+		zap.Float64("prev_close", prevClose),
+		zap.Float64("ratio", ratio))
+
+	// Reset instrument history — old pre-split data is now invalid
+	instID, _, err := m.repo.GetInstrumentBySymbol(ctx, symbol, "NSE")
+	if err != nil || instID == 0 {
+		return
+	}
+
+	if err := m.repo.ResetInstrumentHistory(ctx, instID, time.Now()); err != nil {
+		m.logger.Error("Failed to reset split instrument",
+			zap.String("symbol", symbol), zap.Error(err))
+	}
+
+	// Clear stale Redis 52W data — WebSocket will repopulate with correct values
+	if m.redis != nil {
+		m.redis.Del(ctx, fmt.Sprintf("52w:token:%s", symbol))
 	}
 }
 

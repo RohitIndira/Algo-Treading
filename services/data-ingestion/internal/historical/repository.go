@@ -536,6 +536,32 @@ func (r *Repository) GetInstrumentBySymbol(ctx context.Context, symbol, exchange
 	return id, token, err
 }
 
+// GetAllPrevClose returns the most recent close price for every NSE instrument.
+// Used for O(1) stock split detection: ratio = ltp / prev_close.
+func (r *Repository) GetAllPrevClose(ctx context.Context) (map[string]float64, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT DISTINCT ON (i.symbol) i.symbol, d.close
+		FROM daily_ohlcv d
+		JOIN instruments i ON i.instrument_id = d.instrument_id
+		WHERE i.exchange = 'NSE' AND i.is_active = TRUE
+		ORDER BY i.symbol, d.trade_date DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]float64, 4000)
+	for rows.Next() {
+		var symbol string
+		var closePrice float64
+		if err := rows.Scan(&symbol, &closePrice); err != nil {
+			return nil, err
+		}
+		result[symbol] = closePrice
+	}
+	return result, rows.Err()
+}
+
 // GetAllNSESymbols returns all active NSE instrument symbols for WebSocket subscription.
 func (r *Repository) GetAllNSESymbols(ctx context.Context) ([]string, error) {
 	rows, err := r.db.QueryContext(ctx,
