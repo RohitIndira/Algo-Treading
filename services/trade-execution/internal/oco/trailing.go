@@ -331,6 +331,9 @@ func (c *OCOMarketClient) processMessage(msg []byte) {
 	case "subscription_response":
 		if d, ok := envelope["data"].(map[string]interface{}); ok {
 			log.Printf("[oco-market] Subscription: %v", d["subscribed_stocks"])
+			if failed, ok := d["failed_stocks"]; ok && failed != nil {
+				log.Printf("[oco-market] WARNING: failed subscriptions: %v", failed)
+			}
 		}
 
 	case "error":
@@ -491,10 +494,10 @@ func (t *TrailingMonitor) Start(ctx context.Context) {
 		case <-refreshTicker.C:
 			t.refreshGroups()
 		case <-ticker.C:
-			// Redis fallback: only when WSS is not healthy
-			if t.marketClient == nil || !t.marketClient.IsHealthy() {
-				t.pollRedisFallback(ctx)
-			}
+			// Redis fallback: poll for symbols missing WSS ticks.
+			// WSS may report healthy overall while specific symbols
+			// receive no ticks (subscription silently dropped).
+			t.pollRedisForMissingSymbols(ctx)
 		}
 	}
 }
@@ -518,6 +521,11 @@ func (t *TrailingMonitor) OnPriceUpdate(symbol string, ltp float64) {
 	for _, group := range groups {
 		if group.State != StateActive || !group.TrailingSL {
 			continue
+		}
+		// Log trailing evaluation for diagnostics
+		if ltp > group.HighestPrice {
+			log.Printf("[oco-trailing] New high for %s: ltp=%.2f highest=%.2f sl_trigger=%.2f group=%s",
+				symbol, ltp, group.HighestPrice, group.SLTriggerPrice, group.GroupID)
 		}
 		t.evaluateTrailing(group, ltp)
 	}
@@ -582,14 +590,28 @@ func (t *TrailingMonitor) refreshGroups() {
 	t.symbolGroupsMu.Unlock()
 
 	if len(newTokens) > 0 {
-		log.Printf("[oco-trailing] Watching %d symbols for trailing SL across %d groups",
-			len(newMap), len(activeGroups))
+		// Log WSS LTP cache status for each watched symbol to diagnose tick delivery
+		var ltpInfo []string
+		for sym, groups := range newMap {
+			if t.marketClient != nil {
+				ltp, ok := t.marketClient.GetLTP(sym)
+				if ok {
+					ltpInfo = append(ltpInfo, fmt.Sprintf("%s=%.2f(highest=%.2f)", sym, ltp, groups[0].HighestPrice))
+				} else {
+					ltpInfo = append(ltpInfo, fmt.Sprintf("%s=NO_TICK(highest=%.2f)", sym, groups[0].HighestPrice))
+				}
+			}
+		}
+		log.Printf("[oco-trailing] Watching %d symbols for trailing SL across %d groups | WSS cache: %v | WSS healthy: %v",
+			len(newMap), len(activeGroups), strings.Join(ltpInfo, ", "), t.marketClient != nil && t.marketClient.IsHealthy())
 	}
 }
 
-// pollRedisFallback fetches LTPs from Redis for all watched symbols.
-// Only called when WSS is unhealthy.
-func (t *TrailingMonitor) pollRedisFallback(ctx context.Context) {
+// pollRedisForMissingSymbols fetches LTPs from Redis for symbols that have
+// no WSS tick in the LTP cache. This handles the case where WSS is globally
+// healthy (some symbols receive ticks) but specific subscriptions silently
+// fail to deliver data.
+func (t *TrailingMonitor) pollRedisForMissingSymbols(ctx context.Context) {
 	if t.redisProvider == nil {
 		return
 	}
@@ -605,10 +627,20 @@ func (t *TrailingMonitor) pollRedisFallback(ctx context.Context) {
 		return
 	}
 
+	wssHealthy := t.marketClient != nil && t.marketClient.IsHealthy()
+
 	for _, groupList := range groups {
 		for _, group := range groupList {
 			if group.State != StateActive || !group.TrailingSL {
 				continue
+			}
+
+			// If WSS is healthy, only poll Redis for symbols missing from WSS cache.
+			// If WSS is down, poll Redis for everything.
+			if wssHealthy && t.marketClient != nil {
+				if _, hasWSSTick := t.marketClient.GetLTP(group.Symbol); hasWSSTick {
+					continue // WSS is delivering ticks for this symbol — skip Redis
+				}
 			}
 
 			ltp, err := t.redisProvider.GetLTP(ctx, strings.ToLower(group.Exchange), group.StockCode)

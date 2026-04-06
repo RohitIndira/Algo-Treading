@@ -10,6 +10,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // DashboardStats holds aggregated trading stats for a user.
@@ -70,6 +71,9 @@ type OrderRepository interface {
 	// OCO (One-Cancels-the-Other) queries
 	GetActiveOCOOrders(ctx context.Context) ([]*models.Order, error)
 	GetOCOGroupOrders(ctx context.Context, groupID uuid.UUID) ([]*models.Order, error)
+	// GetStrategyNamesByIDs returns a map of strategy_id → strategy_name from the orders table.
+	// Looks across all orders (not just today's) to find names for strategies that may have been deleted.
+	GetStrategyNamesByIDs(ctx context.Context, strategyIDs []string) (map[string]string, error)
 }
 
 type orderRepository struct {
@@ -764,4 +768,34 @@ func (r *orderRepository) GetOCOGroupOrders(ctx context.Context, groupID uuid.UU
 		return nil, fmt.Errorf("failed to get OCO group orders: %w", err)
 	}
 	return orders, nil
+}
+
+// GetStrategyNamesByIDs returns a map of strategy_id → strategy_name from the orders table.
+// Scans all orders (not just today's) so deleted strategies still resolve to a name.
+func (r *orderRepository) GetStrategyNamesByIDs(ctx context.Context, strategyIDs []string) (map[string]string, error) {
+	result := make(map[string]string, len(strategyIDs))
+	if len(strategyIDs) == 0 {
+		return result, nil
+	}
+
+	query := `
+		SELECT DISTINCT ON (strategy_id) strategy_id, strategy_name
+		FROM orders
+		WHERE strategy_id = ANY($1)
+		AND strategy_name != ''
+		ORDER BY strategy_id, created_at DESC
+	`
+	type row struct {
+		StrategyID   string `db:"strategy_id"`
+		StrategyName string `db:"strategy_name"`
+	}
+	var rows []row
+	err := r.db.SelectContext(ctx, &rows, query, pq.Array(strategyIDs))
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get strategy names: %w", err)
+	}
+	for _, r := range rows {
+		result[r.StrategyID] = r.StrategyName
+	}
+	return result, nil
 }

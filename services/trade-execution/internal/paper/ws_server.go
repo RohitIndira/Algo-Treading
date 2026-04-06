@@ -117,6 +117,17 @@ type strategyShare struct {
 // position. This function splits it proportionally across strategies based on
 // the entry order quantities in our DB.
 func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Order) []EnrichedAlgoPosition {
+	// Pre-scan: build a strategy_id → strategy_name lookup from ALL orders (including
+	// SELL, square-off, etc.) so we can backfill names even when entry orders lack them.
+	strategyNameLookup := make(map[string]string)
+	for _, order := range algoOrders {
+		if order.StrategyID != "" && order.StrategyName != "" {
+			if _, exists := strategyNameLookup[order.StrategyID]; !exists {
+				strategyNameLookup[order.StrategyID] = order.StrategyName
+			}
+		}
+	}
+
 	// Step 1: From our orders, find the FIRST BUY entry order per (symbol, strategy_id).
 	// We only look at the initial entry order to determine each strategy's share.
 	// Use a dedup key to avoid counting duplicate/retry orders.
@@ -158,20 +169,26 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 		}
 		seen[dk] = true
 
+		// Resolve strategy name: order itself > lookup from all orders
+		stratName := order.StrategyName
+		if stratName == "" {
+			stratName = strategyNameLookup[order.StrategyID]
+		}
+
 		key := symStratKey{Symbol: sym, StrategyID: sid}
 		share, exists := shares[key]
 		if !exists {
 			share = &strategyShare{
 				StrategyID:   order.StrategyID,
-				StrategyName: order.StrategyName,
+				StrategyName: stratName,
 				TradingMode:  order.TradingMode,
 				OrderSide:    string(order.OrderSide),
 			}
 			shares[key] = share
 		}
 		// Backfill strategy_name if earlier orders had it empty
-		if share.StrategyName == "" && order.StrategyName != "" {
-			share.StrategyName = order.StrategyName
+		if share.StrategyName == "" && stratName != "" {
+			share.StrategyName = stratName
 		}
 
 		share.EntryQty += int(order.Quantity)
@@ -1117,6 +1134,25 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 	// 3. Split broker positions into per-strategy virtual positions using our orders DB.
 	result := enrichPositions(brokerPositions, algoOrders)
 
+	// 4. Backfill missing strategy names from historical orders in the DB.
+	var missingIDs []string
+	for i := range result {
+		if result[i].StrategyID != "" && result[i].StrategyName == "" {
+			missingIDs = append(missingIDs, result[i].StrategyID)
+		}
+	}
+	if len(missingIDs) > 0 {
+		if nameMap, err := s.repo.GetStrategyNamesByIDs(r.Context(), missingIDs); err == nil {
+			for i := range result {
+				if result[i].StrategyID != "" && result[i].StrategyName == "" {
+					if name, ok := nameMap[result[i].StrategyID]; ok {
+						result[i].StrategyName = name
+					}
+				}
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":      true,
@@ -1170,6 +1206,26 @@ func (s *PaperWSServer) PushPositions(ctx context.Context, userID, bearerToken, 
 	}
 
 	result := enrichPositions(brokerPositions, algoOrders)
+
+	// Backfill missing strategy names from historical orders in the DB.
+	var missingIDs []string
+	for i := range result {
+		if result[i].StrategyID != "" && result[i].StrategyName == "" {
+			missingIDs = append(missingIDs, result[i].StrategyID)
+		}
+	}
+	if len(missingIDs) > 0 {
+		if nameMap, err := s.repo.GetStrategyNamesByIDs(ctx, missingIDs); err == nil {
+			for i := range result {
+				if result[i].StrategyID != "" && result[i].StrategyName == "" {
+					if name, ok := nameMap[result[i].StrategyID]; ok {
+						result[i].StrategyName = name
+					}
+				}
+			}
+		}
+	}
+
 	s.BroadcastLiveOrder(userID, LiveOrderUpdate{
 		Type:      "positions",
 		UserID:    userID,

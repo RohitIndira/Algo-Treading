@@ -671,7 +671,7 @@ func loadConfig() Config {
 		PostgresURL:      buildPostgresURL(),
 		EncryptionKey:    getEnv("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef"),
 		PaperWSPort:      getEnvInt("PAPER_WS_PORT", 8081),
-		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", "wss://stockkaskwebsocket.indiratrade.com/enhanced-stream"),
+		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", ""),
 		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
 		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
 		MetricsPort:      getEnvInt("METRICS_PORT", 9090),
