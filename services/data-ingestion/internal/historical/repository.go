@@ -203,16 +203,17 @@ func (r *Repository) RefreshMaterializedView(ctx context.Context) error {
 
 // Week52Data holds pre-computed 52W data for a single instrument.
 type Week52Data struct {
-	InstrumentID      int
-	Token             string
-	Symbol            string
-	ISIN              string
-	Exchange          string
-	Week52High        float64
-	Week52Low         float64
-	LastClose         float64
-	LastTradeDate     time.Time
-	PositionInRange   float64 // 0-100%
+	InstrumentID    int
+	Token           string
+	Symbol          string
+	ISIN            string
+	Exchange        string
+	Week52High      float64
+	Week52Low       float64
+	LastClose       float64
+	LastTradeDate   time.Time
+	PositionInRange float64 // 0-100%
+	DataDays        int     // Fix #4: number of trading days of data (< 252 = partial/IPO)
 }
 
 // GetAll52WData reads the entire materialized view for Redis sync.
@@ -220,7 +221,8 @@ func (r *Repository) GetAll52WData(ctx context.Context) ([]Week52Data, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT instrument_id, token, symbol, COALESCE(isin,''), exchange,
 		       week_52_high, week_52_low, COALESCE(last_close, 0),
-		       last_trade_date, COALESCE(position_in_52w_range, 0)
+		       last_trade_date, COALESCE(position_in_52w_range, 0),
+		       COALESCE(data_days, 0)
 		FROM mv_52w_high_low`)
 	if err != nil {
 		return nil, err
@@ -232,7 +234,7 @@ func (r *Repository) GetAll52WData(ctx context.Context) ([]Week52Data, error) {
 		var d Week52Data
 		if err := rows.Scan(&d.InstrumentID, &d.Token, &d.Symbol, &d.ISIN, &d.Exchange,
 			&d.Week52High, &d.Week52Low, &d.LastClose,
-			&d.LastTradeDate, &d.PositionInRange); err != nil {
+			&d.LastTradeDate, &d.PositionInRange, &d.DataDays); err != nil {
 			return nil, err
 		}
 		result = append(result, d)
@@ -289,4 +291,96 @@ func (r *Repository) IsDateLoaded(ctx context.Context, tradeDate time.Time, exch
 			WHERE trade_date = $1 AND exchange = $2 AND status = 'SUCCESS'
 		)`, tradeDate, exchange).Scan(&exists)
 	return exists, err
+}
+
+// --- Cleanup ---
+
+// CleanupOldData deletes OHLCV rows older than 370 calendar days.
+// Uses calendar days (not trading days) so holidays don't cause over-deletion.
+// Also cleans up old load log entries.
+func (r *Repository) CleanupOldData(ctx context.Context) (int64, error) {
+	result, err := r.db.ExecContext(ctx,
+		`DELETE FROM daily_ohlcv WHERE trade_date < CURRENT_DATE - INTERVAL '370 days'`)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup ohlcv: %w", err)
+	}
+	deleted, _ := result.RowsAffected()
+
+	// Also cleanup old load log (best effort, non-critical)
+	_, _ = r.db.ExecContext(ctx,
+		`DELETE FROM data_load_log WHERE trade_date < CURRENT_DATE - INTERVAL '370 days'`)
+
+	return deleted, nil
+}
+
+// --- Stock Split / Corporate Action Detection ---
+
+// SplitDetection holds info about a detected stock split or corporate action.
+type SplitDetection struct {
+	InstrumentID int
+	Symbol       string
+	Exchange     string
+	PrevClose    float64
+	TodayOpen    float64
+	GapPct       float64
+}
+
+// DetectSplits finds stocks where today's open price has a >30% gap from
+// the previous close. This indicates a stock split, bonus, or corporate action.
+// Returns the list of affected instruments so their history can be reset.
+func (r *Repository) DetectSplits(ctx context.Context, tradeDate time.Time) ([]SplitDetection, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		WITH today AS (
+			SELECT instrument_id, open, trade_date
+			FROM daily_ohlcv
+			WHERE trade_date = $1
+		),
+		prev AS (
+			SELECT DISTINCT ON (instrument_id)
+				instrument_id, close
+			FROM daily_ohlcv
+			WHERE trade_date < $1
+			ORDER BY instrument_id, trade_date DESC
+		)
+		SELECT t.instrument_id, i.symbol, i.exchange, p.close AS prev_close, t.open AS today_open,
+			   ABS((t.open - p.close) / NULLIF(p.close, 0) * 100) AS gap_pct
+		FROM today t
+		JOIN prev p ON p.instrument_id = t.instrument_id
+		JOIN instruments i ON i.instrument_id = t.instrument_id
+		WHERE p.close > 0
+		  AND ABS((t.open - p.close) / p.close * 100) > 30`, tradeDate)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []SplitDetection
+	for rows.Next() {
+		var d SplitDetection
+		if err := rows.Scan(&d.InstrumentID, &d.Symbol, &d.Exchange,
+			&d.PrevClose, &d.TodayOpen, &d.GapPct); err != nil {
+			return nil, err
+		}
+		result = append(result, d)
+	}
+	return result, rows.Err()
+}
+
+// ResetInstrumentHistory deletes all OHLCV history for an instrument EXCEPT today's data.
+// Used after detecting a stock split so stale pre-split data doesn't pollute 52W calculations.
+func (r *Repository) ResetInstrumentHistory(ctx context.Context, instrumentID int, keepDate time.Time) error {
+	_, err := r.db.ExecContext(ctx,
+		`DELETE FROM daily_ohlcv WHERE instrument_id = $1 AND trade_date < $2`,
+		instrumentID, keepDate)
+	return err
+}
+
+// --- Redis Recovery ---
+
+// Has52WData checks if the materialized view has any data.
+func (r *Repository) Has52WData(ctx context.Context) (bool, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM mv_52w_high_low`).Scan(&count)
+	return count > 0, err
 }

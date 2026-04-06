@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -193,6 +194,93 @@ func (w *Worker) ingestExchange(ctx context.Context, date time.Time, exchange st
 	return inserted, skipped, nil
 }
 
+// --- Fix #5: Stock Split Detection ---
+
+// DetectAndHandleSplits checks for stock splits/bonus/corporate actions
+// by looking for >30% overnight gaps. Resets affected instruments' history.
+func (w *Worker) DetectAndHandleSplits(ctx context.Context, date time.Time) {
+	splits, err := w.repo.DetectSplits(ctx, date)
+	if err != nil {
+		w.logger.Error("Split detection query failed", zap.Error(err))
+		return
+	}
+
+	if len(splits) == 0 {
+		return
+	}
+
+	w.logger.Warn("Detected potential stock splits/corporate actions",
+		zap.Int("count", len(splits)))
+
+	for _, s := range splits {
+		w.logger.Warn("Stock split detected — resetting history",
+			zap.String("symbol", s.Symbol),
+			zap.String("exchange", s.Exchange),
+			zap.Float64("prev_close", s.PrevClose),
+			zap.Float64("today_open", s.TodayOpen),
+			zap.Float64("gap_pct", math.Round(s.GapPct*100)/100))
+
+		// Delete all history BEFORE today — keep only today's data
+		if err := w.repo.ResetInstrumentHistory(ctx, s.InstrumentID, date); err != nil {
+			w.logger.Error("Failed to reset instrument history",
+				zap.String("symbol", s.Symbol),
+				zap.Error(err))
+		}
+	}
+}
+
+// --- Fix #3: Cleanup old data ---
+
+// CleanupOldData removes OHLCV data older than 370 calendar days.
+func (w *Worker) CleanupOldData(ctx context.Context) {
+	deleted, err := w.repo.CleanupOldData(ctx)
+	if err != nil {
+		w.logger.Error("Cleanup failed", zap.Error(err))
+		return
+	}
+	if deleted > 0 {
+		w.logger.Info("Cleaned up old data",
+			zap.Int64("rows_deleted", deleted))
+	}
+}
+
+// --- Fix #7: Redis Recovery ---
+
+// EnsureRedisLoaded checks if Redis has 52W data. If empty, reloads from Postgres.
+// Called on startup to handle Redis crash recovery.
+func (w *Worker) EnsureRedisLoaded(ctx context.Context) error {
+	if w.redis == nil {
+		return nil
+	}
+
+	// Check if Redis has any 52W keys
+	keys, err := w.redis.Keys(ctx, "52w:*").Result()
+	if err != nil {
+		return fmt.Errorf("redis keys check: %w", err)
+	}
+
+	if len(keys) > 0 {
+		w.logger.Info("Redis has 52W data", zap.Int("keys", len(keys)))
+		return nil
+	}
+
+	// Redis is empty — check if Postgres has data to load
+	hasData, err := w.repo.Has52WData(ctx)
+	if err != nil {
+		return fmt.Errorf("check matview: %w", err)
+	}
+
+	if !hasData {
+		w.logger.Warn("No 52W data in Postgres either — will be available after first ingestion")
+		return nil
+	}
+
+	w.logger.Warn("Redis empty but Postgres has 52W data — reloading")
+	return w.syncToRedis(ctx)
+}
+
+// --- Materialized View + Redis Sync ---
+
 // RefreshAndSync refreshes the 52W materialized view and syncs to Redis.
 // Called after daily ingestion completes.
 func (w *Worker) RefreshAndSync(ctx context.Context) error {
@@ -210,6 +298,8 @@ func (w *Worker) RefreshAndSync(ctx context.Context) error {
 }
 
 // syncToRedis reads all 52W data from the materialized view and writes to Redis.
+// Fix #7: Redis TTL = 120 hours (5 days) to survive long holidays.
+// Fix #4: Includes data_days count so rules-engine knows if data is partial (IPO).
 func (w *Worker) syncToRedis(ctx context.Context) error {
 	if w.redis == nil {
 		w.logger.Warn("Redis client not configured, skipping 52W sync")
@@ -227,7 +317,7 @@ func (w *Worker) syncToRedis(ctx context.Context) error {
 	}
 
 	pipe := w.redis.Pipeline()
-	ttl := 25 * time.Hour // Survive weekends + some buffer
+	ttl := 120 * time.Hour // Fix: 5 days TTL to survive long holidays (was 25h)
 
 	for _, d := range data {
 		key := fmt.Sprintf("52w:%d", d.InstrumentID)
@@ -239,6 +329,7 @@ func (w *Worker) syncToRedis(ctx context.Context) error {
 			"token":      d.Token,
 			"exchange":   d.Exchange,
 			"position":   d.PositionInRange,
+			"data_days":  d.DataDays, // Fix #4: rules-engine can check if partial
 			"as_of":      d.LastTradeDate.Format("2006-01-02"),
 		})
 		pipe.Set(ctx, key, val, ttl)
@@ -260,8 +351,10 @@ func (w *Worker) syncToRedis(ctx context.Context) error {
 	return nil
 }
 
+// --- Fix #8: Retry bhavcopy with polling ---
+
 // RunDailyScheduler runs the daily ingestion + refresh cycle.
-// Ingests today's data at the scheduled time, then refreshes the matview and syncs Redis.
+// Fix #8: Retries bhavcopy download every 10 min if not available (up to 22:00 IST).
 func (w *Worker) RunDailyScheduler(ctx context.Context, scheduleHour, scheduleMinute int) {
 	w.logger.Info("Daily scheduler started",
 		zap.Int("schedule_hour", scheduleHour),
@@ -301,19 +394,53 @@ func (w *Worker) RunDailyScheduler(ctx context.Context, scheduleHour, scheduleMi
 		w.logger.Info("Running daily ingestion",
 			zap.String("date", today.Format("2006-01-02")))
 
-		// Ingest today's data
-		ins, skip, err := w.IngestDate(ctx, today)
-		if err != nil {
-			w.logger.Error("Daily ingestion failed", zap.Error(err))
-			continue
-		}
-		w.logger.Info("Daily ingestion complete",
-			zap.Int("inserted", ins),
-			zap.Int("skipped", skip))
+		// Fix #8: Retry ingestion every 10 min until data available or 22:00 IST
+		deadline := time.Date(today.Year(), today.Month(), today.Day(), 22, 0, 0, 0, loc)
+		var ins, skip int
+		var ingestErr error
 
-		// Refresh materialized view + sync to Redis
-		if err := w.RefreshAndSync(ctx); err != nil {
-			w.logger.Error("Refresh/sync failed", zap.Error(err))
+		for attempt := 0; ; attempt++ {
+			ins, skip, ingestErr = w.IngestDate(ctx, today)
+			if ingestErr == nil && ins > 0 {
+				break // Success
+			}
+
+			if time.Now().In(loc).After(deadline) {
+				w.logger.Warn("Bhavcopy not available before deadline, giving up",
+					zap.String("date", today.Format("2006-01-02")))
+				break
+			}
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			w.logger.Info("Bhavcopy not ready yet, retrying in 10 min",
+				zap.Int("attempt", attempt+1),
+				zap.Error(ingestErr))
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Minute):
+			}
+		}
+
+		if ins > 0 {
+			w.logger.Info("Daily ingestion complete",
+				zap.Int("inserted", ins),
+				zap.Int("skipped", skip))
+
+			// Fix #5: Detect stock splits after ingestion
+			w.DetectAndHandleSplits(ctx, today)
+
+			// Fix #3: Cleanup old data (>370 calendar days)
+			w.CleanupOldData(ctx)
+
+			// Refresh materialized view + sync to Redis
+			if err := w.RefreshAndSync(ctx); err != nil {
+				w.logger.Error("Refresh/sync failed", zap.Error(err))
+			}
 		}
 	}
 }

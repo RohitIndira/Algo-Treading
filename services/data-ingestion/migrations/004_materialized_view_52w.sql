@@ -6,8 +6,13 @@
 --
 -- During market hours, real-time 52W data comes from broker WebSocket.
 -- This view is the authoritative source for pre-market / post-market / offline.
+--
+-- Fix #4: Includes data_days so rules-engine knows if data is partial (IPO stock).
+--         If data_days < 252, the stock doesn't have a full year of data.
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_52w_high_low AS
+DROP MATERIALIZED VIEW IF EXISTS mv_52w_high_low;
+
+CREATE MATERIALIZED VIEW mv_52w_high_low AS
 SELECT
     d.instrument_id,
     i.token,
@@ -23,6 +28,8 @@ SELECT
      ORDER BY d2.trade_date DESC
      LIMIT 1) AS last_close,
     MAX(d.trade_date) AS last_trade_date,
+    -- How many trading days of data we have (Fix #4: partial data detection for IPOs)
+    COUNT(*) AS data_days,
     -- Distance from 52W high/low as percentage
     ROUND(
         ((SELECT d3.close FROM daily_ohlcv d3

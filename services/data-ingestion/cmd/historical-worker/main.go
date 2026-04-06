@@ -116,6 +116,11 @@ func main() {
 		cancel()
 	}()
 
+	// Fix #7: On startup, ensure Redis has 52W data (recover from Redis crash)
+	if err := worker.EnsureRedisLoaded(ctx); err != nil {
+		logger.Error("Redis recovery failed", zap.Error(err))
+	}
+
 	switch *mode {
 	case "backfill":
 		if *fromStr == "" || *toStr == "" {
