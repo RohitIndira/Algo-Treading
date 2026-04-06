@@ -448,6 +448,20 @@ func (r *Repository) GetTodayBreakouts(ctx context.Context) ([]BreakoutEvent, er
 	return result, rows.Err()
 }
 
+// DeleteFalseBreakout removes a today's breakout that turned out to be false
+// (WebSocket provided more accurate 52W values). Returns true if a row was deleted.
+func (r *Repository) DeleteFalseBreakout(ctx context.Context, symbol, breakoutType string) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `
+		DELETE FROM breakout_events
+		WHERE symbol = $1 AND breakout_type = $2 AND trade_date = CURRENT_DATE`,
+		symbol, breakoutType)
+	if err != nil {
+		return false, err
+	}
+	rows, _ := result.RowsAffected()
+	return rows > 0, nil
+}
+
 // GetInstrumentBySymbol looks up instrument by symbol+exchange.
 func (r *Repository) GetInstrumentBySymbol(ctx context.Context, symbol, exchange string) (int, string, error) {
 	var id int

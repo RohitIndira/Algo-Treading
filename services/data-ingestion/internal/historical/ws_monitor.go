@@ -254,42 +254,53 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 	m.lastTick = time.Now()
 	m.statsMu.Unlock()
 
-	week52High := getFloatField(data, "week_52_high")
-	week52Low := getFloatField(data, "week_52_low")
+	ws52High := getFloatField(data, "week_52_high")
+	ws52Low := getFloatField(data, "week_52_low")
 	volume := getIntField(data, "volume")
 	pctChange := getFloatField(data, "percent_change")
 	isNew52WH, _ := data["is_new_week_52_high"].(bool)
 	isNew52WL, _ := data["is_new_week_52_low"].(bool)
 
-	// Also check against our Redis values (bhavcopy computed — covers BSE too)
+	// Determine 52W values to use:
+	//   Priority 1: WebSocket values (broker's official data, most accurate)
+	//   Priority 2: Bhavcopy Redis values (fallback for stocks where WS has no 52W data)
 	redis52H, redis52L := m.getRedis52W(ctx, token)
 
-	// Detect 52W HIGH breakout
-	if isNew52WH || (week52High > 0 && ltp > week52High) || (redis52H > 0 && ltp > redis52H) {
+	use52H := ws52High
+	use52L := ws52Low
+	if use52H <= 0 {
+		use52H = redis52H // Fallback to bhavcopy
+	}
+	if use52L <= 0 {
+		use52L = redis52L // Fallback to bhavcopy
+	}
+
+	// Detect 52W HIGH breakout (LTP crosses above 52W high)
+	if use52H > 0 && (isNew52WH || ltp > use52H) {
 		m.recordBreakout(ctx, BreakoutEvent{
 			Token:         token,
 			Symbol:        symbol,
 			Exchange:      exchange,
 			BreakoutType:  "52W_HIGH",
 			BreakoutPrice: ltp,
-			Prev52WH:      maxFloat(week52High, redis52H),
-			Prev52WL:      maxFloat(week52Low, redis52L),
+			Prev52WH:      use52H,
+			Prev52WL:      use52L,
 			Volume:        volume,
 			PctChange:     pctChange,
 			Source:        "websocket",
 		})
 	}
 
-	// Detect 52W LOW breakout (price falls below 52W low)
-	if isNew52WL || (week52Low > 0 && ltp < week52Low) || (redis52L > 0 && ltp < redis52L && redis52L > 0) {
+	// Detect 52W LOW breakout (LTP falls below 52W low)
+	if use52L > 0 && (isNew52WL || ltp < use52L) {
 		m.recordBreakout(ctx, BreakoutEvent{
 			Token:         token,
 			Symbol:        symbol,
 			Exchange:      exchange,
 			BreakoutType:  "52W_LOW",
 			BreakoutPrice: ltp,
-			Prev52WH:      maxFloat(week52High, redis52H),
-			Prev52WL:      maxFloat(week52Low, redis52L),
+			Prev52WH:      use52H,
+			Prev52WL:      use52L,
 			Volume:        volume,
 			PctChange:     pctChange,
 			Source:        "websocket",
@@ -297,8 +308,12 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 	}
 
 	// Update Redis 52W values if WebSocket has fresher data
-	if week52High > 0 || week52Low > 0 {
-		m.updateRedis52W(ctx, token, symbol, exchange, week52High, week52Low, ltp)
+	if ws52High > 0 || ws52Low > 0 {
+		m.updateRedis52W(ctx, token, symbol, exchange, ws52High, ws52Low, ltp)
+
+		// Fix 2: If WebSocket 52W high is now HIGHER than a breakout we recorded,
+		// that breakout was false — delete it from DB and Redis
+		m.cleanupFalseBreakouts(ctx, symbol, ws52High, ws52Low, ltp)
 	}
 }
 
@@ -350,6 +365,79 @@ func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
 
 		// Store in Redis for live screener
 		m.storeBreakoutInRedis(ctx, evt)
+	}
+}
+
+// cleanupFalseBreakouts removes breakout events that are now invalid because
+// the WebSocket provided a more accurate 52W value.
+// Example: We detected CCL breakout at 1116.20 (bhavcopy said 52W high was 1116),
+// but WebSocket later says 52W high is actually 1117 → 1116.20 < 1117 → false breakout.
+func (m *WSMonitor) cleanupFalseBreakouts(ctx context.Context, symbol string, ws52High, ws52Low, ltp float64) {
+	// Check 52W_HIGH: if WebSocket 52W high is now higher than today's breakout price,
+	// the breakout was false
+	if ws52High > 0 {
+		dedupKey := symbol + ":52W_HIGH"
+		if _, exists := m.breakoutToday.Load(dedupKey); exists {
+			// We recorded a breakout today — check if it's still valid
+			if ltp <= ws52High {
+				// LTP is now below the real 52W high → false breakout
+				deleted, err := m.repo.DeleteFalseBreakout(ctx, symbol, "52W_HIGH")
+				if err != nil {
+					m.logger.Error("Failed to delete false breakout", zap.Error(err))
+				} else if deleted {
+					m.breakoutToday.Delete(dedupKey) // Allow re-detection
+					m.removeFalseBreakoutFromRedis(ctx, symbol, "52W_HIGH")
+					m.logger.Warn("Removed false 52W_HIGH breakout",
+						zap.String("symbol", symbol),
+						zap.Float64("ws_52w_high", ws52High),
+						zap.Float64("ltp", ltp))
+				}
+			}
+		}
+	}
+
+	// Check 52W_LOW: if WebSocket 52W low is now lower than today's breakout price,
+	// the breakout was false
+	if ws52Low > 0 {
+		dedupKey := symbol + ":52W_LOW"
+		if _, exists := m.breakoutToday.Load(dedupKey); exists {
+			if ltp >= ws52Low {
+				deleted, err := m.repo.DeleteFalseBreakout(ctx, symbol, "52W_LOW")
+				if err != nil {
+					m.logger.Error("Failed to delete false breakout", zap.Error(err))
+				} else if deleted {
+					m.breakoutToday.Delete(dedupKey)
+					m.removeFalseBreakoutFromRedis(ctx, symbol, "52W_LOW")
+					m.logger.Warn("Removed false 52W_LOW breakout",
+						zap.String("symbol", symbol),
+						zap.Float64("ws_52w_low", ws52Low),
+						zap.Float64("ltp", ltp))
+				}
+			}
+		}
+	}
+}
+
+// removeFalseBreakoutFromRedis removes a false breakout from the Redis sorted set.
+func (m *WSMonitor) removeFalseBreakoutFromRedis(ctx context.Context, symbol, breakoutType string) {
+	if m.redis == nil {
+		return
+	}
+
+	key := fmt.Sprintf("breakouts:today:%s", breakoutType)
+	// Scan the sorted set to find and remove the entry for this symbol
+	members, err := m.redis.ZRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return
+	}
+	for _, member := range members {
+		var data map[string]interface{}
+		if json.Unmarshal([]byte(member), &data) == nil {
+			if data["symbol"] == symbol {
+				m.redis.ZRem(ctx, key, member)
+				break
+			}
+		}
 	}
 }
 
