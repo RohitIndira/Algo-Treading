@@ -40,8 +40,8 @@ func main() {
 	mode := flag.String("mode", "daily", "Mode: daily (scheduler), backfill, or monitor")
 	fromStr := flag.String("from", "", "Backfill start date (YYYY-MM-DD)")
 	toStr := flag.String("to", "", "Backfill end date (YYYY-MM-DD)")
-	schedHour := flag.Int("hour", 18, "Daily schedule hour IST (default 18)")
-	schedMin := flag.Int("min", 30, "Daily schedule minute IST (default 30)")
+	schedHour := flag.Int("hour", 6, "Daily API sync hour IST (default 6)")
+	schedMin := flag.Int("min", 0, "Daily API sync minute IST (default 0)")
 	catchupDays := flag.Int("catchup", 7, "Days to catch up on startup in daily mode")
 	flag.Parse()
 
@@ -192,8 +192,16 @@ func main() {
 			logger.Fatal("WebSocket monitor failed", zap.Error(err))
 		}
 
+	case "apisync":
+		// One-time API sync: fetch 52W from NSE + BSE APIs → DB + Redis, then exit
+		logger.Info("Running one-time API sync (NSE + BSE)")
+		if err := worker.RunAPISync(ctx); err != nil {
+			logger.Fatal("API sync failed", zap.Error(err))
+		}
+		logger.Info("API sync complete")
+
 	default:
-		fmt.Fprintf(os.Stderr, "unknown mode: %s (use 'daily', 'backfill', or 'monitor')\n", *mode)
+		fmt.Fprintf(os.Stderr, "unknown mode: %s (use 'daily', 'backfill', 'monitor', or 'apisync')\n", *mode)
 		os.Exit(1)
 	}
 }

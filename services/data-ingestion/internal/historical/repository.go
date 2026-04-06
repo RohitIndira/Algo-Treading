@@ -467,12 +467,31 @@ func (r *Repository) InsertBreakoutEvent(ctx context.Context, evt BreakoutEvent)
 	if breakoutAt.IsZero() {
 		breakoutAt = time.Now()
 	}
+	// ON CONFLICT: update if the new breakout price is higher (for 52W_HIGH)
+	// or lower (for 52W_LOW) than what we already recorded.
+	// This keeps the DB showing the actual peak/trough for the day.
 	result, err := r.db.ExecContext(ctx, `
 		INSERT INTO breakout_events
 			(instrument_id, token, symbol, exchange, breakout_type,
 			 breakout_price, prev_52w_high, prev_52w_low, volume, pct_change, source, detected_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-		ON CONFLICT (instrument_id, breakout_type, trade_date) DO NOTHING`,
+		ON CONFLICT (instrument_id, breakout_type, trade_date) DO UPDATE SET
+			breakout_price = CASE
+				WHEN breakout_events.breakout_type = '52W_HIGH'
+					AND EXCLUDED.breakout_price > breakout_events.breakout_price
+				THEN EXCLUDED.breakout_price
+				WHEN breakout_events.breakout_type = '52W_LOW'
+					AND EXCLUDED.breakout_price < breakout_events.breakout_price
+				THEN EXCLUDED.breakout_price
+				ELSE breakout_events.breakout_price
+			END,
+			volume = EXCLUDED.volume,
+			detected_at = CASE
+				WHEN (breakout_events.breakout_type = '52W_HIGH' AND EXCLUDED.breakout_price > breakout_events.breakout_price)
+				  OR (breakout_events.breakout_type = '52W_LOW' AND EXCLUDED.breakout_price < breakout_events.breakout_price)
+				THEN EXCLUDED.detected_at
+				ELSE breakout_events.detected_at
+			END`,
 		evt.InstrumentID, evt.Token, evt.Symbol, evt.Exchange, evt.BreakoutType,
 		evt.BreakoutPrice, evt.Prev52WH, evt.Prev52WL, evt.Volume, evt.PctChange, evt.Source, breakoutAt)
 	if err != nil {

@@ -17,6 +17,7 @@ type Worker struct {
 	parser     *Parser
 	repo       *Repository
 	redis      *redis.Client
+	apiFetcher *APIFetcher
 	logger     *zap.Logger
 }
 
@@ -26,11 +27,18 @@ func NewWorker(repo *Repository, redisClient *redis.Client, logger *zap.Logger) 
 	if err != nil {
 		return nil, fmt.Errorf("create downloader: %w", err)
 	}
+
+	apiFetcher, err := NewAPIFetcher(repo, redisClient, logger)
+	if err != nil {
+		return nil, fmt.Errorf("create api fetcher: %w", err)
+	}
+
 	return &Worker{
 		downloader: dl,
 		parser:     NewParser(logger),
 		repo:       repo,
 		redis:      redisClient,
+		apiFetcher: apiFetcher,
 		logger:     logger,
 	}, nil
 }
@@ -512,10 +520,16 @@ func (w *Worker) syncToRedis(ctx context.Context) error {
 
 // --- Fix #8: Retry bhavcopy with polling ---
 
-// RunDailyScheduler runs the daily ingestion + refresh cycle.
-// Fix #8: Retries bhavcopy download every 10 min if not available (up to 22:00 IST).
+// RunAPISync runs a one-time NSE + BSE API sync. Used for manual/apisync mode.
+func (w *Worker) RunAPISync(ctx context.Context) error {
+	return w.apiFetcher.SyncAll(ctx)
+}
+
+// RunDailyScheduler runs the daily 52W API sync at the scheduled time (default 8:00 AM IST).
+// Fetches official 52W data from NSE and BSE APIs → stores in DB + Redis.
+// No bhavcopy download, no matview computation. Exchanges are the source of truth.
 func (w *Worker) RunDailyScheduler(ctx context.Context, scheduleHour, scheduleMinute int) {
-	w.logger.Info("Daily scheduler started",
+	w.logger.Info("Daily API sync scheduler started",
 		zap.Int("schedule_hour", scheduleHour),
 		zap.Int("schedule_minute", scheduleMinute))
 
@@ -532,7 +546,7 @@ func (w *Worker) RunDailyScheduler(ctx context.Context, scheduleHour, scheduleMi
 		}
 
 		sleepDur := next.Sub(nowIST)
-		w.logger.Info("Next daily run scheduled",
+		w.logger.Info("Next API sync scheduled",
 			zap.String("next_run", next.Format("2006-01-02 15:04 IST")),
 			zap.Duration("sleep", sleepDur))
 
@@ -546,60 +560,16 @@ func (w *Worker) RunDailyScheduler(ctx context.Context, scheduleHour, scheduleMi
 		// Skip weekends
 		today := time.Now().In(loc)
 		if today.Weekday() == time.Saturday || today.Weekday() == time.Sunday {
-			w.logger.Info("Weekend — skipping daily ingestion")
+			w.logger.Info("Weekend — skipping API sync")
 			continue
 		}
 
-		w.logger.Info("Running daily ingestion",
+		w.logger.Info("Running daily 52W API sync",
 			zap.String("date", today.Format("2006-01-02")))
 
-		// Fix #8: Retry ingestion every 10 min until data available or 22:00 IST
-		deadline := time.Date(today.Year(), today.Month(), today.Day(), 22, 0, 0, 0, loc)
-		var ins, skip int
-		var ingestErr error
-
-		for attempt := 0; ; attempt++ {
-			ins, skip, ingestErr = w.IngestDate(ctx, today)
-			if ingestErr == nil && ins > 0 {
-				break // Success
-			}
-
-			if time.Now().In(loc).After(deadline) {
-				w.logger.Warn("Bhavcopy not available before deadline, giving up",
-					zap.String("date", today.Format("2006-01-02")))
-				break
-			}
-
-			if ctx.Err() != nil {
-				return
-			}
-
-			w.logger.Info("Bhavcopy not ready yet, retrying in 10 min",
-				zap.Int("attempt", attempt+1),
-				zap.Error(ingestErr))
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(10 * time.Minute):
-			}
-		}
-
-		if ins > 0 {
-			w.logger.Info("Daily ingestion complete",
-				zap.Int("inserted", ins),
-				zap.Int("skipped", skip))
-
-			// Fix #5: Detect stock splits after ingestion
-			w.DetectAndHandleSplits(ctx, today)
-
-			// Fix #3: Cleanup old data (>370 calendar days)
-			w.CleanupOldData(ctx)
-
-			// Refresh materialized view + sync to Redis
-			if err := w.RefreshAndSync(ctx); err != nil {
-				w.logger.Error("Refresh/sync failed", zap.Error(err))
-			}
+		// Fetch 52W data from NSE + BSE APIs → DB + Redis
+		if err := w.apiFetcher.SyncAll(ctx); err != nil {
+			w.logger.Error("API sync failed", zap.Error(err))
 		}
 	}
 }

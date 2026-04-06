@@ -468,11 +468,10 @@ func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
 		return
 	}
 
-	// Check if already recorded today (in-memory dedup — fast)
+	// Dedup: first detection logs + stores in Redis/Kafka.
+	// Subsequent detections only update DB (if price is higher/lower).
 	dedupKey := fmt.Sprintf("%s:%s", evt.Symbol, evt.BreakoutType)
-	if _, exists := m.breakoutToday.LoadOrStore(dedupKey, true); exists {
-		return // Already recorded today
-	}
+	_, alreadyRecorded := m.breakoutToday.LoadOrStore(dedupKey, true)
 
 	// Lookup instrument_id from DB
 	instID, dbToken, err := m.repo.GetInstrumentBySymbol(ctx, evt.Symbol, evt.Exchange)
@@ -490,8 +489,9 @@ func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
 		evt.Token = dbToken
 	}
 
-	// Store in DB
-	isNew, err := m.repo.InsertBreakoutEvent(ctx, evt)
+	// Always update all 3 sources with latest price
+	// DB: upserts — keeps highest high or lowest low for the day
+	_, err = m.repo.InsertBreakoutEvent(ctx, evt)
 	if err != nil {
 		m.logger.Error("Failed to store breakout event",
 			zap.String("symbol", evt.Symbol),
@@ -499,7 +499,14 @@ func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
 		return
 	}
 
-	if isNew {
+	// Redis: always update with latest breakout price
+	m.storeBreakoutInRedis(ctx, evt)
+
+	// Kafka: always publish latest price (consumers get real-time updates)
+	m.publishBreakoutToKafka(ctx, evt)
+
+	// Log only on first detection
+	if !alreadyRecorded {
 		m.statsMu.Lock()
 		m.breakouts++
 		m.statsMu.Unlock()
@@ -512,12 +519,6 @@ func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
 			zap.Float64("prev_52w_high", evt.Prev52WH),
 			zap.Float64("prev_52w_low", evt.Prev52WL),
 			zap.Int64("volume", evt.Volume))
-
-		// Store in Redis for live screener
-		m.storeBreakoutInRedis(ctx, evt)
-
-		// Publish to Kafka for downstream consumers (rules-engine, notifications, etc.)
-		m.publishBreakoutToKafka(ctx, evt)
 	}
 }
 
@@ -616,12 +617,13 @@ func (m *WSMonitor) getRedis52W(ctx context.Context, token string) (high, low fl
 }
 
 // updateRedis52W updates Redis with fresh 52W values from WebSocket tick.
+// Writes to BOTH token-based key (52w:token:11452) and symbol-based key (52w:token:CCL)
+// so both bhavcopy consumers and WebSocket consumers see the same data.
 func (m *WSMonitor) updateRedis52W(ctx context.Context, token, symbol, exchange string, high, low, ltp float64) {
-	if m.redis == nil || token == "" {
+	if m.redis == nil {
 		return
 	}
 
-	key := fmt.Sprintf("52w:token:%s", token)
 	val, _ := json.Marshal(map[string]interface{}{
 		"high":       high,
 		"low":        low,
@@ -632,7 +634,22 @@ func (m *WSMonitor) updateRedis52W(ctx context.Context, token, symbol, exchange 
 		"as_of":      time.Now().Format("2006-01-02"),
 		"source":     "websocket",
 	})
-	m.redis.Set(ctx, key, val, 120*time.Hour)
+
+	ttl := 120 * time.Hour
+	pipe := m.redis.Pipeline()
+
+	// Update by exchange token number (e.g., 52w:token:11452)
+	if token != "" {
+		pipe.Set(ctx, fmt.Sprintf("52w:token:%s", token), val, ttl)
+	}
+
+	// Also update by symbol name (e.g., 52w:token:CCL)
+	// This is the key bhavcopy uses — keeps them in sync
+	if symbol != "" && symbol != token {
+		pipe.Set(ctx, fmt.Sprintf("52w:token:%s", symbol), val, ttl)
+	}
+
+	pipe.Exec(ctx)
 }
 
 // midnightReset clears the daily breakout tracking at midnight IST.
