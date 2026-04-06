@@ -384,3 +384,99 @@ func (r *Repository) Has52WData(ctx context.Context) (bool, error) {
 		`SELECT COUNT(*) FROM mv_52w_high_low`).Scan(&count)
 	return count > 0, err
 }
+
+// --- Breakout Events ---
+
+// BreakoutEvent represents a 52W breakout detection.
+type BreakoutEvent struct {
+	InstrumentID  int
+	Token         string
+	Symbol        string
+	Exchange      string
+	BreakoutType  string  // "52W_HIGH" or "52W_LOW"
+	BreakoutPrice float64
+	Prev52WH      float64
+	Prev52WL      float64
+	Volume        int64
+	PctChange     float64
+	Source        string // "websocket" or "bhavcopy"
+}
+
+// InsertBreakoutEvent stores a breakout event. Uses ON CONFLICT to ignore
+// duplicate breakouts for the same stock on the same day (only first detection counts).
+// Returns true if inserted (new breakout), false if already existed.
+func (r *Repository) InsertBreakoutEvent(ctx context.Context, evt BreakoutEvent) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `
+		INSERT INTO breakout_events
+			(instrument_id, token, symbol, exchange, breakout_type,
+			 breakout_price, prev_52w_high, prev_52w_low, volume, pct_change, source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (instrument_id, breakout_type, trade_date) DO NOTHING`,
+		evt.InstrumentID, evt.Token, evt.Symbol, evt.Exchange, evt.BreakoutType,
+		evt.BreakoutPrice, evt.Prev52WH, evt.Prev52WL, evt.Volume, evt.PctChange, evt.Source)
+	if err != nil {
+		return false, err
+	}
+	rows, _ := result.RowsAffected()
+	return rows > 0, nil
+}
+
+// GetTodayBreakouts returns all breakout events for today.
+func (r *Repository) GetTodayBreakouts(ctx context.Context) ([]BreakoutEvent, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT instrument_id, token, symbol, exchange, breakout_type,
+		       breakout_price, COALESCE(prev_52w_high,0), COALESCE(prev_52w_low,0),
+		       COALESCE(volume,0), COALESCE(pct_change,0), source
+		FROM breakout_events
+		WHERE trade_date = CURRENT_DATE
+		ORDER BY detected_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []BreakoutEvent
+	for rows.Next() {
+		var e BreakoutEvent
+		if err := rows.Scan(&e.InstrumentID, &e.Token, &e.Symbol, &e.Exchange,
+			&e.BreakoutType, &e.BreakoutPrice, &e.Prev52WH, &e.Prev52WL,
+			&e.Volume, &e.PctChange, &e.Source); err != nil {
+			return nil, err
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+// GetInstrumentBySymbol looks up instrument by symbol+exchange.
+func (r *Repository) GetInstrumentBySymbol(ctx context.Context, symbol, exchange string) (int, string, error) {
+	var id int
+	var token string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT instrument_id, token FROM instruments WHERE symbol = $1 AND exchange = $2 LIMIT 1`,
+		symbol, exchange).Scan(&id, &token)
+	if err == sql.ErrNoRows {
+		return 0, "", nil
+	}
+	return id, token, err
+}
+
+// GetAllNSESymbols returns all active NSE instrument symbols for WebSocket subscription.
+func (r *Repository) GetAllNSESymbols(ctx context.Context) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT DISTINCT symbol FROM instruments WHERE exchange = 'NSE' AND is_active = TRUE AND symbol != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var symbols []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		symbols = append(symbols, s)
+	}
+	return symbols, rows.Err()
+}

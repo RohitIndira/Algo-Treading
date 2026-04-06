@@ -37,7 +37,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "daily", "Mode: daily (scheduler) or backfill")
+	mode := flag.String("mode", "daily", "Mode: daily (scheduler), backfill, or monitor")
 	fromStr := flag.String("from", "", "Backfill start date (YYYY-MM-DD)")
 	toStr := flag.String("to", "", "Backfill end date (YYYY-MM-DD)")
 	schedHour := flag.Int("hour", 18, "Daily schedule hour IST (default 18)")
@@ -169,11 +169,28 @@ func main() {
 			}
 		}
 
+		// Start WebSocket monitor in background (real-time breakout detection)
+		monitor := historical.NewWSMonitor(repo, redisClient, logger)
+		go func() {
+			if err := monitor.Start(ctx); err != nil {
+				logger.Error("WebSocket monitor failed", zap.Error(err))
+			}
+		}()
+		logger.Info("WebSocket monitor started in background")
+
 		// Run daily scheduler (blocks until ctx cancelled)
 		worker.RunDailyScheduler(ctx, *schedHour, *schedMin)
 
+	case "monitor":
+		// Monitor-only mode: just run WebSocket breakout detection
+		monitor := historical.NewWSMonitor(repo, redisClient, logger)
+		logger.Info("Starting WebSocket monitor (standalone mode)")
+		if err := monitor.Start(ctx); err != nil {
+			logger.Fatal("WebSocket monitor failed", zap.Error(err))
+		}
+
 	default:
-		fmt.Fprintf(os.Stderr, "unknown mode: %s (use 'daily' or 'backfill')\n", *mode)
+		fmt.Fprintf(os.Stderr, "unknown mode: %s (use 'daily', 'backfill', or 'monitor')\n", *mode)
 		os.Exit(1)
 	}
 }
