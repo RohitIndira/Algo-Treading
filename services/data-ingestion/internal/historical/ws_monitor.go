@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -39,8 +40,9 @@ type WSMonitor struct {
 	breakoutToday sync.Map // key: "SYMBOL:52W_HIGH" or "SYMBOL:52W_LOW"
 
 	// O(1) split detection: prev_close per instrument (loaded from bhavcopy on startup)
-	prevClose   map[string]float64 // key: symbol → prev_close from bhavcopy
-	splitChecked sync.Map          // key: symbol → true (only check once per day)
+	prevClose    map[string]float64 // key: symbol → prev_close from bhavcopy
+	splitChecked sync.Map           // key: symbol → true (done checking)
+	splitTicks   sync.Map           // key: symbol → tick count (check first 10 ticks)
 
 	// Stats
 	statsMu    sync.Mutex
@@ -353,15 +355,27 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 }
 
 // detectSplitO1 detects stock splits in O(1) time using price/prev_close ratio.
-// Only checks once per stock per day. If split detected, resets instrument history.
+// Checks first 10 ticks per stock (not just first — first tick can be stale).
+// If split detected, resets instrument history immediately.
 //
 // Common split ratios in Indian markets:
 //   1:2 → ratio ~0.50    1:5  → ratio ~0.20    2:1 reverse → ratio ~2.0
 //   1:3 → ratio ~0.33    1:10 → ratio ~0.10    3:1 reverse → ratio ~3.0
 //   1:4 → ratio ~0.25
 func (m *WSMonitor) detectSplitO1(ctx context.Context, symbol string, ltp float64) {
-	// Only check once per stock per day
-	if _, checked := m.splitChecked.LoadOrStore(symbol, true); checked {
+	// Already done checking for this stock
+	if _, done := m.splitChecked.Load(symbol); done {
+		return
+	}
+
+	// Increment tick count for this stock
+	countVal, _ := m.splitTicks.LoadOrStore(symbol, new(int32))
+	count := countVal.(*int32)
+	tickNum := atomic.AddInt32(count, 1)
+
+	// After 10 ticks without detecting a split, stop checking
+	if tickNum > 10 {
+		m.splitChecked.Store(symbol, true)
 		return
 	}
 
@@ -633,8 +647,10 @@ func (m *WSMonitor) midnightReset(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(sleepDur):
-			m.breakoutToday = sync.Map{} // Reset for new day
-			m.logger.Info("Midnight reset: cleared daily breakout tracking")
+			m.breakoutToday = sync.Map{}  // Reset breakout dedup for new day
+			m.splitChecked = sync.Map{}   // Reset split detection for new day
+			m.splitTicks = sync.Map{}     // Reset tick counters
+			m.logger.Info("Midnight reset: cleared daily breakout + split tracking")
 		}
 	}
 }
