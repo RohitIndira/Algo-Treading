@@ -91,6 +91,7 @@ topics=(
     "trade-executions"      # Trade Execution - execution results
     "risk-approvals"        # Risk Management - approved trades
     "order-updates"         # Trade Execution - order status updates
+    "market.data.52w_breakouts" # Data Ingestion - 52W high/low breakout events (real-time)
 )
 
 for topic in "${topics[@]}"; do

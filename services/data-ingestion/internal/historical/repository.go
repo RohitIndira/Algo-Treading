@@ -377,6 +377,61 @@ func (r *Repository) ResetInstrumentHistory(ctx context.Context, instrumentID in
 
 // --- Redis Recovery ---
 
+// Get52WForSymbol returns 52W data for a specific symbol+exchange from the materialized view.
+func (r *Repository) Get52WForSymbol(ctx context.Context, symbol, exchange string) (*Week52Data, error) {
+	var d Week52Data
+	err := r.db.QueryRowContext(ctx, `
+		SELECT instrument_id, token, symbol, COALESCE(isin,''), exchange,
+		       week_52_high, week_52_low, COALESCE(last_close, 0),
+		       last_trade_date, COALESCE(position_in_52w_range, 0), COALESCE(data_days, 0)
+		FROM mv_52w_high_low
+		WHERE symbol = $1 AND exchange = $2
+		LIMIT 1`, symbol, exchange,
+	).Scan(&d.InstrumentID, &d.Token, &d.Symbol, &d.ISIN, &d.Exchange,
+		&d.Week52High, &d.Week52Low, &d.LastClose,
+		&d.LastTradeDate, &d.PositionInRange, &d.DataDays)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// SplitSuspect represents a stock where 52W high is >2x last close (likely stock split).
+type SplitSuspect struct {
+	InstrumentID int
+	Symbol       string
+	Exchange     string
+	Week52High   float64
+	LastClose    float64
+}
+
+// FindSplitSuspects finds stocks in the matview where 52W high is more than
+// 2x the last close price. This is a strong signal of an unhandled stock split.
+func (r *Repository) FindSplitSuspects(ctx context.Context) ([]SplitSuspect, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT instrument_id, symbol, exchange, week_52_high, last_close
+		FROM mv_52w_high_low
+		WHERE last_close > 0 AND week_52_high > last_close * 2`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []SplitSuspect
+	for rows.Next() {
+		var s SplitSuspect
+		if err := rows.Scan(&s.InstrumentID, &s.Symbol, &s.Exchange,
+			&s.Week52High, &s.LastClose); err != nil {
+			return nil, err
+		}
+		result = append(result, s)
+	}
+	return result, rows.Err()
+}
+
 // Has52WData checks if the materialized view has any data.
 func (r *Repository) Has52WData(ctx context.Context) (bool, error) {
 	var count int
@@ -389,31 +444,37 @@ func (r *Repository) Has52WData(ctx context.Context) (bool, error) {
 
 // BreakoutEvent represents a 52W breakout detection.
 type BreakoutEvent struct {
-	InstrumentID  int
-	Token         string
-	Symbol        string
-	Exchange      string
-	BreakoutType  string  // "52W_HIGH" or "52W_LOW"
-	BreakoutPrice float64
-	Prev52WH      float64
-	Prev52WL      float64
-	Volume        int64
-	PctChange     float64
-	Source        string // "websocket" or "bhavcopy"
+	InstrumentID    int
+	Token           string
+	Symbol          string
+	Exchange        string
+	BreakoutType    string  // "52W_HIGH" or "52W_LOW"
+	BreakoutPrice   float64
+	Prev52WH        float64
+	Prev52WL        float64
+	Volume          int64
+	PctChange       float64
+	Source          string    // "websocket" or "bhavcopy"
+	BreakoutAt      time.Time // Actual time of breakout from broker (not our detection time)
 }
 
 // InsertBreakoutEvent stores a breakout event. Uses ON CONFLICT to ignore
 // duplicate breakouts for the same stock on the same day (only first detection counts).
 // Returns true if inserted (new breakout), false if already existed.
 func (r *Repository) InsertBreakoutEvent(ctx context.Context, evt BreakoutEvent) (bool, error) {
+	// Use broker's breakout timestamp if available, otherwise use current time
+	breakoutAt := evt.BreakoutAt
+	if breakoutAt.IsZero() {
+		breakoutAt = time.Now()
+	}
 	result, err := r.db.ExecContext(ctx, `
 		INSERT INTO breakout_events
 			(instrument_id, token, symbol, exchange, breakout_type,
-			 breakout_price, prev_52w_high, prev_52w_low, volume, pct_change, source)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			 breakout_price, prev_52w_high, prev_52w_low, volume, pct_change, source, detected_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (instrument_id, breakout_type, trade_date) DO NOTHING`,
 		evt.InstrumentID, evt.Token, evt.Symbol, evt.Exchange, evt.BreakoutType,
-		evt.BreakoutPrice, evt.Prev52WH, evt.Prev52WL, evt.Volume, evt.PctChange, evt.Source)
+		evt.BreakoutPrice, evt.Prev52WH, evt.Prev52WL, evt.Volume, evt.PctChange, evt.Source, breakoutAt)
 	if err != nil {
 		return false, err
 	}

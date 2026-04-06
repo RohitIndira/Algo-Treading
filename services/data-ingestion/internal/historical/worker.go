@@ -229,6 +229,106 @@ func (w *Worker) DetectAndHandleSplits(ctx context.Context, date time.Time) {
 	}
 }
 
+// --- Reconciliation: Fix stale pre-split data ---
+
+// ReconcileWithWebSocket compares our bhavcopy-computed 52W values with
+// WebSocket-stored values in Redis. If a stock's bhavcopy value is >10%
+// different from WebSocket (likely a stock split), delete its history
+// from DB so the matview recomputes from clean data.
+func (w *Worker) ReconcileWithWebSocket(ctx context.Context) {
+	if w.redis == nil {
+		return
+	}
+
+	w.logger.Info("Running reconciliation: checking bhavcopy vs WebSocket 52W values")
+
+	// Get all WebSocket-sourced keys from Redis
+	keys, err := w.redis.Keys(ctx, "52w:token:*").Result()
+	if err != nil {
+		w.logger.Error("Reconciliation: Redis keys failed", zap.Error(err))
+		return
+	}
+
+	fixed := 0
+	for _, key := range keys {
+		val, err := w.redis.Get(ctx, key).Result()
+		if err != nil {
+			continue
+		}
+		var data map[string]interface{}
+		if json.Unmarshal([]byte(val), &data) != nil {
+			continue
+		}
+
+		source, _ := data["source"].(string)
+		if source != "websocket" {
+			continue
+		}
+
+		wsHigh, _ := data["high"].(float64)
+		symbol, _ := data["symbol"].(string)
+		exchange, _ := data["exchange"].(string)
+
+		if wsHigh <= 0 || symbol == "" {
+			continue
+		}
+
+		// Get our DB's 52W high for this stock
+		dbData, err := w.repo.Get52WForSymbol(ctx, symbol, exchange)
+		if err != nil || dbData == nil {
+			continue
+		}
+
+		// Compare — if >10% different, it's a split
+		if dbData.Week52High > 0 {
+			diff := (dbData.Week52High - wsHigh) / wsHigh * 100
+			if diff > 10 || diff < -10 {
+				w.logger.Warn("Reconciliation: stale data detected (likely stock split)",
+					zap.String("symbol", symbol),
+					zap.Float64("db_52w_high", dbData.Week52High),
+					zap.Float64("ws_52w_high", wsHigh),
+					zap.Float64("diff_pct", diff))
+
+				// Delete all history for this instrument — it will rebuild from fresh bhavcopy
+				if err := w.repo.ResetInstrumentHistory(ctx, dbData.InstrumentID, time.Now()); err != nil {
+					w.logger.Error("Reconciliation: failed to reset", zap.String("symbol", symbol), zap.Error(err))
+				} else {
+					fixed++
+				}
+			}
+		}
+	}
+
+	// Also check matview directly: if 52W high is >2x last close,
+	// it's very likely a stock split (no stock drops 50%+ and stays there for a year)
+	splitSuspects, err := w.repo.FindSplitSuspects(ctx)
+	if err != nil {
+		w.logger.Error("Reconciliation: split suspects query failed", zap.Error(err))
+	} else {
+		for _, s := range splitSuspects {
+			w.logger.Warn("Reconciliation: likely split (52W high > 2x last close)",
+				zap.String("symbol", s.Symbol),
+				zap.Float64("52w_high", s.Week52High),
+				zap.Float64("last_close", s.LastClose))
+
+			if err := w.repo.ResetInstrumentHistory(ctx, s.InstrumentID, time.Now()); err != nil {
+				w.logger.Error("Reconciliation: failed to reset", zap.String("symbol", s.Symbol), zap.Error(err))
+			} else {
+				fixed++
+			}
+		}
+	}
+
+	if fixed > 0 {
+		w.logger.Info("Reconciliation complete: reset stale instruments",
+			zap.Int("fixed", fixed))
+		// Refresh matview after cleanup
+		w.repo.RefreshMaterializedView(ctx)
+	} else {
+		w.logger.Info("Reconciliation complete: no stale data found")
+	}
+}
+
 // --- Fix #3: Cleanup old data ---
 
 // CleanupOldData removes OHLCV data older than 370 calendar days.
@@ -298,8 +398,9 @@ func (w *Worker) RefreshAndSync(ctx context.Context) error {
 }
 
 // syncToRedis reads all 52W data from the materialized view and writes to Redis.
-// Fix #7: Redis TTL = 120 hours (5 days) to survive long holidays.
-// Fix #4: Includes data_days count so rules-engine knows if data is partial (IPO).
+// IMPORTANT: Does NOT overwrite if WebSocket already stored a better value today.
+// WebSocket values are more accurate (handle splits, adjustments automatically).
+// Bhavcopy is only used for stocks where WebSocket has no data.
 func (w *Worker) syncToRedis(ctx context.Context) error {
 	if w.redis == nil {
 		w.logger.Warn("Redis client not configured, skipping 52W sync")
@@ -317,10 +418,68 @@ func (w *Worker) syncToRedis(ctx context.Context) error {
 	}
 
 	pipe := w.redis.Pipeline()
-	ttl := 120 * time.Hour // Fix: 5 days TTL to survive long holidays (was 25h)
+	ttl := 120 * time.Hour
+	synced := 0
+	skippedWS := 0
 
 	for _, d := range data {
-		key := fmt.Sprintf("52w:%d", d.InstrumentID)
+		tokenKey := fmt.Sprintf("52w:token:%s", d.Token)
+
+		// Check if WebSocket already has a value for this stock
+		existing, err := w.redis.Get(ctx, tokenKey).Result()
+		if err == nil && existing != "" {
+			var existingData map[string]interface{}
+			if json.Unmarshal([]byte(existing), &existingData) == nil {
+				source, _ := existingData["source"].(string)
+				if source == "websocket" {
+					// WebSocket value exists — use the BEST of both:
+					// Higher high (bhavcopy might have older higher value if no split)
+					// Lower low (bhavcopy might have older lower value if no split)
+					wsHigh, _ := existingData["high"].(float64)
+					wsLow, _ := existingData["low"].(float64)
+
+					// If WebSocket high is significantly different from bhavcopy (>10%),
+					// it's likely a stock split — trust WebSocket
+					if wsHigh > 0 && d.Week52High > 0 {
+						diff := (d.Week52High - wsHigh) / wsHigh * 100
+						if diff > 10 || diff < -10 {
+							// Big difference = likely split. Skip bhavcopy, keep WebSocket value.
+							skippedWS++
+							continue
+						}
+					}
+
+					// Small difference or no conflict — use the best of both
+					bestHigh := d.Week52High
+					if wsHigh > bestHigh {
+						bestHigh = wsHigh
+					}
+					bestLow := d.Week52Low
+					if wsLow > 0 && wsLow < bestLow {
+						bestLow = wsLow
+					}
+
+					val, _ := json.Marshal(map[string]interface{}{
+						"high":       bestHigh,
+						"low":        bestLow,
+						"last_close": d.LastClose,
+						"symbol":     d.Symbol,
+						"token":      d.Token,
+						"exchange":   d.Exchange,
+						"position":   d.PositionInRange,
+						"data_days":  d.DataDays,
+						"as_of":      d.LastTradeDate.Format("2006-01-02"),
+						"source":     "merged", // Both sources combined
+					})
+					pipe.Set(ctx, tokenKey, val, ttl)
+					pipe.Set(ctx, fmt.Sprintf("52w:%d", d.InstrumentID), val, ttl)
+					synced++
+					continue
+				}
+			}
+		}
+
+		// No WebSocket data — use bhavcopy only
 		val, _ := json.Marshal(map[string]interface{}{
 			"high":       d.Week52High,
 			"low":        d.Week52Low,
@@ -329,16 +488,15 @@ func (w *Worker) syncToRedis(ctx context.Context) error {
 			"token":      d.Token,
 			"exchange":   d.Exchange,
 			"position":   d.PositionInRange,
-			"data_days":  d.DataDays, // Fix #4: rules-engine can check if partial
+			"data_days":  d.DataDays,
 			"as_of":      d.LastTradeDate.Format("2006-01-02"),
+			"source":     "bhavcopy",
 		})
-		pipe.Set(ctx, key, val, ttl)
-
-		// Also set by token for easy lookup from rules-engine
+		pipe.Set(ctx, fmt.Sprintf("52w:%d", d.InstrumentID), val, ttl)
 		if d.Token != "" {
-			tokenKey := fmt.Sprintf("52w:token:%s", d.Token)
 			pipe.Set(ctx, tokenKey, val, ttl)
 		}
+		synced++
 	}
 
 	_, err = pipe.Exec(ctx)
@@ -347,7 +505,8 @@ func (w *Worker) syncToRedis(ctx context.Context) error {
 	}
 
 	w.logger.Info("52W data synced to Redis",
-		zap.Int("instruments", len(data)))
+		zap.Int("synced", synced),
+		zap.Int("skipped_ws_better", skippedWS))
 	return nil
 }
 

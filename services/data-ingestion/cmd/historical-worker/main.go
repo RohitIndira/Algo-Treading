@@ -121,6 +121,9 @@ func main() {
 		logger.Error("Redis recovery failed", zap.Error(err))
 	}
 
+	// Reconcile bhavcopy vs WebSocket 52W values (fixes stale pre-split data)
+	worker.ReconcileWithWebSocket(ctx)
+
 	switch *mode {
 	case "backfill":
 		if *fromStr == "" || *toStr == "" {
@@ -170,7 +173,7 @@ func main() {
 		}
 
 		// Start WebSocket monitor in background (real-time breakout detection)
-		monitor := historical.NewWSMonitor(repo, redisClient, logger)
+		monitor := historical.NewWSMonitor(repo, redisClient, cfg.KafkaBrokers, logger)
 		go func() {
 			if err := monitor.Start(ctx); err != nil {
 				logger.Error("WebSocket monitor failed", zap.Error(err))
@@ -183,7 +186,7 @@ func main() {
 
 	case "monitor":
 		// Monitor-only mode: just run WebSocket breakout detection
-		monitor := historical.NewWSMonitor(repo, redisClient, logger)
+		monitor := historical.NewWSMonitor(repo, redisClient, cfg.KafkaBrokers, logger)
 		logger.Info("Starting WebSocket monitor (standalone mode)")
 		if err := monitor.Start(ctx); err != nil {
 			logger.Fatal("WebSocket monitor failed", zap.Error(err))

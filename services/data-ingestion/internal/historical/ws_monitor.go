@@ -9,6 +9,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
 
@@ -22,11 +23,12 @@ const (
 )
 
 // WSMonitor connects to the enhanced-stream WebSocket, subscribes to all NSE stocks,
-// detects 52W breakouts in real-time, and stores them in DB + Redis.
+// detects 52W breakouts in real-time, and stores them in DB + Redis + Kafka.
 type WSMonitor struct {
-	repo   *Repository
-	redis  *redis.Client
-	logger *zap.Logger
+	repo        *Repository
+	redis       *redis.Client
+	kafkaWriter *kafka.Writer
+	logger      *zap.Logger
 
 	symbols []string // All NSE symbols to subscribe
 
@@ -45,12 +47,29 @@ type WSMonitor struct {
 }
 
 // NewWSMonitor creates a new WebSocket monitor.
-func NewWSMonitor(repo *Repository, redisClient *redis.Client, logger *zap.Logger) *WSMonitor {
-	return &WSMonitor{
+// kafkaBrokers can be empty — Kafka publishing will be skipped if not configured.
+func NewWSMonitor(repo *Repository, redisClient *redis.Client, kafkaBrokers []string, logger *zap.Logger) *WSMonitor {
+	m := &WSMonitor{
 		repo:   repo,
 		redis:  redisClient,
 		logger: logger,
 	}
+
+	// Initialize Kafka writer if brokers are configured
+	if len(kafkaBrokers) > 0 && kafkaBrokers[0] != "" {
+		m.kafkaWriter = &kafka.Writer{
+			Addr:         kafka.TCP(kafkaBrokers...),
+			Topic:        "market.data.52w_breakouts",
+			Balancer:     &kafka.LeastBytes{},
+			BatchTimeout: 100 * time.Millisecond, // Low latency for real-time events
+			Async:        true,                     // Non-blocking writes
+		}
+		logger.Info("Kafka producer initialized for 52W breakout events",
+			zap.Strings("brokers", kafkaBrokers),
+			zap.String("topic", "market.data.52w_breakouts"))
+	}
+
+	return m
 }
 
 // Start connects to the WebSocket and begins monitoring. Blocks until ctx is cancelled.
@@ -258,66 +277,97 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 	ws52Low := getFloatField(data, "week_52_low")
 	volume := getIntField(data, "volume")
 	pctChange := getFloatField(data, "percent_change")
+
+	// Broker's flags — true only at the exact tick of breakout
 	isNew52WH, _ := data["is_new_week_52_high"].(bool)
 	isNew52WL, _ := data["is_new_week_52_low"].(bool)
 
-	// Determine 52W values to use:
-	//   Priority 1: WebSocket values (broker's official data, most accurate)
-	//   Priority 2: Bhavcopy Redis values (fallback for stocks where WS has no 52W data)
-	redis52H, redis52L := m.getRedis52W(ctx, token)
+	// Broker's dates and timestamps — when the 52W high/low was actually hit
+	ws52HighDate, _ := data["week_52_high_date"].(string)         // "2026-04-06"
+	ws52LowDate, _ := data["week_52_low_date"].(string)
+	ws52HighTS, _ := data["week_52_high_timestamp"].(string)      // "2026-04-06T10:32:15+05:30"
+	ws52LowTS, _ := data["week_52_low_timestamp"].(string)
 
-	use52H := ws52High
-	use52L := ws52Low
-	if use52H <= 0 {
-		use52H = redis52H // Fallback to bhavcopy
-	}
-	if use52L <= 0 {
-		use52L = redis52L // Fallback to bhavcopy
+	todayStr := time.Now().Format("2006-01-02")
+
+	// Update Redis with broker's 52W values (always keep Redis fresh)
+	if ws52High > 0 || ws52Low > 0 {
+		m.updateRedis52W(ctx, token, symbol, exchange, ws52High, ws52Low, ltp)
 	}
 
-	// Detect 52W HIGH breakout (LTP crosses above 52W high)
-	if use52H > 0 && (isNew52WH || ltp > use52H) {
+	// --- 52W HIGH Breakout Detection ---
+	// Two reliable signals (both from broker's server, no stale data):
+	//   1. is_new_week_52_high = true → breakout happening RIGHT NOW
+	//   2. week_52_high_date = today  → breakout happened earlier today (backup catch)
+	if isNew52WH || ws52HighDate == todayStr {
+		breakoutAt := parseTimestamp(ws52HighTS) // Use broker's actual breakout time
 		m.recordBreakout(ctx, BreakoutEvent{
 			Token:         token,
 			Symbol:        symbol,
 			Exchange:      exchange,
 			BreakoutType:  "52W_HIGH",
-			BreakoutPrice: ltp,
-			Prev52WH:      use52H,
-			Prev52WL:      use52L,
+			BreakoutPrice: ws52High,
+			Prev52WH:      ws52High,
+			Prev52WL:      ws52Low,
 			Volume:        volume,
 			PctChange:     pctChange,
 			Source:        "websocket",
+			BreakoutAt:    breakoutAt,
 		})
 	}
 
-	// Detect 52W LOW breakout (LTP falls below 52W low)
-	if use52L > 0 && (isNew52WL || ltp < use52L) {
+	// --- 52W LOW Breakout Detection ---
+	if isNew52WL || ws52LowDate == todayStr {
+		breakoutAt := parseTimestamp(ws52LowTS)
 		m.recordBreakout(ctx, BreakoutEvent{
 			Token:         token,
 			Symbol:        symbol,
 			Exchange:      exchange,
 			BreakoutType:  "52W_LOW",
-			BreakoutPrice: ltp,
-			Prev52WH:      use52H,
-			Prev52WL:      use52L,
+			BreakoutPrice: ws52Low,
+			Prev52WH:      ws52High,
+			Prev52WL:      ws52Low,
 			Volume:        volume,
 			PctChange:     pctChange,
 			Source:        "websocket",
+			BreakoutAt:    breakoutAt,
 		})
-	}
-
-	// Update Redis 52W values if WebSocket has fresher data
-	if ws52High > 0 || ws52Low > 0 {
-		m.updateRedis52W(ctx, token, symbol, exchange, ws52High, ws52Low, ltp)
-
-		// Fix 2: If WebSocket 52W high is now HIGHER than a breakout we recorded,
-		// that breakout was false — delete it from DB and Redis
-		m.cleanupFalseBreakouts(ctx, symbol, ws52High, ws52Low, ltp)
 	}
 }
 
+// isETFOrFund returns true if the symbol is an ETF, index fund, or liquid fund.
+// These are excluded from breakout detection because they make new 52W highs/lows
+// almost daily (just interest/index movement), not real trading signals.
+func isETFOrFund(symbol string) bool {
+	etfPatterns := []string{
+		"BEES", "ETF", "LIQUID", "GOLD", "SILVER",
+		"CASE", "GROWW", "AONE", "MONQ", "NPBET",
+		"ABSL", "MOM50", "MOMGF", "ADD", "HEALTHCARE",
+		"NIFTY1", "NEXT50", "QUAL30", "MID150", "TOP10",
+		"TOP15", "TOP20", "EQUAL", "LOWVOL", "ALPHA",
+		"VALUE", "MIDQ", "PSUBANK", "FMCG", "INFRA",
+		"BANKI", "SETF", "MOVALUE", "MOALPHA", "MODEFENCE",
+		"MOMOMENTUM", "MOMENTUM", "CASHIETF", "AUTOBEES",
+		"EBANKNIFTY", "HDFCSENSEX", "BSLSENETF", "SENSEX",
+	}
+	for _, p := range etfPatterns {
+		if len(symbol) >= len(p) {
+			for i := 0; i <= len(symbol)-len(p); i++ {
+				if symbol[i:i+len(p)] == p {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
+	// Skip ETFs, index funds, liquid funds — not real breakouts
+	if isETFOrFund(evt.Symbol) {
+		return
+	}
+
 	// Check if already recorded today (in-memory dedup — fast)
 	dedupKey := fmt.Sprintf("%s:%s", evt.Symbol, evt.BreakoutType)
 	if _, exists := m.breakoutToday.LoadOrStore(dedupKey, true); exists {
@@ -365,79 +415,46 @@ func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
 
 		// Store in Redis for live screener
 		m.storeBreakoutInRedis(ctx, evt)
+
+		// Publish to Kafka for downstream consumers (rules-engine, notifications, etc.)
+		m.publishBreakoutToKafka(ctx, evt)
 	}
 }
 
-// cleanupFalseBreakouts removes breakout events that are now invalid because
-// the WebSocket provided a more accurate 52W value.
-// Example: We detected CCL breakout at 1116.20 (bhavcopy said 52W high was 1116),
-// but WebSocket later says 52W high is actually 1117 → 1116.20 < 1117 → false breakout.
-func (m *WSMonitor) cleanupFalseBreakouts(ctx context.Context, symbol string, ws52High, ws52Low, ltp float64) {
-	// Check 52W_HIGH: if WebSocket 52W high is now higher than today's breakout price,
-	// the breakout was false
-	if ws52High > 0 {
-		dedupKey := symbol + ":52W_HIGH"
-		if _, exists := m.breakoutToday.Load(dedupKey); exists {
-			// We recorded a breakout today — check if it's still valid
-			if ltp <= ws52High {
-				// LTP is now below the real 52W high → false breakout
-				deleted, err := m.repo.DeleteFalseBreakout(ctx, symbol, "52W_HIGH")
-				if err != nil {
-					m.logger.Error("Failed to delete false breakout", zap.Error(err))
-				} else if deleted {
-					m.breakoutToday.Delete(dedupKey) // Allow re-detection
-					m.removeFalseBreakoutFromRedis(ctx, symbol, "52W_HIGH")
-					m.logger.Warn("Removed false 52W_HIGH breakout",
-						zap.String("symbol", symbol),
-						zap.Float64("ws_52w_high", ws52High),
-						zap.Float64("ltp", ltp))
-				}
-			}
-		}
-	}
-
-	// Check 52W_LOW: if WebSocket 52W low is now lower than today's breakout price,
-	// the breakout was false
-	if ws52Low > 0 {
-		dedupKey := symbol + ":52W_LOW"
-		if _, exists := m.breakoutToday.Load(dedupKey); exists {
-			if ltp >= ws52Low {
-				deleted, err := m.repo.DeleteFalseBreakout(ctx, symbol, "52W_LOW")
-				if err != nil {
-					m.logger.Error("Failed to delete false breakout", zap.Error(err))
-				} else if deleted {
-					m.breakoutToday.Delete(dedupKey)
-					m.removeFalseBreakoutFromRedis(ctx, symbol, "52W_LOW")
-					m.logger.Warn("Removed false 52W_LOW breakout",
-						zap.String("symbol", symbol),
-						zap.Float64("ws_52w_low", ws52Low),
-						zap.Float64("ltp", ltp))
-				}
-			}
-		}
-	}
-}
-
-// removeFalseBreakoutFromRedis removes a false breakout from the Redis sorted set.
-func (m *WSMonitor) removeFalseBreakoutFromRedis(ctx context.Context, symbol, breakoutType string) {
-	if m.redis == nil {
+// publishBreakoutToKafka publishes breakout event to Kafka topic market.data.52w_breakouts.
+// Rules-engine, notification service, etc. can consume this for real-time actions.
+func (m *WSMonitor) publishBreakoutToKafka(ctx context.Context, evt BreakoutEvent) {
+	if m.kafkaWriter == nil {
 		return
 	}
 
-	key := fmt.Sprintf("breakouts:today:%s", breakoutType)
-	// Scan the sorted set to find and remove the entry for this symbol
-	members, err := m.redis.ZRange(ctx, key, 0, -1).Result()
+	breakoutAt := evt.BreakoutAt
+	if breakoutAt.IsZero() {
+		breakoutAt = time.Now()
+	}
+
+	val, _ := json.Marshal(map[string]interface{}{
+		"event_type":    evt.BreakoutType,
+		"symbol":        evt.Symbol,
+		"token":         evt.Token,
+		"exchange":      evt.Exchange,
+		"price":         evt.BreakoutPrice,
+		"prev_52w_high": evt.Prev52WH,
+		"prev_52w_low":  evt.Prev52WL,
+		"volume":        evt.Volume,
+		"pct_change":    evt.PctChange,
+		"breakout_at":   breakoutAt.Format(time.RFC3339),
+		"detected_at":   time.Now().Format(time.RFC3339),
+	})
+
+	err := m.kafkaWriter.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(evt.Symbol),
+		Value: val,
+	})
 	if err != nil {
-		return
-	}
-	for _, member := range members {
-		var data map[string]interface{}
-		if json.Unmarshal([]byte(member), &data) == nil {
-			if data["symbol"] == symbol {
-				m.redis.ZRem(ctx, key, member)
-				break
-			}
-		}
+		m.logger.Warn("Failed to publish breakout to Kafka",
+			zap.String("symbol", evt.Symbol),
+			zap.Error(err))
 	}
 }
 
@@ -449,19 +466,25 @@ func (m *WSMonitor) storeBreakoutInRedis(ctx context.Context, evt BreakoutEvent)
 		return
 	}
 
+	breakoutAt := evt.BreakoutAt
+	if breakoutAt.IsZero() {
+		breakoutAt = time.Now()
+	}
+
 	val, _ := json.Marshal(map[string]interface{}{
-		"symbol":    evt.Symbol,
-		"token":     evt.Token,
-		"exchange":  evt.Exchange,
-		"price":     evt.BreakoutPrice,
-		"prev_high": evt.Prev52WH,
-		"prev_low":  evt.Prev52WL,
-		"volume":    evt.Volume,
-		"pct_change": evt.PctChange,
+		"symbol":      evt.Symbol,
+		"token":       evt.Token,
+		"exchange":    evt.Exchange,
+		"price":       evt.BreakoutPrice,
+		"prev_high":   evt.Prev52WH,
+		"prev_low":    evt.Prev52WL,
+		"volume":      evt.Volume,
+		"pct_change":  evt.PctChange,
+		"breakout_at": breakoutAt.Format(time.RFC3339), // Broker's actual breakout time
 	})
 
 	key := fmt.Sprintf("breakouts:today:%s", evt.BreakoutType)
-	score := float64(time.Now().Unix())
+	score := float64(breakoutAt.Unix()) // Sort by actual breakout time, not detection time
 
 	pipe := m.redis.Pipeline()
 	pipe.ZAdd(ctx, key, redis.Z{Score: score, Member: string(val)})
@@ -559,6 +582,26 @@ func getFloatField(m map[string]interface{}, key string) float64 {
 func getIntField(m map[string]interface{}, key string) int64 {
 	v, _ := m[key].(float64)
 	return int64(v)
+}
+
+// parseTimestamp parses broker's timestamp string (e.g., "2026-04-06T10:32:15+05:30").
+// Returns zero time if parsing fails.
+func parseTimestamp(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	// Try RFC3339 first
+	t, err := time.Parse(time.RFC3339, s)
+	if err == nil {
+		return t
+	}
+	// Try without timezone
+	t, err = time.Parse("2006-01-02T15:04:05", s)
+	if err == nil {
+		loc, _ := time.LoadLocation("Asia/Kolkata")
+		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, loc)
+	}
+	return time.Time{}
 }
 
 func maxFloat(a, b float64) float64 {
