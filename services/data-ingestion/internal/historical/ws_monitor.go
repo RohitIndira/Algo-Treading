@@ -578,6 +578,7 @@ func (m *WSMonitor) publishBreakoutToKafka(ctx context.Context, evt BreakoutEven
 		breakoutAt = time.Now()
 	}
 
+	loc, _ := time.LoadLocation("Asia/Kolkata")
 	val, _ := json.Marshal(map[string]interface{}{
 		"event_type":    evt.BreakoutType,
 		"symbol":        evt.Symbol,
@@ -588,8 +589,9 @@ func (m *WSMonitor) publishBreakoutToKafka(ctx context.Context, evt BreakoutEven
 		"prev_52w_low":  evt.Prev52WL,
 		"volume":        evt.Volume,
 		"pct_change":    evt.PctChange,
-		"breakout_at":   breakoutAt.Format(time.RFC3339),
-		"detected_at":   time.Now().Format(time.RFC3339),
+		"trade_date":    time.Now().In(loc).Format("2006-01-02"),
+		"breakout_at":   breakoutAt.In(loc).Format("2006-01-02 15:04:05 IST"),
+		"detected_at":   time.Now().In(loc).Format("2006-01-02 15:04:05 IST"),
 	})
 
 	err := m.kafkaWriter.WriteMessages(ctx, kafka.Message{
