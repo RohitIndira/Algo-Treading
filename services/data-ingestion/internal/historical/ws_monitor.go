@@ -618,6 +618,11 @@ func (m *WSMonitor) storeBreakoutInRedis(ctx context.Context, evt BreakoutEvent)
 		breakoutAt = time.Now()
 	}
 
+	loc, _ := time.LoadLocation("Asia/Kolkata")
+
+	// Store breakout details in a separate hash key per stock
+	// This way updates to price/volume don't create duplicates
+	detailKey := fmt.Sprintf("breakout:%s:%s:%s", evt.BreakoutType, evt.Symbol, time.Now().In(loc).Format("2006-01-02"))
 	val, _ := json.Marshal(map[string]interface{}{
 		"symbol":      evt.Symbol,
 		"token":       evt.Token,
@@ -627,16 +632,25 @@ func (m *WSMonitor) storeBreakoutInRedis(ctx context.Context, evt BreakoutEvent)
 		"prev_low":    evt.Prev52WL,
 		"volume":      evt.Volume,
 		"pct_change":  evt.PctChange,
-		"breakout_at": breakoutAt.Format(time.RFC3339), // Broker's actual breakout time
+		"breakout_at": breakoutAt.In(loc).Format("2006-01-02 15:04:05 IST"),
+		"updated_at":  time.Now().In(loc).Format("2006-04-02 15:04:05 IST"),
 	})
 
-	key := fmt.Sprintf("breakouts:today:%s", evt.BreakoutType)
-	score := float64(breakoutAt.Unix()) // Sort by actual breakout time, not detection time
+	listKey := fmt.Sprintf("breakouts:today:%s", evt.BreakoutType)
+	score := float64(breakoutAt.Unix())
 
 	pipe := m.redis.Pipeline()
-	pipe.ZAdd(ctx, key, redis.Z{Score: score, Member: string(val)})
-	pipe.ExpireAt(ctx, key, midnightIST()) // Expire at midnight IST
-	// Publish for real-time listeners (frontend WebSocket can subscribe)
+
+	// Store/update detail key (always latest price)
+	pipe.Set(ctx, detailKey, val, 25*time.Hour)
+
+	// Sorted set: use SYMBOL as member (not JSON) — prevents duplicates
+	// Remove old entry first, then add with new score
+	pipe.ZRem(ctx, listKey, evt.Symbol)
+	pipe.ZAdd(ctx, listKey, redis.Z{Score: score, Member: evt.Symbol})
+	pipe.ExpireAt(ctx, listKey, midnightIST())
+
+	// Publish for real-time listeners
 	pipe.Publish(ctx, "breakout_events", string(val))
 	pipe.Exec(ctx)
 }
