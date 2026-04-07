@@ -309,47 +309,91 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 
 	todayStr := time.Now().Format("2006-01-02")
 
-	// Update Redis with broker's 52W values (always keep Redis fresh)
+	// Get previous 52W values from Redis (from 6AM API sync — exchange-verified)
+	prev52H, prev52L, redisSource := m.getRedis52WWithSource(ctx, token, symbol)
+
+	// Update Redis with broker's WebSocket values (always keep fresh)
 	if ws52High > 0 || ws52Low > 0 {
 		m.updateRedis52W(ctx, token, symbol, exchange, ws52High, ws52Low, ltp)
 	}
 
 	// --- 52W HIGH Breakout Detection ---
-	// Two reliable signals (both from broker's server, no stale data):
-	//   1. is_new_week_52_high = true → breakout happening RIGHT NOW
-	//   2. week_52_high_date = today  → breakout happened earlier today (backup catch)
-	if isNew52WH || ws52HighDate == todayStr {
-		breakoutAt := parseTimestamp(ws52HighTS) // Use broker's actual breakout time
+	// Three detection methods (from most to least reliable):
+	//
+	// Method 1: is_new_week_52_high = true
+	//   → Broker's flag, true only at the exact tick of breakout. Most reliable.
+	//
+	// Method 2: week_52_high_date = TODAY (strict today only, not yesterday)
+	//   → Backup catch for when we missed the flag tick.
+	//
+	// Method 3: LTP > Redis 52W high (from 6AM API sync)
+	//   → Fallback for stocks where WebSocket doesn't send the flag at all.
+	//   → ONLY safe when Redis source is "nse_api" or "bse_api" (exchange-verified).
+	//   → NOT safe against old bhavcopy/websocket values (could be stale).
+
+	highBreakout := false
+	var breakoutAtHigh time.Time
+
+	if isNew52WH {
+		// Method 1: broker flag
+		highBreakout = true
+		breakoutAtHigh = parseTimestamp(ws52HighTS)
+	} else if ws52HighDate == todayStr {
+		// Method 2: date = today (strict)
+		highBreakout = true
+		breakoutAtHigh = parseTimestamp(ws52HighTS)
+	} else if prev52H > 0 && ltp > prev52H &&
+		(redisSource == "nse_api" || redisSource == "bse_api") {
+		// Method 3: LTP exceeds exchange-verified 52W high from 6AM sync
+		highBreakout = true
+		breakoutAtHigh = time.Now()
+	}
+
+	if highBreakout {
 		m.recordBreakout(ctx, BreakoutEvent{
 			Token:         token,
 			Symbol:        symbol,
 			Exchange:      exchange,
 			BreakoutType:  "52W_HIGH",
-			BreakoutPrice: ws52High,
-			Prev52WH:      ws52High,
-			Prev52WL:      ws52Low,
+			BreakoutPrice: ltp,             // Use actual LTP (highest seen)
+			Prev52WH:      prev52H,         // Previous 52W high from 6AM sync
+			Prev52WL:      prev52L,
 			Volume:        volume,
 			PctChange:     pctChange,
 			Source:        "websocket",
-			BreakoutAt:    breakoutAt,
+			BreakoutAt:    breakoutAtHigh,
 		})
 	}
 
 	// --- 52W LOW Breakout Detection ---
-	if isNew52WL || ws52LowDate == todayStr {
-		breakoutAt := parseTimestamp(ws52LowTS)
+	lowBreakout := false
+	var breakoutAtLow time.Time
+
+	if isNew52WL {
+		lowBreakout = true
+		breakoutAtLow = parseTimestamp(ws52LowTS)
+	} else if ws52LowDate == todayStr {
+		lowBreakout = true
+		breakoutAtLow = parseTimestamp(ws52LowTS)
+	} else if prev52L > 0 && ltp < prev52L && ltp > 0 &&
+		(redisSource == "nse_api" || redisSource == "bse_api") {
+		lowBreakout = true
+		breakoutAtLow = time.Now()
+	}
+
+	if lowBreakout {
 		m.recordBreakout(ctx, BreakoutEvent{
 			Token:         token,
 			Symbol:        symbol,
 			Exchange:      exchange,
 			BreakoutType:  "52W_LOW",
-			BreakoutPrice: ws52Low,
-			Prev52WH:      ws52High,
-			Prev52WL:      ws52Low,
+			BreakoutPrice: ltp,
+			Prev52WH:      prev52H,
+			Prev52WL:      prev52L,
 			Volume:        volume,
 			PctChange:     pctChange,
 			Source:        "websocket",
-			BreakoutAt:    breakoutAt,
+			BreakoutAt:    breakoutAtLow,
 		})
 	}
 }
@@ -595,25 +639,48 @@ func (m *WSMonitor) storeBreakoutInRedis(ctx context.Context, evt BreakoutEvent)
 	pipe.Exec(ctx)
 }
 
-// getRedis52W fetches our computed 52W values from Redis (from bhavcopy pipeline).
+// getRedis52W fetches 52W values from Redis.
 func (m *WSMonitor) getRedis52W(ctx context.Context, token string) (high, low float64) {
-	if m.redis == nil || token == "" {
-		return 0, 0
+	high, low, _ = m.getRedis52WWithSource(ctx, token, "")
+	return
+}
+
+// getRedis52WWithSource fetches 52W values from Redis and returns the source.
+// Tries token key first, then symbol key as fallback.
+func (m *WSMonitor) getRedis52WWithSource(ctx context.Context, token, symbol string) (high, low float64, source string) {
+	if m.redis == nil {
+		return 0, 0, ""
 	}
 
-	val, err := m.redis.Get(ctx, fmt.Sprintf("52w:token:%s", token)).Result()
-	if err != nil {
-		return 0, 0
+	// Try by token first
+	keys := []string{}
+	if token != "" {
+		keys = append(keys, fmt.Sprintf("52w:token:%s", token))
+	}
+	if symbol != "" && symbol != token {
+		keys = append(keys, fmt.Sprintf("52w:token:%s", symbol))
 	}
 
-	var data map[string]interface{}
-	if json.Unmarshal([]byte(val), &data) != nil {
-		return 0, 0
+	for _, key := range keys {
+		val, err := m.redis.Get(ctx, key).Result()
+		if err != nil {
+			continue
+		}
+
+		var data map[string]interface{}
+		if json.Unmarshal([]byte(val), &data) != nil {
+			continue
+		}
+
+		high, _ = data["high"].(float64)
+		low, _ = data["low"].(float64)
+		source, _ = data["source"].(string)
+		if high > 0 {
+			return high, low, source
+		}
 	}
 
-	high, _ = data["high"].(float64)
-	low, _ = data["low"].(float64)
-	return high, low
+	return 0, 0, ""
 }
 
 // updateRedis52W updates Redis with fresh 52W values from WebSocket tick.
