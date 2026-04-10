@@ -98,8 +98,8 @@ The service expects documents in this format:
 ### Start Kafka First
 
 ```bash
-cd /home/rohitt/Desktop/trading-system/deployments/docker
-./setup_kafka.sh
+cd deployments/docker
+./setup.sh kafka
 ```
 
 ### Run the Service
@@ -248,7 +248,7 @@ mongosh "mongodb://localhost:27017"
 docker ps | grep kafka
 
 # Start Kafka if needed
-cd deployments/docker && ./setup_kafka.sh
+cd deployments/docker && ./setup.sh kafka
 ```
 
 #### 3. No Messages Being Published

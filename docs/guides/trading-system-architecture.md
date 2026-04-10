@@ -173,49 +173,29 @@ service UserConfigService {
 
 **Technology Stack**:
 - Go microservice
-- Kafka Consumer (market.data.news topic)
-- Elasticsearch for rule indexing
-- Redis for user config caching
-- gRPC client (User Config Service)
+- Kafka Consumer (news-events, user-config-events topics)
+- PostgreSQL for strategy storage
+- Redis for strategy caching and LTP lookup
 - RabbitMQ Producer (order.execution.queue)
 
 **Matching Algorithm**:
 ```
 1. Receive event from Kafka
-2. Query Elasticsearch for potentially matching rules:
-   - Index by: impact_score, sentiment, category, stock
-   - Use range queries and filters
-3. For each candidate user:
-   - Fetch full config from Redis (cache) or MongoDB
+2. Load active strategies from PostgreSQL (cached in Redis)
+3. For each strategy:
    - Evaluate all conditions (impact score, sentiment, price, volume, etc.)
-   - Check risk limits (daily trades, loss limits)
+   - Weighted scoring (impact: 25%, stock: 20%, sentiment: 15%, etc.)
+   - Min match score threshold: 80.0
 4. If match found:
    - Generate trade signal
-   - Publish to RabbitMQ order queue
+   - Publish to Kafka (trade-signals topic)
 5. Update metrics and logs
 ```
 
-**Elasticsearch Index Structure**:
-```json
-{
-  "user_id": "string",
-  "strategy_id": "string",
-  "impact_score_min": 5,
-  "sentiments": ["positive", "neutral"],
-  "categories": ["Financial Results"],
-  "stocks": [517170, 500325],
-  "price_min": 100,
-  "price_max": 5000,
-  "volume_min": 100000,
-  "active": true
-}
-```
-
 **Scalability Features**:
-- Kafka consumer group with 50 partitions
+- Kafka consumer group with partitioned topics
 - Parallel processing (50 goroutines per instance)
-- Elasticsearch sharding by user_id hash
-- Redis Cluster for distributed caching
+- Redis caching for strategy data
 - Exactly-once semantics via Kafka transactions
 
 **gRPC Methods** (Internal):
@@ -229,19 +209,19 @@ service RulesEngine {
 ---
 
 ### 5. Trade Execution Service
-**Purpose**: Execute trades via Odin API
+**Purpose**: Execute trades via Indira Securities API
 
 **Technology Stack**:
 - Go microservice
 - RabbitMQ Consumer (order.execution.queue)
 - PostgreSQL for order management
 - gRPC server for order status
-- Odin API client
+- Indira Securities API client
 
 **Responsibilities**:
-- Consume order requests from RabbitMQ
+- Consume trade signals from Kafka
 - Pre-trade risk checks
-- Call Odin API for order placement
+- Call Indira Securities API for order placement
 - Update order status in PostgreSQL
 - Publish execution confirmations
 
@@ -263,7 +243,7 @@ CREATE TABLE orders (
   quantity INT NOT NULL,
   price DECIMAL(10,2),
   status VARCHAR(20) NOT NULL,
-  odin_order_id VARCHAR(50),
+  indira_order_id VARCHAR(50),
   filled_quantity INT DEFAULT 0,
   filled_price DECIMAL(10,2),
   commission DECIMAL(10,2),
@@ -296,12 +276,12 @@ CREATE INDEX idx_event_orders ON orders(event_id);
 }
 ```
 
-**Odin API Integration**:
+**Indira Securities API Integration**:
 - Order placement endpoint
-- Order status check
+- Order status check via WebSocket
 - Order modification/cancellation
 - Error handling and retry logic
-- Rate limiting compliance
+- Per-user credential management
 
 **gRPC Methods**:
 ```protobuf
@@ -316,7 +296,7 @@ service TradeExecutionService {
 **Error Handling**:
 - Retry logic with exponential backoff
 - Dead letter queue for failed orders
-- Circuit breaker for Odin API
+- Circuit breaker for Indira API
 - Idempotency checks
 
 ---
@@ -403,18 +383,17 @@ MongoDB (News Updates)
 ### Flow 2: Strategy Matching
 ```
 Kafka Consumer (Rules Engine)
-  -> Fetch User Configs (Redis/MongoDB)
-  -> Query Elasticsearch (Indexed Rules)
-  -> Evaluate Conditions
+  -> Load Strategies (PostgreSQL / Redis cache)
+  -> Evaluate Conditions (in-memory matching)
   -> Generate Trade Signal
-  -> Publish to RabbitMQ (order.execution.queue)
+  -> Publish to Kafka (trade-signals)
 ```
 
 ### Flow 3: Order Execution
 ```
 RabbitMQ Consumer (Trade Execution Service)
   -> Pre-Trade Risk Check (Risk Management Service via gRPC)
-  -> Submit Order to Odin API
+  -> Submit Order to Indira Securities API
   -> Update Order Status (PostgreSQL)
   -> Post-Trade Metrics (Risk Management Service via gRPC)
   -> Send Confirmation (WebSocket/Notification)
@@ -425,9 +404,9 @@ RabbitMQ Consumer (Trade Execution Service)
 User Dashboard (Web/API)
   -> API Gateway
   -> User Config Service (gRPC)
-  -> Update MongoDB
+  -> Update PostgreSQL
+  -> Publish event to Kafka (user-config-events)
   -> Invalidate Redis Cache
-  -> Reindex Elasticsearch
 ```
 
 ---
@@ -501,25 +480,9 @@ User Dashboard (Web/API)
 - TTL-based cache invalidation
 - Pub/Sub for cache invalidation notifications
 
-### Elasticsearch
-**Index**: `user_strategies`
-**Purpose**: Fast rule matching for 10K users
-
-**Query Pattern**:
-```json
-{
-  "query": {
-    "bool": {
-      "must": [
-        {"term": {"active": true}},
-        {"range": {"impact_score_min": {"lte": 5}}},
-        {"terms": {"sentiments": ["neutral"]}},
-        {"terms": {"stocks": [517170]}}
-      ]
-    }
-  }
-}
-```
+### PostgreSQL (Strategies)
+**Tables**: strategies, strategy_conditions, trade_configs, risk_limits
+**Purpose**: Strategy storage and matching for 10K users
 
 ---
 
@@ -539,11 +502,11 @@ User Dashboard (Web/API)
 | User Config Service | 2-3 | Read-heavy, cached |
 | Data Ingestion | 2-3 | Change stream fan-out |
 | Rules Engine | 10-20 | CPU-intensive matching |
-| Trade Execution | 5-10 | I/O bound (Odin API) |
+| Trade Execution | 5-10 | I/O bound (Indira API) |
 | Risk Management | 3-5 | Redis-backed, fast |
 
 ### Bottleneck Mitigation
-1. **Rules Engine**: Elasticsearch + Redis caching reduces DB load
+1. **Rules Engine**: Redis caching reduces DB load
 2. **Order Queue**: RabbitMQ with multiple consumers
 3. **Database**: MongoDB sharding, PostgreSQL connection pooling
 4. **Network**: gRPC connection pooling, HTTP/2 multiplexing
@@ -558,7 +521,7 @@ User Dashboard (Web/API)
 | RPC | gRPC + Protocol Buffers | Inter-service communication |
 | Event Streaming | Apache Kafka | Market data ingestion |
 | Message Queue | RabbitMQ | Order execution queue |
-| Databases | MongoDB, PostgreSQL, Redis, Elasticsearch | Polyglot persistence |
+| Databases | MongoDB, PostgreSQL, Redis | Polyglot persistence |
 | API Framework | Gin/Fiber | REST API Gateway |
 | Authentication | JWT | User authentication |
 | Monitoring | Prometheus + Grafana | Metrics and dashboards |
@@ -596,8 +559,8 @@ User Dashboard (Web/API)
 2. ⏭️ Define directory structure
 3. ⏭️ Create Protocol Buffer definitions
 4. ⏭️ Implement core services (User Config, Data Ingestion)
-5. ⏭️ Implement Rules Engine with Elasticsearch
-6. ⏭️ Implement Trade Execution with Odin API
+5. ⏭️ Implement Rules Engine with PostgreSQL + Redis
+6. ⏭️ Implement Trade Execution with Indira Securities API
 7. ⏭️ Add monitoring and observability
 8. ⏭️ Load testing and optimization
 
@@ -609,5 +572,5 @@ User Dashboard (Web/API)
 - **Sentiment**: Emotional tone of news (Positive, Neutral, Negative)
 - **Strategy**: User-defined trading rules and conditions
 - **Trade Signal**: Matched condition triggering an order
-- **Odin API**: Indian stock market trading API
+- **Indira Securities API**: Indian stock market trading API (broker)
 - **Change Stream**: MongoDB real-time data change notification

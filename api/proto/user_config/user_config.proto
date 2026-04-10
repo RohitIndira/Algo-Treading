@@ -81,26 +81,24 @@ message StrategyConditions {
   
   // News categories to monitor
   repeated string categories = 5;
-  
-  // Specific stocks to monitor (stock codes)
-  repeated int64 stock_codes = 6;
-  
+
+  // reserved 6; (stock_codes removed)
+
   // Price range filter
   common.PriceRange price_range = 7;
-  
+
   // Market Cap Type (Small, Mid, Large)
   repeated string market_cap_types = 8;
-  
+
   // Market cap range filter (in crores)
   message MarketCapRange {
     double min_mcap = 1; // Minimum market cap in crores
     double max_mcap = 2; // Maximum market cap in crores
   }
   MarketCapRange market_cap_range = 9;
-  
-  // Minimum trading volume threshold
-  int64 volume_threshold = 10;
-  
+
+  // reserved 10; (volume_threshold removed)
+
   // Percentage change threshold range (trigger if stock moves within/outside this range)
   message PctChangeRange {
       double min_pct_change = 1;

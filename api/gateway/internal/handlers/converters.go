@@ -129,7 +129,6 @@ func dtoConditionsToProto(c *dto.StrategyConditions) *pb.StrategyConditions {
 		ImpactScoreMax: c.ImpactScoreMax,
 		Sentiments:     sentiments,
 		Categories:     c.Categories,
-		StockCodes:     c.StockCodes,
 		MarketCapTypes: c.MarketCapTypes,
 		MarketCapRange: &pb.StrategyConditions_MarketCapRange{
 			MinMcap: c.MinMarketCap,
@@ -139,8 +138,7 @@ func dtoConditionsToProto(c *dto.StrategyConditions) *pb.StrategyConditions {
 			MinPctChange: c.MinPriceChangePct,
 			MaxPctChange: c.MaxPriceChangePct,
 		},
-		VolumeThreshold: c.MinVolume,
-		Exchanges:       exchanges,
+		Exchanges: exchanges,
 	}
 }
 

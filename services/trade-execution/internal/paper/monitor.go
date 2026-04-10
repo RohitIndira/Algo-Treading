@@ -11,6 +11,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/google/uuid"
 )
 
 const (
@@ -24,6 +25,13 @@ const (
 type symbolMeta struct {
 	exchange string // "NSE" or "BSE"
 	token    int64  // StockCode / instrument token
+}
+
+// trailSLState tracks in-memory trailing stop-loss state for a paper order.
+type trailSLState struct {
+	bestPrice float64 // highest LTP seen for BUY; lowest for SELL
+	currentSL float64 // current trailing SL price (moves with bestPrice)
+	trailPct  float64 // trailing percentage (e.g. 0.5 → 0.5%)
 }
 
 // PaperTradeMonitor is the SL/TP engine and live PnL broadcaster.
@@ -50,6 +58,10 @@ type PaperTradeMonitor struct {
 
 	// track orders currently being exited to avoid duplicates (sync.Map[uuid.UUID → bool])
 	exiting sync.Map
+
+	// trailing SL state per order — protected by trailMu
+	trailStates map[uuid.UUID]*trailSLState
+	trailMu     sync.Mutex
 }
 
 // NewPaperTradeMonitor creates a new monitor.
@@ -67,10 +79,11 @@ func NewPaperTradeMonitor(
 		wsServer:     wsServer,
 		marketClient: marketClient,
 		redisPrices:  redisPrices,
-		orderCache:  make(map[string][]*models.Order),
-		symbolMeta:  make(map[string]symbolMeta),
-		latestLTP:   make(map[string]float64),
-		wssLastSeen: make(map[string]time.Time),
+		orderCache:   make(map[string][]*models.Order),
+		symbolMeta:   make(map[string]symbolMeta),
+		latestLTP:    make(map[string]float64),
+		wssLastSeen:  make(map[string]time.Time),
+		trailStates:  make(map[uuid.UUID]*trailSLState),
 	}
 }
 
@@ -152,6 +165,21 @@ func (m *PaperTradeMonitor) AddOrder(order *models.Order) {
 	}
 	m.cacheMu.Unlock()
 
+	// Initialise trailing SL state for TRAILING orders.
+	if order.StopLossType != nil && *order.StopLossType == "TRAILING" &&
+		order.TrailingSLPct != nil && *order.TrailingSLPct > 0 {
+		entry := safeF(order.FilledPrice)
+		m.trailMu.Lock()
+		m.trailStates[order.OrderID] = &trailSLState{
+			bestPrice: entry,
+			currentSL: safeF(order.StopLoss),
+			trailPct:  *order.TrailingSLPct,
+		}
+		m.trailMu.Unlock()
+		log.Printf("[paper-monitor] Trailing SL enabled for order %s (trailPct=%.2f%% initialSL=%.2f)",
+			order.OrderID, *order.TrailingSLPct, safeF(order.StopLoss))
+	}
+
 	subs := []string{order.Symbol}
 	if order.StockCode > 0 {
 		subs = append(subs, strconv.FormatInt(order.StockCode, 10))
@@ -167,6 +195,52 @@ func (m *PaperTradeMonitor) AddOrder(order *models.Order) {
 			Order:  order,
 		})
 	}
+}
+
+// advanceTrailingSL updates the trailing SL for an order based on the new LTP.
+// Returns the effective SL to use for exit evaluation (fixed or trailed).
+// If the order has no trailing SL state, returns order.StopLoss unchanged.
+func (m *PaperTradeMonitor) advanceTrailingSL(order *models.Order, ltp float64) float64 {
+	m.trailMu.Lock()
+	ts, ok := m.trailStates[order.OrderID]
+	if !ok {
+		m.trailMu.Unlock()
+		return safeF(order.StopLoss)
+	}
+
+	updated := false
+	if order.OrderSide == models.OrderSideBuy && ltp > ts.bestPrice {
+		ts.bestPrice = ltp
+		newSL := ltp * (1 - ts.trailPct/100)
+		if newSL > ts.currentSL {
+			ts.currentSL = newSL
+			updated = true
+		}
+	} else if order.OrderSide == models.OrderSideSell && ltp < ts.bestPrice {
+		ts.bestPrice = ltp
+		newSL := ltp * (1 + ts.trailPct/100)
+		if newSL < ts.currentSL || ts.currentSL == 0 {
+			ts.currentSL = newSL
+			updated = true
+		}
+	}
+
+	effectiveSL := ts.currentSL
+	m.trailMu.Unlock()
+
+	if updated {
+		newSL := effectiveSL
+		orderID := order.OrderID
+		go func() {
+			m.repo.RecordExecutionEvent(context.Background(), orderID, "PAPER_TRAILING_SL_UPDATED", map[string]interface{}{
+				"new_sl": newSL,
+				"ltp":    ltp,
+			})
+		}()
+		log.Printf("[paper-monitor] Trailing SL updated for %s: SL=%.2f (ltp=%.2f)", orderID, newSL, ltp)
+	}
+
+	return effectiveSL
 }
 
 // OnPriceUpdate is called by PaperMarketClient on every new LTP from WSS.
@@ -193,7 +267,8 @@ func (m *PaperTradeMonitor) OnPriceUpdate(symbol string, ltp float64) {
 			continue
 		}
 
-		sl := safeF(order.StopLoss)
+		// Advance trailing SL before evaluating exit conditions.
+		sl := m.advanceTrailingSL(order, ltp)
 		tp := safeF(order.TakeProfit)
 
 		// SL/TP check — WSS only
@@ -492,6 +567,11 @@ func (m *PaperTradeMonitor) exitPosition(ctx context.Context, order *models.Orde
 		m.priceMu.Unlock()
 	}
 
+	// Clean up trailing SL state.
+	m.trailMu.Lock()
+	delete(m.trailStates, order.OrderID)
+	m.trailMu.Unlock()
+
 	finalPnL := computePnL(order, exitPrice)
 
 	if m.wsServer != nil {
@@ -583,6 +663,39 @@ func computePnL(order *models.Order, ltp float64) float64 {
 		return (ltp - entry) * qty
 	}
 	return (entry - ltp) * qty
+}
+
+// SquareOffAll closes all open paper positions across all users.
+// Called by the AutoSquareOffScheduler at market close (15:05 IST).
+func (m *PaperTradeMonitor) SquareOffAll(ctx context.Context) error {
+	// Collect distinct user IDs from the in-memory cache.
+	m.cacheMu.RLock()
+	userSet := make(map[string]struct{})
+	for _, orders := range m.orderCache {
+		for _, o := range orders {
+			userSet[o.UserID] = struct{}{}
+		}
+	}
+	m.cacheMu.RUnlock()
+
+	if len(userSet) == 0 {
+		log.Println("[paper-monitor] Auto square-off: no open paper positions")
+		return nil
+	}
+
+	log.Printf("[paper-monitor] Auto square-off: closing positions for %d user(s)", len(userSet))
+	var wg sync.WaitGroup
+	for uid := range userSet {
+		wg.Add(1)
+		go func(userID string) {
+			defer wg.Done()
+			if err := m.ForceExitAll(ctx, userID); err != nil {
+				log.Printf("[paper-monitor] Auto square-off failed for user %s: %v", userID, err)
+			}
+		}(uid)
+	}
+	wg.Wait()
+	return nil
 }
 
 func safeF(p *float64) float64 {

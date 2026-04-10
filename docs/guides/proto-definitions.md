@@ -168,7 +168,7 @@ Current position details:
 **File**: `api/proto/trade_execution/trade_execution.proto`
 
 ### Purpose
-Handles order execution via Odin API and order lifecycle management.
+Handles order execution via Indira Securities API and order lifecycle management.
 
 ### Service Methods
 
@@ -186,7 +186,7 @@ Handles order execution via Odin API and order lifecycle management.
 
 #### Order
 Complete order information:
-- Order identification (internal and Odin IDs)
+- Order identification (internal and broker IDs)
 - User, strategy, and event IDs
 - Stock and exchange details
 - Order parameters (type, side, quantity, price)

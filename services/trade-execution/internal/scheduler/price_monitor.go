@@ -160,6 +160,12 @@ func shardFor(key string) int {
 	return int(h % shardCount)
 }
 
+// SetExecuteFn replaces the executor used to place orders when a price condition is met.
+// Use this to swap in a RoutingExecutor that handles both live and paper orders.
+func (pm *PriceMonitor) SetExecuteFn(fn OrderExecutorFunc) {
+	pm.executeFn = fn
+}
+
 // SetOnTickDone sets a callback invoked after each checkPrices tick.
 // Used to broadcast price watch snapshots via WebSocket.
 func (pm *PriceMonitor) SetOnTickDone(fn func()) {

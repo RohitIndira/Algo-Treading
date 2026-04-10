@@ -57,7 +57,6 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 		Conditions: ConditionsPayload{
 			Sentiments:     []string{},
 			Categories:     []string{},
-			StockCodes:     []int64{},
 			MarketCapTypes: []string{},
 			Exchanges:      []string{},
 		},
@@ -73,13 +72,11 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 			ImpactScoreMax:    s.Conditions.ImpactScoreMax,
 			Sentiments:        nilSafeStringSlice([]string(s.Conditions.Sentiments)),
 			Categories:        nilSafeStringSlice([]string(s.Conditions.Categories)),
-			StockCodes:        nilSafeInt64Slice([]int64(s.Conditions.StockCodes)),
 			MarketCapTypes:    nilSafeStringSlice([]string(s.Conditions.MarketCapTypes)),
 			MinMarketCap:      valueOrZeroFloat64(s.Conditions.MinMarketCap),
 			MaxMarketCap:      valueOrZeroFloat64(s.Conditions.MaxMarketCap),
 			MinPriceChangePct: valueOrZeroFloat64(s.Conditions.MinPriceChangePct),
 			MaxPriceChangePct: valueOrZeroFloat64(s.Conditions.MaxPriceChangePct),
-			MinVolume:         valueOrZeroInt64(s.Conditions.MinVolume),
 			Exchanges:         nilSafeStringSlice([]string(s.Conditions.Exchanges)),
 			CreatedAt:         s.Conditions.CreatedAt.UnixNano(),
 		}
@@ -127,21 +124,7 @@ func nilSafeStringSlice(in []string) []string {
 	return in
 }
 
-func nilSafeInt64Slice(in []int64) []int64 {
-	if in == nil {
-		return []int64{}
-	}
-	return in
-}
-
 func valueOrZeroFloat64(v *float64) float64 {
-	if v == nil {
-		return 0
-	}
-	return *v
-}
-
-func valueOrZeroInt64(v *int64) int64 {
 	if v == nil {
 		return 0
 	}

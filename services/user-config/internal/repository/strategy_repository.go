@@ -42,7 +42,7 @@ func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offse
 	// Load related data for each strategy
 	for _, strategy := range strategies {
 		condition := &models.StrategyCondition{}
-		condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
+		condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
 		err := r.db.GetContext(ctx, condition, condQuery, strategy.StrategyID)
 		if err == nil {
 			strategy.Conditions = condition
@@ -109,18 +109,18 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		condQuery := `
 			INSERT INTO strategy_conditions (
 				condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max,
-				sentiments, news_categories, stock_codes, min_market_cap, max_market_cap,
-				market_cap_types, min_price_change_pct, max_price_change_pct, min_volume, exchanges
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+				sentiments, news_categories, min_market_cap, max_market_cap,
+				market_cap_types, min_price_change_pct, max_price_change_pct, exchanges
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, condQuery,
 			conditionID, strategy.StrategyID, req.Conditions.MatchAllNews,
 			req.Conditions.ImpactScoreMin, req.Conditions.ImpactScoreMax,
-			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
+			req.Conditions.Sentiments, req.Conditions.Categories,
 			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap, req.Conditions.MarketCapTypes,
 			req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
-			req.Conditions.MinVolume, req.Conditions.Exchanges,
+			req.Conditions.Exchanges,
 		).Scan(&req.Conditions.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert conditions: %w", err)
@@ -218,7 +218,7 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 
 	// Get conditions
 	condition := &models.StrategyCondition{}
-	condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
+	condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
 	err = r.db.GetContext(ctx, condition, condQuery, strategyID)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to get conditions: %w", err)
@@ -289,7 +289,7 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 	for _, strategy := range strategies {
 		// Load conditions
 		condition := &models.StrategyCondition{}
-		condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
+		condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, condition, condQuery, strategy.StrategyID)
 		if err == nil {
 			strategy.Conditions = condition
@@ -350,18 +350,18 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		condQuery := `
 			UPDATE strategy_conditions
 			SET match_all_news = $1, impact_score_min = $2, impact_score_max = $3,
-			    sentiments = $4, news_categories = $5, stock_codes = $6,
-			    min_market_cap = $7, max_market_cap = $8, market_cap_types = $9,
-			    min_price_change_pct = $10, max_price_change_pct = $11,
-			    min_volume = $12, exchanges = $13
-			WHERE strategy_id = $14`
+			    sentiments = $4, news_categories = $5,
+			    min_market_cap = $6, max_market_cap = $7, market_cap_types = $8,
+			    min_price_change_pct = $9, max_price_change_pct = $10,
+			    exchanges = $11
+			WHERE strategy_id = $12`
 
 		_, err = tx.ExecContext(ctx, condQuery,
 			req.Conditions.MatchAllNews, req.Conditions.ImpactScoreMin, req.Conditions.ImpactScoreMax,
-			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
+			req.Conditions.Sentiments, req.Conditions.Categories,
 			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap, req.Conditions.MarketCapTypes,
 			req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
-			req.Conditions.MinVolume, req.Conditions.Exchanges, req.StrategyID,
+			req.Conditions.Exchanges, req.StrategyID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update conditions: %w", err)
@@ -615,7 +615,7 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 	for _, strategy := range strategies {
 		// Load conditions
 		condition := &models.StrategyCondition{}
-		condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
+		condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, condition, condQuery, strategy.StrategyID)
 		if err == nil {
 			strategy.Conditions = condition

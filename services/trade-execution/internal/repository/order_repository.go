@@ -293,6 +293,8 @@ func (r *orderRepository) GetOpenOrders(ctx context.Context) ([]*models.Order, e
 		AND product_type = 'INTRADAY'
 		AND is_square_off_order = false
 		AND is_paper_trade = false
+		AND strategy_id != ''
+		AND created_at >= CURRENT_DATE
 		ORDER BY created_at ASC
 	`
 

@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -15,16 +18,26 @@ type OrderExecutorFunc interface {
 	ExecuteOrder(ctx context.Context, order *models.Order) error
 }
 
-// AutoSquareOffScheduler manages automatic square-off of positions at market close
+// AutoSquareOffScheduler manages automatic square-off of intraday positions
+// placed through our algo system at market close (default 15:05 IST).
+// Only orders belonging to a strategy in the local orders table are affected —
+// positions opened manually on other platforms are untouched.
 type AutoSquareOffScheduler struct {
 	orderRepo     repository.OrderRepository
 	credsRepo     repository.CredentialsRepository
 	orderExecutor OrderExecutorFunc
 	squareOffTime string // Format: "15:05" for 3:05 PM
 	stopChan      chan struct{}
+
+	// Guard against re-execution within the same minute / same day.
+	mu              sync.Mutex
+	lastExecuteDate string // "2006-01-02"
+
+	// paperSquareOff, if set, is called alongside the live square-off to close paper positions.
+	paperSquareOff func(ctx context.Context) error
 }
 
-// NewAutoSquareOffScheduler creates a new auto square-off scheduler
+// NewAutoSquareOffScheduler creates a new auto square-off scheduler.
 func NewAutoSquareOffScheduler(
 	orderRepo repository.OrderRepository,
 	credsRepo repository.CredentialsRepository,
@@ -44,40 +57,47 @@ func NewAutoSquareOffScheduler(
 	}
 }
 
-// Start starts the auto square-off scheduler
-func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
-	log.Printf("Starting Auto Square-Off Scheduler (Time: %s)", s.squareOffTime)
+// SetPaperSquareOff registers a callback that is invoked during square-off to close
+// all open paper positions. Pass paperMonitor.SquareOffAll to wire it up.
+func (s *AutoSquareOffScheduler) SetPaperSquareOff(fn func(ctx context.Context) error) {
+	s.paperSquareOff = fn
+}
 
-	ticker := time.NewTicker(1 * time.Minute) // Check every minute
+// Start begins the auto square-off check loop (every 1 minute).
+func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
+	log.Printf("[auto-square-off] Scheduler started (trigger time: %s IST, weekdays only)", s.squareOffTime)
+
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Auto Square-Off Scheduler stopped")
+			log.Println("[auto-square-off] Scheduler stopped (context cancelled)")
 			return nil
 
 		case <-s.stopChan:
-			log.Println("Auto Square-Off Scheduler stopped")
+			log.Println("[auto-square-off] Scheduler stopped")
 			return nil
 
 		case <-ticker.C:
 			if s.shouldSquareOff() {
-				log.Println("Auto Square-Off Time Reached - Initiating square-off for all open positions")
+				log.Println("[auto-square-off] ========== TRIGGER — squaring off all open algo positions ==========")
 				if err := s.squareOffAllPositions(ctx); err != nil {
-					log.Printf("Error during auto square-off: %v", err)
+					log.Printf("[auto-square-off] Error during square-off: %v", err)
 				}
 			}
 		}
 	}
 }
 
-// Stop stops the scheduler
+// Stop stops the scheduler gracefully.
 func (s *AutoSquareOffScheduler) Stop() {
 	close(s.stopChan)
 }
 
-// shouldSquareOff checks if current time matches square-off time
+// shouldSquareOff returns true when current time matches squareOffTime on a
+// weekday and we haven't already executed today.
 func (s *AutoSquareOffScheduler) shouldSquareOff() bool {
 	now := time.Now()
 
@@ -86,51 +106,73 @@ func (s *AutoSquareOffScheduler) shouldSquareOff() bool {
 		return false
 	}
 
-	// Parse square-off time
+	// Parse configured square-off time
 	hour, minute := s.parseTime(s.squareOffTime)
 	if hour == -1 || minute == -1 {
 		return false
 	}
 
-	// Check if current time matches square-off time (with 1-minute window)
-	currentHour := now.Hour()
-	currentMinute := now.Minute()
+	// Check if current HH:MM matches
+	if now.Hour() != hour || now.Minute() != minute {
+		return false
+	}
 
-	return currentHour == hour && currentMinute == minute
+	// Prevent re-execution if we already ran today
+	today := now.Format("2006-01-02")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastExecuteDate == today {
+		return false
+	}
+	s.lastExecuteDate = today
+	return true
 }
 
-// parseTime parses time string in "HH:MM" format
+// parseTime parses time string in "HH:MM" format.
 func (s *AutoSquareOffScheduler) parseTime(timeStr string) (hour int, minute int) {
 	_, err := fmt.Sscanf(timeStr, "%d:%d", &hour, &minute)
 	if err != nil {
-		log.Printf("Error parsing time %s: %v", timeStr, err)
+		log.Printf("[auto-square-off] Error parsing time %q: %v", timeStr, err)
 		return -1, -1
 	}
 	return hour, minute
 }
 
-// squareOffAllPositions squares off all open positions for all users
+// squareOffAllPositions fetches today's open algo positions and places
+// reverse MARKET/IOC orders to close each one.
 func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) error {
-	log.Println("=== Auto Square-Off: Starting ===")
+	log.Println("[auto-square-off] Fetching today's open INTRADAY algo positions...")
 
-	// Get all open/partially filled orders
-	openOrders, err := s.getOpenOrders(ctx)
+	// GetOpenOrders returns FILLED/PARTIALLY_FILLED INTRADAY live orders
+	// placed today through strategies (is_square_off_order=false, is_paper_trade=false,
+	// strategy_id != '', created_at >= today).
+	openOrders, err := s.orderRepo.GetOpenOrders(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get open orders: %w", err)
 	}
 
-	log.Printf("Found %d open orders to square off", len(openOrders))
+	if len(openOrders) == 0 {
+		log.Println("[auto-square-off] No open positions to square off")
+		return nil
+	}
+
+	log.Printf("[auto-square-off] Found %d open position(s) to square off", len(openOrders))
 
 	successCount := 0
 	failCount := 0
 
 	for _, order := range openOrders {
-		log.Printf("Squaring off order %s for user %s (Symbol: %s, Qty: %d)",
-			order.OrderID, order.UserID, order.Symbol, order.Quantity)
+		// Skip orders with zero filled quantity — nothing to reverse
+		if order.FilledQuantity <= 0 {
+			log.Printf("[auto-square-off] Skipping order %s (filled_qty=0)", order.OrderID)
+			continue
+		}
 
-		// Create reverse order (opposite side)
-		if err := s.createSquareOffOrder(ctx, order); err != nil {
-			log.Printf("Failed to square off order %s: %v", order.OrderID, err)
+		log.Printf("[auto-square-off] Squaring off: user=%s strategy=%s symbol=%s side=%s filled_qty=%d",
+			order.UserID, order.StrategyID, order.Symbol, order.OrderSide, order.FilledQuantity)
+
+		if err := s.createAndExecuteSquareOffOrder(ctx, order); err != nil {
+			log.Printf("[auto-square-off] FAILED order %s: %v", order.OrderID, err)
 			failCount++
 			continue
 		}
@@ -138,56 +180,67 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 		successCount++
 	}
 
-	log.Printf("=== Auto Square-Off: Complete (Success: %d, Failed: %d) ===", successCount, failCount)
+	log.Printf("[auto-square-off] ========== COMPLETE: %d succeeded, %d failed ==========", successCount, failCount)
+
+	// Square off paper positions alongside live positions.
+	if s.paperSquareOff != nil {
+		log.Println("[auto-square-off] Closing paper positions...")
+		if err := s.paperSquareOff(ctx); err != nil {
+			log.Printf("[auto-square-off] Paper square-off error (non-fatal): %v", err)
+		}
+	}
+
 	return nil
 }
 
-// getOpenOrders retrieves all orders that are filled or partially filled
-func (s *AutoSquareOffScheduler) getOpenOrders(ctx context.Context) ([]*models.Order, error) {
-	// Get all orders with status = FILLED or PARTIALLY_FILLED and product_type = INTRADAY
-	return s.orderRepo.GetOpenOrders(ctx)
-}
-
-// createSquareOffOrder creates a reverse order to square off a position
-func (s *AutoSquareOffScheduler) createSquareOffOrder(ctx context.Context, originalOrder *models.Order) error {
-	// Determine reverse order side
-	reverseOrderSide := models.OrderSideSell
+// createAndExecuteSquareOffOrder creates a reverse order to close a position
+// and executes it via the broker.
+func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Context, originalOrder *models.Order) error {
+	// Determine reverse side
+	reverseSide := models.OrderSideSell
 	if originalOrder.OrderSide == models.OrderSideSell {
-		reverseOrderSide = models.OrderSideBuy
+		reverseSide = models.OrderSideBuy
 	}
 
-	// Create square-off order
 	squareOffOrder := &models.Order{
-		UserID:       originalOrder.UserID,
-		StrategyID:   originalOrder.StrategyID,
-		StrategyName: originalOrder.StrategyName,
-		StockCode:    originalOrder.StockCode,
-		Exchange:     originalOrder.Exchange,
-		Symbol:       originalOrder.Symbol,
-		OrderType:    models.OrderTypeMarket, // Always use market order for square-off
-		OrderSide:    reverseOrderSide,
-		Quantity:     originalOrder.FilledQuantity, // Square off filled quantity
-		Validity:     "IOC",                        // Immediate or Cancel
-		ProductType:  originalOrder.ProductType,
-		Status:       models.StatusReceived,
-		BearerToken:  originalOrder.BearerToken,
-		AppId:        originalOrder.AppId,
-		Source:       originalOrder.Source,
-		RiskApproved: true, // Auto square-off bypasses risk checks
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
+		OrderID:          uuid.New(),
+		EventID:          uuid.New(),
+		UserID:           originalOrder.UserID,
+		StrategyID:       originalOrder.StrategyID,
+		StrategyName:     originalOrder.StrategyName,
+		StockCode:        originalOrder.StockCode,
+		Exchange:         originalOrder.Exchange,
+		Symbol:           originalOrder.Symbol,
+		OrderType:        models.OrderTypeMarket, // MARKET for guaranteed execution
+		OrderSide:        reverseSide,
+		Quantity:         originalOrder.FilledQuantity, // only exit the filled portion
+		Validity:         "IOC",                        // Immediate or Cancel
+		ProductType:      originalOrder.ProductType,
+		Status:           models.StatusReceived,
+		IsSquareOffOrder: true,  // mark so it won't be picked up again
+		IsPaperTrade:     false, // live order
+		TradingMode:      "LIVE",
+		RiskApproved:     true, // auto square-off bypasses risk checks
+		BearerToken:      originalOrder.BearerToken,
+		AppId:            originalOrder.AppId,
+		Source:           originalOrder.Source,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
 	}
 
-	// Save order to database
+	// Persist to DB first
 	if err := s.orderRepo.Create(ctx, squareOffOrder); err != nil {
-		return fmt.Errorf("failed to create square-off order: %w", err)
+		return fmt.Errorf("failed to save square-off order: %w", err)
 	}
 
-	// Execute the square-off order
+	// Execute via broker (executor handles credential lookup + retries)
 	if err := s.orderExecutor.ExecuteOrder(ctx, squareOffOrder); err != nil {
 		return fmt.Errorf("failed to execute square-off order: %w", err)
 	}
 
-	log.Printf("Successfully created and executed square-off order for %s", originalOrder.OrderID)
+	log.Printf("[auto-square-off] OK — placed %s %s %d qty for user %s (sq_off_id=%s, original=%s)",
+		reverseSide, originalOrder.Symbol, originalOrder.FilledQuantity,
+		originalOrder.UserID, squareOffOrder.OrderID, originalOrder.OrderID)
+
 	return nil
 }

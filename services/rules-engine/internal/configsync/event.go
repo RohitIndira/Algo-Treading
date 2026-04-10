@@ -44,13 +44,11 @@ type ConditionsPayload struct {
 	ImpactScoreMax    int32    `json:"impact_score_max"`
 	Sentiments        []string `json:"sentiments"`
 	Categories        []string `json:"categories"`
-	StockCodes        []int64  `json:"stock_codes"`
 	MarketCapTypes    []string `json:"market_cap_types"`
 	MinMarketCap      float64  `json:"min_market_cap"`
 	MaxMarketCap      float64  `json:"max_market_cap"`
 	MinPriceChangePct float64  `json:"min_price_change_pct"`
 	MaxPriceChangePct float64  `json:"max_price_change_pct"`
-	MinVolume         int64    `json:"min_volume"`
 	Exchanges         []string `json:"exchanges"`
 	CreatedAt         int64    `json:"created_at"`
 }

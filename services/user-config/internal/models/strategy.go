@@ -43,13 +43,11 @@ type StrategyCondition struct {
 	ImpactScoreMax     int32          `db:"impact_score_max" json:"impact_score_max"`
 	Sentiments         pq.StringArray `db:"sentiments" json:"sentiments"`
 	Categories         pq.StringArray `db:"news_categories" json:"categories"`
-	StockCodes         pq.Int64Array  `db:"stock_codes" json:"stock_codes"`
 	MinMarketCap       *float64       `db:"min_market_cap" json:"min_market_cap,omitempty"`
 	MaxMarketCap       *float64       `db:"max_market_cap" json:"max_market_cap,omitempty"`
 	MarketCapTypes     pq.StringArray `db:"market_cap_types" json:"market_cap_types"`
 	MinPriceChangePct  *float64       `db:"min_price_change_pct" json:"min_price_change_pct,omitempty"`
 	MaxPriceChangePct  *float64       `db:"max_price_change_pct" json:"max_price_change_pct,omitempty"`
-	MinVolume          *int64         `db:"min_volume" json:"min_volume,omitempty"`
 	Exchanges          pq.StringArray `db:"exchanges" json:"exchanges"`
 	CreatedAt          time.Time      `db:"created_at" json:"created_at"`
 }

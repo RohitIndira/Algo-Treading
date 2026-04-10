@@ -33,16 +33,13 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 		MatchAllNews:    p.Conditions.MatchAllNews,
 		ImpactScoreMin:  p.Conditions.ImpactScoreMin,
 		ImpactScoreMax:  p.Conditions.ImpactScoreMax,
-		Sentiments:      nilSafeStringSlice(p.Conditions.Sentiments),
-		Categories:      nilSafeStringSlice(p.Conditions.Categories),
-		Stocks:          nilSafeInt64Slice(p.Conditions.StockCodes),
-		VolumeThreshold: p.Conditions.MinVolume,
-		MinPctChange:    p.Conditions.MinPriceChangePct,
+		Sentiments:   nilSafeStringSlice(p.Conditions.Sentiments),
+		Categories:   nilSafeStringSlice(p.Conditions.Categories),
+		MinPctChange: p.Conditions.MinPriceChangePct,
 		MaxPctChange:    p.Conditions.MaxPriceChangePct,
-		Exchanges:       normalizeExchanges(p.Conditions.Exchanges),
+		Exchanges:      normalizeExchanges(p.Conditions.Exchanges),
+		MarketCapTypes: nilSafeStringSlice(p.Conditions.MarketCapTypes),
 	}
-	// Market cap range
-	// (rules-engine model currently stores range but doesn't evaluate it yet; keep for future.)
 	s.Conditions.MarketCapRange = models.MarketCapRange{
 		MinMcap: p.Conditions.MinMarketCap,
 		MaxMcap: p.Conditions.MaxMarketCap,
@@ -87,13 +84,6 @@ func unixNanosToTime(n int64) time.Time {
 func nilSafeStringSlice(in []string) []string {
 	if in == nil {
 		return []string{}
-	}
-	return in
-}
-
-func nilSafeInt64Slice(in []int64) []int64 {
-	if in == nil {
-		return []int64{}
 	}
 	return in
 }

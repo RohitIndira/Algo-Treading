@@ -785,8 +785,7 @@ grpcurl -plaintext \
 ### Consumer Integration
 
 **Rules Engine subscribes to this topic to:**
-- Update Elasticsearch index with new strategies
-- Update Redis cache
+- Update Redis cache with new strategies
 - Recompute matching rules
 
 ---

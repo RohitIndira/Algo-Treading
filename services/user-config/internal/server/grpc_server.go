@@ -408,11 +408,6 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 		exchanges[i] = exchangeToString(e)
 	}
 
-	stockCodes := make(pq.Int64Array, len(proto.StockCodes))
-	for i, code := range proto.StockCodes {
-		stockCodes[i] = code
-	}
-
 	marketCapTypes := make(pq.StringArray, len(proto.MarketCapTypes))
 	copy(marketCapTypes, proto.MarketCapTypes)
 
@@ -422,8 +417,6 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 		ImpactScoreMax: proto.ImpactScoreMax,
 		Sentiments:     sentiments,
 		Categories:     pq.StringArray(proto.Categories),
-		StockCodes:     stockCodes,
-		MinVolume:      &proto.VolumeThreshold, // Mapped from VolumeThreshold
 		Exchanges:      exchanges,
 		MarketCapTypes: marketCapTypes,
 	}
@@ -684,11 +677,6 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 		exchanges[i] = stringToExchange(e)
 	}
 
-	stockCodes := make([]int64, len(model.StockCodes))
-	for i, code := range model.StockCodes {
-		stockCodes[i] = code
-	}
-
 	marketCapTypes := make([]string, len(model.MarketCapTypes))
 	copy(marketCapTypes, model.MarketCapTypes)
 
@@ -698,7 +686,6 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 		ImpactScoreMax: model.ImpactScoreMax,
 		Sentiments:     sentiments,
 		Categories:     []string(model.Categories),
-		StockCodes:     stockCodes,
 		Exchanges:      exchanges,
 		MarketCapTypes: marketCapTypes,
 	}
@@ -715,10 +702,6 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 			MinPctChange: *model.MinPriceChangePct,
 			MaxPctChange: *model.MaxPriceChangePct,
 		}
-	}
-
-	if model.MinVolume != nil {
-		cond.VolumeThreshold = *model.MinVolume
 	}
 
 	return cond

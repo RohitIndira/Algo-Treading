@@ -33,18 +33,17 @@ type StrategyConfig = Strategy
 
 // Conditions represents the conditions for a strategy
 type Conditions struct {
-	MatchAllNews    bool           `json:"match_all_news" bson:"match_all_news"`
-	ImpactScoreMin  int32          `json:"impact_score_min" bson:"impact_score_min"`
-	ImpactScoreMax  int32          `json:"impact_score_max" bson:"impact_score_max"`
-	Sentiments      []string       `json:"sentiments" bson:"sentiments"`
-	Categories      []string       `json:"categories" bson:"categories"`
-	Stocks          []int64        `json:"stocks" bson:"stocks"`
-	PriceRange      PriceRange     `json:"price_range" bson:"price_range"` // legacy; may be unset
-	VolumeThreshold int64          `json:"volume_threshold" bson:"volume_threshold"`
-	MinPctChange    float64        `json:"min_pct_change" bson:"min_pct_change"`
-	MaxPctChange    float64        `json:"max_pct_change" bson:"max_pct_change"`
-	Exchanges       []string       `json:"exchanges" bson:"exchanges"`
-	MarketCapRange  MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
+	MatchAllNews   bool           `json:"match_all_news" bson:"match_all_news"`
+	ImpactScoreMin int32          `json:"impact_score_min" bson:"impact_score_min"`
+	ImpactScoreMax int32          `json:"impact_score_max" bson:"impact_score_max"`
+	Sentiments     []string       `json:"sentiments" bson:"sentiments"`
+	Categories     []string       `json:"categories" bson:"categories"`
+	PriceRange     PriceRange     `json:"price_range" bson:"price_range"` // legacy; may be unset
+	MinPctChange   float64        `json:"min_pct_change" bson:"min_pct_change"`
+	MaxPctChange   float64        `json:"max_pct_change" bson:"max_pct_change"`
+	Exchanges      []string       `json:"exchanges" bson:"exchanges"`
+	MarketCapTypes []string       `json:"market_cap_types" bson:"market_cap_types"` // "SMALL", "MID", "LARGE"
+	MarketCapRange MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
 }
 
 // PriceRange represents price range filter
@@ -116,23 +115,8 @@ func (s *Strategy) Validate() error {
 	if s.TradeConfig.OrderType != "MARKET" && s.TradeConfig.OrderType != "LIMIT" && s.TradeConfig.OrderType != "BRACKET" && s.TradeConfig.OrderType != "STOP_LOSS" {
 		return ErrInvalidOrderType
 	}
-	// NOTE: Sentiments/categories/stocks can be empty to mean "match all".
+	// NOTE: Sentiments/categories can be empty to mean "match all".
 	return nil
-}
-
-// MatchesStock checks if strategy applies to the stock
-func (s *Strategy) MatchesStock(stockCode int64) bool {
-	// Empty stocks list means apply to all stocks
-	if len(s.Conditions.Stocks) == 0 {
-		return true
-	}
-
-	for _, stock := range s.Conditions.Stocks {
-		if stock == stockCode {
-			return true
-		}
-	}
-	return false
 }
 
 // MatchesSentiment checks if strategy applies to the sentiment

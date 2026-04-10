@@ -66,28 +66,6 @@ services:
       retries: 5
     restart: unless-stopped
 
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
-    container_name: trading-elasticsearch
-    hostname: elasticsearch
-    ports:
-      - "9200:9200"
-      - "9300:9300"
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    volumes:
-      - elasticsearch-data:/usr/share/elasticsearch/data
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: unless-stopped
-
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: trading-kafka
@@ -265,26 +243,21 @@ services:
     ports:
       - "50053:50053"
     environment:
-      # Elasticsearch
-      ELASTICSEARCH_HOST: elasticsearch:9200
-      
       # Kafka
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC_INPUT: market.data.news
       KAFKA_TOPIC_OUTPUT: order.execution.queue
-      
+
       # Redis
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      
+
       # gRPC
       GRPC_PORT: 50053
-      
+
       # Logging
       LOG_LEVEL: info
     depends_on:
-      elasticsearch:
-        condition: service_healthy
       kafka:
         condition: service_healthy
       redis:
@@ -378,8 +351,6 @@ volumes:
   mongodb-config:
     driver: local
   redis-data:
-    driver: local
-  elasticsearch-data:
     driver: local
   zookeeper-data:
     driver: local

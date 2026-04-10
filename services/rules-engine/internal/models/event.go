@@ -54,13 +54,15 @@ func (e *MarketEvent) UnmarshalJSON(data []byte) error {
 
 // StockData contains stock information
 type StockData struct {
-	StockCode   int64  `json:"stock_code"` // Primary stock code (based on active exchange)
-	NSECode     int64  `json:"nse_code"`   // NSE-specific code (for Redis lookup)
-	BSECode     int64  `json:"bse_code"`   // BSE-specific code (for Redis lookup)
-	Exchange    string `json:"exchange"`
-	Symbol      string `json:"symbol"`
-	ISIN        string `json:"isin"`
-	CompanyName string `json:"company_name"`
+	StockCode   int64   `json:"stock_code"` // Primary stock code (based on active exchange)
+	NSECode     int64   `json:"nse_code"`   // NSE-specific code (for Redis lookup)
+	BSECode     int64   `json:"bse_code"`   // BSE-specific code (for Redis lookup)
+	Exchange    string  `json:"exchange"`
+	Symbol      string  `json:"symbol"`
+	ISIN        string  `json:"isin"`
+	CompanyName string  `json:"company_name"`
+	MCap        float64 `json:"mcap"`      // Market cap in crores
+	MCapType    string  `json:"mcaptype"`  // "Small", "Mid", "Large"
 }
 
 // NewsData contains news information

@@ -125,7 +125,7 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 	isBelowMin := order.OrderType == models.OrderTypeStopLoss &&
 		(order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO")
 
-	if isBelowMin && p.priceMonitor != nil && !order.IsPaperTrade {
+	if isBelowMin && p.priceMonitor != nil {
 		targetPrice := 0.0
 		if order.Price != nil {
 			targetPrice = *order.Price

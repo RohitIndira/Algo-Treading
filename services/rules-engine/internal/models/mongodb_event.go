@@ -29,6 +29,8 @@ type MongoDBEvent struct {
 	DtTmAlt         interface{}            `json:"dttm"`
 	Company         string                 `json:"company"`     // ISIN
 	CompanyName     string                 `json:"companyname"` // Company name
+	MCap            interface{}            `json:"mcap"`        // Market cap (float64)
+	MCapType        string                 `json:"mcaptype"`    // Market cap type: "Small", "Mid", "Large"
 	SymbolMap       map[string]interface{} `json:"symbolmap"`
 	LastTraded      interface{}            `json:"LastTradedPrice"`
 	PctChange       interface{}            `json:"pct_change"`
@@ -123,6 +125,8 @@ func (m *MongoDBEvent) mapStockData() StockData {
 	sd := StockData{
 		ISIN:        m.Company,
 		CompanyName: m.CompanyName,
+		MCap:        m.toFloat64(m.MCap),
+		MCapType:    m.MCapType,
 	}
 
 	// Use the exchange field directly from the event (set by data-ingestion service)

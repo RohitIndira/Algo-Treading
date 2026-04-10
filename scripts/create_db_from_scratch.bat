@@ -4,17 +4,16 @@ rem Usage: set PGHOST=host && set PGPORT=5432 && set PGUSER=user && set PGPASSWO
 
 setlocal enableextensions
 
-rem Resolve repo root (script is in scripts\)
 set "SCRIPT_DIR=%~dp0"
 set "REPO_ROOT=%SCRIPT_DIR%.."
 
 if not defined PGHOST set "PGHOST=localhost"
 if not defined PGPORT set "PGPORT=5432"
 if not defined PGUSER set "PGUSER=postgres"
-if not defined DBNAME set "DBNAME=trading_system"
+if not defined DBNAME set "DBNAME=trading_db"
 
 if not defined PGPASSWORD (
-  set /p PGPASSWORD=Enter Postgres password for %PGUSER%: 
+  set /p PGPASSWORD=Enter Postgres password for %PGUSER%:
 )
 
 where psql >nul 2>&1
@@ -38,50 +37,18 @@ if errorlevel 1 (
 )
 
 echo Applying base schema: deployments\docker\init_all_schemas.sql
-echo Applying pre-init SQL: scripts\pre_create_users.sql
-psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %DBNAME% -v ON_ERROR_STOP=1 -f "%REPO_ROOT%\scripts\pre_create_users.sql"
-if errorlevel 1 (
-  echo Failed applying pre-init SQL. Aborting.
-  exit /b 1
-)
-
-echo Applying base schema: deployments\docker\init_all_schemas.sql
 psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %DBNAME% -v ON_ERROR_STOP=1 -f "%REPO_ROOT%\deployments\docker\init_all_schemas.sql"
 if errorlevel 1 (
   echo Failed applying base schema. Aborting.
   exit /b 1
 )
 
-echo Searching and applying other migration SQL files...
+echo Applying service migrations...
 
 rem Apply migrations from services/*/migrations
 for /f "delims=" %%F in ('dir /b /s "%REPO_ROOT%\services\*\migrations\*.sql" 2^>nul ^| sort') do (
-  echo -> Applying: %%F
-  psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %DBNAME% -v ON_ERROR_STOP=1 -f "%%F"
-  if errorlevel 1 (
-    echo Failed applying %%F. Aborting.
-    exit /b 1
-  )
-)
-
-rem Apply migrations from scripts/migrations
-for /f "delims=" %%F in ('dir /b /s "%REPO_ROOT%\scripts\migrations\*.sql" 2^>nul ^| sort') do (
-  echo -> Applying: %%F
-  psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %DBNAME% -v ON_ERROR_STOP=1 -f "%%F"
-  if errorlevel 1 (
-    echo Failed applying %%F. Aborting.
-    exit /b 1
-  )
-)
-
-rem Apply migrations from deployments/docker/migrations
-for /f "delims=" %%F in ('dir /b /s "%REPO_ROOT%\deployments\docker\migrations\*.sql" 2^>nul ^| sort') do (
-  echo -> Applying: %%F
-  psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %DBNAME% -v ON_ERROR_STOP=1 -f "%%F"
-  if errorlevel 1 (
-    echo Failed applying %%F. Aborting.
-    exit /b 1
-  )
+  echo -^> Applying: %%F
+  psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %DBNAME% -f "%%F"
 )
 
 echo All migrations applied successfully. Database "%DBNAME%" is ready.

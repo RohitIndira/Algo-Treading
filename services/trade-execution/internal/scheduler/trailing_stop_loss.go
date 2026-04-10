@@ -17,6 +17,7 @@ type TrailingStopLossMonitor struct {
 	orderRepo     repository.OrderRepository
 	indiraClient  *indira.ExecutionClient
 	credsRepo     repository.CredentialsRepository
+	ltpProvider   LTPProvider // optional Redis price source (replaces broker GetQuote)
 	checkInterval time.Duration
 	stopChan      chan struct{}
 }
@@ -79,6 +80,12 @@ func (m *TrailingStopLossMonitor) Start(ctx context.Context) error {
 // Stop stops the monitor
 func (m *TrailingStopLossMonitor) Stop() {
 	close(m.stopChan)
+}
+
+// SetLTPProvider wires a Redis price client so getCurrentPrice uses live market data
+// instead of returning the order's filled price as a placeholder.
+func (m *TrailingStopLossMonitor) SetLTPProvider(p LTPProvider) {
+	m.ltpProvider = p
 }
 
 // monitorTrailingStopLosses checks and updates all trailing stop losses
@@ -179,28 +186,22 @@ func (m *TrailingStopLossMonitor) updateTrailingStopLoss(ctx context.Context, or
 	return nil
 }
 
-// getCurrentPrice gets the current market price for an order's symbol
+// getCurrentPrice fetches the current market LTP for an order's instrument.
+// Priority: Redis live price → order's filled price (last-resort fallback).
 func (m *TrailingStopLossMonitor) getCurrentPrice(ctx context.Context, order *models.Order) (float64, error) {
-	// Build auth context from order
-	if order.BearerToken == nil || order.AppId == nil || order.Source == nil {
-		return 0, fmt.Errorf("missing authentication data for order %s", order.OrderID)
+	if m.ltpProvider != nil {
+		pCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		ltp, err := m.ltpProvider.GetLTP(pCtx, string(order.Exchange), order.StockCode)
+		cancel()
+		if err == nil && ltp > 0 {
+			return ltp, nil
+		}
+		log.Printf("[trailing-sl] Redis LTP unavailable for %s: %v — falling back to fill price", order.Symbol, err)
 	}
 
-	// TODO: Implement GetQuote or similar method in Indira client to get current price
-	// When implemented, use this auth context:
-	// auth := &indiraClient.AuthContext{
-	// 	UserId:      order.UserID,
-	// 	BearerToken: *order.BearerToken,
-	// 	AppId:       *order.AppId,
-	// 	Source:      *order.Source,
-	// }
-	// positions, err := m.indiraClient.GetPositions(ctx, auth)
-
-	// For now, return filled price as placeholder
 	if order.FilledPrice != nil {
 		return *order.FilledPrice, nil
 	}
-
 	return 0, fmt.Errorf("no price available for order %s", order.OrderID)
 }
 

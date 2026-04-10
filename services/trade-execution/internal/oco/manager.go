@@ -623,8 +623,17 @@ func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, ord
 			}
 		}
 
-		// Cancel TP leg
-		go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg executed (OCO)")
+		// Cancel TP leg if one was placed; otherwise complete directly (SL-only mode)
+		if group.TPBrokerID != "" {
+			go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg executed (OCO)")
+		} else {
+			group.State = StateCompleted
+			group.UpdatedAt = time.Now()
+			log.Printf("[oco] Group %s COMPLETED via SL (no TP leg)", group.GroupID)
+			if m.wsBroadcaster != nil {
+				m.wsBroadcaster(group.UserID, "oco_completed", nil)
+			}
+		}
 
 	case "REJECTED", "A.REJECTED":
 		log.Printf("[oco] SL leg REJECTED for group %s — cancelling TP and marking failed", group.GroupID)
@@ -694,8 +703,17 @@ func (m *OCOManager) handleTPLegUpdate(ctx context.Context, group *OCOGroup, ord
 			}
 		}
 
-		// Cancel SL leg
-		go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg executed (OCO)")
+		// Cancel SL leg if one was placed; otherwise complete directly (TP-only mode)
+		if group.SLBrokerID != "" {
+			go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg executed (OCO)")
+		} else {
+			group.State = StateCompleted
+			group.UpdatedAt = time.Now()
+			log.Printf("[oco] Group %s COMPLETED via TP (no SL leg)", group.GroupID)
+			if m.wsBroadcaster != nil {
+				m.wsBroadcaster(group.UserID, "oco_completed", nil)
+			}
+		}
 
 	case "REJECTED", "A.REJECTED":
 		log.Printf("[oco] WARNING: TP leg REJECTED for group %s — SL leg remains active (user has SL protection but NO take-profit)", group.GroupID)
@@ -738,7 +756,7 @@ func (m *OCOManager) checkLegsConfirmed(group *OCOGroup) {
 		return
 	}
 
-	slOK := group.SLLegConfirmed
+	slOK := group.SLLegConfirmed || group.SLBrokerID == "" // no SL leg to confirm
 	tpOK := group.TPLegConfirmed || group.TPBrokerID == "" // no TP leg to confirm
 
 	if slOK && tpOK {
@@ -756,19 +774,32 @@ func (m *OCOManager) checkLegsConfirmed(group *OCOGroup) {
 // STEP 3: Place SL + TP Legs After Entry Fill
 // ════════════════════════════════════════════════════════════════════════════
 
-// placeOCOLegs places both the SL and TP legs after the entry order fills.
-// Both legs are placed in parallel for minimum latency.
+// placeOCOLegs places SL and/or TP legs after the entry order fills.
+// Either leg is skipped when its percentage is 0 (user disabled it).
+// Both are placed in parallel when both are enabled.
 func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 	fillPrice := group.EntryFillPrice
 	exitSide := group.ExitSide()
 
-	// Calculate prices
-	slTrigger, slLimit := group.CalculateSLFromFill(fillPrice)
-	tpLimit := group.CalculateTPFromFill(fillPrice)
+	hasSL := group.SLPercent > 0
+	hasTP := group.TPPercent > 0
 
-	// Validate SL/TP price direction
-	if group.OrderSide == "BUY" {
-		if slTrigger >= fillPrice {
+	if !hasSL && !hasTP {
+		log.Printf("[oco] CRITICAL: Both SL and TP disabled for group %s — aborting legs (position unprotected)", group.GroupID)
+		mu := m.GetGroupMu(group.GroupID)
+		mu.Lock()
+		group.State = StateFailed
+		group.UpdatedAt = time.Now()
+		mu.Unlock()
+		return
+	}
+
+	// Calculate and validate prices for enabled legs only
+	var slTrigger, slLimit, tpLimit float64
+
+	if hasSL {
+		slTrigger, slLimit = group.CalculateSLFromFill(fillPrice)
+		if group.OrderSide == "BUY" && slTrigger >= fillPrice {
 			log.Printf("[oco] CRITICAL: SL trigger %.2f >= fill %.2f for BUY group %s (SLPct=%.1f%%) — aborting legs",
 				slTrigger, fillPrice, group.GroupID, group.SLPercent)
 			mu := m.GetGroupMu(group.GroupID)
@@ -778,18 +809,7 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 			mu.Unlock()
 			return
 		}
-		if tpLimit <= fillPrice {
-			log.Printf("[oco] CRITICAL: TP limit %.2f <= fill %.2f for BUY group %s (TPPct=%.1f%%) — aborting legs",
-				tpLimit, fillPrice, group.GroupID, group.TPPercent)
-			mu := m.GetGroupMu(group.GroupID)
-			mu.Lock()
-			group.State = StateFailed
-			group.UpdatedAt = time.Now()
-			mu.Unlock()
-			return
-		}
-	} else {
-		if slTrigger <= fillPrice {
+		if group.OrderSide == "SELL" && slTrigger <= fillPrice {
 			log.Printf("[oco] CRITICAL: SL trigger %.2f <= fill %.2f for SELL group %s (SLPct=%.1f%%) — aborting legs",
 				slTrigger, fillPrice, group.GroupID, group.SLPercent)
 			mu := m.GetGroupMu(group.GroupID)
@@ -799,7 +819,21 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 			mu.Unlock()
 			return
 		}
-		if tpLimit >= fillPrice {
+	}
+
+	if hasTP {
+		tpLimit = group.CalculateTPFromFill(fillPrice)
+		if group.OrderSide == "BUY" && tpLimit <= fillPrice {
+			log.Printf("[oco] CRITICAL: TP limit %.2f <= fill %.2f for BUY group %s (TPPct=%.1f%%) — aborting legs",
+				tpLimit, fillPrice, group.GroupID, group.TPPercent)
+			mu := m.GetGroupMu(group.GroupID)
+			mu.Lock()
+			group.State = StateFailed
+			group.UpdatedAt = time.Now()
+			mu.Unlock()
+			return
+		}
+		if group.OrderSide == "SELL" && tpLimit >= fillPrice {
 			log.Printf("[oco] CRITICAL: TP limit %.2f >= fill %.2f for SELL group %s (TPPct=%.1f%%) — aborting legs",
 				tpLimit, fillPrice, group.GroupID, group.TPPercent)
 			mu := m.GetGroupMu(group.GroupID)
@@ -811,56 +845,73 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		}
 	}
 
-	log.Printf("[oco] Placing legs for group %s: fillPrice=%.2f SL(trigger=%.2f limit=%.2f) TP(limit=%.2f) side=%s",
-		group.GroupID, fillPrice, slTrigger, slLimit, tpLimit, exitSide)
+	log.Printf("[oco] Placing legs for group %s: fillPrice=%.2f hasSL=%v(%.1f%%) hasTP=%v(%.1f%%) side=%s",
+		group.GroupID, fillPrice, hasSL, group.SLPercent, hasTP, group.TPPercent, exitSide)
 
-	// Create order models for SL and TP legs
-	slOrderID := uuid.New()
-	tpOrderID := uuid.New()
+	// Build order models for enabled legs; pre-confirm disabled legs so the
+	// state machine can transition to ACTIVE without waiting for a WS event.
+	var slOrder, tpOrder *models.Order
 
-	group.SLOrderID = slOrderID
-	group.TPOrderID = tpOrderID
-	group.SLTriggerPrice = slTrigger
-	group.SLLimitPrice = slLimit
-	group.TPLimitPrice = tpLimit
+	if hasSL {
+		slOrderID := uuid.New()
+		group.SLOrderID = slOrderID
+		group.SLTriggerPrice = slTrigger
+		group.SLLimitPrice = slLimit
+		slOrder = m.buildLegOrder(group, slOrderID, exitSide, models.OrderTypeStopLoss, &slLimit, &slTrigger, RoleSLLeg)
+	} else {
+		group.SLLegConfirmed = true // no SL leg — skip WS confirmation
+	}
 
-	slOrder := m.buildLegOrder(group, slOrderID, exitSide, models.OrderTypeStopLoss, &slLimit, &slTrigger, RoleSLLeg)
-	tpOrder := m.buildLegOrder(group, tpOrderID, exitSide, models.OrderTypeLimit, &tpLimit, nil, RoleTPLeg)
+	if hasTP {
+		tpOrderID := uuid.New()
+		group.TPOrderID = tpOrderID
+		group.TPLimitPrice = tpLimit
+		tpOrder = m.buildLegOrder(group, tpOrderID, exitSide, models.OrderTypeLimit, &tpLimit, nil, RoleTPLeg)
+	} else {
+		group.TPLegConfirmed = true // no TP leg — skip WS confirmation
+	}
 
-	// Persist both leg orders to DB
+	// Persist enabled leg orders to DB
 	var dbWg sync.WaitGroup
-	dbWg.Add(2)
-	go func() {
-		defer dbWg.Done()
-		if err := m.repo.Create(ctx, slOrder); err != nil {
-			log.Printf("[oco] Failed to persist SL leg order: %v", err)
-		}
-	}()
-	go func() {
-		defer dbWg.Done()
-		if err := m.repo.Create(ctx, tpOrder); err != nil {
-			log.Printf("[oco] Failed to persist TP leg order: %v", err)
-		}
-	}()
+	if slOrder != nil {
+		dbWg.Add(1)
+		go func() {
+			defer dbWg.Done()
+			if err := m.repo.Create(ctx, slOrder); err != nil {
+				log.Printf("[oco] Failed to persist SL leg order: %v", err)
+			}
+		}()
+	}
+	if tpOrder != nil {
+		dbWg.Add(1)
+		go func() {
+			defer dbWg.Done()
+			if err := m.repo.Create(ctx, tpOrder); err != nil {
+				log.Printf("[oco] Failed to persist TP leg order: %v", err)
+			}
+		}()
+	}
 	dbWg.Wait()
 
-	// Place both legs at broker in parallel
+	// Place enabled legs at broker in parallel
 	var wg sync.WaitGroup
 	var slBrokerID, tpBrokerID string
 	var slErr, tpErr error
 
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		slBrokerID, slErr = m.placeLegWithRetry(ctx, slOrder, group.Auth, "SL", group.GroupID)
-	}()
-
-	go func() {
-		defer wg.Done()
-		tpBrokerID, tpErr = m.placeLegWithRetry(ctx, tpOrder, group.Auth, "TP", group.GroupID)
-	}()
-
+	if slOrder != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slBrokerID, slErr = m.placeLegWithRetry(ctx, slOrder, group.Auth, "SL", group.GroupID)
+		}()
+	}
+	if tpOrder != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tpBrokerID, tpErr = m.placeLegWithRetry(ctx, tpOrder, group.Auth, "TP", group.GroupID)
+		}()
+	}
 	wg.Wait()
 
 	// Lock the group for state updates
@@ -868,9 +919,11 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Handle results
-	if slErr != nil && tpErr != nil {
-		// Both failed — critical failure. User has an open position with NO protection.
+	// Handle placement results
+	slFailed := slOrder != nil && slErr != nil
+	tpFailed := tpOrder != nil && tpErr != nil
+
+	if slFailed && tpFailed {
 		log.Printf("[oco] CRITICAL: Both legs failed for group %s: SL=%v TP=%v — POSITION UNPROTECTED", group.GroupID, slErr, tpErr)
 		group.State = StateFailed
 		group.UpdatedAt = time.Now()
@@ -881,11 +934,13 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		return
 	}
 
-	if slErr != nil {
-		// SL failed but TP placed — user has no protection! Cancel TP and fail.
+	if slFailed {
+		// SL failed — cancel any placed TP and fail (no downside protection)
 		log.Printf("[oco] SL leg failed for group %s (no protection) — cancelling TP", group.GroupID)
-		group.TPBrokerID = tpBrokerID
-		m.brokerIndex.Store(tpBrokerID, group.GroupID)
+		if tpBrokerID != "" {
+			group.TPBrokerID = tpBrokerID
+			m.brokerIndex.Store(tpBrokerID, group.GroupID)
+		}
 		group.State = StateFailed
 		group.UpdatedAt = time.Now()
 		go m.cancelLeg(group, tpBrokerID, "TP", "SL leg failed (no protection)")
@@ -895,12 +950,14 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		return
 	}
 
-	if tpErr != nil {
-		// TP failed but SL placed — user has protection via SL. Continue without TP.
-		log.Printf("[oco] TP leg failed for group %s — SL submitted, awaiting WS confirmation (user protected)", group.GroupID)
-		group.SLBrokerID = slBrokerID
-		m.brokerIndex.Store(slBrokerID, group.GroupID)
-		group.TPLegConfirmed = true // no TP leg to confirm
+	if tpFailed {
+		// TP failed but SL placed — user has downside protection. Continue SL-only.
+		log.Printf("[oco] TP leg failed for group %s — SL submitted, user protected (SL-only mode)", group.GroupID)
+		if slBrokerID != "" {
+			group.SLBrokerID = slBrokerID
+			m.brokerIndex.Store(slBrokerID, group.GroupID)
+		}
+		group.TPLegConfirmed = true // no TP leg to wait for
 		group.State = StateLegsSubmitted
 		group.UpdatedAt = time.Now()
 		if m.wsBroadcaster != nil {
@@ -909,20 +966,21 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		return
 	}
 
-	// Both succeeded — submitted to broker, awaiting WS confirmation
-	group.SLBrokerID = slBrokerID
-	group.TPBrokerID = tpBrokerID
+	// All placed legs succeeded — register broker IDs and await WS confirmation
+	if slBrokerID != "" {
+		group.SLBrokerID = slBrokerID
+		m.brokerIndex.Store(slBrokerID, group.GroupID)
+	}
+	if tpBrokerID != "" {
+		group.TPBrokerID = tpBrokerID
+		m.brokerIndex.Store(tpBrokerID, group.GroupID)
+	}
 	group.State = StateLegsSubmitted
 	group.UpdatedAt = time.Now()
-
-	// Register broker IDs for O(1) WS lookup
-	m.brokerIndex.Store(slBrokerID, group.GroupID)
-	m.brokerIndex.Store(tpBrokerID, group.GroupID)
 
 	log.Printf("[oco] Group %s LEGS_SUBMITTED: SL(broker=%s trigger=%.2f) TP(broker=%s limit=%.2f) — awaiting WS confirmation",
 		group.GroupID, slBrokerID, slTrigger, tpBrokerID, tpLimit)
 
-	// Broadcast to frontend
 	if m.wsBroadcaster != nil {
 		m.wsBroadcaster(group.UserID, "oco_legs_submitted", slOrder)
 	}

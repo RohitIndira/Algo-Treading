@@ -381,11 +381,15 @@ func main() {
 	var priceMonitorRef *scheduler.PriceMonitor
 	var priceMonitorWSClient *marketws.Client
 	{
+		// RoutingExecutor: live orders → orderExecutor, paper orders → paperExec.
+		// This lets the PriceMonitor handle below_min paper orders without broker calls.
+		routingExec := executor.NewRoutingExecutor(orderExecutor, paperExec)
+
 		priceMonitorRef = scheduler.NewPriceMonitor(
 			redisPrices,   // Redis fallback (nil-safe)
 			orderRepo,
 			kafkaPub,
-			orderExecutor, // satisfies scheduler.OrderExecutorFunc interface
+			routingExec, // routes paper/live based on IsPaperTrade
 			100*time.Millisecond, // check interval for evaluating WSS-cached prices
 		)
 
@@ -468,6 +472,21 @@ func main() {
 	log.Println("✓ OCO layer initialized")
 	// ──────────────────────────────────────────────────────────────────────
 
+	// ── Auto Square-Off Scheduler ─────────────────────────────────────────
+	// Runs a cron-like check every minute. At the configured time (default 15:05 IST)
+	// it closes all open INTRADAY positions placed through our algo strategies.
+	// Positions opened manually on other platforms are NOT touched.
+	autoSquareOff := scheduler.NewAutoSquareOffScheduler(
+		orderRepo,
+		credsRepo,
+		orderExecutor,
+		cfg.AutoSquareOffTime,
+	)
+	// Wire paper monitor so paper positions are closed at market close alongside live positions.
+	autoSquareOff.SetPaperSquareOff(paperMonitor.SquareOffAll)
+	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled)", cfg.AutoSquareOffTime)
+	// ──────────────────────────────────────────────────────────────────────
+
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -487,7 +506,9 @@ func main() {
 	lc.RegisterStoppable("gRPC server", grpcServer)
 	// 3. Kafka publisher (flush writes)
 	lc.RegisterCloseable("Kafka publisher", kafkaPub)
-	// 4. PostgreSQL (release connections)
+	// 4. Auto Square-Off Scheduler
+	lc.RegisterStoppable("Auto Square-Off Scheduler", autoSquareOff)
+	// 5. PostgreSQL (release connections)
 	lc.Register(lifecycle.Component{
 		Name:    "PostgreSQL",
 		CloseFn: db.Close,
@@ -518,6 +539,14 @@ func main() {
 			metricsServer.Shutdown(shutCtx)
 		},
 	})
+
+	// Start Auto Square-Off Scheduler
+	go func() {
+		log.Println("Starting Auto Square-Off Scheduler...")
+		if err := autoSquareOff.Start(ctx); err != nil {
+			log.Printf("Auto Square-Off Scheduler error: %v", err)
+		}
+	}()
 
 	// Start market data WSS client (paper trading price feed)
 	go func() {
@@ -644,6 +673,8 @@ type Config struct {
 	RedisPassword string
 	// Observability
 	MetricsPort int
+	// Auto square-off
+	AutoSquareOffTime string // "HH:MM" format, default "15:05"
 }
 
 func loadConfig() Config {
@@ -675,6 +706,7 @@ func loadConfig() Config {
 		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
 		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
 		MetricsPort:      getEnvInt("METRICS_PORT", 9090),
+		AutoSquareOffTime: getEnv("AUTO_SQUARE_OFF_TIME", "15:05"),
 	}
 }
 
