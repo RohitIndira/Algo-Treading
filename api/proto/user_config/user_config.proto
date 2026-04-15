@@ -113,8 +113,23 @@ message StrategyConditions {
 // Stop loss type enumeration
 enum StopLossType {
   STOP_LOSS_TYPE_UNSPECIFIED = 0;
-  FIXED = 1;     // Fixed stop loss percentage
-  TRAILING = 2;  // Trailing stop loss that moves with profit
+  FIXED = 1;       // Fixed stop loss percentage
+  TRAILING = 2;    // Trailing stop loss that moves with profit
+  MULTI_LEVEL = 3; // Up to 5 partial exits at different price levels
+}
+
+// Take profit type enumeration
+enum TakeProfitType {
+  TAKE_PROFIT_TYPE_UNSPECIFIED = 0;
+  TAKE_PROFIT_FIXED = 1;       // Single take profit at fixed %
+  TAKE_PROFIT_MULTI_LEVEL = 2; // Up to 5 partial exits at different price levels
+}
+
+// One level in a multi-level exit plan (SL or TP)
+message MultiLevelExitLevel {
+  int32 level_num  = 1; // 1..5, sequential
+  double price_pct = 2; // % from entry price (always positive, strictly increasing)
+  double qty_pct   = 3; // % of total qty to exit at this level; all levels must sum to 100
 }
 
 // Trade execution configuration
@@ -151,6 +166,22 @@ message TradeConfig {
   
   // Limit price (for LIMIT orders, optional)
   double limit_price = 11;
+
+  // Take profit type (TAKE_PROFIT_FIXED or TAKE_PROFIT_MULTI_LEVEL)
+  TakeProfitType take_profit_type = 19;
+
+  // Multi-level stop loss levels (only when stop_loss_type == MULTI_LEVEL)
+  repeated MultiLevelExitLevel multi_level_sl = 20;
+
+  // Multi-level take profit levels (only when take_profit_type == TAKE_PROFIT_MULTI_LEVEL)
+  repeated MultiLevelExitLevel multi_level_tp = 21;
+
+  // Trade window: orders are only placed when the current IST time falls
+  // within [trade_window_start, trade_window_end].
+  // Format: "HH:MM" 24-hour (e.g. "09:15", "14:00").
+  // Empty string means no restriction. Valid range: "09:15" to "15:00".
+  string trade_window_start = 22;
+  string trade_window_end   = 23;
 
   // Indira-specific fields
   string instrument = 12;      // Instrument type: "STK", "OPT", "FUT", "IDX"

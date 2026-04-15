@@ -72,6 +72,10 @@ type TradeConfig struct {
 	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING
 	TrailingSLPct   float64 `json:"trailing_sl_pct" bson:"trailing_sl_pct"` // Trailing SL percentage
 	ProductType     string  `json:"product_type" bson:"product_type"`       // INTRADAY, DELIVERY, CASH
+	// TradeWindowStart / TradeWindowEnd define the IST time range (HH:MM, 24h)
+	// within which this strategy may place orders. Empty = no restriction.
+	TradeWindowStart string `json:"trade_window_start" bson:"trade_window_start"`
+	TradeWindowEnd   string `json:"trade_window_end" bson:"trade_window_end"`
 }
 
 // RiskLimits represents risk limits

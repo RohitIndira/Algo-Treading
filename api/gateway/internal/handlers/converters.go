@@ -77,9 +77,32 @@ func mapStopLossType(slType string) pb.StopLossType {
 		return pb.StopLossType_FIXED
 	case "TRAILING":
 		return pb.StopLossType_TRAILING
+	case "MULTI_LEVEL":
+		return pb.StopLossType_MULTI_LEVEL
 	default:
 		return pb.StopLossType_STOP_LOSS_TYPE_UNSPECIFIED
 	}
+}
+
+func mapTakeProfitType(tpType string) pb.TakeProfitType {
+	switch strings.ToUpper(tpType) {
+	case "MULTI_LEVEL":
+		return pb.TakeProfitType_TAKE_PROFIT_MULTI_LEVEL
+	default:
+		return pb.TakeProfitType_TAKE_PROFIT_FIXED
+	}
+}
+
+func dtoMultiLevelToProto(levels []dto.MultiLevelExitLevel) []*pb.MultiLevelExitLevel {
+	out := make([]*pb.MultiLevelExitLevel, len(levels))
+	for i, l := range levels {
+		out[i] = &pb.MultiLevelExitLevel{
+			LevelNum: int32(l.LevelNum),
+			PricePct: l.PricePct,
+			QtyPct:   l.QtyPct,
+		}
+	}
+	return out
 }
 
 func mapSentiment(sentiment string) common.Sentiment {
@@ -146,18 +169,28 @@ func dtoTradeConfigToProto(tc *dto.TradeConfig) *pb.TradeConfig {
 	if tc == nil {
 		return nil
 	}
-	return &pb.TradeConfig{
-		OrderType:     mapOrderType(tc.OrderType),
-		ProductType:   mapProductType(tc.ProductType),
-		Validity:      tc.Validity,
-		Quantity:      tc.Quantity,
-		Exchange:      mapExchange(tc.Exchange),
-		OrderSide:     mapOrderSide(tc.OrderSide),
-		StopLossPct:   tc.StopLossPct,
-		TakeProfitPct: tc.TakeProfitPct,
-		TrailingSlPct: tc.TrailingSLPct,
-		StopLossType:  mapStopLossType(tc.StopLossType),
+	cfg := &pb.TradeConfig{
+		OrderType:      mapOrderType(tc.OrderType),
+		ProductType:    mapProductType(tc.ProductType),
+		Validity:       tc.Validity,
+		Quantity:       tc.Quantity,
+		Exchange:       mapExchange(tc.Exchange),
+		OrderSide:      mapOrderSide(tc.OrderSide),
+		StopLossPct:    tc.StopLossPct,
+		TakeProfitPct:  tc.TakeProfitPct,
+		TrailingSlPct:  tc.TrailingSLPct,
+		StopLossType:   mapStopLossType(tc.StopLossType),
+		TakeProfitType: mapTakeProfitType(tc.TakeProfitType),
 	}
+	if len(tc.MultiLevelSL) > 0 {
+		cfg.MultiLevelSl = dtoMultiLevelToProto(tc.MultiLevelSL)
+	}
+	if len(tc.MultiLevelTP) > 0 {
+		cfg.MultiLevelTp = dtoMultiLevelToProto(tc.MultiLevelTP)
+	}
+	cfg.TradeWindowStart = tc.TradeWindowStart
+	cfg.TradeWindowEnd = tc.TradeWindowEnd
+	return cfg
 }
 
 func dtoRiskLimitsToProto(rl *dto.RiskLimits) *pb.RiskLimits {

@@ -52,6 +52,7 @@ func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offse
 		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
+			r.loadMultiLevelConfig(ctx, tradeConfig)
 			strategy.TradeConfig = tradeConfig
 		}
 
@@ -133,11 +134,23 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	// Insert trade config
 	if req.TradeConfig != nil {
 		tradeConfigID := uuid.New()
+
+		mlSLJSON, err := marshalMultiLevel(req.TradeConfig.MultiLevelSL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal multi_level_sl: %w", err)
+		}
+		mlTPJSON, err := marshalMultiLevel(req.TradeConfig.MultiLevelTP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal multi_level_tp: %w", err)
+		}
+
 		tradeQuery := `
 			INSERT INTO trade_configs (
 				trade_config_id, strategy_id, order_type, product_type, validity, quantity,
-				exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct,
+				stop_loss_type, limit_price, take_profit_type, multi_level_sl, multi_level_tp,
+				trade_window_start, trade_window_end
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, tradeQuery,
@@ -146,6 +159,8 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
 			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice,
+			req.TradeConfig.TakeProfitType, mlSLJSON, mlTPJSON,
+			req.TradeConfig.TradeWindowStart, req.TradeConfig.TradeWindowEnd,
 		).Scan(&req.TradeConfig.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert trade config: %w", err)
@@ -235,6 +250,7 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 		return nil, fmt.Errorf("failed to get trade config: %w", err)
 	}
 	if err == nil {
+		r.loadMultiLevelConfig(ctx, tradeConfig)
 		strategy.TradeConfig = tradeConfig
 	}
 
@@ -300,6 +316,7 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
+			r.loadMultiLevelConfig(ctx, tradeConfig)
 			strategy.TradeConfig = tradeConfig
 		}
 
@@ -370,18 +387,31 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 
 	// Update trade config if provided
 	if req.TradeConfig != nil {
+		mlSLJSON, err := marshalMultiLevel(req.TradeConfig.MultiLevelSL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal multi_level_sl: %w", err)
+		}
+		mlTPJSON, err := marshalMultiLevel(req.TradeConfig.MultiLevelTP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal multi_level_tp: %w", err)
+		}
+
 		tradeQuery := `
 			UPDATE trade_configs
 			SET order_type = $1, product_type = $2, validity = $3, quantity = $4,
 			    exchange = $5, order_side = $6, stop_loss_pct = $7, take_profit_pct = $8,
-			    trailing_sl_pct = $9, stop_loss_type = $10, limit_price = $11
-			WHERE strategy_id = $12`
+			    trailing_sl_pct = $9, stop_loss_type = $10, limit_price = $11,
+			    take_profit_type = $12, multi_level_sl = $13, multi_level_tp = $14,
+			    trade_window_start = $15, trade_window_end = $16
+			WHERE strategy_id = $17`
 
 		_, err = tx.ExecContext(ctx, tradeQuery,
 			req.TradeConfig.OrderType, req.TradeConfig.ProductType, req.TradeConfig.Validity,
 			req.TradeConfig.Quantity, req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
-			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice, req.StrategyID,
+			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice,
+			req.TradeConfig.TakeProfitType, mlSLJSON, mlTPJSON,
+			req.TradeConfig.TradeWindowStart, req.TradeConfig.TradeWindowEnd, req.StrategyID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update trade config: %w", err)
@@ -626,6 +656,7 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
+			r.loadMultiLevelConfig(ctx, tradeConfig)
 			strategy.TradeConfig = tradeConfig
 		}
 
@@ -669,4 +700,40 @@ func (r *StrategyRepository) MarkOutboxEventsProcessed(ctx context.Context, even
 		return fmt.Errorf("failed to mark events as processed: %w", err)
 	}
 	return nil
+}
+
+// ── Multi-Level Helpers ───────────────────────────────────────────────────────
+
+// marshalMultiLevel converts a slice of MultiLevelExitLevel to a JSON byte slice
+// suitable for insertion into a JSONB column. Returns nil when levels is empty
+// (which stores NULL in the DB).
+func marshalMultiLevel(levels []models.MultiLevelExitLevel) ([]byte, error) {
+	if len(levels) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(levels)
+}
+
+// loadMultiLevelConfig reads the multi_level_sl / multi_level_tp JSONB columns
+// for a TradeConfig that was loaded via SELECT *. Because the model fields have
+// db:"-" (sqlx skips them), we fetch the raw JSON separately and unmarshal.
+func (r *StrategyRepository) loadMultiLevelConfig(ctx context.Context, tc *models.TradeConfig) {
+	if tc == nil {
+		return
+	}
+
+	var raw struct {
+		MultiLevelSL []byte `db:"multi_level_sl"`
+		MultiLevelTP []byte `db:"multi_level_tp"`
+	}
+	query := `SELECT multi_level_sl, multi_level_tp FROM trade_configs WHERE strategy_id = $1`
+	if err := r.db.GetContext(ctx, &raw, query, tc.StrategyID); err != nil {
+		return // non-fatal; columns may not exist on older DB instances
+	}
+	if len(raw.MultiLevelSL) > 0 {
+		_ = json.Unmarshal(raw.MultiLevelSL, &tc.MultiLevelSL)
+	}
+	if len(raw.MultiLevelTP) > 0 {
+		_ = json.Unmarshal(raw.MultiLevelTP, &tc.MultiLevelTP)
+	}
 }

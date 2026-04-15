@@ -164,6 +164,18 @@ type NotificationChannels struct {
 	InApp bool `json:"in_app"`
 }
 
+// MultiLevelExitLevel defines one partial exit level for multi-level SL or TP.
+// Mirrors the user-config model; duplicated here so trade-execution has no
+// cross-service model import.
+//
+//   - price_pct: always positive; direction is implied by exit_type and order side.
+//   - qty_pct: % of TOTAL position qty to exit at this level; all levels sum to 100.
+type MultiLevelExitLevel struct {
+	LevelNum int     `json:"level_num"`
+	PricePct float64 `json:"price_pct"`
+	QtyPct   float64 `json:"qty_pct"`
+}
+
 // Trade Signal from Kafka (consumed from trade-signals topic)
 type TradeSignal struct {
 	OrderID      string    `json:"order_id"`
@@ -191,10 +203,18 @@ type TradeSignal struct {
 	Source      string `json:"source"`       // Source platform (IOS, AND, WEB)
 
 	// Stop loss configuration
-	StopLossType  string  `json:"stop_loss_type"`  // "FIXED" or "TRAILING"
-	StopLossPct   float64 `json:"stop_loss_pct"`   // Original SL percentage from strategy
-	TakeProfitPct float64 `json:"take_profit_pct"` // Original TP percentage from strategy
-	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing stop loss percentage
+	// StopLossType: "FIXED" | "TRAILING" | "MULTI_LEVEL"
+	StopLossType  string  `json:"stop_loss_type"`
+	StopLossPct   float64 `json:"stop_loss_pct"`   // Original SL % from strategy (used for FIXED/TRAILING)
+	TakeProfitPct float64 `json:"take_profit_pct"` // Original TP % from strategy (used for FIXED)
+	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing SL percentage
+
+	// TakeProfitType: "FIXED" | "MULTI_LEVEL"
+	TakeProfitType string `json:"take_profit_type"`
+
+	// Multi-level exit levels (non-nil only when respective type == "MULTI_LEVEL")
+	MultiLevelSL []MultiLevelExitLevel `json:"multi_level_sl,omitempty"`
+	MultiLevelTP []MultiLevelExitLevel `json:"multi_level_tp,omitempty"`
 
 	// Product type
 	ProductType string `json:"product_type"` // INTRADAY, DELIVERY, CASH

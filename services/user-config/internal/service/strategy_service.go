@@ -288,6 +288,11 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		return fmt.Errorf("take_profit_pct must be non-negative")
 	}
 
+	// Validate multi-level SL/TP
+	if err := validateMultiLevelConfig(req.TradeConfig); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -326,12 +331,102 @@ func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyReques
 		if req.TradeConfig.TakeProfitPct != nil && *req.TradeConfig.TakeProfitPct < 0 {
 			return fmt.Errorf("take_profit_pct must be non-negative")
 		}
+		if err := validateMultiLevelConfig(req.TradeConfig); err != nil {
+			return err
+		}
 	}
 
 	if req.TradingMode != nil {
 		if *req.TradingMode != models.TradingModePaper && *req.TradingMode != models.TradingModeLive {
 			return fmt.Errorf("invalid trading_mode: %s", *req.TradingMode)
 		}
+	}
+
+	return nil
+}
+
+// validateMultiLevelConfig validates the multi-level SL and TP configuration
+// inside a TradeConfig. Called for both create and update paths.
+//
+// Rules:
+//  1. If StopLossType == "MULTI_LEVEL", MultiLevelSL must be non-empty (and vice-versa).
+//  2. If TakeProfitType == "MULTI_LEVEL", MultiLevelTP must be non-empty.
+//  3. Each set: max 5 levels, level_num sequential from 1, price_pct > 0 and
+//     strictly increasing, qty_pct > 0, all qty_pct values sum to 100 (±0.01 tolerance).
+//  4. Mixed modes (e.g. Trailing SL + multi-level TP) are valid.
+func validateMultiLevelConfig(tc *models.TradeConfig) error {
+	if tc == nil {
+		return nil
+	}
+
+	// --- Stop Loss ---
+	if tc.StopLossType == models.SLModeMultiLevel {
+		if len(tc.MultiLevelSL) == 0 {
+			return fmt.Errorf("stop_loss_type is MULTI_LEVEL but multi_level_sl is empty")
+		}
+		if err := validateLevels("multi_level_sl", tc.MultiLevelSL); err != nil {
+			return err
+		}
+	} else if len(tc.MultiLevelSL) > 0 {
+		return fmt.Errorf("multi_level_sl provided but stop_loss_type is %q (expected MULTI_LEVEL)", tc.StopLossType)
+	}
+
+	// --- Take Profit ---
+	tpType := tc.TakeProfitType
+	if tpType == "" {
+		tpType = models.TPModeFixed // backward-compatible default
+	}
+	if tpType == models.TPModeMultiLevel {
+		if len(tc.MultiLevelTP) == 0 {
+			return fmt.Errorf("take_profit_type is MULTI_LEVEL but multi_level_tp is empty")
+		}
+		if err := validateLevels("multi_level_tp", tc.MultiLevelTP); err != nil {
+			return err
+		}
+	} else if len(tc.MultiLevelTP) > 0 {
+		return fmt.Errorf("multi_level_tp provided but take_profit_type is %q (expected MULTI_LEVEL)", tpType)
+	}
+
+	// --- Invalid SL+TP combinations ---
+	// TRAILING SL with MULTI_LEVEL SL is a contradiction.
+	if tc.StopLossType == models.SLModeTrailing && len(tc.MultiLevelSL) > 0 {
+		return fmt.Errorf("cannot combine trailing SL with multi_level_sl; choose one SL mode")
+	}
+
+	return nil
+}
+
+// validateLevels checks the structural rules for a slice of MultiLevelExitLevel.
+func validateLevels(field string, levels []models.MultiLevelExitLevel) error {
+	if len(levels) > models.MaxMultiLevelExits {
+		return fmt.Errorf("%s: maximum %d levels allowed, got %d", field, models.MaxMultiLevelExits, len(levels))
+	}
+
+	var totalQty float64
+	prevPricePct := 0.0
+
+	for i, l := range levels {
+		expectedNum := i + 1
+		if l.LevelNum != expectedNum {
+			return fmt.Errorf("%s: level_num at index %d must be %d, got %d", field, i, expectedNum, l.LevelNum)
+		}
+		if l.PricePct <= 0 {
+			return fmt.Errorf("%s level %d: price_pct must be positive, got %.4f", field, l.LevelNum, l.PricePct)
+		}
+		if l.PricePct <= prevPricePct {
+			return fmt.Errorf("%s level %d: price_pct (%.4f) must be strictly greater than level %d (%.4f)",
+				field, l.LevelNum, l.PricePct, l.LevelNum-1, prevPricePct)
+		}
+		if l.QtyPct <= 0 {
+			return fmt.Errorf("%s level %d: qty_pct must be positive, got %.4f", field, l.LevelNum, l.QtyPct)
+		}
+		totalQty += l.QtyPct
+		prevPricePct = l.PricePct
+	}
+
+	// Allow ±0.01 rounding tolerance (e.g. 33.33 + 33.33 + 33.34 = 100.00)
+	if totalQty < 99.99 || totalQty > 100.01 {
+		return fmt.Errorf("%s: qty_pct values must sum to 100, got %.4f", field, totalQty)
 	}
 
 	return nil

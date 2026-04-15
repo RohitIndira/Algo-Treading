@@ -54,19 +54,37 @@ type ConditionsPayload struct {
 	CreatedAt         int64    `json:"created_at"` // UnixNano
 }
 
+// MultiLevelExitLevelPayload is the Kafka-serialised form of one exit level.
+type MultiLevelExitLevelPayload struct {
+	LevelNum int     `json:"level_num"`
+	PricePct float64 `json:"price_pct"`
+	QtyPct   float64 `json:"qty_pct"`
+}
+
 type TradeConfigPayload struct {
-	OrderType     string  `json:"order_type"`
-	ProductType   string  `json:"product_type"`
-	Validity      string  `json:"validity"`
-	Quantity      int32   `json:"quantity"`
-	Exchange      string  `json:"exchange"`
-	OrderSide     string  `json:"order_side"`
-	LimitPrice    float64 `json:"limit_price"`
-	StopLossPct   float64 `json:"stop_loss_pct"`
-	TakeProfitPct float64 `json:"take_profit_pct"`
-	TrailingSLPct float64 `json:"trailing_sl_pct"`
-	StopLossType  string  `json:"stop_loss_type"`
-	CreatedAt     int64   `json:"created_at"` // UnixNano
+	OrderType      string  `json:"order_type"`
+	ProductType    string  `json:"product_type"`
+	Validity       string  `json:"validity"`
+	Quantity       int32   `json:"quantity"`
+	Exchange       string  `json:"exchange"`
+	OrderSide      string  `json:"order_side"`
+	LimitPrice     float64 `json:"limit_price"`
+	StopLossPct    float64 `json:"stop_loss_pct"`
+	TakeProfitPct  float64 `json:"take_profit_pct"`
+	TrailingSLPct  float64 `json:"trailing_sl_pct"`
+	StopLossType   string  `json:"stop_loss_type"`
+	TakeProfitType string  `json:"take_profit_type"`
+
+	// Multi-level exit levels (non-nil only when type == "MULTI_LEVEL")
+	MultiLevelSL []MultiLevelExitLevelPayload `json:"multi_level_sl,omitempty"`
+	MultiLevelTP []MultiLevelExitLevelPayload `json:"multi_level_tp,omitempty"`
+
+	// Trade window: orders only fire when IST time is within [start, end].
+	// HH:MM 24-hour format. Empty = no restriction.
+	TradeWindowStart string `json:"trade_window_start"`
+	TradeWindowEnd   string `json:"trade_window_end"`
+
+	CreatedAt int64 `json:"created_at"` // UnixNano
 }
 
 type RiskLimitsPayload struct {

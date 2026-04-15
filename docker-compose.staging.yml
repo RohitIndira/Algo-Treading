@@ -1,26 +1,26 @@
 version: '3.9'
 
 services:
-  # ===== INFRASTRUCTURE SERVICES =====
+  # ===== INFRASTRUCTURE SERVICES (STAGING) =====
   
   postgres:
     image: postgres:15-alpine
-    container_name: trading-postgres
-    hostname: postgres
+    container_name: trading-postgres-staging
+    hostname: postgres-staging
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: trading_db
+      POSTGRES_DB: trading_db_staging
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-data-staging:/var/lib/postgresql/data
       - ./deployments/docker/init_all_schemas.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
-      - trading-network
+      - trading-network-staging
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_db"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_db_staging"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -28,19 +28,19 @@ services:
 
   mongodb:
     image: mongo:7-alpine
-    container_name: trading-mongodb
-    hostname: mongodb
+    container_name: trading-mongodb-staging
+    hostname: mongodb-staging
     ports:
-      - "27017:27017"
+      - "27018:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: admin
       MONGO_INITDB_ROOT_PASSWORD: admin
-      MONGO_INITDB_DATABASE: trading_db
+      MONGO_INITDB_DATABASE: trading_db_staging
     volumes:
-      - mongodb-data:/data/db
-      - mongodb-config:/data/configdb
+      - mongodb-data-staging:/data/db
+      - mongodb-config-staging:/data/configdb
     networks:
-      - trading-network
+      - trading-network-staging
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -50,14 +50,14 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: trading-redis
-    hostname: redis
+    container_name: trading-redis-staging
+    hostname: redis-staging
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
-      - redis-data:/data
+      - redis-data-staging:/data
     networks:
-      - trading-network
+      - trading-network-staging
     command: redis-server --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -68,15 +68,15 @@ services:
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
-    container_name: trading-kafka
-    hostname: kafka
+    container_name: trading-kafka-staging
+    hostname: kafka-staging
     ports:
-      - "9092:9092"
-      - "29092:29092"
+      - "9093:9092"
+      - "29093:29092"
     environment:
       KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-staging:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-staging:9092,PLAINTEXT_HOST://localhost:29093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -84,7 +84,7 @@ services:
     depends_on:
       - zookeeper
     networks:
-      - trading-network
+      - trading-network-staging
     healthcheck:
       test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
       interval: 30s
@@ -94,33 +94,33 @@ services:
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
-    container_name: trading-zookeeper
-    hostname: zookeeper
+    container_name: trading-zookeeper-staging
+    hostname: zookeeper-staging
     ports:
-      - "2181:2181"
+      - "2182:2181"
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
     volumes:
-      - zookeeper-data:/var/lib/zookeeper/data
-      - zookeeper-logs:/var/lib/zookeeper/log
+      - zookeeper-data-staging:/var/lib/zookeeper/data
+      - zookeeper-logs-staging:/var/lib/zookeeper/log
     networks:
-      - trading-network
+      - trading-network-staging
     restart: unless-stopped
 
   rabbitmq:
     image: rabbitmq:3.12-management-alpine
-    container_name: trading-rabbitmq
-    hostname: rabbitmq
+    container_name: trading-rabbitmq-staging
+    hostname: rabbitmq-staging
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "5673:5672"
+      - "15673:15672"
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
     volumes:
-      - rabbitmq-data:/var/lib/rabbitmq
+      - rabbitmq-data-staging:/var/lib/rabbitmq
     networks:
-      - trading-network
+      - trading-network-staging
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 30s
@@ -128,20 +128,21 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # ===== APPLICATION SERVICES =====
+  # ===== APPLICATION SERVICES (STAGING) =====
 
   api-gateway:
     build:
       context: ./api/gateway
       dockerfile: Dockerfile
-    container_name: trading-api-gateway
-    hostname: api-gateway
+    container_name: trading-api-gateway-staging
+    hostname: api-gateway-staging
     ports:
-      - "8081:8081"
+      - "8181:8081"
     env_file:
-      - ./api/gateway/.env.live
+      - ./api/gateway/.env.staging
     environment:
-      ENVIRONMENT: production
+      # Override with staging-specific values if needed
+      ENVIRONMENT: staging
       LOG_LEVEL: info
     depends_on:
       postgres:
@@ -151,21 +152,21 @@ services:
       user-config:
         condition: service_started
     networks:
-      - trading-network
+      - trading-network-staging
     restart: unless-stopped
 
   user-config:
     build:
       context: ./services/user-config
       dockerfile: Dockerfile
-    container_name: trading-user-config
-    hostname: user-config
+    container_name: trading-user-config-staging
+    hostname: user-config-staging
     ports:
-      - "50051:50051"
+      - "50151:50051"
     env_file:
-      - ./services/user-config/.env.live
+      - ./services/user-config/.env.staging
     environment:
-      ENVIRONMENT: production
+      ENVIRONMENT: staging
       GRPC_PORT: 50051
     depends_on:
       postgres:
@@ -173,115 +174,115 @@ services:
       redis:
         condition: service_healthy
     networks:
-      - trading-network
+      - trading-network-staging
     restart: unless-stopped
 
   data-ingestion:
     build:
       context: ./services/data-ingestion
       dockerfile: Dockerfile
-    container_name: trading-data-ingestion
-    hostname: data-ingestion
+    container_name: trading-data-ingestion-staging
+    hostname: data-ingestion-staging
     ports:
-      - "50052:50052"
-    env_file:
-      - ./services/data-ingestion/.env.live
+      - "50152:50052"
     environment:
-      ENVIRONMENT: production
+      # MongoDB
+      MONGODB_URI: mongodb://admin:admin@mongodb-staging:27017/trading_db_staging?authSource=admin
+      
+      # Kafka
+      KAFKA_BROKERS: kafka-staging:9092
+      KAFKA_TOPIC: market.data.news
+      
+      # gRPC
       GRPC_PORT: 50052
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-    networks:
-      - trading-network
-    restart: unless-stopped
-
-  rules-engine:
-    build:
-      context: ./services/rules-engine
+      
+      # Logging
+      L_file:
+      - ./services/data-ingestion/.env.staging
+    environment:
+      ENVIRONMENT: staging
+      GRPC_PORT: 50052ices/rules-engine
       dockerfile: Dockerfile
-    container_name: trading-rules-engine
-    hostname: rules-engine
+    container_name: trading-rules-engine-staging
+    hostname: rules-engine-staging
     ports:
-      - "50053:50053"
+      - "50153:50053"
     environment:
       # Kafka
-      KAFKA_BROKERS: kafka:9092
+      KAFKA_BROKERS: kafka-staging:9092
       KAFKA_TOPIC_INPUT: market.data.news
       KAFKA_TOPIC_OUTPUT: order.execution.queue
 
       # Redis
-      REDIS_HOST: redis
+      REDIS_HOST: redis-staging
       R_file:
-      - ./services/rules-engine/.env.live
+      - ./services/rules-engine/.env.staging
     environment:
-      ENVIRONMENT: production
+      ENVIRONMENT: staging
       GRPC_PORT: 50053topped
 
   trade-execution:
     build:
       context: ./services/trade-execution
       dockerfile: Dockerfile
-    container_name: trading-trade-execution
-    hostname: trade-execution
+    container_name: trading-trade-execution-staging
+    hostname: trade-execution-staging
     ports:
-      - "50054:50054"
+      - "50154:50054"
     environment:
       # Database
-      DATABASE_HOST: postgres
+      DATABASE_HOST: postgres-staging
       DATABASE_PORT: 5432
       DATABASE_USER: postgres
       DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db
+      DATABASE_NAME: trading_db_staging
       
       # Message Queue
-      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_HOST: rabbitmq-staging
       R_file:
-      - ./services/trade-execution/.env.live
+      - ./services/trade-execution/.env.staging
     environment:
-      ENVIRONMENT: production
+      ENVIRONMENT: staging
       SERVICE_PORT: 50054topped
 
   risk-management:
     build:
       context: ./services/risk-management
       dockerfile: Dockerfile
-    container_name: trading-risk-management
-    hostname: risk-management
+    container_name: trading-risk-management-staging
+    hostname: risk-management-staging
     ports:
-      - "50055:50055"
+      - "50155:50055"
     environment:
       # Database
-      DATABASE_HOST: postgres
+      DATABASE_HOST: postgres-staging
       DATABASE_PORT: 5432
       DATABASE_USER: postgres
       DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db
+      DATABASE_NAME: trading_db_staging
       
       # Redis (for risk counters)
-      REDIS_HOST: redis
+      REDIS_HOST: redis-staging
       REDIS_PORT: 6379
       
       # gRPC
       GRPC_PORT: 50055
       
       #_file:
-      - ./services/risk-management/.env.live
+      - ./services/risk-management/.env.staging
     environment:
-      ENVIRONMENT: production
-      SERVICE_PORT: 50055
+      ENVIRONMENT: staging
+      SERVICE_PORT: 50055ng:
     driver: local
-  mongodb-data:
+  mongodb-data-staging:
     driver: local
-  mongodb-config:
+  mongodb-config-staging:
     driver: local
-  redis-data:
+  redis-data-staging:
     driver: local
-  zookeeper-data:
+  zookeeper-data-staging:
     driver: local
-  zookeeper-logs:
+  zookeeper-logs-staging:
     driver: local
-  rabbitmq-data:
+  rabbitmq-data-staging:
     driver: local

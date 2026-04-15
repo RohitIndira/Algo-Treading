@@ -27,6 +27,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/lifecycle"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/oco"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/multilevel"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/paper"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -470,6 +471,25 @@ func main() {
 	}()
 
 	log.Println("✓ OCO layer initialized")
+	// ──────────────────────────────────────────────────────────────────────
+
+	// ── Multi-Level SL/TP Layer ────────────────────────────────────────────
+	log.Println("Initializing multi-level SL/TP management layer...")
+	var mlPriceLookup multilevel.PriceLookup
+	if redisPrices != nil {
+		mlPriceLookup = redisPrices
+	}
+	mlManager := multilevel.NewManager(orderRepo, mlPriceLookup, indiraClient, logger)
+
+	// Wire ML handler into StatusService — broker WS events are forwarded here
+	// so entry fills and TP limit order fills are detected.
+	statusService.SetMLHandler(mlManager)
+
+	// Wire ML manager into SignalProcessor — multi-level signals (Route 4) are
+	// registered and executed through the ML manager.
+	signalProcessor.SetMultiLevelManager(mlManager)
+
+	log.Println("✓ Multi-level SL/TP layer initialized")
 	// ──────────────────────────────────────────────────────────────────────
 
 	// ── Auto Square-Off Scheduler ─────────────────────────────────────────

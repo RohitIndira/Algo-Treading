@@ -523,9 +523,44 @@ func stopLossTypeToString(slt pb.StopLossType) string {
 		return "FIXED"
 	case pb.StopLossType_TRAILING:
 		return "TRAILING"
+	case pb.StopLossType_MULTI_LEVEL:
+		return "MULTI_LEVEL"
 	default:
 		return "FIXED"
 	}
+}
+
+func takeProfitTypeToString(tpt pb.TakeProfitType) string {
+	switch tpt {
+	case pb.TakeProfitType_TAKE_PROFIT_MULTI_LEVEL:
+		return "MULTI_LEVEL"
+	default:
+		return "FIXED"
+	}
+}
+
+func protoMultiLevelToModel(levels []*pb.MultiLevelExitLevel) []models.MultiLevelExitLevel {
+	out := make([]models.MultiLevelExitLevel, len(levels))
+	for i, l := range levels {
+		out[i] = models.MultiLevelExitLevel{
+			LevelNum: int(l.LevelNum),
+			PricePct: l.PricePct,
+			QtyPct:   l.QtyPct,
+		}
+	}
+	return out
+}
+
+func modelMultiLevelToProto(levels []models.MultiLevelExitLevel) []*pb.MultiLevelExitLevel {
+	out := make([]*pb.MultiLevelExitLevel, len(levels))
+	for i, l := range levels {
+		out[i] = &pb.MultiLevelExitLevel{
+			LevelNum: int32(l.LevelNum),
+			PricePct: l.PricePct,
+			QtyPct:   l.QtyPct,
+		}
+	}
+	return out
 }
 
 func positionSizingToString(ps common.PositionSizing) string {
@@ -547,18 +582,29 @@ func protoTradeConfigToModel(proto *pb.TradeConfig) *models.TradeConfig {
 	}
 
 	config := &models.TradeConfig{
-		OrderType:     orderTypeToString(proto.OrderType),
-		Quantity:      proto.Quantity,
-		StopLossPct:   &proto.StopLossPct,
-		TakeProfitPct: &proto.TakeProfitPct,
-		Exchange:      exchangeToString(proto.Exchange),
-		OrderSide:     orderSideToString(proto.OrderSide),
-		LimitPrice:    &proto.LimitPrice,
-		Validity:      proto.Validity,
-		StopLossType:  stopLossTypeToString(proto.StopLossType),
-		TrailingSLPct: &proto.TrailingSlPct,
-		ProductType:   productTypeToString(proto.ProductType),
+		OrderType:      orderTypeToString(proto.OrderType),
+		Quantity:       proto.Quantity,
+		StopLossPct:    &proto.StopLossPct,
+		TakeProfitPct:  &proto.TakeProfitPct,
+		Exchange:       exchangeToString(proto.Exchange),
+		OrderSide:      orderSideToString(proto.OrderSide),
+		LimitPrice:     &proto.LimitPrice,
+		Validity:       proto.Validity,
+		StopLossType:   stopLossTypeToString(proto.StopLossType),
+		TakeProfitType: takeProfitTypeToString(proto.TakeProfitType),
+		TrailingSLPct:  &proto.TrailingSlPct,
+		ProductType:    productTypeToString(proto.ProductType),
 	}
+
+	if len(proto.MultiLevelSl) > 0 {
+		config.MultiLevelSL = protoMultiLevelToModel(proto.MultiLevelSl)
+	}
+	if len(proto.MultiLevelTp) > 0 {
+		config.MultiLevelTP = protoMultiLevelToModel(proto.MultiLevelTp)
+	}
+
+	config.TradeWindowStart = proto.TradeWindowStart
+	config.TradeWindowEnd = proto.TradeWindowEnd
 
 	return config
 }
@@ -733,9 +779,21 @@ func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
 	if model.StopLossType != "" {
 		config.StopLossType = stringToStopLossType(model.StopLossType)
 	}
+	if model.TakeProfitType != "" {
+		config.TakeProfitType = stringToTakeProfitType(model.TakeProfitType)
+	}
 	if model.TrailingSLPct != nil {
 		config.TrailingSlPct = *model.TrailingSLPct
 	}
+	if len(model.MultiLevelSL) > 0 {
+		config.MultiLevelSl = modelMultiLevelToProto(model.MultiLevelSL)
+	}
+	if len(model.MultiLevelTP) > 0 {
+		config.MultiLevelTp = modelMultiLevelToProto(model.MultiLevelTP)
+	}
+
+	config.TradeWindowStart = model.TradeWindowStart
+	config.TradeWindowEnd = model.TradeWindowEnd
 
 	return config
 }

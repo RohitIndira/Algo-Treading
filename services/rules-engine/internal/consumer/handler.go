@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
@@ -219,6 +220,41 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 // Percentage accuracy: SL and TP are always computed from the final buying
 // price (the limit price the order will actually execute at), ensuring the
 // user's configured percentage is applied exactly (subject to tick rounding).
+// isWithinTradeWindow returns true when the current IST time falls within
+// the strategy's configured trade window [start, end] (both inclusive).
+// Returns true when either bound is empty (i.e. no restriction is configured).
+//
+// windowStart / windowEnd must be in "HH:MM" 24-hour format.
+// IST = UTC+5:30.
+func isWithinTradeWindow(windowStart, windowEnd string) bool {
+	if windowStart == "" || windowEnd == "" {
+		return true // no window configured
+	}
+
+	ist := time.FixedZone("IST", 5*60*60+30*60)
+	now := time.Now().In(ist)
+
+	// Parse HH:MM for start and end.
+	parseHHMM := func(s string) (int, int, bool) {
+		var h, m int
+		_, err := fmt.Sscanf(s, "%d:%d", &h, &m)
+		return h, m, err == nil
+	}
+
+	sh, sm, ok1 := parseHHMM(windowStart)
+	eh, em, ok2 := parseHHMM(windowEnd)
+	if !ok1 || !ok2 {
+		return true // malformed window — fail open (do not block trading)
+	}
+
+	// Express as minutes since midnight for simple comparison.
+	nowMins := now.Hour()*60 + now.Minute()
+	startMins := sh*60 + sm
+	endMins := eh*60 + em
+
+	return nowMins >= startMins && nowMins <= endMins
+}
+
 func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, event *models.MarketEvent, md *MarketDataResult) error {
 	strategy := match.Strategy
 	if strategy == nil {
@@ -226,6 +262,19 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			zap.String("strategy_id", match.StrategyID),
 			zap.String("user_id", match.UserID))
 		return fmt.Errorf("strategy is nil in match")
+	}
+
+	// ── Trade window check ──────────────────────────────────────────────────
+	// If the strategy has a trade window configured, only place orders when
+	// the current IST time is within that window.
+	if !isWithinTradeWindow(strategy.TradeConfig.TradeWindowStart, strategy.TradeConfig.TradeWindowEnd) {
+		h.logger.Info("Skipping order — current time is outside strategy trade window",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.String("user_id", strategy.UserID),
+			zap.String("trade_window_start", strategy.TradeConfig.TradeWindowStart),
+			zap.String("trade_window_end", strategy.TradeConfig.TradeWindowEnd),
+			zap.String("symbol", event.StockData.Symbol))
+		return nil
 	}
 
 	if strategy.TradeConfig.Quantity <= 0 {

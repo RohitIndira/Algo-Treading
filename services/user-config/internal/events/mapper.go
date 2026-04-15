@@ -85,18 +85,23 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 	// Trade config
 	if s.TradeConfig != nil {
 		p.TradeConfig = TradeConfigPayload{
-			OrderType:     s.TradeConfig.OrderType,
-			ProductType:   s.TradeConfig.ProductType,
-			Validity:      s.TradeConfig.Validity,
-			Quantity:      s.TradeConfig.Quantity,
-			Exchange:      s.TradeConfig.Exchange,
-			OrderSide:     s.TradeConfig.OrderSide,
-			LimitPrice:    valueOrZeroFloat64(s.TradeConfig.LimitPrice),
-			StopLossPct:   valueOrZeroFloat64(s.TradeConfig.StopLossPct),
-			TakeProfitPct: valueOrZeroFloat64(s.TradeConfig.TakeProfitPct),
-			TrailingSLPct: valueOrZeroFloat64(s.TradeConfig.TrailingSLPct),
-			StopLossType:  s.TradeConfig.StopLossType,
-			CreatedAt:     s.TradeConfig.CreatedAt.UnixNano(),
+			OrderType:        s.TradeConfig.OrderType,
+			ProductType:      s.TradeConfig.ProductType,
+			Validity:         s.TradeConfig.Validity,
+			Quantity:         s.TradeConfig.Quantity,
+			Exchange:         s.TradeConfig.Exchange,
+			OrderSide:        s.TradeConfig.OrderSide,
+			LimitPrice:       valueOrZeroFloat64(s.TradeConfig.LimitPrice),
+			StopLossPct:      valueOrZeroFloat64(s.TradeConfig.StopLossPct),
+			TakeProfitPct:    valueOrZeroFloat64(s.TradeConfig.TakeProfitPct),
+			TrailingSLPct:    valueOrZeroFloat64(s.TradeConfig.TrailingSLPct),
+			StopLossType:     s.TradeConfig.StopLossType,
+			TakeProfitType:   s.TradeConfig.TakeProfitType,
+			MultiLevelSL:     toMultiLevelPayload(s.TradeConfig.MultiLevelSL),
+			MultiLevelTP:     toMultiLevelPayload(s.TradeConfig.MultiLevelTP),
+			TradeWindowStart: s.TradeConfig.TradeWindowStart,
+			TradeWindowEnd:   s.TradeConfig.TradeWindowEnd,
+			CreatedAt:        s.TradeConfig.CreatedAt.UnixNano(),
 		}
 	}
 
@@ -115,6 +120,23 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 	}
 
 	return p
+}
+
+// toMultiLevelPayload converts model multi-level levels to the Kafka payload type.
+// Returns nil (omitted from JSON) when levels is empty.
+func toMultiLevelPayload(levels []models.MultiLevelExitLevel) []MultiLevelExitLevelPayload {
+	if len(levels) == 0 {
+		return nil
+	}
+	out := make([]MultiLevelExitLevelPayload, len(levels))
+	for i, l := range levels {
+		out[i] = MultiLevelExitLevelPayload{
+			LevelNum: l.LevelNum,
+			PricePct: l.PricePct,
+			QtyPct:   l.QtyPct,
+		}
+	}
+	return out
 }
 
 func nilSafeStringSlice(in []string) []string {

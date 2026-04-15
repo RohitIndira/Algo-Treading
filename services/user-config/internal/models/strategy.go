@@ -52,6 +52,34 @@ type StrategyCondition struct {
 	CreatedAt          time.Time      `db:"created_at" json:"created_at"`
 }
 
+// SLMode / TPMode constants — used in StopLossType and TakeProfitType fields.
+const (
+	SLModeFixed      = "FIXED"       // Single SL at a fixed percentage
+	SLModeTrailing   = "TRAILING"    // Trailing SL that moves with price
+	SLModeMultiLevel = "MULTI_LEVEL" // Up to 5 partial exits at different SL levels
+	TPModeFixed      = "FIXED"       // Single TP at a fixed percentage
+	TPModeMultiLevel = "MULTI_LEVEL" // Up to 5 partial exits at different TP levels
+)
+
+// MaxMultiLevelExits is the hard cap on the number of levels allowed for both SL and TP.
+const MaxMultiLevelExits = 5
+
+// MultiLevelExitLevel defines one partial exit level for multi-level SL or TP.
+//
+// price_pct: percentage distance from entry price — always positive.
+//   - For SL (BUY): trigger when LTP ≤ entry*(1 − price_pct/100)
+//   - For SL (SELL): trigger when LTP ≥ entry*(1 + price_pct/100)
+//   - For TP (BUY): trigger when LTP ≥ entry*(1 + price_pct/100)
+//   - For TP (SELL): trigger when LTP ≤ entry*(1 − price_pct/100)
+//
+// qty_pct: percentage of the TOTAL position quantity to exit at this level (0..100).
+// All levels for a given exit type must sum to exactly 100.
+type MultiLevelExitLevel struct {
+	LevelNum int     `json:"level_num"` // 1..5, must be sequential
+	PricePct float64 `json:"price_pct"` // % from entry, always positive, strictly increasing
+	QtyPct   float64 `json:"qty_pct"`   // % of total qty to exit here; all levels sum to 100
+}
+
 // TradeConfig represents the trade execution configuration
 type TradeConfig struct {
 	TradeConfigID   uuid.UUID `db:"trade_config_id" json:"trade_config_id"`
@@ -67,8 +95,29 @@ type TradeConfig struct {
 	StopLossPct     *float64  `db:"stop_loss_pct" json:"stop_loss_pct,omitempty"`
 	TakeProfitPct   *float64  `db:"take_profit_pct" json:"take_profit_pct,omitempty"`
 	TrailingSLPct   *float64  `db:"trailing_sl_pct" json:"trailing_sl_pct,omitempty"`
-	StopLossType    string    `db:"stop_loss_type" json:"stop_loss_type"`
-	CreatedAt       time.Time `db:"created_at" json:"created_at"`
+
+	// StopLossType: "FIXED" | "TRAILING" | "MULTI_LEVEL"
+	StopLossType string `db:"stop_loss_type" json:"stop_loss_type"`
+
+	// TakeProfitType: "FIXED" | "MULTI_LEVEL"
+	// Defaults to "FIXED" for backward compatibility.
+	TakeProfitType string `db:"take_profit_type" json:"take_profit_type"`
+
+	// MultiLevelSL holds up to 5 partial SL exit levels.
+	// Only used when StopLossType == "MULTI_LEVEL". Stored as JSONB.
+	MultiLevelSL []MultiLevelExitLevel `db:"-" json:"multi_level_sl,omitempty"`
+
+	// MultiLevelTP holds up to 5 partial TP exit levels.
+	// Only used when TakeProfitType == "MULTI_LEVEL". Stored as JSONB.
+	MultiLevelTP []MultiLevelExitLevel `db:"-" json:"multi_level_tp,omitempty"`
+
+	// TradeWindowStart / TradeWindowEnd define the IST time range (HH:MM, 24h)
+	// within which this strategy is allowed to place orders.
+	// Empty string means no restriction. Valid range: "09:15" to "15:00".
+	TradeWindowStart string `db:"trade_window_start" json:"trade_window_start"`
+	TradeWindowEnd   string `db:"trade_window_end" json:"trade_window_end"`
+
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
 }
 
 // RiskLimits represents risk management limits

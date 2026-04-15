@@ -74,6 +74,12 @@ type OrderRepository interface {
 	// GetStrategyNamesByIDs returns a map of strategy_id → strategy_name from the orders table.
 	// Looks across all orders (not just today's) to find names for strategies that may have been deleted.
 	GetStrategyNamesByIDs(ctx context.Context, strategyIDs []string) (map[string]string, error)
+
+	// ── Multi-level exit level operations ─────────────────────────────────────
+	UpsertMultiLevelExitLevel(ctx context.Context, rec *models.MultiLevelExitRecord) error
+	UpdateMultiLevelLevelStatus(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, status string, exitPrice float64) error
+	UpdateMultiLevelLevelBrokerID(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, brokerOrderID string, exitOrderID uuid.UUID) error
+	GetMultiLevelExitLevels(ctx context.Context, entryOrderID uuid.UUID) ([]*models.MultiLevelExitRecord, error)
 }
 
 type orderRepository struct {
@@ -800,4 +806,104 @@ func (r *orderRepository) GetStrategyNamesByIDs(ctx context.Context, strategyIDs
 		result[r.StrategyID] = r.StrategyName
 	}
 	return result, nil
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Multi-level exit level operations
+// ════════════════════════════════════════════════════════════════════════════
+
+// UpsertMultiLevelExitLevel inserts a new level row or updates it if (entry_order_id, exit_type, level_num) exists.
+func (r *orderRepository) UpsertMultiLevelExitLevel(ctx context.Context, rec *models.MultiLevelExitRecord) error {
+	query := `
+		INSERT INTO multi_level_exit_levels
+			(entry_order_id, exit_type, level_num, price_pct, qty_pct, trigger_price, exit_qty, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (entry_order_id, exit_type, level_num) DO UPDATE
+		SET trigger_price = EXCLUDED.trigger_price,
+		    exit_qty      = EXCLUDED.exit_qty,
+		    status        = EXCLUDED.status,
+		    updated_at    = NOW()
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		rec.EntryOrderID, rec.ExitType, rec.LevelNum,
+		rec.PricePct, rec.QtyPct, rec.TriggerPrice, rec.ExitQty, rec.Status,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upsert multi-level exit level: %w", err)
+	}
+	return nil
+}
+
+// UpdateMultiLevelLevelStatus marks a level as TRIGGERED or CANCELLED.
+func (r *orderRepository) UpdateMultiLevelLevelStatus(
+	ctx context.Context,
+	entryOrderID uuid.UUID,
+	exitType string,
+	levelNum int,
+	status string,
+	exitPrice float64,
+) error {
+	var triggeredAt *time.Time
+	var exitPricePtr *float64
+	if status == models.MLStatusTriggered {
+		now := time.Now()
+		triggeredAt = &now
+		exitPricePtr = &exitPrice
+	}
+	query := `
+		UPDATE multi_level_exit_levels
+		SET status       = $1,
+		    triggered_at = $2,
+		    exit_price   = $3,
+		    updated_at   = NOW()
+		WHERE entry_order_id = $4 AND exit_type = $5 AND level_num = $6
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		status, triggeredAt, exitPricePtr, entryOrderID, exitType, levelNum)
+	if err != nil {
+		return fmt.Errorf("failed to update multi-level level status: %w", err)
+	}
+	return nil
+}
+
+// UpdateMultiLevelLevelBrokerID stores the broker order ID for a live TP level.
+func (r *orderRepository) UpdateMultiLevelLevelBrokerID(
+	ctx context.Context,
+	entryOrderID uuid.UUID,
+	exitType string,
+	levelNum int,
+	brokerOrderID string,
+	exitOrderID uuid.UUID,
+) error {
+	query := `
+		UPDATE multi_level_exit_levels
+		SET broker_order_id = $1,
+		    exit_order_id   = $2,
+		    status          = 'ACTIVE',
+		    updated_at      = NOW()
+		WHERE entry_order_id = $3 AND exit_type = $4 AND level_num = $5
+	`
+	_, err := r.db.ExecContext(ctx, query, brokerOrderID, exitOrderID, entryOrderID, exitType, levelNum)
+	if err != nil {
+		return fmt.Errorf("failed to update multi-level broker ID: %w", err)
+	}
+	return nil
+}
+
+// GetMultiLevelExitLevels returns all level rows for a given entry order.
+func (r *orderRepository) GetMultiLevelExitLevels(ctx context.Context, entryOrderID uuid.UUID) ([]*models.MultiLevelExitRecord, error) {
+	var recs []*models.MultiLevelExitRecord
+	query := `
+		SELECT id, entry_order_id, exit_type, level_num, price_pct, qty_pct,
+		       trigger_price, exit_qty, status, exit_order_id, broker_order_id,
+		       triggered_at, exit_price, created_at, updated_at
+		FROM multi_level_exit_levels
+		WHERE entry_order_id = $1
+		ORDER BY exit_type, level_num
+	`
+	err := r.db.SelectContext(ctx, &recs, query, entryOrderID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get multi-level exit levels: %w", err)
+	}
+	return recs, nil
 }

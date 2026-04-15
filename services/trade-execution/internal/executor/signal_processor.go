@@ -20,12 +20,27 @@ import (
 // SignalProcessor processes trade signals from Kafka.
 // This is the primary entry point for all orders from the rules-engine.
 type SignalProcessor struct {
-	executor     *OrderExecutor
-	orderRepo    repository.OrderRepository
-	kafkaPub     *publisher.KafkaPublisher
-	priceMonitor *scheduler.PriceMonitor
-	ocoManager   *oco.OCOManager
-	logger       *zap.Logger
+	executor          *OrderExecutor
+	orderRepo         repository.OrderRepository
+	kafkaPub          *publisher.KafkaPublisher
+	priceMonitor      *scheduler.PriceMonitor
+	ocoManager        *oco.OCOManager
+	multiLevelManager MultiLevelManager
+	logger            *zap.Logger
+}
+
+// MultiLevelManager is the interface the SignalProcessor uses to register
+// entry orders with the multi-level exit manager. Implemented by *multilevel.Manager.
+type MultiLevelManager interface {
+	RegisterEntry(
+		entryOrder *models.Order,
+		slMode, tpMode string,
+		slLevels, tpLevels []models.MultiLevelExitLevel,
+		fixedSLPct, trailingSLPct float64,
+		auth *indiraClient.AuthContext,
+	)
+	OnEntryFill(ctx context.Context, entryOrderID uuid.UUID, fillPrice float64, filledQty int32,
+		slLevels, tpLevels []models.MultiLevelExitLevel)
 }
 
 // NewSignalProcessor creates a new trade signal processor.
@@ -53,6 +68,11 @@ func (p *SignalProcessor) SetPriceMonitor(pm *scheduler.PriceMonitor) {
 // SetOCOManager sets the OCO manager for routing trailing SL orders.
 func (p *SignalProcessor) SetOCOManager(m *oco.OCOManager) {
 	p.ocoManager = m
+}
+
+// SetMultiLevelManager sets the multi-level exit manager.
+func (p *SignalProcessor) SetMultiLevelManager(m MultiLevelManager) {
+	p.multiLevelManager = m
 }
 
 // ProcessTradeSignal processes a trade signal from Kafka — hot path.
@@ -91,7 +111,14 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 	dbMs := float64(time.Since(dbStart).Microseconds()) / 1000.0
 	metrics.SignalDBPersistDuration.Observe(time.Since(dbStart).Seconds())
 
+	// ── Detect multi-level SL / TP config ───────────────────────────────
+	hasMultiLevelSL := len(signal.MultiLevelSL) > 0 && signal.StopLossType == "MULTI_LEVEL"
+	hasMultiLevelTP := len(signal.MultiLevelTP) > 0 && signal.TakeProfitType == "MULTI_LEVEL"
+	isMultiLevel := (hasMultiLevelSL || hasMultiLevelTP) && p.multiLevelManager != nil
+
 	// ── Route 1: Trailing SL → Custom OCO ───────────────────────────────
+	// NOTE: Trailing SL + Multi-level TP is handled by Route 4 (multi-level),
+	// NOT by Route 1 (OCO), because multi-level TP requires N separate LIMIT orders.
 	isTrailingSL := order.StopLossType != nil && *order.StopLossType == "TRAILING"
 	hasAuth := order.BearerToken != nil && order.AppId != nil && order.Source != nil
 
@@ -115,7 +142,8 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 		}
 	}
 
-	if isTrailingSL && p.ocoManager != nil && hasAuth && !order.IsPaperTrade {
+	// Route 4 intercepts: Trailing SL with multi-level TP skips OCO.
+	if isTrailingSL && p.ocoManager != nil && hasAuth && !order.IsPaperTrade && !isMultiLevel {
 		err := p.routeToOCO(ctx, order, signal)
 		p.logOrderTiming(signal, "oco", kafkaTime, processStart, idempotencyMs, dbMs, err)
 		return err
@@ -137,6 +165,16 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 		p.priceMonitor.Watch(order, targetPrice)
 		p.logOrderTiming(signal, "price_monitor", kafkaTime, processStart, idempotencyMs, dbMs, nil)
 		return nil
+	}
+
+	// ── Route 4: Multi-level SL / TP ────────────────────────────────────
+	// Place entry order normally via executor, then register with ML manager.
+	// After paper fill: call OnEntryFill immediately.
+	// After live fill: HandleBrokerUpdate (via status service WS) calls OnEntryFill.
+	if isMultiLevel {
+		err = p.routeToMultiLevel(ctx, order, signal)
+		p.logOrderTiming(signal, "multi_level", kafkaTime, processStart, idempotencyMs, dbMs, err)
+		return err
 	}
 
 	// ── Route 3: Default → Broker API (bracket or regular order) ────────
@@ -215,6 +253,80 @@ func (p *SignalProcessor) logOrderTiming(signal *models.TradeSignal, route strin
 }
 
 
+
+// routeToMultiLevel places the entry order via the regular executor then registers
+// the order with the multi-level exit manager. For paper trades the fill is
+// immediate, so OnEntryFill is called inline. For live trades the ML manager
+// waits for the broker WS EXECUTED event via HandleBrokerUpdate.
+func (p *SignalProcessor) routeToMultiLevel(ctx context.Context, order *models.Order, signal *models.TradeSignal) error {
+	slMode := signal.StopLossType
+	if slMode == "" {
+		slMode = "FIXED"
+	}
+	tpMode := signal.TakeProfitType
+	if tpMode == "" {
+		tpMode = "FIXED"
+	}
+
+	var auth *indiraClient.AuthContext
+	if order.BearerToken != nil && order.AppId != nil && order.Source != nil {
+		auth = &indiraClient.AuthContext{
+			UserId:      order.UserID,
+			BearerToken: *order.BearerToken,
+			AppId:       *order.AppId,
+			Source:      *order.Source,
+		}
+	}
+
+	fixedSLPct := signal.StopLossPct
+	trailingSLPct := signal.TrailingSLPct
+
+	// Register BEFORE placing — so that if paper fill fires the OnPaperFilled
+	// callback synchronously, the group is already in the map.
+	p.multiLevelManager.RegisterEntry(
+		order,
+		slMode, tpMode,
+		signal.MultiLevelSL, signal.MultiLevelTP,
+		fixedSLPct, trailingSLPct,
+		auth,
+	)
+
+	// Place entry order
+	if err := p.executor.ExecuteOrder(ctx, order); err != nil {
+		return fmt.Errorf("multi-level entry order execution failed: %w", err)
+	}
+
+	// For paper trades: entry is filled immediately — trigger ML fill processing now.
+	if order.IsPaperTrade && order.FilledQuantity > 0 && order.FilledPrice != nil {
+		fillPrice := *order.FilledPrice
+		p.multiLevelManager.OnEntryFill(
+			ctx, order.OrderID, fillPrice, order.FilledQuantity,
+			signal.MultiLevelSL, signal.MultiLevelTP,
+		)
+	}
+
+	// For live trades: ML manager's HandleBrokerUpdate fires when broker WS reports EXECUTED.
+	// Ensure broker WS subscription is active.
+	if !order.IsPaperTrade && p.executor.statusSvc != nil && auth != nil {
+		go func() {
+			if err := p.executor.statusSvc.StartSubscription(context.Background(), order.UserID, auth); err != nil {
+				p.logger.Warn("ml_ws_sub_failed",
+					zap.String("uid", order.UserID),
+					zap.Error(err))
+			}
+		}()
+	}
+
+	p.logger.Info("Order routed to multi-level manager",
+		zap.String("order_id", order.OrderID.String()),
+		zap.String("symbol", order.Symbol),
+		zap.String("sl_mode", slMode),
+		zap.String("tp_mode", tpMode),
+		zap.Int("ml_sl_levels", len(signal.MultiLevelSL)),
+		zap.Int("ml_tp_levels", len(signal.MultiLevelTP)))
+
+	return nil
+}
 
 // routeToOCO creates an OCO entry order for trailing SL signals.
 // Instead of placing a broker bracket order, this creates a custom OCO group:

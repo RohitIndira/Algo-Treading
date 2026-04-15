@@ -65,7 +65,11 @@ type TradeConfigPayload struct {
 	TakeProfitPct float64 `json:"take_profit_pct"`
 	TrailingSLPct float64 `json:"trailing_sl_pct"`
 	StopLossType  string  `json:"stop_loss_type"`
-	CreatedAt     int64   `json:"created_at"`
+	// Trade window: orders only fire when IST time is within [start, end].
+	// HH:MM 24-hour format. Empty = no restriction.
+	TradeWindowStart string `json:"trade_window_start"`
+	TradeWindowEnd   string `json:"trade_window_end"`
+	CreatedAt        int64  `json:"created_at"`
 }
 
 type RiskLimitsPayload struct {

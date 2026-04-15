@@ -47,18 +47,20 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 
 	// Trade config
 	s.TradeConfig = models.TradeConfig{
-		OrderType:       normalizeOrderType(p.TradeConfig.OrderType),
-		Quantity:        p.TradeConfig.Quantity,
-		Exchange:        normalizeExchange(p.TradeConfig.Exchange),
-		OrderSide:       normalizeOrderSide(p.TradeConfig.OrderSide),
-		Validity:        normalizeValidity(p.TradeConfig.Validity),
-		LimitPrice:      p.TradeConfig.LimitPrice,
-		StopLossPct:     p.TradeConfig.StopLossPct,
-		TakeProfitPct:   p.TradeConfig.TakeProfitPct,
-		StopLossType:    normalizeStopLossType(p.TradeConfig.StopLossType),
-		TrailingSLPct:   p.TradeConfig.TrailingSLPct,
-		ProductType:     normalizeProductType(p.TradeConfig.ProductType),
-		MaxPositionSize: 0,
+		OrderType:        normalizeOrderType(p.TradeConfig.OrderType),
+		Quantity:         p.TradeConfig.Quantity,
+		Exchange:         normalizeExchange(p.TradeConfig.Exchange),
+		OrderSide:        normalizeOrderSide(p.TradeConfig.OrderSide),
+		Validity:         normalizeValidity(p.TradeConfig.Validity),
+		LimitPrice:       p.TradeConfig.LimitPrice,
+		StopLossPct:      p.TradeConfig.StopLossPct,
+		TakeProfitPct:    p.TradeConfig.TakeProfitPct,
+		StopLossType:     normalizeStopLossType(p.TradeConfig.StopLossType),
+		TrailingSLPct:    p.TradeConfig.TrailingSLPct,
+		ProductType:      normalizeProductType(p.TradeConfig.ProductType),
+		MaxPositionSize:  0,
+		TradeWindowStart: p.TradeConfig.TradeWindowStart,
+		TradeWindowEnd:   p.TradeConfig.TradeWindowEnd,
 	}
 
 	// Risk limits

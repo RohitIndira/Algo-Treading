@@ -34,6 +34,15 @@ type OCOHandler interface {
 	IsKnownBrokerID(brokerID string) bool
 }
 
+// MLHandler is called on every broker WS status update to check if the order
+// belongs to a multi-level exit group (TP limit orders or single SL order).
+// Implemented by *multilevel.Manager.
+type MLHandler interface {
+	HandleBrokerUpdate(ctx context.Context, order *models.Order, brokerStatus string)
+	CancelGroupsBySymbol(ctx context.Context, userID string, symbol string)
+	IsKnownBrokerID(brokerID string) bool
+}
+
 // OrderStatusService listens to a single shared WebSocket connection and
 // routes order-status updates to the correct user by WSOrderStatus.UserID.
 // All active users share one TCP connection to Indira instead of one per user.
@@ -45,6 +54,7 @@ type OrderStatusService struct {
 	logger        *zap.Logger
 	wsBroadcaster func(userID string, order *models.Order)
 	ocoHandler    OCOHandler // OCO order management hook
+	mlHandler     MLHandler  // Multi-level exit order management hook
 
 	// tokenExpiredNotifier is called when a user's token is confirmed expired (30s retry also failed).
 	// Wired in main.go to push a token_expired event via /ws/live-orders.
@@ -105,6 +115,12 @@ func (s *OrderStatusService) ResumeUserSubscription(userID string, auth *indiraC
 //   - SL leg fill → cancel TP leg (and vice versa)
 func (s *OrderStatusService) SetOCOHandler(handler OCOHandler) {
 	s.ocoHandler = handler
+}
+
+// SetMLHandler wires the multi-level exit manager so broker WS events for
+// live TP limit orders and single SL orders are routed correctly.
+func (s *OrderStatusService) SetMLHandler(handler MLHandler) {
+	s.mlHandler = handler
 }
 
 // NewOrderStatusService creates a new order status service.
@@ -444,6 +460,13 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	if s.ocoHandler != nil {
 		orderCopy := *order
 		go s.ocoHandler.HandleBrokerUpdate(context.Background(), &orderCopy, brokerStatusUpper)
+	}
+
+	// ── Multi-level hook: check if order is a TP/SL leg of a multi-level group ──
+	// Handles: TP limit order fills, fixed/trailing SL fills for multi-level groups.
+	if s.mlHandler != nil {
+		orderCopy := *order
+		go s.mlHandler.HandleBrokerUpdate(context.Background(), &orderCopy, brokerStatusUpper)
 	}
 
 	s.publishNotification(ctx, order, wsStatus)
