@@ -455,6 +455,67 @@ func (h *PaperTradingHandler) GetPriceWatches(w http.ResponseWriter, r *http.Req
 	w.Write(body)
 }
 
+// SetAutoSquareOffConfig handles POST /api/v1/auto-square-off/config
+// Stores the user's auto square-off time directly in trade-execution (no risk-management dep).
+func (h *PaperTradingHandler) SetAutoSquareOffConfig(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("userId")
+	if userID == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
+
+	bodyBytes, _ := io.ReadAll(r.Body)
+	var payload map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	payload["user_id"] = userID
+	enriched, _ := json.Marshal(payload)
+
+	resp, err := http.Post(
+		h.tradeExecBaseURL+"/ws/auto-square-off/config",
+		"application/json",
+		io.NopCloser(newReaderFrom(enriched)),
+	)
+	if err != nil {
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// GetAutoSquareOffConfig handles GET /api/v1/auto-square-off/config
+// Returns the user's auto square-off config from trade-execution.
+func (h *PaperTradingHandler) GetAutoSquareOffConfig(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	url := fmt.Sprintf("%s/ws/auto-square-off/config?user_id=%s", h.tradeExecBaseURL, userID)
+	resp, err := http.Get(url)
+	if err != nil {
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
 // GetPaperWSInfo returns the WebSocket URL the frontend should connect to.
 // GET /api/v1/paper-trades/ws-info
 func (h *PaperTradingHandler) GetPaperWSInfo(w http.ResponseWriter, r *http.Request) {

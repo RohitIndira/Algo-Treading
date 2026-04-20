@@ -70,20 +70,25 @@ CREATE TABLE IF NOT EXISTS strategy_conditions (
 
 -- Trade configuration (one row per strategy)
 CREATE TABLE IF NOT EXISTS trade_configs (
-    trade_config_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    strategy_id     UUID        NOT NULL UNIQUE REFERENCES strategies(strategy_id) ON DELETE CASCADE,
-    order_type      VARCHAR(50) NOT NULL,
-    product_type    VARCHAR(50) NOT NULL,
-    validity        VARCHAR(50) NOT NULL,
-    quantity        INTEGER     NOT NULL,
-    exchange        VARCHAR(20) NOT NULL,
-    order_side      VARCHAR(20) NOT NULL DEFAULT 'BUY',
-    limit_price     DECIMAL,
-    stop_loss_pct   DECIMAL,
-    take_profit_pct DECIMAL,
-    trailing_sl_pct DECIMAL,
-    stop_loss_type  VARCHAR(20) DEFAULT 'FIXED',
-    created_at      TIMESTAMPTZ DEFAULT NOW()
+    trade_config_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id       UUID        NOT NULL UNIQUE REFERENCES strategies(strategy_id) ON DELETE CASCADE,
+    order_type        VARCHAR(50) NOT NULL,
+    product_type      VARCHAR(50) NOT NULL,
+    validity          VARCHAR(50) NOT NULL,
+    quantity          INTEGER     NOT NULL,
+    exchange          VARCHAR(20) NOT NULL,
+    order_side        VARCHAR(20) NOT NULL DEFAULT 'BUY',
+    limit_price       DECIMAL,
+    stop_loss_pct     DECIMAL,
+    take_profit_pct   DECIMAL,
+    trailing_sl_pct   DECIMAL,
+    stop_loss_type    VARCHAR(20) DEFAULT 'FIXED',
+    take_profit_type  VARCHAR(20) DEFAULT 'FIXED',
+    multi_level_sl    JSONB,
+    multi_level_tp    JSONB,
+    trade_window_start VARCHAR(5) NOT NULL DEFAULT '',
+    trade_window_end   VARCHAR(5) NOT NULL DEFAULT '',
+    created_at        TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Risk limits (one row per strategy)
@@ -187,8 +192,11 @@ CREATE TABLE IF NOT EXISTS orders (
     trailing_sl_pct  DECIMAL(10,4),
     highest_price    DECIMAL(15,2),
 
-    -- Auto square-off flag
-    is_square_off_order BOOLEAN DEFAULT false,
+    -- Auto square-off
+    is_square_off_order   BOOLEAN     DEFAULT false,
+    -- Per-user override: HH:MM IST at which all this user's positions are force-closed.
+    -- NULL = use the global default (15:05 live, 15:00 paper).
+    auto_square_off_time  VARCHAR(5),
 
     -- Paper trading
     is_paper_trade    BOOLEAN      DEFAULT false,
@@ -253,6 +261,9 @@ CREATE INDEX IF NOT EXISTS idx_orders_product_type ON orders(product_type, statu
 CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_number ON orders(exchange_order_number) WHERE exchange_order_number IS NOT NULL;
 
 -- Paper trading indexes
+CREATE INDEX IF NOT EXISTS idx_orders_auto_sq_off_time ON orders(auto_square_off_time, user_id)
+    WHERE auto_square_off_time IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_orders_paper_trade  ON orders(user_id, is_paper_trade, status)        WHERE is_paper_trade = true;
 CREATE INDEX IF NOT EXISTS idx_orders_paper_symbol ON orders(symbol, is_paper_trade, status)          WHERE is_paper_trade = true;
 CREATE INDEX IF NOT EXISTS idx_orders_paper_closed ON orders(user_id, is_paper_trade, paper_exit_price) WHERE is_paper_trade = true AND paper_exit_price IS NOT NULL;
@@ -348,15 +359,68 @@ CREATE TRIGGER trade_signals_updated_at BEFORE UPDATE ON trade_signals
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
+-- MULTI-LEVEL EXIT LEVELS (migration 014)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS multi_level_exit_levels (
+    id              SERIAL          PRIMARY KEY,
+    entry_order_id  UUID            NOT NULL,
+    exit_type       VARCHAR(5)      NOT NULL CHECK (exit_type IN ('SL', 'TP')),
+    level_num       INT             NOT NULL CHECK (level_num BETWEEN 1 AND 5),
+    price_pct       DECIMAL(10,4)   NOT NULL CHECK (price_pct > 0),
+    qty_pct         DECIMAL(10,4)   NOT NULL CHECK (qty_pct > 0),
+    trigger_price   DECIMAL(15,2),
+    exit_qty        INT,
+    status          VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
+    exit_order_id   UUID,
+    broker_order_id VARCHAR(50),
+    triggered_at    TIMESTAMPTZ,
+    exit_price      DECIMAL(15,2),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_ml_entry_type_level UNIQUE (entry_order_id, exit_type, level_num)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ml_entry_order ON multi_level_exit_levels(entry_order_id);
+CREATE INDEX IF NOT EXISTS idx_ml_active_sl   ON multi_level_exit_levels(exit_type, status) WHERE exit_type = 'SL' AND status IN ('PENDING', 'ACTIVE');
+CREATE INDEX IF NOT EXISTS idx_ml_active_tp   ON multi_level_exit_levels(exit_type, status) WHERE exit_type = 'TP' AND status IN ('PENDING', 'ACTIVE');
+CREATE INDEX IF NOT EXISTS idx_ml_broker_order ON multi_level_exit_levels(broker_order_id)  WHERE broker_order_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION update_ml_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_ml_updated_at
+    BEFORE UPDATE ON multi_level_exit_levels
+    FOR EACH ROW EXECUTE FUNCTION update_ml_updated_at();
+
+-- ============================================================================
+-- USER AUTO SQUARE-OFF CONFIG (migration 016)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS user_square_off_config (
+    user_id         VARCHAR(50) PRIMARY KEY,
+    square_off_time VARCHAR(5)  NOT NULL,
+    enabled         BOOLEAN     NOT NULL DEFAULT true,
+    updated_at      TIMESTAMP   DEFAULT NOW()
+);
+
+-- ============================================================================
 -- TABLE COMMENTS
 -- ============================================================================
 
-COMMENT ON TABLE strategies          IS 'User trading strategies configuration';
-COMMENT ON TABLE strategy_conditions IS 'Conditions/filters for strategy triggers';
-COMMENT ON TABLE trade_configs       IS 'Trade execution configuration per strategy';
-COMMENT ON TABLE risk_limits         IS 'Risk management limits per strategy';
-COMMENT ON TABLE execution_outbox    IS 'Transactional outbox for reliable Kafka publishing';
-COMMENT ON TABLE user_credentials    IS 'Indira Securities broker authentication credentials';
-COMMENT ON TABLE orders              IS 'Order records submitted to broker';
-COMMENT ON TABLE execution_events    IS 'Event log for order lifecycle tracking';
-COMMENT ON TABLE trade_signals       IS 'Trade signals generated by rules engine';
+COMMENT ON TABLE strategies              IS 'User trading strategies configuration';
+COMMENT ON TABLE strategy_conditions     IS 'Conditions/filters for strategy triggers';
+COMMENT ON TABLE trade_configs           IS 'Trade execution configuration per strategy';
+COMMENT ON TABLE risk_limits             IS 'Risk management limits per strategy';
+COMMENT ON TABLE execution_outbox        IS 'Transactional outbox for reliable Kafka publishing';
+COMMENT ON TABLE user_credentials        IS 'Indira Securities broker authentication credentials';
+COMMENT ON TABLE orders                  IS 'Order records submitted to broker';
+COMMENT ON TABLE execution_events        IS 'Event log for order lifecycle tracking';
+COMMENT ON TABLE trade_signals           IS 'Trade signals generated by rules engine';
+COMMENT ON TABLE multi_level_exit_levels IS 'Runtime state of each partial SL/TP exit level per entry order';
+COMMENT ON TABLE user_square_off_config  IS 'Per-user auto square-off time stored natively in trade-execution';

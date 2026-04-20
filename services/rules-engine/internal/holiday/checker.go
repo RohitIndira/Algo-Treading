@@ -61,7 +61,7 @@ func New(ctx context.Context, cfg Config, logger *zap.Logger) (*Checker, error) 
 
 	c := &Checker{
 		client:     client,
-		collection: client.Database("OdinMasterData").Collection("OdinMasterData"),
+		collection: client.Database("OdinMasterData").Collection("HolidayMaster"),
 		logger:     logger,
 		timezone:   loc,
 		holidays:   make(map[string]struct{}),

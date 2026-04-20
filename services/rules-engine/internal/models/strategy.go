@@ -58,6 +58,15 @@ type MarketCapRange struct {
 	MaxMcap float64 `json:"max_mcap" bson:"max_mcap"` // Maximum market cap in crores
 }
 
+// MultiLevelExitLevel defines one partial-exit level for multi-level SL or TP.
+// price_pct is always positive; direction is implied by exit type and order side.
+// qty_pct is the % of TOTAL position qty to exit at this level; all levels sum to 100.
+type MultiLevelExitLevel struct {
+	LevelNum int     `json:"level_num" bson:"level_num"`
+	PricePct float64 `json:"price_pct" bson:"price_pct"`
+	QtyPct   float64 `json:"qty_pct" bson:"qty_pct"`
+}
+
 // TradeConfig represents trade configuration
 type TradeConfig struct {
 	OrderType       string  `json:"order_type" bson:"order_type"` // MARKET, LIMIT
@@ -69,9 +78,15 @@ type TradeConfig struct {
 	OrderSide       string  `json:"order_side" bson:"order_side"`           // BUY/SELL
 	Validity        string  `json:"validity" bson:"validity"`               // DAY/IOC
 	LimitPrice      float64 `json:"limit_price" bson:"limit_price"`         // LIMIT only
-	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING
+	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING, MULTI_LEVEL
+	TakeProfitType  string  `json:"take_profit_type" bson:"take_profit_type"` // FIXED, MULTI_LEVEL
 	TrailingSLPct   float64 `json:"trailing_sl_pct" bson:"trailing_sl_pct"` // Trailing SL percentage
 	ProductType     string  `json:"product_type" bson:"product_type"`       // INTRADAY, DELIVERY, CASH
+
+	// Multi-level exit levels (non-nil only when respective type == "MULTI_LEVEL")
+	MultiLevelSL []MultiLevelExitLevel `json:"multi_level_sl,omitempty" bson:"multi_level_sl,omitempty"`
+	MultiLevelTP []MultiLevelExitLevel `json:"multi_level_tp,omitempty" bson:"multi_level_tp,omitempty"`
+
 	// TradeWindowStart / TradeWindowEnd define the IST time range (HH:MM, 24h)
 	// within which this strategy may place orders. Empty = no restriction.
 	TradeWindowStart string `json:"trade_window_start" bson:"trade_window_start"`

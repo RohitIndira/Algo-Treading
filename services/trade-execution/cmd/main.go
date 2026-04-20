@@ -489,6 +489,57 @@ func main() {
 	// registered and executed through the ML manager.
 	signalProcessor.SetMultiLevelManager(mlManager)
 
+	// Wire ML paper completion → WS broadcast so the frontend receives a
+	// position_exit event when all levels of a paper ML position have triggered.
+	mlManager.OnPaperGroupCompleted = func(userID, orderID string, finalPnL, avgExitPrice float64) {
+		// Remove from paper monitor cache so it stops receiving price updates.
+		// Without this the order stays in cache with FilledQuantity=0 and triggers
+		// warn-spam on every tick after all ML levels have exited.
+		if oid, err := uuid.Parse(orderID); err == nil {
+			paperMonitor.RemoveOrder(oid)
+		}
+		paperWSServer.Broadcast(userID, paper.PaperUpdate{
+			Type:      "position_exit",
+			OrderID:   orderID,
+			UserID:    userID,
+			LTP:       avgExitPrice,
+			FinalPnL:  finalPnL,
+			Reason:    "MULTI_LEVEL_COMPLETE",
+			ExitPrice: avgExitPrice,
+		})
+	}
+
+	// Wire ML canceller into the paper monitor so force-exit stops ML goroutines.
+	paperMonitor.SetMLCanceller(mlManager)
+
+	// Wire ML level trigger → WS broadcast so frontend refreshes level chips in real time.
+	mlManager.OnPaperLevelTriggered = func(userID, orderID, exitType string, levelNum int, exitPrice float64, remainingQty int32, cancelledExitType string, cancelledLevelNum int) {
+		paperWSServer.Broadcast(userID, paper.PaperUpdate{
+			Type:              "ml_level_triggered",
+			OrderID:           orderID,
+			UserID:            userID,
+			ExitType:          exitType,
+			LevelNum:          levelNum,
+			ExitPrice:         exitPrice,
+			RemainingQty:      remainingQty,
+			CancelledExitType: cancelledExitType,
+			CancelledLevelNum: cancelledLevelNum,
+		})
+	}
+
+	// Wire partial-exit qty update → monitor cache so PnL broadcasts use remaining qty.
+	mlManager.OnPaperQtyUpdated = func(entryOrderID uuid.UUID, remainingQty int32) {
+		paperMonitor.UpdateCachedOrderQty(entryOrderID, remainingQty)
+	}
+
+	// Wire SL breakeven move → monitor cache so the regular SL price-check in the
+	// paper monitor uses the updated (tighter) stop after each TP level fires.
+	// After TP L1: SL moves to entry price (breakeven). After TP L2+: SL moves to
+	// the previous TP trigger price, locking in that level's profit.
+	mlManager.OnPaperSLMoved = func(entryOrderID uuid.UUID, newSL float64) {
+		paperMonitor.UpdateCachedOrderSL(entryOrderID, newSL)
+	}
+
 	log.Println("✓ Multi-level SL/TP layer initialized")
 	// ──────────────────────────────────────────────────────────────────────
 
@@ -504,7 +555,9 @@ func main() {
 	)
 	// Wire paper monitor so paper positions are closed at market close alongside live positions.
 	autoSquareOff.SetPaperSquareOff(paperMonitor.SquareOffAll)
-	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled)", cfg.AutoSquareOffTime)
+	// Wire per-user paper exit: closes a specific user's paper positions at their custom time.
+	autoSquareOff.SetPaperForceExitUser(paperMonitor.ForceExitAll)
+	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-user: enabled)", cfg.AutoSquareOffTime)
 	// ──────────────────────────────────────────────────────────────────────
 
 	// Start services

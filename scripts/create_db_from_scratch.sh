@@ -38,6 +38,12 @@ echo "Applying service migrations..."
 mapfile -t MIG_FILES < <(find "$REPO_ROOT/services" -type f -path "*/migrations/*.sql" 2>/dev/null | sort)
 
 for sql in "${MIG_FILES[@]}"; do
+  base="$(basename "$sql")"
+  # Skip rollback/cleanup migrations that conflict with the base schema
+  if [[ "$base" == "012_rollback_v2.sql" || "$base" == "013_drop_legacy_tables.sql" ]]; then
+    echo "-> Skipping (rollback/cleanup): $sql"
+    continue
+  fi
   echo "-> Applying: $sql"
   psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$DBNAME" -v ON_ERROR_STOP=1 -f "$sql" || true
 done

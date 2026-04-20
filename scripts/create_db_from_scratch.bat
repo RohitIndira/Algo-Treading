@@ -45,10 +45,15 @@ if errorlevel 1 (
 
 echo Applying service migrations...
 
-rem Apply migrations from services/*/migrations
+rem Apply migrations from services/*/migrations (skip rollback/cleanup scripts)
 for /f "delims=" %%F in ('dir /b /s "%REPO_ROOT%\services\*\migrations\*.sql" 2^>nul ^| sort') do (
-  echo -^> Applying: %%F
-  psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %DBNAME% -f "%%F"
+  echo %%~nxF | findstr /i "012_rollback_v2 013_drop_legacy_tables" >nul
+  if errorlevel 1 (
+    echo -^> Applying: %%F
+    psql -h %PGHOST% -p %PGPORT% -U %PGUSER% -d %DBNAME% -f "%%F"
+  ) else (
+    echo -^> Skipping rollback/cleanup: %%~nxF
+  )
 )
 
 echo All migrations applied successfully. Database "%DBNAME%" is ready.

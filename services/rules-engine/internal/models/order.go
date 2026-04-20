@@ -38,11 +38,16 @@ type OrderRequest struct {
 	AppId       string `json:"app_id"`       // Application ID
 	Source      string `json:"source"`       // Source platform (IOS, AND, WEB)
 
-	// Stop loss configuration
-	StopLossType  string  `json:"stop_loss_type"`  // "FIXED" or "TRAILING"
-	StopLossPct   float64 `json:"stop_loss_pct"`   // Original SL percentage from strategy
-	TakeProfitPct float64 `json:"take_profit_pct"` // Original TP percentage from strategy
-	TrailingSLPct float64 `json:"trailing_sl_pct"` // Trailing stop loss percentage
+	// Stop loss / take profit configuration
+	StopLossType   string  `json:"stop_loss_type"`   // "FIXED" | "TRAILING" | "MULTI_LEVEL"
+	TakeProfitType string  `json:"take_profit_type"` // "FIXED" | "MULTI_LEVEL"
+	StopLossPct    float64 `json:"stop_loss_pct"`    // Original SL percentage from strategy
+	TakeProfitPct  float64 `json:"take_profit_pct"`  // Original TP percentage from strategy
+	TrailingSLPct  float64 `json:"trailing_sl_pct"`  // Trailing stop loss percentage
+
+	// Multi-level exit levels (non-nil only when respective type == "MULTI_LEVEL")
+	MultiLevelSL []MultiLevelExitLevel `json:"multi_level_sl,omitempty"`
+	MultiLevelTP []MultiLevelExitLevel `json:"multi_level_tp,omitempty"`
 
 	// Product type
 	ProductType string `json:"product_type"` // INTRADAY, DELIVERY, CASH
@@ -63,6 +68,11 @@ type OrderRequest struct {
 	// The PriceMonitor must NOT trigger the order if LTP exceeds this level.
 	// 0 means no upper bound.
 	MaxMonitorPrice float64 `json:"max_monitor_price,omitempty"`
+
+	// AutoSquareOffTime is the user-configured time (HH:MM IST) at which all
+	// open positions for this user should be automatically closed.
+	// Empty string = use the global default in trade-execution (15:05 IST live, 15:00 paper).
+	AutoSquareOffTime string `json:"auto_square_off_time,omitempty"`
 }
 
 // RuleMatch represents a successful rule match
@@ -147,17 +157,29 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 		AppId:       strategy.AppId,
 		Source:      strategy.Source,
 
-		// Stop loss configuration
-		StopLossType:  stopLossType,
-		StopLossPct:   strategy.TradeConfig.StopLossPct,
-		TakeProfitPct: strategy.TradeConfig.TakeProfitPct,
-		TrailingSLPct: strategy.TradeConfig.TrailingSLPct,
+		// Stop loss / take profit configuration
+		StopLossType:   stopLossType,
+		TakeProfitType: strategy.TradeConfig.TakeProfitType,
+		StopLossPct:    strategy.TradeConfig.StopLossPct,
+		TakeProfitPct:  strategy.TradeConfig.TakeProfitPct,
+		TrailingSLPct:  strategy.TradeConfig.TrailingSLPct,
+		MultiLevelSL:   strategy.TradeConfig.MultiLevelSL,
+		MultiLevelTP:   strategy.TradeConfig.MultiLevelTP,
 
 		// Product type
 		ProductType: productType,
 
 		// Trading mode
 		TradingMode: strategy.TradingMode,
+
+		// Per-user auto square-off override from strategy risk limits.
+		// Only forwarded when the user has explicitly enabled it.
+		AutoSquareOffTime: func() string {
+			if strategy.RiskLimits.EnableAutoSquareOff {
+				return strategy.RiskLimits.AutoSquareOffTime
+			}
+			return ""
+		}(),
 	}
 }
 

@@ -162,7 +162,7 @@ func (e *Evaluator) evaluateCategory(event *models.MarketEvent, strategy *models
 	}
 
 	for _, category := range strategy.Conditions.Categories {
-		if category == event.NewsData.Category {
+		if strings.EqualFold(category, event.NewsData.Category) {
 			result.MatchedConditions = append(result.MatchedConditions, condition)
 			result.ConditionScores[condition] = 100.0
 			return
@@ -304,25 +304,28 @@ func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *model
 		zap.String("strategy_id", strategy.StrategyID))
 }
 
-// evaluateExchange evaluates exchange condition
+// evaluateExchange evaluates exchange condition against the Conditions.Exchanges filter list.
+// TradeConfig.Exchange is the execution exchange (where to place orders) and is NOT used for filtering.
 func (e *Evaluator) evaluateExchange(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
 	condition := "exchange"
 
-	// If strategy has no exchange preference, accept all
-	if strategy.TradeConfig.Exchange == "" {
+	// Empty filter list means accept all exchanges
+	if len(strategy.Conditions.Exchanges) == 0 {
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 		result.ConditionScores[condition] = 100.0
 		return
 	}
 
-	// Check if exchange matches
-	if event.StockData.Exchange == strategy.TradeConfig.Exchange {
-		result.MatchedConditions = append(result.MatchedConditions, condition)
-		result.ConditionScores[condition] = 100.0
-	} else {
-		result.FailedConditions = append(result.FailedConditions, condition)
-		result.ConditionScores[condition] = 0
+	for _, ex := range strategy.Conditions.Exchanges {
+		if strings.EqualFold(ex, event.StockData.Exchange) {
+			result.MatchedConditions = append(result.MatchedConditions, condition)
+			result.ConditionScores[condition] = 100.0
+			return
+		}
 	}
+
+	result.FailedConditions = append(result.FailedConditions, condition)
+	result.ConditionScores[condition] = 0
 }
 
 // GetMatchedConditionCount returns the number of matched conditions

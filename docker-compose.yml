@@ -206,19 +206,19 @@ services:
     hostname: rules-engine
     ports:
       - "50053:50053"
-    environment:
-      # Kafka
-      KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC_INPUT: market.data.news
-      KAFKA_TOPIC_OUTPUT: order.execution.queue
-
-      # Redis
-      REDIS_HOST: redis
-      R_file:
+    env_file:
       - ./services/rules-engine/.env.live
     environment:
       ENVIRONMENT: production
-      GRPC_PORT: 50053topped
+      GRPC_PORT: 50053
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-network
+    restart: unless-stopped
 
   trade-execution:
     build:
@@ -228,21 +228,19 @@ services:
     hostname: trade-execution
     ports:
       - "50054:50054"
-    environment:
-      # Database
-      DATABASE_HOST: postgres
-      DATABASE_PORT: 5432
-      DATABASE_USER: postgres
-      DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db
-      
-      # Message Queue
-      RABBITMQ_HOST: rabbitmq
-      R_file:
+    env_file:
       - ./services/trade-execution/.env.live
     environment:
       ENVIRONMENT: production
-      SERVICE_PORT: 50054topped
+      SERVICE_PORT: 50054
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - trading-network
+    restart: unless-stopped
 
   risk-management:
     build:
@@ -252,27 +250,21 @@ services:
     hostname: risk-management
     ports:
       - "50055:50055"
-    environment:
-      # Database
-      DATABASE_HOST: postgres
-      DATABASE_PORT: 5432
-      DATABASE_USER: postgres
-      DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db
-      
-      # Redis (for risk counters)
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      
-      # gRPC
-      GRPC_PORT: 50055
-      
-      #_file:
+    env_file:
       - ./services/risk-management/.env.live
     environment:
       ENVIRONMENT: production
       SERVICE_PORT: 50055
-    driver: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+volumes:
   mongodb-data:
     driver: local
   mongodb-config:

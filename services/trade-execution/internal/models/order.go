@@ -134,6 +134,11 @@ type Order struct {
 	// Auto square-off flag
 	IsSquareOffOrder bool `json:"is_square_off_order" db:"is_square_off_order"` // Flag for auto square-off orders
 
+	// AutoSquareOffTime is a per-user override for when all positions are closed
+	// (format "HH:MM" IST, e.g. "14:30"). Applies to both paper and live modes.
+	// NULL / empty means "use the global default" (15:05 live, 15:00 paper).
+	AutoSquareOffTime *string `json:"auto_square_off_time,omitempty" db:"auto_square_off_time"`
+
 	// Paper trading fields
 	IsPaperTrade    bool     `json:"is_paper_trade" db:"is_paper_trade"`               // True for paper trade orders
 	TradingMode     string   `json:"trading_mode" db:"trading_mode"`                    // PAPER or LIVE

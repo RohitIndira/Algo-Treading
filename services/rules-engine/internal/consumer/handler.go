@@ -376,6 +376,11 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	slPct := strategy.TradeConfig.StopLossPct
 	tpPct := strategy.TradeConfig.TakeProfitPct
 	isTrailingSL := strategy.TradeConfig.StopLossType == "TRAILING"
+	// For MULTI_LEVEL modes, absolute SL/TP prices are computed by the multi-level
+	// manager from level price_pct values. Setting them here from slPct/tpPct=0 would
+	// produce SL=TP=entry price, causing the paper monitor to exit immediately.
+	isMultiLevelSL := strategy.TradeConfig.StopLossType == "MULTI_LEVEL"
+	isMultiLevelTP := strategy.TradeConfig.TakeProfitType == "MULTI_LEVEL"
 
 	switch match.PctChangeStatus {
 	case "within_range":
@@ -391,14 +396,22 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			// Use INTRADAY (not BRACKET) because OCO places SL+TP legs separately.
 			orderReq.ProductType = "INTRADAY"
 		} else {
-			// Fixed SL → use broker's native bracket order.
-			orderReq.ProductType = "BRACKET"
+			// Fixed SL or MULTI_LEVEL → INTRADAY; ML manager places its own exit orders.
+			if isMultiLevelSL {
+				orderReq.ProductType = "INTRADAY"
+			} else {
+				orderReq.ProductType = "BRACKET"
+			}
 		}
 
-		// SL/TP from the trigger price (LTP) — the actual entry target.
-		// limitPrice is just a buffer to ensure fill, not the base for risk.
-		orderReq.StopLoss = roundToTickSize(ltp*(1-slPct/100), tickSize)
-		orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
+		// SL/TP from the trigger price (LTP).
+		// Leave as 0 for MULTI_LEVEL modes — ML manager computes its own triggers.
+		if !isMultiLevelSL {
+			orderReq.StopLoss = roundToTickSize(ltp*(1-slPct/100), tickSize)
+		}
+		if !isMultiLevelTP {
+			orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
+		}
 
 		h.logger.Info("Case 1: pct_change within range — immediate order",
 			zap.String("strategy_id", strategy.StrategyID),
@@ -450,10 +463,14 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			orderReq.ProductType = "BRACKET"
 		}
 
-		// SL/TP from the trigger price (targetMonitorPrice) — the actual entry target.
-		// limitPrice is just a buffer to ensure fill, not the base for risk.
-		orderReq.StopLoss = roundToTickSize(targetMonitorPrice*(1-slPct/100), tickSize)
-		orderReq.TakeProfit = roundToTickSize(targetMonitorPrice*(1+tpPct/100), tickSize)
+		// SL/TP from the trigger price (targetMonitorPrice).
+		// Leave as 0 for MULTI_LEVEL modes — ML manager computes its own triggers.
+		if !isMultiLevelSL {
+			orderReq.StopLoss = roundToTickSize(targetMonitorPrice*(1-slPct/100), tickSize)
+		}
+		if !isMultiLevelTP {
+			orderReq.TakeProfit = roundToTickSize(targetMonitorPrice*(1+tpPct/100), tickSize)
+		}
 
 		// Max monitor price (upper bound).
 		maxPct := strategy.Conditions.MaxPctChange
@@ -481,8 +498,12 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 	default:
 		// ── No pct_change filter: SL/TP from LTP directly ───────────
-		orderReq.StopLoss = roundToTickSize(ltp*(1-slPct/100), tickSize)
-		orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
+		if !isMultiLevelSL {
+			orderReq.StopLoss = roundToTickSize(ltp*(1-slPct/100), tickSize)
+		}
+		if !isMultiLevelTP {
+			orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
+		}
 	}
 
 	// ── Validate order ──────────────────────────────────────────────────

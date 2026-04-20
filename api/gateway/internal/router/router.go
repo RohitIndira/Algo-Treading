@@ -58,6 +58,9 @@ func NewRouter(
 		api.HandleFunc("/live-orders/subscribe-broker-ws", paperHandler.SubscribeBrokerWS).Methods("POST")
 		api.HandleFunc("/live-orders/price-watches", paperHandler.GetPriceWatches).Methods("GET")
 		api.HandleFunc("/live-orders/cancel-price-watch", paperHandler.CancelPriceWatch).Methods("POST")
+		// Auto square-off config (trade-execution native)
+		api.HandleFunc("/auto-square-off/config", paperHandler.SetAutoSquareOffConfig).Methods("POST")
+		api.HandleFunc("/auto-square-off/config", paperHandler.GetAutoSquareOffConfig).Methods("GET")
 		// Dashboard
 		api.HandleFunc("/dashboard-stats", paperHandler.GetDashboardStats).Methods("GET")
 	}

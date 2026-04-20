@@ -49,7 +49,7 @@ func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offse
 		}
 
 		tradeConfig := &models.TradeConfig{}
-		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
+		tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
 			r.loadMultiLevelConfig(ctx, tradeConfig)
@@ -135,11 +135,11 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	if req.TradeConfig != nil {
 		tradeConfigID := uuid.New()
 
-		mlSLJSON, err := marshalMultiLevel(req.TradeConfig.MultiLevelSL)
+		mlSLStr, err := marshalMultiLevel(req.TradeConfig.MultiLevelSL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal multi_level_sl: %w", err)
 		}
-		mlTPJSON, err := marshalMultiLevel(req.TradeConfig.MultiLevelTP)
+		mlTPStr, err := marshalMultiLevel(req.TradeConfig.MultiLevelTP)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal multi_level_tp: %w", err)
 		}
@@ -159,7 +159,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
 			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice,
-			req.TradeConfig.TakeProfitType, mlSLJSON, mlTPJSON,
+			req.TradeConfig.TakeProfitType, mlSLStr, mlTPStr,
 			req.TradeConfig.TradeWindowStart, req.TradeConfig.TradeWindowEnd,
 		).Scan(&req.TradeConfig.CreatedAt)
 		if err != nil {
@@ -196,7 +196,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	}
 
 	// Insert into Execution Outbox
-	payload, err := json.Marshal(strategy)
+	payloadBytes, err := json.Marshal(strategy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal strategy for outbox: %w", err)
 	}
@@ -205,7 +205,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 		VALUES ($1, $2, $3)`
 
-	_, err = tx.ExecContext(ctx, outboxQuery, strategy.StrategyID, "STRATEGY_CREATED", payload)
+	_, err = tx.ExecContext(ctx, outboxQuery, strategy.StrategyID, "STRATEGY_CREATED", string(payloadBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert into execution outbox: %w", err)
 	}
@@ -244,7 +244,7 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 
 	// Get trade config
 	tradeConfig := &models.TradeConfig{}
-	tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
+	tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
 	err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategyID)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to get trade config: %w", err)
@@ -313,7 +313,7 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 
 		// Load trade config
 		tradeConfig := &models.TradeConfig{}
-		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
+		tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
 			r.loadMultiLevelConfig(ctx, tradeConfig)
@@ -387,11 +387,11 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 
 	// Update trade config if provided
 	if req.TradeConfig != nil {
-		mlSLJSON, err := marshalMultiLevel(req.TradeConfig.MultiLevelSL)
+		mlSLStr, err := marshalMultiLevel(req.TradeConfig.MultiLevelSL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal multi_level_sl: %w", err)
 		}
-		mlTPJSON, err := marshalMultiLevel(req.TradeConfig.MultiLevelTP)
+		mlTPStr, err := marshalMultiLevel(req.TradeConfig.MultiLevelTP)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal multi_level_tp: %w", err)
 		}
@@ -410,7 +410,7 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 			req.TradeConfig.Quantity, req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
 			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice,
-			req.TradeConfig.TakeProfitType, mlSLJSON, mlTPJSON,
+			req.TradeConfig.TakeProfitType, mlSLStr, mlTPStr,
 			req.TradeConfig.TradeWindowStart, req.TradeConfig.TradeWindowEnd, req.StrategyID,
 		)
 		if err != nil {
@@ -442,13 +442,13 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 	fullStrategy, err := r.GetByID(ctx, req.StrategyID, req.UserID)
 	if err == nil {
 		// Insert into Execution Outbox
-		payload, err := json.Marshal(fullStrategy)
+		payloadBytes, err := json.Marshal(fullStrategy)
 		if err == nil {
 			outboxQuery := `
 				INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 				VALUES ($1, $2, $3)`
 
-			_, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", payload)
+			_, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", string(payloadBytes))
 			if ctxErr != nil {
 				return nil, fmt.Errorf("failed to insert into execution outbox: %w", ctxErr)
 			}
@@ -495,12 +495,12 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 		"active":      false,
 		"deleted":     true,
 	}
-	payload, _ := json.Marshal(eventPayload)
+	payloadBytes, _ := json.Marshal(eventPayload)
 	outboxQuery := `
 		INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 		VALUES ($1, $2, $3)`
 
-	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DELETED", payload)
+	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DELETED", string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("failed to insert into execution outbox: %w", err)
 	}
@@ -532,9 +532,9 @@ func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID,
 		"version":     uint64(currentVersion),
 		"active":      true,
 	}
-	payload, _ := json.Marshal(eventPayload)
+	payloadBytes, _ := json.Marshal(eventPayload)
 	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
-	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_ACTIVATED", payload)
+	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_ACTIVATED", string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("failed to outbox: %w", err)
 	}
@@ -565,9 +565,9 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 		"version":     uint64(currentVersion),
 		"active":      false,
 	}
-	payload, _ := json.Marshal(eventPayload)
+	payloadBytes, _ := json.Marshal(eventPayload)
 	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
-	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DEACTIVATED", payload)
+	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DEACTIVATED", string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("failed to outbox: %w", err)
 	}
@@ -610,13 +610,13 @@ func (r *StrategyRepository) DeactivateAllActive(ctx context.Context) (int, erro
 	// Insert one outbox event per deactivated strategy.
 	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
 	for _, row := range rows {
-		payload, _ := json.Marshal(map[string]interface{}{
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
 			"strategy_id": row.StrategyID,
 			"user_id":     row.UserID,
 			"version":     row.Version,
 			"active":      false,
 		})
-		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", payload); err != nil {
+		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", string(payloadBytes)); err != nil {
 			return 0, fmt.Errorf("failed to insert outbox entry for strategy %s: %w", row.StrategyID, err)
 		}
 	}
@@ -653,7 +653,7 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 
 		// Load trade config
 		tradeConfig := &models.TradeConfig{}
-		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
+		tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
 			r.loadMultiLevelConfig(ctx, tradeConfig)
@@ -704,14 +704,20 @@ func (r *StrategyRepository) MarkOutboxEventsProcessed(ctx context.Context, even
 
 // ── Multi-Level Helpers ───────────────────────────────────────────────────────
 
-// marshalMultiLevel converts a slice of MultiLevelExitLevel to a JSON byte slice
+// marshalMultiLevel converts a slice of MultiLevelExitLevel to a JSON string
 // suitable for insertion into a JSONB column. Returns nil when levels is empty
-// (which stores NULL in the DB).
-func marshalMultiLevel(levels []models.MultiLevelExitLevel) ([]byte, error) {
+// (which stores NULL in the DB). A *string is returned so pq sends the value
+// as text rather than binary, which PostgreSQL accepts for JSONB columns.
+func marshalMultiLevel(levels []models.MultiLevelExitLevel) (*string, error) {
 	if len(levels) == 0 {
 		return nil, nil
 	}
-	return json.Marshal(levels)
+	b, err := json.Marshal(levels)
+	if err != nil {
+		return nil, err
+	}
+	s := string(b)
+	return &s, nil
 }
 
 // loadMultiLevelConfig reads the multi_level_sl / multi_level_tp JSONB columns

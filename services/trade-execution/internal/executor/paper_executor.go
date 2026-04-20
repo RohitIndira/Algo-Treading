@@ -178,7 +178,7 @@ func (e *PaperOrderExecutor) createReverseExitOrder(ctx context.Context, origina
 		OrderType:        models.OrderTypeMarket,
 		OrderSide:        reverseSide,
 		Quantity:         original.FilledQuantity,
-		Price:            &exitPrice,
+		Price:            original.FilledPrice, // original entry price (mirrors ML partial-exit convention)
 		Validity:         "IOC",
 		ProductType:      original.ProductType,
 		Status:           models.StatusFilled,

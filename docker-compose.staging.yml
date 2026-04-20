@@ -185,41 +185,41 @@ services:
     hostname: data-ingestion-staging
     ports:
       - "50152:50052"
-    environment:
-      # MongoDB
-      MONGODB_URI: mongodb://admin:admin@mongodb-staging:27017/trading_db_staging?authSource=admin
-      
-      # Kafka
-      KAFKA_BROKERS: kafka-staging:9092
-      KAFKA_TOPIC: market.data.news
-      
-      # gRPC
-      GRPC_PORT: 50052
-      
-      # Logging
-      L_file:
+    env_file:
       - ./services/data-ingestion/.env.staging
     environment:
       ENVIRONMENT: staging
-      GRPC_PORT: 50052ices/rules-engine
+      GRPC_PORT: 50052
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - trading-network-staging
+    restart: unless-stopped
+
+  rules-engine:
+    build:
+      context: ./services/rules-engine
       dockerfile: Dockerfile
     container_name: trading-rules-engine-staging
     hostname: rules-engine-staging
     ports:
       - "50153:50053"
-    environment:
-      # Kafka
-      KAFKA_BROKERS: kafka-staging:9092
-      KAFKA_TOPIC_INPUT: market.data.news
-      KAFKA_TOPIC_OUTPUT: order.execution.queue
-
-      # Redis
-      REDIS_HOST: redis-staging
-      R_file:
+    env_file:
       - ./services/rules-engine/.env.staging
     environment:
       ENVIRONMENT: staging
-      GRPC_PORT: 50053topped
+      GRPC_PORT: 50053
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-network-staging
+    restart: unless-stopped
 
   trade-execution:
     build:
@@ -229,21 +229,19 @@ services:
     hostname: trade-execution-staging
     ports:
       - "50154:50054"
-    environment:
-      # Database
-      DATABASE_HOST: postgres-staging
-      DATABASE_PORT: 5432
-      DATABASE_USER: postgres
-      DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db_staging
-      
-      # Message Queue
-      RABBITMQ_HOST: rabbitmq-staging
-      R_file:
+    env_file:
       - ./services/trade-execution/.env.staging
     environment:
       ENVIRONMENT: staging
-      SERVICE_PORT: 50054topped
+      SERVICE_PORT: 50054
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - trading-network-staging
+    restart: unless-stopped
 
   risk-management:
     build:
@@ -253,27 +251,21 @@ services:
     hostname: risk-management-staging
     ports:
       - "50155:50055"
-    environment:
-      # Database
-      DATABASE_HOST: postgres-staging
-      DATABASE_PORT: 5432
-      DATABASE_USER: postgres
-      DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db_staging
-      
-      # Redis (for risk counters)
-      REDIS_HOST: redis-staging
-      REDIS_PORT: 6379
-      
-      # gRPC
-      GRPC_PORT: 50055
-      
-      #_file:
+    env_file:
       - ./services/risk-management/.env.staging
     environment:
       ENVIRONMENT: staging
-      SERVICE_PORT: 50055ng:
-    driver: local
+      SERVICE_PORT: 50055
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-network-staging
+    restart: unless-stopped
+
+volumes:
   mongodb-data-staging:
     driver: local
   mongodb-config-staging:

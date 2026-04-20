@@ -42,6 +42,36 @@ type Manager struct {
 	logger      *zap.Logger
 
 	pollInterval time.Duration // how often to check SL/paper-TP levels (default: 1s)
+
+	// OnPaperGroupCompleted is called when all ML levels of a PAPER position have
+	// triggered. Wired in main.go to broadcast a position_exit WS event.
+	// Signature: (userID, orderID string, finalPnL, avgExitPrice float64)
+	OnPaperGroupCompleted func(userID, orderID string, finalPnL, avgExitPrice float64)
+
+	// OnPaperLevelTriggered is called each time a single ML level triggers on a
+	// PAPER position. Wired in main.go to broadcast an ml_level_triggered WS event
+	// so the frontend can refresh level chips in real time.
+	//
+	// cancelledExitType / cancelledLevelNum: the opposite-side level that was
+	// automatically cancelled as a result of this trigger (e.g. TP L1 cancelled when
+	// SL L1 fires). Both are empty / -1 when no cancellation occurred.
+	//
+	// Signature: (userID, orderID, exitType string, levelNum int, exitPrice float64,
+	//             remainingQty int32, cancelledExitType string, cancelledLevelNum int)
+	OnPaperLevelTriggered func(userID, orderID, exitType string, levelNum int, exitPrice float64, remainingQty int32, cancelledExitType string, cancelledLevelNum int)
+
+	// OnPaperQtyUpdated is called after a partial ML exit so the in-memory monitor
+	// cache can update FilledQuantity for the entry order. Wired in main.go to
+	// monitor.UpdateCachedOrderQty.
+	// Signature: (entryOrderID uuid.UUID, remainingQty int32)
+	OnPaperQtyUpdated func(entryOrderID uuid.UUID, remainingQty int32)
+
+	// OnPaperSLMoved is called after a TP level fires and the effective stop for
+	// the remaining position is moved to breakeven (after L1) or to the previous
+	// TP trigger price (after L2+). Wired in main.go to monitor.UpdateCachedOrderSL
+	// so the regular SL price-check in the paper monitor uses the updated stop.
+	// Signature: (entryOrderID uuid.UUID, newSL float64)
+	OnPaperSLMoved func(entryOrderID uuid.UUID, newSL float64)
 }
 
 // NewManager creates a Manager.
@@ -510,10 +540,12 @@ func (m *Manager) onTPLevelFilled(ctx context.Context, group *Group, level *Exit
 		return
 	}
 
-	// For FIXED/TRAILING SL: replace SL order with reduced qty
+	// For FIXED/TRAILING SL: cancel old SL order and replace with reduced qty
+	// and a new trigger moved to breakeven (L1) or previous TP price (L2+).
 	if (group.SLMode == SLModeFixed || group.SLMode == SLModeTrailing) &&
-		group.SingleSLBrokerID != "" && group.TradingMode == "LIVE" {
-		m.replaceSLWithReducedQty(ctx, group, remaining)
+		group.TradingMode == "LIVE" {
+		newSLTrigger := m.computeSLAfterTPFill(group, level.LevelNum)
+		m.replaceSLWithReducedQty(ctx, group, remaining, newSLTrigger)
 	}
 }
 
@@ -618,13 +650,37 @@ func (m *Manager) evaluateSLLevels(ctx context.Context, group *Group, ltp float6
 			continue
 		}
 
+		// For paper trading, exit at the trigger price (the level's configured stop price)
+		// rather than the current LTP. This ensures each level shows its own distinct exit
+		// price, even when multiple levels breach in the same poll tick.
+		exitPrice := ltp
+		if group.TradingMode == "PAPER" && trigger > 0 {
+			exitPrice = trigger
+		}
+
+		// exitQty=0 happens when totalQty is too small for the configured qty_pct
+		// (e.g. qty=1 with level1=50% → int32(0.5)=0). Skip placing an order but
+		// mark the level triggered so it doesn't fire again; remaining qty unchanged.
+		if exitQty <= 0 {
+			m.logger.Warn("ml_sl_level_qty_zero_skipped",
+				zap.String("group_id", group.GroupID.String()),
+				zap.Int("level", levelNum),
+				zap.Float64("trigger", trigger),
+				zap.Int32("total_qty", group.TotalQty))
+			level.markTriggered(exitPrice)
+			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeSL, levelNum,
+				models.MLStatusTriggered, exitPrice)
+			continue
+		}
+
 		m.logger.Info("ml_sl_level_breached",
 			zap.String("group_id", group.GroupID.String()),
 			zap.Int("level", levelNum),
 			zap.Float64("trigger", trigger),
-			zap.Float64("ltp", ltp))
+			zap.Float64("ltp", ltp),
+			zap.Float64("exit_price", exitPrice))
 
-		level.markTriggered(ltp)
+		level.markTriggered(exitPrice)
 
 		group.mu.Lock()
 		group.RemainingQty -= exitQty
@@ -632,24 +688,122 @@ func (m *Manager) evaluateSLLevels(ctx context.Context, group *Group, ltp float6
 		group.mu.Unlock()
 
 		_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeSL, levelNum,
-			models.MLStatusTriggered, ltp)
+			models.MLStatusTriggered, exitPrice)
 
 		if group.TradingMode == "LIVE" && group.broker != nil {
 			m.placeSLExitOrder(ctx, group, exitQty, ltp)
 		} else {
-			// Paper: record the partial exit
-			m.recordPaperPartialExit(ctx, group, exitQty, ltp, "SL_HIT", levelNum)
+			// Paper: record the partial exit and reduce entry order's filled_quantity.
+			m.recordPaperPartialExit(ctx, group, exitQty, exitPrice, "SL_HIT", levelNum)
+			if err := m.repo.UpdatePaperPositionFilledQty(ctx, group.EntryOrderID, remaining); err != nil {
+				m.logger.Error("ml_paper_sl_qty_update_failed",
+					zap.String("group_id", group.GroupID.String()),
+					zap.Int("level", levelNum),
+					zap.Error(err))
+			}
+			if m.OnPaperQtyUpdated != nil {
+				m.OnPaperQtyUpdated(group.EntryOrderID, remaining)
+			}
 		}
 
-		// Cancel the corresponding TP order for this qty slice (MULTI_LEVEL TP case)
+		// Cancel the corresponding TP level for this qty slice (both LIVE and PAPER).
+		cancelledTPLevelNum := -1
 		if group.TPMode == TPModeMultiLevel {
-			m.cancelTPLevelForSLFill(ctx, group, levelNum)
+			cancelledTPLevelNum = m.cancelTPLevelForSLFill(ctx, group, levelNum)
+		}
+
+		if group.TradingMode != "LIVE" && m.OnPaperLevelTriggered != nil {
+			cancelledExitType := ""
+			if cancelledTPLevelNum >= 0 {
+				cancelledExitType = models.MLExitTypeTP
+			}
+			m.OnPaperLevelTriggered(group.UserID, group.EntryOrderID.String(), models.MLExitTypeSL, levelNum, exitPrice, remaining, cancelledExitType, cancelledTPLevelNum)
 		}
 
 		if remaining <= 0 {
 			m.completeGroup(ctx, group)
 			return
 		}
+		// Process one level per tick so each fires at its own price on the next poll.
+		return
+	}
+}
+
+// computeSLAfterTPFill returns the new SL trigger after a TP level fires.
+//
+// Risk management rule:
+//   - After TP level 1 fires → move SL to entry price (breakeven, zero loss)
+//   - After TP level N > 1 fires → move SL to level N-1's trigger price (lock in profit)
+//
+// Applied to both paper (via OnPaperSLMoved callback) and live (via replaceSLWithReducedQty).
+func (m *Manager) computeSLAfterTPFill(group *Group, tpLevelNum int) float64 {
+	if tpLevelNum <= 1 {
+		// First profit level hit → protect capital at entry (breakeven)
+		return group.FillPrice
+	}
+	// Subsequent levels → lock in the previous TP profit
+	for _, l := range group.TPLevels {
+		l.mu.Lock()
+		num := l.LevelNum
+		price := l.TriggerPrice
+		l.mu.Unlock()
+		if num == tpLevelNum-1 {
+			return price
+		}
+	}
+	// Fallback: use entry price if previous level not found
+	return group.FillPrice
+}
+
+// rebalanceMLSLAfterTP moves all remaining active SL levels to the new floor price
+// after a TP level fires in MULTI_LEVEL SL mode. This ensures the remaining position
+// is protected at breakeven (after TP L1) or at the previous TP price (after TP L2+).
+// It only tightens stops — it never widens a level that is already better than newSL.
+func (m *Manager) rebalanceMLSLAfterTP(ctx context.Context, group *Group, tpLevelNum int) {
+	newSL := m.computeSLAfterTPFill(group, tpLevelNum)
+	if newSL <= 0 {
+		return
+	}
+	for i, slLevel := range group.SLLevels {
+		slLevel.mu.Lock()
+		if slLevel.Status != LevelActive {
+			slLevel.mu.Unlock()
+			continue
+		}
+		oldTrigger := slLevel.TriggerPrice
+		// Only tighten: for BUY the new SL must be higher (better), for SELL lower.
+		shouldMove := (group.OrderSide == "BUY" && newSL > oldTrigger) ||
+			(group.OrderSide == "SELL" && newSL < oldTrigger)
+		if !shouldMove {
+			slLevel.mu.Unlock()
+			continue
+		}
+		slLevel.TriggerPrice = newSL
+		levelNum := slLevel.LevelNum
+		exitQty := slLevel.ExitQty
+		slLevel.mu.Unlock()
+
+		var cfg SLTPLevelConfig
+		if i < len(group.SLLevelConfigs) {
+			cfg = group.SLLevelConfigs[i]
+		}
+		triggerCopy := newSL
+		_ = m.repo.UpsertMultiLevelExitLevel(ctx, &models.MultiLevelExitRecord{
+			EntryOrderID: group.EntryOrderID,
+			ExitType:     models.MLExitTypeSL,
+			LevelNum:     levelNum,
+			PricePct:     cfg.PricePct,
+			QtyPct:       cfg.QtyPct,
+			TriggerPrice: &triggerCopy,
+			ExitQty:      &exitQty,
+			Status:       models.MLStatusActive,
+		})
+		m.logger.Info("ml_sl_rebalanced_after_tp",
+			zap.String("group_id", group.GroupID.String()),
+			zap.Int("sl_level", levelNum),
+			zap.Float64("old_trigger", oldTrigger),
+			zap.Float64("new_trigger", newSL),
+			zap.Int("tp_level", tpLevelNum))
 	}
 }
 
@@ -670,7 +824,28 @@ func (m *Manager) evaluateTPLevelsPaper(ctx context.Context, group *Group, ltp f
 			continue
 		}
 
-		level.markTriggered(ltp)
+		// For paper trading, exit at the level's configured trigger price (not LTP).
+		// This ensures each TP level shows its own distinct exit price even when the
+		// price jumps past multiple levels in a single poll tick.
+		exitPrice := ltp
+		if limit > 0 {
+			exitPrice = limit
+		}
+
+		// exitQty=0 when totalQty is too small for the configured qty_pct — skip.
+		if exitQty <= 0 {
+			m.logger.Warn("ml_tp_level_qty_zero_skipped",
+				zap.String("group_id", group.GroupID.String()),
+				zap.Int("level", levelNum),
+				zap.Float64("limit", limit),
+				zap.Int32("total_qty", group.TotalQty))
+			level.markTriggered(exitPrice)
+			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeTP, levelNum,
+				models.MLStatusTriggered, exitPrice)
+			continue
+		}
+
+		level.markTriggered(exitPrice)
 
 		group.mu.Lock()
 		group.RemainingQty -= exitQty
@@ -681,17 +856,67 @@ func (m *Manager) evaluateTPLevelsPaper(ctx context.Context, group *Group, ltp f
 			zap.String("group_id", group.GroupID.String()),
 			zap.Int("level", levelNum),
 			zap.Float64("limit", limit),
-			zap.Float64("ltp", ltp))
+			zap.Float64("ltp", ltp),
+			zap.Float64("exit_price", exitPrice))
 
 		_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeTP, levelNum,
-			models.MLStatusTriggered, ltp)
+			models.MLStatusTriggered, exitPrice)
 
-		m.recordPaperPartialExit(ctx, group, exitQty, ltp, "TP_HIT", levelNum)
+		m.recordPaperPartialExit(ctx, group, exitQty, exitPrice, "TP_HIT", levelNum)
+		// Reduce entry order's filled_quantity so open positions shows remaining qty.
+		if err := m.repo.UpdatePaperPositionFilledQty(ctx, group.EntryOrderID, remaining); err != nil {
+			m.logger.Error("ml_paper_tp_qty_update_failed",
+				zap.String("group_id", group.GroupID.String()),
+				zap.Int("level", levelNum),
+				zap.Error(err))
+		}
+		if m.OnPaperQtyUpdated != nil {
+			m.OnPaperQtyUpdated(group.EntryOrderID, remaining)
+		}
+
+		// Move SL to breakeven (after L1) or to the previous TP price (after L2+)
+		// so the paper monitor's SL check protects the remaining position's profits.
+		if remaining > 0 {
+			if group.SLMode != SLModeMultiLevel {
+				// Single SL mode: update the cached SL price in the paper monitor.
+				newSL := m.computeSLAfterTPFill(group, levelNum)
+				if m.OnPaperSLMoved != nil {
+					m.OnPaperSLMoved(group.EntryOrderID, newSL)
+				}
+				m.logger.Info("ml_paper_sl_moved_to_protect",
+					zap.String("group_id", group.GroupID.String()),
+					zap.Int("tp_level", levelNum),
+					zap.Float64("new_sl", newSL),
+					zap.Float64("entry_price", group.FillPrice))
+			} else {
+				// Multi-level SL mode: move all remaining active SL levels to the new
+				// floor (breakeven after L1, previous TP price after L2+). This ensures
+				// the remaining position's downside is protected after each profit lock-in.
+				m.rebalanceMLSLAfterTP(ctx, group, levelNum)
+			}
+		}
+
+		// Cancel the SL level with the same level_num — its qty slice is now exited.
+		// This keeps the SL chip display accurate (shows CANCELLED instead of active).
+		cancelledSLLevelNum := -1
+		if group.SLMode == SLModeMultiLevel {
+			cancelledSLLevelNum = m.cancelSLLevelForTPFill(ctx, group, levelNum)
+		}
+
+		if m.OnPaperLevelTriggered != nil {
+			cancelledExitType := ""
+			if cancelledSLLevelNum >= 0 {
+				cancelledExitType = models.MLExitTypeSL
+			}
+			m.OnPaperLevelTriggered(group.UserID, group.EntryOrderID.String(), models.MLExitTypeTP, levelNum, exitPrice, remaining, cancelledExitType, cancelledSLLevelNum)
+		}
 
 		if remaining <= 0 {
 			m.completeGroup(ctx, group)
 			return
 		}
+		// Process one level per tick for clean sequential paper simulation.
+		return
 	}
 }
 
@@ -819,30 +1044,38 @@ func (m *Manager) cancelSLOrder(ctx context.Context, group *Group) {
 	}
 }
 
-func (m *Manager) replaceSLWithReducedQty(ctx context.Context, group *Group, remainingQty int32) {
+// replaceSLWithReducedQty cancels the current single SL order and places a new
+// one for the remaining qty using newSLTrigger as the trigger price.
+//
+// newSLTrigger is computed by computeSLAfterTPFill:
+//   - After TP L1 → entry price (breakeven, zero downside risk on remaining qty)
+//   - After TP L2+ → previous TP trigger price (lock in prior level's profit)
+//
+// Applies to both FIXED and TRAILING SL modes; for TRAILING the new order is a
+// plain SL-M at the computed trigger — trailing continues from there via the
+// evaluateTrailingSL loop on the next price tick.
+func (m *Manager) replaceSLWithReducedQty(ctx context.Context, group *Group, remainingQty int32, newSLTrigger float64) {
 	m.cancelSLOrder(ctx, group)
 
-	if group.SLMode != SLModeFixed || group.Auth == nil || group.FixedSLPct <= 0 {
-		// For trailing SL: the monitor recalculates on next tick with updated RemainingQty
+	if group.Auth == nil || group.broker == nil || newSLTrigger <= 0 {
 		return
 	}
 
-	slTrigger := group.CalcSLTriggerPrice(group.FixedSLPct)
-	slLimit := slTrigger
+	slLimit := newSLTrigger
 	if group.OrderSide == "BUY" {
-		slLimit = roundNSE(slTrigger * 0.995)
+		slLimit = roundNSE(newSLTrigger * 0.995)
 	} else {
-		slLimit = roundNSE(slTrigger * 1.005)
+		slLimit = roundNSE(newSLTrigger * 1.005)
 	}
 
 	exitOrderID := uuid.New()
-	exitOrder := m.buildExitOrder(exitOrderID, group, remainingQty, slLimit, "SL-M", slTrigger, "SL")
+	exitOrder := m.buildExitOrder(exitOrderID, group, remainingQty, slLimit, "SL-M", newSLTrigger, "SL")
 
 	brokerID, err := group.broker.PlaceOrder(ctx, exitOrder, group.Auth)
 	if err != nil {
 		m.logger.Error("ml_replace_sl_failed",
 			zap.String("group_id", group.GroupID.String()),
-			zap.Float64("trigger", slTrigger),
+			zap.Float64("trigger", newSLTrigger),
 			zap.Int32("qty", remainingQty),
 			zap.Error(err))
 		return
@@ -851,11 +1084,16 @@ func (m *Manager) replaceSLWithReducedQty(ctx context.Context, group *Group, rem
 	group.mu.Lock()
 	group.SingleSLBrokerID = brokerID
 	group.SingleSLOrderID = exitOrderID
+	// For trailing SL, reset HighestPrice to current fill so trailing advances
+	// from the new (breakeven / locked-in) level, not from the original entry.
+	if group.SLMode == SLModeTrailing {
+		group.HighestPrice = newSLTrigger
+	}
 	group.mu.Unlock()
 
 	m.logger.Info("ml_sl_replaced",
 		zap.String("group_id", group.GroupID.String()),
-		zap.Float64("trigger", slTrigger),
+		zap.Float64("new_trigger", newSLTrigger),
 		zap.Int32("qty", remainingQty),
 		zap.String("broker_id", brokerID))
 }
@@ -878,40 +1116,82 @@ func (m *Manager) cancelTPOrder(ctx context.Context, group *Group, level *ExitLe
 }
 
 // cancelTPLevelForSLFill cancels the TP level corresponding to the same SL level
-// when multi-level SL fires. Strategy: cancel TP level N when SL level N fires
-// (assuming symmetric level counts). If level counts differ, cancel TP levels
-// proportionally: the TP level that covers the same slice of qty.
-func (m *Manager) cancelTPLevelForSLFill(ctx context.Context, group *Group, slLevelNum int) {
-	// Find the TP level with the same level_num, if it exists
+// when multi-level SL fires. Returns the cancelled level number, or -1 if none.
+func (m *Manager) cancelTPLevelForSLFill(ctx context.Context, group *Group, slLevelNum int) int {
 	for _, tpLevel := range group.TPLevels {
 		tpLevel.mu.Lock()
 		matches := tpLevel.LevelNum == slLevelNum && tpLevel.Status == LevelActive
 		bid := tpLevel.BrokerOrderID
+		levelNum := tpLevel.LevelNum
 		tpLevel.mu.Unlock()
 
 		if matches && bid != "" && group.TradingMode == "LIVE" {
 			m.cancelTPOrder(ctx, group, tpLevel, bid)
-			return
+			return levelNum
 		} else if matches && group.TradingMode == "PAPER" {
 			tpLevel.markCancelled()
-			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeTP, tpLevel.LevelNum,
+			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeTP, levelNum,
 				models.MLStatusCancelled, 0)
+			return levelNum
 		}
 	}
+	return -1
+}
+
+// cancelSLLevelForTPFill cancels the SL level with the same level_num as the triggered TP level.
+// Called when a TP level fires in paper trading so the now-exited qty slice no longer
+// shows an active SL chip in the UI. Returns the cancelled level number, or -1 if none.
+func (m *Manager) cancelSLLevelForTPFill(ctx context.Context, group *Group, tpLevelNum int) int {
+	for _, slLevel := range group.SLLevels {
+		slLevel.mu.Lock()
+		matches := slLevel.LevelNum == tpLevelNum && slLevel.Status == LevelActive
+		levelNum := slLevel.LevelNum
+		slLevel.mu.Unlock()
+
+		if matches {
+			slLevel.markCancelled()
+			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeSL, levelNum,
+				models.MLStatusCancelled, 0)
+			return levelNum
+		}
+	}
+	return -1
 }
 
 // ── Paper Exit Recording ──────────────────────────────────────────────────────
 
 func (m *Manager) recordPaperPartialExit(ctx context.Context, group *Group, qty int32, exitPrice float64, reason string, levelNum int) {
+	if qty <= 0 {
+		m.logger.Warn("ml_paper_exit_skipped_zero_qty",
+			zap.String("group_id", group.GroupID.String()),
+			zap.Int("level", levelNum),
+			zap.String("reason", reason))
+		return
+	}
 	log.Printf("[ml] Paper partial exit: group=%s level=%d qty=%d price=%.2f reason=%s",
 		group.GroupID, levelNum, qty, exitPrice, reason)
-	// Create a reverse paper order in DB for audit trail
+
 	reverseSide := "SELL"
 	if group.OrderSide == "SELL" {
 		reverseSide = "BUY"
 	}
-	paperID := fmt.Sprintf("PAPER-ML-%s-L%d", group.EntryOrderID.String()[:8], levelNum)
+
+	// Encode entry price, level, and reason in IndiraOrderID so the UI can display them.
+	paperID := fmt.Sprintf("PAPER-ML-%s-L%d-%s", group.EntryOrderID.String()[:8], levelNum, reason)
 	now := time.Now()
+
+	// Store entry price in Price field; FilledPrice holds the exit price.
+	// This lets the Closed tab show both entry and exit prices for the partial exit row.
+	entryPrice := group.FillPrice
+
+	// Compute partial P&L so it can be displayed directly without a join.
+	var partialPnL float64
+	if group.OrderSide == "BUY" {
+		partialPnL = (exitPrice - entryPrice) * float64(qty)
+	} else {
+		partialPnL = (entryPrice - exitPrice) * float64(qty)
+	}
+
 	exitOrder := &models.Order{
 		OrderID:          uuid.New(),
 		UserID:           group.UserID,
@@ -923,14 +1203,16 @@ func (m *Manager) recordPaperPartialExit(ctx context.Context, group *Group, qty 
 		OrderType:        models.OrderTypeMarket,
 		OrderSide:        models.OrderSide(reverseSide),
 		Quantity:         qty,
-		Price:            &exitPrice,
+		Price:            &entryPrice, // entry price of the original position
 		Validity:         "IOC",
 		ProductType:      group.ProductType,
 		Status:           models.StatusFilled,
 		IsPaperTrade:     true,
 		TradingMode:      "PAPER",
 		FilledQuantity:   qty,
-		FilledPrice:      &exitPrice,
+		FilledPrice:      &exitPrice,  // price at which this partial exit was executed
+		PaperExitPrice:   &exitPrice,  // marks this as a closed record for the Closed tab query
+		PaperPnL:         &partialPnL,
 		IsSquareOffOrder: true,
 		RiskApproved:     true,
 		IndiraOrderID:    &paperID,
@@ -939,7 +1221,7 @@ func (m *Manager) recordPaperPartialExit(ctx context.Context, group *Group, qty 
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
-	if err := m.repo.Create(ctx, exitOrder); err != nil {
+	if err := m.repo.CreatePaperPartialExit(ctx, exitOrder); err != nil {
 		m.logger.Error("ml_paper_exit_order_create_failed",
 			zap.String("group_id", group.GroupID.String()),
 			zap.Error(err))
@@ -968,6 +1250,63 @@ func (m *Manager) completeGroup(ctx context.Context, group *Group) {
 	m.logger.Info("ml_group_completed",
 		zap.String("group_id", group.GroupID.String()),
 		zap.String("entry_order_id", group.EntryOrderID.String()))
+
+	// For paper trades: persist the final exit price and PnL on the entry order,
+	// and notify the WS server so the frontend removes it from open positions.
+	//
+	// IMPORTANT: cancel() above has already cancelled the monitor goroutine's ctx.
+	// We must use a fresh context here, otherwise UpdatePaperTradeExit will fail
+	// with "context canceled" and paper_exit_price will never be written to the DB,
+	// leaving the order as a zombie that reloads on every service restart.
+	if group.TradingMode == "PAPER" {
+		avgExitPrice, totalPnL := m.computeFinalPaperPnL(group)
+		exitCtx, exitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer exitCancel()
+		if err := m.repo.UpdatePaperTradeExit(exitCtx, group.EntryOrderID, avgExitPrice, totalPnL); err != nil {
+			m.logger.Error("ml_complete_paper_exit_update_failed",
+				zap.String("group_id", group.GroupID.String()),
+				zap.String("entry_order_id", group.EntryOrderID.String()),
+				zap.Error(err))
+		}
+		if m.OnPaperGroupCompleted != nil {
+			m.OnPaperGroupCompleted(group.UserID, group.EntryOrderID.String(), totalPnL, avgExitPrice)
+		}
+	}
+}
+
+// computeFinalPaperPnL computes the weighted-average exit price and total PnL
+// for a completed paper ML group by summing all triggered level exits.
+func (m *Manager) computeFinalPaperPnL(group *Group) (avgExitPrice float64, totalPnL float64) {
+	var totalExitQty int32
+	var weightedSum float64
+
+	collectLevels := func(levels []*ExitLevelState) {
+		for _, l := range levels {
+			l.mu.Lock()
+			if l.Status == LevelTriggered && l.ExitQty > 0 && l.ExitPrice > 0 {
+				weightedSum += l.ExitPrice * float64(l.ExitQty)
+				totalExitQty += l.ExitQty
+			}
+			l.mu.Unlock()
+		}
+	}
+	collectLevels(group.SLLevels)
+	collectLevels(group.TPLevels)
+
+	if totalExitQty > 0 {
+		avgExitPrice = weightedSum / float64(totalExitQty)
+	} else {
+		// Fallback: use fill price (no exit recorded — shouldn't happen)
+		avgExitPrice = group.FillPrice
+	}
+
+	qty := float64(group.TotalQty)
+	if group.OrderSide == "BUY" {
+		totalPnL = (avgExitPrice - group.FillPrice) * qty
+	} else {
+		totalPnL = (group.FillPrice - avgExitPrice) * qty
+	}
+	return
 }
 
 // CancelGroup cancels all levels and stops monitoring (e.g., user force-exits).

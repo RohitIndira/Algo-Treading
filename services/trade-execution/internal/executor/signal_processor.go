@@ -189,7 +189,7 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 	// has no OCO protection. Retroactively adopt the placed order into an
 	// OCO group so that handleEntryUpdate fires on the WS EXECUTED event
 	// and places SL/TP legs from the actual fill price.
-	if isTrailingSL && p.ocoManager != nil && order.IndiraOrderID != nil {
+	if isTrailingSL && p.ocoManager != nil && !order.IsPaperTrade && order.IndiraOrderID != nil {
 		var auth *indiraClient.AuthContext
 		if order.BearerToken != nil && order.AppId != nil && order.Source != nil {
 			auth = &indiraClient.AuthContext{
@@ -489,6 +489,8 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 		TradingMode:      tradingMode,
 		CurrentPctChange: signal.CurrentPctChange,
 		MaxMonitorPrice:  signal.MaxMonitorPrice,
+		// Per-user auto square-off override (e.g. "14:30" IST); nil if not set
+		AutoSquareOffTime: stringPtr(signal.AutoSquareOffTime),
 	}, nil
 }
 

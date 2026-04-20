@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -43,6 +44,17 @@ type OrderRepository interface {
 	GetFilledPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	GetClosedPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	UpdatePaperTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error
+	// CreatePaperPartialExit inserts a partial exit (square-off) record for an ML level
+	// trigger. Unlike Create, it writes filled_quantity, filled_price, paper_exit_price,
+	// paper_pnl, is_square_off_order, and indira_order_id which the generic Create omits.
+	CreatePaperPartialExit(ctx context.Context, order *models.Order) error
+	// UpdatePaperPositionFilledQty reduces the entry order's filled_quantity after a partial
+	// ML exit so the open positions view shows the remaining quantity, not the original.
+	UpdatePaperPositionFilledQty(ctx context.Context, orderID uuid.UUID, remainingQty int32) error
+	// UpdateTrailingSL persists the new trailing stop-loss price to the orders table.
+	// Called each time advanceTrailingSL advances the SL so that REST fetches and
+	// service-restart recovery both see the latest SL, not the original entry value.
+	UpdateTrailingSL(ctx context.Context, orderID uuid.UUID, newSL float64) error
 	// Live trading
 	GetLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	GetAllTodayLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
@@ -74,12 +86,29 @@ type OrderRepository interface {
 	// GetStrategyNamesByIDs returns a map of strategy_id → strategy_name from the orders table.
 	// Looks across all orders (not just today's) to find names for strategies that may have been deleted.
 	GetStrategyNamesByIDs(ctx context.Context, strategyIDs []string) (map[string]string, error)
+	// GetUsersWithAutoSquareOffAtTime returns distinct user IDs whose square_off_time
+	// matches timeStr ("HH:MM" IST) in user_square_off_config. Used by the scheduler
+	// to trigger per-user square-offs at user-configured times.
+	GetUsersWithAutoSquareOffAtTime(ctx context.Context, timeStr string) ([]string, error)
+	// GetOpenOrdersByUser returns FILLED/PARTIALLY_FILLED INTRADAY live orders for a single
+	// user today that haven't been square-offed yet. Used for per-user live square-off.
+	GetOpenOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
+
+	// ── Auto square-off config ────────────────────────────────────────────────
+	// UpsertUserSquareOffConfig stores or updates the auto square-off config for a user.
+	UpsertUserSquareOffConfig(ctx context.Context, userID, squareOffTime string, enabled bool) error
+	// GetUserSquareOffConfig retrieves the auto square-off config for a user.
+	// Returns ("", false, nil) when no config exists.
+	GetUserSquareOffConfig(ctx context.Context, userID string) (squareOffTime string, enabled bool, err error)
 
 	// ── Multi-level exit level operations ─────────────────────────────────────
 	UpsertMultiLevelExitLevel(ctx context.Context, rec *models.MultiLevelExitRecord) error
 	UpdateMultiLevelLevelStatus(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, status string, exitPrice float64) error
 	UpdateMultiLevelLevelBrokerID(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, brokerOrderID string, exitOrderID uuid.UUID) error
 	GetMultiLevelExitLevels(ctx context.Context, entryOrderID uuid.UUID) ([]*models.MultiLevelExitRecord, error)
+	// GetMultiLevelExitLevelsBatch fetches ML levels for multiple entry orders in one query.
+	// Returns a map of entryOrderID → levels slice.
+	GetMultiLevelExitLevelsBatch(ctx context.Context, entryOrderIDs []uuid.UUID) (map[uuid.UUID][]*models.MultiLevelExitRecord, error)
 }
 
 type orderRepository struct {
@@ -98,14 +127,14 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			order_id, user_id, strategy_id, strategy_name, event_id,
 			stock_code, exchange, symbol,
 			order_type, order_side, quantity, price,
-			stop_loss, take_profit, validity, product_type,
+			stop_loss, take_profit, stop_loss_type, trailing_sl_pct, validity, product_type,
 			status, risk_approved, risk_score,
 			is_paper_trade, trading_mode,
 			retry_count, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
 			$13, $14, $15, $16, $17, $18, $19, $20, $21,
-			$22, $23, $24
+			$22, $23, $24, $25, $26
 		)
 	`
 
@@ -113,7 +142,7 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 		order.OrderID, order.UserID, order.StrategyID, order.StrategyName, order.EventID,
 		order.StockCode, order.Exchange, order.Symbol,
 		order.OrderType, order.OrderSide, order.Quantity, order.Price,
-		order.StopLoss, order.TakeProfit, order.Validity, order.ProductType,
+		order.StopLoss, order.TakeProfit, order.StopLossType, order.TrailingSLPct, order.Validity, order.ProductType,
 		order.Status, order.RiskApproved, order.RiskScore,
 		order.IsPaperTrade, order.TradingMode,
 		order.RetryCount, order.CreatedAt, order.UpdatedAt,
@@ -123,6 +152,53 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 		return fmt.Errorf("failed to create order: %w", err)
 	}
 
+	return nil
+}
+
+// CreatePaperPartialExit inserts a partial exit (square-off) record produced by an ML
+// level trigger. It writes every field that the generic Create omits: filled_quantity,
+// filled_price, paper_exit_price, paper_pnl, is_square_off_order, and indira_order_id.
+func (r *orderRepository) CreatePaperPartialExit(ctx context.Context, order *models.Order) error {
+	query := `
+		INSERT INTO orders (
+			order_id, user_id, strategy_id, strategy_name, event_id,
+			stock_code, exchange, symbol,
+			order_type, order_side, quantity, price,
+			validity, product_type,
+			status, risk_approved,
+			is_paper_trade, trading_mode,
+			filled_quantity, filled_price,
+			paper_exit_price, paper_pnl,
+			is_square_off_order, indira_order_id,
+			submitted_at, executed_at, created_at, updated_at
+		) VALUES (
+			$1,  $2,  $3,  $4,  $5,
+			$6,  $7,  $8,
+			$9,  $10, $11, $12,
+			$13, $14,
+			$15, $16,
+			$17, $18,
+			$19, $20,
+			$21, $22,
+			$23, $24,
+			$25, $26, $27, $28
+		)
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		order.OrderID, order.UserID, order.StrategyID, order.StrategyName, order.EventID,
+		order.StockCode, order.Exchange, order.Symbol,
+		order.OrderType, order.OrderSide, order.Quantity, order.Price,
+		order.Validity, order.ProductType,
+		order.Status, order.RiskApproved,
+		order.IsPaperTrade, order.TradingMode,
+		order.FilledQuantity, order.FilledPrice,
+		order.PaperExitPrice, order.PaperPnL,
+		order.IsSquareOffOrder, order.IndiraOrderID,
+		order.SubmittedAt, order.ExecutedAt, order.CreatedAt, order.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create paper partial exit: %w", err)
+	}
 	return nil
 }
 
@@ -338,8 +414,10 @@ func (r *orderRepository) GetAllActivePaperOrders(ctx context.Context) ([]*model
 	query := `
 		SELECT * FROM orders
 		WHERE is_paper_trade = true
+		AND is_square_off_order = false
 		AND status IN ('FILLED', 'EXECUTED', 'TRADED')
 		AND paper_exit_price IS NULL
+		AND filled_quantity > 0
 		ORDER BY created_at ASC
 	`
 	err := r.db.SelectContext(ctx, &orders, query)
@@ -368,14 +446,20 @@ func (r *orderRepository) GetFilledPaperOrdersBySymbol(ctx context.Context, symb
 }
 
 // GetFilledPaperOrdersByUser retrieves active paper trading positions for a user.
-// Only returns orders that have NOT been exited yet (paper_exit_price IS NULL).
+// Only returns FILLED entry orders that have NOT been exited yet (paper_exit_price IS NULL).
+// RECEIVED/PENDING/SUBMITTED orders are excluded — they have no fill data and must not
+// appear as open positions in the UI.
+// Square-off reverse orders (audit trail for exits/partial-exits) are excluded.
 func (r *orderRepository) GetFilledPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	orders := make([]*models.Order, 0)
 	query := `
 		SELECT * FROM orders
 		WHERE user_id = $1
 		AND is_paper_trade = true
-		AND status IN ('FILLED', 'EXECUTED', 'TRADED', 'RECEIVED', 'PENDING', 'SUBMITTED')
+		AND is_square_off_order = false
+		AND status IN ('FILLED', 'EXECUTED', 'TRADED')
+		AND filled_quantity > 0
+		AND filled_price IS NOT NULL
 		AND paper_exit_price IS NULL
 		ORDER BY created_at DESC
 	`
@@ -442,7 +526,12 @@ func (r *orderRepository) CancelAllLiveOrdersByUser(ctx context.Context, userID 
 	return nil
 }
 
-// GetClosedPaperOrdersByUser retrieves paper orders that have been exited (paper_exit_price IS NOT NULL)
+// GetClosedPaperOrdersByUser retrieves closed paper positions for a user.
+// Includes two record types:
+//  1. Fully closed entry orders (paper_exit_price IS NOT NULL, is_square_off_order = false)
+//  2. Partial exit records (is_square_off_order = true) — each represents one ML level
+//     that fired; they have paper_exit_price set by recordPaperPartialExit so
+//     the Closed tab can show per-level closes with correct qty and P&L.
 func (r *orderRepository) GetClosedPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	orders := make([]*models.Order, 0)
 	query := `
@@ -727,6 +816,43 @@ func (r *orderRepository) UpdatePaperTradeExit(ctx context.Context, orderID uuid
 	return nil
 }
 
+// UpdatePaperPositionFilledQty reduces the entry order's filled_quantity after a partial
+// ML exit so the open positions view shows remaining quantity instead of the original.
+func (r *orderRepository) UpdatePaperPositionFilledQty(ctx context.Context, orderID uuid.UUID, remainingQty int32) error {
+	query := `
+		UPDATE orders SET
+			filled_quantity = $1,
+			updated_at = $2
+		WHERE order_id = $3
+		AND is_paper_trade = true
+		AND is_square_off_order = false
+	`
+	result, err := r.db.ExecContext(ctx, query, remainingQty, time.Now(), orderID)
+	if err != nil {
+		return fmt.Errorf("failed to update paper position filled_quantity: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("paper entry order not found: %s", orderID)
+	}
+	return nil
+}
+
+// UpdateTrailingSL persists the advanced trailing stop-loss price to the orders table.
+func (r *orderRepository) UpdateTrailingSL(ctx context.Context, orderID uuid.UUID, newSL float64) error {
+	query := `
+		UPDATE orders SET
+			stop_loss = $1,
+			updated_at = $2
+		WHERE order_id = $3
+	`
+	_, err := r.db.ExecContext(ctx, query, newSL, time.Now(), orderID)
+	if err != nil {
+		return fmt.Errorf("failed to update trailing SL: %w", err)
+	}
+	return nil
+}
+
 // GetDistinctActiveUserIDs returns unique user IDs that have non-terminal live orders.
 func (r *orderRepository) GetDistinctActiveUserIDs(ctx context.Context) ([]string, error) {
 	query := `
@@ -906,4 +1032,138 @@ func (r *orderRepository) GetMultiLevelExitLevels(ctx context.Context, entryOrde
 		return nil, fmt.Errorf("failed to get multi-level exit levels: %w", err)
 	}
 	return recs, nil
+}
+
+// GetMultiLevelExitLevelsBatch fetches ML levels for multiple entry orders in a single query.
+// Returns a map of entryOrderID → levels slice.
+func (r *orderRepository) GetMultiLevelExitLevelsBatch(ctx context.Context, entryOrderIDs []uuid.UUID) (map[uuid.UUID][]*models.MultiLevelExitRecord, error) {
+	result := make(map[uuid.UUID][]*models.MultiLevelExitRecord, len(entryOrderIDs))
+	if len(entryOrderIDs) == 0 {
+		return result, nil
+	}
+
+	// Build $1,$2,... placeholders
+	placeholders := make([]string, len(entryOrderIDs))
+	args := make([]interface{}, len(entryOrderIDs))
+	for i, id := range entryOrderIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, entry_order_id, exit_type, level_num, price_pct, qty_pct,
+		       trigger_price, exit_qty, status, exit_order_id, broker_order_id,
+		       triggered_at, exit_price, created_at, updated_at
+		FROM multi_level_exit_levels
+		WHERE entry_order_id IN (%s)
+		ORDER BY entry_order_id, exit_type, level_num
+	`, strings.Join(placeholders, ","))
+
+	var recs []*models.MultiLevelExitRecord
+	if err := r.db.SelectContext(ctx, &recs, query, args...); err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to batch-get multi-level exit levels: %w", err)
+	}
+
+	for _, rec := range recs {
+		result[rec.EntryOrderID] = append(result[rec.EntryOrderID], rec)
+	}
+	return result, nil
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Per-user auto square-off queries
+// ════════════════════════════════════════════════════════════════════════════
+
+// GetUsersWithAutoSquareOffAtTime returns user IDs whose enabled square_off_time
+// in user_square_off_config matches timeStr ("HH:MM" IST).
+func (r *orderRepository) GetUsersWithAutoSquareOffAtTime(ctx context.Context, timeStr string) ([]string, error) {
+	query := `
+		SELECT user_id FROM user_square_off_config
+		WHERE square_off_time = $1
+		AND enabled = true
+	`
+	var userIDs []string
+	if err := r.db.SelectContext(ctx, &userIDs, query, timeStr); err != nil && err != sql.ErrNoRows {
+		// If the table doesn't exist yet (migration 016 not applied), return empty
+		// instead of spamming error logs every minute. Run migration 016 to enable
+		// per-user auto square-off config.
+		if isTableNotFoundErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get users with auto sq-off at %s: %w", timeStr, err)
+	}
+	return userIDs, nil
+}
+
+// isTableNotFoundErr returns true when err is a PostgreSQL "relation does not exist" error.
+func isTableNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// pq error code 42P01 = undefined_table
+	if pqErr, ok := err.(*pq.Error); ok {
+		return pqErr.Code == "42P01"
+	}
+	return strings.Contains(err.Error(), "does not exist")
+}
+
+// GetOpenOrdersByUser returns FILLED/PARTIALLY_FILLED INTRADAY live orders for a single
+// user placed today that have not been square-offed yet. Used for per-user live square-off.
+func (r *orderRepository) GetOpenOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	var orders []*models.Order
+	query := `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		AND status IN ('FILLED', 'PARTIALLY_FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED')
+		AND product_type = 'INTRADAY'
+		AND is_square_off_order = false
+		AND is_paper_trade = false
+		AND strategy_id != ''
+		AND created_at >= CURRENT_DATE
+		ORDER BY created_at ASC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, userID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get open orders for user %s: %w", userID, err)
+	}
+	return orders, nil
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Auto square-off config
+// ════════════════════════════════════════════════════════════════════════════
+
+// UpsertUserSquareOffConfig stores or updates the auto square-off config for a user.
+func (r *orderRepository) UpsertUserSquareOffConfig(ctx context.Context, userID, squareOffTime string, enabled bool) error {
+	query := `
+		INSERT INTO user_square_off_config (user_id, square_off_time, enabled, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (user_id) DO UPDATE
+		SET square_off_time = EXCLUDED.square_off_time,
+		    enabled         = EXCLUDED.enabled,
+		    updated_at      = NOW()
+	`
+	if _, err := r.db.ExecContext(ctx, query, userID, squareOffTime, enabled); err != nil {
+		return fmt.Errorf("failed to upsert square-off config for user %s: %w", userID, err)
+	}
+	return nil
+}
+
+// GetUserSquareOffConfig retrieves the auto square-off config for a user.
+// Returns ("", false, nil) when no config row exists.
+func (r *orderRepository) GetUserSquareOffConfig(ctx context.Context, userID string) (string, bool, error) {
+	var squareOffTime string
+	var enabled bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT square_off_time, enabled
+		FROM user_square_off_config
+		WHERE user_id = $1
+	`, userID).Scan(&squareOffTime, &enabled)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("failed to get square-off config for user %s: %w", userID, err)
+	}
+	return squareOffTime, enabled, nil
 }

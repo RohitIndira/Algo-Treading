@@ -29,18 +29,25 @@ const (
 
 // PaperUpdate is the message sent to frontend clients over the paper trading WebSocket.
 type PaperUpdate struct {
-	Type       string          `json:"type"`                 // connected | pnl_update | position_exit | force_exit_done | initial_orders | new_order
+	Type       string          `json:"type"`                 // connected | pnl_update | position_exit | force_exit_done | initial_orders | new_order | ml_level_triggered
 	OrderID    string          `json:"order_id,omitempty"`
 	UserID     string          `json:"user_id,omitempty"`
 	Symbol     string          `json:"symbol,omitempty"`
 	LTP        float64         `json:"ltp,omitempty"`
-	LivePnL    float64         `json:"live_pnl,omitempty"`  // Ongoing PnL
-	FinalPnL   float64         `json:"final_pnl,omitempty"` // On exit
-	Reason     string          `json:"reason,omitempty"`    // STOP_LOSS | TAKE_PROFIT | FORCE_EXIT
+	LivePnL    float64         `json:"live_pnl"`              // Ongoing PnL (always sent, even when 0)
+	FinalPnL   float64         `json:"final_pnl,omitempty"`   // On exit
+	CurrentSL  float64         `json:"current_sl,omitempty"`  // Updated trailing SL price (non-zero only when it changed)
+	Reason     string          `json:"reason,omitempty"`    // STOP_LOSS | TAKE_PROFIT | FORCE_EXIT | MULTI_LEVEL_COMPLETE
 	ExitPrice  float64         `json:"exit_price,omitempty"`
 	EntryPrice float64         `json:"entry_price,omitempty"`
 	Positions  []*models.Order `json:"positions,omitempty"` // Used for initial_orders
 	Order      *models.Order   `json:"order,omitempty"`     // Used for new_order
+	// Fields for ml_level_triggered
+	ExitType              string `json:"exit_type,omitempty"`               // "SL" | "TP"
+	LevelNum              int    `json:"level_num,omitempty"`
+	RemainingQty          int32  `json:"remaining_qty,omitempty"`           // qty still open after this level fires
+	CancelledExitType     string `json:"cancelled_exit_type,omitempty"`     // opposite side level cancelled as side effect
+	CancelledLevelNum     int    `json:"cancelled_level_num"`               // -1 = none (always serialised so frontend can read it)
 }
 
 // LiveOrderUpdate is the message sent to frontend clients over the live orders WebSocket.
@@ -462,6 +469,8 @@ func (s *PaperWSServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/ws/live-orders/subscribe-broker-ws", s.handleSubscribeBrokerWS)
 	mux.HandleFunc("/ws/live-orders/price-watches", s.handleGetPriceWatches)
 	mux.HandleFunc("/ws/live-orders/cancel-price-watch", s.handleCancelPriceWatch)
+	// Auto square-off config (trade-execution native, no risk-management dependency)
+	mux.HandleFunc("/ws/auto-square-off/config", s.handleAutoSquareOffConfig)
 	// Dashboard
 	mux.HandleFunc("/ws/dashboard-stats", s.handleGetDashboardStats)
 }
@@ -547,6 +556,15 @@ func (s *PaperWSServer) handleWSConnection(w http.ResponseWriter, r *http.Reques
 	log.Printf("[paper-ws] Client disconnected: user=%s", userID)
 }
 
+// paperPositionDTO is the JSON shape sent to the frontend for each open paper position.
+// It embeds the full Order and appends multi-level exit level arrays so the UI can
+// display SL/TP level chips instead of a single absolute price.
+type paperPositionDTO struct {
+	*models.Order
+	MultiLevelSL []*models.MultiLevelExitRecord `json:"multi_level_sl,omitempty"`
+	MultiLevelTP []*models.MultiLevelExitRecord `json:"multi_level_tp,omitempty"`
+}
+
 // handleGetPositions returns all open paper positions as JSON.
 // GET /ws/paper-trades/positions?user_id=xxx
 func (s *PaperWSServer) handleGetPositions(w http.ResponseWriter, r *http.Request) {
@@ -566,10 +584,31 @@ func (s *PaperWSServer) handleGetPositions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Collect order IDs for a single batch query instead of N+1.
+	orderIDs := make([]uuid.UUID, len(orders))
+	for i, o := range orders {
+		orderIDs[i] = o.OrderID
+	}
+	mlLevelsByOrder, _ := s.repo.GetMultiLevelExitLevelsBatch(r.Context(), orderIDs)
+
+	// Build DTOs enriched with ML level data.
+	dtos := make([]*paperPositionDTO, 0, len(orders))
+	for _, o := range orders {
+		dto := &paperPositionDTO{Order: o}
+		for _, l := range mlLevelsByOrder[o.OrderID] {
+			if l.ExitType == models.MLExitTypeSL {
+				dto.MultiLevelSL = append(dto.MultiLevelSL, l)
+			} else {
+				dto.MultiLevelTP = append(dto.MultiLevelTP, l)
+			}
+		}
+		dtos = append(dtos, dto)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":   true,
-		"positions": orders,
+		"positions": dtos,
 	})
 }
 
@@ -1417,6 +1456,72 @@ func (s *PaperWSServer) handleCancelPriceWatch(w http.ResponseWriter, r *http.Re
 		"success":   true,
 		"cancelled": cancelled,
 		"requested": len(parsedIDs),
+	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTO SQUARE-OFF CONFIG handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// handleAutoSquareOffConfig routes GET and POST for /ws/auto-square-off/config.
+//
+//	POST body: {"user_id":"xxx", "square_off_time":"HH:MM", "enabled":true}
+//	GET  ?user_id=xxx  → {"success":true, "square_off_time":"HH:MM", "enabled":true}
+func (s *PaperWSServer) handleAutoSquareOffConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		s.handleSetAutoSquareOffConfig(w, r)
+	case http.MethodGet:
+		s.handleGetAutoSquareOffConfig(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *PaperWSServer) handleSetAutoSquareOffConfig(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		UserID         string `json:"user_id"`
+		SquareOffTime  string `json:"square_off_time"`
+		Enabled        bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UserID == "" {
+		http.Error(w, `{"error":"user_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Enabled && body.SquareOffTime == "" {
+		http.Error(w, `{"error":"square_off_time is required when enabled"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.repo.UpsertUserSquareOffConfig(r.Context(), body.UserID, body.SquareOffTime, body.Enabled); err != nil {
+		log.Printf("[auto-sq-off] Failed to upsert config for user %s: %v", body.UserID, err)
+		http.Error(w, `{"error":"failed to save config"}`, http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[auto-sq-off] Config saved: user=%s time=%s enabled=%v", body.UserID, body.SquareOffTime, body.Enabled)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+func (s *PaperWSServer) handleGetAutoSquareOffConfig(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+	if userID == "" {
+		http.Error(w, `{"error":"user_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	sqTime, enabled, err := s.repo.GetUserSquareOffConfig(r.Context(), userID)
+	if err != nil {
+		log.Printf("[auto-sq-off] Failed to get config for user %s: %v", userID, err)
+		http.Error(w, `{"error":"failed to get config"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"square_off_time": sqTime,
+		"enabled":         enabled,
 	})
 }
 

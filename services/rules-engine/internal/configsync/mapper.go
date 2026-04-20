@@ -56,9 +56,12 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 		StopLossPct:      p.TradeConfig.StopLossPct,
 		TakeProfitPct:    p.TradeConfig.TakeProfitPct,
 		StopLossType:     normalizeStopLossType(p.TradeConfig.StopLossType),
+		TakeProfitType:   normalizeTakeProfitType(p.TradeConfig.TakeProfitType),
 		TrailingSLPct:    p.TradeConfig.TrailingSLPct,
 		ProductType:      normalizeProductType(p.TradeConfig.ProductType),
 		MaxPositionSize:  0,
+		MultiLevelSL:     toModelMultiLevel(p.TradeConfig.MultiLevelSL),
+		MultiLevelTP:     toModelMultiLevel(p.TradeConfig.MultiLevelTP),
 		TradeWindowStart: p.TradeConfig.TradeWindowStart,
 		TradeWindowEnd:   p.TradeConfig.TradeWindowEnd,
 	}
@@ -150,9 +153,35 @@ func normalizeStopLossType(v string) string {
 		return "FIXED"
 	case "TRAILING", "STOP_LOSS_TYPE_TRAILING":
 		return "TRAILING"
+	case "MULTI_LEVEL", "STOP_LOSS_TYPE_MULTI_LEVEL":
+		return "MULTI_LEVEL"
 	default:
 		return "FIXED"
 	}
+}
+
+func normalizeTakeProfitType(v string) string {
+	switch v {
+	case "MULTI_LEVEL", "TAKE_PROFIT_TYPE_MULTI_LEVEL":
+		return "MULTI_LEVEL"
+	default:
+		return "FIXED"
+	}
+}
+
+func toModelMultiLevel(in []MultiLevelExitLevelPayload) []models.MultiLevelExitLevel {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]models.MultiLevelExitLevel, len(in))
+	for i, l := range in {
+		out[i] = models.MultiLevelExitLevel{
+			LevelNum: l.LevelNum,
+			PricePct: l.PricePct,
+			QtyPct:   l.QtyPct,
+		}
+	}
+	return out
 }
 
 func normalizeProductType(v string) string {

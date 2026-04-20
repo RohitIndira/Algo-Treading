@@ -229,4 +229,9 @@ type TradeSignal struct {
 	// The PriceMonitor must NOT trigger the order if LTP exceeds this level.
 	// 0 means no upper bound.
 	MaxMonitorPrice float64 `json:"max_monitor_price,omitempty"`
+
+	// AutoSquareOffTime is an optional per-user override for when all positions are
+	// force-closed. Format: "HH:MM" (24-hour IST). Applies to both paper and live.
+	// Empty string = use the global default (15:05 IST live, 15:00 IST paper).
+	AutoSquareOffTime string `json:"auto_square_off_time,omitempty"`
 }
