@@ -101,6 +101,9 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		strategy.Description, strategy.Active, strategy.TradingMode, strategy.Version,
 	).Scan(&strategy.CreatedAt, &strategy.UpdatedAt)
 	if err != nil {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			return nil, fmt.Errorf("strategy name %q already exists for this user", strategy.StrategyName)
+		}
 		return nil, fmt.Errorf("failed to insert strategy: %w", err)
 	}
 
@@ -358,6 +361,9 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("strategy not found or version mismatch")
+		}
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			return nil, fmt.Errorf("strategy name %q already exists for this user", req.StrategyName)
 		}
 		return nil, fmt.Errorf("failed to update strategy: %w", err)
 	}

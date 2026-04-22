@@ -45,6 +45,11 @@ CREATE INDEX IF NOT EXISTS idx_strategies_user_id    ON strategies(user_id);
 CREATE INDEX IF NOT EXISTS idx_strategies_active     ON strategies(active);
 CREATE INDEX IF NOT EXISTS idx_strategies_deleted_at ON strategies(deleted_at);
 
+-- Enforce unique strategy name per user (only among non-deleted strategies)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_strategies_user_name
+    ON strategies(user_id, strategy_name)
+    WHERE deleted_at IS NULL;
+
 CREATE TRIGGER update_strategies_updated_at BEFORE UPDATE ON strategies
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 

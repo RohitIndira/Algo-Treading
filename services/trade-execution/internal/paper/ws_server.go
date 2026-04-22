@@ -27,6 +27,55 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 )
 
+// istLocation is IST (UTC+5:30), used to format all timestamps sent to the frontend.
+var istLocation = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		return time.FixedZone("IST", 5*3600+30*60)
+	}
+	return loc
+}()
+
+func fmtIST(t time.Time) string {
+	return t.In(istLocation).Format(time.RFC3339)
+}
+
+func fmtISTPtr(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := fmtIST(*t)
+	return &s
+}
+
+// orderISTWrapper shadows the time.Time timestamp fields of models.Order with
+// IST-formatted RFC3339 strings so the frontend receives IST times directly.
+type orderISTWrapper struct {
+	*models.Order
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
+	SubmittedAt *string `json:"submitted_at,omitempty"`
+	ExecutedAt  *string `json:"executed_at,omitempty"`
+}
+
+func wrapOrderIST(o *models.Order) *orderISTWrapper {
+	return &orderISTWrapper{
+		Order:       o,
+		CreatedAt:   fmtIST(o.CreatedAt),
+		UpdatedAt:   fmtIST(o.UpdatedAt),
+		SubmittedAt: fmtISTPtr(o.SubmittedAt),
+		ExecutedAt:  fmtISTPtr(o.ExecutedAt),
+	}
+}
+
+func wrapOrdersIST(orders []*models.Order) []*orderISTWrapper {
+	wrapped := make([]*orderISTWrapper, len(orders))
+	for i, o := range orders {
+		wrapped[i] = wrapOrderIST(o)
+	}
+	return wrapped
+}
+
 // PaperUpdate is the message sent to frontend clients over the paper trading WebSocket.
 type PaperUpdate struct {
 	Type       string          `json:"type"`                 // connected | pnl_update | position_exit | force_exit_done | initial_orders | new_order | ml_level_triggered
@@ -50,6 +99,54 @@ type PaperUpdate struct {
 	CancelledLevelNum     int    `json:"cancelled_level_num"`               // -1 = none (always serialised so frontend can read it)
 }
 
+func (u PaperUpdate) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		Type              string             `json:"type"`
+		OrderID           string             `json:"order_id,omitempty"`
+		UserID            string             `json:"user_id,omitempty"`
+		Symbol            string             `json:"symbol,omitempty"`
+		LTP               float64            `json:"ltp,omitempty"`
+		LivePnL           float64            `json:"live_pnl"`
+		FinalPnL          float64            `json:"final_pnl,omitempty"`
+		CurrentSL         float64            `json:"current_sl,omitempty"`
+		Reason            string             `json:"reason,omitempty"`
+		ExitPrice         float64            `json:"exit_price,omitempty"`
+		EntryPrice        float64            `json:"entry_price,omitempty"`
+		Positions         []*orderISTWrapper `json:"positions,omitempty"`
+		Order             *orderISTWrapper   `json:"order,omitempty"`
+		ExitType          string             `json:"exit_type,omitempty"`
+		LevelNum          int                `json:"level_num,omitempty"`
+		RemainingQty      int32              `json:"remaining_qty,omitempty"`
+		CancelledExitType string             `json:"cancelled_exit_type,omitempty"`
+		CancelledLevelNum int                `json:"cancelled_level_num"`
+	}
+	a := alias{
+		Type:              u.Type,
+		OrderID:           u.OrderID,
+		UserID:            u.UserID,
+		Symbol:            u.Symbol,
+		LTP:               u.LTP,
+		LivePnL:           u.LivePnL,
+		FinalPnL:          u.FinalPnL,
+		CurrentSL:         u.CurrentSL,
+		Reason:            u.Reason,
+		ExitPrice:         u.ExitPrice,
+		EntryPrice:        u.EntryPrice,
+		ExitType:          u.ExitType,
+		LevelNum:          u.LevelNum,
+		RemainingQty:      u.RemainingQty,
+		CancelledExitType: u.CancelledExitType,
+		CancelledLevelNum: u.CancelledLevelNum,
+	}
+	if u.Positions != nil {
+		a.Positions = wrapOrdersIST(u.Positions)
+	}
+	if u.Order != nil {
+		a.Order = wrapOrderIST(u.Order)
+	}
+	return json.Marshal(a)
+}
+
 // LiveOrderUpdate is the message sent to frontend clients over the live orders WebSocket.
 type LiveOrderUpdate struct {
 	Type         string                     `json:"type"`                    // connected | initial_orders | initial_closed_orders | order_update | closed_orders | force_exit_done | price_watches_snapshot | price_watch_cancelled | token_expired | positions
@@ -58,6 +155,30 @@ type LiveOrderUpdate struct {
 	Order        *models.Order              `json:"order,omitempty"`         // For order_update
 	PriceWatches []scheduler.WatchSnapshot  `json:"price_watches,omitempty"` // For price_watches_snapshot
 	Positions    []EnrichedAlgoPosition     `json:"positions,omitempty"`     // For positions (event-driven push after fills)
+}
+
+func (u LiveOrderUpdate) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		Type         string                    `json:"type"`
+		UserID       string                    `json:"user_id,omitempty"`
+		Orders       []*orderISTWrapper        `json:"orders,omitempty"`
+		Order        *orderISTWrapper          `json:"order,omitempty"`
+		PriceWatches []scheduler.WatchSnapshot `json:"price_watches,omitempty"`
+		Positions    []EnrichedAlgoPosition    `json:"positions,omitempty"`
+	}
+	a := alias{
+		Type:         u.Type,
+		UserID:       u.UserID,
+		PriceWatches: u.PriceWatches,
+		Positions:    u.Positions,
+	}
+	if u.Orders != nil {
+		a.Orders = wrapOrdersIST(u.Orders)
+	}
+	if u.Order != nil {
+		a.Order = wrapOrderIST(u.Order)
+	}
+	return json.Marshal(a)
 }
 
 // BrokerPosition is a position returned by the Indira broker API.
@@ -203,9 +324,9 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 		// Track earliest entry order for metadata
 		entryTime := ""
 		if order.ExecutedAt != nil {
-			entryTime = order.ExecutedAt.Format("2006-01-02T15:04:05Z07:00")
+			entryTime = fmtIST(*order.ExecutedAt)
 		} else if !order.CreatedAt.IsZero() {
-			entryTime = order.CreatedAt.Format("2006-01-02T15:04:05Z07:00")
+			entryTime = fmtIST(order.CreatedAt)
 		}
 		if share.EntryOrderID == "" || (entryTime != "" && entryTime < share.EntryTime) {
 			share.EntryOrderID = order.OrderID.String()
@@ -563,6 +684,19 @@ type paperPositionDTO struct {
 	*models.Order
 	MultiLevelSL []*models.MultiLevelExitRecord `json:"multi_level_sl,omitempty"`
 	MultiLevelTP []*models.MultiLevelExitRecord `json:"multi_level_tp,omitempty"`
+}
+
+func (dto *paperPositionDTO) MarshalJSON() ([]byte, error) {
+	type shadow struct {
+		*orderISTWrapper
+		MultiLevelSL []*models.MultiLevelExitRecord `json:"multi_level_sl,omitempty"`
+		MultiLevelTP []*models.MultiLevelExitRecord `json:"multi_level_tp,omitempty"`
+	}
+	return json.Marshal(&shadow{
+		orderISTWrapper: wrapOrderIST(dto.Order),
+		MultiLevelSL:    dto.MultiLevelSL,
+		MultiLevelTP:    dto.MultiLevelTP,
+	})
 }
 
 // handleGetPositions returns all open paper positions as JSON.
@@ -1061,7 +1195,7 @@ func (s *PaperWSServer) handleGetClosedPaperOrders(w http.ResponseWriter, r *htt
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"orders":  orders,
+		"orders":  wrapOrdersIST(orders),
 	})
 }
 
@@ -1085,7 +1219,7 @@ func (s *PaperWSServer) handleGetClosedLiveOrders(w http.ResponseWriter, r *http
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"orders":  orders,
+		"orders":  wrapOrdersIST(orders),
 	})
 }
 

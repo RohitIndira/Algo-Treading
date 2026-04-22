@@ -898,7 +898,7 @@ func checkRequiredTables(db *sqlx.DB) error {
 	if !exists {
 		// Give an actionable error pointing to migration SQL and setup script
 		return fmt.Errorf("required table 'orders' does not exist in the database. " +
-			"Run the migration: `psql -h <host> -U <user> -d <db> -f services/trade-execution/migrations/001_create_orders_table.sql` " +
+			"Run the migration: `psql -h <host> -U <user> -d <db> -f services/trade-execution/migrations/001_init.sql` " +
 			"or run `scripts/setup_all_databases.sh` to create databases and run migrations.")
 	}
 

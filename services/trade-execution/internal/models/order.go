@@ -155,7 +155,7 @@ type Order struct {
 	// MaxMonitorPrice is the price ceiling for the PriceMonitor.
 	// If LTP exceeds this level, the monitor must NOT trigger the order.
 	// 0 means no upper bound.
-	MaxMonitorPrice float64 `json:"max_monitor_price,omitempty" db:"max_monitor_price"`
+	MaxMonitorPrice *float64 `json:"max_monitor_price,omitempty" db:"max_monitor_price"`
 
 	// OCO (One-Cancels-the-Other) group tracking
 	OCOGroupID    *uuid.UUID `json:"oco_group_id,omitempty" db:"oco_group_id"`       // Links all orders in one OCO group

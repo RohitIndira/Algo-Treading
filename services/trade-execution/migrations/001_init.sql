@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Trade Execution Service — Initial Schema (Go-Live)
 -- Single migration combining all prior incremental migrations.
--- Tables: instruments, broker_accounts, orders_v2, order_status_history,
+-- Tables: instruments, broker_accounts, orders, order_status_history,
 --         fills, broker_requests, stop_loss_config, order_groups,
 --         order_group_legs, positions, position_fills, daily_pnl_summary,
 --         signal_metrics, multi_level_exit_levels, user_square_off_config
@@ -65,60 +65,138 @@ CREATE TABLE IF NOT EXISTS broker_accounts (
 CREATE INDEX IF NOT EXISTS idx_broker_accounts_user ON broker_accounts(user_id);
 
 -- ============================================================================
--- 3. ORDERS_V2
+-- 3. ORDERS
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS orders_v2 (
-    order_id        UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
-    instrument_id   INT             REFERENCES instruments(instrument_id),
-    account_id      INT             REFERENCES broker_accounts(account_id) ON DELETE SET NULL,
+CREATE TABLE IF NOT EXISTS orders (
+    order_id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id               VARCHAR(50)     NOT NULL,
+    strategy_id           VARCHAR(50)     NOT NULL,
+    strategy_name         VARCHAR(255)    NOT NULL DEFAULT '',
+    event_id              UUID            NOT NULL,
+    signal_id             UUID,
 
-    user_id         VARCHAR(50)     NOT NULL,
-    strategy_id     VARCHAR(50)     NOT NULL,
-    strategy_name   VARCHAR(255)    NOT NULL DEFAULT '',
-    event_id        UUID            NOT NULL,
-    signal_id       UUID,
+    -- Instrument info (denormalised for query speed)
+    stock_code            BIGINT          NOT NULL DEFAULT 0,
+    exchange              VARCHAR(10)     NOT NULL DEFAULT '',
+    symbol                VARCHAR(100)    NOT NULL DEFAULT '',
 
-    order_type      VARCHAR(10)     NOT NULL,
-    order_side      VARCHAR(10)     NOT NULL,
-    quantity        INT             NOT NULL,
-    price           DECIMAL(15,2),
-    validity        VARCHAR(10)     NOT NULL DEFAULT 'DAY',
-    product_type    VARCHAR(20)     NOT NULL DEFAULT 'INTRADAY',
-    trading_mode    VARCHAR(10)     NOT NULL DEFAULT 'LIVE',
+    -- Order details
+    order_type            VARCHAR(20)     NOT NULL,
+    order_side            VARCHAR(10)     NOT NULL,
+    quantity              INT             NOT NULL,
+    price                 DECIMAL(15,2),
+    stop_loss             DECIMAL(15,2),
+    take_profit           DECIMAL(15,2),
+    target_price          DECIMAL(15,2),
+    validity              VARCHAR(10)     NOT NULL DEFAULT 'DAY',
+    product_type          VARCHAR(20)     NOT NULL DEFAULT 'INTRADAY',
 
-    status          VARCHAR(20)     NOT NULL DEFAULT 'RECEIVED',
-    filled_qty      INT             NOT NULL DEFAULT 0,
-    avg_fill_price  DECIMAL(15,2),
+    -- Status
+    status                VARCHAR(20)     NOT NULL DEFAULT 'RECEIVED',
+    rejection_reason      TEXT,
+    error_message         TEXT,
+    retry_count           INT             NOT NULL DEFAULT 0,
 
-    risk_approved   BOOLEAN         NOT NULL DEFAULT false,
-    risk_score      DECIMAL(5,2),
+    -- Broker integration
+    indira_order_id       VARCHAR(100),
+    indira_response       TEXT,
+    odin_order_id         VARCHAR(100),
+    odin_response         TEXT,
+    broker_status         VARCHAR(50),
+    broker_ws_data        TEXT,
+    exchange_order_number VARCHAR(100),
 
-    auto_square_off_time VARCHAR(5),
+    -- Frontend auth (passed-through for broker calls)
+    bearer_token          TEXT,
+    app_id                VARCHAR(100),
+    source                VARCHAR(20),
 
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    submitted_at    TIMESTAMPTZ,
-    executed_at     TIMESTAMPTZ,
+    -- Stop loss config
+    stop_loss_type        VARCHAR(20),
+    trailing_sl_pct       DECIMAL(10,4),
+    highest_price         DECIMAL(15,2),
 
-    error_message   TEXT,
-    retry_count     INT             NOT NULL DEFAULT 0,
+    -- Square-off flags
+    is_square_off_order   BOOLEAN         NOT NULL DEFAULT false,
+    auto_square_off_time  VARCHAR(5),
 
-    CONSTRAINT chk_orders_v2_qty_positive   CHECK (quantity > 0),
-    CONSTRAINT chk_orders_v2_price_positive CHECK (price IS NULL OR price > 0)
+    -- Paper vs live
+    is_paper_trade        BOOLEAN         NOT NULL DEFAULT false,
+    trading_mode          VARCHAR(10)     NOT NULL DEFAULT 'LIVE',
+    paper_exit_price      DECIMAL(15,2),
+    paper_pnl             DECIMAL(15,2),
+
+    -- Live exit
+    live_exit_price       DECIMAL(15,2),
+    live_pnl              DECIMAL(15,2),
+
+    -- Price monitor helpers
+    current_pct_change    DECIMAL(10,4)   NOT NULL DEFAULT 0,
+    max_monitor_price     DECIMAL(15,2),
+
+    -- OCO (One-Cancels-the-Other) group
+    oco_group_id          UUID,
+    oco_role              VARCHAR(20),
+    parent_order_id       UUID,
+
+    -- Execution details
+    filled_quantity       INT             NOT NULL DEFAULT 0,
+    filled_price          DECIMAL(15,2),
+    commission            DECIMAL(15,2),
+    total_cost            DECIMAL(15,2),
+
+    -- Risk
+    risk_approved         BOOLEAN         NOT NULL DEFAULT false,
+    risk_score            DECIMAL(10,4),
+
+    -- Timestamps
+    created_at            TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    submitted_at          TIMESTAMPTZ,
+    executed_at           TIMESTAMPTZ,
+
+    CONSTRAINT chk_orders_qty_positive   CHECK (quantity > 0),
+    CONSTRAINT chk_orders_price_positive CHECK (price IS NULL OR price > 0)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_v2_signal_unique  ON orders_v2(signal_id) WHERE signal_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_orders_v2_user_time   ON orders_v2(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_v2_status      ON orders_v2(status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_v2_strategy    ON orders_v2(strategy_id, status);
-CREATE INDEX IF NOT EXISTS idx_orders_v2_event       ON orders_v2(event_id);
-CREATE INDEX IF NOT EXISTS idx_orders_v2_instrument  ON orders_v2(instrument_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_v2_trading_mode ON orders_v2(trading_mode, status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_v2_sq_off_time ON orders_v2(auto_square_off_time, user_id) WHERE auto_square_off_time IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_signal_unique             ON orders(signal_id) WHERE signal_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_user_time                        ON orders(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_status                           ON orders(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_strategy                         ON orders(strategy_id, status);
+CREATE INDEX IF NOT EXISTS idx_orders_strategy_id                      ON orders(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_orders_event                            ON orders(event_id);
+CREATE INDEX IF NOT EXISTS idx_orders_stock_code                       ON orders(stock_code);
+CREATE INDEX IF NOT EXISTS idx_orders_created_at                       ON orders(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_trading_mode                     ON orders(trading_mode, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_sq_off_time                      ON orders(auto_square_off_time, user_id) WHERE auto_square_off_time IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_oco_group                        ON orders(oco_group_id) WHERE oco_group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_oco_active                       ON orders(oco_group_id, status) WHERE oco_group_id IS NOT NULL AND status NOT IN ('CANCELLED', 'REJECTED', 'A.REJECTED', 'FAILED');
+CREATE INDEX IF NOT EXISTS idx_orders_indira_id                        ON orders(indira_order_id) WHERE indira_order_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_product_type                     ON orders(product_type, status) WHERE is_paper_trade = false;
+CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_number            ON orders(exchange_order_number) WHERE exchange_order_number IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_paper_trade                      ON orders(user_id, is_paper_trade, status) WHERE is_paper_trade = true;
+CREATE INDEX IF NOT EXISTS idx_orders_paper_symbol                     ON orders(symbol, is_paper_trade, status) WHERE is_paper_trade = true;
+CREATE INDEX IF NOT EXISTS idx_orders_paper_closed                     ON orders(user_id, is_paper_trade, paper_exit_price) WHERE is_paper_trade = true AND paper_exit_price IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_paper_open                       ON orders(user_id, is_paper_trade, status) WHERE is_paper_trade = true AND status = 'FILLED';
+CREATE INDEX IF NOT EXISTS idx_orders_live_closed                      ON orders(user_id, is_paper_trade, live_exit_price) WHERE is_paper_trade = false AND live_exit_price IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_live_open                        ON orders(user_id, is_paper_trade, status) WHERE is_paper_trade = false AND status IN ('FILLED', 'PARTIALLY_FILLED');
 
-CREATE TRIGGER trg_orders_v2_updated_at
-    BEFORE UPDATE ON orders_v2
+CREATE TRIGGER trg_orders_updated_at
+    BEFORE UPDATE ON orders
     FOR EACH ROW EXECUTE FUNCTION update_v2_updated_at();
+
+-- Execution events (order lifecycle log)
+CREATE TABLE IF NOT EXISTS execution_events (
+    id          SERIAL      PRIMARY KEY,
+    order_id    UUID        NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    event_type  VARCHAR(20) NOT NULL,
+    event_data  JSONB,
+    created_at  TIMESTAMP   DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_events_order_id   ON execution_events(order_id);
+CREATE INDEX IF NOT EXISTS idx_execution_events_created_at ON execution_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_events_type       ON execution_events(event_type);
 
 -- ============================================================================
 -- 4. ORDER_STATUS_HISTORY (partitioned by month)

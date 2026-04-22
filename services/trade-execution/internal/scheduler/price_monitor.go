@@ -192,10 +192,14 @@ func (pm *PriceMonitor) Watch(order *models.Order, targetPrice float64) {
 		return
 	}
 
+	var maxPrice float64
+	if order.MaxMonitorPrice != nil {
+		maxPrice = *order.MaxMonitorPrice
+	}
 	entry := &watchEntry{
 		order:       order,
 		targetPrice: targetPrice,
-		maxPrice:    order.MaxMonitorPrice,
+		maxPrice:    maxPrice,
 		stockKey:    key,
 	}
 	shard.byOrder[order.OrderID] = entry
@@ -208,9 +212,9 @@ func (pm *PriceMonitor) Watch(order *models.Order, targetPrice float64) {
 		pm.wsClient.Subscribe([]string{token})
 	}
 
-	if order.MaxMonitorPrice > 0 {
+	if maxPrice > 0 {
 		log.Printf("[price-monitor] ▶ Watching %s:%s (order=%s user=%s strategy=%s) target=%.2f max=%.2f",
-			order.Exchange, order.Symbol, order.OrderID, order.UserID, order.StrategyID, targetPrice, order.MaxMonitorPrice)
+			order.Exchange, order.Symbol, order.OrderID, order.UserID, order.StrategyID, targetPrice, maxPrice)
 	} else {
 		log.Printf("[price-monitor] ▶ Watching %s:%s (order=%s user=%s strategy=%s) target=%.2f (no max)",
 			order.Exchange, order.Symbol, order.OrderID, order.UserID, order.StrategyID, targetPrice)

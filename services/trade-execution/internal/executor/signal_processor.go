@@ -488,7 +488,7 @@ func (p *SignalProcessor) convertSignalToOrder(signal *models.TradeSignal) (*mod
 		IsPaperTrade:     tradingMode == "PAPER",
 		TradingMode:      tradingMode,
 		CurrentPctChange: signal.CurrentPctChange,
-		MaxMonitorPrice:  signal.MaxMonitorPrice,
+		MaxMonitorPrice:  float64Ptr(signal.MaxMonitorPrice),
 		// Per-user auto square-off override (e.g. "14:30" IST); nil if not set
 		AutoSquareOffTime: stringPtr(signal.AutoSquareOffTime),
 	}, nil

@@ -35,7 +35,7 @@ type Order struct {
 	StrategyID   string    `gorm:"column:strategy_id;type:varchar(50);not null" json:"strategy_id"`
 	StrategyName string    `gorm:"column:strategy_name;type:varchar(255);not null;default:''" json:"strategy_name"`
 	EventID      uuid.UUID `gorm:"column:event_id;type:uuid;not null" json:"event_id"`
-	SignalID     *uuid.UUID `gorm:"column:signal_id;type:uuid;uniqueIndex:idx_orders_v2_signal_unique,where:signal_id IS NOT NULL" json:"signal_id,omitempty"`
+	SignalID     *uuid.UUID `gorm:"column:signal_id;type:uuid;uniqueIndex:idx_orders_signal_unique,where:signal_id IS NOT NULL" json:"signal_id,omitempty"`
 
 	// Order Specification
 	OrderType   string   `gorm:"column:order_type;type:varchar(10);not null" json:"order_type"`
@@ -74,7 +74,7 @@ type Order struct {
 	StopLoss      *StopLossConfig  `gorm:"foreignKey:OrderID;references:OrderID" json:"stop_loss,omitempty"`
 }
 
-func (Order) TableName() string { return "orders_v2" }
+func (Order) TableName() string { return "orders" }
 
 func (o *Order) IsPaper() bool {
 	return o.TradingMode == TradingModePaper
