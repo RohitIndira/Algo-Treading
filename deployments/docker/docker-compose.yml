@@ -12,6 +12,11 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: trading_db
       PGDATA: /var/lib/postgresql/data/pgdata
+    command: >
+      postgres
+        -c max_connections=500
+        -c shared_buffers=256MB
+        -c work_mem=4MB
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./init_all_schemas.sql:/docker-entrypoint-initdb.d/init.sql
@@ -19,6 +24,46 @@ services:
       - trading-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d trading_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ===== CONNECTION POOLER =====
+  # PgBouncer sits in front of Postgres in transaction-pool mode.
+  # Services point to pgbouncer:6432 to multiplex hundreds of app-side
+  # connections into a small number of real Postgres connections.
+  # To enable: update POSTGRES_HOST/PORT in each service .env to
+  # pgbouncer / 6432 and restart services.
+  pgbouncer:
+    image: bitnami/pgbouncer:latest
+    container_name: trading-pgbouncer
+    hostname: pgbouncer
+    ports:
+      - "6432:6432"
+    environment:
+      POSTGRESQL_HOST: postgres
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_USERNAME: postgres
+      POSTGRESQL_PASSWORD: postgres
+      POSTGRESQL_DATABASE: trading_db
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_MAX_CLIENT_CONN: 2000
+      PGBOUNCER_DEFAULT_POOL_SIZE: 80
+      PGBOUNCER_MIN_POOL_SIZE: 10
+      PGBOUNCER_RESERVE_POOL_SIZE: 20
+      PGBOUNCER_RESERVE_POOL_TIMEOUT: 5
+      PGBOUNCER_SERVER_IDLE_TIMEOUT: 600
+      PGBOUNCER_CLIENT_IDLE_TIMEOUT: 0
+      PGBOUNCER_LOG_CONNECTIONS: 0
+      PGBOUNCER_LOG_DISCONNECTIONS: 0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 6432 -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -32,7 +77,14 @@ services:
     hostname: redis
     ports:
       - "6379:6379"
-    command: redis-server --appendonly yes
+    command: >
+      redis-server
+        --appendonly yes
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --tcp-backlog 511
+        --timeout 0
+        --tcp-keepalive 300
     volumes:
       - redis-data:/data
     networks:

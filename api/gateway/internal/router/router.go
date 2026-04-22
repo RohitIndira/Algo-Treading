@@ -17,6 +17,16 @@ func NewRouter(
 
 	r := mux.NewRouter()
 
+	// Assign/propagate X-Correlation-ID before anything else touches the context
+	r.Use(middleware.CorrelationID())
+	// Security headers on every response
+	r.Use(middleware.SecurityHeaders())
+	// Cap request bodies at 1 MB
+	r.Use(middleware.RequestSizeLimit(1 << 20))
+	// Rate limit: 100 req/s per IP, burst of 200
+	r.Use(middleware.NewRateLimiter(100, 200).Middleware())
+	// Audit log for mutating operations
+	r.Use(middleware.AuditLog())
 	// CORS middleware
 	r.Use(middleware.CORS(corsConfig))
 

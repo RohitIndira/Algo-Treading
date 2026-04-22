@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -81,34 +82,28 @@ func (p *SignalProcessor) SetMultiLevelManager(m MultiLevelManager) {
 func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models.TradeSignal, kafkaTime time.Time) error {
 	processStart := time.Now()
 
-	// Idempotency check: skip if this order was already processed.
-	orderID, err := uuid.Parse(signal.OrderID)
-	if err != nil {
-		return fmt.Errorf("invalid order_id in signal: %w", err)
-	}
-	idempotencyStart := time.Now()
-	exists, err := p.orderRepo.ExistsByID(ctx, orderID)
-	idempotencyMs := float64(time.Since(idempotencyStart).Microseconds()) / 1000.0
-	if err == nil && exists {
-		p.logger.Info("signal_duplicate_skip", zap.String("oid", signal.OrderID))
-		return nil
-	}
-
-	// Convert TradeSignal to Order
+	// Convert TradeSignal to Order (also validates order_id UUID format)
 	order, err := p.convertSignalToOrder(signal)
 	if err != nil {
 		return fmt.Errorf("failed to convert signal to order: %w", err)
 	}
 
-	// Persist order to DB synchronously so subsequent Update calls can find the row.
+	// Persist order — ON CONFLICT DO NOTHING combines the idempotency check
+	// and insert into a single roundtrip. ErrDuplicateOrder means the signal
+	// was already processed (duplicate Kafka delivery); treat as success.
 	dbStart := time.Now()
 	if err := p.orderRepo.Create(ctx, order); err != nil {
+		if errors.Is(err, repository.ErrDuplicateOrder) {
+			p.logger.Info("signal_duplicate_skip", zap.String("oid", signal.OrderID))
+			return nil
+		}
 		p.logger.Error("signal_db_persist_failed",
 			zap.String("oid", order.OrderID.String()),
 			zap.Error(err))
 		return fmt.Errorf("failed to persist order: %w", err)
 	}
 	dbMs := float64(time.Since(dbStart).Microseconds()) / 1000.0
+	idempotencyMs := 0.0 // folded into dbMs — kept for logOrderTiming signature
 	metrics.SignalDBPersistDuration.Observe(time.Since(dbStart).Seconds())
 
 	// ── Detect multi-level SL / TP config ───────────────────────────────

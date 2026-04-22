@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/correlation"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/workerpool"
@@ -46,7 +47,7 @@ func NewKafkaConsumer(brokers []string, groupID string, processor TradeSignalPro
 		StartOffset:    kafka.LastOffset,
 	})
 
-	pool := workerpool.New(workers, workers*4)
+	pool := workerpool.New(workers, workers*16)
 
 	logger.Info("Kafka consumer initialized",
 		zap.Strings("brokers", brokers),
@@ -109,23 +110,43 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 		metrics.WorkerPoolActive.Set(float64(c.pool.Active()))
 		metrics.WorkerPoolQueued.Set(float64(c.pool.Queued()))
 
+		// Propagate correlation ID from Kafka headers into the handler context.
+		corrID := extractCorrelationID(msg)
+		if corrID == "" {
+			corrID = correlation.NewID()
+		}
+		msgCtx := correlation.WithContext(ctx, corrID)
+
 		// Submit to bounded worker pool (blocks if queue is full).
 		c.pool.Submit(func() {
-			if err := c.processMessage(ctx, msg); err != nil {
+			if err := c.processMessage(msgCtx, msg); err != nil {
 				metrics.KafkaProcessingErrors.WithLabelValues("trade-signals").Inc()
 				c.logger.Error("Failed to process message",
 					zap.Error(err),
 					zap.String("topic", msg.Topic),
 					zap.Int("partition", msg.Partition),
-					zap.Int64("offset", msg.Offset))
+					zap.Int64("offset", msg.Offset),
+					zap.String("correlation_id", corrID))
 				return // skip commit on failure
 			}
 
 			if err := c.reader.CommitMessages(ctx, msg); err != nil {
-				c.logger.Error("Failed to commit message", zap.Error(err))
+				c.logger.Error("Failed to commit message",
+					zap.Error(err),
+					zap.String("correlation_id", corrID))
 			}
 		})
 	}
+}
+
+// extractCorrelationID reads the correlation ID from Kafka message headers.
+func extractCorrelationID(msg kafka.Message) string {
+	for _, h := range msg.Headers {
+		if h.Key == correlation.KafkaHeaderKey {
+			return string(h.Value)
+		}
+	}
+	return ""
 }
 
 // processMessage processes a single Kafka message
@@ -144,7 +165,8 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) e
 		zap.String("oid", signal.OrderID),
 		zap.String("uid", signal.UserID),
 		zap.String("sym", signal.Symbol),
-		zap.String("mode", signal.TradingMode))
+		zap.String("mode", signal.TradingMode),
+		zap.String("correlation_id", correlation.FromContext(ctx)))
 
 	if err := c.processor.ProcessTradeSignal(ctx, &signal, msg.Time); err != nil {
 		return fmt.Errorf("failed to process trade signal: %w", err)

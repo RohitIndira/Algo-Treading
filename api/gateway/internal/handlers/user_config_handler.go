@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,7 +30,7 @@ func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHand
 func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Request) {
 	var reqDTO dto.CreateStrategyRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
@@ -97,7 +98,8 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 	// Call Service
 	resp, err := h.client.CreateStrategy(r.Context(), pbReq)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to create strategy: "+err.Error())
+		log.Printf("ERROR CreateStrategy user_id=%s: %v", userIdHeader, err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to create strategy")
 		return
 	}
 
@@ -116,7 +118,7 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 
 	var reqDTO dto.UpdateStrategyRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
@@ -139,7 +141,8 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 
 	resp, err := h.client.UpdateStrategy(r.Context(), pbReq)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to update strategy: "+err.Error())
+		log.Printf("ERROR UpdateStrategy strategy_id=%s user_id=%s: %v", strategyID, userIdHeader, err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to update strategy")
 		return
 	}
 
@@ -169,7 +172,8 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 
 	resp, err := h.client.DeleteStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to delete strategy: "+err.Error())
+		log.Printf("ERROR DeleteStrategy strategy_id=%s user_id=%s: %v", strategyID, userID, err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to delete strategy")
 		return
 	}
 
@@ -203,7 +207,8 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 
 	resp, err := h.client.GetStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to get strategy: "+err.Error())
+		log.Printf("ERROR GetStrategy strategy_id=%s user_id=%s: %v", strategyID, userID, err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to get strategy")
 		return
 	}
 
@@ -253,7 +258,8 @@ func (h *UserConfigHandler) ListUserStrategies(w http.ResponseWriter, r *http.Re
 
 	resp, err := h.client.ListUserStrategies(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to list strategies: "+err.Error())
+		log.Printf("ERROR ListUserStrategies user_id=%s: %v", userID, err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to list strategies")
 		return
 	}
 
@@ -275,7 +281,7 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
@@ -296,7 +302,8 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 
 	resp, err := h.client.ActivateStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to activate strategy: "+err.Error())
+		log.Printf("ERROR ActivateStrategy strategy_id=%s user_id=%s: %v", strategyID, reqBody.UserID, err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to activate strategy")
 		return
 	}
 
@@ -318,7 +325,7 @@ func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Re
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
@@ -339,7 +346,8 @@ func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Re
 
 	resp, err := h.client.DeactivateStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to deactivate strategy: "+err.Error())
+		log.Printf("ERROR DeactivateStrategy strategy_id=%s user_id=%s: %v", strategyID, reqBody.UserID, err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to deactivate strategy")
 		return
 	}
 
@@ -357,7 +365,8 @@ func (h *UserConfigHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 
 	resp, err := h.client.HealthCheck(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusServiceUnavailable, "Service unavailable: "+err.Error())
+		log.Printf("ERROR HealthCheck: %v", err)
+		respondWithError(w, http.StatusServiceUnavailable, "Service unavailable")
 		return
 	}
 

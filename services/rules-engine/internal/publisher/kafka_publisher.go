@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/correlation"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -54,18 +55,23 @@ func (p *KafkaPublisher) PublishTradeSignal(ctx context.Context, orderReq *model
 		return fmt.Errorf("failed to marshal order: %w", err)
 	}
 
-	// Create Kafka message
+	// Create Kafka message, propagating the correlation ID so trade-execution
+	// can continue the trace from the same original news event.
+	headers := []kafka.Header{
+		{Key: "order_id", Value: []byte(orderReq.OrderID)},
+		{Key: "user_id", Value: []byte(orderReq.UserID)},
+		{Key: "strategy_id", Value: []byte(orderReq.StrategyID)},
+		{Key: "event_id", Value: []byte(orderReq.EventID)},
+		{Key: "order_type", Value: []byte(orderReq.OrderType)},
+		{Key: "timestamp", Value: []byte(orderReq.Timestamp.Format(time.RFC3339))},
+	}
+	if id := correlation.FromContext(ctx); id != "" {
+		headers = append(headers, kafka.Header{Key: correlation.KafkaHeaderKey, Value: []byte(id)})
+	}
 	msg := kafka.Message{
-		Key:   []byte(orderReq.OrderID),
-		Value: orderJSON,
-		Headers: []kafka.Header{
-			{Key: "order_id", Value: []byte(orderReq.OrderID)},
-			{Key: "user_id", Value: []byte(orderReq.UserID)},
-			{Key: "strategy_id", Value: []byte(orderReq.StrategyID)},
-			{Key: "event_id", Value: []byte(orderReq.EventID)},
-			{Key: "order_type", Value: []byte(orderReq.OrderType)},
-			{Key: "timestamp", Value: []byte(orderReq.Timestamp.Format(time.RFC3339))},
-		},
+		Key:     []byte(orderReq.OrderID),
+		Value:   orderJSON,
+		Headers: headers,
 	}
 
 	// Publish to Kafka

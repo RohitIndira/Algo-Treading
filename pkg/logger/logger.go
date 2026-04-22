@@ -268,6 +268,11 @@ func (l *Logger) WithComponent(component string) *Logger {
 	return &Logger{Logger: l.With(zap.String("component", component)), writer: l.writer}
 }
 
+// WithCorrelationID adds a correlation_id field to the logger.
+func (l *Logger) WithCorrelationID(correlationID string) *Logger {
+	return &Logger{Logger: l.With(zap.String("correlation_id", correlationID)), writer: l.writer}
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------

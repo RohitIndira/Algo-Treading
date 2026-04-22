@@ -31,21 +31,27 @@ if ! command -v pm2 &>/dev/null; then
     exit 1
 fi
 
-# ── Deployment order (path:pm2-name:binary-name) ────────────────────────────
-# risk-management is intentionally excluded
+# ── Deployment order (path:pm2-name:binary-name:instances) ──────────────────
+# instances > 1 starts that many numbered PM2 processes sharing the same
+# Kafka consumer group — Kafka distributes partitions across them automatically.
+# risk-management is intentionally excluded.
 declare -a SERVICES=(
-    "services/data-ingestion:data-ingestion:data-ingestion"
-    "services/user-config:user-config:user-config"
-    "services/rules-engine:rules-engine:rules-engine"
-    "services/trade-execution:trade-execution:trade-execution"
-    "api/gateway:api-gateway:gateway"
+    "services/data-ingestion:data-ingestion:data-ingestion:1"
+    "services/user-config:user-config:user-config:1"
+    "services/rules-engine:rules-engine:rules-engine:2"
+    "services/trade-execution:trade-execution:trade-execution:2"
+    "api/gateway:api-gateway:gateway:1"
 )
 
-# ── Helper: deploy a single service ─────────────────────────────────────────
+# ── Helper: deploy a single service (optionally multiple numbered instances) ──
+# Args: rel_path  pm2_name  binary  instances
+# When instances > 1, starts processes named <pm2_name>-0, <pm2_name>-1, …
+# Each shares the same Kafka consumer group — Kafka rebalances partitions.
 deploy_service() {
     local rel_path="$1"
     local pm2_name="$2"
     local binary="$3"
+    local instances="${4:-1}"
     local service_dir="${PROJECT_ROOT}/${rel_path}"
     local binary_path="${service_dir}/bin/${binary}"
     local env_file="${service_dir}/.env"
@@ -53,7 +59,7 @@ deploy_service() {
 
     echo ""
     echo "=========================================="
-    info "Deploying: ${pm2_name}"
+    info "Deploying: ${pm2_name} (x${instances})"
     echo "  Path  : ${rel_path}"
     echo "  Binary: ${binary_path}"
     echo "=========================================="
@@ -67,24 +73,9 @@ deploy_service() {
 
     mkdir -p "${log_dir}"
 
-    # Stop existing instance if running (ignore errors if not found)
-    pm2 delete "${pm2_name}" 2>/dev/null || true
-
-    # Build pm2 start command
-    local pm2_cmd=(
-        pm2 start "${binary_path}"
-        --name "${pm2_name}"
-        --log "${log_dir}/${pm2_name}.log"
-        --error "${log_dir}/${pm2_name}-error.log"
-        --restart-delay 3000
-        --max-restarts 10
-        --no-autorestart
-    )
-
-    # Inject .env if present
+    # Inject .env if present (exported into the shell so pm2 inherits them)
     if [ -f "${env_file}" ]; then
         info "Loading env: ${env_file}"
-        # Parse key=value lines (skip comments and blanks), export for the process
         set -o allexport
         # shellcheck disable=SC1090
         source "${env_file}"
@@ -93,8 +84,34 @@ deploy_service() {
         warn "No .env found at ${env_file} — using system environment"
     fi
 
-    "${pm2_cmd[@]}"
-    info "${pm2_name} started."
+    # Stop all existing instances for this service (handles both single and
+    # previously-multi-instance deployments).
+    if [ "${instances}" -gt 1 ]; then
+        for idx in $(seq 0 $(( instances - 1 ))); do
+            pm2 delete "${pm2_name}-${idx}" 2>/dev/null || true
+        done
+    else
+        pm2 delete "${pm2_name}" 2>/dev/null || true
+    fi
+
+    # Start the requested number of instances.
+    for idx in $(seq 0 $(( instances - 1 ))); do
+        if [ "${instances}" -gt 1 ]; then
+            local instance_name="${pm2_name}-${idx}"
+        else
+            local instance_name="${pm2_name}"
+        fi
+
+        pm2 start "${binary_path}" \
+            --name "${instance_name}" \
+            --log  "${log_dir}/${instance_name}.log" \
+            --error "${log_dir}/${instance_name}-error.log" \
+            --restart-delay 3000 \
+            --max-restarts 10 \
+            --no-autorestart
+
+        info "${instance_name} started."
+    done
 }
 
 # ── Subcommands ─────────────────────────────────────────────────────────────
@@ -104,8 +121,15 @@ case "$ACTION" in
     stop)
         info "Stopping all managed services..."
         for entry in "${SERVICES[@]}"; do
-            IFS=':' read -r _ pm2_name _ <<< "$entry"
-            pm2 delete "${pm2_name}" 2>/dev/null && info "Stopped ${pm2_name}" || warn "${pm2_name} was not running"
+            IFS=':' read -r _ pm2_name _ instances <<< "$entry"
+            instances="${instances:-1}"
+            if [ "${instances}" -gt 1 ]; then
+                for idx in $(seq 0 $(( instances - 1 ))); do
+                    pm2 delete "${pm2_name}-${idx}" 2>/dev/null && info "Stopped ${pm2_name}-${idx}" || warn "${pm2_name}-${idx} was not running"
+                done
+            else
+                pm2 delete "${pm2_name}" 2>/dev/null && info "Stopped ${pm2_name}" || warn "${pm2_name} was not running"
+            fi
         done
         pm2 save
         exit 0
@@ -114,8 +138,15 @@ case "$ACTION" in
     restart)
         info "Restarting all managed services..."
         for entry in "${SERVICES[@]}"; do
-            IFS=':' read -r _ pm2_name _ <<< "$entry"
-            pm2 restart "${pm2_name}" 2>/dev/null && info "Restarted ${pm2_name}" || warn "${pm2_name} not found — run deploy first"
+            IFS=':' read -r _ pm2_name _ instances <<< "$entry"
+            instances="${instances:-1}"
+            if [ "${instances}" -gt 1 ]; then
+                for idx in $(seq 0 $(( instances - 1 ))); do
+                    pm2 restart "${pm2_name}-${idx}" 2>/dev/null && info "Restarted ${pm2_name}-${idx}" || warn "${pm2_name}-${idx} not found — run deploy first"
+                done
+            else
+                pm2 restart "${pm2_name}" 2>/dev/null && info "Restarted ${pm2_name}" || warn "${pm2_name} not found — run deploy first"
+            fi
         done
         pm2 save
         exit 0
@@ -147,9 +178,10 @@ echo "=========================================="
 FAILED=()
 
 for i in "${!SERVICES[@]}"; do
-    IFS=':' read -r rel_path pm2_name binary <<< "${SERVICES[$i]}"
+    IFS=':' read -r rel_path pm2_name binary instances <<< "${SERVICES[$i]}"
+    instances="${instances:-1}"
 
-    deploy_service "$rel_path" "$pm2_name" "$binary" || { FAILED+=("$pm2_name"); continue; }
+    deploy_service "$rel_path" "$pm2_name" "$binary" "$instances" || { FAILED+=("$pm2_name"); continue; }
 
     # Wait between services (skip delay after last one)
     if [ $i -lt $(( ${#SERVICES[@]} - 1 )) ]; then

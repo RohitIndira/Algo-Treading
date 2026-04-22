@@ -19,6 +19,7 @@ type StrategyRepository struct {
 
 // ListAllActive returns a page of active, non-deleted strategies.
 // Ordered by updated_at DESC for stable pagination.
+// Uses batch queries (ANY($1)) instead of per-row queries to avoid N+3 DB roundtrips.
 func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offset int) ([]*models.Strategy, error) {
 	if limit <= 0 {
 		limit = 500
@@ -38,29 +39,63 @@ func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offse
 	if err := r.db.SelectContext(ctx, &strategies, query, limit, offset); err != nil {
 		return nil, fmt.Errorf("failed to list active strategies: %w", err)
 	}
+	if len(strategies) == 0 {
+		return strategies, nil
+	}
 
-	// Load related data for each strategy
-	for _, strategy := range strategies {
-		condition := &models.StrategyCondition{}
-		condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
-		err := r.db.GetContext(ctx, condition, condQuery, strategy.StrategyID)
-		if err == nil {
-			strategy.Conditions = condition
+	// Collect strategy IDs and build an O(1) lookup map.
+	ids := make([]uuid.UUID, len(strategies))
+	byID := make(map[uuid.UUID]*models.Strategy, len(strategies))
+	for i, s := range strategies {
+		ids[i] = s.StrategyID
+		byID[s.StrategyID] = s
+	}
+
+	// Batch fetch conditions — 1 query for all IDs in the page.
+	conditions := []*models.StrategyCondition{}
+	condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = ANY($1)`
+	if err := r.db.SelectContext(ctx, &conditions, condQuery, pq.Array(ids)); err == nil {
+		for _, c := range conditions {
+			if s, ok := byID[c.StrategyID]; ok {
+				s.Conditions = c
+			}
 		}
+	}
 
-		tradeConfig := &models.TradeConfig{}
-		tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
-		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
-		if err == nil {
-			r.loadMultiLevelConfig(ctx, tradeConfig)
-			strategy.TradeConfig = tradeConfig
+	// Batch fetch trade configs including JSONB multi_level columns — 1 query.
+	// tcRow embeds TradeConfig (whose multi_level fields have db:"-") and adds raw
+	// byte fields to capture the JSONB columns that sqlx would otherwise skip.
+	type tcRow struct {
+		models.TradeConfig
+		MLSLRaw []byte `db:"multi_level_sl"`
+		MLTPRaw []byte `db:"multi_level_tp"`
+	}
+	tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at, multi_level_sl, multi_level_tp FROM trade_configs WHERE strategy_id = ANY($1)`
+	tcRows := []tcRow{}
+	if err := r.db.SelectContext(ctx, &tcRows, tradeQuery, pq.Array(ids)); err == nil {
+		for i := range tcRows {
+			row := &tcRows[i]
+			if len(row.MLSLRaw) > 0 {
+				_ = json.Unmarshal(row.MLSLRaw, &row.TradeConfig.MultiLevelSL)
+			}
+			if len(row.MLTPRaw) > 0 {
+				_ = json.Unmarshal(row.MLTPRaw, &row.TradeConfig.MultiLevelTP)
+			}
+			if s, ok := byID[row.TradeConfig.StrategyID]; ok {
+				tc := row.TradeConfig
+				s.TradeConfig = &tc
+			}
 		}
+	}
 
-		riskLimits := &models.RiskLimits{}
-		riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = $1`
-		err = r.db.GetContext(ctx, riskLimits, riskQuery, strategy.StrategyID)
-		if err == nil {
-			strategy.RiskLimits = riskLimits
+	// Batch fetch risk limits — 1 query.
+	riskLimits := []*models.RiskLimits{}
+	riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = ANY($1)`
+	if err := r.db.SelectContext(ctx, &riskLimits, riskQuery, pq.Array(ids)); err == nil {
+		for _, rl := range riskLimits {
+			if s, ok := byID[rl.StrategyID]; ok {
+				s.RiskLimits = rl
+			}
 		}
 	}
 

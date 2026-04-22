@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -34,7 +35,8 @@ func (h *PaperTradingHandler) GetPaperPositions(w http.ResponseWriter, r *http.R
 	url := fmt.Sprintf("%s/ws/paper-trades/positions?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -61,7 +63,8 @@ func (h *PaperTradingHandler) ForceExitAll(w http.ResponseWriter, r *http.Reques
 		io.NopCloser(newReaderFrom(payload)),
 	)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -104,7 +107,8 @@ func (h *PaperTradingHandler) ForceExitAllLive(w http.ResponseWriter, r *http.Re
 		io.NopCloser(newReaderFrom(payload)),
 	)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -143,7 +147,8 @@ func (h *PaperTradingHandler) ForceExitStrategy(w http.ResponseWriter, r *http.R
 		io.NopCloser(newReaderFrom(payload)),
 	)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -195,7 +200,8 @@ func (h *PaperTradingHandler) ForceExitStrategyLive(w http.ResponseWriter, r *ht
 		io.NopCloser(newReaderFrom(payload)),
 	)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -220,7 +226,8 @@ func (h *PaperTradingHandler) GetLiveOrders(w http.ResponseWriter, r *http.Reque
 	url := fmt.Sprintf("%s/ws/live-orders?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -245,7 +252,8 @@ func (h *PaperTradingHandler) GetClosedPaperOrders(w http.ResponseWriter, r *htt
 	url := fmt.Sprintf("%s/ws/paper-trades/closed-orders?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -270,7 +278,8 @@ func (h *PaperTradingHandler) GetClosedLiveOrders(w http.ResponseWriter, r *http
 	url := fmt.Sprintf("%s/ws/live-orders/closed-orders?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -300,7 +309,8 @@ func (h *PaperTradingHandler) GetDashboardStats(w http.ResponseWriter, r *http.R
 	url := fmt.Sprintf("%s/ws/dashboard-stats?user_id=%s&mode=%s", h.tradeExecBaseURL, userID, mode)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -329,7 +339,8 @@ func (h *PaperTradingHandler) GetIndiraPositions(w http.ResponseWriter, r *http.
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL, nil)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("ERROR GetIndiraPositions build request user_id=%s: %v", userID, err)
+		respondWithError(w, http.StatusInternalServerError, "Internal error")
 		return
 	}
 
@@ -343,7 +354,8 @@ func (h *PaperTradingHandler) GetIndiraPositions(w http.ResponseWriter, r *http.
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -369,7 +381,8 @@ func (h *PaperTradingHandler) SubscribeBrokerWS(w http.ResponseWriter, r *http.R
 	targetURL := fmt.Sprintf("%s/ws/live-orders/subscribe-broker-ws?user_id=%s", h.tradeExecBaseURL, userID)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, nil)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("ERROR SubscribeBrokerWS build request user_id=%s: %v", userID, err)
+		respondWithError(w, http.StatusInternalServerError, "Internal error")
 		return
 	}
 
@@ -382,7 +395,8 @@ func (h *PaperTradingHandler) SubscribeBrokerWS(w http.ResponseWriter, r *http.R
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -418,7 +432,8 @@ func (h *PaperTradingHandler) CancelPriceWatch(w http.ResponseWriter, r *http.Re
 		io.NopCloser(newReaderFrom(enriched)),
 	)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -444,7 +459,8 @@ func (h *PaperTradingHandler) GetPriceWatches(w http.ResponseWriter, r *http.Req
 	url := fmt.Sprintf("%s/ws/live-orders/price-watches?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -479,7 +495,8 @@ func (h *PaperTradingHandler) SetAutoSquareOffConfig(w http.ResponseWriter, r *h
 		io.NopCloser(newReaderFrom(enriched)),
 	)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -505,7 +522,8 @@ func (h *PaperTradingHandler) GetAutoSquareOffConfig(w http.ResponseWriter, r *h
 	url := fmt.Sprintf("%s/ws/auto-square-off/config?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()

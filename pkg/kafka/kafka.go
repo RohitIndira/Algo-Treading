@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/correlation"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -77,6 +78,34 @@ func (p *Producer) WriteMessage(ctx context.Context, key, value []byte) error {
 	}
 
 	return p.writer.WriteMessages(ctx, msg)
+}
+
+// WriteMessageWithContext writes a message and propagates the correlation ID
+// from ctx as a Kafka header so downstream consumers can continue the trace.
+func (p *Producer) WriteMessageWithContext(ctx context.Context, key, value []byte) error {
+	msg := kafka.Message{
+		Key:   key,
+		Value: value,
+		Time:  time.Now(),
+	}
+	if id := correlation.FromContext(ctx); id != "" {
+		msg.Headers = append(msg.Headers, kafka.Header{
+			Key:   correlation.KafkaHeaderKey,
+			Value: []byte(id),
+		})
+	}
+	return p.writer.WriteMessages(ctx, msg)
+}
+
+// ExtractCorrelationID reads the correlation ID from a Kafka message's headers.
+// Returns an empty string when no correlation header is present.
+func ExtractCorrelationID(msg kafka.Message) string {
+	for _, h := range msg.Headers {
+		if h.Key == correlation.KafkaHeaderKey {
+			return string(h.Value)
+		}
+	}
+	return ""
 }
 
 // WriteMessages writes multiple messages to Kafka

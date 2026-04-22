@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -13,6 +14,10 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 )
+
+// ErrDuplicateOrder is returned by Create when the order_id already exists.
+// Callers should treat this as a successful no-op (idempotent replay).
+var ErrDuplicateOrder = errors.New("duplicate order")
 
 // DashboardStats holds aggregated trading stats for a user.
 type DashboardStats struct {
@@ -122,6 +127,9 @@ func NewOrderRepository(db *sqlx.DB) OrderRepository {
 
 // Create inserts a new order into the database
 func (r *orderRepository) Create(ctx context.Context, order *models.Order) error {
+	// ON CONFLICT DO NOTHING combines the idempotency check and insert into a
+	// single roundtrip. If the order_id already exists (duplicate Kafka delivery),
+	// 0 rows are affected and ErrDuplicateOrder is returned so the caller can skip.
 	query := `
 		INSERT INTO orders (
 			order_id, user_id, strategy_id, strategy_name, event_id,
@@ -135,10 +143,10 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
 			$13, $14, $15, $16, $17, $18, $19, $20, $21,
 			$22, $23, $24, $25, $26
-		)
+		) ON CONFLICT (order_id) DO NOTHING
 	`
 
-	_, err := r.db.ExecContext(ctx, query,
+	result, err := r.db.ExecContext(ctx, query,
 		order.OrderID, order.UserID, order.StrategyID, order.StrategyName, order.EventID,
 		order.StockCode, order.Exchange, order.Symbol,
 		order.OrderType, order.OrderSide, order.Quantity, order.Price,
@@ -147,11 +155,17 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 		order.IsPaperTrade, order.TradingMode,
 		order.RetryCount, order.CreatedAt, order.UpdatedAt,
 	)
-
 	if err != nil {
 		return fmt.Errorf("failed to create order: %w", err)
 	}
 
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrDuplicateOrder
+	}
 	return nil
 }
 
