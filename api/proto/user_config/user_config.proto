@@ -260,6 +260,9 @@ message Strategy {
   
   // Version for optimistic locking
   int32 version = 12;
+
+  // Soft-delete timestamp (null if not deleted)
+  optional common.Timestamp deleted_at = 13;
 }
 
 message CreateStrategyRequest {
@@ -334,6 +337,7 @@ message ListUserStrategiesRequest {
   string user_id = 1;
   bool active_only = 2;  // Filter to only active strategies
   common.PaginationRequest pagination = 3;
+  bool include_deleted = 4; // Include soft-deleted strategies in results
 }
 
 message ListUserStrategiesResponse {

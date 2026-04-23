@@ -227,6 +227,7 @@ func (h *UserConfigHandler) ListUserStrategies(w http.ResponseWriter, r *http.Re
 	userID := vars["user_id"]
 
 	activeOnly := r.URL.Query().Get("active_only") == "true"
+	includeDeleted := r.URL.Query().Get("include_deleted") == "true"
 
 	// Parse pagination parameters
 	pageStr := r.URL.Query().Get("page")
@@ -248,8 +249,9 @@ func (h *UserConfigHandler) ListUserStrategies(w http.ResponseWriter, r *http.Re
 	}
 
 	req := &pb.ListUserStrategiesRequest{
-		UserId:     userID,
-		ActiveOnly: activeOnly,
+		UserId:         userID,
+		ActiveOnly:     activeOnly,
+		IncludeDeleted: includeDeleted,
 		Pagination: &common.PaginationRequest{
 			Page:     page,
 			PageSize: pageSize,

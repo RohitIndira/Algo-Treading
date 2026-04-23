@@ -307,11 +307,13 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 }
 
 // ListByUserID lists all strategies for a user
-func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, activeOnly bool, limit, offset int) ([]*models.Strategy, int, error) {
+func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, activeOnly bool, includeDeleted bool, limit, offset int) ([]*models.Strategy, int, error) {
 	strategies := []*models.Strategy{}
 
-	// Filter out deleted strategies
-	query := `SELECT * FROM strategies WHERE user_id = $1 AND deleted_at IS NULL`
+	query := `SELECT * FROM strategies WHERE user_id = $1`
+	if !includeDeleted {
+		query += ` AND deleted_at IS NULL`
+	}
 	args := []interface{}{userID}
 
 	if activeOnly {
@@ -319,7 +321,10 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 	}
 
 	// Get total count
-	countQuery := `SELECT COUNT(*) FROM strategies WHERE user_id = $1 AND deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM strategies WHERE user_id = $1`
+	if !includeDeleted {
+		countQuery += ` AND deleted_at IS NULL`
+	}
 	if activeOnly {
 		countQuery += ` AND active = true`
 	}

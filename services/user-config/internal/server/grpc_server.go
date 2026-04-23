@@ -199,7 +199,7 @@ func (s *UserConfigServer) ListUserStrategies(ctx context.Context, req *pb.ListU
 	}
 	offset := (page - 1) * pageSize
 
-	strategies, total, err := s.service.ListUserStrategies(ctx, req.UserId, req.ActiveOnly, pageSize, offset)
+	strategies, total, err := s.service.ListUserStrategies(ctx, req.UserId, req.ActiveOnly, req.IncludeDeleted, pageSize, offset)
 	if err != nil {
 		return &pb.ListUserStrategiesResponse{
 			Success: false,
@@ -666,6 +666,9 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 		Version:      model.Version,
 		CreatedAt:    &common.Timestamp{Seconds: model.CreatedAt.Unix()},
 		UpdatedAt:    &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
+	}
+	if model.DeletedAt != nil {
+		strategy.DeletedAt = &common.Timestamp{Seconds: model.DeletedAt.Unix()}
 	}
 
 	if model.Conditions != nil {

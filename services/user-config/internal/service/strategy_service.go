@@ -143,7 +143,7 @@ func (s *StrategyService) GetStrategy(ctx context.Context, strategyID uuid.UUID,
 }
 
 // ListUserStrategies lists all strategies for a user
-func (s *StrategyService) ListUserStrategies(ctx context.Context, userID string, activeOnly bool, limit, offset int) ([]*models.Strategy, int, error) {
+func (s *StrategyService) ListUserStrategies(ctx context.Context, userID string, activeOnly bool, includeDeleted bool, limit, offset int) ([]*models.Strategy, int, error) {
 	// Set default pagination
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -152,7 +152,7 @@ func (s *StrategyService) ListUserStrategies(ctx context.Context, userID string,
 		offset = 0
 	}
 
-	return s.repo.ListByUserID(ctx, userID, activeOnly, limit, offset)
+	return s.repo.ListByUserID(ctx, userID, activeOnly, includeDeleted, limit, offset)
 }
 
 // UpdateStrategy updates a strategy
