@@ -11,7 +11,7 @@ import (
 )
 
 // CredentialsRepository saves/fetches Indira broker credentials in the
-// trade-execution database (trading_execution.user_credentials).
+// trade-execution database (trading_execution.broker_accounts).
 type CredentialsRepository interface {
 	StoreIndiraCredentials(ctx context.Context, userID, indiraUserID, appID, source, bearerToken string) error
 }
@@ -37,15 +37,16 @@ func (r *credentialsRepository) StoreIndiraCredentials(ctx context.Context, user
 	}
 
 	query := `
-        INSERT INTO user_credentials (user_id, indira_user_id, indira_app_id, indira_source, indira_bearer_token, updated_at)
-        VALUES ($1, $2, $3, $4, $5, NOW())
-        ON CONFLICT (user_id)
+        INSERT INTO broker_accounts (user_id, broker_name, broker_user_id, app_id, source, bearer_token, token_updated_at, updated_at)
+        VALUES ($1, 'INDIRA', $2, $3, $4, $5, NOW(), NOW())
+        ON CONFLICT (user_id, broker_name)
         DO UPDATE SET
-            indira_user_id      = EXCLUDED.indira_user_id,
-            indira_app_id       = EXCLUDED.indira_app_id,
-            indira_source       = EXCLUDED.indira_source,
-            indira_bearer_token = EXCLUDED.indira_bearer_token,
-            updated_at          = NOW()
+            broker_user_id   = EXCLUDED.broker_user_id,
+            app_id           = EXCLUDED.app_id,
+            source           = EXCLUDED.source,
+            bearer_token     = EXCLUDED.bearer_token,
+            token_updated_at = NOW(),
+            updated_at       = NOW()
     `
 
 	encryptedToken, err := crypto.Encrypt(bearerToken, r.encryptionKey)

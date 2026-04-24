@@ -728,11 +728,18 @@ func (r *orderRepository) GetActiveOrdersByStrategy(ctx context.Context, strateg
 
 // CancelAllOrdersByStrategy cancels all active orders (both paper and live) for a given strategy.
 // Used when a strategy is deactivated or deleted to ensure no positions remain open.
+// For filled paper orders, paper_exit_price is set to filled_price so they appear in the
+// closed positions view (which requires paper_exit_price IS NOT NULL).
 func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error {
 	query := `
 		UPDATE orders SET
 			status = 'CANCELLED',
 			rejection_reason = 'Strategy deactivated or deleted',
+			paper_exit_price = CASE
+				WHEN is_paper_trade = true AND filled_price IS NOT NULL AND paper_exit_price IS NULL
+				THEN filled_price
+				ELSE paper_exit_price
+			END,
 			updated_at = $1
 		WHERE strategy_id = $2
 		AND user_id = $3
