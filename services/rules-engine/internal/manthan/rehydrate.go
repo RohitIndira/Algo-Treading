@@ -1,0 +1,302 @@
+package manthan
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/go-redis/redis/v8"
+	"go.uber.org/zap"
+)
+
+// RehydrateActivePositions restores in-memory portfolio state from the
+// authoritative source (Postgres `manthan_positions` WHERE status='ACTIVE')
+// after a rules-engine restart.
+//
+// Side effects performed in one pass so DB, memory, and Redis stay in sync:
+//
+//  1. For each ACTIVE row whose strategy is loaded → populate in-memory
+//     portfolio and upsert the Redis `manthan:position:{strategyID}:{symbol}`
+//     cache key.
+//  2. For ACTIVE rows whose strategy is orphaned (soft-deleted or missing)
+//     → mark DB row as EXITED with reason='ORPHAN_CLEANUP', delete Redis key,
+//     and remove from `manthan:positions:active` set. Broker SL cancellation
+//     is handled separately by trade-execution's safety monitor.
+//  3. Evict any `manthan:position:*` Redis key that was NOT seen in step 1
+//     (stale cache from a previous run).
+//
+// strategyByID resolves a strategyID to its UserStrategy; nil return means
+// orphan. Pass a closure bound to the rules-engine ConfigStore.
+//
+// Returns (restored, orphansCleaned, redisStaleEvicted, err).
+func (pm *PortfolioManager) RehydrateActivePositions(
+	ctx context.Context,
+	db *sql.DB,
+	rdb *redis.Client,
+	strategyByID func(string) *UserStrategy,
+) (int, int, int, error) {
+	if db == nil {
+		return 0, 0, 0, nil
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT strategy_id, user_id, symbol,
+		       COALESCE(isin, ''),
+		       COALESCE(industry, ''),
+		       COALESCE(mcap_bucket, ''),
+		       COALESCE(index_name, ''),
+		       entry_price, quantity,
+		       COALESCE(invested_amt, entry_price * quantity),
+		       COALESCE(ema_alloc_pct, 0),
+		       COALESCE(high_since_entry, entry_price),
+		       current_sl,
+		       COALESCE(last_trail_level, entry_price)
+		FROM manthan_positions
+		WHERE status = 'ACTIVE'`)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("query active positions: %w", err)
+	}
+	defer rows.Close()
+
+	seenRedisKeys := make(map[string]struct{})
+	restored := 0
+	orphans := 0
+
+	for rows.Next() {
+		var strategyID, userID, symbol, isin, industry, mcapBucket, indexName string
+		var entryPrice, invested, emaPct, high, sl, lastTrail float64
+		var qty int32
+		if err := rows.Scan(
+			&strategyID, &userID, &symbol, &isin, &industry, &mcapBucket, &indexName,
+			&entryPrice, &qty, &invested, &emaPct, &high, &sl, &lastTrail,
+		); err != nil {
+			pm.logger.Warn("Rehydrate: scan failed", zap.Error(err))
+			continue
+		}
+
+		posKey := fmt.Sprintf("manthan:position:%s:%s", strategyID, symbol)
+		setMember := fmt.Sprintf("%s:%s", strategyID, symbol)
+
+		strategy := strategyByID(strategyID)
+		if strategy == nil {
+			// Orphan — strategy was soft-deleted while position was ACTIVE.
+			// Mark EXITED in DB + evict Redis + remove from active set.
+			if _, err := db.ExecContext(ctx, `
+				UPDATE manthan_positions
+				SET status = 'EXITED', exit_reason = 'ORPHAN_CLEANUP',
+				    exit_time = NOW(), updated_at = NOW()
+				WHERE strategy_id = $1 AND symbol = $2 AND status = 'ACTIVE'`,
+				strategyID, symbol); err != nil {
+				pm.logger.Warn("Rehydrate: orphan DB update failed",
+					zap.String("strategy_id", strategyID),
+					zap.String("symbol", symbol),
+					zap.Error(err))
+			}
+			if rdb != nil {
+				rdb.Del(ctx, posKey)
+				rdb.SRem(ctx, "manthan:positions:active", setMember)
+			}
+			orphans++
+			pm.logger.Warn("Rehydrate: orphan position cleaned up",
+				zap.String("strategy_id", strategyID),
+				zap.String("symbol", symbol))
+			continue
+		}
+
+		// Live position: restore in-memory portfolio + upsert Redis cache
+		p := pm.GetOrCreate(*strategy)
+		pm.mu.Lock()
+		p.Positions[symbol] = &Position{
+			Symbol:         symbol,
+			ISIN:           isin,
+			Industry:       industry,
+			MCapBucket:     mcapBucket,
+			IndexName:      indexName,
+			EntryPrice:     entryPrice,
+			EntryTime:      time.Now(), // true entry_time isn't in schema; use now as best-effort
+			Quantity:       qty,
+			InvestedAmt:    invested,
+			HighSinceEntry: high,
+			CurrentSL:      sl,
+			LastTrailLevel: lastTrail,
+			State:          StateActive,
+			Active:         true,
+		}
+		pm.mu.Unlock()
+
+		if rdb != nil {
+			payload, _ := json.Marshal(map[string]any{
+				"symbol":       symbol,
+				"entry_price":  entryPrice,
+				"quantity":     qty,
+				"invested":     invested,
+				"stop_loss":    sl,
+				"high":         high,
+				"status":       "ACTIVE",
+				"entry_time":   time.Now().Format(time.RFC3339),
+				"industry":     industry,
+				"mcap_bucket":  mcapBucket,
+				"ema_pct":      emaPct * 100,
+				"trading_mode": strategy.TradingMode,
+			})
+			rdb.Set(ctx, posKey, payload, 30*24*time.Hour)
+			rdb.SAdd(ctx, "manthan:positions:active", setMember)
+			seenRedisKeys[posKey] = struct{}{}
+		}
+
+		restored++
+		pm.logger.Info("Position rehydrated",
+			zap.String("strategy_id", strategyID),
+			zap.String("symbol", symbol),
+			zap.Int32("qty", qty),
+			zap.Float64("entry", entryPrice),
+			zap.Float64("sl", sl),
+			zap.Float64("high", high),
+			zap.Float64("last_trail", lastTrail))
+	}
+	if err := rows.Err(); err != nil {
+		return restored, orphans, 0, fmt.Errorf("iterate rows: %w", err)
+	}
+
+	// Evict stale Redis keys that have no corresponding ACTIVE DB row.
+	staleEvicted := 0
+	if rdb != nil {
+		var cursor uint64
+		for {
+			keys, next, err := rdb.Scan(ctx, cursor, "manthan:position:*", 100).Result()
+			if err != nil {
+				pm.logger.Warn("Rehydrate: Redis scan failed", zap.Error(err))
+				break
+			}
+			for _, k := range keys {
+				if _, ok := seenRedisKeys[k]; ok {
+					continue
+				}
+				rdb.Del(ctx, k)
+				staleEvicted++
+			}
+			if next == 0 {
+				break
+			}
+			cursor = next
+		}
+	}
+
+	pm.logger.Info("Rehydrate complete",
+		zap.Int("restored", restored),
+		zap.Int("orphans_cleaned", orphans),
+		zap.Int("redis_stale_evicted", staleEvicted))
+
+	return restored, orphans, staleEvicted, nil
+}
+
+// CleanupOrphans scans `manthan_positions` for ACTIVE rows whose strategy is
+// no longer loaded (soft-deleted via strategies.deleted_at IS NOT NULL) and:
+//
+//  1. Marks the row EXITED with reason='ORPHAN_CLEANUP'
+//  2. Evicts the Redis cache key + removes from the active set
+//
+// It does NOT cancel the broker SL or sell the position — that's intentional.
+// A strategy soft-delete by a user doesn't necessarily mean they want the
+// live position auto-closed (could be accidental deletion, renaming, etc.).
+// The broker SL, if present, stays active so the position remains protected.
+// If the user truly wants to exit, they do it explicitly via the UI.
+//
+// Designed to be called on a timer (every 60s) — fast and cheap (just one
+// indexed query + a few updates per orphan).
+func (pm *PortfolioManager) CleanupOrphans(
+	ctx context.Context,
+	db *sql.DB,
+	rdb *redis.Client,
+	strategyByID func(string) *UserStrategy,
+) (int, error) {
+	if db == nil {
+		return 0, nil
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT strategy_id, symbol
+		FROM manthan_positions
+		WHERE status = 'ACTIVE'`)
+	if err != nil {
+		return 0, fmt.Errorf("query active positions: %w", err)
+	}
+	type rowKey struct{ strategyID, symbol string }
+	var actives []rowKey
+	for rows.Next() {
+		var sid, sym string
+		if err := rows.Scan(&sid, &sym); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		actives = append(actives, rowKey{sid, sym})
+	}
+	rows.Close()
+
+	cleaned := 0
+	for _, rk := range actives {
+		if strategyByID(rk.strategyID) != nil {
+			continue // strategy still loaded — not an orphan
+		}
+		// Also drop from in-memory portfolio if it was rehydrated earlier.
+		pm.mu.Lock()
+		if p, ok := pm.portfolios[rk.strategyID]; ok {
+			delete(p.Positions, rk.symbol)
+		}
+		pm.mu.Unlock()
+
+		if _, err := db.ExecContext(ctx, `
+			UPDATE manthan_positions
+			SET status = 'EXITED', exit_reason = 'ORPHAN_CLEANUP',
+			    exit_time = NOW(), updated_at = NOW()
+			WHERE strategy_id = $1 AND symbol = $2 AND status = 'ACTIVE'`,
+			rk.strategyID, rk.symbol); err != nil {
+			pm.logger.Warn("Orphan cleanup: DB update failed",
+				zap.String("strategy_id", rk.strategyID),
+				zap.String("symbol", rk.symbol), zap.Error(err))
+			continue
+		}
+		if rdb != nil {
+			rdb.Del(ctx, fmt.Sprintf("manthan:position:%s:%s", rk.strategyID, rk.symbol))
+			rdb.SRem(ctx, "manthan:positions:active", fmt.Sprintf("%s:%s", rk.strategyID, rk.symbol))
+		}
+		cleaned++
+		pm.logger.Warn("Orphan position cleaned up (periodic scan)",
+			zap.String("strategy_id", rk.strategyID),
+			zap.String("symbol", rk.symbol))
+	}
+	return cleaned, nil
+}
+
+// StartOrphanScanner runs CleanupOrphans on a ticker. Blocks until ctx
+// cancelled. Intended to be launched once from main() in a goroutine.
+func (pm *PortfolioManager) StartOrphanScanner(
+	ctx context.Context,
+	db *sql.DB,
+	rdb *redis.Client,
+	strategyByID func(string) *UserStrategy,
+	interval time.Duration,
+) {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	pm.logger.Info("Orphan scanner started", zap.Duration("interval", interval))
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			pm.logger.Info("Orphan scanner stopped")
+			return
+		case <-ticker.C:
+			if cleaned, err := pm.CleanupOrphans(ctx, db, rdb, strategyByID); err != nil {
+				pm.logger.Warn("Orphan scanner: cleanup pass failed", zap.Error(err))
+			} else if cleaned > 0 {
+				pm.logger.Info("Orphan scanner pass", zap.Int("cleaned", cleaned))
+			}
+		}
+	}
+}

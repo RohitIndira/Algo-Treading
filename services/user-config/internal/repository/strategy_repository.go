@@ -31,7 +31,7 @@ func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offse
 	query := `
 		SELECT *
 		FROM strategies
-		WHERE active = true AND deleted_at IS NULL
+		WHERE (active = true OR strategy_type = 'MANTHAN') AND deleted_at IS NULL
 		ORDER BY updated_at DESC
 		LIMIT $1 OFFSET $2`
 
@@ -80,24 +80,30 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	defer tx.Rollback()
 
 	// Insert strategy
+	strategyType := req.StrategyType
+	if strategyType == "" {
+		strategyType = models.StrategyTypeNews
+	}
+
 	strategy := &models.Strategy{
 		StrategyID:   uuid.New(),
 		UserID:       req.UserID,
 		StrategyName: req.StrategyName,
 		Description:  req.Description,
 		Active:       req.ActivateImmediately,
+		StrategyType: strategyType,
 		TradingMode:  req.TradingMode,
 		Version:      1,
 	}
 
 	query := `
-		INSERT INTO strategies (strategy_id, user_id, strategy_name, description, active, trading_mode, version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO strategies (strategy_id, user_id, strategy_name, description, active, strategy_type, trading_mode, version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING created_at, updated_at`
 
 	err = tx.QueryRowxContext(ctx, query,
 		strategy.StrategyID, strategy.UserID, strategy.StrategyName,
-		strategy.Description, strategy.Active, strategy.TradingMode, strategy.Version,
+		strategy.Description, strategy.Active, strategy.StrategyType, strategy.TradingMode, strategy.Version,
 	).Scan(&strategy.CreatedAt, &strategy.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert strategy: %w", err)
@@ -136,8 +142,9 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		tradeQuery := `
 			INSERT INTO trade_configs (
 				trade_config_id, strategy_id, order_type, product_type, validity, quantity,
-				exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price,
+				position_sizing_mode, total_capital, max_positions, per_stock_amount
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, tradeQuery,
@@ -146,6 +153,8 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
 			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice,
+			req.TradeConfig.PositionSizingMode, req.TradeConfig.TotalCapital,
+			req.TradeConfig.MaxPositions, req.TradeConfig.PerStockAmount,
 		).Scan(&req.TradeConfig.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert trade config: %w", err)
@@ -562,10 +571,13 @@ func (r *StrategyRepository) DeactivateAllActive(ctx context.Context) (int, erro
 		Version    int64     `db:"version"`
 	}
 
+	// Only deactivate NEWS strategies at EOD. 52W_BREAKOUT strategies are positional
+	// and should stay active across trading days.
 	updateQuery := `
 		UPDATE strategies
 		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
 		WHERE active = true AND deleted_at IS NULL
+		  AND (strategy_type IS NULL OR strategy_type = 'NEWS')
 		RETURNING strategy_id, user_id, version`
 
 	rows := []deactivatedRow{}

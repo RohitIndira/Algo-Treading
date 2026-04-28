@@ -18,17 +18,23 @@ type Store interface {
 	GetStrategy(userID, strategyID string) (*models.StrategyConfig, bool)
 }
 
+// OnManthanCreatedFn is called when a new MANTHAN strategy is created.
+// Used to trigger catch-up allocation of today's signals.
+type OnManthanCreatedFn func(ctx context.Context, strategy *models.Strategy)
+
 // Consumer converts Kafka user-config-events payloads into store operations.
-//
-// This is intentionally pure/business-logic and does not deal with kafka.Reader.
-// The kafka wrapper (internal/kafka/config_consumer.go) is responsible for
-// polling messages and committing offsets.
 type Consumer struct {
-	store Store
+	store             Store
+	onManthanCreated  OnManthanCreatedFn
 }
 
 func NewConsumer(store Store) *Consumer {
 	return &Consumer{store: store}
+}
+
+// SetOnManthanCreated registers a callback for MANTHAN strategy creation.
+func (c *Consumer) SetOnManthanCreated(fn OnManthanCreatedFn) {
+	c.onManthanCreated = fn
 }
 
 // ProcessMessage parses one Kafka message value and applies it to the store.
@@ -70,9 +76,14 @@ func (c *Consumer) ProcessMessage(ctx context.Context, value []byte) error {
 		if err != nil {
 			return nil
 		}
-		// enforce envelope version
 		m.Version = ev.Version
-		return c.store.Upsert((*models.StrategyConfig)(m))
+		if err := c.store.Upsert((*models.StrategyConfig)(m)); err != nil {
+			return err
+		}
+		if ev.Type == ConfigCreated && m.StrategyType == "MANTHAN" && c.onManthanCreated != nil {
+			c.onManthanCreated(ctx, m)
+		}
+		return nil
 
 	case ConfigPaused:
 		return c.store.Pause(ev.UserID, ev.StrategyID, ev.Version)

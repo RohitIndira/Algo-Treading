@@ -12,6 +12,7 @@ func NewRouter(
 	userConfigHandler *handlers.UserConfigHandler,
 	websocketHandler *handlers.WebSocketHandler,
 	paperHandler *handlers.PaperTradingHandler,
+	manthanHandler *handlers.ManthanHandler,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
 
@@ -60,6 +61,11 @@ func NewRouter(
 		api.HandleFunc("/live-orders/cancel-price-watch", paperHandler.CancelPriceWatch).Methods("POST")
 		// Dashboard
 		api.HandleFunc("/dashboard-stats", paperHandler.GetDashboardStats).Methods("GET")
+	}
+
+	// Manthan aggregated overview
+	if manthanHandler != nil {
+		api.HandleFunc("/manthan/overview", manthanHandler.GetOverview).Methods("GET")
 	}
 
 	// WebSocket routes for live match feed

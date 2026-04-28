@@ -79,6 +79,17 @@ func validateStrategyConfig(s *models.StrategyConfig) error {
 	if s.UserID == "" {
 		return fmt.Errorf("user_id empty")
 	}
+
+	// MANTHAN strategies have different validation — no news conditions, no quantity
+	if s.StrategyType == "MANTHAN" {
+		if s.TradeConfig.TotalCapital <= 0 {
+			return fmt.Errorf("total_capital <= 0")
+		}
+		s.Active = true // MANTHAN always active once created
+		return nil
+	}
+
+	// NEWS / 52W_BREAKOUT validation
 	if s.Conditions.ImpactScoreMin > s.Conditions.ImpactScoreMax {
 		return fmt.Errorf("impact_score_min > impact_score_max")
 	}

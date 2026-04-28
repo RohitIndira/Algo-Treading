@@ -67,6 +67,21 @@ enum TradingMode {
   LIVE = 2;  // Real money trading
 }
 
+// Strategy Type
+enum StrategyType {
+  STRATEGY_TYPE_UNSPECIFIED = 0;
+  NEWS = 1;           // News-based strategy (existing)
+  WEEK52_BREAKOUT = 2; // 52-week high/low breakout strategy
+  MANTHAN = 3;         // Manthan ATH breakout strategy
+}
+
+// Position Sizing Mode
+enum PositionSizingMode {
+  POSITION_SIZING_UNSPECIFIED = 0;
+  FIXED_QTY = 1;        // Fixed number of shares (existing)
+  EMA_ALLOCATION = 2;   // EMA score-based allocation (Manthan)
+}
+
 // Strategy condition filters
 message StrategyConditions {
   // Match ALL news events (overrides all other conditions)
@@ -162,6 +177,12 @@ message TradeConfig {
   double bracket_order_stop_loss = 16;   // Bracket order stop loss (optional)
   double bracket_order_target = 17;      // Bracket order target (optional)
   double max_position_size = 18; // Included for backward compatibility/validation
+
+  // 52W Breakout strategy fields (Manthan)
+  PositionSizingMode position_sizing_mode = 19; // FIXED_QTY or EMA_ALLOCATION
+  double total_capital = 20;                     // Total investment (default ₹1,00,000)
+  int32 max_positions = 21;                      // Max stocks to hold (default 25)
+  double per_stock_amount = 22;                  // Auto: total_capital / max_positions
 }
 
 // Risk management limits
@@ -231,6 +252,9 @@ message Strategy {
   
   // Version for optimistic locking
   int32 version = 12;
+
+  // Strategy type
+  StrategyType strategy_type = 13;
 }
 
 message CreateStrategyRequest {
@@ -242,9 +266,12 @@ message CreateStrategyRequest {
     RiskLimits risk_limits = 6;
     bool activate_immediately = 7;
     TradingMode trading_mode = 8;
-    
+
     // Indira Securities authentication
     common.IndiraAuthContext indira_auth = 9;
+
+    // Strategy type (NEWS or 52W_BREAKOUT)
+    StrategyType strategy_type = 10;
 }
 
 message CreateStrategyResponse {

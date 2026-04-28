@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/ema"
 )
 
 const (
@@ -29,6 +32,7 @@ type WSMonitor struct {
 	repo        *Repository
 	redis       *redis.Client
 	kafkaWriter *kafka.Writer
+	emaSvc      *ema.Service
 	logger      *zap.Logger
 
 	symbols []string // All NSE symbols to subscribe
@@ -58,6 +62,7 @@ func NewWSMonitor(repo *Repository, redisClient *redis.Client, kafkaBrokers []st
 	m := &WSMonitor{
 		repo:   repo,
 		redis:  redisClient,
+		emaSvc: ema.NewService(redisClient, logger),
 		logger: logger,
 	}
 
@@ -342,8 +347,7 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 		// Method 2: date = today (strict)
 		highBreakout = true
 		breakoutAtHigh = parseTimestamp(ws52HighTS)
-	} else if prev52H > 0 && ltp > prev52H &&
-		(redisSource == "nse_api" || redisSource == "bse_api") {
+	} else if prev52H > 0 && ltp > prev52H && isAPISource(redisSource) {
 		// Method 3: LTP exceeds exchange-verified 52W high from 6AM sync
 		highBreakout = true
 		breakoutAtHigh = time.Now()
@@ -375,8 +379,7 @@ func (m *WSMonitor) handleTick(ctx context.Context, envelope map[string]interfac
 	} else if ws52LowDate == todayStr {
 		lowBreakout = true
 		breakoutAtLow = parseTimestamp(ws52LowTS)
-	} else if prev52L > 0 && ltp < prev52L && ltp > 0 &&
-		(redisSource == "nse_api" || redisSource == "bse_api") {
+	} else if prev52L > 0 && ltp < prev52L && ltp > 0 && isAPISource(redisSource) {
 		lowBreakout = true
 		breakoutAtLow = time.Now()
 	}
@@ -549,11 +552,13 @@ func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
 	// Kafka: always publish latest price (consumers get real-time updates)
 	m.publishBreakoutToKafka(ctx, evt)
 
-	// Log only on first detection
+	// Log only on first detection — include EMA score
 	if !alreadyRecorded {
 		m.statsMu.Lock()
 		m.breakouts++
 		m.statsMu.Unlock()
+
+		emaScore, allocPct := m.emaSvc.GetScore(ctx, evt.Symbol)
 
 		m.logger.Info("BREAKOUT DETECTED",
 			zap.String("type", evt.BreakoutType),
@@ -562,7 +567,9 @@ func (m *WSMonitor) recordBreakout(ctx context.Context, evt BreakoutEvent) {
 			zap.Float64("price", evt.BreakoutPrice),
 			zap.Float64("prev_52w_high", evt.Prev52WH),
 			zap.Float64("prev_52w_low", evt.Prev52WL),
-			zap.Int64("volume", evt.Volume))
+			zap.Int64("volume", evt.Volume),
+			zap.Int("ema_score", emaScore),
+			zap.Float64("allocation", allocPct))
 	}
 }
 
@@ -579,6 +586,7 @@ func (m *WSMonitor) publishBreakoutToKafka(ctx context.Context, evt BreakoutEven
 	}
 
 	loc, _ := time.LoadLocation("Asia/Kolkata")
+	emaScore, allocPct := m.emaSvc.GetScore(ctx, evt.Symbol)
 	val, _ := json.Marshal(map[string]interface{}{
 		"event_type":    evt.BreakoutType,
 		"symbol":        evt.Symbol,
@@ -589,6 +597,8 @@ func (m *WSMonitor) publishBreakoutToKafka(ctx context.Context, evt BreakoutEven
 		"prev_52w_low":  evt.Prev52WL,
 		"volume":        evt.Volume,
 		"pct_change":    evt.PctChange,
+		"ema_score":     emaScore,
+		"allocation_pct": allocPct,
 		"trade_date":    time.Now().In(loc).Format("2006-01-02"),
 		"breakout_at":   breakoutAt.In(loc).Format("2006-01-02 15:04:05 IST"),
 		"detected_at":   time.Now().In(loc).Format("2006-01-02 15:04:05 IST"),
@@ -804,6 +814,13 @@ func parseTimestamp(s string) time.Time {
 		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, loc)
 	}
 	return time.Time{}
+}
+
+// isAPISource returns true if the Redis source is from exchange API (trusted for comparison).
+// Handles case variations: "nse_api", "NSE_api", "bse_api", "BSE_api" etc.
+func isAPISource(source string) bool {
+	s := strings.ToLower(source)
+	return s == "nse_api" || s == "bse_api"
 }
 
 func maxFloat(a, b float64) float64 {

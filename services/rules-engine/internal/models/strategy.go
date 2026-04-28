@@ -10,6 +10,7 @@ type Strategy struct {
 	StrategyID   string      `json:"strategy_id" bson:"strategy_id"`
 	UserID       string      `json:"user_id" bson:"user_id"`
 	StrategyName string      `json:"strategy_name" bson:"strategy_name"`
+	StrategyType string      `json:"strategy_type" bson:"strategy_type"` // NEWS, 52W_BREAKOUT, MANTHAN
 	Version      uint64      `json:"version" bson:"version"`
 	Active       bool        `json:"active" bson:"active"`
 	TradingMode  string      `json:"trading_mode" bson:"trading_mode"`
@@ -73,6 +74,11 @@ type TradeConfig struct {
 	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING
 	TrailingSLPct   float64 `json:"trailing_sl_pct" bson:"trailing_sl_pct"` // Trailing SL percentage
 	ProductType     string  `json:"product_type" bson:"product_type"`       // INTRADAY, DELIVERY, CASH
+
+	// MANTHAN-specific fields
+	TotalCapital   float64 `json:"total_capital" bson:"total_capital"`
+	MaxPositions   int32   `json:"max_positions" bson:"max_positions"`
+	PerStockAmount float64 `json:"per_stock_amount" bson:"per_stock_amount"`
 }
 
 // RiskLimits represents risk limits

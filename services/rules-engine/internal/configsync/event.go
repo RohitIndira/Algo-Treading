@@ -28,6 +28,7 @@ type StrategyPayload struct {
 	StrategyID   string             `json:"strategy_id"`
 	UserID       string             `json:"user_id"`
 	StrategyName string             `json:"strategy_name"`
+	StrategyType string             `json:"strategy_type"`
 	Active       bool               `json:"active"`
 	TradingMode  string             `json:"trading_mode"`
 	Conditions   ConditionsPayload  `json:"conditions"`
@@ -65,9 +66,12 @@ type TradeConfigPayload struct {
 	LimitPrice    float64 `json:"limit_price"`
 	StopLossPct   float64 `json:"stop_loss_pct"`
 	TakeProfitPct float64 `json:"take_profit_pct"`
-	TrailingSLPct float64 `json:"trailing_sl_pct"`
-	StopLossType  string  `json:"stop_loss_type"`
-	CreatedAt     int64   `json:"created_at"`
+	TrailingSLPct  float64 `json:"trailing_sl_pct"`
+	StopLossType   string  `json:"stop_loss_type"`
+	TotalCapital   float64 `json:"total_capital"`
+	MaxPositions   int32   `json:"max_positions"`
+	PerStockAmount float64 `json:"per_stock_amount"`
+	CreatedAt      int64   `json:"created_at"`
 }
 
 type RiskLimitsPayload struct {

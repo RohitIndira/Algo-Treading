@@ -286,10 +286,10 @@ func (rm *RedisManager) StartScheduler(ctx context.Context, mongoClient *mongodb
 			if now.After(nextRun) {
 				nextRun = nextRun.Add(24 * time.Hour)
 			}
-			
+
 			duration := nextRun.Sub(now)
 			rm.lgr.Info("scheduling next company master sync", zap.Duration("wait", duration))
-			
+
 			select {
 			case <-time.After(duration):
 				if err := rm.LoadCompanyMasterData(ctx, mongoClient); err != nil {
@@ -300,4 +300,24 @@ func (rm *RedisManager) StartScheduler(ctx context.Context, mongoClient *mongodb
 			}
 		}
 	}()
+}
+
+// ResolveCompany implements manthan.CompanyResolver. Returns the NSE/BSE codes
+// + active exchange for an ISIN. Hits Redis first; on miss falls back to
+// MongoDB CompanyMaster and writes the result into Redis (so subsequent
+// trade-execution lookups for the same ISIN are guaranteed to hit cache).
+//
+// Returns (empty, empty, empty, nil) when the ISIN exists in CompanyMaster
+// but neither exchange is Active — caller should treat this as un-tradeable.
+// Returns ("","","",nil) when ISIN is genuinely missing in master data.
+// Returns ("","","",err) on transport / decode failures.
+func (rm *RedisManager) ResolveCompany(ctx context.Context, isin string) (nseCode, bseCode, exchange string, err error) {
+	details, err := rm.GetCompanyDetails(ctx, isin)
+	if err != nil {
+		return "", "", "", err
+	}
+	if details == nil {
+		return "", "", "", nil // missing in master / inactive on both exchanges
+	}
+	return details.NSECode, details.BSECode, details.Exchange, nil
 }

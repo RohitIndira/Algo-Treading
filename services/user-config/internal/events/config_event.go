@@ -26,17 +26,18 @@ type ConfigEvent struct {
 // StrategyPayload is the full strategy configuration.
 // Values are published exactly as stored in the User Config DB model (no enum conversion here).
 type StrategyPayload struct {
-	StrategyID   string             `json:"strategy_id"`
-	UserID       string             `json:"user_id"`
-	StrategyName string             `json:"strategy_name"`
-	Active       bool               `json:"active"`
-	TradingMode  string             `json:"trading_mode"`
-	Conditions   ConditionsPayload  `json:"conditions"`
-	TradeConfig  TradeConfigPayload `json:"trade_config"`
-	RiskLimits   RiskLimitsPayload  `json:"risk_limits"`
-	Version      uint64             `json:"version"`
-	CreatedAt    int64              `json:"created_at"` // UnixNano
-	UpdatedAt    int64              `json:"updated_at"` // UnixNano
+	StrategyID   string              `json:"strategy_id"`
+	UserID       string              `json:"user_id"`
+	StrategyName string              `json:"strategy_name"`
+	StrategyType string              `json:"strategy_type,omitempty"`
+	Active       bool                `json:"active"`
+	TradingMode  string              `json:"trading_mode"`
+	Conditions   *ConditionsPayload  `json:"conditions,omitempty"`
+	TradeConfig  TradeConfigPayload  `json:"trade_config"`
+	RiskLimits   *RiskLimitsPayload  `json:"risk_limits,omitempty"`
+	Version      uint64              `json:"version"`
+	CreatedAt    int64               `json:"created_at,omitempty"` // UnixNano
+	UpdatedAt    int64               `json:"updated_at,omitempty"` // UnixNano
 }
 
 type ConditionsPayload struct {
@@ -57,18 +58,21 @@ type ConditionsPayload struct {
 }
 
 type TradeConfigPayload struct {
-	OrderType     string  `json:"order_type"`
-	ProductType   string  `json:"product_type"`
-	Validity      string  `json:"validity"`
-	Quantity      int32   `json:"quantity"`
-	Exchange      string  `json:"exchange"`
-	OrderSide     string  `json:"order_side"`
-	LimitPrice    float64 `json:"limit_price"`
-	StopLossPct   float64 `json:"stop_loss_pct"`
-	TakeProfitPct float64 `json:"take_profit_pct"`
-	TrailingSLPct float64 `json:"trailing_sl_pct"`
-	StopLossType  string  `json:"stop_loss_type"`
-	CreatedAt     int64   `json:"created_at"` // UnixNano
+	OrderType      string  `json:"order_type,omitempty"`
+	ProductType    string  `json:"product_type,omitempty"`
+	Validity       string  `json:"validity,omitempty"`
+	Quantity       int32   `json:"quantity,omitempty"`
+	Exchange       string  `json:"exchange,omitempty"`
+	OrderSide      string  `json:"order_side,omitempty"`
+	LimitPrice     float64 `json:"limit_price,omitempty"`
+	StopLossPct    float64 `json:"stop_loss_pct,omitempty"`
+	TakeProfitPct  float64 `json:"take_profit_pct,omitempty"`
+	TrailingSLPct  float64 `json:"trailing_sl_pct,omitempty"`
+	StopLossType   string  `json:"stop_loss_type,omitempty"`
+	TotalCapital   float64 `json:"total_capital,omitempty"`
+	MaxPositions   int32   `json:"max_positions,omitempty"`
+	PerStockAmount float64 `json:"per_stock_amount,omitempty"`
+	CreatedAt      int64   `json:"created_at,omitempty"` // UnixNano
 }
 
 type RiskLimitsPayload struct {

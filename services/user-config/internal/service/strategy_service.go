@@ -237,14 +237,9 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 	if req.StrategyName == "" {
 		return fmt.Errorf("strategy_name is required")
 	}
-	if req.Conditions == nil {
-		return fmt.Errorf("conditions are required")
-	}
-	if req.TradeConfig == nil {
-		return fmt.Errorf("trade_config is required")
-	}
-	if req.RiskLimits == nil {
-		return fmt.Errorf("risk_limits are required")
+	// Default strategy type
+	if req.StrategyType == "" {
+		req.StrategyType = models.StrategyTypeNews
 	}
 
 	// Default trading mode
@@ -253,6 +248,179 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 	}
 	if req.TradingMode != models.TradingModePaper && req.TradingMode != models.TradingModeLive {
 		return fmt.Errorf("invalid trading_mode: %s", req.TradingMode)
+	}
+
+	if req.TradeConfig == nil {
+		return fmt.Errorf("trade_config is required")
+	}
+
+	// --- 52W_BREAKOUT strategy: production-grade validation ---
+	if req.StrategyType == models.StrategyType52WBreakout {
+
+		// Strategy name: 3-100 chars, no SQL injection
+		if len(req.StrategyName) < 3 {
+			return fmt.Errorf("strategy_name must be at least 3 characters")
+		}
+		if len(req.StrategyName) > 100 {
+			return fmt.Errorf("strategy_name must be less than 100 characters")
+		}
+
+		// Total capital: min ₹10,000, max ₹10 crore
+		if req.TradeConfig.TotalCapital != nil {
+			cap := *req.TradeConfig.TotalCapital
+			if cap < 10000 {
+				return fmt.Errorf("total_capital must be at least ₹10,000")
+			}
+			if cap > 100000000 { // 10 crore
+				return fmt.Errorf("total_capital cannot exceed ₹10,00,00,000")
+			}
+		}
+
+		// Max positions: 1-100
+		if req.TradeConfig.MaxPositions != nil {
+			pos := *req.TradeConfig.MaxPositions
+			if pos < 1 || pos > 100 {
+				return fmt.Errorf("max_positions must be between 1 and 100")
+			}
+		}
+
+		// Stop loss: 0.1% - 50%
+		if req.TradeConfig.StopLossPct != nil {
+			sl := *req.TradeConfig.StopLossPct
+			if sl < 0.1 || sl > 50 {
+				return fmt.Errorf("stop_loss_pct must be between 0.1%% and 50%%")
+			}
+		} else {
+			return fmt.Errorf("stop_loss_pct is required")
+		}
+
+		// Take profit: 0.1% - 100%
+		if req.TradeConfig.TakeProfitPct != nil {
+			tp := *req.TradeConfig.TakeProfitPct
+			if tp < 0.1 || tp > 100 {
+				return fmt.Errorf("take_profit_pct must be between 0.1%% and 100%%")
+			}
+		} else {
+			return fmt.Errorf("take_profit_pct is required")
+		}
+
+		// Per stock amount must be meaningful (at least ₹100)
+		// Set defaults
+		if req.TradeConfig.PositionSizingMode == "" {
+			req.TradeConfig.PositionSizingMode = "EMA_ALLOCATION"
+		}
+		if req.TradeConfig.TotalCapital == nil {
+			defaultCap := 100000.0
+			req.TradeConfig.TotalCapital = &defaultCap
+		}
+		if req.TradeConfig.MaxPositions == nil {
+			defaultPos := int32(25)
+			req.TradeConfig.MaxPositions = &defaultPos
+		}
+
+		// Auto-calculate per_stock_amount
+		perStock := *req.TradeConfig.TotalCapital / float64(*req.TradeConfig.MaxPositions)
+		if perStock < 100 {
+			return fmt.Errorf("per_stock_amount too low (₹%.0f). Increase total_capital or reduce max_positions", perStock)
+		}
+		req.TradeConfig.PerStockAmount = &perStock
+
+		// Fixed system defaults (user doesn't control these for 52W)
+		req.TradeConfig.OrderType = "MARKET"
+		req.TradeConfig.ProductType = "INTRADAY"
+		req.TradeConfig.Validity = "DAY"
+		req.TradeConfig.Exchange = "NSE"
+		req.TradeConfig.OrderSide = "BUY"
+		req.TradeConfig.StopLossType = "FIXED"
+		if req.TradeConfig.Quantity <= 0 {
+			req.TradeConfig.Quantity = 1
+		}
+
+		// Empty conditions (52W doesn't use news conditions)
+		if req.Conditions == nil {
+			req.Conditions = &models.StrategyCondition{}
+		}
+
+		// Default risk limits for 52W (no EOD square-off for positional)
+		if req.RiskLimits == nil {
+			req.RiskLimits = &models.RiskLimits{
+				EnableRiskChecks:    true,
+				EnableAutoSquareOff: false, // Positional — no auto square-off
+			}
+		}
+
+		return nil
+	}
+
+	// --- MANTHAN strategy: minimal user input, backend fills everything ---
+	if req.StrategyType == models.StrategyTypeManthan {
+		if len(req.StrategyName) < 3 {
+			return fmt.Errorf("strategy_name must be at least 3 characters")
+		}
+		if len(req.StrategyName) > 100 {
+			return fmt.Errorf("strategy_name must be less than 100 characters")
+		}
+
+		// Total capital: min ₹5,00,000 (5 lakh), no upper limit
+		if req.TradeConfig == nil {
+			req.TradeConfig = &models.TradeConfig{}
+		}
+		if req.TradeConfig.TotalCapital == nil {
+			return fmt.Errorf("total_capital is required (minimum ₹5,00,000)")
+		}
+		cap := *req.TradeConfig.TotalCapital
+		if cap < 500000 {
+			return fmt.Errorf("total_capital must be at least ₹5,00,000 for Manthan strategy")
+		}
+
+		// Max positions: ≤25L → 25 stocks, >25L → 50 stocks
+		maxPos := int32(25)
+		if cap > 2500000 {
+			maxPos = 50
+		}
+		req.TradeConfig.MaxPositions = &maxPos
+
+		perStock := cap / float64(maxPos)
+		req.TradeConfig.PerStockAmount = &perStock
+
+		// Fixed system defaults — user does not control these
+		req.TradeConfig.PositionSizingMode = "EMA_ALLOCATION"
+		req.TradeConfig.OrderType = "MARKET"
+		req.TradeConfig.ProductType = "DELIVERY"
+		req.TradeConfig.Validity = "DAY"
+		req.TradeConfig.Exchange = "NSE"
+		req.TradeConfig.OrderSide = "BUY"
+		req.TradeConfig.StopLossType = "TRAILING"
+		req.TradeConfig.Quantity = 1
+
+		sl := 20.0  // 20% trailing SL from 52W high
+		req.TradeConfig.StopLossPct = &sl
+
+		trail := 2.0 // 2% trail increments
+		req.TradeConfig.TrailingSLPct = &trail
+
+		// No conditions (signal comes from manthan.signals pipeline)
+		if req.Conditions == nil {
+			req.Conditions = &models.StrategyCondition{}
+		}
+
+		// Risk limits — positional, no auto square-off
+		if req.RiskLimits == nil {
+			req.RiskLimits = &models.RiskLimits{
+				EnableRiskChecks:    true,
+				EnableAutoSquareOff: false,
+			}
+		}
+
+		return nil
+	}
+
+	// --- NEWS strategy: existing validation ---
+	if req.Conditions == nil {
+		return fmt.Errorf("conditions are required")
+	}
+	if req.RiskLimits == nil {
+		return fmt.Errorf("risk_limits are required")
 	}
 
 	// Validate conditions

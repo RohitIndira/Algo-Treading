@@ -20,8 +20,9 @@ const (
 	// Environment variable names
 	EnvIndiraBaseURL = "INDIRA_BASE_URL"
 
-	// Fallback base URL if environment variable is not set
-	FallbackBaseURL = "https://localhost:8000"
+	// Fallback base URL if environment variable is not set.
+	// Matches the official "Live" environment per Indira Securities API spec.
+	FallbackBaseURL = "https://livemiddleware.indiratrade.com"
 )
 
 // getDefaultBaseURL returns the base URL from environment or uses fallback
@@ -138,8 +139,11 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	if auth.BearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
 	}
-	// Always send SSO as true by default
-	req.Header.Set("sso", "true")
+	// Indira SSO middleware is case-sensitive on this value — it must be
+	// "True" (capital T). Lowercase "true" causes AU004 "Session data not
+	// received" because the request falls through to the non-SSO auth path
+	// while the JWT was minted under SSO.
+	req.Header.Set("sso", "True")
 
 	// Execute request
 	resp, err := c.httpClient.Do(req)

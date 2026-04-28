@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -36,8 +37,35 @@ import (
 )
 
 func main() {
-	// Load .env file
-	if err := godotenv.Load(); err != nil {
+	// Load .env file — try multiple paths so `go run ./services/trade-execution/cmd/`
+	// from repo root and a compiled binary in services/trade-execution/bin/ both work.
+	loaded := false
+	for _, p := range []string{
+		".env",
+		filepath.Join("services", "trade-execution", ".env"),
+	} {
+		if err := godotenv.Overload(p); err == nil {
+			log.Printf("Loaded .env from %s", p)
+			loaded = true
+			break
+		}
+	}
+	if !loaded {
+		if exe, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exe)
+			for _, p := range []string{
+				filepath.Join(exeDir, ".env"),
+				filepath.Join(exeDir, "..", ".env"),
+			} {
+				if err := godotenv.Overload(p); err == nil {
+					log.Printf("Loaded .env from %s", p)
+					loaded = true
+					break
+				}
+			}
+		}
+	}
+	if !loaded {
 		log.Println("No .env file found, using environment variables")
 	}
 
@@ -471,6 +499,18 @@ func main() {
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// ── Manthan Order Execution Module ──────────────────────────────────
+	manthanModule := InitManthan(ctx, db.DB, indiraClient.IndiraClient(), statusService, orderExecutor.CredentialsCache(), cfg.KafkaBrokers, logger)
+	if manthanModule != nil {
+		manthanModule.Start(ctx)
+		log.Println("✓ Manthan order execution module started")
+	}
+	defer func() {
+		if manthanModule != nil {
+			manthanModule.Stop()
+		}
+	}()
 
 	// ── Lifecycle: ordered graceful shutdown ──────────────────────────────────
 	lc := lifecycle.New(cancel, 15*time.Second)

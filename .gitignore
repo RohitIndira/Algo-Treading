@@ -5,6 +5,20 @@ bin/
 *.so
 *.dylib
 
+# Compiled service binaries (built into source dirs during dev)
+services/data-ingestion/historical-worker
+services/data-ingestion/ws-poc
+
+# IDE workspace files
+*.code-workspace
+
+# Nested experimental repos / scratch dirs
+StockkAsk/
+
+# Vendor / confidential docs (broker API PDFs, SSO guides etc.)
+internal/*.pdf
+internal/*.docx
+
 # Go
 *.test
 *.out
@@ -74,3 +88,8 @@ site/
 *.pdf
 *.json
 test.js
+# Secrets — never commit
+**/credentials/
+*.credentials.json
+*-sheet.json
+service-account*.json

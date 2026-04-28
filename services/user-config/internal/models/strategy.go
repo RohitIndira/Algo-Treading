@@ -15,14 +15,24 @@ const (
 	TradingModeLive  TradingMode = "LIVE"
 )
 
+// StrategyType represents the type of strategy
+type StrategyType string
+
+const (
+	StrategyTypeNews        StrategyType = "NEWS"
+	StrategyType52WBreakout StrategyType = "52W_BREAKOUT"
+	StrategyTypeManthan     StrategyType = "MANTHAN"
+)
+
 // Strategy represents a user trading strategy
 type Strategy struct {
 	StrategyID   uuid.UUID   `db:"strategy_id" json:"strategy_id"`
 	UserID       string      `db:"user_id" json:"user_id"`
-	StrategyName string      `db:"strategy_name" json:"strategy_name"`
-	Description  string      `db:"description" json:"description"`
-	Active       bool        `db:"active" json:"active"`
-	TradingMode  TradingMode `db:"trading_mode" json:"trading_mode"`
+	StrategyName string       `db:"strategy_name" json:"strategy_name"`
+	Description  string       `db:"description" json:"description"`
+	Active       bool         `db:"active" json:"active"`
+	StrategyType StrategyType `db:"strategy_type" json:"strategy_type"`
+	TradingMode  TradingMode  `db:"trading_mode" json:"trading_mode"`
 	Version      int32       `db:"version" json:"version"`
 	CreatedAt    time.Time   `db:"created_at" json:"created_at"`
 	UpdatedAt    time.Time   `db:"updated_at" json:"updated_at"`
@@ -70,6 +80,13 @@ type TradeConfig struct {
 	TakeProfitPct   *float64  `db:"take_profit_pct" json:"take_profit_pct,omitempty"`
 	TrailingSLPct   *float64  `db:"trailing_sl_pct" json:"trailing_sl_pct,omitempty"`
 	StopLossType    string    `db:"stop_loss_type" json:"stop_loss_type"`
+
+	// 52W Breakout strategy fields (Manthan)
+	PositionSizingMode string   `db:"position_sizing_mode" json:"position_sizing_mode"` // FIXED_QTY or EMA_ALLOCATION
+	TotalCapital       *float64 `db:"total_capital" json:"total_capital,omitempty"`      // Total investment (default ₹1,00,000)
+	MaxPositions       *int32   `db:"max_positions" json:"max_positions,omitempty"`      // Max stocks to hold (default 25)
+	PerStockAmount     *float64 `db:"per_stock_amount" json:"per_stock_amount,omitempty"` // Auto: total_capital / max_positions
+
 	CreatedAt       time.Time `db:"created_at" json:"created_at"`
 }
 
@@ -102,9 +119,10 @@ type CreateStrategyRequest struct {
 	UserID              string             `json:"user_id" validate:"required"`
 	StrategyName        string             `json:"strategy_name" validate:"required"`
 	Description         string             `json:"description"`
-	Conditions          *StrategyCondition `json:"conditions" validate:"required"`
+	StrategyType        StrategyType       `json:"strategy_type"` // NEWS or 52W_BREAKOUT
+	Conditions          *StrategyCondition `json:"conditions"`    // Required for NEWS, optional for 52W
 	TradeConfig         *TradeConfig       `json:"trade_config" validate:"required"`
-	RiskLimits          *RiskLimits        `json:"risk_limits" validate:"required"`
+	RiskLimits          *RiskLimits        `json:"risk_limits"`
 	ActivateImmediately bool               `json:"activate_immediately"`
 	TradingMode         TradingMode        `json:"trading_mode"`
 

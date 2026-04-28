@@ -5,6 +5,7 @@ type CreateStrategyRequest struct {
 	UserID              string              `json:"user_id"`
 	StrategyName        string              `json:"strategy_name"`
 	Description         string              `json:"description"`
+	StrategyType        string              `json:"strategy_type"` // "NEWS", "52W_BREAKOUT"
 	Conditions          *StrategyConditions `json:"conditions"`
 	TradeConfig         *TradeConfig        `json:"trade_config"`
 	RiskLimits          *RiskLimits         `json:"risk_limits"`
@@ -43,16 +44,22 @@ type StrategyConditions struct {
 
 // TradeConfig represents JSON trade configuration
 type TradeConfig struct {
-	OrderType       string  `json:"order_type"` // "MARKET", "LIMIT"
-	ProductType     string  `json:"product_type"` // "INTRADAY", "DELIVERY", "BRACKET"
+	OrderType       string  `json:"order_type"`    // "MARKET", "LIMIT"
+	ProductType     string  `json:"product_type"`  // "INTRADAY", "DELIVERY", "BRACKET"
 	Validity        string  `json:"validity"`
 	Quantity        int32   `json:"quantity"`
 	Exchange        string  `json:"exchange"`
-	OrderSide       string  `json:"order_side"` // "BUY", "SELL"
+	OrderSide       string  `json:"order_side"`    // "BUY", "SELL"
 	StopLossPct     float64 `json:"stop_loss_pct"`
 	TakeProfitPct   float64 `json:"take_profit_pct"`
 	TrailingSLPct   float64 `json:"trailing_sl_pct"`
 	StopLossType    string  `json:"stop_loss_type"` // "FIXED", "TRAILING"
+
+	// 52W Breakout strategy fields (Manthan)
+	PositionSizingMode string  `json:"position_sizing_mode"` // "FIXED_QTY", "EMA_ALLOCATION"
+	TotalCapital       float64 `json:"total_capital"`        // Total investment (default 100000)
+	MaxPositions       int32   `json:"max_positions"`        // Max positions (default 25)
+	PerStockAmount     float64 `json:"per_stock_amount"`     // Auto: total_capital / max_positions
 }
 
 // RiskLimits represents JSON risk limits

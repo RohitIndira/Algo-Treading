@@ -32,10 +32,13 @@ func (c *Client) GetFundLimit(ctx context.Context, auth *AuthContext) (*FundLimi
 		return nil, fmt.Errorf("fund limit request failed: %w", err)
 	}
 
-	var fundLimit FundLimit
-	if err := json.Unmarshal(resp.Data, &fundLimit); err != nil {
+	// Indira wraps fund fields under data.summary — flat unmarshal returns zeros.
+	// Parse the wrapper first, then copy the summary into the public FundLimit type.
+	var wrapper struct {
+		Summary FundLimit `json:"summary"`
+	}
+	if err := json.Unmarshal(resp.Data, &wrapper); err != nil {
 		return nil, fmt.Errorf("failed to parse fund limit: %w", err)
 	}
-
-	return &fundLimit, nil
+	return &wrapper.Summary, nil
 }

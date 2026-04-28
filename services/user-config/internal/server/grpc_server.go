@@ -33,6 +33,7 @@ func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStr
 		UserID:              req.UserId,
 		StrategyName:        req.StrategyName,
 		Description:         req.Description,
+		StrategyType:        protoStrategyTypeToModel(req.StrategyType),
 		Conditions:          protoConditionsToModel(req.Conditions),
 		TradeConfig:         protoTradeConfigToModel(req.TradeConfig),
 		RiskLimits:          protoRiskLimitsToModel(req.RiskLimits),
@@ -449,6 +450,43 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 	return cond
 }
 
+func modelStrategyTypeToProto(t models.StrategyType) pb.StrategyType {
+	switch t {
+	case models.StrategyType52WBreakout:
+		return pb.StrategyType_WEEK52_BREAKOUT
+	case models.StrategyTypeManthan:
+		return pb.StrategyType_MANTHAN
+	case models.StrategyTypeNews:
+		return pb.StrategyType_NEWS
+	default:
+		return pb.StrategyType_NEWS
+	}
+}
+
+func positionSizingModeToString(m pb.PositionSizingMode) string {
+	switch m {
+	case pb.PositionSizingMode_EMA_ALLOCATION:
+		return "EMA_ALLOCATION"
+	case pb.PositionSizingMode_FIXED_QTY:
+		return "FIXED_QTY"
+	default:
+		return "FIXED_QTY"
+	}
+}
+
+func protoStrategyTypeToModel(t pb.StrategyType) models.StrategyType {
+	switch t {
+	case pb.StrategyType_WEEK52_BREAKOUT:
+		return models.StrategyType52WBreakout
+	case pb.StrategyType_MANTHAN:
+		return models.StrategyTypeManthan
+	case pb.StrategyType_NEWS:
+		return models.StrategyTypeNews
+	default:
+		return models.StrategyTypeNews
+	}
+}
+
 func protoTradingModeToModel(mode pb.TradingMode) models.TradingMode {
 	switch mode {
 	case pb.TradingMode_PAPER:
@@ -553,18 +591,26 @@ func protoTradeConfigToModel(proto *pb.TradeConfig) *models.TradeConfig {
 		return nil
 	}
 
+	totalCap := proto.TotalCapital
+	maxPos := proto.MaxPositions
+	perStock := proto.PerStockAmount
+
 	config := &models.TradeConfig{
-		OrderType:     orderTypeToString(proto.OrderType),
-		Quantity:      proto.Quantity,
-		StopLossPct:   &proto.StopLossPct,
-		TakeProfitPct: &proto.TakeProfitPct,
-		Exchange:      exchangeToString(proto.Exchange),
-		OrderSide:     orderSideToString(proto.OrderSide),
-		LimitPrice:    &proto.LimitPrice,
-		Validity:      proto.Validity,
-		StopLossType:  stopLossTypeToString(proto.StopLossType),
-		TrailingSLPct: &proto.TrailingSlPct,
-		ProductType:   productTypeToString(proto.ProductType),
+		OrderType:          orderTypeToString(proto.OrderType),
+		Quantity:           proto.Quantity,
+		StopLossPct:        &proto.StopLossPct,
+		TakeProfitPct:      &proto.TakeProfitPct,
+		Exchange:           exchangeToString(proto.Exchange),
+		OrderSide:          orderSideToString(proto.OrderSide),
+		LimitPrice:         &proto.LimitPrice,
+		Validity:           proto.Validity,
+		StopLossType:       stopLossTypeToString(proto.StopLossType),
+		TrailingSLPct:      &proto.TrailingSlPct,
+		ProductType:        productTypeToString(proto.ProductType),
+		PositionSizingMode: positionSizingModeToString(proto.PositionSizingMode),
+		TotalCapital:       &totalCap,
+		MaxPositions:       &maxPos,
+		PerStockAmount:     &perStock,
 	}
 
 	return config
@@ -623,6 +669,7 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 		StrategyName: model.StrategyName,
 		Description:  model.Description,
 		Active:       model.Active,
+		StrategyType: modelStrategyTypeToProto(model.StrategyType),
 		TradingMode:  modelTradingModeToProto(model.TradingMode),
 		Version:      model.Version,
 		CreatedAt:    &common.Timestamp{Seconds: model.CreatedAt.Unix()},
@@ -754,7 +801,30 @@ func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
 		config.TrailingSlPct = *model.TrailingSLPct
 	}
 
+	// 52W fields
+	config.PositionSizingMode = stringToPositionSizingMode(model.PositionSizingMode)
+	if model.TotalCapital != nil {
+		config.TotalCapital = *model.TotalCapital
+	}
+	if model.MaxPositions != nil {
+		config.MaxPositions = *model.MaxPositions
+	}
+	if model.PerStockAmount != nil {
+		config.PerStockAmount = *model.PerStockAmount
+	}
+
 	return config
+}
+
+func stringToPositionSizingMode(s string) pb.PositionSizingMode {
+	switch s {
+	case "EMA_ALLOCATION":
+		return pb.PositionSizingMode_EMA_ALLOCATION
+	case "FIXED_QTY":
+		return pb.PositionSizingMode_FIXED_QTY
+	default:
+		return pb.PositionSizingMode_FIXED_QTY
+	}
 }
 
 func modelRiskLimitsToProto(model *models.RiskLimits) *pb.RiskLimits {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
@@ -133,6 +134,16 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) e
 	// Measure delay from Kafka message timestamp to processing start
 	if !msg.Time.IsZero() {
 		metrics.SignalKafkaDelay.Observe(time.Since(msg.Time).Seconds())
+	}
+
+	// Manthan orders share this topic but use a different JSON schema
+	// (ManthanOrder, with `entry_price` instead of `price`). They are handled
+	// by the dedicated Manthan signal consumer — skip them here so we don't
+	// mis-unmarshal and write zero price into `orders` (chk_price_positive).
+	for _, h := range msg.Headers {
+		if h.Key == "order_type" && strings.HasPrefix(string(h.Value), "MANTHAN_") {
+			return nil
+		}
 	}
 
 	var signal models.TradeSignal

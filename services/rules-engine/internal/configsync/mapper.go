@@ -21,11 +21,17 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 		StrategyID:   p.StrategyID,
 		UserID:       p.UserID,
 		StrategyName: p.StrategyName,
+		StrategyType: p.StrategyType,
 		Version:      p.Version,
 		Active:       p.Active,
 		TradingMode:  p.TradingMode,
 		CreatedAt:    unixNanosToTime(p.CreatedAt),
 		UpdatedAt:    unixNanosToTime(p.UpdatedAt),
+	}
+
+	// MANTHAN strategies are always active once created — backend controls lifecycle.
+	if p.StrategyType == "MANTHAN" {
+		s.Active = true
 	}
 
 	// Conditions
@@ -61,6 +67,9 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 		StopLossType:    normalizeStopLossType(p.TradeConfig.StopLossType),
 		TrailingSLPct:   p.TradeConfig.TrailingSLPct,
 		ProductType:     normalizeProductType(p.TradeConfig.ProductType),
+		TotalCapital:    p.TradeConfig.TotalCapital,
+		MaxPositions:    p.TradeConfig.MaxPositions,
+		PerStockAmount:  p.TradeConfig.PerStockAmount,
 		MaxPositionSize: 0,
 	}
 

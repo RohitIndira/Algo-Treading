@@ -46,7 +46,7 @@ func (s *EODDeactivationScheduler) Start(ctx context.Context) {
 
 	var lastFiredDate string // "YYYY-MM-DD" — prevents double-firing in the same minute
 
-	log.Printf("[eod-scheduler] Started — will deactivate all strategies at %02d:%02d IST on weekdays",
+	log.Printf("[eod-scheduler] Started — will deactivate NEWS strategies at %02d:%02d IST (52W strategies stay active)",
 		eodDeactivationHour, eodDeactivationMinute)
 
 	for {
@@ -87,7 +87,7 @@ func (s *EODDeactivationScheduler) shouldFire(now time.Time, lastFiredDate strin
 }
 
 func (s *EODDeactivationScheduler) deactivateAll(ctx context.Context) {
-	log.Printf("[eod-scheduler] 15:30 IST reached — deactivating all active strategies")
+	log.Printf("[eod-scheduler] 15:30 IST reached — deactivating NEWS strategies (52W stays active)")
 
 	deactivateCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()

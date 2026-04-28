@@ -14,15 +14,23 @@ import (
 
 // ConfigConsumer consumes "user-config-events" and applies deltas to ConfigStore.
 // Single goroutine. Never crashes on bad messages.
+// OnManthanCreatedFn is called when a MANTHAN strategy is created.
+type OnManthanCreatedFn func(ctx context.Context, strategy *models.Strategy)
+
 type ConfigConsumer struct {
-	reader      KafkaReader
-	configStore *configstore.ConfigStore
-	processed   atomic.Int64
-	errors      atomic.Int64
+	reader           KafkaReader
+	configStore      *configstore.ConfigStore
+	onManthanCreated OnManthanCreatedFn
+	processed        atomic.Int64
+	errors           atomic.Int64
 }
 
 func NewConfigConsumer(reader KafkaReader, store *configstore.ConfigStore) *ConfigConsumer {
 	return &ConfigConsumer{reader: reader, configStore: store}
+}
+
+func (c *ConfigConsumer) SetOnManthanCreated(fn OnManthanCreatedFn) {
+	c.onManthanCreated = fn
 }
 
 func (c *ConfigConsumer) Start(ctx context.Context) error {
@@ -80,6 +88,10 @@ func (c *ConfigConsumer) Start(ctx context.Context) error {
 			if err := c.configStore.Upsert((*models.StrategyConfig)(m)); err != nil {
 				c.errors.Add(1)
 				log.Printf("config consumer: upsert failed: %v", err)
+			}
+			if string(ev.Type) == "CONFIG_CREATED" && m.StrategyType == "MANTHAN" && c.onManthanCreated != nil {
+				log.Printf("config consumer: MANTHAN strategy created — triggering catch-up for user=%s strategy=%s", m.UserID, m.StrategyID)
+				go c.onManthanCreated(ctx, m)
 			}
 
 		case "CONFIG_PAUSED":

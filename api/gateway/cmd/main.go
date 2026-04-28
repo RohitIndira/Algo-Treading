@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
+	_ "github.com/lib/pq"
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/api/gateway/config"
@@ -71,6 +73,102 @@ func main() {
 	// Initialize Paper Trading handler
 	paperTradingHandler := handlers.NewPaperTradingHandler(cfg.Services.TradeExecutionPaperURL)
 
+	// Initialize Manthan handler — Manthan data is split across two Postgres DBs:
+	//
+	//   MANTHAN_SIGNALS_DB   — holds market_data.manthan_signals
+	//                          (written by data-ingestion / manthan-live).
+	//                          Default: market_data.
+	//   MANTHAN_POSITIONS_DB — holds trading_db.manthan_positions
+	//                          and trading_db.manthan_cooldown
+	//                          (written by the rules-engine publisher).
+	//                          Default: trading_db.
+	//
+	// Handler is nil-safe: failure of either DB just disables the respective
+	// section in the /manthan/overview response.
+	//
+	// Optionally also connects to the external Redis (Indira's market data feed)
+	// to enrich positions + signals with live LTP. Env: EXT_REDIS_ADDR / EXT_REDIS_PASSWORD.
+	var manthanHandler *handlers.ManthanHandler
+	{
+		pgHost := envOr("POSTGRES_HOST", "localhost")
+		pgPort := envOr("POSTGRES_PORT", "5432")
+		pgUser := envOr("POSTGRES_USER", "postgres")
+		pgPass := envOr("POSTGRES_PASSWORD", "postgres")
+		pgSSL := envOr("POSTGRES_SSLMODE", "disable")
+		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "market_data")
+		positionsDBName := envOr("MANTHAN_POSITIONS_DB", "trading_db")
+		ordersDBName := envOr("MANTHAN_ORDERS_DB", "trading_execution")
+
+		openPG := func(dbName string) (*sql.DB, error) {
+			connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+				pgHost, pgPort, pgUser, pgPass, dbName, pgSSL)
+			db, err := sql.Open("postgres", connStr)
+			if err != nil {
+				return nil, err
+			}
+			db.SetMaxOpenConns(5)
+			db.SetMaxIdleConns(2)
+			pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer pCancel()
+			if err := db.PingContext(pCtx); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+			return db, nil
+		}
+
+		signalsDB, err := openPG(signalsDBName)
+		if err != nil {
+			log.Printf("Warning: Manthan signals DB (%s) open/ping failed: %v", signalsDBName, err)
+		} else {
+			log.Printf("Manthan signals DB connected (%s)", signalsDBName)
+			defer signalsDB.Close()
+		}
+
+		positionsDB, err := openPG(positionsDBName)
+		if err != nil {
+			log.Printf("Warning: Manthan positions DB (%s) open/ping failed: %v", positionsDBName, err)
+		} else {
+			log.Printf("Manthan positions DB connected (%s)", positionsDBName)
+			defer positionsDB.Close()
+		}
+
+		ordersDB, err := openPG(ordersDBName)
+		if err != nil {
+			log.Printf("Warning: Manthan orders DB (%s) open/ping failed: %v", ordersDBName, err)
+		} else {
+			log.Printf("Manthan orders DB connected (%s)", ordersDBName)
+			defer ordersDB.Close()
+		}
+
+		// Optional external Redis for live LTP
+		var extRedis *redis.Client
+		if extAddr := os.Getenv("EXT_REDIS_ADDR"); extAddr != "" {
+			extRedis = redis.NewClient(&redis.Options{
+				Addr:         extAddr,
+				Password:     os.Getenv("EXT_REDIS_PASSWORD"),
+				DB:           0,
+				PoolSize:     10,
+				MinIdleConns: 2,
+				ReadTimeout:  2 * time.Second,
+			})
+			pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := extRedis.Ping(pCtx).Err(); err != nil {
+				log.Printf("Warning: external Redis ping failed: %v (live LTP disabled)", err)
+				_ = extRedis.Close()
+				extRedis = nil
+			} else {
+				log.Printf("External Redis connected for live LTP (%s)", extAddr)
+				defer extRedis.Close()
+			}
+			pCancel()
+		}
+
+		if signalsDB != nil || positionsDB != nil || ordersDB != nil {
+			manthanHandler = handlers.NewManthanHandler(signalsDB, positionsDB, ordersDB, redisClient, extRedis)
+		}
+	}
+
 	// CORS config
 	corsConfig := middleware.CORSConfig{
 		AllowedOrigins: cfg.CORS.AllowedOrigins,
@@ -79,7 +177,7 @@ func main() {
 	}
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
@@ -123,4 +221,12 @@ func main() {
 	}
 
 	log.Println("API Gateway stopped")
+}
+
+// envOr returns the value of the named environment variable, or fallback if empty.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

@@ -44,7 +44,15 @@ type OrderStatusService struct {
 	publisher     *publisher.KafkaPublisher
 	logger        *zap.Logger
 	wsBroadcaster func(userID string, order *models.Order)
-	ocoHandler    OCOHandler // OCO order management hook
+	ocoHandler     OCOHandler // OCO order management hook
+	manthanBridge  func(brokerOrderID, status string, filledQty int, avgPrice, triggerPrice float64, reason string) bool
+	// manthanManualExitPub is called when WSS reports an EXECUTED order we
+	// didn't place — a user manually closed a position via mobile app/web.
+	// Wired in manthan_init.go to (a) resolve the entry signal_id from
+	// manthan_orders and (b) publish MANUAL_EXIT_DETECTED to
+	// manthan.execution.events so the rules-engine projector can flip
+	// state and notify the user. Optional: nil = no publish.
+	manthanManualExitPub func(userID, symbol, brokerOrderID, reason string)
 
 	// tokenExpiredNotifier is called when a user's token is confirmed expired (30s retry also failed).
 	// Wired in main.go to push a token_expired event via /ws/live-orders.
@@ -103,6 +111,20 @@ func (s *OrderStatusService) ResumeUserSubscription(userID string, auth *indiraC
 // checked for OCO group membership. This is the hook that enables:
 //   - Entry fill → place SL+TP legs
 //   - SL leg fill → cancel TP leg (and vice versa)
+// SetManthanBridge wires a callback for routing Manthan order WSS updates.
+// Returns true if the update was handled (brokerOrderID is a Manthan order).
+// SetManthanManualExitPub wires the real-time manual-exit publisher. The
+// callback receives the WSS-detected (userID, symbol, brokerOrderID, reason)
+// and is expected to look up the matching entry signal_id and publish a
+// MANUAL_EXIT_DETECTED event to manthan.execution.events. Nil-safe.
+func (s *OrderStatusService) SetManthanManualExitPub(fn func(userID, symbol, brokerOrderID, reason string)) {
+	s.manthanManualExitPub = fn
+}
+
+func (s *OrderStatusService) SetManthanBridge(fn func(brokerOrderID, status string, filledQty int, avgPrice, triggerPrice float64, reason string) bool) {
+	s.manthanBridge = fn
+}
+
 func (s *OrderStatusService) SetOCOHandler(handler OCOHandler) {
 	s.ocoHandler = handler
 }
@@ -446,6 +468,25 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		go s.ocoHandler.HandleBrokerUpdate(context.Background(), &orderCopy, brokerStatusUpper)
 	}
 
+	// ── Manthan hook: route to WSS bridge if this is a Manthan order ────
+	if s.manthanBridge != nil {
+		indiraID := wsStatus.UniqueCode
+		if indiraID == "" {
+			indiraID = wsStatus.OrderNumber
+		}
+		filledQty, _ := strconv.Atoi(string(wsStatus.TradedQTY))
+		var avgPrice float64
+		if order != nil && order.FilledPrice != nil && *order.FilledPrice > 0 {
+			avgPrice = *order.FilledPrice
+		}
+		var trigPrice float64
+		decLoc, _ := strconv.Atoi(string(wsStatus.DecimalLocator))
+		if decLoc > 0 {
+			trigPrice = wsStatus.TriggerPrice / float64(decLoc)
+		}
+		s.manthanBridge(indiraID, brokerStatusUpper, filledQty, avgPrice, trigPrice, wsStatus.Reason)
+	}
+
 	s.publishNotification(ctx, order, wsStatus)
 }
 
@@ -467,6 +508,16 @@ func (s *OrderStatusService) handleManualExitDetection(ctx context.Context, wsSt
 		zap.String("unique_code", wsStatus.UniqueCode))
 
 	go s.ocoHandler.CancelGroupsBySymbol(context.Background(), userID, symbol)
+
+	// Real-time CQRS hook — publish MANUAL_EXIT_DETECTED so the rules-engine
+	// projector can flip manthan_signal_decisions → MANUALLY_EXITED, mark
+	// manthan_positions EXITED, set user_override_until = NOW()+3d, and emit
+	// the user-facing notification on manthan.notifications. Async via
+	// goroutine because we must not block the WSS dispatcher.
+	if s.manthanManualExitPub != nil {
+		reason := "user manually closed position via broker app/web"
+		go s.manthanManualExitPub(userID, symbol, wsStatus.UniqueCode, reason)
+	}
 }
 
 // flexToInt converts a FlexInt to int, returning 0 on failure.

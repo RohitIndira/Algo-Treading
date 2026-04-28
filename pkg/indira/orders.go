@@ -155,6 +155,16 @@ func (c *Client) GetOrderBook(ctx context.Context, auth *AuthContext) ([]OrderBo
 	return orders, nil
 }
 
+// GetOrderBookRaw returns the raw JSON response from the orderbook API.
+// Used when the standard parser fails (e.g., nested symbol objects).
+func (c *Client) GetOrderBookRaw(ctx context.Context, auth *AuthContext) ([]byte, error) {
+	resp, err := c.doRequest(ctx, auth, "GET", "/portfolio-services/api/order/v1/order-book", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
 // GetOrderTrail retrieves the order trail/history for a specific order
 // auth parameter contains user-specific authentication from frontend
 func (c *Client) GetOrderTrail(ctx context.Context, auth *AuthContext, req *OrderTrailRequest) ([]map[string]interface{}, error) {

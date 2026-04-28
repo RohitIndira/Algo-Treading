@@ -26,6 +26,11 @@ func init() {
 
 	if wd, err := os.Getwd(); err == nil {
 		pathsToTry = append(pathsToTry, filepath.Join(wd, ".env"))
+		// Repo-root case: when running `go run ./services/data-ingestion/cmd/...`
+		// from the repo root, CWD is the repo root and the service .env lives
+		// two levels deeper. Try that path too so MongoDB / Redis / Kafka
+		// settings come through without requiring a cd into the service dir.
+		pathsToTry = append(pathsToTry, filepath.Join(wd, "services", "data-ingestion", ".env"))
 	}
 
 	if exe, err := os.Executable(); err == nil {

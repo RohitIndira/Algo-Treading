@@ -92,6 +92,10 @@ topics=(
     "risk-approvals"        # Risk Management - approved trades
     "order-updates"         # Trade Execution - order status updates
     "market.data.52w_breakouts" # Data Ingestion - 52W high/low breakout events (real-time)
+    "manthan.signals"       # Data Ingestion - Manthan strategy eligible stocks (daily)
+    "portfolio.allocations" # Rules Engine - Manthan portfolio state changes (real-time)
+    "manthan.execution.events" # Trade Execution - fill confirmations for rules-engine sync
+    "manthan.notifications" # Rules Engine - user-facing notifications (manual exit detected, etc)
 )
 
 for topic in "${topics[@]}"; do

@@ -57,6 +57,11 @@ func NewExecutionClient() *ExecutionClient {
 }
 
 // SetTickSizeLookup sets the tick size lookup (e.g. RedisPriceClient).
+// IndiraClient returns the underlying Indira API client for direct use (e.g., Manthan module).
+func (c *ExecutionClient) IndiraClient() *indiraClient.Client {
+	return c.client
+}
+
 func (c *ExecutionClient) SetTickSizeLookup(tsl TickSizeLookup) {
 	c.tickSizeLookup = tsl
 }
@@ -282,10 +287,16 @@ func (c *ExecutionClient) FindRecentOrder(ctx context.Context, auth *indiraClien
 			continue
 		}
 		// Broker symbol may be "STK_TCS_EQ_NSE_11536"; our symbol is "TCS".
-		oSymUpper := strings.ToUpper(o.Symbol)
+		// Per Indira API doc page 13, `symbol` is a nested object — pull the
+		// full trading symbol from `symbol.symbol` or fall back to `symbol.dispSym`.
+		brokerSym := o.Symbol.Symbol
+		if brokerSym == "" {
+			brokerSym = o.Symbol.DispSym
+		}
+		oSymUpper := strings.ToUpper(brokerSym)
 		if oSymUpper == symUpper || strings.Contains(oSymUpper, symUpper) {
 			log.Printf("[idempotency] Found matching order in broker book: %s (symbol=%s side=%s qty=%d)",
-				o.OrdId, o.Symbol, o.OrdAction, o.Qty)
+				o.OrdId, brokerSym, o.OrdAction, o.Qty)
 			return o.OrdId, true
 		}
 	}

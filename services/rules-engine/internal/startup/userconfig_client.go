@@ -116,6 +116,7 @@ func protoToModel(ps *proto.Strategy) (*models.StrategyConfig, error) {
 		StrategyID:   ps.StrategyId,
 		UserID:       ps.UserId,
 		StrategyName: ps.StrategyName,
+		StrategyType: normalizeStrategyType(ps.StrategyType),
 		Active:       ps.Active,
 		TradingMode:  normalizeTradingMode(ps.TradingMode.String()),
 		Version:      uint64(ps.Version),
@@ -157,6 +158,9 @@ func protoToModel(ps *proto.Strategy) (*models.StrategyConfig, error) {
 		m.TradeConfig.TakeProfitPct = ps.TradeConfig.TakeProfitPct
 		m.TradeConfig.StopLossType = normalizeStopLossType(ps.TradeConfig.StopLossType.String())
 		m.TradeConfig.TrailingSLPct = ps.TradeConfig.TrailingSlPct
+		m.TradeConfig.TotalCapital = ps.TradeConfig.TotalCapital
+		m.TradeConfig.MaxPositions = ps.TradeConfig.MaxPositions
+		m.TradeConfig.PerStockAmount = ps.TradeConfig.PerStockAmount
 	}
 
 	if ps.RiskLimits != nil {
@@ -244,6 +248,19 @@ func normalizeStopLossType(v string) string {
 		return "TRAILING"
 	default:
 		return "FIXED"
+	}
+}
+
+func normalizeStrategyType(t proto.StrategyType) string {
+	switch t {
+	case proto.StrategyType_MANTHAN:
+		return "MANTHAN"
+	case proto.StrategyType_WEEK52_BREAKOUT:
+		return "52W_BREAKOUT"
+	case proto.StrategyType_NEWS:
+		return "NEWS"
+	default:
+		return "NEWS"
 	}
 }
 

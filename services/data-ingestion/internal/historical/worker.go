@@ -6,14 +6,16 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/data-ingestion/internal/ema"
 )
 
-// Worker handles daily 52W API sync and Redis management.
-// Simple flow: 6AM API sync (NSE+BSE) → Redis, 9:15 WebSocket overrides.
+// Worker handles daily 52W API sync, EMA computation, and Redis management.
 type Worker struct {
 	repo       *Repository
 	redis      *redis.Client
 	apiFetcher *APIFetcher
+	emaSvc     *ema.Service
 	logger     *zap.Logger
 }
 
@@ -24,10 +26,13 @@ func NewWorker(repo *Repository, redisClient *redis.Client, logger *zap.Logger) 
 		return nil, err
 	}
 
+	emaSvc := ema.NewService(redisClient, logger)
+
 	return &Worker{
 		repo:       repo,
 		redis:      redisClient,
 		apiFetcher: apiFetcher,
+		emaSvc:     emaSvc,
 		logger:     logger,
 	}, nil
 }
@@ -35,6 +40,31 @@ func NewWorker(repo *Repository, redisClient *redis.Client, logger *zap.Logger) 
 // RunAPISync runs a one-time NSE + BSE API sync. Used for --mode=apisync.
 func (w *Worker) RunAPISync(ctx context.Context) error {
 	return w.apiFetcher.SyncAll(ctx)
+}
+
+// SeedEMAs fetches 6 months of close prices from Yahoo Finance and computes
+// initial EMA 21/50/100 for all NSE stocks. Run once on first setup.
+func (w *Worker) SeedEMAs(ctx context.Context) error {
+	symbols, err := w.repo.GetAllNSESymbols(ctx)
+	if err != nil {
+		return err
+	}
+	return w.emaSvc.SeedFromYahoo(ctx, symbols)
+}
+
+// UpdateEMAs downloads latest bhavcopy and updates all EMAs.
+func (w *Worker) UpdateEMAs(ctx context.Context) error {
+	return w.emaSvc.UpdateDailyFromBhavcopy(ctx)
+}
+
+// EnsureEMAsSeeded checks if EMAs exist in Redis. If not, seeds from Yahoo.
+func (w *Worker) EnsureEMAsSeeded(ctx context.Context) error {
+	if w.emaSvc.IsSeeded(ctx) {
+		w.logger.Info("EMAs already seeded in Redis")
+		return nil
+	}
+	w.logger.Warn("EMAs not found in Redis — seeding from Yahoo Finance")
+	return w.SeedEMAs(ctx)
 }
 
 // EnsureRedisLoaded checks if Redis has 52W data. If empty, runs API sync.
@@ -94,11 +124,17 @@ func (w *Worker) RunDailyScheduler(ctx context.Context, scheduleHour, scheduleMi
 			continue
 		}
 
-		w.logger.Info("Running daily 52W API sync",
+		w.logger.Info("Running daily sync",
 			zap.String("date", today.Format("2006-01-02")))
 
+		// Step 1: 52W data from NSE + BSE APIs → Redis
 		if err := w.apiFetcher.SyncAll(ctx); err != nil {
-			w.logger.Error("API sync failed", zap.Error(err))
+			w.logger.Error("52W API sync failed", zap.Error(err))
+		}
+
+		// Step 2: EMA update from bhavcopy close prices
+		if err := w.UpdateEMAs(ctx); err != nil {
+			w.logger.Error("EMA update failed", zap.Error(err))
 		}
 	}
 }

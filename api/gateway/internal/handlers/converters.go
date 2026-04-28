@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/dto"
@@ -16,6 +17,30 @@ func mapTradingMode(mode string) pb.TradingMode {
 		return pb.TradingMode_LIVE
 	default:
 		return pb.TradingMode_TRADING_MODE_UNSPECIFIED
+	}
+}
+
+func mapPositionSizingMode(m string) pb.PositionSizingMode {
+	switch strings.ToUpper(m) {
+	case "EMA_ALLOCATION":
+		return pb.PositionSizingMode_EMA_ALLOCATION
+	case "FIXED_QTY":
+		return pb.PositionSizingMode_FIXED_QTY
+	default:
+		return pb.PositionSizingMode_FIXED_QTY
+	}
+}
+
+func mapStrategyType(t string) pb.StrategyType {
+	switch strings.ToUpper(t) {
+	case "52W_BREAKOUT":
+		return pb.StrategyType_WEEK52_BREAKOUT
+	case "MANTHAN":
+		return pb.StrategyType_MANTHAN
+	case "NEWS":
+		return pb.StrategyType_NEWS
+	default:
+		return pb.StrategyType_NEWS
 	}
 }
 
@@ -149,16 +174,20 @@ func dtoTradeConfigToProto(tc *dto.TradeConfig) *pb.TradeConfig {
 		return nil
 	}
 	return &pb.TradeConfig{
-		OrderType:     mapOrderType(tc.OrderType),
-		ProductType:   mapProductType(tc.ProductType),
-		Validity:      tc.Validity,
-		Quantity:      tc.Quantity,
-		Exchange:      mapExchange(tc.Exchange),
-		OrderSide:     mapOrderSide(tc.OrderSide),
-		StopLossPct:   tc.StopLossPct,
-		TakeProfitPct: tc.TakeProfitPct,
-		TrailingSlPct: tc.TrailingSLPct,
-		StopLossType:  mapStopLossType(tc.StopLossType),
+		OrderType:          mapOrderType(tc.OrderType),
+		ProductType:        mapProductType(tc.ProductType),
+		Validity:           tc.Validity,
+		Quantity:           tc.Quantity,
+		Exchange:           mapExchange(tc.Exchange),
+		OrderSide:          mapOrderSide(tc.OrderSide),
+		StopLossPct:        tc.StopLossPct,
+		TakeProfitPct:      tc.TakeProfitPct,
+		TrailingSlPct:      tc.TrailingSLPct,
+		StopLossType:       mapStopLossType(tc.StopLossType),
+		PositionSizingMode: mapPositionSizingMode(tc.PositionSizingMode),
+		TotalCapital:       tc.TotalCapital,
+		MaxPositions:       tc.MaxPositions,
+		PerStockAmount:     tc.PerStockAmount,
 	}
 }
 
@@ -199,4 +228,43 @@ func dtoUpdateStrategyToProto(reqDTO *dto.UpdateStrategyRequest) *pb.UpdateStrat
 	}
 
 	return req
+}
+
+// build52WResponse creates a clean JSON response for 52W strategies.
+// Only includes fields relevant to 52W — no news conditions, no bracket order fields.
+func build52WResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
+	s := resp.Strategy
+	tc := s.TradeConfig
+
+	result := map[string]interface{}{
+		"success": true,
+		"strategy": map[string]interface{}{
+			"strategy_id":   s.StrategyId,
+			"user_id":       s.UserId,
+			"strategy_name": s.StrategyName,
+			"strategy_type": "52W_BREAKOUT",
+			"active":        s.Active,
+			"trading_mode":  fmt.Sprintf("%v", s.TradingMode),
+			"trade_config": map[string]interface{}{
+				"total_capital":    tc.TotalCapital,
+				"max_positions":    tc.MaxPositions,
+				"per_stock_amount": tc.PerStockAmount,
+				"stop_loss_pct":    tc.StopLossPct,
+				"take_profit_pct":  tc.TakeProfitPct,
+			},
+		},
+	}
+
+	return result
+}
+
+func buildManthanResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
+	s := resp.Strategy
+	return map[string]interface{}{
+		"success":       true,
+		"strategy_id":   s.StrategyId,
+		"strategy_name": s.StrategyName,
+		"strategy_type": "MANTHAN",
+		"trading_mode":  fmt.Sprintf("%v", s.TradingMode),
+	}
 }

@@ -135,7 +135,11 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_CREATED outbox id=%d, skipping+marking processed\n", event.ID)
 			return true, nil
 		}
-		kafkaEvent = events.ToFullConfigEvent(events.ConfigCreated, &s)
+		if s.StrategyType == models.StrategyTypeManthan {
+			kafkaEvent = events.ToManthanConfigEvent(events.ConfigCreated, &s)
+		} else {
+			kafkaEvent = events.ToFullConfigEvent(events.ConfigCreated, &s)
+		}
 
 	case "STRATEGY_UPDATED":
 		var s models.Strategy
@@ -146,7 +150,11 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_UPDATED outbox id=%d, skipping+marking processed\n", event.ID)
 			return true, nil
 		}
-		kafkaEvent = events.ToFullConfigEvent(events.ConfigUpdated, &s)
+		if s.StrategyType == models.StrategyTypeManthan {
+			kafkaEvent = events.ToManthanConfigEvent(events.ConfigUpdated, &s)
+		} else {
+			kafkaEvent = events.ToFullConfigEvent(events.ConfigUpdated, &s)
+		}
 
 	case "STRATEGY_DELETED":
 		var thin deleteOutboxPayload

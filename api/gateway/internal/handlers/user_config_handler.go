@@ -83,6 +83,7 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		Description:         reqDTO.Description,
 		ActivateImmediately: reqDTO.ActivateImmediately,
 		TradingMode:         mapTradingMode(reqDTO.TradingMode),
+		StrategyType:        mapStrategyType(reqDTO.StrategyType),
 		Conditions:          dtoConditionsToProto(reqDTO.Conditions),
 		TradeConfig:         dtoTradeConfigToProto(reqDTO.TradeConfig),
 		RiskLimits:          dtoRiskLimitsToProto(reqDTO.RiskLimits),
@@ -106,6 +107,17 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Clean response based on strategy type
+	if resp.Strategy != nil {
+		switch resp.Strategy.StrategyType {
+		case pb.StrategyType_WEEK52_BREAKOUT:
+			respondWithJSON(w, http.StatusCreated, build52WResponse(resp))
+			return
+		case pb.StrategyType_MANTHAN:
+			respondWithJSON(w, http.StatusCreated, buildManthanResponse(resp))
+			return
+		}
+	}
 	respondWithJSON(w, http.StatusCreated, resp)
 }
 

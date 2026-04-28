@@ -61,10 +61,12 @@ type PlaceOrderRequest struct {
 
 // PlaceOrderResponse represents the response from placing an order
 type PlaceOrderResponse struct {
-	OrderId string `json:"orderId,omitempty"`
-	OrdId   string `json:"ordId,omitempty"`
-	Message string `json:"message,omitempty"`
-	Status  string `json:"status,omitempty"`
+	OrderId   string `json:"orderId,omitempty"`
+	OrdId     string `json:"ordId,omitempty"`
+	OrdStatus string `json:"ordStatus,omitempty"` // "Executed", "Pending", "Rejected"
+	RejReason string `json:"rejReason,omitempty"` // rejection reason if rejected
+	Message   string `json:"message,omitempty"`
+	Status    string `json:"status,omitempty"`
 }
 
 // ModifyOrderRequest represents a request to modify an order
@@ -110,21 +112,65 @@ type BrokerageChargesRequest struct {
 // ============ Portfolio Types ============
 
 // OrderBook represents an order in the order book
+// OrderBookSymbol is the nested symbol-descriptor object that Indira returns
+// inside every order-book entry. Matches the schema in Indira OPEN API doc v1.0
+// (pages 13-14). Most fields are nullable or irrelevant for order-book use;
+// kept here so unmarshal doesn't fail on unexpected fields and the Symbol +
+// ExcTkn + ISIN can be read downstream if needed.
+type OrderBookSymbol struct {
+	Symbol        string  `json:"symbol,omitempty"`        // e.g. "STK_KINGFA_EQ_NSE_18944"
+	DispSym       string  `json:"dispSym,omitempty"`       // e.g. "KINGFA"
+	Instrument    string  `json:"instrument,omitempty"`    // STK/IDX/FUT/OPT
+	BaseSym       string  `json:"baseSym,omitempty"`       // e.g. "KINGFA"
+	CompanyName   string  `json:"companyName,omitempty"`
+	ISIN          string  `json:"isin,omitempty"`
+	Exc           string  `json:"exc,omitempty"`           // NSE/BSE/NFO/BFO/MCX/NCDEX/CDS/BCD
+	ExcTkn        int     `json:"excTkn,omitempty"`        // numeric exchange token
+	Series        string  `json:"series,omitempty"`        // EQ/BE/SM
+	TickSize      float64 `json:"tickSize,omitempty"`
+	StreamSym     string  `json:"streamSym,omitempty"`
+	Multiplier    string  `json:"multiplier,omitempty"`
+	TradingSymbol string  `json:"tradingSymbol,omitempty"`
+	FNO           bool    `json:"fno,omitempty"`
+	MTF           bool    `json:"mtf,omitempty"`
+	// Many other nullable fields (lotSize, expiryDate, strikePrice, optionType,
+	// segment, freezeQty, otherExc, isWeeklyExpiry) omitted — add if needed.
+}
+
+// OrderBook mirrors one entry in the Indira order-book response
+// (GET /portfolio-services/api/order/v1/order-book → data.orders[]).
+// Field names match the API doc exactly — notably `price` (not `limitPrice`)
+// for the limit price, and `symbol` as a nested object.
 type OrderBook struct {
-	OrdId        string  `json:"ordId,omitempty"`
-	Symbol       string  `json:"symbol,omitempty"`
-	Exc          string  `json:"exc,omitempty"`
-	OrdAction    string  `json:"ordAction,omitempty"`
-	Qty          int     `json:"qty,omitempty"`
-	TradedQty    int     `json:"tradedQty,omitempty"`
-	LimitPrice   float64 `json:"limitPrice,omitempty"`
-	TriggerPrice float64 `json:"triggerPrice,omitempty"`
-	OrdType      string  `json:"ordType,omitempty"`
-	PrdType      string  `json:"prdType,omitempty"`
-	Status       string  `json:"status,omitempty"`
-	OrdTime      string  `json:"ordTime,omitempty"`
-	ExcToken     string  `json:"excToken,omitempty"`
-	Instrument   string  `json:"instrument,omitempty"`
+	OrdId        string          `json:"ordId,omitempty"`
+	ExchOrdId    int64           `json:"exchOrdId,omitempty"`
+	Symbol       OrderBookSymbol `json:"symbol,omitempty"`
+	Status       string          `json:"status,omitempty"`       // Requested/Executed/Cancelled/Rejected/Pending
+	OrdAction    string          `json:"ordAction,omitempty"`    // BUY/SELL
+	OrdType      string          `json:"ordType,omitempty"`      // Market/Limit/SL-M/Stop-loss
+	PrdType      string          `json:"prdType,omitempty"`      // DELIVERY/INTRADAY
+	OrdValidity  string          `json:"ordValidity,omitempty"`  // NONE/DAY/GTD/IOC/GTC
+	ModifiedBy   string          `json:"modifiedBy,omitempty"`   // MOBILE-Ex/WEB/API/DESKTOP/SYSTEM
+	Price        float64         `json:"price,omitempty"`        // LIMIT price (NOT limitPrice — API doc names it `price`)
+	TriggerPrice float64         `json:"triggerPrice,omitempty"` // SL trigger
+	RejReason    string          `json:"rejReason,omitempty"`
+	OrdDate      string          `json:"ordDate,omitempty"`   // dd-MMM-yyyy hh24:mm:ss
+	ExcOrdTime   string          `json:"excOrdTime,omitempty"`
+	Qty          int             `json:"qty,omitempty"`
+	DisQty       int             `json:"disQty,omitempty"`
+	TradedQty    int             `json:"tradedQty,omitempty"`
+	RemainQty    int             `json:"remainQty,omitempty"`
+	CancelledQty int             `json:"cancelledQty,omitempty"`
+	UndAsset     string          `json:"undAsset,omitempty"`
+	AMO          bool            `json:"amo,omitempty"`
+	Modifiable   bool            `json:"modifiable,omitempty"`
+	Cancellable  bool            `json:"cancellable,omitempty"`
+
+	// Legacy field kept for back-compat. `limitPrice` isn't in the doc's
+	// order-book response — some older callers may still read it. Populated
+	// from Price in a UnmarshalJSON helper if you want; for now unused by the
+	// reconciler.
+	LimitPrice float64 `json:"limitPrice,omitempty"`
 }
 
 // OrderTrailRequest represents a request to get order trail

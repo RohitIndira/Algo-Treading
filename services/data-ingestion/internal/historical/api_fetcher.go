@@ -59,11 +59,90 @@ type Stock52WData struct {
 	LTP       float64
 }
 
+// DiscoverNSEInstruments fetches the full list of NSE equity stocks and adds
+// any missing ones to our instruments table. This catches new IPOs, name changes,
+// and series changes that our DB doesn't know about.
+func (f *APIFetcher) DiscoverNSEInstruments(ctx context.Context) error {
+	f.logger.Info("Discovering new NSE instruments")
+
+	if err := f.refreshNSECookie(); err != nil {
+		return fmt.Errorf("NSE cookie: %w", err)
+	}
+
+	// NSE provides a CSV of all listed securities
+	url := "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Referer", "https://www.nseindia.com/")
+
+	resp, err := f.nseClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch equity list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("equity list HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// Parse CSV: SYMBOL, NAME OF COMPANY, SERIES, DATE OF LISTING, PAID UP VALUE, MARKET LOT, ISIN NUMBER, FACE VALUE
+	lines := strings.Split(string(body), "\n")
+	added := 0
+	for i, line := range lines {
+		if i == 0 {
+			continue // Skip header
+		}
+		fields := strings.Split(line, ",")
+		if len(fields) < 7 {
+			continue
+		}
+
+		symbol := strings.TrimSpace(fields[0])
+		series := strings.TrimSpace(fields[2])
+		isin := strings.TrimSpace(fields[6])
+
+		if symbol == "" {
+			continue
+		}
+
+		// Check if exists
+		existing, _, _ := f.repo.GetInstrumentBySymbol(ctx, symbol, "NSE")
+		if existing > 0 {
+			continue // Already in DB
+		}
+
+		// Add new instrument
+		_, err := f.repo.db.ExecContext(ctx, `
+			INSERT INTO instruments (token, symbol, series, isin, exchange, is_active)
+			VALUES ($1, $2, $3, $4, 'NSE', TRUE)
+			ON CONFLICT (token, exchange) DO NOTHING`,
+			symbol, symbol, series, isin)
+		if err == nil {
+			added++
+		}
+	}
+
+	f.logger.Info("NSE instrument discovery complete",
+		zap.Int("new_instruments", added),
+		zap.Int("total_lines", len(lines)))
+	return nil
+}
+
 // SyncAll fetches 52W data from both NSE and BSE APIs and updates DB + Redis.
-// Designed to run daily at 8:00 AM before market opens.
+// Designed to run daily at 6:00 AM before market opens.
 func (f *APIFetcher) SyncAll(ctx context.Context) error {
 	start := time.Now()
 	f.logger.Info("Starting 52W API sync (NSE + BSE)")
+
+	// Step 0: Discover new instruments (IPOs, name changes)
+	if err := f.DiscoverNSEInstruments(ctx); err != nil {
+		f.logger.Warn("NSE instrument discovery failed (non-fatal)", zap.Error(err))
+	}
 
 	// NSE
 	nseCount, nseErr := f.SyncNSE(ctx)

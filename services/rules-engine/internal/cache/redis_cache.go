@@ -20,6 +20,11 @@ type RedisCache struct {
 	logger *zap.Logger
 }
 
+// Client returns the underlying Redis client for direct access.
+func (c *RedisCache) Client() *redis.Client {
+	return c.client
+}
+
 type Config struct {
 	Addrs       []string
 	Password    string

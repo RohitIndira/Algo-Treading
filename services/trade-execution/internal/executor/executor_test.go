@@ -68,6 +68,15 @@ func (m *mockRepo) CancelAllLiveOrdersByUser(ctx context.Context, userID string)
 func (m *mockRepo) GetActiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
 	return nil, nil
 }
+func (m *mockRepo) GetExitableLiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetExitablePaperOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetFilledLiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
 func (m *mockRepo) CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error {
 	return nil
 }
@@ -90,6 +99,9 @@ func (m *mockRepo) GetActiveOCOOrders(ctx context.Context) ([]*models.Order, err
 	return nil, nil
 }
 func (m *mockRepo) GetOCOGroupOrders(ctx context.Context, groupID uuid.UUID) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetAllTodayLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	return nil, nil
 }
 

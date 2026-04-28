@@ -103,6 +103,11 @@ func main() {
 		logger.Error("Redis recovery failed", zap.Error(err))
 	}
 
+	// On startup: ensure EMAs are seeded (one-time Yahoo fetch if needed)
+	if err := worker.EnsureEMAsSeeded(ctx); err != nil {
+		logger.Error("EMA seed failed", zap.Error(err))
+	}
+
 	switch *mode {
 	case "daily":
 		// Start WebSocket monitor in background
@@ -123,6 +128,22 @@ func main() {
 			logger.Fatal("API sync failed", zap.Error(err))
 		}
 		logger.Info("API sync complete")
+
+	case "emaseed":
+		// One-time: fetch 6 months from Yahoo Finance → compute EMAs → store in Redis
+		logger.Info("Seeding EMAs from Yahoo Finance (one-time)")
+		if err := worker.SeedEMAs(ctx); err != nil {
+			logger.Fatal("EMA seed failed", zap.Error(err))
+		}
+		logger.Info("EMA seed complete")
+
+	case "emaupdate":
+		// Manual: update EMAs from latest bhavcopy
+		logger.Info("Updating EMAs from bhavcopy")
+		if err := worker.UpdateEMAs(ctx); err != nil {
+			logger.Fatal("EMA update failed", zap.Error(err))
+		}
+		logger.Info("EMA update complete")
 
 	case "monitor":
 		monitor := historical.NewWSMonitor(repo, redisClient, cfg.KafkaBrokers, logger)
