@@ -145,6 +145,11 @@ func main() {
 	// Initialize strategy events consumer (user-config-events → close positions on deactivate/delete)
 	log.Println("Initializing Kafka consumer for user-config-events...")
 	strategyEventsConsumer := consumer.NewStrategyEventsConsumer(cfg.KafkaBrokers, orderRepo, orderExecutor, logger)
+	// Wire credentials cache so USER_CREDENTIALS_UPDATED events from the
+	// /api/v1/auth/credentials login flow invalidate the cached JWT — keeps
+	// the protective replayer's 15:35 IST cron and the live order path on
+	// the freshest token without waiting for the 5-min TTL.
+	strategyEventsConsumer.SetCredentialsCache(orderExecutor.CredentialsCache())
 	log.Println("✓ Strategy events consumer initialized")
 
 	// Initialize gRPC server

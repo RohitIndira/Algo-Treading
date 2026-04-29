@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
@@ -86,6 +87,93 @@ func (s *StrategyService) publishToKafka(ctx context.Context, eventType string, 
 		return fmt.Errorf("failed to publish to kafka: %w", err)
 	}
 
+	return nil
+}
+
+// UpdateUserCredentialsRequest holds the input for refreshing a user's broker
+// auth (called from the SSO login flow + JWT refresh).
+type UpdateUserCredentialsRequest struct {
+	UserID       string // platform user id (== indiraUserID for Indira)
+	IndiraUserID string
+	AppID        string
+	Source       string // WEB / IOS / AND
+	BearerToken  string
+}
+
+// CredentialsEvent is the Kafka payload for USER_CREDENTIALS_UPDATED events.
+// Consumers (trade-execution) use it to invalidate any cached JWT for this
+// user so the protective replayer's 15:35 IST cron and the live order path
+// both pick up the freshest token without waiting for the cache TTL.
+//
+// Field tags mirror the existing strategy events on the same topic
+// (events/config_event.go) — `type` not `event_type` — so a single consumer
+// can deserialize both shapes and dispatch on Type value.
+type CredentialsEvent struct {
+	Type      string `json:"type"`               // "USER_CREDENTIALS_UPDATED"
+	UserID    string `json:"user_id"`
+	AppID     string `json:"app_id,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Timestamp int64  `json:"timestamp"`          // UnixNano
+}
+
+// UpdateUserCredentials encrypts + upserts the user's broker credentials in
+// trading_execution.user_credentials, then publishes a USER_CREDENTIALS_UPDATED
+// event to Kafka so any service caching the JWT can invalidate.
+//
+// Idempotent: ON CONFLICT (user_id) DO UPDATE on the underlying table — the
+// latest call wins. Bypasses the outbox pattern: cache invalidation is best-
+// effort with a 5-min TTL fallback in trade-execution's CredentialsCache, so
+// at-least-once delivery isn't a hard requirement here.
+func (s *StrategyService) UpdateUserCredentials(ctx context.Context, req UpdateUserCredentialsRequest) error {
+	if req.UserID == "" {
+		return fmt.Errorf("user_id is required")
+	}
+	if req.BearerToken == "" {
+		return fmt.Errorf("bearer_token is required")
+	}
+	indiraUserID := req.IndiraUserID
+	if indiraUserID == "" {
+		indiraUserID = req.UserID
+	}
+	source := req.Source
+	if source == "" {
+		source = "WEB"
+	}
+
+	if err := s.credsRepo.StoreIndiraCredentials(ctx, req.UserID, indiraUserID, req.AppID, source, req.BearerToken); err != nil {
+		return fmt.Errorf("store credentials: %w", err)
+	}
+
+	// Best-effort cache-invalidation event. Failure here doesn't roll back the
+	// DB upsert — the consumer's TTL fallback covers staleness.
+	if !s.kafkaEnabled {
+		return nil
+	}
+	ev := CredentialsEvent{
+		Type:      "USER_CREDENTIALS_UPDATED",
+		UserID:    req.UserID,
+		AppID:     req.AppID,
+		Source:    source,
+		Timestamp: time.Now().UnixNano(),
+	}
+	body, err := json.Marshal(ev)
+	if err != nil {
+		log.Printf("[user-config] WARN: marshal credentials event: %v", err)
+		return nil
+	}
+	msg := kafka.Message{
+		Key:   []byte(req.UserID),
+		Value: body,
+		Headers: []kafka.Header{
+			{Key: "event_type", Value: []byte(ev.Type)},
+			{Key: "user_id", Value: []byte(req.UserID)},
+		},
+	}
+	if err := s.kafkaWriter.WriteMessages(ctx, msg); err != nil {
+		log.Printf("[user-config] WARN: publish credentials event: %v", err)
+		return nil
+	}
+	log.Printf("[user-config] credentials refreshed + event published for user=%s", req.UserID)
 	return nil
 }
 

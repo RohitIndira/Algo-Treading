@@ -392,6 +392,51 @@ func (s *UserConfigServer) HealthCheck(ctx context.Context, req *common.HealthCh
 	}, nil
 }
 
+// UpdateUserCredentials persists the user's broker auth (called from the SSO
+// login flow + JWT-refresh flow). Encrypts the bearer token, upserts
+// trading_execution.user_credentials, and publishes USER_CREDENTIALS_UPDATED
+// to user-config-events so trade-execution can invalidate its CredentialsCache.
+//
+// Idempotent: ON CONFLICT (user_id) DO UPDATE on the underlying table — calling
+// this multiple times with the same JWT is safe (latest call wins).
+func (s *UserConfigServer) UpdateUserCredentials(ctx context.Context, req *pb.UpdateUserCredentialsRequest) (*pb.UpdateUserCredentialsResponse, error) {
+	if req == nil || req.IndiraAuth == nil {
+		return &pb.UpdateUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "INVALID_REQUEST",
+				Message: "user_id and indira_auth are required",
+			},
+		}, nil
+	}
+	if req.UserId == "" || req.IndiraAuth.BearerToken == "" {
+		return &pb.UpdateUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "INVALID_REQUEST",
+				Message: "user_id and bearer_token are required",
+			},
+		}, nil
+	}
+
+	if err := s.service.UpdateUserCredentials(ctx, service.UpdateUserCredentialsRequest{
+		UserID:       req.UserId,
+		IndiraUserID: req.IndiraAuth.UserId,
+		AppID:        req.IndiraAuth.AppId,
+		Source:       req.IndiraAuth.Source,
+		BearerToken:  req.IndiraAuth.BearerToken,
+	}); err != nil {
+		return &pb.UpdateUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "PERSIST_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+	return &pb.UpdateUserCredentialsResponse{Success: true}, nil
+}
+
 // Helper functions to convert between proto and model types
 
 func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondition {

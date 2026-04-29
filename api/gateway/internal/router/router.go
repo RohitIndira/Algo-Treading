@@ -32,6 +32,11 @@ func NewRouter(
 	// Health check
 	api.HandleFunc("/health", userConfigHandler.HealthCheck).Methods("GET")
 
+	// Auth — frontend calls this after SSO login (and on JWT refresh) so the
+	// backend has the latest broker JWT for offline flows like the protective
+	// replayer's 15:35 IST cron.
+	api.HandleFunc("/auth/credentials", userConfigHandler.UpdateCredentials).Methods("POST")
+
 	// Strategy CRUD
 	api.HandleFunc("/strategies", userConfigHandler.CreateStrategy).Methods("POST")
 	api.HandleFunc("/strategies/{strategy_id}", userConfigHandler.GetStrategy).Methods("GET")

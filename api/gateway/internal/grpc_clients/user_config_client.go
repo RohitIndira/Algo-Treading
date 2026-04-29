@@ -80,3 +80,9 @@ func (c *UserConfigClient) HealthCheck(ctx context.Context, req *common.HealthCh
 	defer cancel()
 	return c.client.HealthCheck(ctx, req)
 }
+
+func (c *UserConfigClient) UpdateUserCredentials(ctx context.Context, req *pb.UpdateUserCredentialsRequest) (*pb.UpdateUserCredentialsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.UpdateUserCredentials(ctx, req)
+}

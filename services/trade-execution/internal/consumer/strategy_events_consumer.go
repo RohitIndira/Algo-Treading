@@ -18,8 +18,9 @@ import (
 type configEventType string
 
 const (
-	configPaused  configEventType = "CONFIG_PAUSED"
-	configDeleted configEventType = "CONFIG_DELETED"
+	configPaused             configEventType = "CONFIG_PAUSED"
+	configDeleted            configEventType = "CONFIG_DELETED"
+	userCredentialsUpdated   configEventType = "USER_CREDENTIALS_UPDATED"
 )
 
 type strategyEvent struct {
@@ -27,6 +28,14 @@ type strategyEvent struct {
 	UserID     string          `json:"user_id"`
 	StrategyID string          `json:"strategy_id"`
 	Version    uint64          `json:"version"`
+}
+
+// CredentialsCacheInvalidator is the minimal surface this consumer needs from
+// executor.CredentialsCache. Defined as an interface so the consumer doesn't
+// have to import the executor package (avoids an import cycle if executor
+// later wants to import this consumer).
+type CredentialsCacheInvalidator interface {
+	Invalidate(userID string)
 }
 
 // OrderUnwatcher removes orders from the price monitor watch list.
@@ -42,6 +51,7 @@ type StrategyEventsConsumer struct {
 	orderRepo    repository.OrderRepository
 	executor     *executor.OrderExecutor
 	priceMonitor OrderUnwatcher // nil-safe: may be unset if PriceMonitor is disabled
+	credsCache   CredentialsCacheInvalidator // nil-safe: invalidates JWT cache on USER_CREDENTIALS_UPDATED
 	logger       *zap.Logger
 }
 
@@ -77,6 +87,15 @@ func NewStrategyEventsConsumer(
 // SetPriceMonitor wires the price monitor so orders are unwatched on strategy deactivation.
 func (c *StrategyEventsConsumer) SetPriceMonitor(pm OrderUnwatcher) {
 	c.priceMonitor = pm
+}
+
+// SetCredentialsCache wires the in-memory JWT cache so we can invalidate a
+// user's cached credentials when their broker JWT is refreshed via the
+// /api/v1/auth/credentials endpoint. Without this, the cache's 5-min TTL
+// could serve a stale JWT to the protective replayer's 15:35 IST cron for
+// up to 5 minutes after a fresh login.
+func (c *StrategyEventsConsumer) SetCredentialsCache(cc CredentialsCacheInvalidator) {
+	c.credsCache = cc
 }
 
 // Start begins consuming user-config-events. Blocks until ctx is cancelled.
@@ -122,12 +141,26 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 		return nil
 	}
 
-	if ev.UserID == "" || ev.StrategyID == "" {
+	if ev.UserID == "" {
 		return nil
 	}
 
 	switch ev.Type {
+	case userCredentialsUpdated:
+		// JWT-refresh path. No strategy_id needed; the event is per-user.
+		// Invalidate the in-memory cache so the next read pulls the fresh
+		// encrypted token from user_credentials. This is best-effort —
+		// failure here just means the cache stays warm for up to its TTL.
+		if c.credsCache != nil {
+			c.credsCache.Invalidate(ev.UserID)
+			c.logger.Info("Credentials cache invalidated",
+				zap.String("user_id", ev.UserID))
+		}
+		return nil
 	case configPaused, configDeleted:
+		if ev.StrategyID == "" {
+			return nil
+		}
 		return c.closeStrategyPositions(ctx, ev)
 	default:
 		return nil

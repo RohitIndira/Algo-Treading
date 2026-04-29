@@ -405,3 +405,94 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 func respondWithError(w http.ResponseWriter, code int, message string) {
 	respondWithJSON(w, code, map[string]string{"error": message})
 }
+
+// UpdateCredentials handles POST /api/v1/auth/credentials.
+//
+// Called by the frontend after a successful SSO login (and again on every JWT
+// refresh). Persists the encrypted bearer token in user_credentials so the
+// protective replayer's 15:35 IST cron + the live order path both have a
+// fresh token to authenticate with — even when the user isn't online.
+//
+// Auth model:
+//   - Bearer JWT goes in the request BODY (not the Authorization header) so we
+//     can distinguish "establishing a session" from "using one". Other endpoints
+//     read the JWT from the Authorization header and validate via gateway
+//     middleware; this one is the establishment path.
+//   - The standard headers (appId, source, userId) are still required so the
+//     IDOR check below works.
+func (h *UserConfigHandler) UpdateCredentials(w http.ResponseWriter, r *http.Request) {
+	var reqDTO dto.UpdateCredentialsRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	// Standard auth headers (appId/source/userId) — proves the caller has a
+	// session via the SSO cookie or the gateway session middleware. The body's
+	// bearer_token is what we're persisting; it is NOT used to auth this call.
+	headerUserID := r.Header.Get("userId")
+	headerAppID := r.Header.Get("appId")
+	headerSource := r.Header.Get("source")
+	if headerUserID == "" || headerAppID == "" || headerSource == "" {
+		respondWithError(w, http.StatusUnauthorized,
+			"Missing authentication headers: appId, source, and userId are required")
+		return
+	}
+
+	// IDOR check — body cannot persist creds for a user other than the caller.
+	if reqDTO.UserID == "" {
+		reqDTO.UserID = headerUserID
+	} else if reqDTO.UserID != headerUserID {
+		respondWithError(w, http.StatusForbidden, "user_id in body must match userId header")
+		return
+	}
+	if reqDTO.BearerToken == "" {
+		respondWithError(w, http.StatusBadRequest, "bearer_token is required")
+		return
+	}
+
+	// Default secondary fields from headers if the body left them blank.
+	indiraUserID := strings.TrimSpace(reqDTO.IndiraUserID)
+	if indiraUserID == "" {
+		indiraUserID = headerUserID
+	}
+	appID := strings.TrimSpace(reqDTO.AppID)
+	if appID == "" {
+		appID = headerAppID
+	}
+	source := strings.TrimSpace(reqDTO.Source)
+	if source == "" {
+		source = headerSource
+	}
+
+	pbReq := &pb.UpdateUserCredentialsRequest{
+		UserId: reqDTO.UserID,
+		IndiraAuth: &common.IndiraAuthContext{
+			UserId:      indiraUserID,
+			AppId:       appID,
+			Source:      source,
+			BearerToken: reqDTO.BearerToken,
+		},
+	}
+
+	resp, err := h.client.UpdateUserCredentials(r.Context(), pbReq)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to persist credentials: "+err.Error())
+		return
+	}
+	if !resp.Success {
+		code := http.StatusBadRequest
+		msg := "Failed to persist credentials"
+		if resp.Error != nil && resp.Error.Message != "" {
+			msg = resp.Error.Message
+		}
+		respondWithError(w, code, msg)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"user_id": reqDTO.UserID,
+	})
+}
+
