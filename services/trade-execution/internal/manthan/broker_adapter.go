@@ -22,6 +22,20 @@ type BrokerAdapter struct {
 	logger   *zap.Logger
 }
 
+// AMODprBuffer is the safety multiplier applied to DPR_lower when we're
+// preparing an AMO+SL trigger that has to survive overnight conversion.
+//
+// Why: today's DPR (cached at 16:00 IST submission) ≠ tomorrow's DPR (re-
+// computed by NSE pre-open based on volatility bucket). Triggers placed at
+// exactly today's DPR_lower may fall outside tomorrow's slightly-tighter band
+// and get rejected at AMO conversion (08:50 IST), as observed in the
+// 2026-04-29 KINGFA / NATIONALUM live test.
+//
+// 50bps inside DPR absorbs almost any realistic overnight band shift, costs
+// at most an additional 0.5% drawdown if the SL fires, and keeps the
+// algorithmic trigger when it's already comfortably inside DPR.
+const AMODprBuffer = 1.005
+
 func NewBrokerAdapter(client *indiraClient.Client, extRedis *redis.Client, logger *zap.Logger) *BrokerAdapter {
 	return &BrokerAdapter{client: client, extRedis: extRedis, logger: logger}
 }
@@ -420,6 +434,89 @@ func (b *BrokerAdapter) PlaceMarketSell(ctx context.Context, auth BrokerAuth, in
 	b.logger.Warn("EMERGENCY MARKET SELL placed",
 		zap.String("symbol", info.Symbol),
 		zap.Int("qty", qty),
+		zap.String("broker_order_id", orderID))
+
+	return orderID, nil
+}
+
+// PlaceAMOSLSell submits an After-Market Order with SL-Limit type for overnight
+// protection. Used by the protective replayer's Phase A (15:35 IST EOD cron).
+//
+// Trigger handling:
+//   - The caller passes the algorithmic trigger (e.g. TSL trigger at -8%).
+//   - We clamp it to MAX(trigger, DPR_lower * AMODprBuffer) to survive
+//     overnight DPR re-bucketing (see AMODprBuffer comment).
+//   - Then standard roundAndClamp guarantees tick-aligned + within band.
+//
+// Returns the broker's AMO queue ID (different from the live order ID that
+// gets generated at 08:50 IST conversion — Phase C swaps it).
+func (b *BrokerAdapter) PlaceAMOSLSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) (string, error) {
+	// Step 1: bias trigger 50bps inside DPR_lower to survive overnight band shift.
+	safeTrigger := triggerPrice
+	safeLimit := limitPrice
+	if info.DPRLower > 0 {
+		floor := info.DPRLower * AMODprBuffer
+		if safeTrigger < floor {
+			b.logger.Info("AMO SL trigger biased above DPR floor for overnight safety",
+				zap.String("symbol", info.Symbol),
+				zap.Float64("requested_trigger", triggerPrice),
+				zap.Float64("dpr_lower", info.DPRLower),
+				zap.Float64("safe_floor", floor))
+			safeTrigger = floor
+			safeLimit = floor - SLLimitGap(floor, info.TickSize)
+			if safeLimit < info.DPRLower {
+				safeLimit = info.DPRLower
+			}
+		}
+	}
+
+	// Step 2: tick-round + clamp inside [DPR_lower, DPR_upper].
+	roundedTrigger := b.roundAndClamp(safeTrigger, info.TickSize, info.DPRLower, info.DPRUpper)
+	roundedLimit := b.roundAndClamp(safeLimit, info.TickSize, info.DPRLower, info.DPRUpper)
+
+	req := &indiraClient.PlaceOrderRequest{
+		Symbol:       info.IndiraSymbol,
+		ExcToken:     info.ExchangeToken,
+		Exc:          "NSE",
+		OrdAction:    "SELL",
+		OrdValidity:  "DAY", // Indira ignores GTC/GTD for AMO; DAY is the only honoured value
+		OrdType:      "SL",
+		PrdType:      "DELIVERY",
+		LimitPrice:   indiraClient.Price2DP(roundedLimit),
+		TriggerPrice: indiraClient.Price2DP(roundedTrigger),
+		Qty:          qty,
+		DisQty:       0,
+		LotSize:      1,
+		Instrument:   "STK",
+		Amo:          true,
+	}
+
+	resp, err := b.client.PlaceOrder(ctx, b.toIndiraAuth(auth), req)
+	if err != nil {
+		return "", err
+	}
+
+	orderID := resp.OrderId
+	if orderID == "" {
+		orderID = resp.OrdId
+	}
+	if orderID == "" {
+		return "", fmt.Errorf("broker returned empty AMO+SL order ID")
+	}
+
+	if resp.OrdStatus == "Rejected" || resp.Status == "Rejected" {
+		reason := resp.RejReason
+		if reason == "" {
+			reason = resp.Message
+		}
+		return "", fmt.Errorf("AMO+SL submission rejected: %s", reason)
+	}
+
+	b.logger.Info("AMO+SL SELL queued for next session",
+		zap.String("symbol", info.Symbol),
+		zap.Int("qty", qty),
+		zap.Float64("trigger", roundedTrigger),
+		zap.Float64("limit", roundedLimit),
 		zap.String("broker_order_id", orderID))
 
 	return orderID, nil

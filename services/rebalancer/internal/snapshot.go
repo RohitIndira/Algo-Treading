@@ -102,7 +102,7 @@ func LoadPortfolioSnapshot(
 	// top-up phase can reference the parent row when emitting MANTHAN_TOPUP.
 	posRows, err := tradingDB.QueryContext(ctx, `
 		SELECT COALESCE(signal_id::text,'') AS signal_id,
-		       symbol, COALESCE(industry,''), COALESCE(mcap_bucket,''), COALESCE(index_name,''),
+		       symbol, COALESCE(isin,''), COALESCE(industry,''), COALESCE(mcap_bucket,''), COALESCE(index_name,''),
 		       quantity, invested_amt, status
 		FROM manthan_positions
 		WHERE strategy_id = $1 AND status IN ('ACTIVE','PARTIAL_ACTIVE')`,
@@ -113,7 +113,7 @@ func LoadPortfolioSnapshot(
 	defer posRows.Close()
 	for posRows.Next() {
 		var p PositionSummary
-		if err := posRows.Scan(&p.SignalID, &p.Symbol, &p.Industry, &p.MCapBucket, &p.IndexName,
+		if err := posRows.Scan(&p.SignalID, &p.Symbol, &p.ISIN, &p.Industry, &p.MCapBucket, &p.IndexName,
 			&p.Quantity, &p.InvestedAmt, &p.Status); err != nil {
 			return nil, err
 		}

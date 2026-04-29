@@ -118,23 +118,26 @@ type BrokerageChargesRequest struct {
 // kept here so unmarshal doesn't fail on unexpected fields and the Symbol +
 // ExcTkn + ISIN can be read downstream if needed.
 type OrderBookSymbol struct {
-	Symbol        string  `json:"symbol,omitempty"`        // e.g. "STK_KINGFA_EQ_NSE_18944"
-	DispSym       string  `json:"dispSym,omitempty"`       // e.g. "KINGFA"
-	Instrument    string  `json:"instrument,omitempty"`    // STK/IDX/FUT/OPT
-	BaseSym       string  `json:"baseSym,omitempty"`       // e.g. "KINGFA"
-	CompanyName   string  `json:"companyName,omitempty"`
-	ISIN          string  `json:"isin,omitempty"`
-	Exc           string  `json:"exc,omitempty"`           // NSE/BSE/NFO/BFO/MCX/NCDEX/CDS/BCD
-	ExcTkn        int     `json:"excTkn,omitempty"`        // numeric exchange token
-	Series        string  `json:"series,omitempty"`        // EQ/BE/SM
-	TickSize      float64 `json:"tickSize,omitempty"`
-	StreamSym     string  `json:"streamSym,omitempty"`
-	Multiplier    string  `json:"multiplier,omitempty"`
-	TradingSymbol string  `json:"tradingSymbol,omitempty"`
-	FNO           bool    `json:"fno,omitempty"`
-	MTF           bool    `json:"mtf,omitempty"`
+	Symbol        string `json:"symbol,omitempty"`     // e.g. "STK_KINGFA_EQ_NSE_18944"
+	DispSym       string `json:"dispSym,omitempty"`    // e.g. "KINGFA"
+	Instrument    string `json:"instrument,omitempty"` // STK/IDX/FUT/OPT
+	BaseSym       string `json:"baseSym,omitempty"`    // e.g. "KINGFA"
+	CompanyName   string `json:"companyName,omitempty"`
+	ISIN          string `json:"isin,omitempty"`
+	Exc           string `json:"exc,omitempty"`    // NSE/BSE/NFO/BFO/MCX/NCDEX/CDS/BCD
+	ExcTkn        int    `json:"excTkn,omitempty"` // numeric exchange token
+	Series        string `json:"series,omitempty"` // EQ/BE/SM
+	StreamSym     string `json:"streamSym,omitempty"`
+	Multiplier    string `json:"multiplier,omitempty"`
+	TradingSymbol string `json:"tradingSymbol,omitempty"`
+	FNO           bool   `json:"fno,omitempty"`
+	MTF           bool   `json:"mtf,omitempty"`
+	// tickSize is intentionally NOT decoded — Indira returns it inconsistently
+	// (e.g. "0.1" as a JSON string) which breaks float64 unmarshal. None of our
+	// code reads tick from this struct anyway — TickSize lives on SymbolInfo,
+	// populated from the external market-data feed (Redis market:nse:<token>).
 	// Many other nullable fields (lotSize, expiryDate, strikePrice, optionType,
-	// segment, freezeQty, otherExc, isWeeklyExpiry) omitted — add if needed.
+	// segment, freezeQty, otherExc, isWeeklyExpiry, pdc) similarly omitted.
 }
 
 // OrderBook mirrors one entry in the Indira order-book response
@@ -142,8 +145,10 @@ type OrderBookSymbol struct {
 // Field names match the API doc exactly — notably `price` (not `limitPrice`)
 // for the limit price, and `symbol` as a nested object.
 type OrderBook struct {
-	OrdId        string          `json:"ordId,omitempty"`
-	ExchOrdId    int64           `json:"exchOrdId,omitempty"`
+	OrdId string `json:"ordId,omitempty"`
+	// exchOrdId arrives as either a JSON number or string depending on order type/age.
+	// Stored raw so unmarshal never fails; nobody reads it from OrderBook anyway.
+	ExchOrdId    json.RawMessage `json:"exchOrdId,omitempty"`
 	Symbol       OrderBookSymbol `json:"symbol,omitempty"`
 	Status       string          `json:"status,omitempty"`       // Requested/Executed/Cancelled/Rejected/Pending
 	OrdAction    string          `json:"ordAction,omitempty"`    // BUY/SELL

@@ -439,6 +439,300 @@ func (r *Repository) GetLiveEntriesByUser(ctx context.Context, userID string) ([
 	return out, rows.Err()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Protective replayer (custom GTC) — Phase A/B/C support
+// ─────────────────────────────────────────────────────────────────────────────
+
+// PositionNeedingProtection is one open Manthan position that requires an
+// SL on the broker for tomorrow's session. Returned by
+// ListPositionsNeedingProtection at 15:35 IST.
+type PositionNeedingProtection struct {
+	EntryOrderID    int64
+	EntrySignalID   string
+	StrategyID      string
+	UserID          string
+	Symbol          string
+	ISIN            string
+	IndiraSymbol    string
+	ExchangeToken   string
+	Exchange        string
+	NetQty          int     // sum(filled BUY) − sum(filled SELL); always > 0 here
+	LatestTrigger   float64 // most recent trail trigger from any prior SL row (0 if no prior SL)
+	LatestLimit     float64
+}
+
+// ListPositionsNeedingProtection enumerates every position that has a filled
+// entry and no terminal exit. Used by the replayer's Phase A (15:35 IST) to
+// know which positions need an AMO+SL for the next session. Aggregates qty
+// across top-ups; carries the latest trigger price from the most recent SL
+// row so the replayer can preserve TSL trail state.
+func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]PositionNeedingProtection, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		WITH live_buys AS (
+		    SELECT DISTINCT ON (e.strategy_id, e.symbol)
+		           e.id AS entry_order_id, e.signal_id, e.strategy_id, e.user_id,
+		           e.symbol, e.isin, e.indira_symbol, e.exchange_token, e.exchange
+		    FROM manthan_orders e
+		    WHERE e.order_side = 'BUY'
+		      AND e.status = 'FILLED'
+		      AND e.signal_id IS NOT NULL
+		      AND NOT EXISTS (
+		          SELECT 1 FROM manthan_orders x
+		          WHERE x.strategy_id = e.strategy_id
+		            AND x.symbol = e.symbol
+		            AND x.order_side = 'SELL'
+		            AND x.status = 'FILLED'
+		            AND x.created_at > e.filled_at
+		      )
+		    ORDER BY e.strategy_id, e.symbol, e.created_at DESC
+		),
+		net_qty AS (
+		    SELECT strategy_id, symbol,
+		           COALESCE(SUM(CASE WHEN order_side='BUY' AND status='FILLED'  THEN filled_qty
+		                              WHEN order_side='SELL' AND status='FILLED' THEN -filled_qty
+		                              ELSE 0 END), 0) AS net
+		    FROM manthan_orders
+		    GROUP BY strategy_id, symbol
+		),
+		latest_sl AS (
+		    SELECT DISTINCT ON (sl.parent_order_id)
+		           sl.parent_order_id,
+		           sl.trigger_price,
+		           sl.limit_price
+		    FROM manthan_orders sl
+		    WHERE sl.order_type IN ('SL_SELL','SL_SELL_AMO')
+		    ORDER BY sl.parent_order_id, sl.created_at DESC
+		)
+		SELECT b.entry_order_id, b.signal_id, b.strategy_id, b.user_id,
+		       b.symbol, COALESCE(b.isin,''), COALESCE(b.indira_symbol,''),
+		       COALESCE(b.exchange_token,''), COALESCE(b.exchange,'NSE'),
+		       n.net,
+		       COALESCE(l.trigger_price, 0), COALESCE(l.limit_price, 0)
+		FROM   live_buys b
+		JOIN   net_qty   n ON n.strategy_id = b.strategy_id AND n.symbol = b.symbol
+		LEFT JOIN latest_sl l ON l.parent_order_id = b.entry_order_id
+		WHERE  n.net > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PositionNeedingProtection
+	for rows.Next() {
+		var p PositionNeedingProtection
+		if err := rows.Scan(&p.EntryOrderID, &p.EntrySignalID, &p.StrategyID, &p.UserID,
+			&p.Symbol, &p.ISIN, &p.IndiraSymbol, &p.ExchangeToken, &p.Exchange,
+			&p.NetQty, &p.LatestTrigger, &p.LatestLimit); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// InsertAMOOrder writes a new SL_SELL_AMO row for the given position+trade_date
+// and returns its id. Returns (0, sql.ErrNoRows) if a row already exists for
+// the same (parent_order_id, trade_date) — the partial UNIQUE index from
+// migration 011 makes this crash-safe: the 15:35 cron can be re-run safely.
+//
+// alreadyExists==true means the caller should skip rather than treat the
+// conflict as an error.
+func (r *Repository) InsertAMOOrder(
+	ctx context.Context,
+	parentEntryOrderID int64,
+	p PositionNeedingProtection,
+	tradeDate time.Time,
+	trigger, limit float64,
+) (id int64, alreadyExists bool, err error) {
+	// Pre-check existence under the partial unique index's predicate. We do
+	// this manually rather than ON CONFLICT because the index is a *partial*
+	// unique index, which postgres can't reference by name in ON CONFLICT
+	// (it requires a real CONSTRAINT, not just an INDEX). The check + insert
+	// run inside a single transaction so the SELECT result is consistent
+	// with the INSERT below.
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var existingID int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM manthan_orders
+		WHERE  parent_order_id = $1
+		  AND  trade_date = $2
+		  AND  order_type IN ('SL_SELL','SL_SELL_AMO')
+		  AND  status NOT IN ('CANCELLED','REJECTED','FILLED','EXPIRED','SL_SELL_AMO_REJECTED')
+		LIMIT 1`,
+		parentEntryOrderID, tradeDate,
+	).Scan(&existingID)
+	if err == nil {
+		_ = tx.Commit()
+		return 0, true, nil
+	}
+	if err != sql.ErrNoRows {
+		return 0, false, fmt.Errorf("check existing: %w", err)
+	}
+
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO manthan_orders (
+		    signal_id, strategy_id, user_id, symbol, isin, exchange,
+		    order_type, order_side, product_type,
+		    qty, limit_price, trigger_price,
+		    indira_symbol, exchange_token, status,
+		    parent_order_id, trade_date, max_retries
+		)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,'SELL','CNC',$8,$9,$10,$11,$12,$13,$14,$15,3)
+		RETURNING id`,
+		nullStr(p.EntrySignalID+"-amo-"+tradeDate.Format("20060102")), p.StrategyID, p.UserID,
+		p.Symbol, nullStr(p.ISIN), p.Exchange,
+		string(OrderTypeSLSellAMO), p.NetQty, limit, trigger,
+		p.IndiraSymbol, p.ExchangeToken, string(StatusAMOPending),
+		parentEntryOrderID, tradeDate,
+	).Scan(&id)
+	if err != nil {
+		return 0, false, fmt.Errorf("insert: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("commit: %w", err)
+	}
+	return id, false, nil
+}
+
+// AMOReplayRow is a thin view of a pending SL_SELL_AMO row used by Phase B/C.
+type AMOReplayRow struct {
+	ID            int64
+	EntryOrderID  int64
+	EntrySignalID string
+	StrategyID    string
+	UserID        string
+	Symbol        string
+	IndiraSymbol  string
+	ExchangeToken string
+	Exchange      string
+	Qty           int
+	TriggerPrice  float64
+	LimitPrice    float64
+	BrokerOrderID string
+	TradeDate     time.Time
+}
+
+// ListPendingAMOForDate returns every SL_SELL_AMO row with the given trade_date
+// that is still in flight. Used by Phase B (09:14 IST re-validate) and Phase C
+// (09:15:30 IST reconcile).
+func (r *Repository) ListPendingAMOForDate(ctx context.Context, tradeDate time.Time) ([]*AMOReplayRow, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT m.id, m.parent_order_id,
+		       COALESCE(e.signal_id, ''),
+		       m.strategy_id, m.user_id, m.symbol,
+		       COALESCE(m.indira_symbol, ''), COALESCE(m.exchange_token, ''),
+		       COALESCE(m.exchange, 'NSE'),
+		       m.qty, m.trigger_price, m.limit_price,
+		       COALESCE(m.broker_order_id, ''), m.trade_date
+		FROM   manthan_orders m
+		LEFT JOIN manthan_orders e ON e.id = m.parent_order_id
+		WHERE  m.order_type = 'SL_SELL_AMO'
+		  AND  m.trade_date = $1
+		  AND  m.status NOT IN ('CANCELLED','REJECTED','FILLED','SL_SELL_AMO_REJECTED','AMO_REJECTED')`,
+		tradeDate)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*AMOReplayRow
+	for rows.Next() {
+		var (
+			row   AMOReplayRow
+			pid   sql.NullInt64
+		)
+		if err := rows.Scan(&row.ID, &pid, &row.EntrySignalID, &row.StrategyID, &row.UserID,
+			&row.Symbol, &row.IndiraSymbol, &row.ExchangeToken, &row.Exchange,
+			&row.Qty, &row.TriggerPrice, &row.LimitPrice, &row.BrokerOrderID,
+			&row.TradeDate); err != nil {
+			return nil, err
+		}
+		if pid.Valid {
+			row.EntryOrderID = pid.Int64
+		}
+		out = append(out, &row)
+	}
+	return out, rows.Err()
+}
+
+// PromoteAMOToActiveSL records a successful AMO→live conversion. The pending
+// SL_SELL_AMO row is promoted to a regular SL_SELL row in StatusSLPlaced with
+// the fresh broker_order_id assigned at 08:50 conversion. After this call the
+// existing SafetyMonitor / Reconciler treat it like any other live SL.
+func (r *Repository) PromoteAMOToActiveSL(ctx context.Context, id int64, newBrokerID string) error {
+	now := time.Now()
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		SET    order_type = $1,
+		       status = $2,
+		       broker_order_id = $3,
+		       placed_at = $4,
+		       updated_at = $4
+		WHERE  id = $5`,
+		string(OrderTypeSLSell), string(StatusSLPlaced), newBrokerID, now, id)
+	return err
+}
+
+// MarkAMORejected marks an AMO row terminal after the broker rejected its
+// conversion to a live order (typically DPR breach). The replayer's Phase C
+// then hot-places a fresh SL with currently-valid DPR.
+func (r *Repository) MarkAMORejected(ctx context.Context, id int64, reason string) error {
+	now := time.Now()
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		SET    status = $1, last_error = $2, updated_at = $3
+		WHERE  id = $4`,
+		string(StatusAMORejected), reason, now, id)
+	return err
+}
+
+// UpdateAMOTrigger rewrites trigger/limit on a pending AMO row. Used by
+// Phase B when fresh DPR makes the original trigger invalid: we cancel the
+// old AMO at the broker, re-place with corrected trigger, update this row
+// to point at the new broker_order_id.
+func (r *Repository) UpdateAMOTrigger(ctx context.Context, id int64, newTrigger, newLimit float64, newBrokerOrderID string) error {
+	now := time.Now()
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		SET    trigger_price = $1,
+		       limit_price = $2,
+		       broker_order_id = $3,
+		       placed_at = $4,
+		       updated_at = $4
+		WHERE  id = $5`,
+		newTrigger, newLimit, newBrokerOrderID, now, id)
+	return err
+}
+
+// HasActiveSLForPositionToday returns true if the position already has an
+// active in-session SL row (order_type=SL_SELL, status SL_PLACED) created
+// today. Phase A skips AMO submission for these — there's already a live
+// SL on the broker that will be auto-cancelled at 15:30 EOD, but the AMO
+// for tomorrow doesn't conflict because uniq_active_sl_per_day is keyed on
+// trade_date. This check is purely informational so we can log "skipped:
+// position already protected today" cleanly.
+func (r *Repository) HasActiveSLForPositionToday(ctx context.Context, parentEntryOrderID int64) (bool, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx, `
+		SELECT count(*) FROM manthan_orders
+		WHERE  parent_order_id = $1
+		  AND  order_type = 'SL_SELL'
+		  AND  status IN ('SL_PLACED','SL_MODIFY_PENDING')
+		  AND  trade_date = CURRENT_DATE`, parentEntryOrderID).Scan(&n)
+	return n > 0, err
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // InsertEvent records an order state change in the audit trail.
 func (r *Repository) InsertEvent(ctx context.Context, orderID int64, eventType, oldStatus, newStatus, brokerStatus string, price float64, qty int, detail string) error {
 	_, err := r.db.ExecContext(ctx, `

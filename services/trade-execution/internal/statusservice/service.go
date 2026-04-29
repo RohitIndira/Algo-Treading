@@ -501,6 +501,20 @@ func (s *OrderStatusService) handleManualExitDetection(ctx context.Context, wsSt
 		return
 	}
 
+	// Manual EXIT can only be a SELL — BUY orders ADD to position, never exit.
+	// Without this guard, a top-up BUY (placed by the rebalancer) that races
+	// ahead of our DB write gets misclassified as MANUAL_EXIT_DETECTED and
+	// flips the parent position to EXITED. Indira encodes Buy_Sell as
+	// "1"=BUY, "2"=SELL.
+	if strings.TrimSpace(wsStatus.BuySell) != "2" {
+		s.logger.Debug("handleManualExitDetection: skipping non-SELL order",
+			zap.String("user_id", userID),
+			zap.String("symbol", wsStatus.Symbol),
+			zap.String("buy_sell", wsStatus.BuySell),
+			zap.String("unique_code", wsStatus.UniqueCode))
+		return
+	}
+
 	symbol := wsStatus.Symbol
 	s.logger.Info("Manual exit detected — cancelling OCO groups for symbol",
 		zap.String("user_id", userID),

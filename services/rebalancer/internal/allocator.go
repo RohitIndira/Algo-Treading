@@ -137,6 +137,7 @@ func TopUpExistingPositions(snap *PortfolioSnapshot, logger *zap.Logger) (topups
 		entry := PlannedEntry{
 			SignalID:         uuid.New().String(),
 			Symbol:           p.Symbol,
+			ISIN:             p.ISIN, // carry through so trade-execution can resolve the broker token
 			IndexName:        p.IndexName,
 			Industry:         p.Industry,
 			MCapBucket:       p.MCapBucket,

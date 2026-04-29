@@ -8,6 +8,7 @@ type OrderType string
 const (
 	OrderTypeLimitBuy   OrderType = "LIMIT_BUY"
 	OrderTypeSLSell     OrderType = "SL_SELL"
+	OrderTypeSLSellAMO  OrderType = "SL_SELL_AMO" // pending AMO+SL row from protective replayer; promoted to SL_SELL after Phase C conversion swap
 	OrderTypeMarketSell OrderType = "MARKET_SELL"
 	OrderTypeAMOSell    OrderType = "AMO_SELL"
 	OrderTypeSLModify   OrderType = "SL_MODIFY"
@@ -29,6 +30,14 @@ const (
 	StatusSLFilled         OrderStatus = "SL_FILLED"
 	StatusSLModifyPending  OrderStatus = "SL_MODIFY_PENDING"
 	StatusEmergencySell    OrderStatus = "EMERGENCY_SELL"
+
+	// AMO replayer-specific lifecycle states.
+	// AMO_PENDING:        submitted to broker AMO queue at 15:35; awaits 08:50 conversion
+	// AMO_REJECTED:       converted but exchange rejected (typically DPR breach)
+	// (Successful conversion ⇒ row is promoted to OrderTypeSLSell + StatusSLPlaced
+	// with a fresh broker_order_id, indistinguishable from a regular in-session SL.)
+	StatusAMOPending  OrderStatus = "AMO_PENDING"
+	StatusAMORejected OrderStatus = "AMO_REJECTED"
 )
 
 func (s OrderStatus) IsTerminal() bool {

@@ -72,8 +72,9 @@ type EligibleSignal struct {
 // for cap math (sector / mcap / index-deployed) and for the top-up phase
 // (we need the parent signal_id + invested_amt to compute the gap to target).
 type PositionSummary struct {
-	SignalID    string  // parent signal_id, used as TopUpForSignalID on top-up entries
+	SignalID    string // parent signal_id, used as TopUpForSignalID on top-up entries
 	Symbol      string
+	ISIN        string // needed by trade-execution to resolve the broker token on top-up
 	Industry    string
 	MCapBucket  string
 	IndexName   string

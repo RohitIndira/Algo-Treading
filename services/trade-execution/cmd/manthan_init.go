@@ -27,6 +27,8 @@ type ManthanModule struct {
 	SLHandler         *manthan.SLHandler
 	BrokerAdapter     *manthan.BrokerAdapter
 	ExternalDetector  *manthan.ExternalActivityDetector // nil when disabled
+	ProtectiveReplay  *manthan.ProtectiveReplay         // custom-GTC AMO replayer
+	JWTNotifier       *manthan.JWTExpiryNotifier        // pre-open JWT-expiry alerts
 }
 
 // InitManthan initializes all Manthan order execution components.
@@ -212,6 +214,37 @@ func InitManthan(
 		log.Println("[manthan] ExternalActivityDetector ENABLED (30 min poll)")
 	}
 
+	// Protective replayer (custom GTC via daily AMO+SL replay) — Phases A/B/C
+	// at 15:35 / 09:14 / 09:15:30 IST. Off by default; enable with
+	// MANTHAN_PROTECTIVE_REPLAY_ENABLED=true once migration 011 is applied.
+	var protectiveReplay *manthan.ProtectiveReplay
+	if os.Getenv("MANTHAN_PROTECTIVE_REPLAY_ENABLED") == "true" {
+		protectiveReplay = manthan.NewProtectiveReplay(broker, repo, getAuth, logger)
+		protectiveReplay.SetEventPublisher(eventPub)
+		log.Println("[manthan] Protective replayer ENABLED (15:35 IST AMO submit, 09:14 re-validate, 09:15:30 reconcile)")
+	}
+
+	// JWT expiry notifier — alerts users 8h before broker session expires so
+	// they can re-login before the next pre-open. Off by default; enable with
+	// MANTHAN_JWT_NOTIFIER_ENABLED=true. Disabled when KAFKA_BROKERS is empty.
+	var jwtNotifier *manthan.JWTExpiryNotifier
+	if os.Getenv("MANTHAN_JWT_NOTIFIER_ENABLED") == "true" && len(kafkaBrokers) > 0 {
+		jwtNotifier = manthan.NewJWTExpiryNotifier(
+			kafkaBrokers,
+			func() []string {
+				ids, err := repo.ListUserIDsWithLiveOrders(ctx)
+				if err != nil {
+					log.Printf("[manthan] jwt-notifier: user list query failed: %v", err)
+					return nil
+				}
+				return ids
+			},
+			getAuth, logger,
+			manthan.JWTExpiryNotifierConfig{}, // defaults: 8h alert, 30m poll, 2h dedup
+		)
+		log.Println("[manthan] JWT-expiry notifier ENABLED (publishes to manthan.notifications)")
+	}
+
 	log.Println("[manthan] ✓ All components initialized")
 
 	return &ManthanModule{
@@ -224,6 +257,8 @@ func InitManthan(
 		SLHandler:        slHandler,
 		BrokerAdapter:    broker,
 		ExternalDetector: externalDetector,
+		ProtectiveReplay: protectiveReplay,
+		JWTNotifier:      jwtNotifier,
 	}
 }
 
@@ -267,6 +302,22 @@ func (m *ManthanModule) Start(ctx context.Context) {
 		m.SignalConsumer.Start(ctx)
 	}()
 
+	// Start protective replayer (custom GTC) if enabled.
+	if m.ProtectiveReplay != nil {
+		go func() {
+			log.Println("[manthan] Starting protective replayer (Phase A/B/C cron)...")
+			m.ProtectiveReplay.Start(ctx)
+		}()
+	}
+
+	// Start JWT expiry notifier if enabled.
+	if m.JWTNotifier != nil {
+		go func() {
+			log.Println("[manthan] Starting JWT expiry notifier...")
+			m.JWTNotifier.Start(ctx)
+		}()
+	}
+
 	log.Println("[manthan] ✓ Manthan order execution ACTIVE")
 }
 
@@ -277,6 +328,9 @@ func (m *ManthanModule) Stop() {
 	}
 	if m.SignalConsumer != nil {
 		_ = m.SignalConsumer.Stop()
+	}
+	if m.JWTNotifier != nil {
+		_ = m.JWTNotifier.Close()
 	}
 	log.Println("[manthan] Stopped")
 }
