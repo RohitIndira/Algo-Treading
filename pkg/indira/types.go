@@ -203,21 +203,68 @@ type TradeBook struct {
 	UndAsset    string  `json:"undAsset,omitempty"`
 }
 
-// Holding represents a holding in the portfolio
+// HoldingSymbol is one row of the `symbol` array inside a holding. Indira
+// returns it as an array because a single security may be listed on multiple
+// exchanges (NSE + BSE). For Manthan we only act on the NSE leg.
+type HoldingSymbol struct {
+	Symbol        string `json:"symbol,omitempty"`        // STK_KINGFA_EQ_NSE_18944
+	DispSym       string `json:"dispSym,omitempty"`       // KINGFA
+	BaseSym       string `json:"baseSym,omitempty"`       // KINGFA
+	Instrument    string `json:"instrument,omitempty"`    // STK
+	CompanyName   string `json:"companyName,omitempty"`
+	ISIN          string `json:"isin,omitempty"`
+	Exc           string `json:"exc,omitempty"`           // NSE / BSE
+	ExcTkn        int    `json:"excTkn,omitempty"`
+	Series        string `json:"series,omitempty"`
+	StreamSym     string `json:"streamSym,omitempty"`
+	TradingSymbol string `json:"tradingSymbol,omitempty"`
+	// tickSize / lotSize / etc are intentionally omitted — Indira returns
+	// inconsistent types here (string vs number, null) which break unmarshal.
+}
+
+// Holding represents one holding in the user's portfolio. Shape matches
+// Indira API doc (Portfolio → Holdings, page 21–22):
+//
+//   data.holdings[] = {
+//     symbol: [HoldingSymbol, ...],          // array of exchange listings
+//     ltp, qty, holdingQty, usedQty, btst,
+//     pledgeQty, prdType, avgPrice, invested,
+//     haircut, pledgeable, freeQty
+//   }
+//
+// freeQty is the field that matters for SELL pre-flight checks: the doc
+// says "Quantity free and unrestricted, available for immediate sale; should
+// equal holdingQty". When freeQty < intended sell qty (e.g. CDSL/TPIN auth
+// pending, share auto-pledged for margin, T+1 not yet settled) the broker
+// rejects automated SELL orders with "Order entered has invalid data".
 type Holding struct {
-	Symbol         string  `json:"symbol,omitempty"`
-	Exc            string  `json:"exc,omitempty"`
-	ExcToken       string  `json:"excToken,omitempty"`
-	Qty            int     `json:"qty,omitempty"`
-	AvgPrice       float64 `json:"avgPrice,omitempty"`
-	CurrentPrice   float64 `json:"currentPrice,omitempty"`
-	PnL            float64 `json:"pnl,omitempty"`
-	PnLPercentage  float64 `json:"pnlPercentage,omitempty"`
-	Instrument     string  `json:"instrument,omitempty"`
-	ISIN           string  `json:"isin,omitempty"`
-	T1Qty          int     `json:"t1Qty,omitempty"`
-	CollateralQty  int     `json:"collateralQty,omitempty"`
-	CollateralType string  `json:"collateralType,omitempty"`
+	Symbol     []HoldingSymbol `json:"symbol,omitempty"`
+	LTP        float64         `json:"ltp,omitempty"`
+	Qty        int             `json:"qty,omitempty"`
+	HoldingQty int             `json:"holdingQty,omitempty"` // available for sale, no restriction
+	UsedQty    int             `json:"usedQty,omitempty"`    // pledged / used for margin
+	BTST       int             `json:"btst,omitempty"`       // bought today, T+1 not yet
+	PledgeQty  int             `json:"pledgeQty,omitempty"`
+	PrdType    string          `json:"prdType,omitempty"`
+	AvgPrice   float64         `json:"avgPrice,omitempty"`
+	Invested   float64         `json:"invested,omitempty"`
+	Haircut    float64         `json:"haircut,omitempty"`
+	Pledgeable bool            `json:"pledgeable,omitempty"`
+	FreeQty    int             `json:"freeQty"` // critical field for SELL pre-flight; not omitempty so 0 is preserved
+
+	// Legacy fields kept so older callers still compile while we migrate.
+	// New code must NOT read these — they're either inaccurate or always
+	// zero against the v2 holdings response.
+	LegacyExc           string  `json:"-"`
+	LegacyExcToken      string  `json:"-"`
+	LegacyCurrentPrice  float64 `json:"-"`
+	LegacyPnL           float64 `json:"-"`
+	LegacyPnLPercentage float64 `json:"-"`
+	LegacyInstrument    string  `json:"-"`
+	LegacyISIN          string  `json:"-"`
+	T1Qty               int     `json:"-"`
+	CollateralQty       int     `json:"-"`
+	CollateralType      string  `json:"-"`
 }
 
 // Position represents a position in the position book

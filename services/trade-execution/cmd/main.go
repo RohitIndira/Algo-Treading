@@ -508,6 +508,22 @@ func main() {
 	// ── Manthan Order Execution Module ──────────────────────────────────
 	manthanModule := InitManthan(ctx, db.DB, indiraClient.IndiraClient(), statusService, orderExecutor.CredentialsCache(), cfg.KafkaBrokers, logger)
 	if manthanModule != nil {
+		// Bridge AU004 detections to the frontend live-orders WebSocket.
+		// The notifier handles the Kafka publish + dedup; this hook reuses the
+		// same `token_expired` payload shape the frontend already consumes for
+		// Indira-WS expiry, so no new message type is needed in the UI.
+		if manthanModule.JWTNotifier != nil {
+			manthanModule.JWTNotifier.SetOnSessionExpired(func(userID string) {
+				paperWSServer.BroadcastLiveOrder(userID, paper.LiveOrderUpdate{
+					Type:   "token_expired",
+					UserID: userID,
+				})
+			})
+			// On JWT refresh (USER_CREDENTIALS_UPDATED Kafka event) clear the
+			// manthan SESSION_EXPIRED gate so loops resume immediately instead
+			// of waiting for the 5-min auto-expiry.
+			strategyEventsConsumer.SetAuthGate(manthanModule.JWTNotifier)
+		}
 		manthanModule.Start(ctx)
 		log.Println("✓ Manthan order execution module started")
 	}

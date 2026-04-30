@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,12 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrAuthExpired is returned when Indira rejects a request with one of its
+// auth-related infoID codes (AU001, AU004, etc.). Callers can use errors.Is
+// to short-circuit retry loops instead of papering over the failure with
+// downstream JSON-parse errors.
+var ErrAuthExpired = errors.New("indira: session expired (AU0xx)")
 
 const (
 	// Default timeouts
@@ -176,6 +183,15 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 			Success: resp.StatusCode >= 200 && resp.StatusCode < 300,
 			Data:    json.RawMessage(responseBody),
 		}, nil
+	}
+
+	// Indira returns HTTP 200 with infoID=AU0xx for auth failures (expired or
+	// invalidated session). The body's `data` field is `{}` in this case, so
+	// downstream parsers fail with cryptic "cannot unmarshal object into []T"
+	// errors. Surface a typed auth error here so callers can branch on
+	// errors.Is(err, ErrAuthExpired) and stop hammering the broker.
+	if strings.HasPrefix(stdResp.InfoID, "AU0") {
+		return nil, fmt.Errorf("%w: %s %s", ErrAuthExpired, stdResp.InfoID, stdResp.InfoMsg)
 	}
 
 	// If the API didn't wrap the payload in a "data" property, make the raw body

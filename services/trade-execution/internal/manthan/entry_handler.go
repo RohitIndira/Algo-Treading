@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
 )
 
@@ -53,9 +55,18 @@ type EntryHandler struct {
 	eventPub      *ManthanEventPublisher
 	logger        *zap.Logger
 
+	// Optional SESSION_EXPIRED publisher — nil-safe.
+	authNotif AuthExpiryNotifier
+
 	maxRetries     int
 	waitTimeout    time.Duration // how long to wait for WSS fill before retry
 	priceThreshold float64       // max % drift before cancel (0.003 = 0.3%)
+}
+
+// SetAuthExpiryNotifier wires the SESSION_EXPIRED publisher fired when a
+// broker poll returns AU004 mid-entry.
+func (h *EntryHandler) SetAuthExpiryNotifier(n AuthExpiryNotifier) {
+	h.authNotif = n
 }
 
 func NewEntryHandler(broker *BrokerAdapter, repo *Repository, preCheck *PreChecker, slHandler *SLHandler, logger *zap.Logger) *EntryHandler {
@@ -541,6 +552,14 @@ func (h *EntryHandler) handleTimeout(ctx context.Context, brokerID string, auth 
 		if filledQty > 0 && filledQty < order.Qty {
 			return fillResult{action: actionPartialFilled, filledQty: filledQty, avgPrice: avgPrice}
 		}
+	} else if errors.Is(err, indiraClient.ErrAuthExpired) {
+		// JWT dead at broker — every subsequent broker call this tick will
+		// fail too (modify, cancel, FetchLTP). Skip silently and let the
+		// outer retry loop pick up after re-login refreshes the cache.
+		h.logger.Info("Poll orderbook skipped — broker session expired",
+			zap.String("symbol", order.Symbol))
+		notifyAuthExpired(h.authNotif, ctx, order.UserID, "entry-poll")
+		return fillResult{action: actionRetry}
 	} else {
 		h.logger.Warn("Poll orderbook failed", zap.Error(err))
 	}

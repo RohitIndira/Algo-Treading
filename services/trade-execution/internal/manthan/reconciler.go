@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -46,12 +47,21 @@ type Reconciler struct {
 	// eventPub publishes RECONCILER_DRIFT_FIX to manthan.execution.events.
 	// Optional — nil-safe.
 	eventPub *ManthanEventPublisher
+
+	// authNotif publishes SESSION_EXPIRED to manthan.notifications when this
+	// loop sees AU004. Optional — nil-safe.
+	authNotif AuthExpiryNotifier
 }
 
 // SetEventPublisher wires the centralized publisher used to emit
 // RECONCILER_DRIFT_FIX whenever the reconciler corrects a DB ↔ broker drift.
 func (r *Reconciler) SetEventPublisher(p *ManthanEventPublisher) {
 	r.eventPub = p
+}
+
+// SetAuthExpiryNotifier wires the SESSION_EXPIRED publisher.
+func (r *Reconciler) SetAuthExpiryNotifier(n AuthExpiryNotifier) {
+	r.authNotif = n
 }
 
 type ReconcilerConfig struct {
@@ -115,8 +125,23 @@ func (r *Reconciler) reconcileAll(ctx context.Context) {
 }
 
 func (r *Reconciler) reconcileUser(ctx context.Context, userID string, auth BrokerAuth) {
+	// Gate: skip if a recent AU004 marked this user expired (resets when the
+	// credentials cache invalidator clears the gate on re-login).
+	if authGated(r.authNotif, userID) {
+		return
+	}
 	brokerOrders, err := r.broker.GetOrderBook(ctx, auth)
 	if err != nil {
+		// AU004 / session-expired: the cached JWT is dead at the broker.
+		// Nothing to reconcile until the user re-logs in (the credentials
+		// cache invalidator will refresh the auth on the next /auth/credentials
+		// POST). Log at info — warn-spamming every 5 min adds no value.
+		if errors.Is(err, indiraClient.ErrAuthExpired) {
+			r.logger.Info("Reconciler: skipping user — broker session expired (re-login required)",
+				zap.String("user", userID))
+			notifyAuthExpired(r.authNotif, ctx, userID, "reconciler")
+			return
+		}
 		r.logger.Warn("Reconciler: order-book fetch failed",
 			zap.String("user", userID), zap.Error(err))
 		return

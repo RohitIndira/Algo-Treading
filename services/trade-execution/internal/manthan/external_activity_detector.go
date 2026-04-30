@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -46,6 +47,14 @@ type ExternalActivityDetector struct {
 	// Kafka topic when broker continues to show the divergence.
 	dedupMu sync.Mutex
 	dedup   map[string]string // signal_id → last published event_type
+
+	// Optional SESSION_EXPIRED publisher — nil-safe.
+	authNotif AuthExpiryNotifier
+}
+
+// SetAuthExpiryNotifier wires the SESSION_EXPIRED publisher.
+func (d *ExternalActivityDetector) SetAuthExpiryNotifier(n AuthExpiryNotifier) {
+	d.authNotif = n
 }
 
 type ExternalActivityDetectorConfig struct {
@@ -165,6 +174,14 @@ func (d *ExternalActivityDetector) detectUser(ctx context.Context, userID string
 	// 2. Broker order-book: the source of truth for "what trades happened".
 	brokerOrders, err := d.broker.client.GetOrderBook(ctx, d.broker.toIndiraAuth(auth))
 	if err != nil {
+		// Broker session expired — wait for the user to re-login. Quiet log
+		// since the reconciler already surfaces the same condition.
+		if errors.Is(err, indiraClient.ErrAuthExpired) {
+			d.logger.Info("ExternalActivityDetector: skipping user — broker session expired",
+				zap.String("user", userID))
+			notifyAuthExpired(d.authNotif, ctx, userID, "external-activity")
+			return
+		}
 		d.logger.Warn("ExternalActivityDetector: order-book fetch failed",
 			zap.String("user", userID), zap.Error(err))
 		return

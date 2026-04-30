@@ -2,8 +2,10 @@ package manthan
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
 )
 
@@ -35,12 +37,21 @@ type SafetyMonitor struct {
 	// eventPub publishes SL_FILLED, EXIT_FILLED to manthan.execution.events.
 	// Optional — nil-safe; falls back to local DB events only.
 	eventPub *ManthanEventPublisher
+
+	// Optional SESSION_EXPIRED publisher — nil-safe.
+	authNotif AuthExpiryNotifier
 }
 
 // SetEventPublisher wires the centralized publisher used to emit SL_FILLED
 // and EXIT_FILLED on broker-confirmed exits detected by polling.
 func (m *SafetyMonitor) SetEventPublisher(p *ManthanEventPublisher) {
 	m.eventPub = p
+}
+
+// SetAuthExpiryNotifier wires the SESSION_EXPIRED publisher fired when a
+// safety-monitor SL poll returns AU004.
+func (m *SafetyMonitor) SetAuthExpiryNotifier(n AuthExpiryNotifier) {
+	m.authNotif = n
 }
 
 type SafetyMonitorConfig struct {
@@ -110,6 +121,12 @@ func (m *SafetyMonitor) check(ctx context.Context) {
 }
 
 func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
+	// Gate: a recent AU004 keeps this user "expired" for 5 min. Skip silently
+	// — every other position for the same user will hit the same dead JWT,
+	// so attempting them just spams the HTTP layer with identical AU004s.
+	if authGated(m.authNotif, sl.UserID) {
+		return
+	}
 	auth := m.getAuth(sl.UserID)
 	if auth == nil {
 		return // no auth available — skip this cycle
@@ -119,7 +136,14 @@ func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
 	if sl.BrokerOrderID != "" && sl.Status == StatusSLPlaced {
 		status, filledQty, avgPrice, err := m.broker.GetOrderStatus(ctx, *auth, sl.BrokerOrderID)
 		if err != nil {
-			// Can't check — log and move on (next cycle will retry)
+			// Broker session dead — surface a SESSION_EXPIRED notification so
+			// the user sees the re-login flash. The dedup window in the
+			// notifier collapses the per-position bursts (this monitor ticks
+			// once per active position every 15s) into one event per ~5min.
+			if errors.Is(err, indiraClient.ErrAuthExpired) {
+				notifyAuthExpired(m.authNotif, ctx, sl.UserID, "safety-monitor")
+			}
+			// Can't check — move on (next cycle will retry)
 			return
 		}
 

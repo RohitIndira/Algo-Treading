@@ -108,7 +108,10 @@ func FetchCurrentCapital(
 			if h.Qty <= 0 {
 				continue
 			}
-			cap.HoldingsValue += float64(h.Qty) * h.CurrentPrice
+			// Use LTP (the new field name matching the Indira API doc); the
+			// old "currentPrice" field was a mis-named legacy that the broker
+			// never actually populated.
+			cap.HoldingsValue += float64(h.Qty) * h.LTP
 		}
 	}
 

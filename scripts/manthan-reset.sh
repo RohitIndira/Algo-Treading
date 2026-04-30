@@ -19,7 +19,7 @@ set -euo pipefail
 
 : "${JWT:?JWT is required (paste the HS512 userSession JWT from browser)}"
 USER_ID="${USER_ID:-ND03920}"
-APP_ID="${APP_ID:-1e7f02cdcedfa8d28f0f912bd1a441931775033677466}"
+APP_ID="${APP_ID:-12018f960c6db047d69cf0b06ce1dc071775711168663}"
 TOTAL_CAPITAL="${TOTAL_CAPITAL:-700000}"
 TRADING_MODE="${TRADING_MODE:-LIVE}"
 GATEWAY="${GATEWAY:-http://localhost:8080}"

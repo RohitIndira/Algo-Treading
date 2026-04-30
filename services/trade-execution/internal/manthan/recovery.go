@@ -3,7 +3,9 @@ package manthan
 import (
 	"context"
 	"database/sql"
+	"errors"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
 )
 
@@ -98,8 +100,17 @@ func (r *Recovery) Run(ctx context.Context) error {
 		// Check broker orderbook
 		status, filledQty, avgPrice, err := r.broker.GetOrderStatus(ctx, *auth, sl.BrokerOrderID)
 		if err != nil {
-			r.logger.Warn("Recovery: can't check SL status — will be caught by safety monitor",
-				zap.String("symbol", sl.Symbol), zap.Error(err))
+			// AU004 on startup means the cached JWT is dead — every SL we
+			// check this loop will return the same error. Surface a single
+			// info line per SL (instead of warn-spam) and lean on the safety
+			// monitor + reconciler to pick up state once the user re-logs in.
+			if errors.Is(err, indiraClient.ErrAuthExpired) {
+				r.logger.Info("Recovery: SL status check skipped — broker session expired",
+					zap.String("symbol", sl.Symbol))
+			} else {
+				r.logger.Warn("Recovery: can't check SL status — will be caught by safety monitor",
+					zap.String("symbol", sl.Symbol), zap.Error(err))
+			}
 			// Register in WSS bridge so future updates are caught
 			if r.wssBridge != nil {
 				r.wssBridge.Register(sl.BrokerOrderID)

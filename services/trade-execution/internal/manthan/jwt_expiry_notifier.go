@@ -19,11 +19,11 @@ import (
 // Why this exists
 // ───────────────
 // Indira issues short-lived JWTs (~24h). When the token expires, the
-// protective replayer's 15:35 IST AMO submission and the live SafetyMonitor
-// both fail with AU004 — the position is then unprotected until the operator
-// notices and re-logs in. Indira does not expose a refresh-token flow, so
-// human-in-the-loop is the only path. This notifier surfaces the warning
-// while there's still time to act.
+// protective replayer's 09:14 IST pre-open trigger cycle and the live
+// SafetyMonitor both fail with AU004 — the position is then unprotected
+// until the operator notices and re-logs in. Indira does not expose a
+// refresh-token flow, so human-in-the-loop is the only path. This notifier
+// surfaces the warning while there's still time to act.
 //
 // The frontend (paperWSServer / live-orders socket) already consumes
 // manthan.notifications and renders banners; emitting a JWT_EXPIRING event
@@ -52,6 +52,59 @@ type JWTExpiryNotifier struct {
 
 	dedupMu       sync.Mutex
 	lastAlertedAt map[string]time.Time
+
+	// Separate dedup window for runtime SESSION_EXPIRED events (AU004 detected
+	// during a live broker call). These need a tighter window than the
+	// pre-emptive JWT_EXPIRING alerts — one alert per user per ~5 min is
+	// enough to drive the frontend re-login flash.
+	sessionDedupMu sync.Mutex
+	sessionLastAt  map[string]time.Time
+
+	// onSessionExpired is invoked once per dedup-window when SESSION_EXPIRED
+	// fires. Wired in main.go to also push a token_expired event over the
+	// /ws/live-orders WebSocket so the frontend renders the re-login flash
+	// without waiting for a Kafka consumer round-trip. Optional — nil-safe.
+	onSessionExpired func(userID string)
+}
+
+// SetOnSessionExpired wires a callback fired once per dedup-window whenever
+// PublishSessionExpired emits a Kafka event. Used by main.go to also push
+// the same event over the frontend live-orders WebSocket.
+func (n *JWTExpiryNotifier) SetOnSessionExpired(fn func(userID string)) {
+	if n == nil {
+		return
+	}
+	n.onSessionExpired = fn
+}
+
+// IsSessionExpired returns true if a SESSION_EXPIRED has fired for this user
+// within the last 5 minutes (i.e. the dedup window is still active). Loops
+// that hit the broker every tick (safety monitor: 15s, reconciler: 5min)
+// should call this BEFORE attempting any broker request — it skips the
+// HTTP-layer log spam during the re-login window. The gate auto-clears
+// when the user re-logs in (via ClearSessionExpired below) or when the 5
+// minutes expire and the next AU004 re-arms it.
+func (n *JWTExpiryNotifier) IsSessionExpired(userID string) bool {
+	if n == nil || userID == "" {
+		return false
+	}
+	const sessionDedup = 5 * time.Minute
+	n.sessionDedupMu.Lock()
+	defer n.sessionDedupMu.Unlock()
+	last, ok := n.sessionLastAt[userID]
+	return ok && time.Since(last) < sessionDedup
+}
+
+// ClearSessionExpired flushes the gate for a user — called from the
+// credentials-cache invalidator when a fresh JWT lands so the next loop
+// tick attempts the broker without waiting for the 5-min window to expire.
+func (n *JWTExpiryNotifier) ClearSessionExpired(userID string) {
+	if n == nil || userID == "" {
+		return
+	}
+	n.sessionDedupMu.Lock()
+	delete(n.sessionLastAt, userID)
+	n.sessionDedupMu.Unlock()
 }
 
 // JWTExpiryNotifierConfig — caller-tunable knobs. Sensible defaults applied
@@ -91,6 +144,7 @@ func NewJWTExpiryNotifier(
 		pollInterval:  cfg.PollInterval,
 		dedupWindow:   cfg.DedupWindow,
 		lastAlertedAt: make(map[string]time.Time),
+		sessionLastAt: make(map[string]time.Time),
 	}
 
 	if len(brokers) > 0 {
@@ -246,6 +300,84 @@ func (n *JWTExpiryNotifier) publishAlert(ctx context.Context, userID string, exp
 	n.logger.Info("JWT_EXPIRING notification published",
 		zap.String("user", userID),
 		zap.Time("expires_at", exp))
+}
+
+// PublishSessionExpired emits a SESSION_EXPIRED notification when a live
+// broker call returns AU004. The frontend live-orders socket renders this
+// as an immediate "re-login required" flash so the user can refresh the
+// session before the next reconciler tick.
+//
+// Dedup window is 5 minutes per user — short enough to re-fire if the user
+// keeps trading without re-logging, long enough to absorb the burst of
+// AU004s that fires across all polling loops in the same tick.
+//
+// reason should be a short tag identifying which loop saw the AU004
+// (e.g. "reconciler", "entry-poll") for log correlation. It is NOT shown
+// to the user.
+func (n *JWTExpiryNotifier) PublishSessionExpired(ctx context.Context, userID, reason string) {
+	if n == nil || !n.enabled || userID == "" {
+		return
+	}
+	const sessionDedup = 5 * time.Minute
+	n.sessionDedupMu.Lock()
+	if last, ok := n.sessionLastAt[userID]; ok && time.Since(last) < sessionDedup {
+		n.sessionDedupMu.Unlock()
+		return
+	}
+	n.sessionLastAt[userID] = time.Now()
+	n.sessionDedupMu.Unlock()
+
+	notif := struct {
+		Type       string `json:"type"`
+		Severity   string `json:"severity"`
+		UserID     string `json:"user_id"`
+		Title      string `json:"title"`
+		Message    string `json:"message"`
+		ActionHint string `json:"action_hint"`
+		Reason     string `json:"reason"`
+		Timestamp  string `json:"timestamp"`
+	}{
+		Type:       "SESSION_EXPIRED",
+		Severity:   "error",
+		UserID:     userID,
+		Title:      "Broker session expired",
+		Message:    "Your broker session was invalidated. Open positions are unprotected until you re-login.",
+		ActionHint: "Re-login from the trading app to refresh the session",
+		Reason:     reason,
+		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+
+	body, err := json.Marshal(notif)
+	if err != nil {
+		n.logger.Warn("SESSION_EXPIRED marshal failed", zap.Error(err))
+		return
+	}
+
+	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	err = n.writer.WriteMessages(writeCtx, kafka.Message{
+		Key:   []byte(userID),
+		Value: body,
+		Headers: []kafka.Header{
+			{Key: "type", Value: []byte("SESSION_EXPIRED")},
+			{Key: "severity", Value: []byte("error")},
+			{Key: "user_id", Value: []byte(userID)},
+		},
+	})
+	if err != nil {
+		n.logger.Warn("SESSION_EXPIRED publish failed",
+			zap.String("user", userID), zap.Error(err))
+		return
+	}
+	n.logger.Info("SESSION_EXPIRED notification published",
+		zap.String("user", userID),
+		zap.String("reason", reason))
+
+	// Fan out to the frontend live-orders socket so the user gets the
+	// re-login flash without waiting for a Kafka consumer hop.
+	if n.onSessionExpired != nil {
+		n.onSessionExpired(userID)
+	}
 }
 
 // decodeJWTExp pulls the `exp` claim from a JWT without verifying the

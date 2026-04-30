@@ -38,6 +38,14 @@ type CredentialsCacheInvalidator interface {
 	Invalidate(userID string)
 }
 
+// AuthGateClearer lets the consumer reset the per-user "session-expired" gate
+// in the manthan AuthExpiryNotifier when a fresh JWT lands. Without this hook
+// the gate would only clear after its 5-min auto-expiry, leaving every loop
+// idle even after the user re-logged in. Implemented by *manthan.JWTExpiryNotifier.
+type AuthGateClearer interface {
+	ClearSessionExpired(userID string)
+}
+
 // OrderUnwatcher removes orders from the price monitor watch list.
 // Implemented by *scheduler.PriceMonitor.
 type OrderUnwatcher interface {
@@ -52,7 +60,13 @@ type StrategyEventsConsumer struct {
 	executor     *executor.OrderExecutor
 	priceMonitor OrderUnwatcher // nil-safe: may be unset if PriceMonitor is disabled
 	credsCache   CredentialsCacheInvalidator // nil-safe: invalidates JWT cache on USER_CREDENTIALS_UPDATED
+	authGate     AuthGateClearer             // nil-safe: clears manthan session-expired gate on USER_CREDENTIALS_UPDATED
 	logger       *zap.Logger
+}
+
+// SetAuthGate wires the manthan SESSION_EXPIRED gate so it clears on JWT refresh.
+func (c *StrategyEventsConsumer) SetAuthGate(g AuthGateClearer) {
+	c.authGate = g
 }
 
 // NewStrategyEventsConsumer creates a consumer for the user-config-events topic.
@@ -155,6 +169,12 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 			c.credsCache.Invalidate(ev.UserID)
 			c.logger.Info("Credentials cache invalidated",
 				zap.String("user_id", ev.UserID))
+		}
+		// Clear the manthan SESSION_EXPIRED gate so safety monitor + reconciler
+		// resume hitting the broker on their next tick instead of waiting up
+		// to 5 min for the dedup window to expire.
+		if c.authGate != nil {
+			c.authGate.ClearSessionExpired(ev.UserID)
 		}
 		return nil
 	case configPaused, configDeleted:

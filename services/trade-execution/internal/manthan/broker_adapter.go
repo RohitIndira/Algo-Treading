@@ -3,6 +3,7 @@ package manthan
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -572,6 +573,13 @@ func (b *BrokerAdapter) GetOrderStatus(ctx context.Context, auth BrokerAuth, bro
 		return "", 0, 0, fmt.Errorf("order %s not found in orderbook", brokerOrderID)
 	}
 
+	// Auth failures are terminal for this poll — the raw fallback below issues
+	// the SAME order-book request and would hit AU004 again, doubling the
+	// log spam during a re-login window. Surface the typed error directly.
+	if errors.Is(clientErr, indiraClient.ErrAuthExpired) {
+		return "", 0, 0, clientErr
+	}
+
 	// Fallback: parse raw response manually (handles nested symbol object)
 	b.logger.Debug("Standard orderbook parse failed, trying raw parse", zap.Error(clientErr))
 	return b.getOrderStatusRaw(ctx, auth, brokerOrderID)
@@ -774,9 +782,19 @@ func (b *BrokerAdapter) GetEffectiveHoldings(ctx context.Context, auth BrokerAut
 			zap.String("user", auth.UserID), zap.Error(err))
 	} else {
 		for _, h := range holdings {
-			// Holdings.Symbol is the full Indira symbol "STK_KINGFA_EQ_NSE_18944".
-			// Extract the trading symbol (second segment, before _EQ_).
-			sym := extractDisplaySymbol(h.Symbol)
+			// h.Symbol is now an array of HoldingSymbol entries (Indira returns
+			// one row per exchange listing — typically NSE + BSE). Use the NSE
+			// dispSym ("KINGFA") as the canonical key.
+			sym := ""
+			for _, s := range h.Symbol {
+				if s.Exc == "NSE" && s.DispSym != "" {
+					sym = s.DispSym
+					break
+				}
+			}
+			if sym == "" && len(h.Symbol) > 0 {
+				sym = h.Symbol[0].DispSym
+			}
 			if sym == "" {
 				continue
 			}

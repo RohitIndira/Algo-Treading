@@ -214,21 +214,27 @@ func InitManthan(
 		log.Println("[manthan] ExternalActivityDetector ENABLED (30 min poll)")
 	}
 
-	// Protective replayer (custom GTC via daily AMO+SL replay) — Phases A/B/C
-	// at 15:35 / 09:14 / 09:15:30 IST. Off by default; enable with
-	// MANTHAN_PROTECTIVE_REPLAY_ENABLED=true once migration 011 is applied.
+	// Protective replayer — server-side trigger engine. Single 09:14 IST cron
+	// builds plans → fires SL/MARKET at 09:15:00.1 → reconciles at 09:15:30.
+	// No AMO. Off by default; enable with MANTHAN_PROTECTIVE_REPLAY_ENABLED=true
+	// once migrations 011 + 007_manthan_protective_audit are applied.
 	var protectiveReplay *manthan.ProtectiveReplay
 	if os.Getenv("MANTHAN_PROTECTIVE_REPLAY_ENABLED") == "true" {
 		protectiveReplay = manthan.NewProtectiveReplay(broker, repo, getAuth, logger)
 		protectiveReplay.SetEventPublisher(eventPub)
-		log.Println("[manthan] Protective replayer ENABLED (15:35 IST AMO submit, 09:14 re-validate, 09:15:30 reconcile)")
+		log.Println("[manthan] Protective replayer ENABLED (server-side trigger: 09:14 plan → 09:15:00.1 fire → 09:15:30 reconcile)")
 	}
 
-	// JWT expiry notifier — alerts users 8h before broker session expires so
-	// they can re-login before the next pre-open. Off by default; enable with
-	// MANTHAN_JWT_NOTIFIER_ENABLED=true. Disabled when KAFKA_BROKERS is empty.
+	// JWT expiry notifier serves two roles on the same Kafka topic:
+	//   1. PROACTIVE — JWT_EXPIRING alerts 8h before token exp (poll loop).
+	//      Opt-in via MANTHAN_JWT_NOTIFIER_ENABLED=true; the poll loop only
+	//      starts when that flag is set.
+	//   2. REACTIVE — SESSION_EXPIRED alerts on every AU004 seen by the live
+	//      polling loops (reconciler, entry-poll, external-activity, replay).
+	//      This path is ALWAYS on whenever Kafka is reachable, since it's the
+	//      signal the frontend renders as a "re-login required" flash.
 	var jwtNotifier *manthan.JWTExpiryNotifier
-	if os.Getenv("MANTHAN_JWT_NOTIFIER_ENABLED") == "true" && len(kafkaBrokers) > 0 {
+	if len(kafkaBrokers) > 0 {
 		jwtNotifier = manthan.NewJWTExpiryNotifier(
 			kafkaBrokers,
 			func() []string {
@@ -242,7 +248,21 @@ func InitManthan(
 			getAuth, logger,
 			manthan.JWTExpiryNotifierConfig{}, // defaults: 8h alert, 30m poll, 2h dedup
 		)
-		log.Println("[manthan] JWT-expiry notifier ENABLED (publishes to manthan.notifications)")
+		// Wire SESSION_EXPIRED publisher into every loop that calls the broker.
+		// Each loop short-circuits + emits one event per user per ~5min on AU004.
+		reconciler.SetAuthExpiryNotifier(jwtNotifier)
+		entryHandler.SetAuthExpiryNotifier(jwtNotifier)
+		safetyMonitor.SetAuthExpiryNotifier(jwtNotifier)
+		if externalDetector != nil {
+			externalDetector.SetAuthExpiryNotifier(jwtNotifier)
+		}
+		if protectiveReplay != nil {
+			protectiveReplay.SetAuthExpiryNotifier(jwtNotifier)
+		}
+		log.Println("[manthan] SESSION_EXPIRED notifier ENABLED (publishes to manthan.notifications on AU004)")
+		if os.Getenv("MANTHAN_JWT_NOTIFIER_ENABLED") == "true" {
+			log.Println("[manthan] JWT_EXPIRING poll loop ENABLED (8h pre-emptive warning)")
+		}
 	}
 
 	log.Println("[manthan] ✓ All components initialized")
@@ -310,10 +330,12 @@ func (m *ManthanModule) Start(ctx context.Context) {
 		}()
 	}
 
-	// Start JWT expiry notifier if enabled.
-	if m.JWTNotifier != nil {
+	// Start JWT expiry POLL loop only when explicitly enabled. The reactive
+	// SESSION_EXPIRED publisher (used by the AU004 short-circuits) is wired
+	// into the notifier object itself and works without the poll loop.
+	if m.JWTNotifier != nil && os.Getenv("MANTHAN_JWT_NOTIFIER_ENABLED") == "true" {
 		go func() {
-			log.Println("[manthan] Starting JWT expiry notifier...")
+			log.Println("[manthan] Starting JWT expiry notifier (poll loop)...")
 			m.JWTNotifier.Start(ctx)
 		}()
 	}
