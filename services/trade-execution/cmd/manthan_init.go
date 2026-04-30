@@ -29,6 +29,7 @@ type ManthanModule struct {
 	ExternalDetector  *manthan.ExternalActivityDetector // nil when disabled
 	ProtectiveReplay  *manthan.ProtectiveReplay         // custom-GTC AMO replayer
 	JWTNotifier       *manthan.JWTExpiryNotifier        // pre-open JWT-expiry alerts
+	InboxWorker       *manthan.InboxWorker              // drains signal_inbox (transactional inbox)
 }
 
 // InitManthan initializes all Manthan order execution components.
@@ -156,11 +157,22 @@ func InitManthan(
 		log.Println("[manthan] ✓ manual-exit publisher wired (WSS → manthan.execution.events)")
 	}
 
-	// Signal consumer (reads from trade-signals topic)
+	// Signal consumer reads from trade-signals topic and persists each
+	// MANTHAN_* message into signal_inbox. The actual broker work happens
+	// in InboxWorker (below). See migration 012 for the design rationale.
 	signalConsumer := manthan.NewSignalConsumer(
 		manthan.SignalConsumerConfig{KafkaBrokers: kafkaBrokers},
-		entryHandler, slHandler, repo, logger,
+		repo, logger,
 	)
+
+	// Inbox worker pool — drains signal_inbox with bounded backoff + DLQ.
+	// 4 workers, 2s poll, 50 attempts before DLQ. The pool is also poked
+	// by the consumer on every INSERT (worker.Notify) for 0-latency processing.
+	inboxWorker := manthan.NewInboxWorker(
+		repo, entryHandler, slHandler, nil /* authNotif wired below */, logger,
+		manthan.InboxWorkerConfig{},
+	)
+	signalConsumer.SetInboxWorker(inboxWorker)
 
 	// Safety monitor
 	safetyMonitor := manthan.NewSafetyMonitor(
@@ -253,6 +265,7 @@ func InitManthan(
 		reconciler.SetAuthExpiryNotifier(jwtNotifier)
 		entryHandler.SetAuthExpiryNotifier(jwtNotifier)
 		safetyMonitor.SetAuthExpiryNotifier(jwtNotifier)
+		inboxWorker.SetAuthExpiryNotifier(jwtNotifier)
 		if externalDetector != nil {
 			externalDetector.SetAuthExpiryNotifier(jwtNotifier)
 		}
@@ -278,6 +291,7 @@ func InitManthan(
 		BrokerAdapter:    broker,
 		ExternalDetector: externalDetector,
 		ProtectiveReplay: protectiveReplay,
+		InboxWorker:      inboxWorker,
 		JWTNotifier:      jwtNotifier,
 	}
 }
@@ -313,6 +327,16 @@ func (m *ManthanModule) Start(ctx context.Context) {
 		go func() {
 			log.Println("[manthan] Starting external-activity detector...")
 			m.ExternalDetector.Start(ctx)
+		}()
+	}
+
+	// Start inbox worker BEFORE the signal consumer — orphaned RUNNING rows
+	// from a previous crash get reaped + re-queued by the worker, and any
+	// rows already PENDING from a prior run start draining immediately.
+	if m.InboxWorker != nil {
+		go func() {
+			log.Println("[manthan] Starting inbox worker (drains signal_inbox)...")
+			m.InboxWorker.Start(ctx)
 		}()
 	}
 
@@ -355,4 +379,26 @@ func (m *ManthanModule) Stop() {
 		_ = m.JWTNotifier.Close()
 	}
 	log.Println("[manthan] Stopped")
+}
+
+// authGateWaker is the AuthGateClearer the strategy-events consumer uses
+// when a USER_CREDENTIALS_UPDATED Kafka event arrives. It both clears the
+// JWT notifier's per-user gate (so safety monitor + reconciler resume) and
+// pokes the inbox worker (so any AUTH_EXPIRED-deferred rows process on the
+// very next worker tick instead of waiting up to 30s for the backoff).
+//
+// Lives in the same package as main.go so we don't need to add a manthan
+// import there just for this 8-line wrapper.
+type authGateWaker struct {
+	*manthan.JWTExpiryNotifier
+	worker *manthan.InboxWorker
+}
+
+func (a authGateWaker) ClearSessionExpired(userID string) {
+	if a.JWTExpiryNotifier != nil {
+		a.JWTExpiryNotifier.ClearSessionExpired(userID)
+	}
+	if a.worker != nil {
+		a.worker.Notify()
+	}
 }

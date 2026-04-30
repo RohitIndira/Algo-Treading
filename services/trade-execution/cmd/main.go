@@ -520,9 +520,13 @@ func main() {
 				})
 			})
 			// On JWT refresh (USER_CREDENTIALS_UPDATED Kafka event) clear the
-			// manthan SESSION_EXPIRED gate so loops resume immediately instead
-			// of waiting for the 5-min auto-expiry.
-			strategyEventsConsumer.SetAuthGate(manthanModule.JWTNotifier)
+			// manthan SESSION_EXPIRED gate AND wake the inbox worker so its
+			// AUTH_EXPIRED-deferred rows fire immediately instead of waiting
+			// for the next backoff window.
+			strategyEventsConsumer.SetAuthGate(authGateWaker{
+				JWTExpiryNotifier: manthanModule.JWTNotifier,
+				worker:            manthanModule.InboxWorker,
+			})
 		}
 		manthanModule.Start(ctx)
 		log.Println("✓ Manthan order execution module started")
