@@ -1,0 +1,28 @@
+package models
+
+import "errors"
+
+// Common errors
+var (
+	// Event validation errors
+	ErrInvalidEventID     = errors.New("invalid event ID")
+	ErrInvalidEventType   = errors.New("invalid event type")
+	ErrInvalidStockCode   = errors.New("invalid stock code")
+	ErrInvalidExchange    = errors.New("invalid exchange")
+	ErrInvalidImpactScore = errors.New("invalid impact score")
+
+	// Strategy validation errors
+	ErrInvalidStrategyID = errors.New("invalid strategy ID")
+	ErrInvalidUserID     = errors.New("invalid user ID")
+	ErrInvalidSentiments = errors.New("invalid sentiments")
+	ErrInvalidQuantity   = errors.New("invalid quantity")
+	ErrInvalidOrderType  = errors.New("invalid order type")
+
+	// Order validation errors
+	ErrInvalidOrderID = errors.New("invalid order ID")
+	ErrInvalidPrice   = errors.New("invalid price")
+
+	// Processing errors
+	ErrNoMatchFound = errors.New("no match found")
+	ErrCacheMiss    = errors.New("cache miss")
+)

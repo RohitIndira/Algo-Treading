@@ -1,0 +1,57 @@
+service:
+  name: trade-execution-service
+  port: 9004
+  environment: development
+
+postgres:
+  host: localhost
+  port: 5432
+  user: trading_user
+  password: ${POSTGRES_PASSWORD}
+  database: trading_execution
+  ssl_mode: disable
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: 5m
+
+rabbitmq:
+  url: ${RABBITMQ_URL}
+  queue: order.execution.queue
+  exchange: order.execution.exchange
+  routing_key: order.execution
+  prefetch_count: 10
+  consumer_tag: trade-executor-1
+  auto_ack: false
+  dlq: order.execution.dlq
+
+redis:
+  host: localhost
+  port: 6379
+  password: ${REDIS_PASSWORD}
+  db: 0
+  pool_size: 10
+  min_idle_conns: 5
+
+odin:
+  base_url: ${ODIN_BASE_URL}
+  api_key: ${ODIN_API_KEY}
+  x_api_key: ${ODIN_X_API_KEY}
+  timeout: 30s
+  max_retries: 3
+  retry_delay: 1s
+
+logging:
+  level: info
+  format: json
+  output: stdout
+
+metrics:
+  enabled: true
+  port: 9104
+  path: /metrics
+
+execution:
+  max_workers: 10
+  batch_size: 100
+  status_poll_interval: 5s
+  max_retry_count: 3
