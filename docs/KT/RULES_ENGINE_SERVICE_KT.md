@@ -7,7 +7,7 @@
 3. [Project Structure](#project-structure)
 4. [Core Components](#core-components)
 5. [Matching Algorithm](#matching-algorithm)
-6. [Elasticsearch Integration](#elasticsearch-integration)
+6. [Strategy Loading & Caching](#strategy-loading--caching)
 7. [Redis Caching](#redis-caching)
 8. [Message Processing](#message-processing)
 9. [Configuration](#configuration)
@@ -25,7 +25,7 @@ The Rules Engine Service is the **core intelligence** of the algorithmic trading
 
 ### Key Responsibilities
 - **Real-time Event Processing**: Consume market events from Kafka
-- **Strategy Matching**: Match events against 10,000+ user strategies using Elasticsearch
+- **Strategy Matching**: Match events against 10,000+ user strategies using in-memory matching against cached strategies
 - **Condition Evaluation**: Evaluate complex matching conditions with configurable weights
 - **Order Generation**: Create order requests when strategies match
 - **Signal Publishing**: Publish matched orders to RabbitMQ for execution
@@ -34,7 +34,6 @@ The Rules Engine Service is the **core intelligence** of the algorithmic trading
 ### Technology Stack
 - **Language**: Go 1.23+
 - **Message Queue**: Apache Kafka (input), RabbitMQ (output)
-- **Search Engine**: Elasticsearch 8.x
 - **Cache**: Redis
 - **Database**: PostgreSQL
 - **RPC**: gRPC
@@ -54,7 +53,7 @@ The Rules Engine Service is the **core intelligence** of the algorithmic trading
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                  Rules Engine Service                        │
-│                     (Port 9003)                              │
+│                     (Port 50053)                             │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
 │  ┌──────────────┐    ┌────────────────┐    ┌────────────┐  │
@@ -64,8 +63,8 @@ The Rules Engine Service is the **core intelligence** of the algorithmic trading
 │         ↑                                          │         │
 │         │                                          ▼         │
 │    news-events                            ┌────────────────┐│
-│      topic                                │ Elasticsearch  ││
-│                                           │ Query Builder  ││
+│      topic                                │  In-Memory     ││
+│                                           │  Strategy Match││
 │                                           └────────┬───────┘│
 │                                                    │         │
 │                                                    ▼         │
@@ -104,14 +103,14 @@ The Rules Engine Service is the **core intelligence** of the algorithmic trading
 ```
 1. Market Event (Kafka) → Rules Engine
 2. Parse Event → Extract key fields
-3. Build Elasticsearch Query → Search matching strategies
-4. For each matched strategy:
-   a. Load from cache or DB
-   b. Evaluate conditions (keywords, sentiment, impact score)
-   c. Calculate match score
-   d. If score >= threshold → Generate order
-5. Publish Order to RabbitMQ
-6. Update metrics and logs
+3. Load strategies from Redis cache (PostgreSQL fallback)
+4. In-memory matching against cached strategies
+5. For each matched strategy:
+   a. Evaluate conditions (keywords, sentiment, impact score)
+   b. Calculate match score
+   c. If score >= threshold → Generate order
+6. Publish Order to RabbitMQ
+7. Update metrics and logs
 ```
 
 ### Component Interaction
@@ -131,13 +130,11 @@ The Rules Engine Service is the **core intelligence** of the algorithmic trading
 │ Matcher Engine │  ← Core matching logic
 └──────┬─────────┘
        │
-       ├─→ Elasticsearch ← Find candidate strategies
-       │
        ├─→ Redis Cache    ← Fast strategy lookup
        │
        ├─→ PostgreSQL     ← Fallback, full strategy data
        │
-       └─→ Evaluator      ← Score matches
+       └─→ Evaluator      ← In-memory matching, score matches
               │
               ▼
        ┌──────────────┐
@@ -163,9 +160,6 @@ services/rules-engine/
 │   │   ├── matcher.go                   # Core matching engine
 │   │   ├── evaluator.go                 # Condition evaluator
 │   │   └── scorer.go                    # Match scorer
-│   ├── index/
-│   │   ├── indexer.go                   # Elasticsearch indexer
-│   │   └── query_builder.go             # ES query builder
 │   ├── cache/
 │   │   ├── redis_cache.go               # Redis cache
 │   │   └── strategy_cache.go            # Strategy caching
@@ -203,19 +197,18 @@ func main() {
     cfg := config.Load()
     
     // 2. Initialize dependencies
+    // Rules Engine no longer uses Elasticsearch.
     db := initPostgreSQL(cfg)
-    esClient := initElasticsearch(cfg)
     redisClient := initRedis(cfg)
     rabbitMQ := initRabbitMQ(cfg)
     
     // 3. Create components
     cache := cache.NewStrategyCache(redisClient)
     repo := repository.NewStrategyRepository(db)
-    indexer := index.NewElasticsearchIndexer(esClient)
     publisher := publisher.NewRabbitMQPublisher(rabbitMQ)
     
     // 4. Create matcher
-    matcher := matcher.NewMatcher(indexer, cache, repo, publisher)
+    matcher := matcher.NewMatcher(cache, repo, publisher)
     
     // 5. Create event handler
     handler := consumer.NewEventHandler(matcher)
@@ -230,7 +223,7 @@ func main() {
     
     // 8. Wait for shutdown
     <-shutdown
-    gracefulShutdown(kafkaConsumer, grpcServer, db, esClient)
+    gracefulShutdown(kafkaConsumer, grpcServer, db)
 }
 ```
 
@@ -335,7 +328,6 @@ func (h *EventHandler) validateEvent(event *models.NewsEvent) error {
 
 ```go
 type Matcher struct {
-    indexer   *index.ElasticsearchIndexer
     cache     *cache.StrategyCache
     repo      *repository.StrategyRepository
     publisher *publisher.RabbitMQPublisher
@@ -349,26 +341,17 @@ func (m *Matcher) MatchEvent(event map[string]interface{}) ([]models.Match, erro
     sentiment := extractSentiment(event)
     impactScore := extractImpactScore(event)
     
-    // 2. Build Elasticsearch query
-    query := m.buildMatchQuery(keywords, stockCodes, sentiment)
+    // 2. Load all active strategies from cache (PostgreSQL fallback)
+    strategies := m.loadAllActiveStrategies()
     
-    // 3. Search Elasticsearch
-    strategyIDs, err := m.indexer.Search(query)
-    if err != nil {
-        return nil, fmt.Errorf("ES search failed: %w", err)
-    }
+    log.Printf("Loaded %d active strategies for in-memory matching", len(strategies))
     
-    log.Printf("Found %d candidate strategies", len(strategyIDs))
-    
-    // 4. Load strategies (cache first, DB fallback)
-    strategies := m.loadStrategies(strategyIDs)
-    
-    // 5. Evaluate each strategy
+    // 3. Evaluate each strategy via in-memory matching
     var matches []models.Match
     for _, strategy := range strategies {
         score := m.evaluator.Evaluate(strategy, event)
         
-        // 6. Check if match threshold met
+        // 4. Check if match threshold met
         if score >= m.config.MatchThreshold {
             match := models.Match{
                 StrategyID:  strategy.StrategyID,
@@ -380,7 +363,7 @@ func (m *Matcher) MatchEvent(event map[string]interface{}) ([]models.Match, erro
             
             matches = append(matches, match)
             
-            // 7. Generate and publish order
+            // 5. Generate and publish order
             m.publishOrder(strategy, event, match)
         }
     }
@@ -492,91 +475,31 @@ func (e *Evaluator) evaluateImpactScore(minScore float64, event map[string]inter
 }
 ```
 
-### 6. Elasticsearch Indexer (`internal/index/indexer.go`)
+### 6. Strategy Loading from PostgreSQL
 
-**Purpose:** Index strategies and build search queries.
+**Note:** The Rules Engine no longer uses Elasticsearch. Strategies are loaded from PostgreSQL and cached in Redis. Matching is performed in-memory against cached strategies.
 
-**Indexing:**
 ```go
-func (idx *ElasticsearchIndexer) IndexStrategy(strategy *models.Strategy) error {
-    // Build index document
-    doc := map[string]interface{}{
-        "strategy_id": strategy.StrategyID,
-        "user_id":     strategy.UserID,
-        "keywords":    strategy.NewsConfig.Keywords,
-        "sentiment":   strategy.NewsConfig.Sentiment,
-        "stock_codes": strategy.NewsConfig.StockCodes,
-        "min_impact":  strategy.NewsConfig.MinImpactScore,
-        "is_active":   strategy.IsActive,
-        "indexed_at":  time.Now(),
+func (m *Matcher) loadAllActiveStrategies() []*models.Strategy {
+    // Try loading from Redis cache first
+    strategies, err := m.cache.GetAllActive()
+    if err == nil && len(strategies) > 0 {
+        return strategies
     }
     
-    // Index in Elasticsearch
-    req := esapi.IndexRequest{
-        Index:      "strategies",
-        DocumentID: strategy.StrategyID,
-        Body:       esutil.NewJSONReader(doc),
-        Refresh:    "true",
-    }
-    
-    res, err := req.Do(context.Background(), idx.client)
+    // Fallback: load from PostgreSQL
+    strategies, err = m.repo.GetAllActive(context.Background())
     if err != nil {
-        return err
-    }
-    defer res.Body.Close()
-    
-    if res.IsError() {
-        return fmt.Errorf("ES index error: %s", res.Status())
+        log.Printf("Failed to load strategies from DB: %v", err)
+        return nil
     }
     
-    return nil
-}
-```
-
-**Query Building:**
-```go
-func (idx *ElasticsearchIndexer) buildMatchQuery(keywords []string, stockCodes []int, sentiment string) map[string]interface{} {
-    // Build bool query
-    query := map[string]interface{}{
-        "query": map[string]interface{}{
-            "bool": map[string]interface{}{
-                "must": []interface{}{
-                    // Must be active
-                    map[string]interface{}{
-                        "term": map[string]interface{}{
-                            "is_active": true,
-                        },
-                    },
-                },
-                "should": []interface{}{
-                    // Match keywords
-                    map[string]interface{}{
-                        "terms": map[string]interface{}{
-                            "keywords": keywords,
-                        },
-                    },
-                    // Match stock codes
-                    map[string]interface{}{
-                        "terms": map[string]interface{}{
-                            "stock_codes": stockCodes,
-                        },
-                    },
-                },
-                "filter": []interface{}{
-                    // Filter by sentiment if specified
-                    map[string]interface{}{
-                        "term": map[string]interface{}{
-                            "sentiment": sentiment,
-                        },
-                    },
-                },
-                "minimum_should_match": 1,
-            },
-        },
-        "size": 1000,  // Max strategies to return
+    // Warm cache with loaded strategies
+    for _, s := range strategies {
+        m.cache.Set(s.StrategyID, s, 1*time.Hour)
     }
     
-    return query
+    return strategies
 }
 ```
 
@@ -702,15 +625,10 @@ func (p *RabbitMQPublisher) PublishOrder(order *models.OrderRequest) error {
    - Parse Extended JSON document
    - Extract key fields (title, keywords, sentiment, impact_score, stock_codes)
 
-2. **Candidate Selection (Elasticsearch)**
-   - Build boolean query with keywords, stock codes, sentiment
-   - Search Elasticsearch index
-   - Return strategy IDs that match basic criteria
-
-3. **Strategy Loading**
-   - Check Redis cache for each strategy
-   - If not in cache, load from PostgreSQL
-   - Update cache with loaded strategy
+2. **Strategy Loading (PostgreSQL + Redis)**
+   - Load all active strategies from Redis cache
+   - If not in cache, load from PostgreSQL and warm cache
+   - Strategies are matched in-memory against event fields
 
 4. **Detailed Evaluation**
    - For each candidate strategy:
@@ -765,7 +683,7 @@ Result: MATCH (score 0.80 >= threshold 0.70)
 # Service Configuration
 SERVICE_NAME=rules-engine
 SERVICE_VERSION=1.0.0
-GRPC_PORT=9003
+GRPC_PORT=50053
 ENVIRONMENT=production
 
 # Kafka Consumer
@@ -773,12 +691,6 @@ KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 KAFKA_GROUP_ID=rules-engine-group
 KAFKA_TOPIC_NEWS=news-events
 KAFKA_AUTO_OFFSET_RESET=earliest
-
-# Elasticsearch
-ELASTICSEARCH_URL=http://localhost:9200
-ELASTICSEARCH_INDEX=strategies
-ELASTICSEARCH_USERNAME=elastic
-ELASTICSEARCH_PASSWORD=changeme
 
 # Redis Cache
 REDIS_ADDR=localhost:6379
@@ -815,16 +727,13 @@ LOG_FORMAT=json
 # 1. Kafka
 docker run -d --name kafka -p 9092:9092 apache/kafka:latest
 
-# 2. Elasticsearch
-docker run -d --name elasticsearch -p 9200:9200 -e "discovery.type=single-node" elasticsearch:8.11.0
-
-# 3. Redis
+# 2. Redis
 docker run -d --name redis -p 6379:6379 redis:latest
 
-# 4. RabbitMQ
+# 3. RabbitMQ
 docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 
-# 5. PostgreSQL
+# 4. PostgreSQL
 docker run -d --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:15
 ```
 
@@ -853,11 +762,10 @@ go build -o bin/rules-engine cmd/main.go
 
 ## Performance Optimization
 
-### 1. Elasticsearch Optimization
-- Use bulk indexing for initial load
-- Shard index by user_id
-- Replicate for read scaling
-- Use query cache
+### 1. PostgreSQL + In-Memory Optimization
+- Load strategies from PostgreSQL on startup and cache in Redis
+- Perform in-memory matching against cached strategies
+- Use periodic sync to keep cache up to date
 
 ### 2. Redis Caching
 - Cache hot strategies (frequently matched)
@@ -885,7 +793,7 @@ type Metrics struct {
     EventsProcessed     prometheus.Counter
     EventsMatched       prometheus.Counter
     MatchingLatency     prometheus.Histogram
-    ElasticsearchErrors prometheus.Counter
+    StrategyLoadErrors  prometheus.Counter
     CacheHitRate        prometheus.Gauge
     ActiveWorkers       prometheus.Gauge
 }
@@ -895,10 +803,10 @@ type Metrics struct {
 
 ```bash
 # gRPC health check
-grpcurl -plaintext localhost:9003 grpc.health.v1.Health/Check
+grpcurl -plaintext localhost:50053 grpc.health.v1.Health/Check
 
 # Metrics endpoint
-curl http://localhost:9003/metrics
+curl http://localhost:50053/metrics
 ```
 
 ---
@@ -908,8 +816,8 @@ curl http://localhost:9003/metrics
 ### Common Issues
 
 #### 1. High Latency
-- Check Elasticsearch performance
-- Verify cache hit rate
+- Check PostgreSQL query performance
+- Verify Redis cache hit rate
 - Review worker pool size
 
 #### 2. Memory Issues

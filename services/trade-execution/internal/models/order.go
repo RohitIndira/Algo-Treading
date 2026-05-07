@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +21,35 @@ const (
 	StatusCancelled       OrderStatus = "CANCELLED"
 	StatusFailed          OrderStatus = "FAILED"
 )
+
+// IsFilledStatus returns true if the status represents a filled order
+// (includes both internal and broker status strings).
+func IsFilledStatus(s OrderStatus) bool {
+	switch strings.ToUpper(string(s)) {
+	case "FILLED", "EXECUTED", "TRADED":
+		return true
+	}
+	return false
+}
+
+// IsPartiallyFilledStatus returns true if the status represents a partially filled order.
+func IsPartiallyFilledStatus(s OrderStatus) bool {
+	switch strings.ToUpper(string(s)) {
+	case "PARTIALLY_FILLED", "PARTIALLY TRADED", "PARTIALLY EXECUTED":
+		return true
+	}
+	return false
+}
+
+// IsTerminalStatus returns true if the order is in a terminal state
+// and cannot be modified or cancelled.
+func IsTerminalStatus(s OrderStatus) bool {
+	switch strings.ToUpper(string(s)) {
+	case "FILLED", "EXECUTED", "TRADED", "CANCELLED", "REJECTED", "A.REJECTED", "FAILED", "EXPIRED":
+		return true
+	}
+	return false
+}
 
 // OrderType represents order type
 type OrderType string
@@ -49,10 +79,11 @@ const (
 
 // Order represents a trading order
 type Order struct {
-	OrderID    uuid.UUID `json:"order_id" db:"order_id"`
-	UserID     string    `json:"user_id" db:"user_id"`
-	StrategyID string    `json:"strategy_id" db:"strategy_id"`
-	EventID    uuid.UUID `json:"event_id" db:"event_id"`
+	OrderID      uuid.UUID `json:"order_id" db:"order_id"`
+	UserID       string    `json:"user_id" db:"user_id"`
+	StrategyID   string    `json:"strategy_id" db:"strategy_id"`
+	StrategyName string    `json:"strategy_name" db:"strategy_name"`
+	EventID      uuid.UUID `json:"event_id" db:"event_id"`
 
 	// Stock information
 	StockCode int64    `json:"stock_code" db:"stock_code"`
@@ -85,6 +116,11 @@ type Order struct {
 	OdinOrderID    *string `json:"odin_order_id,omitempty" db:"odin_order_id"`     // Odin API order ID
 	OdinResponse   *string `json:"odin_response,omitempty" db:"odin_response"`     // Odin API response
 
+	// Raw broker WebSocket data — stored exactly as received, no mapping/transformation
+	BrokerStatus       *string `json:"broker_status,omitempty" db:"broker_status"`               // Raw status from broker WS (e.g. "EXECUTED", "PENDING", "CANCELLED")
+	BrokerWSData       *string `json:"broker_ws_data,omitempty" db:"broker_ws_data"`              // Full raw JSON from broker WS
+	ExchangeOrderNumber *string `json:"exchange_order_number,omitempty" db:"exchange_order_number"` // Exchange order number (OrderNumber from WS)
+
 	// Frontend auth data (passed from frontend for Indira API calls)
 	BearerToken *string `json:"bearer_token,omitempty" db:"bearer_token"` // JWT bearer token from frontend
 	AppId       *string `json:"app_id,omitempty" db:"app_id"`             // Application ID from frontend
@@ -98,6 +134,11 @@ type Order struct {
 	// Auto square-off flag
 	IsSquareOffOrder bool `json:"is_square_off_order" db:"is_square_off_order"` // Flag for auto square-off orders
 
+	// AutoSquareOffTime is a per-user override for when all positions are closed
+	// (format "HH:MM" IST, e.g. "14:30"). Applies to both paper and live modes.
+	// NULL / empty means "use the global default" (15:05 live, 15:00 paper).
+	AutoSquareOffTime *string `json:"auto_square_off_time,omitempty" db:"auto_square_off_time"`
+
 	// Paper trading fields
 	IsPaperTrade    bool     `json:"is_paper_trade" db:"is_paper_trade"`               // True for paper trade orders
 	TradingMode     string   `json:"trading_mode" db:"trading_mode"`                    // PAPER or LIVE
@@ -107,6 +148,22 @@ type Order struct {
 	// Live trading exit fields
 	LiveExitPrice *float64 `json:"live_exit_price,omitempty" db:"live_exit_price"` // Exit price for live positions (force-exit)
 	LivePnL       *float64 `json:"live_pnl,omitempty" db:"live_pnl"`               // Final P&L for live positions (force-exit)
+
+	// CurrentPctChange is the stock's percentage change at the time the order was created.
+	CurrentPctChange float64 `json:"current_pct_change,omitempty" db:"current_pct_change"`
+
+	// MaxMonitorPrice is the price ceiling for the PriceMonitor.
+	// If LTP exceeds this level, the monitor must NOT trigger the order.
+	// 0 means no upper bound.
+	MaxMonitorPrice *float64 `json:"max_monitor_price,omitempty" db:"max_monitor_price"`
+
+	// OCO (One-Cancels-the-Other) group tracking
+	OCOGroupID    *uuid.UUID `json:"oco_group_id,omitempty" db:"oco_group_id"`       // Links all orders in one OCO group
+	OCORole       *string    `json:"oco_role,omitempty" db:"oco_role"`               // ENTRY, SL_LEG, or TP_LEG
+	ParentOrderID *uuid.UUID `json:"parent_order_id,omitempty" db:"parent_order_id"` // Child legs point to entry order
+
+	// Signal deduplication
+	SignalID *uuid.UUID `json:"signal_id,omitempty" db:"signal_id"` // Originating trade signal UUID (for idempotency)
 
 	// Execution details
 	FilledQuantity int32    `json:"filled_quantity" db:"filled_quantity"`
@@ -132,10 +189,11 @@ type Order struct {
 
 // OrderRequest from RabbitMQ
 type OrderRequest struct {
-	RequestID  string   `json:"request_id"`
-	UserID     string   `json:"user_id"`
-	StrategyID string   `json:"strategy_id"`
-	EventID    string   `json:"event_id"`
+	RequestID    string   `json:"request_id"`
+	UserID       string   `json:"user_id"`
+	StrategyID   string   `json:"strategy_id"`
+	StrategyName string   `json:"strategy_name"`
+	EventID      string   `json:"event_id"`
 	StockCode  int64    `json:"stock_code"`
 	Exchange   string   `json:"exchange"`
 	Symbol     string   `json:"symbol"`

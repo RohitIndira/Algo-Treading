@@ -81,7 +81,7 @@ func MapOrderType(orderType string) string {
 		return "Market"
 	case "LIMIT", "LMT", "RL":
 		return "Limit"
-	case "STOPLOSS", "SL":
+	case "STOPLOSS", "SL", "STOP_LOSS":
 		return "SL"
 	case "SL-MKT", "SL-M", "STOPLOSSMARKET":
 		return "SL-M"
@@ -179,5 +179,18 @@ func RoundToTick(price float64) float64 {
 	}
 	rounded := math.Round(price/tick) * tick
 	// Clamp to 2 decimal places to eliminate floating-point noise (e.g. 1299.5000000001)
+	return math.Round(rounded*100) / 100
+}
+
+// RoundToTickSize rounds a price to the nearest multiple of the given tick size.
+// If tickSize <= 0, falls back to the default RoundToTick behavior.
+func RoundToTickSize(price float64, tickSize float64) float64 {
+	if price <= 0 {
+		return price
+	}
+	if tickSize <= 0 {
+		return RoundToTick(price)
+	}
+	rounded := math.Round(price/tickSize) * tickSize
 	return math.Round(rounded*100) / 100
 }

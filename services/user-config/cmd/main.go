@@ -12,10 +12,12 @@ import (
 
 	"github.com/joho/godotenv"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
+	"github.com/RohitIndira/Algo-Treading/pkg/correlation"
 	"github.com/RohitIndira/Algo-Treading/pkg/database/postgres"
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/config"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/worker"
@@ -23,8 +25,30 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 )
+
+// correlationServerInterceptor extracts the correlation ID from incoming gRPC
+// metadata and stores it in the handler context. A new ID is generated when
+// none is present so every RPC is always traceable.
+func correlationServerInterceptor(
+	ctx context.Context,
+	req interface{},
+	_ *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (interface{}, error) {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get(correlation.GRPCMetadataKey); len(vals) > 0 && vals[0] != "" {
+			ctx = correlation.WithContext(ctx, vals[0])
+		}
+	}
+	if correlation.FromContext(ctx) == "" {
+		ctx = correlation.WithContext(ctx, correlation.NewID())
+	}
+	return handler(ctx, req)
+}
 
 func main() {
 	// Load .env file if it exists
@@ -113,11 +137,32 @@ func main() {
 		lgr.Info("Outbox worker started")
 	}
 
+	// Start EOD deactivation scheduler (deactivates all active strategies at 15:30 IST)
+	eodScheduler := scheduler.NewEODDeactivationScheduler(svc)
+	eodCtx, eodCancel := context.WithCancel(context.Background())
+	defer eodCancel()
+	go eodScheduler.Start(eodCtx)
+	lgr.Info("EOD deactivation scheduler started")
+
 	// Initialize gRPC server
-	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(10*1024*1024), // 10MB
-		grpc.MaxSendMsgSize(10*1024*1024), // 10MB
-	)
+	serverOpts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(10 * 1024 * 1024),
+		grpc.MaxSendMsgSize(10 * 1024 * 1024),
+		grpc.UnaryInterceptor(correlationServerInterceptor),
+	}
+	certFile := os.Getenv("GRPC_TLS_CERT")
+	keyFile := os.Getenv("GRPC_TLS_KEY")
+	if certFile != "" && keyFile != "" {
+		creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
+		if err != nil {
+			lgr.Fatal("Failed to load gRPC server TLS credentials", zap.Error(err))
+		}
+		serverOpts = append(serverOpts, grpc.Creds(creds))
+		lgr.Info("gRPC server TLS enabled", zap.String("cert", certFile))
+	} else {
+		lgr.Warn("gRPC server TLS disabled — set GRPC_TLS_CERT and GRPC_TLS_KEY to enable")
+	}
+	grpcServer := grpc.NewServer(serverOpts...)
 
 	// Register service
 	pb.RegisterUserConfigServiceServer(grpcServer, server.NewUserConfigServer(svc))

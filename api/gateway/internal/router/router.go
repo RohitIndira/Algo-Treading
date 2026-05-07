@@ -17,6 +17,16 @@ func NewRouter(
 
 	r := mux.NewRouter()
 
+	// Assign/propagate X-Correlation-ID before anything else touches the context
+	r.Use(middleware.CorrelationID())
+	// Security headers on every response
+	r.Use(middleware.SecurityHeaders())
+	// Cap request bodies at 1 MB
+	r.Use(middleware.RequestSizeLimit(1 << 20))
+	// Rate limit: 100 req/s per IP, burst of 200
+	r.Use(middleware.NewRateLimiter(100, 200).Middleware())
+	// Audit log for mutating operations
+	r.Use(middleware.AuditLog())
 	// CORS middleware
 	r.Use(middleware.CORS(corsConfig))
 
@@ -47,13 +57,20 @@ func NewRouter(
 		api.HandleFunc("/paper-trades/positions", paperHandler.GetPaperPositions).Methods("GET")
 		api.HandleFunc("/paper-trades/closed-orders", paperHandler.GetClosedPaperOrders).Methods("GET")
 		api.HandleFunc("/paper-trades/force-exit-all", paperHandler.ForceExitAll).Methods("POST")
+		api.HandleFunc("/paper-trades/force-exit-strategy", paperHandler.ForceExitStrategy).Methods("POST")
 		api.HandleFunc("/paper-trades/ws-info", paperHandler.GetPaperWSInfo).Methods("GET")
 		// Live orders endpoints
 		api.HandleFunc("/live-orders", paperHandler.GetLiveOrders).Methods("GET")
 		api.HandleFunc("/live-orders/closed-orders", paperHandler.GetClosedLiveOrders).Methods("GET")
 		api.HandleFunc("/live-orders/force-exit-all", paperHandler.ForceExitAllLive).Methods("POST")
+		api.HandleFunc("/live-orders/force-exit-strategy", paperHandler.ForceExitStrategyLive).Methods("POST")
 		api.HandleFunc("/live-orders/indira-positions", paperHandler.GetIndiraPositions).Methods("GET")
 		api.HandleFunc("/live-orders/subscribe-broker-ws", paperHandler.SubscribeBrokerWS).Methods("POST")
+		api.HandleFunc("/live-orders/price-watches", paperHandler.GetPriceWatches).Methods("GET")
+		api.HandleFunc("/live-orders/cancel-price-watch", paperHandler.CancelPriceWatch).Methods("POST")
+		// Auto square-off config (trade-execution native)
+		api.HandleFunc("/auto-square-off/config", paperHandler.SetAutoSquareOffConfig).Methods("POST")
+		api.HandleFunc("/auto-square-off/config", paperHandler.GetAutoSquareOffConfig).Methods("GET")
 		// Dashboard
 		api.HandleFunc("/dashboard-stats", paperHandler.GetDashboardStats).Methods("GET")
 	}

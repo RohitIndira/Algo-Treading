@@ -268,7 +268,7 @@ func (c *RabbitMQConsumer) processMessage(ctx context.Context, msg amqp.Delivery
 		log.Printf("Worker %d: failed to execute order %s: %v", workerID, order.OrderID, err)
 
 		// If order was explicitly rejected or failed (permanent), send to DLQ
-		if order.Status == models.StatusRejected || order.Status == models.StatusFailed {
+		if models.IsTerminalStatus(order.Status) || order.Status == models.StatusFailed {
 			log.Printf("Worker %d: Order %s is %s, sending to DLQ", workerID, order.OrderID, order.Status)
 			msg.Nack(false, false) // Send to DLQ
 			return
@@ -356,6 +356,7 @@ func (c *RabbitMQConsumer) convertToOrder(req *models.OrderRequest) *models.Orde
 		OrderID:      orderID,
 		UserID:       req.UserID,
 		StrategyID:   req.StrategyID,
+		StrategyName: req.StrategyName,
 		EventID:      eventID,
 		StockCode:    req.StockCode,
 		Exchange:     models.Exchange(req.Exchange),

@@ -81,7 +81,7 @@ func TestMatcher_WrongExchange_Drops(t *testing.T) {
 	e := baseEvent()
 	e.StockData.Exchange = "BSE"
 	s := baseStrategy()
-	s.TradeConfig.Exchange = "NSE"
+	s.Conditions.Exchanges = []string{"NSE"}
 
 	ev := NewEvaluator(zap.NewNop())
 	res := ev.Evaluate(e, s)

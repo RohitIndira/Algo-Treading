@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -111,7 +112,11 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	}
 
 	url := c.baseURL + path
-	log.Printf("[indira] → %s %s  body=%s", method, path, string(jsonBody))
+	if strings.Contains(path, "place-order") || strings.Contains(path, "modify-order") {
+		log.Printf("[indira] → %s %s  body=%s", method, path, string(jsonBody))
+	} else {
+		log.Printf("[indira] → %s %s", method, path)
+	}
 	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -149,8 +154,12 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Check HTTP status code
-	log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
+	// Check HTTP status code — skip body for noisy position-book responses
+	if path == "/portfolio-services/api/portfolio/v1/position-book" {
+		log.Printf("[indira] ← %s %s  status=%d", method, path, resp.StatusCode)
+	} else {
+		log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(responseBody))
 	}

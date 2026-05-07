@@ -66,28 +66,6 @@ services:
       retries: 5
     restart: unless-stopped
 
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
-    container_name: trading-elasticsearch
-    hostname: elasticsearch
-    ports:
-      - "9200:9200"
-      - "9300:9300"
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    volumes:
-      - elasticsearch-data:/usr/share/elasticsearch/data
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: unless-stopped
-
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: trading-kafka
@@ -160,26 +138,10 @@ services:
     hostname: api-gateway
     ports:
       - "8081:8081"
+    env_file:
+      - ./api/gateway/.env.live
     environment:
-      # Database
-      DATABASE_HOST: postgres
-      DATABASE_PORT: 5432
-      DATABASE_USER: postgres
-      DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db
-      
-      # gRPC service endpoints
-      USER_CONFIG_SERVICE: user-config:50051
-      DATA_INGESTION_SERVICE: data-ingestion:50052
-      RULES_ENGINE_SERVICE: rules-engine:50053
-      TRADE_EXECUTION_SERVICE: trade-execution:50054
-      RISK_MANAGEMENT_SERVICE: risk-management:50055
-      
-      # Cache
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      
-      # Logging
+      ENVIRONMENT: production
       LOG_LEVEL: info
     depends_on:
       postgres:
@@ -200,23 +162,11 @@ services:
     hostname: user-config
     ports:
       - "50051:50051"
+    env_file:
+      - ./services/user-config/.env.live
     environment:
-      # Database
-      DATABASE_HOST: postgres
-      DATABASE_PORT: 5432
-      DATABASE_USER: postgres
-      DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db
-      
-      # gRPC
+      ENVIRONMENT: production
       GRPC_PORT: 50051
-      
-      # Redis
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      
-      # Logging
-      LOG_LEVEL: info
     depends_on:
       postgres:
         condition: service_healthy
@@ -234,19 +184,11 @@ services:
     hostname: data-ingestion
     ports:
       - "50052:50052"
+    env_file:
+      - ./services/data-ingestion/.env.live
     environment:
-      # MongoDB
-      MONGODB_URI: mongodb://admin:admin@mongodb:27017/trading_db?authSource=admin
-      
-      # Kafka
-      KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC: market.data.news
-      
-      # gRPC
+      ENVIRONMENT: production
       GRPC_PORT: 50052
-      
-      # Logging
-      LOG_LEVEL: info
     depends_on:
       mongodb:
         condition: service_healthy
@@ -264,27 +206,12 @@ services:
     hostname: rules-engine
     ports:
       - "50053:50053"
+    env_file:
+      - ./services/rules-engine/.env.live
     environment:
-      # Elasticsearch
-      ELASTICSEARCH_HOST: elasticsearch:9200
-      
-      # Kafka
-      KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC_INPUT: market.data.news
-      KAFKA_TOPIC_OUTPUT: order.execution.queue
-      
-      # Redis
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      
-      # gRPC
+      ENVIRONMENT: production
       GRPC_PORT: 50053
-      
-      # Logging
-      LOG_LEVEL: info
     depends_on:
-      elasticsearch:
-        condition: service_healthy
       kafka:
         condition: service_healthy
       redis:
@@ -301,33 +228,16 @@ services:
     hostname: trade-execution
     ports:
       - "50054:50054"
+    env_file:
+      - ./services/trade-execution/.env.live
     environment:
-      # Database
-      DATABASE_HOST: postgres
-      DATABASE_PORT: 5432
-      DATABASE_USER: postgres
-      DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db
-      
-      # Message Queue
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_PORT: 5672
-      RABBITMQ_USER: guest
-      RABBITMQ_PASSWORD: guest
-      RABBITMQ_QUEUE: order.execution.queue
-      
-      # gRPC
-      GRPC_PORT: 50054
-      
-      # Logging
-      LOG_LEVEL: info
+      ENVIRONMENT: production
+      SERVICE_PORT: 50054
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      risk-management:
-        condition: service_started
     networks:
       - trading-network
     restart: unless-stopped
@@ -340,23 +250,11 @@ services:
     hostname: risk-management
     ports:
       - "50055:50055"
+    env_file:
+      - ./services/risk-management/.env.live
     environment:
-      # Database
-      DATABASE_HOST: postgres
-      DATABASE_PORT: 5432
-      DATABASE_USER: postgres
-      DATABASE_PASSWORD: postgres
-      DATABASE_NAME: trading_db
-      
-      # Redis (for risk counters)
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      
-      # gRPC
-      GRPC_PORT: 50055
-      
-      # Logging
-      LOG_LEVEL: info
+      ENVIRONMENT: production
+      SERVICE_PORT: 50055
     depends_on:
       postgres:
         condition: service_healthy
@@ -366,20 +264,12 @@ services:
       - trading-network
     restart: unless-stopped
 
-networks:
-  trading-network:
-    driver: bridge
-
 volumes:
-  postgres-data:
-    driver: local
   mongodb-data:
     driver: local
   mongodb-config:
     driver: local
   redis-data:
-    driver: local
-  elasticsearch-data:
     driver: local
   zookeeper-data:
     driver: local

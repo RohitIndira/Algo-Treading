@@ -132,14 +132,13 @@ func protoToModel(ps *proto.Strategy) (*models.StrategyConfig, error) {
 		m.Conditions.ImpactScoreMin = ps.Conditions.ImpactScoreMin
 		m.Conditions.ImpactScoreMax = ps.Conditions.ImpactScoreMax
 		m.Conditions.Categories = ps.Conditions.Categories
-		m.Conditions.Stocks = ps.Conditions.StockCodes
-		m.Conditions.VolumeThreshold = ps.Conditions.VolumeThreshold
 		if ps.Conditions.PctChangeRange != nil {
 			m.Conditions.MinPctChange = ps.Conditions.PctChangeRange.MinPctChange
 			m.Conditions.MaxPctChange = ps.Conditions.PctChangeRange.MaxPctChange
 		}
 		m.Conditions.Sentiments = sentimentsToStrings(ps.Conditions.Sentiments)
 		m.Conditions.Exchanges = exchangesToStrings(ps.Conditions.Exchanges)
+		m.Conditions.MarketCapTypes = ps.Conditions.MarketCapTypes
 		if ps.Conditions.MarketCapRange != nil {
 			m.Conditions.MarketCapRange = models.MarketCapRange{MinMcap: ps.Conditions.MarketCapRange.MinMcap, MaxMcap: ps.Conditions.MarketCapRange.MaxMcap}
 		}

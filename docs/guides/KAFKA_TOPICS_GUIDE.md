@@ -100,7 +100,7 @@ This document explains the purpose and data format for each Kafka topic in the t
 
 ---
 
-## 👤 **Topic: user-configs**
+## 👤 **Topic: user-config-events**
 
 **Producer:** User Config Service  
 **Consumer:** Rules Engine Service (Strategy Sync)  
@@ -159,9 +159,8 @@ This document explains the purpose and data format for each Kafka topic in the t
 
 ### Usage
 Rules Engine subscribes to this topic and:
-1. Indexes strategy to Elasticsearch
-2. Updates strategy cache in Redis
-3. Enables/disables matching for the strategy
+1. Updates strategy cache in Redis
+2. Enables/disables matching for the strategy
 
 ---
 
@@ -297,7 +296,7 @@ Rules Engine subscribes to this topic and:
        │ publishes           │ syncs from
        ▼                     ▼
 ┌─────────────────────┐ ┌──────────────────┐
-│ trade-signals       │ │ user-configs     │
+│ trade-signals       │ │ user-config-events     │
 └──────┬──────────────┘ └──────────────────┘
        │                     ▲
        │                     │ publishes
@@ -350,9 +349,9 @@ kafka-console-consumer --bootstrap-server localhost:9092 \
 kafka-console-consumer --bootstrap-server localhost:9092 \
   --topic trade-signals --from-beginning --max-messages 1
 
-# user-configs
+# user-config-events
 kafka-console-consumer --bootstrap-server localhost:9092 \
-  --topic user-configs --from-beginning --max-messages 1
+  --topic user-config-events --from-beginning --max-messages 1
 ```
 
 ### Monitor real-time:
@@ -383,7 +382,7 @@ kafka-topics --bootstrap-server localhost:9092 --describe --topic trade-signals
 | Topic | Producer | Consumer | Current Status |
 |-------|----------|----------|----------------|
 | **market.data.news** | Data Ingestion | Rules Engine | ✅ **ACTIVE** (63 messages) |
-| **user-configs** | User Config | Rules Engine | ✅ **ACTIVE** (5 messages) |
+| **user-config-events** | User Config | Rules Engine | ✅ **ACTIVE** (5 messages) |
 | **trade-signals** | Rules Engine | Trade Execution | ✅ **ACTIVE** (NEW!) |
 | risk-approvals | Risk Management | Trade Execution | 🔜 Future |
 | trade-executions | Trade Execution | Multiple | 🔜 Future |

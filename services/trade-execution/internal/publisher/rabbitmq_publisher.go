@@ -23,11 +23,12 @@ type RabbitMQPublisher struct {
 
 // OrderMessage represents the order message format for the RabbitMQ consumer (OrderRequest)
 type OrderMessage struct {
-	RequestID  string  `json:"request_id"`
-	OrderID    string  `json:"order_id"`
-	UserID     string  `json:"user_id"`
-	StrategyID string  `json:"strategy_id"`
-	EventID    string  `json:"event_id,omitempty"`
+	RequestID    string  `json:"request_id"`
+	OrderID      string  `json:"order_id"`
+	UserID       string  `json:"user_id"`
+	StrategyID   string  `json:"strategy_id"`
+	StrategyName string  `json:"strategy_name,omitempty"`
+	EventID      string  `json:"event_id,omitempty"`
 	StockCode  int64   `json:"stock_code"`
 	Symbol     string  `json:"symbol"`
 	Exchange   string  `json:"exchange"`
@@ -116,6 +117,7 @@ func (p *RabbitMQPublisher) PublishOrder(ctx context.Context, order *models.Orde
 		OrderID:      order.OrderID.String(),
 		UserID:       order.UserID,
 		StrategyID:   order.StrategyID,
+		StrategyName: order.StrategyName,
 		EventID:      order.EventID.String(),
 		StockCode:    order.StockCode,
 		Symbol:       order.Symbol,

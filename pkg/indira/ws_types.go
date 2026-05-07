@@ -21,7 +21,25 @@ type WSHeartbeat struct {
 	Heartbeat string `json:"heartbeat"` // Typically "h"
 }
 
-// WSOrderStatus represents the main live order status structure from the WebSocket
+// FlexInt is a JSON type that accepts both number and string representations.
+// The broker WS sends some fields as int in one message and string in another.
+type FlexInt string
+
+func (f *FlexInt) UnmarshalJSON(data []byte) error {
+	// Accept both "123" and 123
+	s := string(data)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+	}
+	*f = FlexInt(s)
+	return nil
+}
+
+func (f FlexInt) String() string { return string(f) }
+
+// WSOrderStatus represents the main live order status structure from the WebSocket.
+// Many fields use FlexInt because the broker inconsistently sends them as
+// either JSON numbers or JSON strings across different message types.
 type WSOrderStatus struct {
 	OrderSequenceNumber   int     `json:"OrderSequenceNumber"`
 	ExpiryDate            string  `json:"ExpiryDate"`
@@ -31,10 +49,10 @@ type WSOrderStatus struct {
 	Product               string  `json:"Product"`
 	OrderNumber           string  `json:"OrderNumber"`
 	ModifiedBy            string  `json:"ModifiedBy"`
-	DQ                    int     `json:"DQ"`
+	DQ                    FlexInt `json:"DQ"`
 	OrderType             string  `json:"OrderType"`
 	Remarks               string  `json:"Remarks"`
-	DecimalLocator        string  `json:"DecimalLocator"`
+	DecimalLocator        FlexInt `json:"DecimalLocator"`
 	RegularLot            int     `json:"RegularLot"`
 	ModifiedByUserId      string  `json:"ModifiedByUserId"`
 	SpreadFlag            int     `json:"SpreadFlag"`
@@ -43,13 +61,13 @@ type WSOrderStatus struct {
 	Misc                  string  `json:"Misc"`
 	GTDOrderStatus        int     `json:"GTDOrderStatus"`
 	OrderEntryTime        string  `json:"OrderEntryTime"`
-	DQRemaining           int     `json:"DQRemaining"`
+	DQRemaining           FlexInt `json:"DQRemaining"`
 	ProCli                string  `json:"ProCli"`
-	TradedQTY             string  `json:"TradedQTY"`
-	MessageSequenceNumber string  `json:"MessageSequenceNumber"`
-	Exchange              string  `json:"Exchange"`
+	TradedQTY             FlexInt `json:"TradedQTY"`
+	MessageSequenceNumber FlexInt `json:"MessageSequenceNumber"`
+	Exchange              FlexInt `json:"Exchange"`
 	TradedPrice           string  `json:"TradedPrice"`
-	PendingQty            int     `json:"PendingQty"`
+	PendingQty            FlexInt `json:"PendingQty"`
 	OptionType            string  `json:"Option_Type"`
 	AMOOrderID            string  `json:"AMOOrderID"`
 	LegIndicator          string  `json:"LegIndicator"`
@@ -61,10 +79,10 @@ type WSOrderStatus struct {
 	OrderStatus           string  `json:"OrderStatus"`
 	InstrumentName        string  `json:"InstrumentName"`
 	ExchangeAlgoID        string  `json:"ExchangeAlgoID"`
-	UserID                string  `json:"UserID"`
-	Days                  string  `json:"Days"`
+	UserID                FlexInt `json:"UserID"`
+	Days                  FlexInt `json:"Days"`
 	CliOrderNumber        int     `json:"CliOrderNumber"`
-	ManagerID             string  `json:"ManagerID"`
+	ManagerID             FlexInt `json:"ManagerID"`
 	MarketType            int     `json:"MarketType"`
 	UniqueCode            string  `json:"UniqueCode"` // Usually maps to ordId
 	SpreadPrice           float64 `json:"SpreadPrice"`
@@ -74,9 +92,11 @@ type WSOrderStatus struct {
 	UserRemarks           string  `json:"UserRemarks"`
 	UCC                   string  `json:"UCC"`
 	ExchangeAccountCode   string  `json:"ExchangeAccountCode"`
-	ScripCode             string  `json:"ScripCode"`
+	ScripCode             FlexInt `json:"ScripCode"`
 	OrderValidity         string  `json:"OrderValidity"`
 	LastModifiedTime      string  `json:"LastModifiedTime"`
 	CPID                  string  `json:"CP_ID"`
+	ModifyBit             int     `json:"ModifyBit"`
+	SLLimitPrice          float64 `json:"SLLimitPrice"`
 	OrderTimeStamp        string  `json:"OrderTimeStamp"`
 }

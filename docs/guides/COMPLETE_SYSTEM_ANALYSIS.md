@@ -60,7 +60,7 @@
                          │ Key: MongoDB _id
                          ▼
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│ 2. USER CONFIG SERVICE (gRPC Port 9001)                                         │
+│ 2. USER CONFIG SERVICE (gRPC Port 50051)                                        │
 │                                                                                  │
 │ Purpose: Manage trading strategies & user configurations                        │
 │                                                                                  │
@@ -97,14 +97,14 @@
                          │ Consumed by Rules Engine for cache updates
                          ▼
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│ 3. RULES ENGINE SERVICE (gRPC Port 9003)                                        │
+│ 3. RULES ENGINE SERVICE (gRPC Port 50053)                                       │
 │                                                                                  │
 │ Purpose: Core intelligence - match news events to trading strategies            │
 │                                                                                  │
 │ What It Does:                                                                   │
 │ ✓ Consumes from Kafka topic: "news-events"                                     │
 │ ✓ Converts MongoDB events to MarketEvent objects                               │
-│ ✓ Queries Elasticsearch for candidate strategies                               │
+│ ✓ Loads strategies from PostgreSQL and caches in Redis                         │
 │ ✓ Uses Redis cache for strategy data (TTL-based)                               │
 │ ✓ Concurrent strategy evaluation (worker pool: 50 workers)                     │
 │ ✓ Max concurrent matches: 100 strategies simultaneously                        │
@@ -130,9 +130,8 @@
 │ • Empty arrays mean "accept all" (e.g., stocks=[] accepts all stocks)          │
 │                                                                                  │
 │ What It Cannot Do:                                                              │
-│ ✗ Function if Elasticsearch is down (no matching possible)                     │
 │ ✗ Publish orders if RabbitMQ unavailable (circuit breaker opens)               │
-│ ✗ Fallback to database if Redis cache fails (degrades to ES only)              │
+│ ✗ Fallback if Redis cache fails (degrades to database only)                    │
 │ ✗ Reprocess failed events automatically                                        │
 │ ✗ Dead-letter queue for unmatched events                                       │
 │ ✗ Modify strategies at runtime (needs cache expiry)                            │
@@ -150,7 +149,7 @@
                          │ Format: JSON OrderRequest
                          ▼
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│ 4. RISK MANAGEMENT SERVICE (gRPC Port 9005)                                     │
+│ 4. RISK MANAGEMENT SERVICE (gRPC Port 50055)                                    │
 │                                                                                  │
 │ Purpose: Pre-trade risk validation & post-trade monitoring                      │
 │                                                                                  │
@@ -200,7 +199,7 @@
                          │ Returns: approved=true/false + violations[]
                          ▼
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│ 5. TRADE EXECUTION SERVICE (gRPC Port 9004)                                     │
+│ 5. TRADE EXECUTION SERVICE (gRPC Port 50054)                                    │
 │                                                                                  │
 │ Purpose: Execute approved orders via broker API                                 │
 │                                                                                  │
@@ -221,8 +220,8 @@
 │ ✓ Order execution flow:                                                         │
 │   1. Check risk approval status                                                │
 │   2. Update status to PENDING                                                   │
-│   3. Call Odin API wrapper to place order                                      │
-│   4. Store broker order ID (odin_order_id)                                     │
+│   3. Call Indira Securities API to place order                                 │
+│   4. Store broker order ID (indira_order_id)                                   │
 │   5. Update status to SUBMITTED                                                 │
 │   6. Record execution events                                                    │
 │                                                                                  │
@@ -246,10 +245,9 @@
 │ ✗ Modify orders once submitted (TODO in code)                                  │
 │ ✗ Filter logic in GetUserOrders (TODO)                                         │
 │ ✗ Statistics aggregation (TODO)                                                 │
-│ ✗ Parse order status from Odin API (TODO)                                      │
 │ ✗ Handle complex order types (basket, iceberg)                                 │
 │ ✗ Advanced order routing                                                        │
-│ ✗ Function if Odin wrapper is down                                             │
+│ ✗ Function if Indira API is down                                               │
 │ ✗ Partial fill handling                                                         │
 │ ✗ Order cancellation cascade                                                    │
 │                                                                                  │
@@ -259,62 +257,9 @@
 │ - 8 performance indexes                                                         │
 └────────────────────────┬─────────────────────────────────────────────────────────┘
                          │
-                         │ HTTP calls to Odin API Wrapper
-                         │ Endpoint: POST /orders/place
+                         │ Direct API calls to Indira Securities
                          ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│ 6. ODIN API WRAPPER SERVICE (HTTP Port 8000)                                    │
-│                                                                                  │
-│ Technology: Python + FastAPI + b2c-api-python SDK                               │
-│ Purpose: HTTP interface to Odin Trading API                                     │
-│                                                                                  │
-│ What It Does:                                                                   │
-│ ✓ Session management with in-memory client storage                             │
-│ ✓ TOTP generation for authentication (pyotp)                                   │
-│ ✓ Login flow:                                                                   │
-│   1. Generate TOTP from secret                                                  │
-│   2. Create IBTConnect client                                                   │
-│   3. Login with userId, password, totp                                         │
-│   4. Store client in global dict: clients[user_id]                             │
-│                                                                                  │
-│ ✓ Order management:                                                             │
-│   - Place order (regular, cover, bracket, multileg)                            │
-│   - Modify order                                                                │
-│   - Cancel order                                                                │
-│   - Get order status                                                            │
-│   - Order book                                                                   │
-│   - Trade history                                                               │
-│                                                                                  │
-│ ✓ Portfolio management:                                                         │
-│   - Get balance                                                                 │
-│   - Get positions                                                               │
-│   - Get holdings                                                                │
-│   - Validate session                                                            │
-│                                                                                  │
-│ ✓ Authentication:                                                               │
-│   - X-User-ID header for all authenticated requests                            │
-│   - Auto-retrieves client from global storage                                  │
-│   - Logout clears client session                                               │
-│                                                                                  │
-│ ✓ CORS enabled for all origins                                                 │
-│ ✓ Request/response logging                                                      │
-│ ✓ Environment variable fallbacks                                               │
-│                                                                                  │
-│ What It Cannot Do:                                                              │
-│ ✗ Handle multiple brokers (Odin only)                                          │
-│ ✗ Session persistence across restarts                                          │
-│ ✗ Concurrent requests from same user efficiently                               │
-│ ✗ Rate limiting for broker API                                                 │
-│ ✗ Market data caching                                                           │
-│ ✗ Function if broker API is down                                               │
-│ ✗ Retry mechanism for broker failures                                          │
-│                                                                                  │
-│ Configuration:                                                                   │
-│ - ODIN_API_URL, ODIN_API_KEY (from .env)                                       │
-│ - ODIN_USER_ID, PASSWORD, TOTP_SECRET                                          │
-│ - CLIENT_ID, SOURCE (MOBILEAPI)                                                │
-│ - LOGIN_TYPE (PASSWORD), SECOND_AUTH_TYPE (TOTP)                               │
-└──────────────────────────────────────────────────────────────────────────────────┘
+                    Indira Securities API (broker)
 
 ```
 
@@ -328,7 +273,7 @@
 4. **Kafka Publish** → Topic: "news-events"
 5. **Kafka Consume** → Rules Engine receives event
 6. **MongoDB Event → MarketEvent** → Convert to internal format
-7. **Elasticsearch Query** → Find candidate strategies
+7. **Strategy Lookup** → Load from PostgreSQL / Redis cache
 8. **Redis Cache Lookup** → Get full strategy details
 9. **Concurrent Evaluation** → 50 workers evaluate conditions
 10. **Scoring** → Weighted scoring (impact: 25%, stock: 20%, etc.)
@@ -341,11 +286,10 @@
 17. **Risk Check** → gRPC call to Risk Management Service
 18. **Risk Evaluation** → 8 checks + risk profile adjustment
 19. **Approval/Rejection** → Returns approved + violations
-20. **Execute** → If approved, call Odin API wrapper
-21. **Broker Submission** → HTTP POST to /orders/place
-22. **Odin API Call** → Python SDK places order with broker
-23. **Broker Response** → Returns odin_order_id
-24. **Database Update** → Status: SUBMITTED, store odin_order_id
+20. **Execute** → If approved, call Indira Securities API
+21. **Broker Submission** → Place order via Indira client
+22. **Broker Response** → Returns indira_order_id
+23. **Database Update** → Status: SUBMITTED, store indira_order_id
 25. **Post-Trade Update** → Update Redis metrics
 26. **Event Recording** → Execution events table
 
@@ -357,11 +301,12 @@
 
 #### 1. **Service Ports** (Should be configurable via env)
 ```
-User Config:     9001 (hardcoded in multiple places)
-Rules Engine:    9003 (hardcoded)
-Trade Execution: 9004 (hardcoded)
-Risk Management: 9005 (hardcoded)
-Odin Wrapper:    8000 (hardcoded)
+API Gateway:     8081 (HTTP)
+User Config:     50051 (gRPC)
+Data Ingestion:  50052 (gRPC)
+Rules Engine:    50053 (gRPC)
+Trade Execution: 50054 (gRPC)
+Risk Management: 50055 (gRPC)
 ```
 
 #### 2. **Worker/Concurrency Settings** (Should be per-deployment)
@@ -531,21 +476,20 @@ REDIS_HOST=localhost   // Should REQUIRE explicit config
 |---------|--------|-----------|----------------------|
 | **Data Ingestion** | Watch MongoDB changes, Publish to Kafka | Filter quality, Batch process, Retry | MongoDB Cloud, Kafka |
 | **User Config** | CRUD strategies, Kafka events | Validate logic, Backtest, Version control | PostgreSQL, Kafka (optional) |
-| **Rules Engine** | Match events, Score strategies, Concurrent eval | Work without ES, Reprocess failures, DLQ | Elasticsearch, Redis, Kafka, RabbitMQ |
+| **Rules Engine** | Match events, Score strategies, Concurrent eval | Reprocess failures, DLQ | PostgreSQL, Redis, Kafka, RabbitMQ |
 | **Risk Management** | 8 pre-trade checks, Profile adjustments | Post-submission blocking, Complex derivatives | Redis (CRITICAL) |
-| **Trade Execution** | Order execution, Retry logic, Status tracking | Modify orders, Complex orders, Partial fills | PostgreSQL, RabbitMQ, Odin Wrapper |
-| **Odin Wrapper** | Broker API access, Session management | Multi-broker, Rate limiting, Caching | Odin Trading API |
+| **Trade Execution** | Order execution, Retry logic, Status tracking | Modify orders, Complex orders, Partial fills | PostgreSQL, RabbitMQ, Indira API |
 
 ---
 
 ## 🔒 SINGLE POINTS OF FAILURE
 
 1. **MongoDB Cloud** - No fallback if unavailable
-2. **Elasticsearch** - Rules Engine completely fails
+2. **PostgreSQL** - Strategy loading and order storage fails
 3. **Redis** - Risk Management completely fails
 4. **RabbitMQ** - Circuit breaker opens but no DLQ
 5. **PostgreSQL** - Services fail to start
-6. **Odin API** - No order execution possible
+6. **Indira API** - No order execution possible
 
 ---
 

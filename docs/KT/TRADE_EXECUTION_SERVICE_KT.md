@@ -8,7 +8,7 @@
 5. [gRPC API Reference](#grpc-api-reference)
 6. [Message Queue Integration](#message-queue-integration)
 7. [Database Schema](#database-schema)
-8. [Odin API Integration](#odin-api-integration)
+8. [Indira Securities API Integration](#indira-securities-api-integration)
 9. [Configuration](#configuration)
 10. [Setup & Deployment](#setup--deployment)
 11. [Testing](#testing)
@@ -20,12 +20,12 @@
 ## 1. Overview
 
 ### Purpose
-The **Trade Execution Service** is the core order processing engine of the algorithmic trading system. It receives risk-approved trade signals, executes them through the Odin broker API, and tracks the complete order lifecycle from creation to final settlement.
+The **Trade Execution Service** is the core order processing engine of the algorithmic trading system. It receives risk-approved trade signals, executes them through the Indira Securities broker API, and tracks the complete order lifecycle from creation to final settlement.
 
 ### Key Responsibilities
 - **Order Lifecycle Management**: Tracks orders from RECEIVED → VALIDATED → SUBMITTED → FILLED
 - **Risk-Approved Order Processing**: Only executes orders validated by Risk Management Service
-- **Broker API Integration**: Executes trades through Odin Trading API
+- **Broker API Integration**: Executes trades through Indira Securities Trading API
 - **Multi-Consumer Architecture**: Consumes from both Kafka (trade signals) and RabbitMQ (order executions)
 - **Retry Mechanism**: Implements exponential backoff for failed order placements
 - **Credential Management**: Securely fetches and uses user broker credentials
@@ -34,12 +34,12 @@ The **Trade Execution Service** is the core order processing engine of the algor
 
 ### Technology Stack
 - **Language**: Go 1.23+
-- **Protocol**: gRPC (Port 9004)
+- **Protocol**: gRPC (Port 50054)
 - **Database**: PostgreSQL 13+ (order storage, execution history)
 - **Cache**: Redis (optional - credentials cache)
 - **Message Queue (Input)**: Kafka (`trade-signals` topic), RabbitMQ (`trade.executions` queue)
 - **Message Queue (Output)**: RabbitMQ (`order.executions` exchange)
-- **External API**: Odin Trading API (broker integration)
+- **External API**: Indira Securities Trading API (broker integration)
 - **Migration Tool**: SQL migrations for schema versioning
 
 ### Integration Points
@@ -72,7 +72,7 @@ The **Trade Execution Service** is the core order processing engine of the algor
            │
            ▼
 ┌─────────────────────┐
-│ Order Executor      │ ──► Fetches credentials, places order via Odin API
+│ Order Executor      │ ──► Fetches credentials, places order via Indira Securities API
 └─────────────────────┘
            │
            ▼
@@ -93,8 +93,8 @@ The **Trade Execution Service** is the core order processing engine of the algor
 │                                                                   │
 │  ┌──────────────┐        ┌──────────────┐      ┌──────────────┐ │
 │  │   Kafka      │        │  RabbitMQ    │      │  gRPC Server │ │
-│  │  Consumer    │────────│  Publisher   │      │  (Port 9004) │ │
-│  │(trade-signals)        │(to odin-api) │      └──────────────┘ │
+│  │  Consumer    │────────│  Publisher   │      │  (Port 50054) │ │
+│  │(trade-signals)        │(to indira-api) │      └──────────────┘ │
 │  └──────────────┘        └──────────────┘              │         │
 │         │                        │                      │         │
 │         ▼                        ▼                      ▼         │
@@ -116,14 +116,14 @@ The **Trade Execution Service** is the core order processing engine of the algor
 │  ┌────────────────────────────────────────────────────────────┐  │
 │  │                  Order Executor                            │  │
 │  │  - Fetches user credentials                                │  │
-│  │  - Calls Odin API with retry logic                         │  │
+│  │  - Calls Indira Securities API with retry logic                         │  │
 │  │  - Updates order status                                    │  │
 │  │  - Records execution events                                │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                                │                                  │
 │                                ▼                                  │
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │                  Odin Client                               │  │
+│  │                  Indira Client                               │  │
 │  │  - Authentication (TOTP, API Key)                          │  │
 │  │  - Order placement API calls                               │  │
 │  │  - Response parsing                                        │  │
@@ -322,14 +322,14 @@ args := amqp.Table{
 
 ### 3.5 Order Executor (`internal/executor/executor.go`)
 
-**Purpose**: Core execution logic - places orders via Odin API with retry mechanism.
+**Purpose**: Core execution logic - places orders via Indira Securities API with retry mechanism.
 
 **Structure**:
 ```go
 type OrderExecutor struct {
     repo       repository.OrderRepository
     credsRepo  repository.CredentialsRepository
-    odinClient *odin.ExecutionClient
+    indiraClient *indira.ExecutionClient
     maxRetries int              // 3
     retryDelay time.Duration    // 2 seconds base delay
 }
@@ -341,9 +341,9 @@ type OrderExecutor struct {
 2. Update order status to PENDING
 3. Fetch user credentials from database
 4. Retry loop (max 3 attempts):
-   a. Call odinClient.PlaceOrderWithCredentials()
+   a. Call indiraClient.PlaceOrderWithCredentials()
    b. If success:
-      - Store Odin order ID
+      - Store Indira order ID
       - Update status to SUBMITTED
       - Record execution event
       - Return success
@@ -368,9 +368,9 @@ for attempt := 0; attempt <= maxRetries; attempt++ {
 }
 ```
 
-### 3.6 Odin Client (`internal/odin/client.go`)
+### 3.6 Indira Client (`internal/indira/client.go`)
 
-**Purpose**: Handles authentication and order placement with Odin Trading API.
+**Purpose**: Handles authentication and order placement with Indira Securities Trading API.
 
 **Authentication Methods**:
 1. **API Key + Password**: Basic authentication
@@ -397,21 +397,21 @@ func (c *ExecutionClient) PlaceOrderWithCredentials(
     authToken, err := c.authenticate(apiKey, password, totp)
     
     // 4. Build order request
-    odinReq := c.buildOdinOrderRequest(order)
+    indiraReq := c.buildIndiraOrderRequest(order)
     
     // 5. Place order
-    odinResp, err := c.httpClient.Post(
-        "https://api.odinbroker.com/v1/orders",
-        odinReq,
+    indiraResp, err := c.httpClient.Post(
+        "https://livemiddleware.indiratrade.com/v1/orders",
+        indiraReq,
         authToken,
     )
     
-    // 6. Return Odin order ID
-    return odinResp.OrderID, nil
+    // 6. Return Indira order ID
+    return indiraResp.OrderID, nil
 }
 ```
 
-**Order Translation** (Internal → Odin Format):
+**Order Translation** (Internal → Indira Securities Format):
 ```go
 // Internal Order Model
 Order{
@@ -421,7 +421,7 @@ Order{
     Price:     2500.50,
 }
 
-// Odin API Request
+// Indira Securities API Request
 {
     "exchange": "NSE",
     "tradingsymbol": "RELIANCE",
@@ -444,7 +444,7 @@ type OrderRepository interface {
     Create(ctx context.Context, order *Order) error
     Update(ctx context.Context, order *Order) error
     GetByID(ctx context.Context, orderID uuid.UUID) (*Order, error)
-    GetByOdinOrderID(ctx context.Context, odinOrderID string) (*Order, error)
+    GetByIndiraOrderID(ctx context.Context, indiraOrderID string) (*Order, error)
     GetUserOrders(ctx context.Context, userID string, limit, offset int) ([]*Order, error)
     GetOrdersByStatus(ctx context.Context, status OrderStatus, limit int) ([]*Order, error)
     UpdateStatus(ctx context.Context, orderID uuid.UUID, status OrderStatus) error
@@ -464,7 +464,7 @@ INSERT INTO orders (
 
 // Update - Update order status and execution details
 UPDATE orders SET
-    status = $1, odin_order_id = $2,
+    status = $1, indira_order_id = $2,
     filled_quantity = $3, filled_price = $4,
     executed_at = $5, updated_at = NOW()
 WHERE order_id = $6
@@ -517,13 +517,13 @@ service TradeExecutionService {
 ```bash
 grpcurl -plaintext -d '{
   "order_id": "550e8400-e29b-41d4-a716-446655440000"
-}' localhost:9004 trade_execution.TradeExecutionService/GetOrderStatus
+}' localhost:50054 trade_execution.TradeExecutionService/GetOrderStatus
 
 # Response
 {
   "order_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "SUBMITTED",
-  "odin_order_id": "ODIN123456",
+  "indira_order_id": "INDIRA123456",
   "created_at": "2025-01-15T10:30:00Z",
   "submitted_at": "2025-01-15T10:30:05Z"
 }
@@ -596,35 +596,35 @@ grpcurl -plaintext -d '{
 │    SELECT api_key, password, totp_secret FROM credentials     │
 │                                                                │
 │ 2. Retry loop (max 3 attempts):                               │
-│    Attempt 1: Call Odin API                                   │
+│    Attempt 1: Call Indira Securities API                                   │
 │    - If success → STEP 7                                      │
 │    - If failure → Wait 2s, retry                              │
-│    Attempt 2: Call Odin API (after 2s delay)                  │
+│    Attempt 2: Call Indira Securities API (after 2s delay)                  │
 │    - If success → STEP 7                                      │
 │    - If failure → Wait 4s, retry                              │
-│    Attempt 3: Call Odin API (after 4s delay)                  │
+│    Attempt 3: Call Indira Securities API (after 4s delay)                  │
 │    - If success → STEP 7                                      │
 │    - If failure → STEP 8 (FAILED)                             │
 └────────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌────────────────────────────────────────────────────────────────┐
-│ STEP 7: Odin API Call (Odin Client)                           │
+│ STEP 7: Indira Securities API Call (Indira Client)                           │
 ├────────────────────────────────────────────────────────────────┤
 │ 1. Decrypt user password                                       │
 │ 2. Generate TOTP (if 2FA enabled)                             │
-│ 3. Authenticate with Odin API                                  │
+│ 3. Authenticate with Indira Securities API                                  │
 │    POST /api/v1/login                                          │
 │    → Receive auth token                                        │
 │                                                                │
-│ 4. Place order via Odin API                                   │
+│ 4. Place order via Indira Securities API                                   │
 │    POST /api/v1/orders                                         │
 │    Headers: Authorization: Bearer {token}                     │
 │    Body: {exchange, symbol, quantity, price, ...}             │
-│    → Receive Odin order ID                                    │
+│    → Receive Indira order ID                                    │
 │                                                                │
 │ 5. Update PostgreSQL:                                          │
-│    - odin_order_id: "ODIN123456"                              │
+│    - indira_order_id: "INDIRA123456"                              │
 │    - status: SUBMITTED                                         │
 │    - submitted_at: NOW()                                       │
 │                                                                │
@@ -635,9 +635,9 @@ grpcurl -plaintext -d '{
                             │
                             ▼
 ┌────────────────────────────────────────────────────────────────┐
-│ STEP 8: Status Updates (External - Odin Webhook/Polling)      │
+│ STEP 8: Status Updates (External - Indira Securities WebSocket/Polling)      │
 ├────────────────────────────────────────────────────────────────┤
-│ Odin sends order updates:                                      │
+│ Indira Securities sends order updates via wss://livemiddleware.indiratrade.com:                                      │
 │ - PARTIALLY_FILLED: filled_quantity < quantity                │
 │ - FILLED: filled_quantity == quantity, executed_at = NOW()    │
 │ - CANCELLED: User/system cancellation                         │
@@ -658,7 +658,7 @@ VALIDATED (Risk check passed, order created in DB)
 PENDING (Published to RabbitMQ, awaiting execution)
     │
     ▼
-SUBMITTED (Sent to Odin API successfully)
+SUBMITTED (Sent to Indira Securities API successfully)
     │
     ├──► PARTIALLY_FILLED (Partial execution)
     │
@@ -694,7 +694,7 @@ message GetOrderStatusRequest {
 message GetOrderStatusResponse {
     string order_id = 1;
     string status = 2;  // RECEIVED, VALIDATED, PENDING, SUBMITTED, FILLED, etc.
-    string odin_order_id = 3;
+    string indira_order_id = 3;
     int32 quantity = 4;
     int32 filled_quantity = 5;
     double filled_price = 6;
@@ -709,7 +709,7 @@ message GetOrderStatusResponse {
 ```bash
 grpcurl -plaintext -d '{
   "order_id": "550e8400-e29b-41d4-a716-446655440000"
-}' localhost:9004 trade_execution.TradeExecutionService/GetOrderStatus
+}' localhost:50054 trade_execution.TradeExecutionService/GetOrderStatus
 ```
 
 ### Method 2: GetUserOrders
@@ -873,9 +873,9 @@ CREATE TABLE orders (
     -- Order status
     status VARCHAR(20) NOT NULL DEFAULT 'RECEIVED',
     
-    -- Odin API integration
-    odin_order_id VARCHAR(50),
-    odin_response TEXT,
+    -- Indira Securities API integration
+    indira_order_id VARCHAR(50),
+    indira_response TEXT,
     
     -- Execution details
     filled_quantity INT DEFAULT 0,
@@ -920,7 +920,7 @@ CREATE TABLE execution_events (
 CREATE INDEX idx_orders_user_id ON orders(user_id, created_at DESC);
 CREATE INDEX idx_orders_status ON orders(status, created_at DESC);
 CREATE INDEX idx_orders_event_id ON orders(event_id);
-CREATE INDEX idx_orders_odin_id ON orders(odin_order_id) WHERE odin_order_id IS NOT NULL;
+CREATE INDEX idx_orders_indira_id ON orders(indira_order_id) WHERE indira_order_id IS NOT NULL;
 CREATE INDEX idx_orders_strategy_id ON orders(strategy_id);
 CREATE INDEX idx_orders_stock_code ON orders(stock_code);
 CREATE INDEX idx_orders_created_at ON orders(created_at DESC);
@@ -957,13 +957,13 @@ ORDER BY e.created_at ASC;
 
 ---
 
-## 8. Odin API Integration
+## 8. Indira Securities API Integration
 
 ### Authentication Flow
 
 **Step 1: Login**
 ```http
-POST https://api.odinbroker.com/v1/login
+POST https://livemiddleware.indiratrade.com/v1/login
 Content-Type: application/json
 
 {
@@ -981,7 +981,7 @@ Response:
 
 **Step 2: Place Order**
 ```http
-POST https://api.odinbroker.com/v1/orders
+POST https://livemiddleware.indiratrade.com/v1/orders
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 Content-Type: application/json
 
@@ -998,7 +998,7 @@ Content-Type: application/json
 
 Response:
 {
-  "order_id": "ODIN123456",
+  "order_id": "INDIRA123456",
   "status": "PENDING",
   "message": "Order placed successfully"
 }
@@ -1006,7 +1006,7 @@ Response:
 
 ### Order Type Mapping
 ```
-Internal → Odin API
+Internal → Indira Securities API
 ──────────────────────
 MARKET → MARKET
 LIMIT  → LIMIT
@@ -1015,7 +1015,7 @@ STOP_LOSS → SL
 
 ### Order Side Mapping
 ```
-Internal → Odin API
+Internal → Indira Securities API
 ──────────────────────
 BUY  → BUY
 SELL → SELL
@@ -1023,7 +1023,7 @@ SELL → SELL
 
 ### Exchange Mapping
 ```
-Internal → Odin API
+Internal → Indira Securities API
 ──────────────────────
 NSE → NSE
 BSE → BSE
@@ -1038,7 +1038,7 @@ BSE → BSE
 
 ```yaml
 server:
-  grpc_port: 9004
+  grpc_port: 50054
   enable_reflection: true
 
 database:
@@ -1071,8 +1071,9 @@ executor:
   max_retries: 3
   retry_delay: 2s
 
-odin:
-  base_url: https://api.odinbroker.com/v1
+indira:
+  base_url: https://livemiddleware.indiratrade.com/v1
+  websocket_url: wss://livemiddleware.indiratrade.com
   timeout: 30s
 
 risk_management:
@@ -1087,7 +1088,7 @@ logging:
 ### Environment Variables
 ```bash
 # Service configuration
-GRPC_PORT=9004
+GRPC_PORT=50054
 
 # Database
 DB_HOST=localhost
@@ -1109,9 +1110,10 @@ RABBITMQ_QUEUE=trade.executions
 MAX_RETRIES=3
 RETRY_DELAY=2s
 
-# Odin API
-ODIN_BASE_URL=https://api.odinbroker.com/v1
-ODIN_TIMEOUT=30s
+# Indira Securities API
+INDIRA_BASE_URL=https://livemiddleware.indiratrade.com/v1
+INDIRA_WEBSOCKET_URL=wss://livemiddleware.indiratrade.com
+INDIRA_TIMEOUT=30s
 
 # Risk Management
 RISK_MGMT_ADDRESS=localhost:9005
@@ -1221,7 +1223,7 @@ go build -o bin/trade-execution cmd/main.go
 # 2025-01-15 10:00:00 INFO Connected to PostgreSQL
 # 2025-01-15 10:00:00 INFO Kafka consumer started (trade-signals)
 # 2025-01-15 10:00:00 INFO RabbitMQ consumer started (trade.executions)
-# 2025-01-15 10:00:00 INFO gRPC server listening on port 9004
+# 2025-01-15 10:00:00 INFO gRPC server listening on port 50054
 ```
 
 ### Docker Deployment
@@ -1245,7 +1247,7 @@ COPY --from=builder /app/bin/trade-execution .
 COPY --from=builder /app/config ./config
 COPY --from=builder /app/migrations ./migrations
 
-EXPOSE 9004
+EXPOSE 50054
 
 CMD ["./trade-execution"]
 ```
@@ -1258,7 +1260,7 @@ services:
   trade-execution:
     build: .
     ports:
-      - "9004:9004"
+      - "50054:50054"
     environment:
       - DB_HOST=postgres
       - KAFKA_BROKERS=kafka:9092
@@ -1306,7 +1308,7 @@ psql -U postgres -d trade_execution -c "SELECT order_id, symbol, status FROM ord
 rabbitmqadmin get queue=trade.executions
 
 # 4. Check order execution
-psql -U postgres -d trade_execution -c "SELECT order_id, odin_order_id, status FROM orders WHERE user_id='testuser';"
+psql -U postgres -d trade_execution -c "SELECT order_id, indira_order_id, status FROM orders WHERE user_id='testuser';"
 ```
 
 ### End-to-End Testing
@@ -1319,7 +1321,7 @@ psql -U postgres -d trade_execution -c "SELECT order_id, odin_order_id, status F
 # 3. Order created → DB (status: VALIDATED)
 # 4. Published → RabbitMQ
 # 5. Consumed → Executor
-# 6. Odin API → Success (status: SUBMITTED)
+# 6. Indira Securities API → Success (status: SUBMITTED)
 ```
 
 **Scenario 2: Risk Rejection**
@@ -1333,7 +1335,7 @@ psql -U postgres -d trade_execution -c "SELECT order_id, odin_order_id, status F
 
 **Scenario 3: Retry Mechanism**
 ```bash
-# Simulate Odin API failure
+# Simulate Indira Securities API failure
 # Expected flow:
 # 1. First attempt → Fail (wait 2s)
 # 2. Second attempt → Fail (wait 4s)
@@ -1349,7 +1351,7 @@ psql -U postgres -d trade_execution -c "SELECT order_id, odin_order_id, status F
 **Log Levels**:
 - **INFO**: Normal operations (signal consumed, order placed)
 - **WARN**: Retries, transient failures
-- **ERROR**: Critical failures (DB errors, Odin API errors)
+- **ERROR**: Critical failures (DB errors, Indira Securities API errors)
 
 **Log Format**:
 ```json
@@ -1359,7 +1361,7 @@ psql -U postgres -d trade_execution -c "SELECT order_id, odin_order_id, status F
   "service": "trade-execution",
   "message": "Order placed successfully",
   "order_id": "550e8400-e29b-41d4-a716-446655440000",
-  "odin_order_id": "ODIN123456",
+  "indira_order_id": "INDIRA123456",
   "user_id": "user123"
 }
 ```
@@ -1369,7 +1371,7 @@ psql -U postgres -d trade_execution -c "SELECT order_id, odin_order_id, status F
 #### Service Health
 ```bash
 # gRPC server status
-grpcurl -plaintext localhost:9004 grpc.health.v1.Health/Check
+grpcurl -plaintext localhost:50054 grpc.health.v1.Health/Check
 
 # Kafka consumer lag
 kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
@@ -1422,7 +1424,7 @@ rabbitmqctl list_queues name messages
 # Increase prefetch_count for more concurrency
 ```
 
-#### Issue 3: Odin API Authentication Failure
+#### Issue 3: Indira Securities API Authentication Failure
 **Symptom**: All orders failing with "Authentication failed"
 
 **Solution**:
@@ -1492,7 +1494,7 @@ database:
    - Replay valid messages after fixing issues
 
 5. **Rate Limiting**
-   - Implement rate limits for Odin API calls
+   - Implement rate limits for Indira Securities API calls
    - Prevent account suspension
 
 ---
@@ -1505,18 +1507,19 @@ The **Trade Execution Service** is the operational heart of the algorithmic trad
 
 **Service Details**:
 - Protocol: gRPC + Kafka + RabbitMQ
-- Port: 9004
+- Port: 50054
 - Database: PostgreSQL
 - Language: Go 1.23+
 
 **Core Functions**:
 - Consume trade signals from Kafka
 - Validate with Risk Management Service
-- Execute orders via Odin API
+- Execute orders via Indira Securities API
 - Track order lifecycle in PostgreSQL
 
 **Key Files**:
 - `internal/executor/executor.go` - Order execution logic
+- `internal/indira/client.go` - Indira Securities API client (ExecutionClient)
 - `internal/consumer/kafka_consumer.go` - Kafka signal consumption
 - `internal/consumer/rabbitmq_consumer.go` - RabbitMQ order consumption
 - `migrations/001_create_orders_table.sql` - Database schema
@@ -1529,7 +1532,7 @@ The **Trade Execution Service** is the operational heart of the algorithmic trad
 
 For detailed guides, refer to:
 - [Risk Management KT](./RISK_MANAGEMENT_SERVICE_KT.md) - Risk validation integration
-- [Odin API Wrapper KT](./ODIN_API_WRAPPER_SERVICE_KT.md) - Broker API details
+- [Indira Securities API Wrapper KT](./INDIRA_API_WRAPPER_SERVICE_KT.md) - Broker API details
 - [Master KT Index](./README.md) - Complete documentation index
 
 ---

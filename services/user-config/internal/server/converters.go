@@ -65,8 +65,19 @@ func stringToStopLossType(s string) pb.StopLossType {
 		return pb.StopLossType_FIXED
 	case "TRAILING":
 		return pb.StopLossType_TRAILING
+	case "MULTI_LEVEL":
+		return pb.StopLossType_MULTI_LEVEL
 	default:
 		return pb.StopLossType_STOP_LOSS_TYPE_UNSPECIFIED
+	}
+}
+
+func stringToTakeProfitType(s string) pb.TakeProfitType {
+	switch strings.ToUpper(s) {
+	case "MULTI_LEVEL":
+		return pb.TakeProfitType_TAKE_PROFIT_MULTI_LEVEL
+	default:
+		return pb.TakeProfitType_TAKE_PROFIT_FIXED
 	}
 }
 

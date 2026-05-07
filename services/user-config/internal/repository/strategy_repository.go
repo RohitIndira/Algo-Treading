@@ -19,6 +19,7 @@ type StrategyRepository struct {
 
 // ListAllActive returns a page of active, non-deleted strategies.
 // Ordered by updated_at DESC for stable pagination.
+// Uses batch queries (ANY($1)) instead of per-row queries to avoid N+3 DB roundtrips.
 func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offset int) ([]*models.Strategy, error) {
 	if limit <= 0 {
 		limit = 500
@@ -38,28 +39,63 @@ func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offse
 	if err := r.db.SelectContext(ctx, &strategies, query, limit, offset); err != nil {
 		return nil, fmt.Errorf("failed to list active strategies: %w", err)
 	}
+	if len(strategies) == 0 {
+		return strategies, nil
+	}
 
-	// Load related data for each strategy
-	for _, strategy := range strategies {
-		condition := &models.StrategyCondition{}
-		condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
-		err := r.db.GetContext(ctx, condition, condQuery, strategy.StrategyID)
-		if err == nil {
-			strategy.Conditions = condition
+	// Collect strategy IDs and build an O(1) lookup map.
+	ids := make([]uuid.UUID, len(strategies))
+	byID := make(map[uuid.UUID]*models.Strategy, len(strategies))
+	for i, s := range strategies {
+		ids[i] = s.StrategyID
+		byID[s.StrategyID] = s
+	}
+
+	// Batch fetch conditions — 1 query for all IDs in the page.
+	conditions := []*models.StrategyCondition{}
+	condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = ANY($1)`
+	if err := r.db.SelectContext(ctx, &conditions, condQuery, pq.Array(ids)); err == nil {
+		for _, c := range conditions {
+			if s, ok := byID[c.StrategyID]; ok {
+				s.Conditions = c
+			}
 		}
+	}
 
-		tradeConfig := &models.TradeConfig{}
-		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
-		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
-		if err == nil {
-			strategy.TradeConfig = tradeConfig
+	// Batch fetch trade configs including JSONB multi_level columns — 1 query.
+	// tcRow embeds TradeConfig (whose multi_level fields have db:"-") and adds raw
+	// byte fields to capture the JSONB columns that sqlx would otherwise skip.
+	type tcRow struct {
+		models.TradeConfig
+		MLSLRaw []byte `db:"multi_level_sl"`
+		MLTPRaw []byte `db:"multi_level_tp"`
+	}
+	tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at, multi_level_sl, multi_level_tp FROM trade_configs WHERE strategy_id = ANY($1)`
+	tcRows := []tcRow{}
+	if err := r.db.SelectContext(ctx, &tcRows, tradeQuery, pq.Array(ids)); err == nil {
+		for i := range tcRows {
+			row := &tcRows[i]
+			if len(row.MLSLRaw) > 0 {
+				_ = json.Unmarshal(row.MLSLRaw, &row.TradeConfig.MultiLevelSL)
+			}
+			if len(row.MLTPRaw) > 0 {
+				_ = json.Unmarshal(row.MLTPRaw, &row.TradeConfig.MultiLevelTP)
+			}
+			if s, ok := byID[row.TradeConfig.StrategyID]; ok {
+				tc := row.TradeConfig
+				s.TradeConfig = &tc
+			}
 		}
+	}
 
-		riskLimits := &models.RiskLimits{}
-		riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = $1`
-		err = r.db.GetContext(ctx, riskLimits, riskQuery, strategy.StrategyID)
-		if err == nil {
-			strategy.RiskLimits = riskLimits
+	// Batch fetch risk limits — 1 query.
+	riskLimits := []*models.RiskLimits{}
+	riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = ANY($1)`
+	if err := r.db.SelectContext(ctx, &riskLimits, riskQuery, pq.Array(ids)); err == nil {
+		for _, rl := range riskLimits {
+			if s, ok := byID[rl.StrategyID]; ok {
+				s.RiskLimits = rl
+			}
 		}
 	}
 
@@ -100,6 +136,9 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		strategy.Description, strategy.Active, strategy.TradingMode, strategy.Version,
 	).Scan(&strategy.CreatedAt, &strategy.UpdatedAt)
 	if err != nil {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			return nil, fmt.Errorf("strategy name %q already exists for this user", strategy.StrategyName)
+		}
 		return nil, fmt.Errorf("failed to insert strategy: %w", err)
 	}
 
@@ -109,18 +148,18 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		condQuery := `
 			INSERT INTO strategy_conditions (
 				condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max,
-				sentiments, news_categories, stock_codes, min_market_cap, max_market_cap,
-				market_cap_types, min_price_change_pct, max_price_change_pct, min_volume, exchanges
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+				sentiments, news_categories, min_market_cap, max_market_cap,
+				market_cap_types, min_price_change_pct, max_price_change_pct, exchanges
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, condQuery,
 			conditionID, strategy.StrategyID, req.Conditions.MatchAllNews,
 			req.Conditions.ImpactScoreMin, req.Conditions.ImpactScoreMax,
-			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
+			req.Conditions.Sentiments, req.Conditions.Categories,
 			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap, req.Conditions.MarketCapTypes,
 			req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
-			req.Conditions.MinVolume, req.Conditions.Exchanges,
+			req.Conditions.Exchanges,
 		).Scan(&req.Conditions.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert conditions: %w", err)
@@ -133,11 +172,23 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	// Insert trade config
 	if req.TradeConfig != nil {
 		tradeConfigID := uuid.New()
+
+		mlSLStr, err := marshalMultiLevel(req.TradeConfig.MultiLevelSL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal multi_level_sl: %w", err)
+		}
+		mlTPStr, err := marshalMultiLevel(req.TradeConfig.MultiLevelTP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal multi_level_tp: %w", err)
+		}
+
 		tradeQuery := `
 			INSERT INTO trade_configs (
 				trade_config_id, strategy_id, order_type, product_type, validity, quantity,
-				exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct,
+				stop_loss_type, limit_price, take_profit_type, multi_level_sl, multi_level_tp,
+				trade_window_start, trade_window_end
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, tradeQuery,
@@ -146,6 +197,8 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
 			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice,
+			req.TradeConfig.TakeProfitType, mlSLStr, mlTPStr,
+			req.TradeConfig.TradeWindowStart, req.TradeConfig.TradeWindowEnd,
 		).Scan(&req.TradeConfig.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert trade config: %w", err)
@@ -181,7 +234,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	}
 
 	// Insert into Execution Outbox
-	payload, err := json.Marshal(strategy)
+	payloadBytes, err := json.Marshal(strategy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal strategy for outbox: %w", err)
 	}
@@ -190,7 +243,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 		VALUES ($1, $2, $3)`
 
-	_, err = tx.ExecContext(ctx, outboxQuery, strategy.StrategyID, "STRATEGY_CREATED", payload)
+	_, err = tx.ExecContext(ctx, outboxQuery, strategy.StrategyID, "STRATEGY_CREATED", string(payloadBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert into execution outbox: %w", err)
 	}
@@ -218,7 +271,7 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 
 	// Get conditions
 	condition := &models.StrategyCondition{}
-	condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
+	condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
 	err = r.db.GetContext(ctx, condition, condQuery, strategyID)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to get conditions: %w", err)
@@ -229,12 +282,13 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 
 	// Get trade config
 	tradeConfig := &models.TradeConfig{}
-	tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
+	tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
 	err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategyID)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to get trade config: %w", err)
 	}
 	if err == nil {
+		r.loadMultiLevelConfig(ctx, tradeConfig)
 		strategy.TradeConfig = tradeConfig
 	}
 
@@ -253,11 +307,13 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 }
 
 // ListByUserID lists all strategies for a user
-func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, activeOnly bool, limit, offset int) ([]*models.Strategy, int, error) {
+func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, activeOnly bool, includeDeleted bool, limit, offset int) ([]*models.Strategy, int, error) {
 	strategies := []*models.Strategy{}
 
-	// Filter out deleted strategies
-	query := `SELECT * FROM strategies WHERE user_id = $1 AND deleted_at IS NULL`
+	query := `SELECT * FROM strategies WHERE user_id = $1`
+	if !includeDeleted {
+		query += ` AND deleted_at IS NULL`
+	}
 	args := []interface{}{userID}
 
 	if activeOnly {
@@ -265,7 +321,10 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 	}
 
 	// Get total count
-	countQuery := `SELECT COUNT(*) FROM strategies WHERE user_id = $1 AND deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM strategies WHERE user_id = $1`
+	if !includeDeleted {
+		countQuery += ` AND deleted_at IS NULL`
+	}
 	if activeOnly {
 		countQuery += ` AND active = true`
 	}
@@ -289,7 +348,7 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 	for _, strategy := range strategies {
 		// Load conditions
 		condition := &models.StrategyCondition{}
-		condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
+		condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, condition, condQuery, strategy.StrategyID)
 		if err == nil {
 			strategy.Conditions = condition
@@ -297,9 +356,10 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 
 		// Load trade config
 		tradeConfig := &models.TradeConfig{}
-		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
+		tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
+			r.loadMultiLevelConfig(ctx, tradeConfig)
 			strategy.TradeConfig = tradeConfig
 		}
 
@@ -342,6 +402,9 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("strategy not found or version mismatch")
 		}
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			return nil, fmt.Errorf("strategy name %q already exists for this user", req.StrategyName)
+		}
 		return nil, fmt.Errorf("failed to update strategy: %w", err)
 	}
 
@@ -350,18 +413,18 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		condQuery := `
 			UPDATE strategy_conditions
 			SET match_all_news = $1, impact_score_min = $2, impact_score_max = $3,
-			    sentiments = $4, news_categories = $5, stock_codes = $6,
-			    min_market_cap = $7, max_market_cap = $8, market_cap_types = $9,
-			    min_price_change_pct = $10, max_price_change_pct = $11,
-			    min_volume = $12, exchanges = $13
-			WHERE strategy_id = $14`
+			    sentiments = $4, news_categories = $5,
+			    min_market_cap = $6, max_market_cap = $7, market_cap_types = $8,
+			    min_price_change_pct = $9, max_price_change_pct = $10,
+			    exchanges = $11
+			WHERE strategy_id = $12`
 
 		_, err = tx.ExecContext(ctx, condQuery,
 			req.Conditions.MatchAllNews, req.Conditions.ImpactScoreMin, req.Conditions.ImpactScoreMax,
-			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
+			req.Conditions.Sentiments, req.Conditions.Categories,
 			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap, req.Conditions.MarketCapTypes,
 			req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
-			req.Conditions.MinVolume, req.Conditions.Exchanges, req.StrategyID,
+			req.Conditions.Exchanges, req.StrategyID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update conditions: %w", err)
@@ -370,18 +433,31 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 
 	// Update trade config if provided
 	if req.TradeConfig != nil {
+		mlSLStr, err := marshalMultiLevel(req.TradeConfig.MultiLevelSL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal multi_level_sl: %w", err)
+		}
+		mlTPStr, err := marshalMultiLevel(req.TradeConfig.MultiLevelTP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal multi_level_tp: %w", err)
+		}
+
 		tradeQuery := `
 			UPDATE trade_configs
 			SET order_type = $1, product_type = $2, validity = $3, quantity = $4,
 			    exchange = $5, order_side = $6, stop_loss_pct = $7, take_profit_pct = $8,
-			    trailing_sl_pct = $9, stop_loss_type = $10, limit_price = $11
-			WHERE strategy_id = $12`
+			    trailing_sl_pct = $9, stop_loss_type = $10, limit_price = $11,
+			    take_profit_type = $12, multi_level_sl = $13, multi_level_tp = $14,
+			    trade_window_start = $15, trade_window_end = $16
+			WHERE strategy_id = $17`
 
 		_, err = tx.ExecContext(ctx, tradeQuery,
 			req.TradeConfig.OrderType, req.TradeConfig.ProductType, req.TradeConfig.Validity,
 			req.TradeConfig.Quantity, req.TradeConfig.Exchange, req.TradeConfig.OrderSide,
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
-			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice, req.StrategyID,
+			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice,
+			req.TradeConfig.TakeProfitType, mlSLStr, mlTPStr,
+			req.TradeConfig.TradeWindowStart, req.TradeConfig.TradeWindowEnd, req.StrategyID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update trade config: %w", err)
@@ -412,13 +488,13 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 	fullStrategy, err := r.GetByID(ctx, req.StrategyID, req.UserID)
 	if err == nil {
 		// Insert into Execution Outbox
-		payload, err := json.Marshal(fullStrategy)
+		payloadBytes, err := json.Marshal(fullStrategy)
 		if err == nil {
 			outboxQuery := `
 				INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 				VALUES ($1, $2, $3)`
 
-			_, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", payload)
+			_, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", string(payloadBytes))
 			if ctxErr != nil {
 				return nil, fmt.Errorf("failed to insert into execution outbox: %w", ctxErr)
 			}
@@ -465,12 +541,12 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 		"active":      false,
 		"deleted":     true,
 	}
-	payload, _ := json.Marshal(eventPayload)
+	payloadBytes, _ := json.Marshal(eventPayload)
 	outboxQuery := `
 		INSERT INTO execution_outbox (aggregate_id, event_type, payload)
 		VALUES ($1, $2, $3)`
 
-	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DELETED", payload)
+	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DELETED", string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("failed to insert into execution outbox: %w", err)
 	}
@@ -502,9 +578,9 @@ func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID,
 		"version":     uint64(currentVersion),
 		"active":      true,
 	}
-	payload, _ := json.Marshal(eventPayload)
+	payloadBytes, _ := json.Marshal(eventPayload)
 	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
-	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_ACTIVATED", payload)
+	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_ACTIVATED", string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("failed to outbox: %w", err)
 	}
@@ -535,14 +611,67 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 		"version":     uint64(currentVersion),
 		"active":      false,
 	}
-	payload, _ := json.Marshal(eventPayload)
+	payloadBytes, _ := json.Marshal(eventPayload)
 	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
-	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DEACTIVATED", payload)
+	_, err = tx.ExecContext(ctx, outboxQuery, strategyID, "STRATEGY_DEACTIVATED", string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("failed to outbox: %w", err)
 	}
 
 	return tx.Commit()
+}
+
+// DeactivateAllActive deactivates every active, non-deleted strategy in a single
+// transaction and writes one STRATEGY_DEACTIVATED outbox entry per strategy.
+// Returns the number of strategies that were deactivated.
+func (r *StrategyRepository) DeactivateAllActive(ctx context.Context) (int, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Bulk-deactivate all active strategies and capture their IDs/user/version.
+	type deactivatedRow struct {
+		StrategyID uuid.UUID `db:"strategy_id"`
+		UserID     string    `db:"user_id"`
+		Version    int64     `db:"version"`
+	}
+
+	updateQuery := `
+		UPDATE strategies
+		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
+		WHERE active = true AND deleted_at IS NULL
+		RETURNING strategy_id, user_id, version`
+
+	rows := []deactivatedRow{}
+	if err := tx.SelectContext(ctx, &rows, updateQuery); err != nil {
+		return 0, fmt.Errorf("failed to bulk-deactivate strategies: %w", err)
+	}
+
+	if len(rows) == 0 {
+		return 0, tx.Commit()
+	}
+
+	// Insert one outbox event per deactivated strategy.
+	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
+	for _, row := range rows {
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"strategy_id": row.StrategyID,
+			"user_id":     row.UserID,
+			"version":     row.Version,
+			"active":      false,
+		})
+		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", string(payloadBytes)); err != nil {
+			return 0, fmt.Errorf("failed to insert outbox entry for strategy %s: %w", row.StrategyID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit bulk deactivation: %w", err)
+	}
+
+	return len(rows), nil
 }
 
 // GetByIDs retrieves multiple strategies by their IDs
@@ -562,7 +691,7 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 	for _, strategy := range strategies {
 		// Load conditions
 		condition := &models.StrategyCondition{}
-		condQuery := `SELECT * FROM strategy_conditions WHERE strategy_id = $1`
+		condQuery := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, condition, condQuery, strategy.StrategyID)
 		if err == nil {
 			strategy.Conditions = condition
@@ -570,9 +699,10 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 
 		// Load trade config
 		tradeConfig := &models.TradeConfig{}
-		tradeQuery := `SELECT * FROM trade_configs WHERE strategy_id = $1`
+		tradeQuery := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
+			r.loadMultiLevelConfig(ctx, tradeConfig)
 			strategy.TradeConfig = tradeConfig
 		}
 
@@ -616,4 +746,46 @@ func (r *StrategyRepository) MarkOutboxEventsProcessed(ctx context.Context, even
 		return fmt.Errorf("failed to mark events as processed: %w", err)
 	}
 	return nil
+}
+
+// ── Multi-Level Helpers ───────────────────────────────────────────────────────
+
+// marshalMultiLevel converts a slice of MultiLevelExitLevel to a JSON string
+// suitable for insertion into a JSONB column. Returns nil when levels is empty
+// (which stores NULL in the DB). A *string is returned so pq sends the value
+// as text rather than binary, which PostgreSQL accepts for JSONB columns.
+func marshalMultiLevel(levels []models.MultiLevelExitLevel) (*string, error) {
+	if len(levels) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(levels)
+	if err != nil {
+		return nil, err
+	}
+	s := string(b)
+	return &s, nil
+}
+
+// loadMultiLevelConfig reads the multi_level_sl / multi_level_tp JSONB columns
+// for a TradeConfig that was loaded via SELECT *. Because the model fields have
+// db:"-" (sqlx skips them), we fetch the raw JSON separately and unmarshal.
+func (r *StrategyRepository) loadMultiLevelConfig(ctx context.Context, tc *models.TradeConfig) {
+	if tc == nil {
+		return
+	}
+
+	var raw struct {
+		MultiLevelSL []byte `db:"multi_level_sl"`
+		MultiLevelTP []byte `db:"multi_level_tp"`
+	}
+	query := `SELECT multi_level_sl, multi_level_tp FROM trade_configs WHERE strategy_id = $1`
+	if err := r.db.GetContext(ctx, &raw, query, tc.StrategyID); err != nil {
+		return // non-fatal; columns may not exist on older DB instances
+	}
+	if len(raw.MultiLevelSL) > 0 {
+		_ = json.Unmarshal(raw.MultiLevelSL, &tc.MultiLevelSL)
+	}
+	if len(raw.MultiLevelTP) > 0 {
+		_ = json.Unmarshal(raw.MultiLevelTP, &tc.MultiLevelTP)
+	}
 }

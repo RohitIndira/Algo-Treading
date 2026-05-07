@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -22,9 +23,10 @@ import (
 // Server implements the TradeExecutionService gRPC server
 type Server struct {
 	pb.UnimplementedTradeExecutionServiceServer
-	repo     repository.OrderRepository
-	executor *executor.OrderExecutor
-	port     int
+	repo       repository.OrderRepository
+	executor   *executor.OrderExecutor
+	port       int
+	grpcServer *grpc.Server // stored for graceful shutdown
 }
 
 // NewServer creates a new gRPC server
@@ -43,14 +45,23 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	grpcServer := grpc.NewServer()
-	pb.RegisterTradeExecutionServiceServer(grpcServer, s)
+	s.grpcServer = grpc.NewServer()
+	pb.RegisterTradeExecutionServiceServer(s.grpcServer, s)
 
 	// Register reflection service for grpcurl
-	reflection.Register(grpcServer)
+	reflection.Register(s.grpcServer)
 
 	log.Printf("gRPC server listening on port %d", s.port)
-	return grpcServer.Serve(lis)
+	return s.grpcServer.Serve(lis)
+}
+
+// Stop performs a graceful shutdown — drains in-flight RPCs, then stops.
+func (s *Server) Stop() {
+	if s.grpcServer != nil {
+		log.Println("[grpc] Initiating graceful stop...")
+		s.grpcServer.GracefulStop()
+		log.Println("[grpc] Graceful stop complete")
+	}
 }
 
 // GetOrderStatus retrieves order status by ID
@@ -181,12 +192,76 @@ func (s *Server) CancelOrder(ctx context.Context, req *pb.CancelOrderRequest) (*
 	}, nil
 }
 
-// ModifyOrder modifies a pending order (placeholder implementation)
+// ModifyOrder modifies a pending paper order's price, quantity, or validity.
+// Live order modification is not yet supported (requires broker API integration).
 func (s *Server) ModifyOrder(ctx context.Context, req *pb.ModifyOrderRequest) (*pb.ModifyOrderResponse, error) {
-	// TODO: Implement order modification logic
+	if req.OrderId == "" {
+		return nil, status.Error(codes.InvalidArgument, "order_id is required")
+	}
+	if req.UserId == "" {
+		return nil, status.Error(codes.InvalidArgument, "user_id is required")
+	}
+
+	orderID, err := uuid.Parse(req.OrderId)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid order_id format")
+	}
+
+	order, err := s.repo.GetByID(ctx, orderID)
+	if err != nil {
+		log.Printf("[grpc] ModifyOrder: order %s not found: %v", req.OrderId, err)
+		return &pb.ModifyOrderResponse{Success: false, Message: "order not found"}, nil
+	}
+
+	if order.UserID != req.UserId {
+		return nil, status.Error(codes.PermissionDenied, "access denied")
+	}
+
+	if models.IsTerminalStatus(order.Status) {
+		return &pb.ModifyOrderResponse{
+			Success: false,
+			Message: fmt.Sprintf("order is in terminal state %s and cannot be modified", order.Status),
+		}, nil
+	}
+
+	if !order.IsPaperTrade {
+		return &pb.ModifyOrderResponse{
+			Success: false,
+			Message: "live order modification requires broker API integration — not yet implemented",
+		}, nil
+	}
+
+	// Apply requested field changes to the paper order.
+	if req.NewQuantity != nil {
+		if *req.NewQuantity <= 0 {
+			return &pb.ModifyOrderResponse{Success: false, Message: "new_quantity must be > 0"}, nil
+		}
+		order.Quantity = *req.NewQuantity
+	}
+	if req.NewPrice != nil {
+		p := *req.NewPrice
+		order.Price = &p
+	}
+	if req.NewValidity != nil {
+		order.Validity = *req.NewValidity
+	}
+	if req.NewTriggerPrice != nil {
+		tp := *req.NewTriggerPrice
+		order.TargetPrice = &tp
+	}
+
+	order.UpdatedAt = time.Now()
+
+	if err := s.repo.Update(ctx, order); err != nil {
+		log.Printf("[grpc] ModifyOrder: DB update failed for %s: %v", req.OrderId, err)
+		return &pb.ModifyOrderResponse{Success: false, Message: "failed to update order"}, nil
+	}
+
+	log.Printf("[grpc] ModifyOrder: paper order %s updated (user=%s)", req.OrderId, req.UserId)
 	return &pb.ModifyOrderResponse{
-		Success: false,
-		Message: "Order modification not yet implemented",
+		Success: true,
+		Order:   s.convertToProtoOrder(order),
+		Message: "paper order modified successfully",
 	}, nil
 }
 

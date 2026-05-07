@@ -41,6 +41,12 @@ func NewPaperOrderExecutor(
 	}
 }
 
+// ExecuteOrder implements scheduler.OrderExecutorFunc so PaperOrderExecutor can be
+// used anywhere a live executor is expected (e.g. PriceMonitor, RoutingExecutor).
+func (e *PaperOrderExecutor) ExecuteOrder(ctx context.Context, order *models.Order) error {
+	return e.ExecutePaperOrder(ctx, order)
+}
+
 // ExecutePaperOrder simulates an immediate order fill.
 //
 // Entry price resolution:
@@ -80,8 +86,8 @@ func (e *PaperOrderExecutor) ExecutePaperOrder(ctx context.Context, order *model
 	paperID := "PAPER-" + uuid.New().String()[:8]
 	order.IndiraOrderID = &paperID
 
-	if err := e.repo.Update(ctx, order); err != nil {
-		log.Printf("[paper] DB error updating paper order %s: %v", order.OrderID, err)
+	if err := retryDB(3, func() error { return e.repo.Update(ctx, order) }); err != nil {
+		log.Printf("[paper] DB error updating paper order %s after retries: %v", order.OrderID, err)
 	}
 
 	e.repo.RecordExecutionEvent(ctx, order.OrderID, "PAPER_FILLED", map[string]interface{}{
@@ -127,7 +133,9 @@ func (e *PaperOrderExecutor) ExitPaperPosition(ctx context.Context, order *model
 	order.RejectionReason = &rejectionReason
 	order.UpdatedAt = now
 
-	if err := e.repo.UpdatePaperTradeExit(ctx, order.OrderID, exitPrice, pnl); err != nil {
+	if err := retryDB(3, func() error {
+		return e.repo.UpdatePaperTradeExit(ctx, order.OrderID, exitPrice, pnl)
+	}); err != nil {
 		log.Printf("[paper] DB error recording paper exit for order %s: %v", order.OrderID, err)
 		return fmt.Errorf("failed to persist paper exit for %s: %w", order.OrderID, err)
 	}
@@ -140,10 +148,56 @@ func (e *PaperOrderExecutor) ExitPaperPosition(ctx context.Context, order *model
 		"timestamp":   now,
 	})
 
+	// Create a reverse paper order in DB to mirror live behaviour (entry + exit records).
+	// Non-fatal: if this fails the position is still correctly exited above.
+	go e.createReverseExitOrder(context.Background(), order, exitPrice, now)
+
 	log.Printf("[paper] ✓ Paper position %s exited @ %.2f pnl=%.2f reason=%s",
 		order.OrderID, exitPrice, pnl, reason)
 
 	return nil
+}
+
+// createReverseExitOrder persists a square-off paper order in DB so the trade history
+// shows both entry and exit legs — mirroring live force-exit behaviour.
+func (e *PaperOrderExecutor) createReverseExitOrder(ctx context.Context, original *models.Order, exitPrice float64, at time.Time) {
+	reverseSide := models.OrderSideSell
+	if original.OrderSide == models.OrderSideSell {
+		reverseSide = models.OrderSideBuy
+	}
+
+	paperID := "PAPER-EXIT-" + uuid.New().String()[:8]
+	exitOrder := &models.Order{
+		OrderID:          uuid.New(),
+		UserID:           original.UserID,
+		StrategyID:       original.StrategyID,
+		StrategyName:     original.StrategyName,
+		StockCode:        original.StockCode,
+		Exchange:         original.Exchange,
+		Symbol:           original.Symbol,
+		OrderType:        models.OrderTypeMarket,
+		OrderSide:        reverseSide,
+		Quantity:         original.FilledQuantity,
+		Price:            original.FilledPrice, // original entry price (mirrors ML partial-exit convention)
+		Validity:         "IOC",
+		ProductType:      original.ProductType,
+		Status:           models.StatusFilled,
+		IsPaperTrade:     true,
+		TradingMode:      "PAPER",
+		FilledQuantity:   original.FilledQuantity,
+		FilledPrice:      &exitPrice,
+		IsSquareOffOrder: true,
+		RiskApproved:     true,
+		IndiraOrderID:    &paperID,
+		SubmittedAt:      &at,
+		ExecutedAt:       &at,
+		CreatedAt:        at,
+		UpdatedAt:        at,
+	}
+
+	if err := retryDB(3, func() error { return e.repo.Create(ctx, exitOrder) }); err != nil {
+		log.Printf("[paper] Failed to create reverse exit order for %s: %v", original.OrderID, err)
+	}
 }
 
 func (e *PaperOrderExecutor) publishPaperOrderUpdate(ctx context.Context, order *models.Order, entryPrice float64) {
@@ -186,4 +240,18 @@ func safePrice(p *float64) float64 {
 		return 0
 	}
 	return *p
+}
+
+// retryDB retries fn up to maxAttempts times with linear back-off (50ms × attempt).
+func retryDB(maxAttempts int, fn func() error) error {
+	var err error
+	for i := 0; i < maxAttempts; i++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if i < maxAttempts-1 {
+			time.Sleep(time.Duration(i+1) * 50 * time.Millisecond)
+		}
+	}
+	return err
 }

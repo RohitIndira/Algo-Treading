@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -34,7 +35,8 @@ func (h *PaperTradingHandler) GetPaperPositions(w http.ResponseWriter, r *http.R
 	url := fmt.Sprintf("%s/ws/paper-trades/positions?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -61,7 +63,8 @@ func (h *PaperTradingHandler) ForceExitAll(w http.ResponseWriter, r *http.Reques
 		io.NopCloser(newReaderFrom(payload)),
 	)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -73,6 +76,7 @@ func (h *PaperTradingHandler) ForceExitAll(w http.ResponseWriter, r *http.Reques
 }
 
 // ForceExitAllLive handles POST /api/v1/live-orders/force-exit-all
+// Forwards auth credentials so the trade-execution service can place exit orders at the broker.
 func (h *PaperTradingHandler) ForceExitAllLive(w http.ResponseWriter, r *http.Request) {
 	userID := r.Header.Get("userId")
 	if userID == "" {
@@ -80,7 +84,22 @@ func (h *PaperTradingHandler) ForceExitAllLive(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	payload, _ := json.Marshal(map[string]string{"user_id": userID})
+	bearerToken := r.Header.Get("Authorization")
+	if len(bearerToken) > 7 && bearerToken[:7] == "Bearer " {
+		bearerToken = bearerToken[7:]
+	}
+	appId := r.Header.Get("appId")
+	source := r.Header.Get("source")
+	if source == "" {
+		source = "WEB"
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"user_id":      userID,
+		"bearer_token": bearerToken,
+		"app_id":       appId,
+		"source":       source,
+	})
 
 	resp, err := http.Post(
 		h.tradeExecBaseURL+"/ws/live-orders/force-exit-all",
@@ -88,7 +107,101 @@ func (h *PaperTradingHandler) ForceExitAllLive(w http.ResponseWriter, r *http.Re
 		io.NopCloser(newReaderFrom(payload)),
 	)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// ForceExitStrategy handles POST /api/v1/paper-trades/force-exit-strategy
+// Exits all paper positions for a specific strategy.
+func (h *PaperTradingHandler) ForceExitStrategy(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("userId")
+	if userID == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
+
+	var reqBody struct {
+		StrategyID string `json:"strategy_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil || reqBody.StrategyID == "" {
+		respondWithError(w, http.StatusBadRequest, "strategy_id is required in request body")
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"user_id":     userID,
+		"strategy_id": reqBody.StrategyID,
+	})
+
+	resp, err := http.Post(
+		h.tradeExecBaseURL+"/ws/paper-trades/force-exit-strategy",
+		"application/json",
+		io.NopCloser(newReaderFrom(payload)),
+	)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// ForceExitStrategyLive handles POST /api/v1/live-orders/force-exit-strategy
+// Exits all live positions for a specific strategy by placing reverse limit orders at LTP ± 1%.
+func (h *PaperTradingHandler) ForceExitStrategyLive(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("userId")
+	if userID == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
+
+	bearerToken := r.Header.Get("Authorization")
+	if len(bearerToken) > 7 && bearerToken[:7] == "Bearer " {
+		bearerToken = bearerToken[7:]
+	}
+	appId := r.Header.Get("appId")
+	source := r.Header.Get("source")
+	if source == "" {
+		source = "WEB"
+	}
+
+	var reqBody struct {
+		StrategyID string `json:"strategy_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil || reqBody.StrategyID == "" {
+		respondWithError(w, http.StatusBadRequest, "strategy_id is required in request body")
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"user_id":      userID,
+		"strategy_id":  reqBody.StrategyID,
+		"bearer_token": bearerToken,
+		"app_id":       appId,
+		"source":       source,
+	})
+
+	resp, err := http.Post(
+		h.tradeExecBaseURL+"/ws/live-orders/force-exit-strategy",
+		"application/json",
+		io.NopCloser(newReaderFrom(payload)),
+	)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -113,7 +226,8 @@ func (h *PaperTradingHandler) GetLiveOrders(w http.ResponseWriter, r *http.Reque
 	url := fmt.Sprintf("%s/ws/live-orders?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -138,7 +252,8 @@ func (h *PaperTradingHandler) GetClosedPaperOrders(w http.ResponseWriter, r *htt
 	url := fmt.Sprintf("%s/ws/paper-trades/closed-orders?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -163,7 +278,8 @@ func (h *PaperTradingHandler) GetClosedLiveOrders(w http.ResponseWriter, r *http
 	url := fmt.Sprintf("%s/ws/live-orders/closed-orders?user_id=%s", h.tradeExecBaseURL, userID)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -193,7 +309,8 @@ func (h *PaperTradingHandler) GetDashboardStats(w http.ResponseWriter, r *http.R
 	url := fmt.Sprintf("%s/ws/dashboard-stats?user_id=%s&mode=%s", h.tradeExecBaseURL, userID, mode)
 	resp, err := http.Get(url)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -222,7 +339,8 @@ func (h *PaperTradingHandler) GetIndiraPositions(w http.ResponseWriter, r *http.
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL, nil)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("ERROR GetIndiraPositions build request user_id=%s: %v", userID, err)
+		respondWithError(w, http.StatusInternalServerError, "Internal error")
 		return
 	}
 
@@ -236,7 +354,8 @@ func (h *PaperTradingHandler) GetIndiraPositions(w http.ResponseWriter, r *http.
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()
@@ -262,7 +381,8 @@ func (h *PaperTradingHandler) SubscribeBrokerWS(w http.ResponseWriter, r *http.R
 	targetURL := fmt.Sprintf("%s/ws/live-orders/subscribe-broker-ws?user_id=%s", h.tradeExecBaseURL, userID)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, nil)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("ERROR SubscribeBrokerWS build request user_id=%s: %v", userID, err)
+		respondWithError(w, http.StatusInternalServerError, "Internal error")
 		return
 	}
 
@@ -275,7 +395,135 @@ func (h *PaperTradingHandler) SubscribeBrokerWS(w http.ResponseWriter, r *http.R
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service: "+err.Error())
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// CancelPriceWatch handles POST /api/v1/live-orders/cancel-price-watch
+// Cancels one or more orders being monitored by the PriceMonitor.
+func (h *PaperTradingHandler) CancelPriceWatch(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("userId")
+	if userID == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
+
+	// Read original body, inject user_id from auth header
+	bodyBytes, _ := io.ReadAll(r.Body)
+	var payload map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	payload["user_id"] = userID
+	enriched, _ := json.Marshal(payload)
+
+	resp, err := http.Post(
+		h.tradeExecBaseURL+"/ws/live-orders/cancel-price-watch",
+		"application/json",
+		io.NopCloser(newReaderFrom(enriched)),
+	)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// GetPriceWatches handles GET /api/v1/live-orders/price-watches?user_id=xxx
+// Returns all orders the PriceMonitor is currently watching for this user.
+func (h *PaperTradingHandler) GetPriceWatches(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	url := fmt.Sprintf("%s/ws/live-orders/price-watches?user_id=%s", h.tradeExecBaseURL, userID)
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// SetAutoSquareOffConfig handles POST /api/v1/auto-square-off/config
+// Stores the user's auto square-off time directly in trade-execution (no risk-management dep).
+func (h *PaperTradingHandler) SetAutoSquareOffConfig(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("userId")
+	if userID == "" {
+		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		return
+	}
+
+	bodyBytes, _ := io.ReadAll(r.Body)
+	var payload map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	payload["user_id"] = userID
+	enriched, _ := json.Marshal(payload)
+
+	resp, err := http.Post(
+		h.tradeExecBaseURL+"/ws/auto-square-off/config",
+		"application/json",
+		io.NopCloser(newReaderFrom(enriched)),
+	)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// GetAutoSquareOffConfig handles GET /api/v1/auto-square-off/config
+// Returns the user's auto square-off config from trade-execution.
+func (h *PaperTradingHandler) GetAutoSquareOffConfig(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	url := fmt.Sprintf("%s/ws/auto-square-off/config?user_id=%s", h.tradeExecBaseURL, userID)
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: %v", r.Method, r.URL.Path, err)
+		respondWithError(w, http.StatusBadGateway, "Failed to reach trade-execution service")
 		return
 	}
 	defer resp.Body.Close()

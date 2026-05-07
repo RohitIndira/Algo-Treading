@@ -33,16 +33,13 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 		MatchAllNews:    p.Conditions.MatchAllNews,
 		ImpactScoreMin:  p.Conditions.ImpactScoreMin,
 		ImpactScoreMax:  p.Conditions.ImpactScoreMax,
-		Sentiments:      nilSafeStringSlice(p.Conditions.Sentiments),
-		Categories:      nilSafeStringSlice(p.Conditions.Categories),
-		Stocks:          nilSafeInt64Slice(p.Conditions.StockCodes),
-		VolumeThreshold: p.Conditions.MinVolume,
-		MinPctChange:    p.Conditions.MinPriceChangePct,
+		Sentiments:   nilSafeStringSlice(p.Conditions.Sentiments),
+		Categories:   nilSafeStringSlice(p.Conditions.Categories),
+		MinPctChange: p.Conditions.MinPriceChangePct,
 		MaxPctChange:    p.Conditions.MaxPriceChangePct,
-		Exchanges:       normalizeExchanges(p.Conditions.Exchanges),
+		Exchanges:      normalizeExchanges(p.Conditions.Exchanges),
+		MarketCapTypes: nilSafeStringSlice(p.Conditions.MarketCapTypes),
 	}
-	// Market cap range
-	// (rules-engine model currently stores range but doesn't evaluate it yet; keep for future.)
 	s.Conditions.MarketCapRange = models.MarketCapRange{
 		MinMcap: p.Conditions.MinMarketCap,
 		MaxMcap: p.Conditions.MaxMarketCap,
@@ -50,18 +47,23 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 
 	// Trade config
 	s.TradeConfig = models.TradeConfig{
-		OrderType:       normalizeOrderType(p.TradeConfig.OrderType),
-		Quantity:        p.TradeConfig.Quantity,
-		Exchange:        normalizeExchange(p.TradeConfig.Exchange),
-		OrderSide:       normalizeOrderSide(p.TradeConfig.OrderSide),
-		Validity:        normalizeValidity(p.TradeConfig.Validity),
-		LimitPrice:      p.TradeConfig.LimitPrice,
-		StopLossPct:     p.TradeConfig.StopLossPct,
-		TakeProfitPct:   p.TradeConfig.TakeProfitPct,
-		StopLossType:    normalizeStopLossType(p.TradeConfig.StopLossType),
-		TrailingSLPct:   p.TradeConfig.TrailingSLPct,
-		ProductType:     normalizeProductType(p.TradeConfig.ProductType),
-		MaxPositionSize: 0,
+		OrderType:        normalizeOrderType(p.TradeConfig.OrderType),
+		Quantity:         p.TradeConfig.Quantity,
+		Exchange:         normalizeExchange(p.TradeConfig.Exchange),
+		OrderSide:        normalizeOrderSide(p.TradeConfig.OrderSide),
+		Validity:         normalizeValidity(p.TradeConfig.Validity),
+		LimitPrice:       p.TradeConfig.LimitPrice,
+		StopLossPct:      p.TradeConfig.StopLossPct,
+		TakeProfitPct:    p.TradeConfig.TakeProfitPct,
+		StopLossType:     normalizeStopLossType(p.TradeConfig.StopLossType),
+		TakeProfitType:   normalizeTakeProfitType(p.TradeConfig.TakeProfitType),
+		TrailingSLPct:    p.TradeConfig.TrailingSLPct,
+		ProductType:      normalizeProductType(p.TradeConfig.ProductType),
+		MaxPositionSize:  0,
+		MultiLevelSL:     toModelMultiLevel(p.TradeConfig.MultiLevelSL),
+		MultiLevelTP:     toModelMultiLevel(p.TradeConfig.MultiLevelTP),
+		TradeWindowStart: p.TradeConfig.TradeWindowStart,
+		TradeWindowEnd:   p.TradeConfig.TradeWindowEnd,
 	}
 
 	// Risk limits
@@ -87,13 +89,6 @@ func unixNanosToTime(n int64) time.Time {
 func nilSafeStringSlice(in []string) []string {
 	if in == nil {
 		return []string{}
-	}
-	return in
-}
-
-func nilSafeInt64Slice(in []int64) []int64 {
-	if in == nil {
-		return []int64{}
 	}
 	return in
 }
@@ -158,9 +153,35 @@ func normalizeStopLossType(v string) string {
 		return "FIXED"
 	case "TRAILING", "STOP_LOSS_TYPE_TRAILING":
 		return "TRAILING"
+	case "MULTI_LEVEL", "STOP_LOSS_TYPE_MULTI_LEVEL":
+		return "MULTI_LEVEL"
 	default:
 		return "FIXED"
 	}
+}
+
+func normalizeTakeProfitType(v string) string {
+	switch v {
+	case "MULTI_LEVEL", "TAKE_PROFIT_TYPE_MULTI_LEVEL":
+		return "MULTI_LEVEL"
+	default:
+		return "FIXED"
+	}
+}
+
+func toModelMultiLevel(in []MultiLevelExitLevelPayload) []models.MultiLevelExitLevel {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]models.MultiLevelExitLevel, len(in))
+	for i, l := range in {
+		out[i] = models.MultiLevelExitLevel{
+			LevelNum: l.LevelNum,
+			PricePct: l.PricePct,
+			QtyPct:   l.QtyPct,
+		}
+	}
+	return out
 }
 
 func normalizeProductType(v string) string {

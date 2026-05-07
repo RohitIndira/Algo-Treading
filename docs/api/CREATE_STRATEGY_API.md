@@ -9,7 +9,7 @@ This API allows users to create automated trading strategies that execute trades
 POST /api/v1/strategies
 ```
 
-**Base URL**: `http://localhost:8080` (API Gateway)
+**Base URL**: `http://localhost:8081` (API Gateway)
 
 ## Authentication
 Include authentication headers as required by your API Gateway configuration.
@@ -432,7 +432,7 @@ Risk management controls to prevent excessive losses and over-trading.
 ## Testing with cURL
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/strategies \
+curl -X POST http://localhost:8081/api/v1/strategies \
   -H "Content-Type: application/json" \
   -d '{
     "user_id": "USER123",

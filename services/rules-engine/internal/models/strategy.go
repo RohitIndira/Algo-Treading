@@ -33,18 +33,17 @@ type StrategyConfig = Strategy
 
 // Conditions represents the conditions for a strategy
 type Conditions struct {
-	MatchAllNews    bool           `json:"match_all_news" bson:"match_all_news"`
-	ImpactScoreMin  int32          `json:"impact_score_min" bson:"impact_score_min"`
-	ImpactScoreMax  int32          `json:"impact_score_max" bson:"impact_score_max"`
-	Sentiments      []string       `json:"sentiments" bson:"sentiments"`
-	Categories      []string       `json:"categories" bson:"categories"`
-	Stocks          []int64        `json:"stocks" bson:"stocks"`
-	PriceRange      PriceRange     `json:"price_range" bson:"price_range"` // legacy; may be unset
-	VolumeThreshold int64          `json:"volume_threshold" bson:"volume_threshold"`
-	MinPctChange    float64        `json:"min_pct_change" bson:"min_pct_change"`
-	MaxPctChange    float64        `json:"max_pct_change" bson:"max_pct_change"`
-	Exchanges       []string       `json:"exchanges" bson:"exchanges"`
-	MarketCapRange  MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
+	MatchAllNews   bool           `json:"match_all_news" bson:"match_all_news"`
+	ImpactScoreMin int32          `json:"impact_score_min" bson:"impact_score_min"`
+	ImpactScoreMax int32          `json:"impact_score_max" bson:"impact_score_max"`
+	Sentiments     []string       `json:"sentiments" bson:"sentiments"`
+	Categories     []string       `json:"categories" bson:"categories"`
+	PriceRange     PriceRange     `json:"price_range" bson:"price_range"` // legacy; may be unset
+	MinPctChange   float64        `json:"min_pct_change" bson:"min_pct_change"`
+	MaxPctChange   float64        `json:"max_pct_change" bson:"max_pct_change"`
+	Exchanges      []string       `json:"exchanges" bson:"exchanges"`
+	MarketCapTypes []string       `json:"market_cap_types" bson:"market_cap_types"` // "SMALL", "MID", "LARGE"
+	MarketCapRange MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
 }
 
 // PriceRange represents price range filter
@@ -59,6 +58,15 @@ type MarketCapRange struct {
 	MaxMcap float64 `json:"max_mcap" bson:"max_mcap"` // Maximum market cap in crores
 }
 
+// MultiLevelExitLevel defines one partial-exit level for multi-level SL or TP.
+// price_pct is always positive; direction is implied by exit type and order side.
+// qty_pct is the % of TOTAL position qty to exit at this level; all levels sum to 100.
+type MultiLevelExitLevel struct {
+	LevelNum int     `json:"level_num" bson:"level_num"`
+	PricePct float64 `json:"price_pct" bson:"price_pct"`
+	QtyPct   float64 `json:"qty_pct" bson:"qty_pct"`
+}
+
 // TradeConfig represents trade configuration
 type TradeConfig struct {
 	OrderType       string  `json:"order_type" bson:"order_type"` // MARKET, LIMIT
@@ -70,9 +78,19 @@ type TradeConfig struct {
 	OrderSide       string  `json:"order_side" bson:"order_side"`           // BUY/SELL
 	Validity        string  `json:"validity" bson:"validity"`               // DAY/IOC
 	LimitPrice      float64 `json:"limit_price" bson:"limit_price"`         // LIMIT only
-	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING
+	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING, MULTI_LEVEL
+	TakeProfitType  string  `json:"take_profit_type" bson:"take_profit_type"` // FIXED, MULTI_LEVEL
 	TrailingSLPct   float64 `json:"trailing_sl_pct" bson:"trailing_sl_pct"` // Trailing SL percentage
 	ProductType     string  `json:"product_type" bson:"product_type"`       // INTRADAY, DELIVERY, CASH
+
+	// Multi-level exit levels (non-nil only when respective type == "MULTI_LEVEL")
+	MultiLevelSL []MultiLevelExitLevel `json:"multi_level_sl,omitempty" bson:"multi_level_sl,omitempty"`
+	MultiLevelTP []MultiLevelExitLevel `json:"multi_level_tp,omitempty" bson:"multi_level_tp,omitempty"`
+
+	// TradeWindowStart / TradeWindowEnd define the IST time range (HH:MM, 24h)
+	// within which this strategy may place orders. Empty = no restriction.
+	TradeWindowStart string `json:"trade_window_start" bson:"trade_window_start"`
+	TradeWindowEnd   string `json:"trade_window_end" bson:"trade_window_end"`
 }
 
 // RiskLimits represents risk limits
@@ -113,26 +131,11 @@ func (s *Strategy) Validate() error {
 	if s.TradeConfig.Quantity <= 0 {
 		return ErrInvalidQuantity
 	}
-	if s.TradeConfig.OrderType != "MARKET" && s.TradeConfig.OrderType != "LIMIT" && s.TradeConfig.OrderType != "BRACKET" {
+	if s.TradeConfig.OrderType != "MARKET" && s.TradeConfig.OrderType != "LIMIT" && s.TradeConfig.OrderType != "BRACKET" && s.TradeConfig.OrderType != "STOP_LOSS" {
 		return ErrInvalidOrderType
 	}
-	// NOTE: Sentiments/categories/stocks can be empty to mean "match all".
+	// NOTE: Sentiments/categories can be empty to mean "match all".
 	return nil
-}
-
-// MatchesStock checks if strategy applies to the stock
-func (s *Strategy) MatchesStock(stockCode int64) bool {
-	// Empty stocks list means apply to all stocks
-	if len(s.Conditions.Stocks) == 0 {
-		return true
-	}
-
-	for _, stock := range s.Conditions.Stocks {
-		if stock == stockCode {
-			return true
-		}
-	}
-	return false
 }
 
 // MatchesSentiment checks if strategy applies to the sentiment

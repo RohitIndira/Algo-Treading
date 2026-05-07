@@ -57,7 +57,6 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 		Conditions: ConditionsPayload{
 			Sentiments:     []string{},
 			Categories:     []string{},
-			StockCodes:     []int64{},
 			MarketCapTypes: []string{},
 			Exchanges:      []string{},
 		},
@@ -73,13 +72,11 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 			ImpactScoreMax:    s.Conditions.ImpactScoreMax,
 			Sentiments:        nilSafeStringSlice([]string(s.Conditions.Sentiments)),
 			Categories:        nilSafeStringSlice([]string(s.Conditions.Categories)),
-			StockCodes:        nilSafeInt64Slice([]int64(s.Conditions.StockCodes)),
 			MarketCapTypes:    nilSafeStringSlice([]string(s.Conditions.MarketCapTypes)),
 			MinMarketCap:      valueOrZeroFloat64(s.Conditions.MinMarketCap),
 			MaxMarketCap:      valueOrZeroFloat64(s.Conditions.MaxMarketCap),
 			MinPriceChangePct: valueOrZeroFloat64(s.Conditions.MinPriceChangePct),
 			MaxPriceChangePct: valueOrZeroFloat64(s.Conditions.MaxPriceChangePct),
-			MinVolume:         valueOrZeroInt64(s.Conditions.MinVolume),
 			Exchanges:         nilSafeStringSlice([]string(s.Conditions.Exchanges)),
 			CreatedAt:         s.Conditions.CreatedAt.UnixNano(),
 		}
@@ -88,18 +85,23 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 	// Trade config
 	if s.TradeConfig != nil {
 		p.TradeConfig = TradeConfigPayload{
-			OrderType:     s.TradeConfig.OrderType,
-			ProductType:   s.TradeConfig.ProductType,
-			Validity:      s.TradeConfig.Validity,
-			Quantity:      s.TradeConfig.Quantity,
-			Exchange:      s.TradeConfig.Exchange,
-			OrderSide:     s.TradeConfig.OrderSide,
-			LimitPrice:    valueOrZeroFloat64(s.TradeConfig.LimitPrice),
-			StopLossPct:   valueOrZeroFloat64(s.TradeConfig.StopLossPct),
-			TakeProfitPct: valueOrZeroFloat64(s.TradeConfig.TakeProfitPct),
-			TrailingSLPct: valueOrZeroFloat64(s.TradeConfig.TrailingSLPct),
-			StopLossType:  s.TradeConfig.StopLossType,
-			CreatedAt:     s.TradeConfig.CreatedAt.UnixNano(),
+			OrderType:        s.TradeConfig.OrderType,
+			ProductType:      s.TradeConfig.ProductType,
+			Validity:         s.TradeConfig.Validity,
+			Quantity:         s.TradeConfig.Quantity,
+			Exchange:         s.TradeConfig.Exchange,
+			OrderSide:        s.TradeConfig.OrderSide,
+			LimitPrice:       valueOrZeroFloat64(s.TradeConfig.LimitPrice),
+			StopLossPct:      valueOrZeroFloat64(s.TradeConfig.StopLossPct),
+			TakeProfitPct:    valueOrZeroFloat64(s.TradeConfig.TakeProfitPct),
+			TrailingSLPct:    valueOrZeroFloat64(s.TradeConfig.TrailingSLPct),
+			StopLossType:     s.TradeConfig.StopLossType,
+			TakeProfitType:   s.TradeConfig.TakeProfitType,
+			MultiLevelSL:     toMultiLevelPayload(s.TradeConfig.MultiLevelSL),
+			MultiLevelTP:     toMultiLevelPayload(s.TradeConfig.MultiLevelTP),
+			TradeWindowStart: s.TradeConfig.TradeWindowStart,
+			TradeWindowEnd:   s.TradeConfig.TradeWindowEnd,
+			CreatedAt:        s.TradeConfig.CreatedAt.UnixNano(),
 		}
 	}
 
@@ -120,6 +122,23 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 	return p
 }
 
+// toMultiLevelPayload converts model multi-level levels to the Kafka payload type.
+// Returns nil (omitted from JSON) when levels is empty.
+func toMultiLevelPayload(levels []models.MultiLevelExitLevel) []MultiLevelExitLevelPayload {
+	if len(levels) == 0 {
+		return nil
+	}
+	out := make([]MultiLevelExitLevelPayload, len(levels))
+	for i, l := range levels {
+		out[i] = MultiLevelExitLevelPayload{
+			LevelNum: l.LevelNum,
+			PricePct: l.PricePct,
+			QtyPct:   l.QtyPct,
+		}
+	}
+	return out
+}
+
 func nilSafeStringSlice(in []string) []string {
 	if in == nil {
 		return []string{}
@@ -127,21 +146,7 @@ func nilSafeStringSlice(in []string) []string {
 	return in
 }
 
-func nilSafeInt64Slice(in []int64) []int64 {
-	if in == nil {
-		return []int64{}
-	}
-	return in
-}
-
 func valueOrZeroFloat64(v *float64) float64 {
-	if v == nil {
-		return 0
-	}
-	return *v
-}
-
-func valueOrZeroInt64(v *int64) int64 {
 	if v == nil {
 		return 0
 	}

@@ -61,9 +61,8 @@ func (e *Evaluator) Evaluate(event *models.MarketEvent, strategy *models.Strateg
 	e.evaluateImpactScore(event, strategy, result)
 	e.evaluateSentiment(event, strategy, result)
 	e.evaluateCategory(event, strategy, result)
-	e.evaluateStock(event, strategy, result)
+	e.evaluateMarketCap(event, strategy, result)
 	e.evaluatePriceRange(event, strategy, result)
-	e.evaluateVolume(event, strategy, result)
 	e.evaluatePctChange(event, strategy, result)
 	e.evaluateExchange(event, strategy, result)
 
@@ -85,9 +84,8 @@ func (e *Evaluator) evaluateMatchAllStrategy(event *models.MarketEvent, strategy
 		"match_all_news",
 		"sentiment",
 		"category",
-		"stock",
+		"market_cap",
 		"price_range",
-		"volume",
 		"pct_change",
 		"exchange",
 	)
@@ -96,9 +94,8 @@ func (e *Evaluator) evaluateMatchAllStrategy(event *models.MarketEvent, strategy
 	result.ConditionScores["match_all_news"] = 100.0
 	result.ConditionScores["sentiment"] = 100.0
 	result.ConditionScores["category"] = 100.0
-	result.ConditionScores["stock"] = 100.0
+	result.ConditionScores["market_cap"] = 100.0
 	result.ConditionScores["price_range"] = 100.0
-	result.ConditionScores["volume"] = 100.0
 	result.ConditionScores["pct_change"] = 100.0
 	result.ConditionScores["exchange"] = 100.0
 }
@@ -165,7 +162,7 @@ func (e *Evaluator) evaluateCategory(event *models.MarketEvent, strategy *models
 	}
 
 	for _, category := range strategy.Conditions.Categories {
-		if category == event.NewsData.Category {
+		if strings.EqualFold(category, event.NewsData.Category) {
 			result.MatchedConditions = append(result.MatchedConditions, condition)
 			result.ConditionScores[condition] = 100.0
 			return
@@ -176,19 +173,24 @@ func (e *Evaluator) evaluateCategory(event *models.MarketEvent, strategy *models
 	result.ConditionScores[condition] = 0
 }
 
-// evaluateStock evaluates stock condition
-func (e *Evaluator) evaluateStock(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
-	condition := "stock"
+// evaluateMarketCap evaluates market cap type condition.
+// Strategy stores market_cap_types as uppercase: "SMALL", "MID", "LARGE".
+// Event carries mcaptype as title-case: "Small", "Mid", "Large".
+// Comparison is case-insensitive.
+func (e *Evaluator) evaluateMarketCap(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
+	condition := "market_cap"
 
-	// Empty stocks list means apply to all stocks
-	if len(strategy.Conditions.Stocks) == 0 {
+	// Empty market_cap_types list means accept all
+	if len(strategy.Conditions.MarketCapTypes) == 0 {
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 		result.ConditionScores[condition] = 100.0
 		return
 	}
 
-	for _, stock := range strategy.Conditions.Stocks {
-		if stock == event.StockData.StockCode {
+	eventMCapType := event.StockData.MCapType
+
+	for _, mcapType := range strategy.Conditions.MarketCapTypes {
+		if strings.EqualFold(mcapType, eventMCapType) {
 			result.MatchedConditions = append(result.MatchedConditions, condition)
 			result.ConditionScores[condition] = 100.0
 			return
@@ -224,35 +226,6 @@ func (e *Evaluator) evaluatePriceRange(event *models.MarketEvent, strategy *mode
 	}
 }
 
-// evaluateVolume evaluates volume condition
-func (e *Evaluator) evaluateVolume(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
-	condition := "volume"
-
-	volume := event.MarketData.PriceMap.Volume
-	minVolume := strategy.Conditions.VolumeThreshold
-
-	// If threshold is 0, no volume filter
-	if minVolume == 0 {
-		result.MatchedConditions = append(result.MatchedConditions, condition)
-		result.ConditionScores[condition] = 100.0
-		return
-	}
-
-	// Volume must be >= threshold
-	if volume >= minVolume {
-		result.MatchedConditions = append(result.MatchedConditions, condition)
-
-		// Score based on how much volume exceeds threshold
-		// Diminishing returns after 2x threshold
-		ratio := float64(volume) / float64(minVolume)
-		score := math.Min(ratio, 2.0) / 2.0 * 100.0
-		result.ConditionScores[condition] = score
-	} else {
-		result.FailedConditions = append(result.FailedConditions, condition)
-		result.ConditionScores[condition] = 0
-	}
-}
-
 // evaluatePctChange evaluates percent change condition.
 //
 // Three outcomes:
@@ -279,8 +252,8 @@ func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *model
 		effectiveMax = math.MaxFloat64
 	}
 
-	// Case 3 – above max: skip trade.
-	if absPctChange > effectiveMax {
+	// Case 3 – at or above max: skip trade.
+	if absPctChange >= effectiveMax {
 		result.PctChangeStatus = PctChangeAboveMax
 		result.FailedConditions = append(result.FailedConditions, condition)
 		result.ConditionScores[condition] = 0
@@ -331,25 +304,28 @@ func (e *Evaluator) evaluatePctChange(event *models.MarketEvent, strategy *model
 		zap.String("strategy_id", strategy.StrategyID))
 }
 
-// evaluateExchange evaluates exchange condition
+// evaluateExchange evaluates exchange condition against the Conditions.Exchanges filter list.
+// TradeConfig.Exchange is the execution exchange (where to place orders) and is NOT used for filtering.
 func (e *Evaluator) evaluateExchange(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
 	condition := "exchange"
 
-	// If strategy has no exchange preference, accept all
-	if strategy.TradeConfig.Exchange == "" {
+	// Empty filter list means accept all exchanges
+	if len(strategy.Conditions.Exchanges) == 0 {
 		result.MatchedConditions = append(result.MatchedConditions, condition)
 		result.ConditionScores[condition] = 100.0
 		return
 	}
 
-	// Check if exchange matches
-	if event.StockData.Exchange == strategy.TradeConfig.Exchange {
-		result.MatchedConditions = append(result.MatchedConditions, condition)
-		result.ConditionScores[condition] = 100.0
-	} else {
-		result.FailedConditions = append(result.FailedConditions, condition)
-		result.ConditionScores[condition] = 0
+	for _, ex := range strategy.Conditions.Exchanges {
+		if strings.EqualFold(ex, event.StockData.Exchange) {
+			result.MatchedConditions = append(result.MatchedConditions, condition)
+			result.ConditionScores[condition] = 100.0
+			return
+		}
 	}
+
+	result.FailedConditions = append(result.FailedConditions, condition)
+	result.ConditionScores[condition] = 0
 }
 
 // GetMatchedConditionCount returns the number of matched conditions

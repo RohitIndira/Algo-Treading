@@ -2,14 +2,27 @@ package indira
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 )
+
+// TickSizeLookup retrieves the tick size for an instrument from Redis market data.
+type TickSizeLookup interface {
+	GetTickSize(ctx context.Context, exchange string, token int64) (float64, error)
+}
+
+// DPRLookup retrieves the Daily Price Range (circuit limits) from Redis market data.
+type DPRLookup interface {
+	// GetDPR returns (lower, upper) DPR bounds.
+	GetDPR(ctx context.Context, exchange string, token int64) (lower float64, upper float64, err error)
+}
 
 // ExecutionClient wraps Indira API for trade execution
 // This client is stateless and thread-safe for concurrent use by multiple users
@@ -21,6 +34,14 @@ type ExecutionClient struct {
 	// to receive order updates for ALL users on one TCP connection.
 	sharedWSMu sync.Mutex
 	sharedWS   *indiraClient.WSClient
+
+	// tickSizeLookup fetches per-instrument tick size from Redis market data.
+	// Nil-safe: falls back to hardcoded NSE defaults if unavailable.
+	tickSizeLookup TickSizeLookup
+
+	// dprLookup fetches Daily Price Range (circuit limits) from Redis.
+	// Nil-safe: if unavailable, no DPR clamping is applied.
+	dprLookup DPRLookup
 }
 
 // NewExecutionClient creates a new execution client for Indira Securities
@@ -35,6 +56,69 @@ func NewExecutionClient() *ExecutionClient {
 	}
 }
 
+// SetTickSizeLookup sets the tick size lookup (e.g. RedisPriceClient).
+func (c *ExecutionClient) SetTickSizeLookup(tsl TickSizeLookup) {
+	c.tickSizeLookup = tsl
+}
+
+// SetDPRLookup sets the DPR lookup (e.g. RedisPriceClient).
+func (c *ExecutionClient) SetDPRLookup(dpr DPRLookup) {
+	c.dprLookup = dpr
+}
+
+// resolveTickSize fetches the tick size for an instrument from Redis.
+// Returns 0 on any error (caller falls back to hardcoded defaults).
+func (c *ExecutionClient) resolveTickSize(exchange string, stockCode int64) float64 {
+	if c.tickSizeLookup == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	ts, err := c.tickSizeLookup.GetTickSize(ctx, exchange, stockCode)
+	if err != nil {
+		log.Printf("[tick-size] Redis lookup failed for %s:%d, using default: %v", exchange, stockCode, err)
+		return 0
+	}
+	return ts
+}
+
+// resolveDPR fetches the Daily Price Range for an instrument from Redis.
+// Returns (0, 0) on any error (caller skips DPR clamping).
+func (c *ExecutionClient) resolveDPR(exchange string, stockCode int64) (lower, upper float64) {
+	if c.dprLookup == nil {
+		return 0, 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	lo, hi, err := c.dprLookup.GetDPR(ctx, exchange, stockCode)
+	if err != nil {
+		log.Printf("[dpr] Redis lookup failed for %s:%d, skipping DPR clamp: %v", exchange, stockCode, err)
+		return 0, 0
+	}
+	return lo, hi
+}
+
+// clampDPR clamps a price to within the Daily Price Range [lower, upper].
+// If lower and upper are both 0 (unavailable), the price is returned unchanged.
+func clampDPR(price, lower, upper float64) float64 {
+	if lower <= 0 && upper <= 0 {
+		return price
+	}
+	if lower > 0 && price < lower {
+		return lower
+	}
+	if upper > 0 && price > upper {
+		return upper
+	}
+	return price
+}
+
+// roundPrice rounds a price using the instrument's tick size from Redis,
+// falling back to hardcoded NSE defaults if unavailable.
+func (c *ExecutionClient) roundPrice(price float64, tickSize float64) float64 {
+	return indiraClient.RoundToTickSize(price, tickSize)
+}
+
 // PlaceOrder places order via Indira API
 // auth parameter should be provided by frontend (bearer token, appId, source)
 func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, auth *indiraClient.AuthContext) (string, error) {
@@ -44,7 +128,11 @@ func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, a
 		return "", fmt.Errorf("failed to convert order: %w", err)
 	}
 
-	log.Printf("Placing order for user %s: Symbol=%s",auth.UserId, orderReq.Symbol)
+	if reqJSON, jsonErr := json.Marshal(orderReq); jsonErr == nil {
+		log.Printf("Placing order for user %s: Symbol=%s payload=%s", auth.UserId, orderReq.Symbol, string(reqJSON))
+	} else {
+		log.Printf("Placing order for user %s: Symbol=%s", auth.UserId, orderReq.Symbol)
+	}
 	// Call Indira API
 	resp, err := c.client.PlaceOrder(ctx, auth, orderReq)
 	if err != nil {
@@ -60,7 +148,7 @@ func (c *ExecutionClient) PlaceOrder(ctx context.Context, order *models.Order, a
 		return "", fmt.Errorf("broker accepted request but returned no order ID (message: %s)", resp.Message)
 	}
 
-	log.Printf("✓ Order placed successfully: OrderID=%s", orderID)
+	log.Printf("✓ Order submitted to broker: OrderID=%s (awaiting WS confirmation)", orderID)
 	return orderID, nil
 }
 
@@ -176,6 +264,7 @@ func (c *ExecutionClient) GetOrderBook(ctx context.Context, auth *indiraClient.A
 	return c.client.GetOrderBook(ctx, auth)
 }
 
+
 // FindRecentOrder checks the broker order book for an order matching symbol, side (BUY/SELL), and qty.
 // Used for idempotency: on network timeout we don't know if the order was placed; this checks before retrying.
 // Returns the broker order ID and true if a match is found.
@@ -218,6 +307,36 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 
 	indiraSymbol := symbolBuilder.BuildSymbol()
 
+	// Resolve tick size and DPR concurrently — these are independent Redis lookups.
+	var tickSize float64
+	var dprLower, dprUpper float64
+	var lookupWg sync.WaitGroup
+	lookupWg.Add(2)
+	go func() {
+		defer lookupWg.Done()
+		tickSize = c.resolveTickSize(symbolBuilder.Exchange, order.StockCode)
+	}()
+	go func() {
+		defer lookupWg.Done()
+		dprLower, dprUpper = c.resolveDPR(symbolBuilder.Exchange, order.StockCode)
+	}()
+	lookupWg.Wait()
+
+	round := func(price float64) float64 {
+		return c.roundPrice(price, tickSize)
+	}
+	clamp := func(price float64) float64 {
+		return clampDPR(price, dprLower, dprUpper)
+	}
+	// Convenience: round then clamp to DPR range.
+	roundClamp := func(price float64) float64 {
+		return clamp(round(price))
+	}
+
+	if dprLower > 0 && dprUpper > 0 {
+		log.Printf("[dpr] %s:%d DPR range [%.2f, %.2f]", symbolBuilder.Exchange, order.StockCode, dprLower, dprUpper)
+	}
+
 	// Build order request
 	req := &indiraClient.PlaceOrderRequest{
 		Symbol:       indiraSymbol,
@@ -239,47 +358,42 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 	isBracket := order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO"
 
 	if isBracket {
-		// Bracket Order (BO) price rules per Indira API spec:
-		// - MARKET BO: limitPrice=0, triggerPrice=user SL price, boTgtPrice=user TP price, boStpLoss=0
-		// - LIMIT BO:  limitPrice=entry limit, triggerPrice=user SL price, boTgtPrice=user TP price, boStpLoss=0
-		// All prices use Price2DP so they serialize to exactly 2 decimal places → avoids EG003.
+		// ── Immediate Bracket Order (Case 1: within_range / MARKET) ─────────
 		if order.OrderType == models.OrderTypeMarket {
 			req.LimitPrice = 0
 		} else if order.Price != nil {
-			req.LimitPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.Price))
+			req.LimitPrice = indiraClient.Price2DP(roundClamp(*order.Price))
 		}
 
 		var zero indiraClient.Price2DP = 0.0
 		req.BoStpLoss = &zero // always 0 for BO — SL is carried via triggerPrice
 
 		if order.StopLoss != nil {
-			req.TriggerPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.StopLoss))
+			req.TriggerPrice = indiraClient.Price2DP(roundClamp(*order.StopLoss))
 		}
 		if order.TakeProfit != nil {
-			tgt := indiraClient.Price2DP(indiraClient.RoundToTick(*order.TakeProfit))
+			tgt := indiraClient.Price2DP(roundClamp(*order.TakeProfit))
 			req.BoTgtPrice = &tgt
 		} else {
 			req.BoTgtPrice = &zero
 		}
 	} else {
 		// Non-bracket orders: limitPrice for limit/SL orders; broker ignores it for Market.
-		// Price2DP ensures the JSON value is "5911.30" not "5911.3", preventing EG003.
 		if order.Price != nil {
-			req.LimitPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.Price))
+			req.LimitPrice = indiraClient.Price2DP(roundClamp(*order.Price))
 		}
-		// Always send stop loss to Indira if present (live orders always carry SL).
 		if order.StopLoss != nil {
-			req.TriggerPrice = indiraClient.Price2DP(indiraClient.RoundToTick(*order.StopLoss))
+			req.TriggerPrice = indiraClient.Price2DP(roundClamp(*order.StopLoss))
+			// Force order type to SL (stoploss-limit) when a trigger price is present.
+			// A plain LIMIT order ignores triggerPrice at the broker — the order must
+			// be SL so it stays pending until price hits the trigger, then fills at limitPrice.
+			req.OrdType = "SL"
 		}
-		// Always send take profit to Indira if present (live orders always carry TP).
-		var zero indiraClient.Price2DP = 0.0
-		if order.TakeProfit != nil {
-			tgt := indiraClient.Price2DP(indiraClient.RoundToTick(*order.TakeProfit))
-			req.BoTgtPrice = &tgt
-		} else {
-			req.BoTgtPrice = &zero
-		}
-		req.BoStpLoss = &zero
+		// Do NOT set BoStpLoss / BoTgtPrice for plain (non-bracket) orders.
+		// The broker interprets any order carrying these fields (even as 0) as a
+		// native bracket/OCO order and requires ordType "RL" or "RL-MKT" for the
+		// main leg (EG003). Our OCO is custom-managed, so the entry is a plain
+		// SL/Limit order — no bracket fields should be sent.
 	}
 
 	return req, nil
@@ -324,16 +438,38 @@ func (c *ExecutionClient) convertToIndiraModifyRequest(order *models.Order) (*in
 		OffMktFlag:    false,
 	}
 
+	// Resolve tick size and DPR concurrently — independent Redis lookups.
+	var tickSize float64
+	var dprLower, dprUpper float64
+	var modLookupWg sync.WaitGroup
+	modLookupWg.Add(2)
+	go func() {
+		defer modLookupWg.Done()
+		tickSize = c.resolveTickSize(symbolBuilder.Exchange, order.StockCode)
+	}()
+	go func() {
+		defer modLookupWg.Done()
+		dprLower, dprUpper = c.resolveDPR(symbolBuilder.Exchange, order.StockCode)
+	}()
+	modLookupWg.Wait()
+
+	round := func(price float64) float64 {
+		return c.roundPrice(price, tickSize)
+	}
+	roundClamp := func(price float64) float64 {
+		return clampDPR(round(price), dprLower, dprUpper)
+	}
+
 	// Set price for limit orders
 	if order.Price != nil {
-		req.LimitPrice = *order.Price
+		req.LimitPrice = roundClamp(*order.Price)
 	}
 
 	// Set trigger price for stop loss orders
 	if (order.OrderType == models.OrderTypeStopLoss ||
 		order.OrderType == models.OrderTypeStopLossMarket) &&
 		order.StopLoss != nil {
-		req.TriggerPrice = *order.StopLoss
+		req.TriggerPrice = roundClamp(*order.StopLoss)
 	}
 
 	return req, nil

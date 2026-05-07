@@ -3,14 +3,17 @@ package kafka
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/correlation"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
+
+const maxHandlerRetries = 3
 
 // NewsConsumer consumes market news events and invokes the handler.
 // It supports Stop() to stop fetching new Kafka messages for graceful shutdown.
@@ -61,30 +64,69 @@ func (n *NewsConsumer) Start(ctx context.Context) error {
 			continue
 		}
 
+		// Extract correlation ID from Kafka headers and propagate through context.
+		corrID := extractCorrelationID(msg)
+		if corrID == "" {
+			corrID = correlation.NewID()
+		}
+		msgCtx := correlation.WithContext(ctx, corrID)
+
 		// Parse MongoDB event
 		var mongoEvent models.MongoDBEvent
 		if err := json.Unmarshal(msg.Value, &mongoEvent); err != nil {
-			n.logger.Error("Failed to unmarshal MongoDB event", zap.Error(err))
+			n.logger.Error("Failed to unmarshal MongoDB event",
+				zap.Error(err),
+				zap.String("correlation_id", corrID))
 			_ = n.reader.CommitMessages(ctx, msg)
 			continue
 		}
 		event, err := mongoEvent.ToMarketEvent()
 		if err != nil {
-			n.logger.Error("Failed to convert MongoDB event", zap.Error(err))
+			n.logger.Error("Failed to convert MongoDB event",
+				zap.Error(err),
+				zap.String("correlation_id", corrID))
 			_ = n.reader.CommitMessages(ctx, msg)
 			continue
 		}
 		if err := event.Validate(); err != nil {
-			n.logger.Warn("Invalid event received", zap.Error(err))
+			n.logger.Warn("Invalid event received",
+				zap.Error(err),
+				zap.String("correlation_id", corrID))
 			_ = n.reader.CommitMessages(ctx, msg)
 			continue
 		}
 
-		if err := n.handler.HandleEvent(ctx, event); err != nil {
-			// fail-fast per event: do not commit to allow retry.
-			return fmt.Errorf("handler error: %w", err)
+		var handleErr error
+		for attempt := 1; attempt <= maxHandlerRetries; attempt++ {
+			if handleErr = n.handler.HandleEvent(msgCtx, event); handleErr == nil {
+				break
+			}
+			n.logger.Warn("Handler error, retrying",
+				zap.Error(handleErr),
+				zap.Int("attempt", attempt),
+				zap.Int("max_retries", maxHandlerRetries),
+				zap.String("event_id", event.EventID),
+				zap.String("correlation_id", corrID))
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+		if handleErr != nil {
+			n.logger.Error("Handler failed after all retries, skipping event",
+				zap.Error(handleErr),
+				zap.String("event_id", event.EventID),
+				zap.Int64("stock_code", event.StockData.StockCode),
+				zap.String("correlation_id", corrID))
 		}
 
 		_ = n.reader.CommitMessages(ctx, msg)
 	}
+}
+
+// extractCorrelationID reads the correlation ID from a Kafka message's headers.
+func extractCorrelationID(msg kafka.Message) string {
+	for _, h := range msg.Headers {
+		if h.Key == correlation.KafkaHeaderKey {
+			return string(h.Value)
+		}
+	}
+	return ""
 }
