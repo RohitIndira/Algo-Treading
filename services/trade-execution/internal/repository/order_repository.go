@@ -49,6 +49,9 @@ type OrderRepository interface {
 	GetFilledPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	GetClosedPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	UpdatePaperTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error
+	// UpdatePaperExitPrice sets paper_exit_price and paper_pnl without changing order status.
+	// Used during strategy deactivation so CancelAllOrdersByStrategy still sets rejection_reason.
+	UpdatePaperExitPrice(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error
 	// CreatePaperPartialExit inserts a partial exit (square-off) record for an ML level
 	// trigger. Unlike Create, it writes filled_quantity, filled_price, paper_exit_price,
 	// paper_pnl, is_square_off_order, and indira_order_id which the generic Create omits.
@@ -105,6 +108,10 @@ type OrderRepository interface {
 	// GetUserSquareOffConfig retrieves the auto square-off config for a user.
 	// Returns ("", false, nil) when no config exists.
 	GetUserSquareOffConfig(ctx context.Context, userID string) (squareOffTime string, enabled bool, err error)
+	// BackfillTodaySquareOffConfig copies auto_square_off_time from today's orders into
+	// user_square_off_config for any user who doesn't already have a row there.
+	// Run once on startup so orders placed before the fix was deployed still fire correctly.
+	BackfillTodaySquareOffConfig(ctx context.Context) (int, error)
 
 	// ── Multi-level exit level operations ─────────────────────────────────────
 	UpsertMultiLevelExitLevel(ctx context.Context, rec *models.MultiLevelExitRecord) error
@@ -114,6 +121,10 @@ type OrderRepository interface {
 	// GetMultiLevelExitLevelsBatch fetches ML levels for multiple entry orders in one query.
 	// Returns a map of entryOrderID → levels slice.
 	GetMultiLevelExitLevelsBatch(ctx context.Context, entryOrderIDs []uuid.UUID) (map[uuid.UUID][]*models.MultiLevelExitRecord, error)
+	// UpdateMLLevelRebalancedQty records a qty reduction caused by the opposite side firing.
+	// original_exit_qty is written only on the first rebalance (subsequent calls preserve it).
+	// rebalance_reason example: "SL_L1_TRIGGERED", "TP_L2_TRIGGERED".
+	UpdateMLLevelRebalancedQty(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, originalQty, newQty int32, reason string) error
 }
 
 type orderRepository struct {
@@ -390,7 +401,7 @@ func (r *orderRepository) GetOpenOrders(ctx context.Context) ([]*models.Order, e
 		AND is_square_off_order = false
 		AND is_paper_trade = false
 		AND strategy_id != ''
-		AND created_at >= CURRENT_DATE
+		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
 		ORDER BY created_at ASC
 	`
 
@@ -670,10 +681,10 @@ func (r *orderRepository) GetDashboardStats(ctx context.Context, userID string, 
 				COALESCE(SUM(
 					COALESCE(filled_price, price, 0) *
 					COALESCE(NULLIF(filled_quantity, 0), quantity, 0)
-				) FILTER (WHERE live_exit_price IS NULL), 0) AS current_invested,
+				) FILTER (WHERE live_exit_price IS NULL AND status != 'CANCELLED'), 0) AS current_invested,
 				COALESCE(SUM(live_pnl) FILTER (WHERE live_exit_price IS NOT NULL), 0) AS realized_pnl,
-				COUNT(*) FILTER (WHERE live_exit_price IS NULL) AS open_count,
-				COUNT(*) FILTER (WHERE live_exit_price IS NOT NULL) AS closed_count
+				COUNT(*) FILTER (WHERE live_exit_price IS NULL AND status != 'CANCELLED') AS open_count,
+				COUNT(*) FILTER (WHERE live_exit_price IS NOT NULL OR status = 'CANCELLED') AS closed_count
 			FROM orders
 			WHERE user_id = $1
 			  AND is_paper_trade = false
@@ -691,10 +702,10 @@ func (r *orderRepository) GetDashboardStats(ctx context.Context, userID string, 
 					COALESCE(SUM(
 						COALESCE(filled_price, price, 0) *
 						COALESCE(NULLIF(filled_quantity, 0), quantity, 0)
-					), 0) AS current_invested,
+					) FILTER (WHERE status != 'CANCELLED'), 0) AS current_invested,
 					0::numeric AS realized_pnl,
-					COUNT(*) AS open_count,
-					0 AS closed_count
+					COUNT(*) FILTER (WHERE status != 'CANCELLED') AS open_count,
+					COUNT(*) FILTER (WHERE status = 'CANCELLED') AS closed_count
 				FROM orders
 				WHERE user_id = $1
 				  AND is_paper_trade = false
@@ -739,6 +750,11 @@ func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strateg
 				WHEN is_paper_trade = true AND filled_price IS NOT NULL AND paper_exit_price IS NULL
 				THEN filled_price
 				ELSE paper_exit_price
+			END,
+			paper_pnl = CASE
+				WHEN is_paper_trade = true AND filled_price IS NOT NULL AND paper_pnl IS NULL
+				THEN 0
+				ELSE paper_pnl
 			END,
 			updated_at = $1
 		WHERE strategy_id = $2
@@ -833,6 +849,26 @@ func (r *orderRepository) UpdatePaperTradeExit(ctx context.Context, orderID uuid
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("paper order not found: %s", orderID)
+	}
+	return nil
+}
+
+// UpdatePaperExitPrice sets paper_exit_price and paper_pnl WITHOUT changing status.
+// Used during strategy deactivation/deletion so that CancelAllOrdersByStrategy can still
+// set rejection_reason and status=CANCELLED in the same bulk pass.
+func (r *orderRepository) UpdatePaperExitPrice(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	query := `
+		UPDATE orders SET
+			paper_exit_price = $1,
+			paper_pnl = $2,
+			updated_at = $3
+		WHERE order_id = $4
+		AND is_paper_trade = true
+		AND paper_exit_price IS NULL
+	`
+	_, err := r.db.ExecContext(ctx, query, exitPrice, pnl, time.Now(), orderID)
+	if err != nil {
+		return fmt.Errorf("failed to update paper exit price for order %s: %w", orderID, err)
 	}
 	return nil
 }
@@ -960,16 +996,20 @@ func (r *orderRepository) GetStrategyNamesByIDs(ctx context.Context, strategyIDs
 // ════════════════════════════════════════════════════════════════════════════
 
 // UpsertMultiLevelExitLevel inserts a new level row or updates it if (entry_order_id, exit_type, level_num) exists.
+// On INSERT: original_exit_qty is set equal to exit_qty (first-computed value, never overwritten).
+// On UPDATE: original_exit_qty is preserved via COALESCE so it always reflects the original.
 func (r *orderRepository) UpsertMultiLevelExitLevel(ctx context.Context, rec *models.MultiLevelExitRecord) error {
 	query := `
 		INSERT INTO multi_level_exit_levels
-			(entry_order_id, exit_type, level_num, price_pct, qty_pct, trigger_price, exit_qty, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(entry_order_id, exit_type, level_num, price_pct, qty_pct,
+			 trigger_price, exit_qty, original_exit_qty, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
 		ON CONFLICT (entry_order_id, exit_type, level_num) DO UPDATE
-		SET trigger_price = EXCLUDED.trigger_price,
-		    exit_qty      = EXCLUDED.exit_qty,
-		    status        = EXCLUDED.status,
-		    updated_at    = NOW()
+		SET trigger_price     = EXCLUDED.trigger_price,
+		    exit_qty          = EXCLUDED.exit_qty,
+		    original_exit_qty = COALESCE(multi_level_exit_levels.original_exit_qty, EXCLUDED.exit_qty),
+		    status            = EXCLUDED.status,
+		    updated_at        = NOW()
 	`
 	_, err := r.db.ExecContext(ctx, query,
 		rec.EntryOrderID, rec.ExitType, rec.LevelNum,
@@ -1033,6 +1073,34 @@ func (r *orderRepository) UpdateMultiLevelLevelBrokerID(
 	_, err := r.db.ExecContext(ctx, query, brokerOrderID, exitOrderID, entryOrderID, exitType, levelNum)
 	if err != nil {
 		return fmt.Errorf("failed to update multi-level broker ID: %w", err)
+	}
+	return nil
+}
+
+// UpdateMLLevelRebalancedQty records a qty reduction caused by the opposite side firing.
+// original_exit_qty is written only on the first rebalance (i.e. when currently NULL)
+// so subsequent rebalances don't overwrite the original first-computed qty.
+func (r *orderRepository) UpdateMLLevelRebalancedQty(
+	ctx context.Context,
+	entryOrderID uuid.UUID,
+	exitType string,
+	levelNum int,
+	originalQty, newQty int32,
+	reason string,
+) error {
+	query := `
+		UPDATE multi_level_exit_levels
+		SET exit_qty          = $1,
+		    original_exit_qty = COALESCE(original_exit_qty, $2),
+		    rebalanced_at     = NOW(),
+		    rebalance_reason  = $3,
+		    updated_at        = NOW()
+		WHERE entry_order_id = $4 AND exit_type = $5 AND level_num = $6
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		newQty, originalQty, reason, entryOrderID, exitType, levelNum)
+	if err != nil {
+		return fmt.Errorf("failed to update ml level rebalanced qty: %w", err)
 	}
 	return nil
 }
@@ -1140,7 +1208,7 @@ func (r *orderRepository) GetOpenOrdersByUser(ctx context.Context, userID string
 		AND is_square_off_order = false
 		AND is_paper_trade = false
 		AND strategy_id != ''
-		AND created_at >= CURRENT_DATE
+		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
 		ORDER BY created_at ASC
 	`
 	err := r.db.SelectContext(ctx, &orders, query, userID)
@@ -1187,4 +1255,34 @@ func (r *orderRepository) GetUserSquareOffConfig(ctx context.Context, userID str
 		return "", false, fmt.Errorf("failed to get square-off config for user %s: %w", userID, err)
 	}
 	return squareOffTime, enabled, nil
+}
+
+// BackfillTodaySquareOffConfig copies auto_square_off_time from today's orders into
+// user_square_off_config for any user who doesn't already have a row there.
+// Only considers orders placed today (IST) with a non-empty auto_square_off_time.
+// Safe to call on every startup — ON CONFLICT skips users already configured.
+func (r *orderRepository) BackfillTodaySquareOffConfig(ctx context.Context) (int, error) {
+	query := `
+		INSERT INTO user_square_off_config (user_id, square_off_time, enabled, updated_at)
+		SELECT DISTINCT ON (user_id)
+			user_id,
+			auto_square_off_time,
+			true,
+			NOW()
+		FROM orders
+		WHERE auto_square_off_time IS NOT NULL
+		  AND auto_square_off_time != ''
+		  AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		ORDER BY user_id, created_at DESC
+		ON CONFLICT (user_id) DO NOTHING
+	`
+	result, err := r.db.ExecContext(ctx, query)
+	if err != nil {
+		if isTableNotFoundErr(err) {
+			return 0, nil // migration 016 not applied yet — skip silently
+		}
+		return 0, fmt.Errorf("failed to backfill square-off config: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
 }

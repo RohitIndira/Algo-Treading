@@ -14,6 +14,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/timezone"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -27,17 +28,8 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 )
 
-// istLocation is IST (UTC+5:30), used to format all timestamps sent to the frontend.
-var istLocation = func() *time.Location {
-	loc, err := time.LoadLocation("Asia/Kolkata")
-	if err != nil {
-		return time.FixedZone("IST", 5*3600+30*60)
-	}
-	return loc
-}()
-
 func fmtIST(t time.Time) string {
-	return t.In(istLocation).Format(time.RFC3339)
+	return t.In(timezone.IST).Format(time.RFC3339)
 }
 
 func fmtISTPtr(t *time.Time) *string {

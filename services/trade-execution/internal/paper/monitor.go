@@ -11,6 +11,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/timezone"
 	"github.com/google/uuid"
 )
 
@@ -1069,35 +1070,67 @@ func computePnL(order *models.Order, ltp float64) float64 {
 }
 
 // SquareOffAll closes all open paper positions across all users.
-// Called by the AutoSquareOffScheduler at market close (15:05 IST).
+// Called by the AutoSquareOffScheduler at market close (15:00 IST).
+//
+// Each order is evaluated individually: orders whose AutoSquareOffTime is set to a
+// time later than now are skipped — their per-user scheduler run handles them at the
+// correct time. This is intentionally per-order (not per-user) so that a user with
+// two strategies — one at the default close and one with a later custom time — has
+// only the first strategy's position closed here.
 func (m *PaperTradeMonitor) SquareOffAll(ctx context.Context) error {
-	// Collect distinct user IDs from the in-memory cache.
+	now := time.Now().In(timezone.IST)
+	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
+
+	// Collect the specific orders that should close right now.
 	m.cacheMu.RLock()
-	userSet := make(map[string]struct{})
+	var toExit []*models.Order
+	affectedUsers := make(map[string]struct{})
 	for _, orders := range m.orderCache {
 		for _, o := range orders {
-			userSet[o.UserID] = struct{}{}
+			if o.AutoSquareOffTime != nil && *o.AutoSquareOffTime > currentTime {
+				log.Printf("[paper-monitor] Auto square-off: skipping order=%s user=%s (custom sq-off at %s, now %s)",
+					o.OrderID, o.UserID, *o.AutoSquareOffTime, currentTime)
+				continue
+			}
+			toExit = append(toExit, o)
+			affectedUsers[o.UserID] = struct{}{}
 		}
 	}
 	m.cacheMu.RUnlock()
 
-	if len(userSet) == 0 {
+	if len(toExit) == 0 {
 		log.Println("[paper-monitor] Auto square-off: no open paper positions")
 		return nil
 	}
 
-	log.Printf("[paper-monitor] Auto square-off: closing positions for %d user(s)", len(userSet))
+	log.Printf("[paper-monitor] Auto square-off: closing %d position(s) across %d user(s)", len(toExit), len(affectedUsers))
+
 	var wg sync.WaitGroup
-	for uid := range userSet {
+	for _, order := range toExit {
+		if _, already := m.exiting.LoadOrStore(order.OrderID, true); already {
+			continue
+		}
+		if m.mlCanceller != nil {
+			m.mlCanceller.CancelGroup(ctx, order.OrderID)
+		}
+		exitPrice := m.resolveExitPrice(ctx, order)
 		wg.Add(1)
-		go func(userID string) {
+		go func(o *models.Order, price float64) {
 			defer wg.Done()
-			if err := m.ForceExitAll(ctx, userID); err != nil {
-				log.Printf("[paper-monitor] Auto square-off failed for user %s: %v", userID, err)
-			}
-		}(uid)
+			m.exitPosition(context.Background(), o, price, "SQUARE_OFF")
+		}(order, exitPrice)
 	}
 	wg.Wait()
+
+	// Notify each affected user's WS clients that their positions are closed.
+	if m.wsServer != nil {
+		for uid := range affectedUsers {
+			m.wsServer.Broadcast(uid, PaperUpdate{
+				Type:   "force_exit_done",
+				UserID: uid,
+			})
+		}
+	}
 	return nil
 }
 

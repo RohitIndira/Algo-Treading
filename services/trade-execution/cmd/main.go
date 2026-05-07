@@ -349,6 +349,8 @@ func main() {
 		indiraClient.SetTickSizeLookup(redisPrices)
 		indiraClient.SetDPRLookup(redisPrices)
 		log.Println("✓ Dynamic tick size + DPR lookup enabled (Redis market data)")
+		// Wire Redis price lookup into strategy events consumer for accurate paper exit PnL
+		strategyEventsConsumer.SetPriceClient(redisPrices)
 	}
 
 	paperExec := executor.NewPaperOrderExecutor(orderRepo, kafkaPub, priceLookup)
@@ -558,6 +560,20 @@ func main() {
 	// Wire per-user paper exit: closes a specific user's paper positions at their custom time.
 	autoSquareOff.SetPaperForceExitUser(paperMonitor.ForceExitAll)
 	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-user: enabled)", cfg.AutoSquareOffTime)
+
+	// Backfill user_square_off_config from today's orders on every startup.
+	// Covers orders placed before the per-user custom square-off fix was deployed,
+	// so users who sent signals with auto_square_off_time earlier today still fire correctly.
+	go func() {
+		bfCtx, bfCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer bfCancel()
+		n, err := orderRepo.BackfillTodaySquareOffConfig(bfCtx)
+		if err != nil {
+			log.Printf("[auto-square-off] Backfill warning: %v", err)
+		} else if n > 0 {
+			log.Printf("[auto-square-off] Backfilled square-off config for %d user(s) from today's orders", n)
+		}
+	}()
 	// ──────────────────────────────────────────────────────────────────────
 
 	// Start services

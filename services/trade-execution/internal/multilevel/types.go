@@ -75,10 +75,11 @@ type ExitLevelConfig struct {
 type ExitLevelState struct {
 	mu sync.Mutex
 
-	LevelNum     int
-	TriggerPrice float64     // Absolute price; set after entry fills
-	ExitQty      int32       // Absolute qty; set after entry fills
-	Status       LevelStatus // PENDING → ACTIVE → TRIGGERED | CANCELLED
+	LevelNum        int
+	TriggerPrice    float64     // Absolute price; set after entry fills
+	ExitQty         int32       // Current effective qty (may be reduced by rebalancing)
+	OriginalExitQty int32       // Qty as first computed from fill — never modified after set
+	Status          LevelStatus // PENDING → ACTIVE → TRIGGERED | CANCELLED
 
 	// For live TP limit orders:
 	BrokerOrderID string

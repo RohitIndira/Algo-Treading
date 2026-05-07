@@ -406,10 +406,13 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 		// SL/TP from the trigger price (LTP).
 		// Leave as 0 for MULTI_LEVEL modes — ML manager computes its own triggers.
-		if !isMultiLevelSL {
+		// Leave as 0 when pct is 0 — user disabled that leg (enable_stop_loss /
+		// enable_take_profit = false on the frontend). Computing ltp*(1±0/100)=ltp
+		// would set SL/TP equal to the entry price and cause an immediate exit.
+		if !isMultiLevelSL && slPct > 0 {
 			orderReq.StopLoss = roundToTickSize(ltp*(1-slPct/100), tickSize)
 		}
-		if !isMultiLevelTP {
+		if !isMultiLevelTP && tpPct > 0 {
 			orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
 		}
 
@@ -465,10 +468,11 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 		// SL/TP from the trigger price (targetMonitorPrice).
 		// Leave as 0 for MULTI_LEVEL modes — ML manager computes its own triggers.
-		if !isMultiLevelSL {
+		// Leave as 0 when pct is 0 — user disabled that leg.
+		if !isMultiLevelSL && slPct > 0 {
 			orderReq.StopLoss = roundToTickSize(targetMonitorPrice*(1-slPct/100), tickSize)
 		}
-		if !isMultiLevelTP {
+		if !isMultiLevelTP && tpPct > 0 {
 			orderReq.TakeProfit = roundToTickSize(targetMonitorPrice*(1+tpPct/100), tickSize)
 		}
 
@@ -498,12 +502,22 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 	default:
 		// ── No pct_change filter: SL/TP from LTP directly ───────────
-		if !isMultiLevelSL {
+		// Leave as 0 when pct is 0 — user disabled that leg.
+		if !isMultiLevelSL && slPct > 0 {
 			orderReq.StopLoss = roundToTickSize(ltp*(1-slPct/100), tickSize)
 		}
-		if !isMultiLevelTP {
+		if !isMultiLevelTP && tpPct > 0 {
 			orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
 		}
+	}
+
+	// Warn when both SL and TP are disabled (pct = 0) on a non-multi-level order.
+	// The position will remain open until manual exit or auto square-off.
+	if !isMultiLevelSL && !isMultiLevelTP && orderReq.StopLoss == 0 && orderReq.TakeProfit == 0 {
+		h.logger.Warn("Order has no SL or TP — position will have no automatic exit protection",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.String("user_id", strategy.UserID),
+			zap.String("symbol", event.StockData.Symbol))
 	}
 
 	// ── Validate order ──────────────────────────────────────────────────

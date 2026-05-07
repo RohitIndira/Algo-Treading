@@ -18,6 +18,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/timezone"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -518,11 +519,7 @@ func parseBrokerTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
 	}
-	ist, err := time.LoadLocation("Asia/Kolkata")
-	if err != nil {
-		ist = time.FixedZone("IST", 5*3600+30*60)
-	}
-	t, err := time.ParseInLocation("02-Jan-2006 15:04:05", s, ist)
+	t, err := time.ParseInLocation("02-Jan-2006 15:04:05", s, timezone.IST)
 	if err != nil {
 		return time.Time{}
 	}

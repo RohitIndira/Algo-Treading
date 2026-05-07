@@ -11,11 +11,8 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/timezone"
 )
-
-// ist is the Indian Standard Time zone (UTC+5:30).
-// All auto square-off times are entered and compared in IST.
-var ist = time.FixedZone("IST", 5*60*60+30*60)
 
 // OrderExecutorFunc executes an order at the broker. Implemented by executor.OrderExecutor.
 type OrderExecutorFunc interface {
@@ -136,7 +133,7 @@ func (s *AutoSquareOffScheduler) Stop() {
 // shouldSquareOff returns true when current IST time matches squareOffTime (live) on a
 // weekday and we haven't already executed today.
 func (s *AutoSquareOffScheduler) shouldSquareOff() bool {
-	now := time.Now().In(ist)
+	now := time.Now().In(timezone.IST)
 	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
 		return false
 	}
@@ -160,7 +157,7 @@ func (s *AutoSquareOffScheduler) shouldSquareOff() bool {
 // shouldPaperSquareOff returns true when current IST time matches paperSquareOffTime on a
 // weekday and paper square-off hasn't already run today.
 func (s *AutoSquareOffScheduler) shouldPaperSquareOff() bool {
-	now := time.Now().In(ist)
+	now := time.Now().In(timezone.IST)
 	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
 		return false
 	}
@@ -193,6 +190,8 @@ func (s *AutoSquareOffScheduler) parseTime(timeStr string) (hour int, minute int
 
 // squareOffAllPositions fetches today's open algo positions and places
 // reverse MARKET/IOC orders to close each one.
+// Orders whose auto_square_off_time is set to a time later than now are skipped —
+// their dedicated per-user scheduler run will handle them at the correct time.
 func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) error {
 	log.Println("[auto-square-off] Fetching today's open INTRADAY algo positions...")
 
@@ -211,6 +210,9 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 
 	log.Printf("[auto-square-off] Found %d open position(s) to square off", len(openOrders))
 
+	now := time.Now().In(timezone.IST)
+	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
+
 	successCount := 0
 	failCount := 0
 
@@ -218,6 +220,14 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 		// Skip orders with zero filled quantity — nothing to reverse
 		if order.FilledQuantity <= 0 {
 			log.Printf("[auto-square-off] Skipping order %s (filled_qty=0)", order.OrderID)
+			continue
+		}
+
+		// Skip orders whose user has set a custom square-off time that's later than now.
+		// Those will be closed by checkUserSquareOffs at their designated time.
+		if order.AutoSquareOffTime != nil && *order.AutoSquareOffTime > currentTime {
+			log.Printf("[auto-square-off] Skipping order %s: user=%s has custom sq-off at %s (now %s)",
+				order.OrderID, order.UserID, *order.AutoSquareOffTime, currentTime)
 			continue
 		}
 
@@ -242,7 +252,7 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 // matching the current IST minute and closes all their positions (paper + live).
 // Runs every minute tick on weekdays. Guards against firing twice per user per day.
 func (s *AutoSquareOffScheduler) checkUserSquareOffs(ctx context.Context) {
-	now := time.Now().In(ist)
+	now := time.Now().In(timezone.IST)
 	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
 		return
 	}

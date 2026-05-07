@@ -106,6 +106,18 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 	idempotencyMs := 0.0 // folded into dbMs — kept for logOrderTiming signature
 	metrics.SignalDBPersistDuration.Observe(time.Since(dbStart).Seconds())
 
+	// Persist custom square-off time so the scheduler can find this user.
+	// The scheduler queries user_square_off_config, not orders.auto_square_off_time,
+	// so without this upsert the per-user custom time would never trigger.
+	if order.AutoSquareOffTime != nil && *order.AutoSquareOffTime != "" {
+		if uErr := p.orderRepo.UpsertUserSquareOffConfig(ctx, order.UserID, *order.AutoSquareOffTime, true); uErr != nil {
+			p.logger.Warn("failed to persist custom square-off time",
+				zap.String("uid", order.UserID),
+				zap.String("time", *order.AutoSquareOffTime),
+				zap.Error(uErr))
+		}
+	}
+
 	// ── Detect multi-level SL / TP config ───────────────────────────────
 	hasMultiLevelSL := len(signal.MultiLevelSL) > 0 && signal.StopLossType == "MULTI_LEVEL"
 	hasMultiLevelTP := len(signal.MultiLevelTP) > 0 && signal.TakeProfitType == "MULTI_LEVEL"

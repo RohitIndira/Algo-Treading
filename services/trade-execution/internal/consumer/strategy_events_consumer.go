@@ -14,6 +14,12 @@ import (
 	"go.uber.org/zap"
 )
 
+// PaperPriceLookup looks up the current LTP for an instrument from Redis.
+// Satisfied by *paper.RedisPriceClient.
+type PaperPriceLookup interface {
+	GetLTP(ctx context.Context, exchange string, token int64) (float64, error)
+}
+
 // configEventType mirrors the event types published by user-config service.
 type configEventType string
 
@@ -41,7 +47,8 @@ type StrategyEventsConsumer struct {
 	reader       *kafka.Reader
 	orderRepo    repository.OrderRepository
 	executor     *executor.OrderExecutor
-	priceMonitor OrderUnwatcher // nil-safe: may be unset if PriceMonitor is disabled
+	priceMonitor OrderUnwatcher    // nil-safe: may be unset if PriceMonitor is disabled
+	priceClient  PaperPriceLookup  // nil-safe: used to get LTP for paper exit PnL
 	logger       *zap.Logger
 }
 
@@ -77,6 +84,11 @@ func NewStrategyEventsConsumer(
 // SetPriceMonitor wires the price monitor so orders are unwatched on strategy deactivation.
 func (c *StrategyEventsConsumer) SetPriceMonitor(pm OrderUnwatcher) {
 	c.priceMonitor = pm
+}
+
+// SetPriceClient wires the Redis price client so paper exits use real LTP instead of entry price.
+func (c *StrategyEventsConsumer) SetPriceClient(pc PaperPriceLookup) {
+	c.priceClient = pc
 }
 
 // Start begins consuming user-config-events. Blocks until ctx is cancelled.
@@ -191,8 +203,46 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 	}
 	wg.Wait()
 
-	// Step 2: bulk-cancel anything still not in a terminal state (paper orders,
+	// Step 2: for filled paper orders, record the actual LTP as exit price so that
+	// the closed positions response shows real PnL instead of zero.
+	// CancelAllOrdersByStrategy (step 3) preserves already-set exit prices and acts
+	// as fallback (entry price, zero PnL) when Redis is unavailable.
+	if c.priceClient != nil {
+		for _, order := range orders {
+			if !order.IsPaperTrade {
+				continue
+			}
+			if order.FilledPrice == nil || order.FilledQuantity == 0 {
+				continue
+			}
+			ltp, ltpErr := c.priceClient.GetLTP(ctx, string(order.Exchange), order.StockCode)
+			if ltpErr != nil {
+				c.logger.Warn("LTP unavailable for paper exit; will fall back to entry price",
+					zap.String("order_id", order.OrderID.String()),
+					zap.String("symbol", order.Symbol),
+					zap.Error(ltpErr))
+				continue
+			}
+			entryPrice := *order.FilledPrice
+			qty := float64(order.FilledQuantity)
+			var pnl float64
+			if order.OrderSide == models.OrderSideBuy {
+				pnl = (ltp - entryPrice) * qty
+			} else {
+				pnl = (entryPrice - ltp) * qty
+			}
+			if updateErr := c.orderRepo.UpdatePaperExitPrice(ctx, order.OrderID, ltp, pnl); updateErr != nil {
+				c.logger.Warn("Failed to set paper exit price",
+					zap.String("order_id", order.OrderID.String()),
+					zap.Error(updateErr))
+			}
+		}
+	}
+
+	// Step 3: bulk-cancel anything still not in a terminal state (paper orders,
 	// pre-broker live orders, FILLED positions, and any broker cancel that failed above).
+	// For paper orders where LTP was unavailable, the CASE expression falls back to
+	// filled_price (zero PnL) so they still appear in the closed positions tab.
 	if err := c.orderRepo.CancelAllOrdersByStrategy(ctx, ev.StrategyID, ev.UserID); err != nil {
 		return fmt.Errorf("closeStrategyPositions: bulk cancel: %w", err)
 	}

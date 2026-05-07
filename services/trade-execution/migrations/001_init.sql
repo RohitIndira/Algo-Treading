@@ -526,18 +526,28 @@ CREATE TABLE IF NOT EXISTS multi_level_exit_levels (
     level_num       INT             NOT NULL CHECK (level_num BETWEEN 1 AND 5),
     price_pct       DECIMAL(10,4)   NOT NULL CHECK (price_pct > 0),
     qty_pct         DECIMAL(10,4)   NOT NULL CHECK (qty_pct > 0),
-    trigger_price   DECIMAL(15,2),
-    exit_qty        INT,
-    status          VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
-    exit_order_id   UUID,
-    broker_order_id VARCHAR(50),
-    triggered_at    TIMESTAMPTZ,
-    exit_price      DECIMAL(15,2),
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    trigger_price    DECIMAL(15,2),
+    exit_qty         INT,
+    status           VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
+    exit_order_id    UUID,
+    broker_order_id  VARCHAR(50),
+    triggered_at     TIMESTAMPTZ,
+    exit_price       DECIMAL(15,2),
+    -- Rebalancing audit columns (set when opposite-side level fires and this
+    -- level's qty is reduced to fit the remaining position size).
+    original_exit_qty INT,           -- qty as first computed from entry fill; never changed after set
+    rebalanced_at     TIMESTAMPTZ,   -- when qty was last reduced
+    rebalance_reason  VARCHAR(50),   -- e.g. "SL_L1_TRIGGERED", "TP_L2_TRIGGERED"
+    created_at        TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
 
     CONSTRAINT uq_ml_entry_type_level UNIQUE (entry_order_id, exit_type, level_num)
 );
+
+-- For existing deployments: add rebalancing audit columns if not present.
+ALTER TABLE multi_level_exit_levels ADD COLUMN IF NOT EXISTS original_exit_qty INT;
+ALTER TABLE multi_level_exit_levels ADD COLUMN IF NOT EXISTS rebalanced_at     TIMESTAMPTZ;
+ALTER TABLE multi_level_exit_levels ADD COLUMN IF NOT EXISTS rebalance_reason  VARCHAR(50);
 
 CREATE INDEX IF NOT EXISTS idx_ml_entry_order ON multi_level_exit_levels(entry_order_id);
 CREATE INDEX IF NOT EXISTS idx_ml_active_sl   ON multi_level_exit_levels(exit_type, status)

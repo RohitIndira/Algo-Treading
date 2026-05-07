@@ -250,9 +250,10 @@ func (m *Manager) computeAndPersistLevels(
 
 		state := group.SLLevels[i]
 		state.mu.Lock()
-		state.TriggerPrice = trigger
-		state.ExitQty = exitQty
-		state.Status = LevelActive
+		state.TriggerPrice    = trigger
+		state.ExitQty         = exitQty
+		state.OriginalExitQty = exitQty // set once; never modified after this
+		state.Status          = LevelActive
 		state.mu.Unlock()
 
 		m.persistLevel(ctx, group.EntryOrderID, models.MLExitTypeSL, cfg, trigger, exitQty)
@@ -271,9 +272,10 @@ func (m *Manager) computeAndPersistLevels(
 
 		state := group.TPLevels[i]
 		state.mu.Lock()
-		state.TriggerPrice = limit
-		state.ExitQty = exitQty
-		state.Status = LevelActive
+		state.TriggerPrice    = limit
+		state.ExitQty         = exitQty
+		state.OriginalExitQty = exitQty // set once; never modified after this
+		state.Status          = LevelActive
 		state.mu.Unlock()
 
 		m.persistLevel(ctx, group.EntryOrderID, models.MLExitTypeTP, cfg, limit, exitQty)
@@ -642,13 +644,20 @@ func (m *Manager) evaluateSLLevels(ctx context.Context, group *Group, ltp float6
 			continue
 		}
 		trigger := level.TriggerPrice
-		exitQty := level.ExitQty
 		levelNum := level.LevelNum
 		level.mu.Unlock()
 
 		if !group.SLBreached(trigger, ltp) {
 			continue
 		}
+
+		// Safety cap: never exit more than what actually remains.
+		group.mu.Lock()
+		exitQty := level.ExitQty
+		if exitQty > group.RemainingQty {
+			exitQty = group.RemainingQty
+		}
+		group.mu.Unlock()
 
 		// For paper trading, exit at the trigger price (the level's configured stop price)
 		// rather than the current LTP. This ensures each level shows its own distinct exit
@@ -706,10 +715,10 @@ func (m *Manager) evaluateSLLevels(ctx context.Context, group *Group, ltp float6
 			}
 		}
 
-		// Cancel the corresponding TP level for this qty slice (both LIVE and PAPER).
+		// Rebalance remaining TP levels so their qty sum equals the new RemainingQty.
 		cancelledTPLevelNum := -1
 		if group.TPMode == TPModeMultiLevel {
-			cancelledTPLevelNum = m.cancelTPLevelForSLFill(ctx, group, levelNum)
+			cancelledTPLevelNum = m.rebalanceTPAfterSLFill(ctx, group, levelNum, remaining)
 		}
 
 		if group.TradingMode != "LIVE" && m.OnPaperLevelTriggered != nil {
@@ -816,13 +825,20 @@ func (m *Manager) evaluateTPLevelsPaper(ctx context.Context, group *Group, ltp f
 			continue
 		}
 		limit := level.TriggerPrice
-		exitQty := level.ExitQty
 		levelNum := level.LevelNum
 		level.mu.Unlock()
 
 		if !group.TPReached(limit, ltp) {
 			continue
 		}
+
+		// Safety cap: never exit more than what actually remains.
+		group.mu.Lock()
+		exitQty := level.ExitQty
+		if exitQty > group.RemainingQty {
+			exitQty = group.RemainingQty
+		}
+		group.mu.Unlock()
 
 		// For paper trading, exit at the level's configured trigger price (not LTP).
 		// This ensures each TP level shows its own distinct exit price even when the
@@ -896,11 +912,10 @@ func (m *Manager) evaluateTPLevelsPaper(ctx context.Context, group *Group, ltp f
 			}
 		}
 
-		// Cancel the SL level with the same level_num — its qty slice is now exited.
-		// This keeps the SL chip display accurate (shows CANCELLED instead of active).
+		// Rebalance remaining SL levels so their qty sum equals the new RemainingQty.
 		cancelledSLLevelNum := -1
 		if group.SLMode == SLModeMultiLevel {
-			cancelledSLLevelNum = m.cancelSLLevelForTPFill(ctx, group, levelNum)
+			cancelledSLLevelNum = m.rebalanceMLSLAfterTPFill(ctx, group, levelNum, remaining)
 		}
 
 		if m.OnPaperLevelTriggered != nil {
@@ -1115,49 +1130,6 @@ func (m *Manager) cancelTPOrder(ctx context.Context, group *Group, level *ExitLe
 	}
 }
 
-// cancelTPLevelForSLFill cancels the TP level corresponding to the same SL level
-// when multi-level SL fires. Returns the cancelled level number, or -1 if none.
-func (m *Manager) cancelTPLevelForSLFill(ctx context.Context, group *Group, slLevelNum int) int {
-	for _, tpLevel := range group.TPLevels {
-		tpLevel.mu.Lock()
-		matches := tpLevel.LevelNum == slLevelNum && tpLevel.Status == LevelActive
-		bid := tpLevel.BrokerOrderID
-		levelNum := tpLevel.LevelNum
-		tpLevel.mu.Unlock()
-
-		if matches && bid != "" && group.TradingMode == "LIVE" {
-			m.cancelTPOrder(ctx, group, tpLevel, bid)
-			return levelNum
-		} else if matches && group.TradingMode == "PAPER" {
-			tpLevel.markCancelled()
-			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeTP, levelNum,
-				models.MLStatusCancelled, 0)
-			return levelNum
-		}
-	}
-	return -1
-}
-
-// cancelSLLevelForTPFill cancels the SL level with the same level_num as the triggered TP level.
-// Called when a TP level fires in paper trading so the now-exited qty slice no longer
-// shows an active SL chip in the UI. Returns the cancelled level number, or -1 if none.
-func (m *Manager) cancelSLLevelForTPFill(ctx context.Context, group *Group, tpLevelNum int) int {
-	for _, slLevel := range group.SLLevels {
-		slLevel.mu.Lock()
-		matches := slLevel.LevelNum == tpLevelNum && slLevel.Status == LevelActive
-		levelNum := slLevel.LevelNum
-		slLevel.mu.Unlock()
-
-		if matches {
-			slLevel.markCancelled()
-			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeSL, levelNum,
-				models.MLStatusCancelled, 0)
-			return levelNum
-		}
-	}
-	return -1
-}
-
 // ── Paper Exit Recording ──────────────────────────────────────────────────────
 
 func (m *Manager) recordPaperPartialExit(ctx context.Context, group *Group, qty int32, exitPrice float64, reason string, levelNum int) {
@@ -1226,6 +1198,258 @@ func (m *Manager) recordPaperPartialExit(ctx context.Context, group *Group, qty 
 			zap.String("group_id", group.GroupID.String()),
 			zap.Error(err))
 	}
+}
+
+// ── Rebalancing ───────────────────────────────────────────────────────────────
+
+// rebalanceTPAfterSLFill replaces cancelTPLevelForSLFill.
+// When SL level slLevelNum fires and reduces RemainingQty:
+//  1. Cancel the same-numbered TP level (its qty slice is fully exited by SL).
+//  2. Proportionally scale down all other remaining active TP levels so their
+//     qty sum equals the new remainingQty.
+//
+// Returns the cancelled same-numbered TP level (or -1 if none).
+//
+// Example:
+//
+//	SL L1 fires (50 qty). RemainingQty = 50.
+//	Active TPs: L2 (30 qty), L3 (40 qty) → pendingTotal = 70
+//	Scale = 50/70
+//	New L2 = floor(30×50/70) = 21
+//	New L3 = 50 − 21 = 29   (last level absorbs rounding)
+func (m *Manager) rebalanceTPAfterSLFill(
+	ctx context.Context,
+	group *Group,
+	slLevelNum int,
+	remainingQty int32,
+) int {
+	reason := fmt.Sprintf("SL_L%d_TRIGGERED", slLevelNum)
+
+	// Step 1: cancel the same-numbered TP level.
+	cancelledNum := -1
+	for _, tp := range group.TPLevels {
+		tp.mu.Lock()
+		matches := tp.LevelNum == slLevelNum && tp.Status == LevelActive
+		bid := tp.BrokerOrderID
+		levelNum := tp.LevelNum
+		origQty := tp.OriginalExitQty
+		tp.mu.Unlock()
+
+		if !matches {
+			continue
+		}
+		cancelledNum = levelNum
+		if bid != "" && group.TradingMode == "LIVE" {
+			m.cancelTPOrder(ctx, group, tp, bid)
+		} else {
+			tp.markCancelled()
+			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID,
+				models.MLExitTypeTP, levelNum, models.MLStatusCancelled, 0)
+		}
+		// Record the cancellation as a zero-qty rebalance for audit completeness.
+		_ = m.repo.UpdateMLLevelRebalancedQty(ctx, group.EntryOrderID,
+			models.MLExitTypeTP, levelNum, origQty, 0, reason)
+		break
+	}
+
+	// Step 2: collect remaining active TP levels (excluding the one just cancelled).
+	type tpEntry struct {
+		state *ExitLevelState
+		qty   int32
+		orig  int32
+	}
+	var active []tpEntry
+	var pendingTotal int32
+	for _, tp := range group.TPLevels {
+		tp.mu.Lock()
+		if tp.Status == LevelActive {
+			active = append(active, tpEntry{tp, tp.ExitQty, tp.OriginalExitQty})
+			pendingTotal += tp.ExitQty
+		}
+		tp.mu.Unlock()
+	}
+
+	if len(active) == 0 || pendingTotal == 0 || remainingQty <= 0 {
+		return cancelledNum
+	}
+
+	// Step 3: scale each remaining TP level proportionally.
+	var allocated int32
+	for i, entry := range active {
+		var newQty int32
+		if i == len(active)-1 {
+			// Last level absorbs rounding so all qtys sum exactly to remainingQty.
+			newQty = remainingQty - allocated
+		} else {
+			newQty = int32(float64(entry.qty) * float64(remainingQty) / float64(pendingTotal))
+		}
+		if newQty < 0 {
+			newQty = 0
+		}
+		allocated += newQty
+
+		entry.state.mu.Lock()
+		entry.state.ExitQty = newQty
+		entry.state.mu.Unlock()
+
+		if newQty == 0 {
+			// Level quantity rounded to zero — cancel it entirely.
+			if entry.state.BrokerOrderID != "" && group.TradingMode == "LIVE" {
+				m.cancelTPOrder(ctx, group, entry.state, entry.state.BrokerOrderID)
+			} else {
+				entry.state.markCancelled()
+				_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID,
+					models.MLExitTypeTP, entry.state.LevelNum, models.MLStatusCancelled, 0)
+			}
+			_ = m.repo.UpdateMLLevelRebalancedQty(ctx, group.EntryOrderID,
+				models.MLExitTypeTP, entry.state.LevelNum, entry.orig, 0, reason)
+			m.logger.Info("ml_tp_level_cancelled_zero_qty_after_rebalance",
+				zap.String("group_id", group.GroupID.String()),
+				zap.Int("tp_level", entry.state.LevelNum),
+				zap.String("reason", reason))
+			continue
+		}
+
+		// Persist rebalanced qty with full audit (original vs new).
+		_ = m.repo.UpdateMLLevelRebalancedQty(ctx, group.EntryOrderID,
+			models.MLExitTypeTP, entry.state.LevelNum, entry.orig, newQty, reason)
+
+		// For live trading: modify the broker LIMIT order to the new qty.
+		if group.TradingMode == "LIVE" && entry.state.BrokerOrderID != "" && group.broker != nil {
+			modOrder := m.buildExitOrder(
+				entry.state.ExitOrderID, group, newQty,
+				entry.state.TriggerPrice, "LIMIT", 0, "TP",
+			)
+			modOrder.IndiraOrderID = &entry.state.BrokerOrderID
+			if err := group.broker.ModifyOrder(ctx, modOrder, group.Auth); err != nil {
+				m.logger.Warn("ml_tp_rebalance_modify_failed",
+					zap.String("group_id", group.GroupID.String()),
+					zap.Int("tp_level", entry.state.LevelNum),
+					zap.Int32("new_qty", newQty),
+					zap.Error(err))
+				// ModifyOrder failed — cancel to avoid over-exit.
+				m.cancelTPOrder(ctx, group, entry.state, entry.state.BrokerOrderID)
+			} else {
+				m.logger.Info("ml_tp_rebalance_modified",
+					zap.String("group_id", group.GroupID.String()),
+					zap.Int("tp_level", entry.state.LevelNum),
+					zap.Int32("original_qty", entry.orig),
+					zap.Int32("new_qty", newQty),
+					zap.String("reason", reason))
+			}
+		} else {
+			m.logger.Info("ml_tp_rebalanced_paper",
+				zap.String("group_id", group.GroupID.String()),
+				zap.Int("tp_level", entry.state.LevelNum),
+				zap.Int32("original_qty", entry.orig),
+				zap.Int32("new_qty", newQty),
+				zap.String("reason", reason))
+		}
+	}
+
+	return cancelledNum
+}
+
+// rebalanceMLSLAfterTPFill replaces cancelSLLevelForTPFill for MULTI_LEVEL SL mode.
+// When TP level tpLevelNum fires and reduces RemainingQty:
+//  1. Cancel the same-numbered SL level (its qty slice is now fully taken profit on).
+//  2. Proportionally scale remaining active SL ExitQty values to sum to remainingQty.
+//
+// For MULTI_LEVEL SL, exits are application-managed (no broker orders), so this
+// is in-memory + DB only. Returns the cancelled same-numbered SL level (or -1).
+func (m *Manager) rebalanceMLSLAfterTPFill(
+	ctx context.Context,
+	group *Group,
+	tpLevelNum int,
+	remainingQty int32,
+) int {
+	reason := fmt.Sprintf("TP_L%d_TRIGGERED", tpLevelNum)
+
+	// Step 1: cancel the same-numbered SL level.
+	cancelledNum := -1
+	for _, sl := range group.SLLevels {
+		sl.mu.Lock()
+		matches := sl.LevelNum == tpLevelNum && sl.Status == LevelActive
+		levelNum := sl.LevelNum
+		origQty := sl.OriginalExitQty
+		sl.mu.Unlock()
+
+		if !matches {
+			continue
+		}
+		cancelledNum = levelNum
+		sl.markCancelled()
+		_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID,
+			models.MLExitTypeSL, levelNum, models.MLStatusCancelled, 0)
+		_ = m.repo.UpdateMLLevelRebalancedQty(ctx, group.EntryOrderID,
+			models.MLExitTypeSL, levelNum, origQty, 0, reason)
+		break
+	}
+
+	// Step 2: collect remaining active SL levels.
+	type slEntry struct {
+		state *ExitLevelState
+		qty   int32
+		orig  int32
+	}
+	var active []slEntry
+	var pendingTotal int32
+	for _, sl := range group.SLLevels {
+		sl.mu.Lock()
+		if sl.Status == LevelActive {
+			active = append(active, slEntry{sl, sl.ExitQty, sl.OriginalExitQty})
+			pendingTotal += sl.ExitQty
+		}
+		sl.mu.Unlock()
+	}
+
+	if len(active) == 0 || pendingTotal == 0 || remainingQty <= 0 {
+		return cancelledNum
+	}
+
+	// Step 3: scale each remaining SL level proportionally.
+	var allocated int32
+	for i, entry := range active {
+		var newQty int32
+		if i == len(active)-1 {
+			newQty = remainingQty - allocated
+		} else {
+			newQty = int32(float64(entry.qty) * float64(remainingQty) / float64(pendingTotal))
+		}
+		if newQty < 0 {
+			newQty = 0
+		}
+		allocated += newQty
+
+		entry.state.mu.Lock()
+		entry.state.ExitQty = newQty
+		entry.state.mu.Unlock()
+
+		if newQty == 0 {
+			entry.state.markCancelled()
+			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID,
+				models.MLExitTypeSL, entry.state.LevelNum, models.MLStatusCancelled, 0)
+			_ = m.repo.UpdateMLLevelRebalancedQty(ctx, group.EntryOrderID,
+				models.MLExitTypeSL, entry.state.LevelNum, entry.orig, 0, reason)
+			m.logger.Info("ml_sl_level_cancelled_zero_qty_after_rebalance",
+				zap.String("group_id", group.GroupID.String()),
+				zap.Int("sl_level", entry.state.LevelNum),
+				zap.String("reason", reason))
+			continue
+		}
+
+		_ = m.repo.UpdateMLLevelRebalancedQty(ctx, group.EntryOrderID,
+			models.MLExitTypeSL, entry.state.LevelNum, entry.orig, newQty, reason)
+
+		m.logger.Info("ml_sl_rebalanced_after_tp",
+			zap.String("group_id", group.GroupID.String()),
+			zap.Int("sl_level", entry.state.LevelNum),
+			zap.Int32("original_qty", entry.orig),
+			zap.Int32("new_qty", newQty),
+			zap.String("reason", reason))
+	}
+
+	return cancelledNum
 }
 
 // ── Group Completion ──────────────────────────────────────────────────────────
