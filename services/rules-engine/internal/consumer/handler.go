@@ -18,10 +18,11 @@ import (
 	"go.uber.org/zap"
 )
 
+
+
 // Handler handles market events
 type Handler struct {
 	engine         *engine.Engine
-	rabbitPubl     *publisher.Publisher
 	kafkaPubl      *publisher.KafkaPublisher
 	signalRepo     *repository.TradeSignalRepository
 	riskClient     *risk.Client
@@ -37,7 +38,6 @@ type Handler struct {
 // NewHandler creates a new event handler
 func NewHandler(
 	eng *engine.Engine,
-	rabbitPubl *publisher.Publisher,
 	kafkaPubl *publisher.KafkaPublisher,
 	signalRepo *repository.TradeSignalRepository,
 	riskClient *risk.Client,
@@ -50,7 +50,6 @@ func NewHandler(
 ) *Handler {
 	return &Handler{
 		engine:         eng,
-		rabbitPubl:     rabbitPubl,
 		kafkaPubl:      kafkaPubl,
 		signalRepo:     signalRepo,
 		riskClient:     riskClient,
@@ -277,6 +276,26 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return nil
 	}
 
+	// ── Daily per-stock lock ─────────────────────────────────────────────────
+	// Once any signal is created for this (strategy, stock) on today's IST date
+	// (and after the strategy's last activation), block further signals for the
+	// rest of that day. Resets next day or when the user reactivates the strategy.
+	alreadyTraded, err := h.signalRepo.HasSignalToday(ctx, strategy.StrategyID, event.StockData.StockCode, strategy.UpdatedAt)
+	if err != nil {
+		h.logger.Error("Failed to check daily signal lock, skipping order to be safe",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.Int64("stock_code", event.StockData.StockCode),
+			zap.Error(err))
+		return nil
+	}
+	if alreadyTraded {
+		h.logger.Info("Skipping — stock already entered for this strategy today",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.String("symbol", event.StockData.Symbol),
+			zap.Int64("stock_code", event.StockData.StockCode))
+		return nil
+	}
+
 	if strategy.TradeConfig.Quantity <= 0 {
 		h.logger.Error("Strategy has invalid quantity in trade_config",
 			zap.String("strategy_id", strategy.StrategyID),
@@ -457,14 +476,10 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 		orderReq.OrderType = "STOP_LOSS"
 		orderReq.Price = targetMonitorPrice // PriceMonitor watches this level
-
-		if isTrailingSL {
-			// Trailing SL → route to custom OCO in trade-execution.
-			orderReq.ProductType = "INTRADAY"
-		} else {
-			// Fixed SL → PriceMonitor will place broker bracket order.
-			orderReq.ProductType = "BRACKET"
-		}
+		// Always BRACKET for below_min — price monitor detects this combination
+		// (STOP_LOSS + BRACKET) to route to watch queue. SL type (FIXED/TRAILING)
+		// is carried by stop_loss_type and handled after the price monitor fires.
+		orderReq.ProductType = "BRACKET"
 
 		// SL/TP from the trigger price (targetMonitorPrice).
 		// Leave as 0 for MULTI_LEVEL modes — ML manager computes its own triggers.
@@ -598,14 +613,6 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	}
 
 	pubWg.Wait()
-
-	// RabbitMQ publish is critical — failure stops the order.
-	if h.rabbitPubl != nil {
-		if err := h.rabbitPubl.PublishOrder(ctx, orderReq); err != nil {
-			h.stats.IncrementRabbitMQErrors()
-			return fmt.Errorf("failed to publish order: %w", err)
-		}
-	}
 
 	h.stats.IncrementOrdersGenerated()
 

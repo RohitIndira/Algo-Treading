@@ -149,14 +149,11 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 		}
 	}
 
-	// Route 4 intercepts: Trailing SL with multi-level TP skips OCO.
-	if isTrailingSL && p.ocoManager != nil && hasAuth && !order.IsPaperTrade && !isMultiLevel {
-		err := p.routeToOCO(ctx, order, signal)
-		p.logOrderTiming(signal, "oco", kafkaTime, processStart, idempotencyMs, dbMs, err)
-		return err
-	}
-
 	// ── Route 2: below_min → Price Monitor ──────────────────────────────
+	// Must be checked BEFORE OCO/trailing-SL routing: a below_min order must wait
+	// for price to reach targetMonitorPrice before any SL strategy is applied.
+	// Detected by STOP_LOSS order type + BRACKET product type (set by rules-engine
+	// for all below_min orders regardless of SL type).
 	isBelowMin := order.OrderType == models.OrderTypeStopLoss &&
 		(order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO")
 
@@ -169,9 +166,59 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 			return fmt.Errorf("below_min order %s has no target price", order.OrderID)
 		}
 
-		p.priceMonitor.Watch(order, targetPrice)
+		// For MULTI_LEVEL orders, routeToMultiLevel cannot run at signal-arrival time
+		// because the order must first wait for price target. Pass a closure that runs
+		// RegisterEntry + OnEntryFill after the price monitor triggers and fills the order.
+		var onAfterFill func(*models.Order)
+		if isMultiLevel && p.multiLevelManager != nil {
+			capturedSignal := signal
+			capturedCtx := ctx
+			onAfterFill = func(filled *models.Order) {
+				slMode := capturedSignal.StopLossType
+				if slMode == "" {
+					slMode = "FIXED"
+				}
+				tpMode := capturedSignal.TakeProfitType
+				if tpMode == "" {
+					tpMode = "FIXED"
+				}
+				var auth *indiraClient.AuthContext
+				if filled.BearerToken != nil && filled.AppId != nil && filled.Source != nil {
+					auth = &indiraClient.AuthContext{
+						UserId:      filled.UserID,
+						BearerToken: *filled.BearerToken,
+						AppId:       *filled.AppId,
+						Source:      *filled.Source,
+					}
+				}
+				p.multiLevelManager.RegisterEntry(
+					filled, slMode, tpMode,
+					capturedSignal.MultiLevelSL, capturedSignal.MultiLevelTP,
+					capturedSignal.StopLossPct, capturedSignal.TrailingSLPct,
+					auth,
+				)
+				if filled.IsPaperTrade && filled.FilledQuantity > 0 && filled.FilledPrice != nil {
+					p.multiLevelManager.OnEntryFill(
+						capturedCtx, filled.OrderID, *filled.FilledPrice, filled.FilledQuantity,
+						capturedSignal.MultiLevelSL, capturedSignal.MultiLevelTP,
+					)
+				}
+			}
+		}
+
+		p.priceMonitor.Watch(order, targetPrice, onAfterFill)
 		p.logOrderTiming(signal, "price_monitor", kafkaTime, processStart, idempotencyMs, dbMs, nil)
 		return nil
+	}
+
+	// ── Route 1: Trailing SL → Custom OCO ───────────────────────────────
+	// NOTE: Trailing SL + Multi-level TP is handled by Route 4 (multi-level),
+	// NOT by Route 1 (OCO), because multi-level TP requires N separate LIMIT orders.
+	// Route 4 intercepts: Trailing SL with multi-level TP skips OCO.
+	if isTrailingSL && p.ocoManager != nil && hasAuth && !order.IsPaperTrade && !isMultiLevel {
+		err := p.routeToOCO(ctx, order, signal)
+		p.logOrderTiming(signal, "oco", kafkaTime, processStart, idempotencyMs, dbMs, err)
+		return err
 	}
 
 	// ── Route 4: Multi-level SL / TP ────────────────────────────────────

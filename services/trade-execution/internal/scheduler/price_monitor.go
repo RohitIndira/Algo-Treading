@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -24,6 +25,8 @@ type LTPProvider interface {
 	// keys are in the format "exchange:token" (e.g. "nse:2475").
 	// Returns a map of key → LTP. Missing/invalid keys are omitted from the result.
 	GetLTPs(ctx context.Context, keys []string) (map[string]float64, error)
+	// GetTickSize returns the instrument tick size stored in Redis market data.
+	GetTickSize(ctx context.Context, exchange string, token int64) (float64, error)
 }
 
 // MarketWSClient provides real-time LTP from WebSocket (primary price source).
@@ -58,6 +61,11 @@ type watchEntry struct {
 	triggered       int32   // atomic: 1 = already triggered
 	triggerAttempts int32   // atomic: number of times trigger+execute has been attempted
 	stockKey        string  // cached "exchange:token" key for deduplication
+	// onAfterFill is called after a successful ExecuteOrder. Used by the signal
+	// processor to wire multi-level exit setup for below_min + MULTI_LEVEL orders,
+	// where routeToMultiLevel cannot run at signal-arrival time (order must wait
+	// for price target first). Nil for all non-multi-level orders.
+	onAfterFill func(order *models.Order)
 }
 
 // stockShard holds the watches for a subset of stocks, behind its own lock.
@@ -181,7 +189,10 @@ func (pm *PriceMonitor) SetWSClient(ws MarketWSClient) {
 // Watch registers an order for price monitoring.
 // targetPrice is the price level at which the order should be triggered.
 // Automatically subscribes the token on the WSS client for real-time prices.
-func (pm *PriceMonitor) Watch(order *models.Order, targetPrice float64) {
+// Watch registers an order for price monitoring. onAfterFill is an optional
+// callback invoked after a successful ExecuteOrder (used for multi-level setup
+// on below_min orders). Pass nil when not needed.
+func (pm *PriceMonitor) Watch(order *models.Order, targetPrice float64, onAfterFill func(*models.Order)) {
 	key := stockKey(string(order.Exchange), order.StockCode)
 	shard := pm.shards[shardFor(key)]
 
@@ -201,6 +212,7 @@ func (pm *PriceMonitor) Watch(order *models.Order, targetPrice float64) {
 		targetPrice: targetPrice,
 		maxPrice:    maxPrice,
 		stockKey:    key,
+		onAfterFill: onAfterFill,
 	}
 	shard.byOrder[order.OrderID] = entry
 	shard.byStock[key] = append(shard.byStock[key], entry)
@@ -600,14 +612,36 @@ func (pm *PriceMonitor) triggerOrder(ctx context.Context, entry *watchEntry, ltp
 	// Set limit price = LTP + 0.5% buffer to cross the spread and fill immediately.
 	order.OrderType = models.OrderTypeLimit
 	adjustedLimit := ltp * 1.005
-	// Round to NSE tick size (0.05) using integer paise arithmetic
-	paise := int64(adjustedLimit*100 + 0.5) // math.Round equivalent
-	paise = ((paise + 2) / 5) * 5
-	roundedLimit := float64(paise) / 100.0
-	order.Price = &roundedLimit // limit price with 0.5% buffer for immediate fill
 
-	log.Printf("[price-monitor] Limit price set: LTP=%.2f → limit=%.2f (+0.5%% buffer)",
-		ltp, roundedLimit)
+	// Fetch per-instrument tick size from Redis; fall back to NSE default (0.05).
+	tickSize := 0.05
+	if pm.ltpProvider != nil {
+		if ts, err := pm.ltpProvider.GetTickSize(ctx, string(order.Exchange), order.StockCode); err == nil && ts > 0 {
+			tickSize = ts
+		}
+	}
+	roundedLimit := indiraClient.RoundToTickSize(adjustedLimit, tickSize)
+	order.Price = &roundedLimit
+
+	// Recompute SL/TP from the actual fill price (roundedLimit) rather than
+	// targetMonitorPrice. SL/TP were set as targetMonitorPrice*(1±slPct/100),
+	// so the ratio order.StopLoss/targetPrice preserves (1-slPct/100) exactly.
+	targetPrice := entry.targetPrice
+	if targetPrice > 0 {
+		if order.StopLoss != nil && *order.StopLoss > 0 {
+			ratio := *order.StopLoss / targetPrice
+			newSL := indiraClient.RoundToTickSize(roundedLimit*ratio, tickSize)
+			order.StopLoss = &newSL
+		}
+		if order.TakeProfit != nil && *order.TakeProfit > 0 {
+			ratio := *order.TakeProfit / targetPrice
+			newTP := indiraClient.RoundToTickSize(roundedLimit*ratio, tickSize)
+			order.TakeProfit = &newTP
+		}
+	}
+
+	log.Printf("[price-monitor] Limit price set: LTP=%.2f → limit=%.2f (+0.5%% buffer, tick=%.2f)",
+		ltp, roundedLimit, tickSize)
 
 	// Record the trigger event
 	if pm.orderRepo != nil {
@@ -647,7 +681,10 @@ func (pm *PriceMonitor) triggerOrder(ctx context.Context, entry *watchEntry, ltp
 		}
 	}
 
-	// Call the executor to place the order at broker
+	// Call the executor to place the order at broker.
+	// For paper trades: fills synchronously and sets order.FilledPrice/FilledQuantity.
+	// onAfterFill (if set) is called on success to wire ML exit setup for
+	// below_min + MULTI_LEVEL orders.
 	if err := pm.executeFn.ExecuteOrder(ctx, order); err != nil {
 		attempts := atomic.AddInt32(&entry.triggerAttempts, 1)
 		log.Printf("[price-monitor] ✗ Failed to execute triggered order %s (trigger attempt %d/%d): %v",
@@ -668,6 +705,10 @@ func (pm *PriceMonitor) triggerOrder(ctx context.Context, entry *watchEntry, ltp
 	pm.Unwatch(order.OrderID)
 	log.Printf("[price-monitor] ✓ Order %s executed and removed from watch list (remaining: %d)",
 		order.OrderID, pm.WatchCount())
+
+	if entry.onAfterFill != nil {
+		entry.onAfterFill(order)
+	}
 }
 
 // CancelWatch removes an order from monitoring and marks it as CANCELLED in the DB.
@@ -831,7 +872,7 @@ func (pm *PriceMonitor) reloadFromDB(ctx context.Context) error {
 			log.Printf("[price-monitor] Skipping order %s — no target price set", order.OrderID)
 			continue
 		}
-		pm.Watch(order, *order.Price)
+		pm.Watch(order, *order.Price, nil)
 	}
 
 	if len(orders) > 0 {

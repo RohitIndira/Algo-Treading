@@ -674,6 +674,109 @@ func (r *StrategyRepository) DeactivateAllActive(ctx context.Context) (int, erro
 	return len(rows), nil
 }
 
+// DeactivateAllActiveByMode deactivates every active, non-deleted strategy whose
+// trading_mode matches the given mode ("PAPER" or "LIVE"). Writes one
+// STRATEGY_DEACTIVATED outbox entry per strategy. Returns the count deactivated.
+func (r *StrategyRepository) DeactivateAllActiveByMode(ctx context.Context, tradingMode string) (int, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	type deactivatedRow struct {
+		StrategyID uuid.UUID `db:"strategy_id"`
+		UserID     string    `db:"user_id"`
+		Version    int64     `db:"version"`
+	}
+
+	updateQuery := `
+		UPDATE strategies
+		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
+		WHERE active = true AND deleted_at IS NULL AND trading_mode = $1
+		RETURNING strategy_id, user_id, version`
+
+	rows := []deactivatedRow{}
+	if err := tx.SelectContext(ctx, &rows, updateQuery, tradingMode); err != nil {
+		return 0, fmt.Errorf("failed to bulk-deactivate %s strategies: %w", tradingMode, err)
+	}
+
+	if len(rows) == 0 {
+		return 0, tx.Commit()
+	}
+
+	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
+	for _, row := range rows {
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"strategy_id": row.StrategyID,
+			"user_id":     row.UserID,
+			"version":     row.Version,
+			"active":      false,
+		})
+		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", string(payloadBytes)); err != nil {
+			return 0, fmt.Errorf("failed to insert outbox entry for strategy %s: %w", row.StrategyID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit %s strategy deactivation: %w", tradingMode, err)
+	}
+
+	return len(rows), nil
+}
+
+// DeactivateActiveByAutoSquareOffTime deactivates all active strategies that have
+// enable_auto_square_off=true and auto_square_off_time matching squareOffTime (HH:MM).
+// Writes one STRATEGY_DEACTIVATED outbox entry per deactivated strategy.
+func (r *StrategyRepository) DeactivateActiveByAutoSquareOffTime(ctx context.Context, squareOffTime string) (int, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	type deactivatedRow struct {
+		StrategyID uuid.UUID `db:"strategy_id"`
+		UserID     string    `db:"user_id"`
+		Version    int64     `db:"version"`
+	}
+
+	updateQuery := `
+		UPDATE strategies
+		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
+		WHERE active = true AND deleted_at IS NULL
+		  AND enable_auto_square_off = true AND auto_square_off_time = $1
+		RETURNING strategy_id, user_id, version`
+
+	rows := []deactivatedRow{}
+	if err := tx.SelectContext(ctx, &rows, updateQuery, squareOffTime); err != nil {
+		return 0, fmt.Errorf("failed to deactivate strategies at sq-off time %s: %w", squareOffTime, err)
+	}
+
+	if len(rows) == 0 {
+		return 0, tx.Commit()
+	}
+
+	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
+	for _, row := range rows {
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"strategy_id": row.StrategyID,
+			"user_id":     row.UserID,
+			"version":     row.Version,
+			"active":      false,
+		})
+		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", string(payloadBytes)); err != nil {
+			return 0, fmt.Errorf("failed to insert outbox entry for strategy %s: %w", row.StrategyID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit deactivation at sq-off time %s: %w", squareOffTime, err)
+	}
+
+	return len(rows), nil
+}
+
 // GetByIDs retrieves multiple strategies by their IDs
 func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UUID) ([]*models.Strategy, error) {
 	if len(strategyIDs) == 0 {
