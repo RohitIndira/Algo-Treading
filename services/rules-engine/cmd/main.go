@@ -179,8 +179,7 @@ func main() {
 	// Initialize event handler
 	eng := engine.New(store, engine.Config{Workers: cfg.Performance.WorkerCount}, logger)
 	eng.Start(ctx)
-	// RabbitMQ is intentionally not initialized (Kafka-only publishing).
-	handler := consumer.NewHandler(eng, nil, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours, holidayChecker)
+	handler := consumer.NewHandler(eng, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours, holidayChecker)
 
 	// Step 5: Start config consumer BEFORE news consumer
 	configReader := kafka.NewReader(kafka.ReaderConfig{
@@ -260,7 +259,7 @@ func main() {
 		zap.Int64("total_events_processed", stats.TotalEventsProcessed),
 		zap.Int64("total_matches_found", stats.TotalMatchesFound),
 		zap.Int64("total_orders_generated", stats.TotalOrdersGenerated),
-		zap.Int64("total_errors", stats.EvaluationErrors+stats.KafkaErrors+stats.RabbitMQErrors))
+		zap.Int64("total_errors", stats.EvaluationErrors+stats.KafkaErrors))
 
 	logger.Info("Rules Engine Service shutdown complete")
 }

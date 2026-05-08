@@ -107,27 +107,6 @@ services:
       - trading-network
     restart: unless-stopped
 
-  rabbitmq:
-    image: rabbitmq:3.12-management-alpine
-    container_name: trading-rabbitmq
-    hostname: rabbitmq
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-    volumes:
-      - rabbitmq-data:/var/lib/rabbitmq
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: unless-stopped
-
   # ===== APPLICATION SERVICES =====
 
   api-gateway:
@@ -236,7 +215,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      rabbitmq:
+      kafka:
         condition: service_healthy
     networks:
       - trading-network
@@ -274,6 +253,4 @@ volumes:
   zookeeper-data:
     driver: local
   zookeeper-logs:
-    driver: local
-  rabbitmq-data:
     driver: local

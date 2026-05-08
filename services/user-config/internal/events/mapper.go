@@ -23,16 +23,12 @@ func ToFullConfigEvent(eventType ConfigEventType, s *models.Strategy) *ConfigEve
 }
 
 // ToThinConfigEvent builds a ConfigEvent with NO strategy payload.
-// Use for: CONFIG_DELETED, CONFIG_PAUSED, CONFIG_RESUMED.
+// Use for: CONFIG_DELETED, CONFIG_PAUSED.
 //
-// CONFIG_RESUMED is thin (config=nil) because:
-// Rule Engine keeps strategy in its byUser paused index on PAUSE.
-// On RESUME it re-activates from that index — it already has full config.
-// Sending full config again on RESUME is redundant.
-//
-// If Rule Engine does NOT have the strategy in its paused index
-// (e.g. it restarted between PAUSE and RESUME), it will bulk-reload
-// from DB at next startup anyway.
+// NOTE: Do NOT use for CONFIG_RESUMED / STRATEGY_ACTIVATED — a thin resume
+// silently no-ops in the rules engine when the strategy is absent from its
+// in-memory Paused map (e.g. after a restart). Use ToFullConfigEvent with
+// ConfigUpdated for activation so ApplyUpsert runs unconditionally.
 func ToThinConfigEvent(eventType ConfigEventType, userID string, strategyID string, version uint64) *ConfigEvent {
 	return &ConfigEvent{
 		Type:       eventType,
