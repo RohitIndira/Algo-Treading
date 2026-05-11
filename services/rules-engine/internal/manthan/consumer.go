@@ -110,10 +110,11 @@ func NewConsumer(
 //   - New strategy created → CatchUpNewStrategy replays today's signals from Redis
 //   - Next day → new signals allocated to all strategies (including yesterday's)
 func (c *Consumer) Start(ctx context.Context) {
-	c.logger.Info("Manthan signal consumer started", zap.String("topic", c.reader.Config().Topic))
+	c.logger.Info("Manthan signal consumer started (manual-commit mode)",
+		zap.String("topic", c.reader.Config().Topic))
 
 	for {
-		msg, err := c.reader.ReadMessage(ctx)
+		msg, err := c.reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				c.logger.Info("Manthan consumer shutting down")
@@ -125,13 +126,36 @@ func (c *Consumer) Start(ctx context.Context) {
 
 		var signal ManthanSignal
 		if err := json.Unmarshal(msg.Value, &signal); err != nil {
-			c.logger.Warn("Failed to unmarshal manthan signal",
+			// Poison message — can never parse. Commit and skip so it doesn't
+			// block the partition.
+			c.logger.Warn("Failed to unmarshal manthan signal — dropping",
 				zap.Error(err), zap.String("raw", string(msg.Value)))
+			if cmErr := c.reader.CommitMessages(ctx, msg); cmErr != nil {
+				c.logger.Warn("Commit (poison drop) failed", zap.Error(cmErr))
+			}
 			continue
 		}
 
+		// storeSignal writes the Redis cache + manthan_signals (already
+		// written by data-ingestion is the authoritative source); processSignal
+		// runs the allocator and publishes entry orders. Either step failing
+		// would normally leak the message via ReadMessage's auto-commit.
+		// With FetchMessage we hold the offset until both succeed (or we
+		// decide the failure is non-retryable).
 		c.storeSignal(ctx, signal)
 		c.processSignal(ctx, signal)
+
+		// Commit AFTER processing. `processSignal` already logs internally
+		// for every skip/error path; if the allocator/publisher hits a
+		// transient Kafka issue, processSignal swallows it (best-effort
+		// publish). The DB-authoritative `manthan_signals` table means a
+		// restart-time WarmUpCache will re-process today's signals anyway,
+		// so we always commit here — the partition shouldn't get stuck on
+		// a single signal that can't be allocated.
+		if cmErr := c.reader.CommitMessages(ctx, msg); cmErr != nil {
+			c.logger.Warn("Manthan signal commit failed (redelivery on restart is safe)",
+				zap.String("symbol", signal.Symbol), zap.Error(cmErr))
+		}
 	}
 }
 

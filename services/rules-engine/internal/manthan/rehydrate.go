@@ -81,8 +81,42 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 
 		strategy := strategyByID(strategyID)
 		if strategy == nil {
-			// Orphan — strategy was soft-deleted while position was ACTIVE.
-			// Mark EXITED in DB + evict Redis + remove from active set.
+			// Configstore doesn't show this strategy as Active. Two causes:
+			//   1. Genuine orphan — strategy was soft-deleted while the
+			//      position was ACTIVE. Position should be cleaned up.
+			//   2. Startup race — the config consumer is still replaying
+			//      `user-config-events` from FirstOffset. The strategy is
+			//      transiently in Paused (after a DEACTIVATED event, before
+			//      the matching ACTIVATED catches up). Cleaning up here
+			//      would WRONGLY mark a live position as orphan. This bit
+			//      us 2026-05-11: three real positions got EXITED in DB
+			//      because the configstore showed the strategy as
+			//      not-Active for ~500ms during the replay window.
+			//
+			// Resolution: consult `strategies.deleted_at` directly. The DB
+			// is the source of truth for "is this strategy alive?". Only
+			// orphan-cleanup when the DB confirms soft-deletion.
+			isDeleted, dbErr := isStrategySoftDeleted(ctx, db, strategyID)
+			if dbErr != nil {
+				pm.logger.Warn("Rehydrate: strategies DB lookup failed — skipping (no orphan cleanup, no restore)",
+					zap.String("strategy_id", strategyID),
+					zap.String("symbol", symbol),
+					zap.Error(dbErr))
+				continue
+			}
+			if !isDeleted {
+				// Strategy is alive in DB; configstore just hasn't caught up.
+				// Don't restore in-memory (the config consumer will populate
+				// the configstore shortly), don't touch DB. The orphan
+				// scanner reruns every 60s and will retry once the race
+				// window has closed.
+				pm.logger.Warn("Rehydrate: strategy not yet in configstore but alive in DB — skipping (config-consumer replay race)",
+					zap.String("strategy_id", strategyID),
+					zap.String("symbol", symbol))
+				continue
+			}
+
+			// Genuine orphan — strategy is soft-deleted in DB.
 			if _, err := db.ExecContext(ctx, `
 				UPDATE manthan_positions
 				SET status = 'EXITED', exit_reason = 'ORPHAN_CLEANUP',
@@ -99,7 +133,7 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 				rdb.SRem(ctx, "manthan:positions:active", setMember)
 			}
 			orphans++
-			pm.logger.Warn("Rehydrate: orphan position cleaned up",
+			pm.logger.Warn("Rehydrate: orphan position cleaned up (strategy soft-deleted in DB)",
 				zap.String("strategy_id", strategyID),
 				zap.String("symbol", symbol))
 			continue
@@ -240,7 +274,25 @@ func (pm *PortfolioManager) CleanupOrphans(
 		if strategyByID(rk.strategyID) != nil {
 			continue // strategy still loaded — not an orphan
 		}
-		// Also drop from in-memory portfolio if it was rehydrated earlier.
+		// Configstore-miss alone isn't enough to destroy a position. Confirm
+		// against DB truth (`strategies.deleted_at`) before EXITing. Same
+		// reasoning as the boot-time rehydrate — see isStrategySoftDeleted
+		// doc for the contract.
+		isDeleted, dbErr := isStrategySoftDeleted(ctx, db, rk.strategyID)
+		if dbErr != nil {
+			pm.logger.Warn("Orphan scanner: DB lookup failed — skipping",
+				zap.String("strategy_id", rk.strategyID),
+				zap.String("symbol", rk.symbol), zap.Error(dbErr))
+			continue
+		}
+		if !isDeleted {
+			// Configstore lag (e.g. operator-initiated pause that the
+			// scanner observed in a transient window). Skip silently.
+			continue
+		}
+
+		// Genuine orphan — also drop from in-memory portfolio if it was
+		// rehydrated earlier.
 		pm.mu.Lock()
 		if p, ok := pm.portfolios[rk.strategyID]; ok {
 			delete(p.Positions, rk.symbol)
@@ -263,11 +315,42 @@ func (pm *PortfolioManager) CleanupOrphans(
 			rdb.SRem(ctx, "manthan:positions:active", fmt.Sprintf("%s:%s", rk.strategyID, rk.symbol))
 		}
 		cleaned++
-		pm.logger.Warn("Orphan position cleaned up (periodic scan)",
+		pm.logger.Warn("Orphan position cleaned up (strategy soft-deleted in DB)",
 			zap.String("strategy_id", rk.strategyID),
 			zap.String("symbol", rk.symbol))
 	}
 	return cleaned, nil
+}
+
+// isStrategySoftDeleted is the DB-truth check used by both the boot-time
+// rehydrate and the periodic orphan scanner before they EXIT a position
+// for "orphan" reasons. We can't rely on the configstore here — that view
+// is racy at startup (config consumer replay) and transient on pause.
+//
+// Contract:
+//   - row exists with deleted_at IS NULL  → returns (false, nil)  ← alive
+//   - row exists with deleted_at IS NOT NULL → returns (true,  nil)  ← genuine orphan
+//   - row missing entirely                → returns (true,  nil)  ← also orphan
+//   - query failed                        → returns (false, err)   ← caller skips, safer than wrong cleanup
+//
+// The "missing → orphan" case covers hard-delete (rare; the standard path
+// is soft-delete). Either way the position has no owner.
+func isStrategySoftDeleted(ctx context.Context, db *sql.DB, strategyID string) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("nil DB handle")
+	}
+	var deletedAt sql.NullTime
+	err := db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM strategies WHERE strategy_id = $1`,
+		strategyID).Scan(&deletedAt)
+	if err == sql.ErrNoRows {
+		// Strategy row gone — treat as orphan (very rare; soft-delete is the norm).
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("strategies lookup: %w", err)
+	}
+	return deletedAt.Valid, nil
 }
 
 // StartOrphanScanner runs CleanupOrphans on a ticker. Blocks until ctx
