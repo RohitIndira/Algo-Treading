@@ -89,6 +89,7 @@ func main() {
 	// Optionally also connects to the external Redis (Indira's market data feed)
 	// to enrich positions + signals with live LTP. Env: EXT_REDIS_ADDR / EXT_REDIS_PASSWORD.
 	var manthanHandler *handlers.ManthanHandler
+	var healthHandler *handlers.HealthHandler
 	{
 		pgHost := envOr("POSTGRES_HOST", "localhost")
 		pgPort := envOr("POSTGRES_PORT", "5432")
@@ -167,6 +168,17 @@ func main() {
 		if signalsDB != nil || positionsDB != nil || ordersDB != nil {
 			manthanHandler = handlers.NewManthanHandler(signalsDB, positionsDB, ordersDB, redisClient, extRedis)
 		}
+
+		// Health probe handler — bootstraps the health_probes table on each
+		// reachable DB and exposes /livez, /readyz, /health. Built here so
+		// it can reuse the same DB/Redis/gRPC handles the rest of the app
+		// uses (probes the SAME pool the production code uses, not a sidecar).
+		healthHandler = handlers.NewHealthHandler(
+			signalsDB, positionsDB, ordersDB,
+			redisClient, extRedis,
+			userConfigClient,
+			nil, /* logger optional; main.go uses log.Printf */
+		)
 	}
 
 	// CORS config
@@ -177,7 +189,7 @@ func main() {
 	}
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

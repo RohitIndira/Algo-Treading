@@ -13,6 +13,7 @@ func NewRouter(
 	websocketHandler *handlers.WebSocketHandler,
 	paperHandler *handlers.PaperTradingHandler,
 	manthanHandler *handlers.ManthanHandler,
+	healthHandler *handlers.HealthHandler,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
 
@@ -20,6 +21,18 @@ func NewRouter(
 
 	// CORS middleware
 	r.Use(middleware.CORS(corsConfig))
+
+	// Health probes — three tiers per the production playbook.
+	// Mounted at root (NOT under /api/v1) so k8s / ALB probes don't have to
+	// know about API versioning.
+	//   /livez   — process alive (always 200 if HTTP works)
+	//   /readyz  — read-only probe of every dependency
+	//   /health  — deep probe: readyz + DB write probe (UPSERT on health_probes)
+	if healthHandler != nil {
+		r.HandleFunc("/livez", healthHandler.Livez).Methods("GET")
+		r.HandleFunc("/readyz", healthHandler.Readyz).Methods("GET")
+		r.HandleFunc("/health", healthHandler.Health).Methods("GET")
+	}
 
 	// /api/v1 prefix
 	api := r.PathPrefix("/api/v1").Subrouter()
@@ -29,7 +42,9 @@ func NewRouter(
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// Health check
+	// Legacy /api/v1/health — keep the gRPC pass-through for backwards
+	// compatibility with existing frontends, but the production probes are
+	// /livez, /readyz, /health at root.
 	api.HandleFunc("/health", userConfigHandler.HealthCheck).Methods("GET")
 
 	// Auth — frontend calls this after SSO login (and on JWT refresh) so the
