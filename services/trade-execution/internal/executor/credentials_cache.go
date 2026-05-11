@@ -3,18 +3,44 @@ package executor
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 )
 
+// cacheTTL bounds the staleness window when the Kafka-based invalidation
+// path drops an event. Even if every USER_CREDENTIALS_UPDATED event were
+// lost forever, a user's cache entry refreshes from DB at most this many
+// seconds after the broker JWT changed.
+//
+// Why 60s: the JWT itself is valid for ~12h, so freshness within a minute
+// is well inside the broker's session window. Shorter means more DB load
+// (~2k–20k users × 1 reload/min); longer means a worse worst-case UX after
+// a missed event. 60s is the sweet spot for the current 1k–10k scale.
+const cacheTTL = 60 * time.Second
+
 type cachedCreds struct {
 	userId, appId, source, bearerToken string
+	loadedAt                           time.Time
 }
 
 // CredentialsCache keeps Indira credentials in memory for active users,
 // eliminating a DB + decrypt round-trip on every order execution.
 //
-// Miss behaviour: load from repository, populate cache, return result.
+// Consistency model: cache is invalidated three independent ways so a
+// missed Kafka event never wedges a user in a stale-JWT loop:
+//
+//   1. Kafka USER_CREDENTIALS_UPDATED event → Invalidate(userID)
+//      (zero-latency happy path; works when the publish succeeds)
+//
+//   2. ErrAuthExpired observed on any broker call → Invalidate(userID)
+//      (zero-latency self-heal; wired via JWTNotifier.OnSessionExpired
+//      in main.go — see the SESSION_EXPIRED fan-out)
+//
+//   3. cacheTTL elapsed since last load → fall through to DB on next Get
+//      (worst-case bound; closes the dual-write gap when both #1 and #2
+//      somehow drop, e.g. the very first call after a silent JWT swap)
+//
 // Thread-safe for concurrent reads and writes.
 type CredentialsCache struct {
 	mu    sync.RWMutex
@@ -30,24 +56,31 @@ func NewCredentialsCache(repo repository.CredentialsRepository) *CredentialsCach
 	}
 }
 
-// Get returns credentials for userID. Cache hit avoids DB; on miss it loads
-// from the repository, stores the result, and returns it.
+// Get returns credentials for userID. Cache hit avoids DB; on miss OR on
+// an entry older than cacheTTL it reloads from the repository, stores the
+// fresh result, and returns it.
 func (c *CredentialsCache) Get(ctx context.Context, userID string) (userId, appId, source, bearerToken string, err error) {
 	c.mu.RLock()
-	if creds, ok := c.cache[userID]; ok {
-		c.mu.RUnlock()
+	creds, ok := c.cache[userID]
+	c.mu.RUnlock()
+	if ok && time.Since(creds.loadedAt) < cacheTTL {
 		return creds.userId, creds.appId, creds.source, creds.bearerToken, nil
 	}
-	c.mu.RUnlock()
 
-	// Cache miss — load from DB (decrypt happens inside repo).
+	// Miss OR expired — load from DB (decrypt happens inside repo).
 	userId, appId, source, bearerToken, err = c.repo.GetIndiraCredentials(ctx, userID)
 	if err != nil {
 		return
 	}
 
 	c.mu.Lock()
-	c.cache[userID] = &cachedCreds{userId, appId, source, bearerToken}
+	c.cache[userID] = &cachedCreds{
+		userId:      userId,
+		appId:       appId,
+		source:      source,
+		bearerToken: bearerToken,
+		loadedAt:    time.Now(),
+	}
 	c.mu.Unlock()
 	return
 }
@@ -69,8 +102,16 @@ func (c *CredentialsCache) Warm(ctx context.Context, userIDs []string) {
 	wg.Wait()
 }
 
-// Invalidate removes userID from the cache (e.g. on bearer-token rotation or logout).
-// The next Get will reload from the repository.
+// Invalidate removes userID from the cache. Triggered by:
+//
+//   - The Kafka USER_CREDENTIALS_UPDATED consumer when SSO refreshes a JWT
+//     (the cache-invalidator interface in consumer/strategy_events_consumer.go)
+//
+//   - The JWTExpiryNotifier's OnSessionExpired callback wired in main.go,
+//     so the FIRST AU004 from any broker call also force-evicts the entry
+//     instead of waiting for cacheTTL.
+//
+// The next Get for that user reloads from the repository.
 func (c *CredentialsCache) Invalidate(userID string) {
 	c.mu.Lock()
 	delete(c.cache, userID)

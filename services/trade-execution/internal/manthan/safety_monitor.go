@@ -229,6 +229,25 @@ func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
 			_ = m.repo.UpdateOrderPlaced(ctx, sl.ID, newBrokerID)
 			_ = m.repo.InsertEvent(ctx, sl.ID, "SL_REPLACED", "CANCELLED", "SL_PLACED",
 				"", sl.TriggerPrice, sl.Qty, "re-placed by safety monitor: "+newBrokerID)
+
+			// Tell rules-engine the SL is back at the broker with a new
+			// broker_order_id and the (still-our-requested) trigger. Without
+			// this, rules-engine's `manthan_positions.broker_order_id` would
+			// keep pointing at the cancelled order, and any reconciler /
+			// audit query would show a dangling row. Emits SL_PLACED — same
+			// envelope shape as the initial placement — so the projector's
+			// existing UPSERT path handles it.
+			if m.eventPub != nil {
+				if entrySignalID, err := m.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); err == nil && entrySignalID != "" {
+					m.eventPub.PublishSLPlaced(ctx,
+						ManthanSignal{
+							OrderID: entrySignalID, UserID: sl.UserID,
+							StrategyID: sl.StrategyID, Symbol: sl.Symbol,
+							TradingMode: "LIVE",
+						},
+						newBrokerID, sl.TriggerPrice, sl.LimitPrice)
+				}
+			}
 			return
 		}
 	}

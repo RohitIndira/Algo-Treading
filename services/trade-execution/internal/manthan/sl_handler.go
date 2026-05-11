@@ -247,6 +247,59 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 		return fmt.Errorf("no active SL order found for %s", signal.Symbol)
 	}
 
+	// RATCHET GUARD — for a long position (SL is SELL-side), the SL trigger
+	// can only move UP. Refuse any modify that would LOWER the broker's
+	// current trigger.
+	//
+	// This is the last line of defence against rules-engine state divergence.
+	// If somehow a stale SL_MODIFY signal slips through (e.g. rules-engine
+	// computed off an internal value that didn't reflect broker DPR-clamping),
+	// applying it at the broker would WIDEN the stop and increase downside
+	// risk on a long position. We refuse and return nil so the inbox marks
+	// the signal DONE (not an error worth retrying — the signal is stale,
+	// the next legitimate trail will land normally).
+	//
+	// Direction-aware: only applies when the SL order is a SELL (i.e. the
+	// position is long). A SELL SL going DOWN means stop loosening. For
+	// short positions (BUY-side SL, future feature) the inverse would apply.
+	if isLongPositionSL(targetSL) && signal.NewSL < targetSL.TriggerPrice {
+		h.logger.Warn("SL modify refused — would LOWER broker stop on a long position",
+			zap.String("symbol", signal.Symbol),
+			zap.Float64("broker_trigger", targetSL.TriggerPrice),
+			zap.Float64("requested_new_sl", signal.NewSL),
+			zap.Float64("delta", targetSL.TriggerPrice-signal.NewSL),
+			zap.String("broker_order_id", targetSL.BrokerOrderID),
+			zap.String("reason", "ratchet violation — rules-engine state likely diverged from broker reality"))
+		// Record this as a position event for forensics — operator can grep
+		// for SL_MODIFY_REJECTED_RATCHET in the audit trail.
+		_ = h.repo.InsertEvent(ctx, targetSL.ID, "SL_MODIFY_REJECTED_RATCHET",
+			"SL_PLACED", "SL_PLACED", "",
+			signal.NewSL, 0,
+			fmt.Sprintf("requested %.2f < broker %.2f (high=%.2f, old_sl=%.2f)",
+				signal.NewSL, targetSL.TriggerPrice, signal.NewHigh, signal.OldSL))
+
+		// Tell rules-engine "broker is at this trigger, sync your state".
+		// We emit SL_PLACED (not SL_MODIFIED) because we don't want the
+		// projector to advance trail state — we're reconciling, not trailing.
+		// Without this the rules-engine's internal pos.CurrentSL stays stale
+		// and the very next tick computes the same wrong new_sl all over again.
+		if h.eventPub != nil {
+			entrySignalID, _ := h.repo.GetEntrySignalIDByOrderID(ctx, targetSL.ID)
+			if entrySignalID != "" {
+				h.eventPub.PublishSLPlaced(ctx,
+					ManthanSignal{
+						OrderID: entrySignalID, UserID: signal.UserID,
+						StrategyID: signal.StrategyID, Symbol: signal.Symbol,
+						TradingMode: signal.TradingMode,
+					},
+					targetSL.BrokerOrderID, targetSL.TriggerPrice, targetSL.LimitPrice)
+			}
+		}
+
+		h.recordCooldown(signal.Symbol)
+		return nil
+	}
+
 	auth := BrokerAuth{
 		UserID:      signal.UserID,
 		BearerToken: signal.BearerToken,
@@ -410,4 +463,21 @@ func (h *SLHandler) recordCooldown(symbol string) {
 	h.cooldownMu.Lock()
 	defer h.cooldownMu.Unlock()
 	h.lastModify[symbol] = time.Now()
+}
+
+// isLongPositionSL reports whether targetSL belongs to a long position, i.e.
+// the SL order is a SELL (entry was BUY → exit is SELL). Used by the ratchet
+// guard in ModifyTrail to decide whether "new_sl < broker_trigger" means
+// "loosening the stop" (only true for long-position SELL-side SLs).
+//
+// Short positions (not yet supported by Manthan but on the roadmap) would
+// have BUY-side SLs where the inverse direction is the loosening direction.
+// Defensive case-insensitive compare; empty OrderSide on legacy rows is
+// treated as long, matching today's BUY-only Manthan strategy.
+func isLongPositionSL(o *ManthanOrder) bool {
+	if o == nil {
+		return false
+	}
+	side := strings.ToUpper(strings.TrimSpace(o.OrderSide))
+	return side == "" || side == "SELL"
 }

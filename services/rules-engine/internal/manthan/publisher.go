@@ -373,6 +373,53 @@ func (p *ManthanPublisher) UpdatePositionFill(ctx context.Context, strategyID, s
 	}
 }
 
+// UpdatePositionSL writes the broker's actual SL trigger price back to
+// manthan_positions and the Redis cache. Called from FillConsumer when a
+// SL_PLACED or SL_MODIFIED event arrives. Only used in LEGACY mode — when
+// the CQRS projector is enabled it owns the manthan_positions update via
+// its transactional path (see position_projector.go SL_PLACED / SL_MODIFIED).
+//
+// Critical for the trailing-SL contract: without this, the broker may have
+// DPR-clamped our initial SL to a tighter trigger (e.g. requested 332.56 →
+// accepted 390), but manthan_positions.current_sl still shows our requested
+// value. Subsequent trail math computed off the stale DB row would emit
+// SL_MODIFY signals BELOW the broker's actual trigger — lowering the stop.
+//
+// Idempotent: same trigger arriving twice produces an identical UPDATE.
+// `WHERE status='ACTIVE'` filters out racing EXIT updates.
+func (p *ManthanPublisher) UpdatePositionSL(ctx context.Context, strategyID, symbol string, brokerTrigger float64) {
+	if brokerTrigger <= 0 {
+		return
+	}
+	if p.db != nil {
+		if _, err := p.db.ExecContext(ctx, `
+			UPDATE manthan_positions
+			SET current_sl = $1, updated_at = NOW()
+			WHERE strategy_id = $2 AND symbol = $3 AND status = 'ACTIVE'`,
+			brokerTrigger, strategyID, symbol); err != nil {
+			p.logger.Warn("UpdatePositionSL DB update failed",
+				zap.String("strategy_id", strategyID),
+				zap.String("symbol", symbol),
+				zap.Float64("trigger", brokerTrigger),
+				zap.Error(err))
+		}
+	}
+
+	if p.rdb != nil {
+		posKey := fmt.Sprintf("manthan:position:%s:%s", strategyID, symbol)
+		existing, err := p.rdb.Get(ctx, posKey).Bytes()
+		if err == nil {
+			var pos map[string]any
+			if json.Unmarshal(existing, &pos) == nil {
+				pos["stop_loss"] = brokerTrigger
+				if updated, mErr := json.Marshal(pos); mErr == nil {
+					p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour)
+				}
+			}
+		}
+	}
+}
+
 // UpdatePortfolioState syncs portfolio summary to DB + Redis.
 // Called after every entry/exit to keep state current.
 func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *Portfolio) {

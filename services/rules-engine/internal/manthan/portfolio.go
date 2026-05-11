@@ -155,6 +155,53 @@ func (pm *PortfolioManager) ConfirmFill(strategyID, symbol string, avgFillPrice 
 	pm.ProcessFillEvent(strategyID, symbol, avgFillPrice, filledQty, filledQty, true, slMgr, slPct)
 }
 
+// UpdateSLFromBroker syncs the in-memory SL trigger to whatever the broker
+// actually has. Called from FillConsumer when SL_PLACED / SL_MODIFIED events
+// arrive carrying the broker's accepted trigger price.
+//
+// Why this is critical: the broker may DPR-clamp our requested SL (e.g. we
+// ask for 332.56, broker accepts 390 because that's the lowest legal stop
+// within today's lower circuit). If we don't sync, the TickHandler's
+// trailing-SL math keeps using our stale internal value, eventually emits
+// an SL_MODIFY with new_sl below the broker's actual trigger, and trade-
+// execution would LOWER the broker stop — widening risk on a long position.
+//
+// The trail ratchet check inside TrailingSLManager.ProcessTick
+// (if newSL <= pos.CurrentSL → no action) does the right thing once
+// pos.CurrentSL reflects broker reality. So all this function needs to do
+// is overwrite CurrentSL when the broker reports back.
+//
+// HighSinceEntry and LastTrailLevel are intentionally NOT touched — those
+// describe price history, not SL state. Touching them would corrupt the
+// trail math.
+//
+// Idempotent: same broker trigger arriving twice is a no-op.
+func (pm *PortfolioManager) UpdateSLFromBroker(strategyID, symbol string, brokerTrigger float64) {
+	if brokerTrigger <= 0 {
+		return
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	p, ok := pm.portfolios[strategyID]
+	if !ok {
+		return
+	}
+	pos, ok := p.Positions[symbol]
+	if !ok {
+		return
+	}
+	if pos.CurrentSL == brokerTrigger {
+		return
+	}
+	pm.logger.Info("In-memory SL synced from broker (closes rules-engine/broker divergence)",
+		zap.String("strategy_id", strategyID),
+		zap.String("symbol", symbol),
+		zap.Float64("old_internal_sl", pos.CurrentSL),
+		zap.Float64("new_broker_sl", brokerTrigger))
+	pos.CurrentSL = brokerTrigger
+}
+
 // ExitPosition marks a position as exited after SL triggered.
 // Adds to cooldown for re-entry logic. Returns realized P&L.
 func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice float64) float64 {

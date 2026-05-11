@@ -514,6 +514,15 @@ func main() {
 		// Indira-WS expiry, so no new message type is needed in the UI.
 		if manthanModule.JWTNotifier != nil {
 			manthanModule.JWTNotifier.SetOnSessionExpired(func(userID string) {
+				// Cache eviction on the FIRST AU004 — closes the dual-write
+				// gap where user-config's DB upsert lands but the Kafka
+				// USER_CREDENTIALS_UPDATED event drops. Without this the
+				// stale JWT would loop forever (no TTL, no Kafka trigger).
+				// See credentials_cache.go for the three-way invalidation
+				// contract this is half of.
+				orderExecutor.CredentialsCache().Invalidate(userID)
+
+				// Frontend "re-login" flash over /ws/live-orders.
 				paperWSServer.BroadcastLiveOrder(userID, paper.LiveOrderUpdate{
 					Type:   "token_expired",
 					UserID: userID,
