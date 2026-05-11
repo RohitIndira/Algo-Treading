@@ -171,27 +171,41 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	} else {
 		log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
 	}
+
+	// Auth-expired detection runs BEFORE the HTTP-status gate because Indira
+	// is inconsistent about what code it returns for AU004:
+	//
+	//   - Sometimes HTTP 200 with body {"infoID":"AU004","data":{}}
+	//   - Sometimes HTTP 401 with body {"infoID":"AU004", ...}
+	//
+	// Without parsing the body first, the 401 case falls into the generic
+	// "HTTP error 401: <body>" path and downstream errors.Is(err, ErrAuthExpired)
+	// returns false — every auth-aware loop (reconciler, safety monitor,
+	// inbox worker, entry handler) misses its short-circuit and keeps
+	// hammering the broker. We hit this bug live on 2026-05-11 during
+	// trade-execution end-to-end testing with a probe-token DB row.
+	//
+	// Parse the body first; if it's a StandardResponse with infoID=AU0**,
+	// return ErrAuthExpired regardless of HTTP code.
+	var stdResp StandardResponse
+	bodyParsedOK := false
+	if jsonErr := json.Unmarshal(responseBody, &stdResp); jsonErr == nil {
+		bodyParsedOK = true
+		if strings.HasPrefix(stdResp.InfoID, "AU0") {
+			return nil, fmt.Errorf("%w: %s %s", ErrAuthExpired, stdResp.InfoID, stdResp.InfoMsg)
+		}
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(responseBody))
 	}
 
-	// Parse response
-	var stdResp StandardResponse
-	if err := json.Unmarshal(responseBody, &stdResp); err != nil {
-		// Some endpoints might return different format, try to handle gracefully
+	// 200-range path: use the parsed stdResp from above, or fall through.
+	if !bodyParsedOK {
 		return &StandardResponse{
-			Success: resp.StatusCode >= 200 && resp.StatusCode < 300,
+			Success: true,
 			Data:    json.RawMessage(responseBody),
 		}, nil
-	}
-
-	// Indira returns HTTP 200 with infoID=AU0xx for auth failures (expired or
-	// invalidated session). The body's `data` field is `{}` in this case, so
-	// downstream parsers fail with cryptic "cannot unmarshal object into []T"
-	// errors. Surface a typed auth error here so callers can branch on
-	// errors.Is(err, ErrAuthExpired) and stop hammering the broker.
-	if strings.HasPrefix(stdResp.InfoID, "AU0") {
-		return nil, fmt.Errorf("%w: %s %s", ErrAuthExpired, stdResp.InfoID, stdResp.InfoMsg)
 	}
 
 	// If the API didn't wrap the payload in a "data" property, make the raw body
