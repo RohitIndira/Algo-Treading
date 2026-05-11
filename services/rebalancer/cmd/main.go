@@ -117,10 +117,24 @@ func main() {
 		logger.Fatal("load eligible signals failed", zap.Error(err))
 	}
 	logger.Info("today's eligible signals", zap.Int("count", len(signals)))
-	if len(signals) == 0 {
-		logger.Info("nothing eligible today — exiting")
-		return
-	}
+	// IMPORTANT: do NOT early-exit when signals is empty.
+	//
+	// The rebalancer has two independent phases:
+	//
+	//   1. TopUp existing positions — driven by EMA-target × per_call vs
+	//      current-invested. The EMA sheet refreshes EVERY DAY after market
+	//      hours, so today's target can differ from yesterday's. Capital
+	//      also moves with P&L, recomputing per_call. Either change creates
+	//      a positive gap that Phase 1 fills — completely independent of
+	//      whether any new ATH-breakout signal arrived today.
+	//
+	//   2. Allocate fresh entries — only fires when new eligible signals
+	//      exist (Allocate naturally returns empty when len(signals)==0).
+	//
+	// Earlier this returned here when signals were empty, silently freezing
+	// top-ups on every signal-less day. Most trading days have no new ATH
+	// signals; under the old behaviour positions stayed at their initial
+	// allocation forever even as EMA targets shifted in the sheet.
 
 	// --- Per-strategy rebalance ---
 	results := []internal.AllocResult{}
