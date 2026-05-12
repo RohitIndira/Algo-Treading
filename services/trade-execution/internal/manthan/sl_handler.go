@@ -187,6 +187,121 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 	}
 }
 
+// MergeTopupSL extends the PARENT SL to cover the combined position after a
+// top-up fill, instead of placing a separate SL for the top-up qty alone.
+//
+// Why: without merging, every MANTHAN_TOPUP fill creates a new SL_SELL on
+// the broker. Over 8 top-ups a single symbol ends up with 8 broker SL rows,
+// only one of which the trail-tick will see (GetActiveSLOrders returns one
+// row per (strategy, symbol) match). The rest stay at their original
+// triggers forever, exposing the position to staggered partial exits — a
+// price dip can fire the lowest SL while the highest stays armed.
+//
+// Approach: ModifyOrder on the parent SL with combined_qty. Indira's
+// modify-order accepts a new qty as long as it's >= already-traded. The
+// new trigger is the higher of (existing_trigger, topup_avg × 0.80) so the
+// SL is never lowered (any prior trailing is preserved).
+//
+// Fallback: if the parent SL can't be located (DB out of sync, or AMO not
+// yet promoted) we fall back to PlaceInitialSL with the top-up qty alone.
+// That recreates the old behaviour for that one top-up — operationally
+// safe (position still SL-protected), just sub-optimal until the operator
+// cleans up the duplicate.
+func (h *SLHandler) MergeTopupSL(
+	ctx context.Context,
+	topupEntryOrderID int64,
+	signal ManthanSignal,
+	info *SymbolInfo,
+	topupQty int,
+	topupAvgPrice float64,
+) {
+	parentSL, err := h.repo.GetActiveSLByEntrySignalID(ctx, signal.TopUpForSignalID)
+	if err != nil || parentSL == nil || parentSL.BrokerOrderID == "" {
+		h.logger.Warn("Top-up SL merge: parent SL not found — placing per-tranche SL as fallback",
+			zap.String("symbol", signal.Symbol),
+			zap.String("parent_signal_id", signal.TopUpForSignalID),
+			zap.Error(err))
+		triggerPrice := topupAvgPrice * 0.80
+		limitPrice := triggerPrice - SLLimitGap(triggerPrice, info.TickSize)
+		h.PlaceInitialSL(ctx, topupEntryOrderID, signal, info, topupQty, triggerPrice, limitPrice)
+		return
+	}
+
+	auth := BrokerAuth{
+		UserID:      signal.UserID,
+		BearerToken: signal.BearerToken,
+		AppID:       signal.AppId,
+		Source:      signal.Source,
+	}
+	if h.authProvider != nil {
+		if fresh := h.authProvider(signal.UserID); fresh != nil {
+			auth = *fresh
+		}
+	}
+
+	combinedQty := parentSL.Qty + topupQty
+	// Ratchet: never lower the broker stop. parentSL.TriggerPrice already
+	// reflects any TSL trailing that ran while we held the original position.
+	newTrigger := parentSL.TriggerPrice
+	if topupBased := topupAvgPrice * 0.80; topupBased > newTrigger {
+		newTrigger = topupBased
+	}
+	if info.DPRLower > 0 && newTrigger < info.DPRLower {
+		newTrigger = info.DPRLower
+	}
+	newLimit := newTrigger - SLLimitGap(newTrigger, info.TickSize)
+	if info.DPRLower > 0 && newLimit < info.DPRLower {
+		newLimit = info.DPRLower
+	}
+
+	h.logger.Info("Top-up SL merge: extending parent SL",
+		zap.String("symbol", signal.Symbol),
+		zap.String("parent_broker_id", parentSL.BrokerOrderID),
+		zap.Int("old_qty", parentSL.Qty),
+		zap.Int("topup_qty", topupQty),
+		zap.Int("combined_qty", combinedQty),
+		zap.Float64("old_trigger", parentSL.TriggerPrice),
+		zap.Float64("new_trigger", newTrigger))
+
+	modErr := h.broker.ModifySLOrder(ctx, auth, info, parentSL.BrokerOrderID,
+		combinedQty, newTrigger, newLimit)
+	if IsAuthError(modErr) && h.refreshAuth != nil {
+		if fresh := h.refreshAuth(signal.UserID); fresh != nil {
+			auth = *fresh
+			modErr = h.broker.ModifySLOrder(ctx, auth, info, parentSL.BrokerOrderID,
+				combinedQty, newTrigger, newLimit)
+		}
+	}
+	if modErr != nil {
+		h.logger.Error("Top-up SL merge: modify failed — falling back to per-tranche SL",
+			zap.String("symbol", signal.Symbol),
+			zap.String("parent_broker_id", parentSL.BrokerOrderID),
+			zap.Error(modErr))
+		triggerPrice := topupAvgPrice * 0.80
+		limitPrice := triggerPrice - SLLimitGap(triggerPrice, info.TickSize)
+		h.PlaceInitialSL(ctx, topupEntryOrderID, signal, info, topupQty, triggerPrice, limitPrice)
+		return
+	}
+
+	// Persist new qty + trigger onto the parent SL row. Without this the next
+	// TSL trail-modify reads the stale parent.qty=13 and would shrink the
+	// broker stop back down to cover only the original tranche.
+	if err := h.repo.UpdateSLAfterTopupMerge(ctx, parentSL.ID, combinedQty, newTrigger, newLimit); err != nil {
+		h.logger.Error("Top-up SL merge: DB update failed — broker is correct but DB drifted",
+			zap.Int64("sl_order_id", parentSL.ID), zap.Error(err))
+	}
+	_ = h.repo.InsertEvent(ctx, parentSL.ID, "SL_MERGED_TOPUP", "SL_PLACED", "SL_PLACED", "",
+		newTrigger, combinedQty,
+		fmt.Sprintf("topup signal=%s: qty %d→%d, trigger %.2f→%.2f",
+			signal.OrderID, parentSL.Qty, combinedQty, parentSL.TriggerPrice, newTrigger))
+
+	// Publish SL_MODIFIED so the rules-engine projector syncs
+	// manthan_positions.current_sl with the new broker-side trigger.
+	if h.eventPub != nil {
+		h.eventPub.PublishSLModified(ctx, signal, parentSL.BrokerOrderID, newTrigger, newLimit, 0)
+	}
+}
+
 // ModifyTrail modifies an existing SL order for trailing SL.
 // Called when rules-engine detects +2% move.
 func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) error {
@@ -197,8 +312,38 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 		return nil
 	}
 
-	// Resolve symbol
-	info, err := h.broker.ResolveSymbol(ctx, signal.Symbol, signal.ISIN)
+	// Find the active SL order BEFORE resolving the symbol. The rules-engine
+	// SL_MODIFY signal omits ISIN (see rules-engine/internal/manthan/order.go
+	// GenerateSLModify — only ENTRY orders carry it), so ResolveSymbol's ISIN
+	// → token Redis lookup ("isin:<ISIN>") returns redis:nil and every modify
+	// retries TRANSIENT forever. The parent SL order row in manthan_orders
+	// already has the resolved ISIN + exchange_token from when we placed it,
+	// so we use that as the authoritative source.
+	slOrders, err := h.repo.GetActiveSLOrders(ctx)
+	if err != nil {
+		return fmt.Errorf("get active SL orders: %w", err)
+	}
+
+	var targetSL *ManthanOrder
+	for _, o := range slOrders {
+		if o.Symbol == signal.Symbol && o.StrategyID == signal.StrategyID {
+			targetSL = o
+			break
+		}
+	}
+
+	if targetSL == nil || targetSL.BrokerOrderID == "" {
+		return fmt.Errorf("no active SL order found for %s", signal.Symbol)
+	}
+
+	// Backfill ISIN from the SL order if the signal didn't carry one — the
+	// rules-engine producer doesn't include it on SL_MODIFY (only on entry).
+	isin := signal.ISIN
+	if isin == "" {
+		isin = targetSL.ISIN
+	}
+
+	info, err := h.broker.ResolveSymbol(ctx, signal.Symbol, isin)
 	if err != nil {
 		return fmt.Errorf("resolve symbol: %w", err)
 	}
@@ -227,24 +372,6 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 			zap.Float64("new_sl", signal.NewSL))
 		h.recordCooldown(signal.Symbol)
 		return nil
-	}
-
-	// LIVE mode — find active SL order and modify
-	slOrders, err := h.repo.GetActiveSLOrders(ctx)
-	if err != nil {
-		return fmt.Errorf("get active SL orders: %w", err)
-	}
-
-	var targetSL *ManthanOrder
-	for _, o := range slOrders {
-		if o.Symbol == signal.Symbol && o.StrategyID == signal.StrategyID {
-			targetSL = o
-			break
-		}
-	}
-
-	if targetSL == nil || targetSL.BrokerOrderID == "" {
-		return fmt.Errorf("no active SL order found for %s", signal.Symbol)
 	}
 
 	// RATCHET GUARD — for a long position (SL is SELL-side), the SL trigger

@@ -662,10 +662,17 @@ func (h *EntryHandler) handleFill(ctx context.Context, orderID int64, result fil
 		zap.Int("qty", result.filledQty),
 		zap.Float64("avg_price", result.avgPrice))
 
-	// Manthan production SL: 20% below actual fill price.
-	slTrigger := result.avgPrice * 0.80
-	slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
-	h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit)
+	// Top-up fill: extend the parent SL to cover combined qty instead of
+	// placing a brand-new SL_SELL. Without this, every top-up accumulates
+	// another broker SL row that the trail-tick can't see.
+	if signal.TopUpForSignalID != "" {
+		h.slHandler.MergeTopupSL(ctx, orderID, signal, info, result.filledQty, result.avgPrice)
+	} else {
+		// First-time entry — fresh SL at 20% below actual fill price.
+		slTrigger := result.avgPrice * 0.80
+		slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
+		h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit)
+	}
 
 	// Publish FILL_CONFIRMED to Kafka — rules-engine overwrites entry with real price
 	if h.eventPub != nil {
@@ -687,11 +694,15 @@ func (h *EntryHandler) handlePartialFill(ctx context.Context, orderID int64, res
 		result.avgPrice, result.filledQty,
 		fmt.Sprintf("accepted %d of %d", result.filledQty, signal.Quantity))
 
-	// Manthan production SL: 20% below actual fill price (partial fill handles
-	// the same — SL covers whatever quantity we ended up with).
-	slTrigger := result.avgPrice * 0.80
-	slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
-	h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit)
+	// Top-up partial fills also merge into parent SL — only the actually-filled
+	// qty is covered (the rest got cancelled with the remainder).
+	if signal.TopUpForSignalID != "" {
+		h.slHandler.MergeTopupSL(ctx, orderID, signal, info, result.filledQty, result.avgPrice)
+	} else {
+		slTrigger := result.avgPrice * 0.80
+		slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
+		h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit)
+	}
 	return orderID, nil
 }
 

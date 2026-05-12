@@ -102,6 +102,19 @@ func (r *Repository) UpdateSLBrokerID(ctx context.Context, id int64, brokerOrder
 	return err
 }
 
+// UpdateSLAfterTopupMerge bumps an existing SL_SELL row's qty + trigger/limit
+// after a top-up fill merged into the parent SL via ModifyOrder. Without this
+// the next trail tick would call ModifySLOrder with the STALE pre-topup qty,
+// which Indira interprets as a request to shrink the SL back down — silently
+// dropping protection on the top-up shares.
+func (r *Repository) UpdateSLAfterTopupMerge(ctx context.Context, id int64, newQty int, newTrigger, newLimit float64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET qty=$1, trigger_price=$2, limit_price=$3, updated_at=NOW()
+		 WHERE id=$4`, newQty, newTrigger, newLimit, id)
+	return err
+}
+
 // CheckDuplicate returns true if a signal_id already exists (idempotency).
 func (r *Repository) CheckDuplicate(ctx context.Context, signalID string) (bool, error) {
 	var count int
