@@ -561,13 +561,36 @@ func (b *BrokerAdapter) PlaceAMOSell(ctx context.Context, auth BrokerAuth, info 
 // GetOrderStatus fetches current order status from broker orderbook.
 // Handles nested response format where orders are under data.orders
 // and symbol is a complex object (not a string).
+//
+// avgPrice contract: when status is Executed/Traded AND tradedQty>0, fetch
+// the qty-weighted average from the trade book (authoritative exchange fill
+// price). The order book ONLY carries the LIMIT price (`price`), not the
+// executed avg — it's literally absent from the response schema. Returning
+// the limit price as "avg" is wrong because:
+//   - Partial-fill orders may execute at multiple prices below the limit
+//   - The downstream SL math uses avgPrice * 0.80 to compute trigger; a 0 or
+//     a wrong avg here cascades into bogus SLs and trail-modifications
+//     (verified live 2026-05-12: 8 entries had entry_price=0 in
+//     manthan_positions because we returned o.LimitPrice — a legacy field
+//     that the Indira API never populates — yielding avg=0).
 func (b *BrokerAdapter) GetOrderStatus(ctx context.Context, auth BrokerAuth, brokerOrderID string) (status string, filledQty int, avgPrice float64, err error) {
 	// First try the standard client
 	orders, clientErr := b.client.GetOrderBook(ctx, b.toIndiraAuth(auth))
 	if clientErr == nil {
 		for _, o := range orders {
 			if o.OrdId == brokerOrderID {
-				return o.Status, o.TradedQty, o.LimitPrice, nil
+				avgPx := o.Price // LIMIT price as fallback if trade book lookup fails
+				if o.TradedQty > 0 && isFilledOrPartialBrokerStatus(o.Status) {
+					if tradeAvg, terr := b.fetchAvgFillPrice(ctx, auth, brokerOrderID); terr == nil && tradeAvg > 0 {
+						avgPx = tradeAvg
+					} else if terr != nil {
+						b.logger.Warn("trade book avg-price lookup failed — using limit price as fallback",
+							zap.String("broker_order_id", brokerOrderID),
+							zap.Float64("limit_price", o.Price),
+							zap.Error(terr))
+					}
+				}
+				return o.Status, o.TradedQty, avgPx, nil
 			}
 		}
 		return "", 0, 0, fmt.Errorf("order %s not found in orderbook", brokerOrderID)
@@ -608,10 +631,56 @@ func (b *BrokerAdapter) getOrderStatusRaw(ctx context.Context, auth BrokerAuth, 
 
 	for _, o := range raw.Orders {
 		if o.OrdId == brokerOrderID {
-			return o.Status, o.TradedQty, o.Price, nil
+			avgPx := o.Price
+			if o.TradedQty > 0 && isFilledOrPartialBrokerStatus(o.Status) {
+				if tradeAvg, terr := b.fetchAvgFillPrice(ctx, auth, brokerOrderID); terr == nil && tradeAvg > 0 {
+					avgPx = tradeAvg
+				}
+			}
+			return o.Status, o.TradedQty, avgPx, nil
 		}
 	}
 	return "", 0, 0, fmt.Errorf("order %s not found in raw orderbook (%d orders)", brokerOrderID, len(raw.Orders))
+}
+
+// fetchAvgFillPrice returns the quantity-weighted average traded price for a
+// single broker order, derived from the trade book (authoritative source).
+//
+// Indira's GET /trade-book may return either one row per fill leg or one row
+// aggregated per order; both cases collapse cleanly: sum(qty*price) / sum(qty).
+// Returns (0, nil) only if the trade book legitimately has no rows yet — the
+// caller should fall back to the limit price in that case rather than
+// blocking the entry pipeline.
+func (b *BrokerAdapter) fetchAvgFillPrice(ctx context.Context, auth BrokerAuth, brokerOrderID string) (float64, error) {
+	trades, err := b.client.GetTradeBook(ctx, b.toIndiraAuth(auth), brokerOrderID)
+	if err != nil {
+		return 0, fmt.Errorf("trade book fetch: %w", err)
+	}
+	var totalQty int
+	var totalNotional float64
+	for _, t := range trades {
+		if t.OrdId != brokerOrderID || t.TradedQty <= 0 || t.TradedPrice <= 0 {
+			continue
+		}
+		totalQty += t.TradedQty
+		totalNotional += float64(t.TradedQty) * t.TradedPrice
+	}
+	if totalQty == 0 {
+		return 0, nil
+	}
+	return totalNotional / float64(totalQty), nil
+}
+
+// isFilledOrPartialBrokerStatus matches the broker-side status strings that
+// imply at least one executed share. Kept local to broker_adapter so we don't
+// drag the WSS helper's casing assumptions into REST-orderbook parsing.
+func isFilledOrPartialBrokerStatus(s string) bool {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "EXECUTED", "TRADED", "COMPLETE", "FILLED",
+		"PARTIALLY TRADED", "PARTIALLY EXECUTED":
+		return true
+	}
+	return false
 }
 
 // GetAvailableMargin returns the user's free margin at the broker. Used by
