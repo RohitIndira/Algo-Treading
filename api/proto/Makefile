@@ -8,6 +8,7 @@ USER_CONFIG_PROTO = api/proto/user_config/user_config.proto
 RISK_MGMT_PROTO = api/proto/risk_management/risk_management.proto
 TRADE_EXEC_PROTO = api/proto/trade_execution/trade_execution.proto
 RULES_ENGINE_PROTO = api/proto/rules_engine/rules_engine.proto
+HFT_ENGINE_PROTO = api/proto/hft_engine/hft_engine.proto
 
 # Output directories (relative to proto root)
 GO_OUT = $(PROTO_ROOT)
@@ -30,7 +31,7 @@ install-tools:
 	@echo "Tools installed successfully!"
 
 # Generate all proto files
-generate-all: generate-common generate-user-config generate-risk-management generate-trade-execution generate-rules-engine
+generate-all: generate-common generate-user-config generate-risk-management generate-trade-execution generate-rules-engine generate-hft-engine
 	@echo "All protobuf files generated successfully!"
 
 # Generate common proto
@@ -57,6 +58,11 @@ generate-trade-execution:
 generate-rules-engine:
 	@echo "Generating rules engine proto..."
 	$(PROTOC) $(PROTO_FLAGS) $(RULES_ENGINE_PROTO)
+
+# Generate HFT engine proto
+generate-hft-engine:
+	@echo "Generating HFT engine proto..."
+	$(PROTOC) $(PROTO_FLAGS) $(HFT_ENGINE_PROTO)
 
 # Clean generated files
 clean:
