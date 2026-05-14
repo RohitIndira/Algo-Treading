@@ -41,6 +41,12 @@ type OrderUnwatcher interface {
 	UnwatchByStrategy(strategyID string) int
 }
 
+// MLGroupCanceller cancels active multi-level groups for a strategy, recording
+// paper partial exits for remaining qty. Implemented by *multilevel.Manager.
+type MLGroupCanceller interface {
+	CancelGroupsByStrategy(ctx context.Context, userID, strategyID string)
+}
+
 // StrategyEventsConsumer listens to user-config-events and closes all open
 // positions / cancels all pending orders when a strategy is deactivated or deleted.
 type StrategyEventsConsumer struct {
@@ -49,6 +55,7 @@ type StrategyEventsConsumer struct {
 	executor     *executor.OrderExecutor
 	priceMonitor OrderUnwatcher    // nil-safe: may be unset if PriceMonitor is disabled
 	priceClient  PaperPriceLookup  // nil-safe: used to get LTP for paper exit PnL
+	mlManager    MLGroupCanceller  // nil-safe: creates paper partial exits for remaining ML qty
 	logger       *zap.Logger
 }
 
@@ -89,6 +96,12 @@ func (c *StrategyEventsConsumer) SetPriceMonitor(pm OrderUnwatcher) {
 // SetPriceClient wires the Redis price client so paper exits use real LTP instead of entry price.
 func (c *StrategyEventsConsumer) SetPriceClient(pc PaperPriceLookup) {
 	c.priceClient = pc
+}
+
+// SetMLManager wires the multi-level manager so paper partial exits are recorded
+// for remaining ML qty when a strategy is deactivated.
+func (c *StrategyEventsConsumer) SetMLManager(ml MLGroupCanceller) {
+	c.mlManager = ml
 }
 
 // Start begins consuming user-config-events. Blocks until ctx is cancelled.
@@ -202,6 +215,14 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 		}(order)
 	}
 	wg.Wait()
+
+	// Step 1b: cancel any active ML groups for this strategy, recording paper partial
+	// exits for remaining qty so the closed-positions tab shows a row per level exit
+	// (the strategy-deactivation exit appears as a distinct row alongside any SL/TP
+	// levels that already fired).
+	if c.mlManager != nil {
+		c.mlManager.CancelGroupsByStrategy(ctx, ev.UserID, ev.StrategyID)
+	}
 
 	// Step 2: for filled paper orders, record the actual LTP as exit price so that
 	// the closed positions response shows real PnL instead of zero.

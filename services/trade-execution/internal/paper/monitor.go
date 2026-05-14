@@ -43,6 +43,9 @@ type trailSLState struct {
 type MLGroupCanceller interface {
 	CancelGroup(ctx context.Context, entryOrderID uuid.UUID)
 	CancelGroupsBySymbol(ctx context.Context, userID string, symbol string)
+	// CancelGroupForExit stops the group and, for paper positions, records a
+	// partial exit at exitPrice so closed-positions shows a distinct exit row.
+	CancelGroupForExit(ctx context.Context, entryOrderID uuid.UUID, exitPrice float64, reason string)
 }
 
 // PaperTradeMonitor is the SL/TP engine and live PnL broadcaster.
@@ -703,8 +706,22 @@ func (m *PaperTradeMonitor) checkRedisSLTP(ctx context.Context) {
 			continue
 		}
 
+		// Skip symbols where WSS is actively delivering ticks — the primary
+		// SL/TP path (OnPriceUpdate) already handles those. The Redis safety-net
+		// is only needed when WSS has been silent beyond the grace period,
+		// mirroring the guard in tickRedisPnL.
+		m.priceMu.RLock()
+		lastSeen := m.wssLastSeen[s.symbol]
+		m.priceMu.RUnlock()
+		if time.Since(lastSeen) < wssGracePeriod {
+			continue
+		}
+
+		// Use GetLTPFresh to reject stale keys (e.g. a key whose ltp field still
+		// holds yesterday's closing price = prev_close). A 2-minute threshold is
+		// conservative: during normal trading hours data updates every few seconds.
 		rCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		ltp, err := m.redisPrices.GetLTP(rCtx, s.meta.exchange, s.meta.token)
+		ltp, err := m.redisPrices.GetLTPFresh(rCtx, s.meta.exchange, s.meta.token, 2*time.Minute)
 		cancel()
 		if err != nil || ltp <= 0 {
 			continue
@@ -797,13 +814,13 @@ func (m *PaperTradeMonitor) ForceExitAll(ctx context.Context, userID string) err
 			continue
 		}
 
-		// Cancel any active ML group for this order so the price-monitor goroutine
-		// stops and doesn't try to place further exits after force-exit.
+		// Resolve exit price first so CancelGroupForExit can record the partial
+		// exit at the same price used by exitPosition below.
+		exitPrice := m.resolveExitPrice(ctx, order)
 		if m.mlCanceller != nil {
-			m.mlCanceller.CancelGroup(ctx, order.OrderID)
+			m.mlCanceller.CancelGroupForExit(ctx, order.OrderID, exitPrice, "FORCE_EXIT")
 		}
 
-		exitPrice := m.resolveExitPrice(ctx, order)
 		wg.Add(1)
 		go func(o *models.Order, price float64) {
 			defer wg.Done()
@@ -841,12 +858,11 @@ func (m *PaperTradeMonitor) ForceExitByStrategy(ctx context.Context, userID, str
 			continue
 		}
 
-		// Cancel any active ML group for this order so its goroutine stops.
+		exitPrice := m.resolveExitPrice(ctx, order)
 		if m.mlCanceller != nil {
-			m.mlCanceller.CancelGroup(ctx, order.OrderID)
+			m.mlCanceller.CancelGroupForExit(ctx, order.OrderID, exitPrice, "FORCE_EXIT")
 		}
 
-		exitPrice := m.resolveExitPrice(ctx, order)
 		wg.Add(1)
 		go func(o *models.Order, price float64) {
 			defer wg.Done()
@@ -976,6 +992,7 @@ func (m *PaperTradeMonitor) exitPosition(ctx context.Context, order *models.Orde
 	finalPnL := computePnL(order, exitPrice)
 
 	if m.wsServer != nil {
+		now := time.Now()
 		m.wsServer.Broadcast(order.UserID, PaperUpdate{
 			Type:       "position_exit",
 			OrderID:    order.OrderID.String(),
@@ -985,6 +1002,8 @@ func (m *PaperTradeMonitor) exitPosition(ctx context.Context, order *models.Orde
 			Reason:     reason,
 			ExitPrice:  exitPrice,
 			EntryPrice: safeF(order.FilledPrice),
+			EntryTime:  order.ExecutedAt,
+			ExitTime:   &now,
 		})
 	}
 
@@ -1072,19 +1091,24 @@ func computePnL(order *models.Order, ltp float64) float64 {
 // SquareOffAll closes all open paper positions across all users.
 // Called by the AutoSquareOffScheduler at market close (15:00 IST).
 //
-// Each order is evaluated individually: orders whose AutoSquareOffTime is set to a
-// time later than now are skipped — their per-user scheduler run handles them at the
-// correct time. This is intentionally per-order (not per-user) so that a user with
-// two strategies — one at the default close and one with a later custom time — has
-// only the first strategy's position closed here.
+// Two-pass approach:
+//  1. In-memory cache — fast path, covers every position currently being monitored.
+//  2. DB sweep — catches positions not in the cache (e.g. service restarted mid-day,
+//     multi-level entries whose in-memory group was already cancelled, etc.).
+//     The paper_exit_price IS NULL guard on UpdatePaperTradeExit means the DB sweep
+//     is safe to run unconditionally: already-exited positions are a no-op.
+//
+// Orders whose AutoSquareOffTime is later than now are skipped in both passes —
+// their per-user scheduler run will handle them at the correct time.
 func (m *PaperTradeMonitor) SquareOffAll(ctx context.Context) error {
 	now := time.Now().In(timezone.IST)
 	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
 
-	// Collect the specific orders that should close right now.
+	// ── Pass 1: in-memory cache ──────────────────────────────────────────────
 	m.cacheMu.RLock()
 	var toExit []*models.Order
 	affectedUsers := make(map[string]struct{})
+	inCacheIDs := make(map[uuid.UUID]struct{})
 	for _, orders := range m.orderCache {
 		for _, o := range orders {
 			if o.AutoSquareOffTime != nil && *o.AutoSquareOffTime > currentTime {
@@ -1094,26 +1118,22 @@ func (m *PaperTradeMonitor) SquareOffAll(ctx context.Context) error {
 			}
 			toExit = append(toExit, o)
 			affectedUsers[o.UserID] = struct{}{}
+			inCacheIDs[o.OrderID] = struct{}{}
 		}
 	}
 	m.cacheMu.RUnlock()
 
-	if len(toExit) == 0 {
-		log.Println("[paper-monitor] Auto square-off: no open paper positions")
-		return nil
-	}
-
-	log.Printf("[paper-monitor] Auto square-off: closing %d position(s) across %d user(s)", len(toExit), len(affectedUsers))
+	log.Printf("[paper-monitor] Auto square-off pass-1 (cache): %d position(s) across %d user(s)", len(toExit), len(affectedUsers))
 
 	var wg sync.WaitGroup
 	for _, order := range toExit {
 		if _, already := m.exiting.LoadOrStore(order.OrderID, true); already {
 			continue
 		}
-		if m.mlCanceller != nil {
-			m.mlCanceller.CancelGroup(ctx, order.OrderID)
-		}
 		exitPrice := m.resolveExitPrice(ctx, order)
+		if m.mlCanceller != nil {
+			m.mlCanceller.CancelGroupForExit(ctx, order.OrderID, exitPrice, "SQUARE_OFF")
+		}
 		wg.Add(1)
 		go func(o *models.Order, price float64) {
 			defer wg.Done()
@@ -1121,6 +1141,48 @@ func (m *PaperTradeMonitor) SquareOffAll(ctx context.Context) error {
 		}(order, exitPrice)
 	}
 	wg.Wait()
+
+	// ── Pass 2: DB sweep for any positions not in the in-memory cache ────────
+	// GetAllActivePaperOrders returns FILLED paper orders where paper_exit_price IS NULL,
+	// covering multi-level, fixed, trailing — every order type.
+	dbOrders, err := m.repo.GetAllActivePaperOrders(ctx)
+	if err != nil {
+		log.Printf("[paper-monitor] Auto square-off pass-2 DB sweep error: %v", err)
+	} else {
+		var dbToExit []*models.Order
+		for _, o := range dbOrders {
+			if _, inCache := inCacheIDs[o.OrderID]; inCache {
+				continue // already handled in pass 1
+			}
+			if o.AutoSquareOffTime != nil && *o.AutoSquareOffTime > currentTime {
+				continue // custom later time — skip
+			}
+			dbToExit = append(dbToExit, o)
+			affectedUsers[o.UserID] = struct{}{}
+		}
+
+		if len(dbToExit) > 0 {
+			log.Printf("[paper-monitor] Auto square-off pass-2 (DB sweep): %d position(s) not in cache", len(dbToExit))
+			var wg2 sync.WaitGroup
+			for _, order := range dbToExit {
+				if _, already := m.exiting.LoadOrStore(order.OrderID, true); already {
+					continue
+				}
+				exitPrice := m.resolveExitPrice(ctx, order)
+				if m.mlCanceller != nil {
+					m.mlCanceller.CancelGroupForExit(ctx, order.OrderID, exitPrice, "SQUARE_OFF")
+				}
+				wg2.Add(1)
+				go func(o *models.Order, price float64) {
+					defer wg2.Done()
+					m.exitPosition(context.Background(), o, price, "SQUARE_OFF")
+				}(order, exitPrice)
+			}
+			wg2.Wait()
+		} else {
+			log.Println("[paper-monitor] Auto square-off pass-2 (DB sweep): no additional positions found")
+		}
+	}
 
 	// Notify each affected user's WS clients that their positions are closed.
 	if m.wsServer != nil {

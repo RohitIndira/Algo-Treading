@@ -890,27 +890,6 @@ func (m *Manager) evaluateTPLevelsPaper(ctx context.Context, group *Group, ltp f
 			m.OnPaperQtyUpdated(group.EntryOrderID, remaining)
 		}
 
-		// Move SL to breakeven (after L1) or to the previous TP price (after L2+)
-		// so the paper monitor's SL check protects the remaining position's profits.
-		if remaining > 0 {
-			if group.SLMode != SLModeMultiLevel {
-				// Single SL mode: update the cached SL price in the paper monitor.
-				newSL := m.computeSLAfterTPFill(group, levelNum)
-				if m.OnPaperSLMoved != nil {
-					m.OnPaperSLMoved(group.EntryOrderID, newSL)
-				}
-				m.logger.Info("ml_paper_sl_moved_to_protect",
-					zap.String("group_id", group.GroupID.String()),
-					zap.Int("tp_level", levelNum),
-					zap.Float64("new_sl", newSL),
-					zap.Float64("entry_price", group.FillPrice))
-			} else {
-				// Multi-level SL mode: move all remaining active SL levels to the new
-				// floor (breakeven after L1, previous TP price after L2+). This ensures
-				// the remaining position's downside is protected after each profit lock-in.
-				m.rebalanceMLSLAfterTP(ctx, group, levelNum)
-			}
-		}
 
 		// Rebalance remaining SL levels so their qty sum equals the new RemainingQty.
 		cancelledSLLevelNum := -1
@@ -1202,21 +1181,22 @@ func (m *Manager) recordPaperPartialExit(ctx context.Context, group *Group, qty 
 
 // ── Rebalancing ───────────────────────────────────────────────────────────────
 
-// rebalanceTPAfterSLFill replaces cancelTPLevelForSLFill.
-// When SL level slLevelNum fires and reduces RemainingQty:
-//  1. Cancel the same-numbered TP level (its qty slice is fully exited by SL).
-//  2. Proportionally scale down all other remaining active TP levels so their
-//     qty sum equals the new remainingQty.
+// rebalanceTPAfterSLFill is called when SL level slLevelNum fires.
+// It proportionally scales ALL remaining active TP levels (including the
+// same-numbered one) so their qty sum equals the new remainingQty.
+// TP L1 is kept alive so the remaining position targets the nearest profit
+// level first rather than jumping straight to TP L2.
 //
-// Returns the cancelled same-numbered TP level (or -1 if none).
+// Always returns -1 (no TP level explicitly cancelled; levels may be cancelled
+// only if their scaled qty rounds to zero).
 //
 // Example:
 //
 //	SL L1 fires (50 qty). RemainingQty = 50.
-//	Active TPs: L2 (30 qty), L3 (40 qty) → pendingTotal = 70
-//	Scale = 50/70
-//	New L2 = floor(30×50/70) = 21
-//	New L3 = 50 − 21 = 29   (last level absorbs rounding)
+//	Active TPs: L1 (50 qty), L2 (50 qty) → pendingTotal = 100
+//	Scale = 50/100
+//	New L1 = 25  (stays active — nearest profit target)
+//	New L2 = 25  (last level absorbs rounding)
 func (m *Manager) rebalanceTPAfterSLFill(
 	ctx context.Context,
 	group *Group,
@@ -1225,34 +1205,10 @@ func (m *Manager) rebalanceTPAfterSLFill(
 ) int {
 	reason := fmt.Sprintf("SL_L%d_TRIGGERED", slLevelNum)
 
-	// Step 1: cancel the same-numbered TP level.
-	cancelledNum := -1
-	for _, tp := range group.TPLevels {
-		tp.mu.Lock()
-		matches := tp.LevelNum == slLevelNum && tp.Status == LevelActive
-		bid := tp.BrokerOrderID
-		levelNum := tp.LevelNum
-		origQty := tp.OriginalExitQty
-		tp.mu.Unlock()
-
-		if !matches {
-			continue
-		}
-		cancelledNum = levelNum
-		if bid != "" && group.TradingMode == "LIVE" {
-			m.cancelTPOrder(ctx, group, tp, bid)
-		} else {
-			tp.markCancelled()
-			_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID,
-				models.MLExitTypeTP, levelNum, models.MLStatusCancelled, 0)
-		}
-		// Record the cancellation as a zero-qty rebalance for audit completeness.
-		_ = m.repo.UpdateMLLevelRebalancedQty(ctx, group.EntryOrderID,
-			models.MLExitTypeTP, levelNum, origQty, 0, reason)
-		break
-	}
-
-	// Step 2: collect remaining active TP levels (excluding the one just cancelled).
+	// Scale ALL active TP levels (including the same-numbered one) proportionally
+	// to the new remainingQty. TP L1 stays alive as the nearest profit target for
+	// the remaining position — cancelling it caused TP L2 to be the first trigger
+	// even when price only reached TP L1's level.
 	type tpEntry struct {
 		state *ExitLevelState
 		qty   int32
@@ -1270,10 +1226,10 @@ func (m *Manager) rebalanceTPAfterSLFill(
 	}
 
 	if len(active) == 0 || pendingTotal == 0 || remainingQty <= 0 {
-		return cancelledNum
+		return -1
 	}
 
-	// Step 3: scale each remaining TP level proportionally.
+	// Scale each TP level proportionally.
 	var allocated int32
 	for i, entry := range active {
 		var newQty int32
@@ -1347,7 +1303,7 @@ func (m *Manager) rebalanceTPAfterSLFill(
 		}
 	}
 
-	return cancelledNum
+	return -1
 }
 
 // rebalanceMLSLAfterTPFill replaces cancelSLLevelForTPFill for MULTI_LEVEL SL mode.
@@ -1570,6 +1526,65 @@ func (m *Manager) CancelGroup(ctx context.Context, entryOrderID uuid.UUID) {
 		zap.String("group_id", group.GroupID.String()))
 }
 
+// CancelGroupForExit cancels an active ML group and, for paper positions with
+// remaining qty, records a partial exit at exitPrice so the closed-positions tab
+// shows a distinct row for the unexited qty (e.g. during square-off or force-exit).
+// reason is the exit tag written into IndiraOrderID (e.g. "SQUARE_OFF", "FORCE_EXIT").
+// Safe to call even if no group is registered (no-op).
+func (m *Manager) CancelGroupForExit(ctx context.Context, entryOrderID uuid.UUID, exitPrice float64, reason string) {
+	v, ok := m.groups.Load(entryOrderID)
+	if !ok {
+		return
+	}
+	group := v.(*Group)
+
+	group.mu.Lock()
+	if group.State != GroupStateActive {
+		group.mu.Unlock()
+		return
+	}
+	remaining := group.RemainingQty
+	tradingMode := group.TradingMode
+	group.State = GroupStateCancelled
+	cancel := group.cancelMonitor
+	group.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	// Cancel live TP / SL broker orders.
+	for _, level := range group.TPLevels {
+		level.mu.Lock()
+		if level.Status == LevelActive && level.BrokerOrderID != "" {
+			bid := level.BrokerOrderID
+			level.mu.Unlock()
+			m.cancelTPOrder(ctx, group, level, bid)
+		} else {
+			level.mu.Unlock()
+		}
+	}
+	m.cancelSLOrder(ctx, group)
+
+	// For paper positions with remaining qty, record a partial exit so the
+	// closed-positions tab shows this exit as its own row.
+	if tradingMode == "PAPER" && remaining > 0 && exitPrice > 0 {
+		m.recordPaperPartialExit(ctx, group, remaining, exitPrice, reason, 0)
+		if err := m.repo.UpdatePaperPositionFilledQty(ctx, entryOrderID, 0); err != nil {
+			m.logger.Warn("ml_cancel_for_exit_qty_update_failed",
+				zap.String("group_id", group.GroupID.String()),
+				zap.Error(err))
+		}
+	}
+
+	m.groups.Delete(entryOrderID)
+	m.logger.Info("ml_group_cancelled_for_exit",
+		zap.String("group_id", group.GroupID.String()),
+		zap.Float64("exit_price", exitPrice),
+		zap.String("reason", reason),
+		zap.Int32("remaining_qty", remaining))
+}
+
 // CancelGroupsBySymbol cancels all active groups for a user+symbol.
 // Implements statusservice.MLHandler interface (same as OCO).
 func (m *Manager) CancelGroupsBySymbol(ctx context.Context, userID string, symbol string) {
@@ -1578,6 +1593,63 @@ func (m *Manager) CancelGroupsBySymbol(ctx context.Context, userID string, symbo
 		if group.UserID == userID && group.Symbol == symbol {
 			m.CancelGroup(ctx, group.EntryOrderID)
 		}
+		return true
+	})
+}
+
+// CancelGroupsByStrategy cancels all active groups for a user+strategy.
+// For paper positions with remaining qty, a partial exit record is created at
+// the current LTP (reason: STRATEGY_DEACTIVATED) so the closed-positions tab
+// shows the deactivation exit as a distinct row alongside any level exits that
+// already fired. Called by StrategyEventsConsumer when a strategy is paused or deleted.
+func (m *Manager) CancelGroupsByStrategy(ctx context.Context, userID, strategyID string) {
+	m.groups.Range(func(k, v interface{}) bool {
+		group := v.(*Group)
+		if group.UserID != userID || group.StrategyID != strategyID {
+			return true
+		}
+
+		group.mu.Lock()
+		if group.State != GroupStateActive {
+			group.mu.Unlock()
+			return true
+		}
+		remaining := group.RemainingQty
+		tradingMode := group.TradingMode
+		// Mark cancelled immediately so no concurrent level fires overlap.
+		group.State = GroupStateCancelled
+		cancel := group.cancelMonitor
+		group.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+
+		// For paper positions, record the deactivation exit so closed-positions
+		// shows a separate row for the remaining qty.
+		if tradingMode == "PAPER" && remaining > 0 && m.priceLookup != nil {
+			ltp, err := m.priceLookup.GetLTP(ctx, group.Exchange, group.StockCode)
+			if err == nil && ltp > 0 {
+				m.recordPaperPartialExit(ctx, group, remaining, ltp, "STRATEGY_DEACTIVATED", 0)
+				if err2 := m.repo.UpdatePaperPositionFilledQty(ctx, group.EntryOrderID, 0); err2 != nil {
+					m.logger.Warn("ml_cancel_strategy_qty_update_failed",
+						zap.String("group_id", group.GroupID.String()),
+						zap.Error(err2))
+				}
+			} else {
+				m.logger.Warn("ml_cancel_strategy_ltp_unavailable",
+					zap.String("group_id", group.GroupID.String()),
+					zap.String("symbol", group.Symbol),
+					zap.Error(err))
+			}
+		}
+
+		m.groups.Delete(group.EntryOrderID)
+		m.logger.Info("ml_group_cancelled_by_strategy",
+			zap.String("group_id", group.GroupID.String()),
+			zap.String("strategy_id", strategyID),
+			zap.Int32("remaining_qty", remaining))
+
 		return true
 	})
 }

@@ -44,19 +44,23 @@ func fmtISTPtr(t *time.Time) *string {
 // IST-formatted RFC3339 strings so the frontend receives IST times directly.
 type orderISTWrapper struct {
 	*models.Order
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
-	SubmittedAt *string `json:"submitted_at,omitempty"`
-	ExecutedAt  *string `json:"executed_at,omitempty"`
+	CreatedAt     string  `json:"created_at"`
+	UpdatedAt     string  `json:"updated_at"`
+	SubmittedAt   *string `json:"submitted_at,omitempty"`
+	ExecutedAt    *string `json:"executed_at,omitempty"`   // entry_time alias
+	EntryTime     *string `json:"entry_time,omitempty"`    // same as executed_at, explicit label
+	PaperExitTime *string `json:"paper_exit_time,omitempty"` // exit_time for paper positions
 }
 
 func wrapOrderIST(o *models.Order) *orderISTWrapper {
 	return &orderISTWrapper{
-		Order:       o,
-		CreatedAt:   fmtIST(o.CreatedAt),
-		UpdatedAt:   fmtIST(o.UpdatedAt),
-		SubmittedAt: fmtISTPtr(o.SubmittedAt),
-		ExecutedAt:  fmtISTPtr(o.ExecutedAt),
+		Order:         o,
+		CreatedAt:     fmtIST(o.CreatedAt),
+		UpdatedAt:     fmtIST(o.UpdatedAt),
+		SubmittedAt:   fmtISTPtr(o.SubmittedAt),
+		ExecutedAt:    fmtISTPtr(o.ExecutedAt),
+		EntryTime:     fmtISTPtr(o.ExecutedAt),
+		PaperExitTime: fmtISTPtr(o.PaperExitTime),
 	}
 }
 
@@ -81,6 +85,8 @@ type PaperUpdate struct {
 	Reason     string          `json:"reason,omitempty"`    // STOP_LOSS | TAKE_PROFIT | FORCE_EXIT | MULTI_LEVEL_COMPLETE
 	ExitPrice  float64         `json:"exit_price,omitempty"`
 	EntryPrice float64         `json:"entry_price,omitempty"`
+	EntryTime  *time.Time      `json:"entry_time,omitempty"`  // When the entry order was filled (executed_at)
+	ExitTime   *time.Time      `json:"exit_time,omitempty"`   // When the position was closed (paper_exit_time)
 	Positions  []*models.Order `json:"positions,omitempty"` // Used for initial_orders
 	Order      *models.Order   `json:"order,omitempty"`     // Used for new_order
 	// Fields for ml_level_triggered
@@ -104,6 +110,8 @@ func (u PaperUpdate) MarshalJSON() ([]byte, error) {
 		Reason            string             `json:"reason,omitempty"`
 		ExitPrice         float64            `json:"exit_price,omitempty"`
 		EntryPrice        float64            `json:"entry_price,omitempty"`
+		EntryTime         *string            `json:"entry_time,omitempty"`
+		ExitTime          *string            `json:"exit_time,omitempty"`
 		Positions         []*orderISTWrapper `json:"positions,omitempty"`
 		Order             *orderISTWrapper   `json:"order,omitempty"`
 		ExitType          string             `json:"exit_type,omitempty"`
@@ -124,6 +132,8 @@ func (u PaperUpdate) MarshalJSON() ([]byte, error) {
 		Reason:            u.Reason,
 		ExitPrice:         u.ExitPrice,
 		EntryPrice:        u.EntryPrice,
+		EntryTime:         fmtISTPtr(u.EntryTime),
+		ExitTime:          fmtISTPtr(u.ExitTime),
 		ExitType:          u.ExitType,
 		LevelNum:          u.LevelNum,
 		RemainingQty:      u.RemainingQty,

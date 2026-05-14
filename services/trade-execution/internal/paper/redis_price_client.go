@@ -40,11 +40,11 @@ type RedisPriceClient struct {
 // NewRedisPriceClient creates a Redis client for market price lookups.
 // Returns an error if the initial connection ping fails; callers should treat
 // this as non-fatal and pass nil to the monitor/executor when unavailable.
-func NewRedisPriceClient(addr, password string) (*RedisPriceClient, error) {
+func NewRedisPriceClient(addr, password string, db int) (*RedisPriceClient, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:         addr,
 		Password:     password,
-		DB:           0,
+		DB:           db,
 		PoolSize:     20,
 		MinIdleConns: 5,
 		DialTimeout:  3 * time.Second,
@@ -88,6 +88,50 @@ func (r *RedisPriceClient) GetLTP(ctx context.Context, exchange string, token in
 
 	if tick.LTP <= 0 {
 		return 0, fmt.Errorf("redis: ltp=0 for key %s", key)
+	}
+
+	return tick.LTP, nil
+}
+
+// GetLTPFresh returns the LTP only when the stored tick is no older than maxAge.
+// Use this for SL/TP exit decisions to avoid acting on stale data (e.g. a key
+// whose ltp field still holds yesterday's closing price = prev_close).
+//
+// The Timestamp field is interpreted as Unix milliseconds when > 1e12, otherwise
+// as Unix seconds (both formats are seen in practice from different broker feeds).
+// If Timestamp is 0 (not populated by the writer), the staleness check is skipped
+// and the LTP is returned as-is — callers must add their own WSS-freshness guard.
+func (r *RedisPriceClient) GetLTPFresh(ctx context.Context, exchange string, token int64, maxAge time.Duration) (float64, error) {
+	if r == nil || r.client == nil {
+		return 0, fmt.Errorf("redis price client is nil")
+	}
+
+	key := fmt.Sprintf("market:%s:%d", strings.ToLower(exchange), token)
+
+	raw, err := r.client.Get(ctx, key).Result()
+	if err != nil {
+		return 0, fmt.Errorf("redis GET %s: %w", key, err)
+	}
+
+	var tick MarketTick
+	if err := json.Unmarshal([]byte(raw), &tick); err != nil {
+		return 0, fmt.Errorf("redis unmarshal %s: %w", key, err)
+	}
+
+	if tick.LTP <= 0 {
+		return 0, fmt.Errorf("redis: ltp=0 for key %s", key)
+	}
+
+	if tick.Timestamp > 0 && maxAge > 0 {
+		var tickTime time.Time
+		if tick.Timestamp > 1_000_000_000_000 { // milliseconds (13-digit epoch)
+			tickTime = time.UnixMilli(tick.Timestamp)
+		} else {
+			tickTime = time.Unix(tick.Timestamp, 0)
+		}
+		if age := time.Since(tickTime); age > maxAge {
+			return 0, fmt.Errorf("redis: stale tick for %s (age=%s, max=%s)", key, age.Round(time.Second), maxAge)
+		}
 	}
 
 	return tick.LTP, nil

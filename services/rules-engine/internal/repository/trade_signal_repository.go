@@ -102,6 +102,27 @@ func (r *TradeSignalRepository) SaveTradeSignal(ctx context.Context, orderReq *m
 	return nil
 }
 
+// HasSignalToday returns true if the strategy already has any signal for this
+// stock on today's IST date AND after sinceTime (the strategy's last activation).
+// This enforces the daily per-stock lock and resets when the strategy is reactivated.
+func (r *TradeSignalRepository) HasSignalToday(ctx context.Context, strategyID string, stockCode int64, sinceTime time.Time) (bool, error) {
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM trade_signals
+			WHERE strategy_id = $1
+			  AND stock_code  = $2
+			  AND (created_at AT TIME ZONE 'Asia/Kolkata')::date
+			      = (NOW()    AT TIME ZONE 'Asia/Kolkata')::date
+			  AND created_at >= $3
+		)
+	`
+	var exists bool
+	if err := r.db.QueryRowContext(ctx, query, strategyID, stockCode, sinceTime).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check daily signal: %w", err)
+	}
+	return exists, nil
+}
+
 // UpdateSignalStatus updates the execution status of a trade signal
 func (r *TradeSignalRepository) UpdateSignalStatus(ctx context.Context, orderID string, status string, executionPrice float64, brokerOrderID string, errorMsg string) error {
 	query := `

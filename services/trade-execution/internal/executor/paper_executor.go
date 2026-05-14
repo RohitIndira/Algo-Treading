@@ -59,7 +59,8 @@ func (e *PaperOrderExecutor) ExecutePaperOrder(ctx context.Context, order *model
 	now := time.Now()
 
 	// Resolve entry price: prefer Redis live LTP for accurate market fill
-	entryPrice := safePrice(order.Price)
+	signalPrice := safePrice(order.Price)
+	entryPrice := signalPrice
 	if e.priceLookup != nil {
 		pCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		ltp, err := e.priceLookup.GetLTP(pCtx, string(order.Exchange), order.StockCode)
@@ -71,6 +72,22 @@ func (e *PaperOrderExecutor) ExecutePaperOrder(ctx context.Context, order *model
 		} else if err != nil {
 			log.Printf("[paper] Redis price unavailable for %s: %v — using signal price %.2f",
 				order.Symbol, err, entryPrice)
+		}
+	}
+
+	// If the fill price differs from the signal price (e.g. price monitor set a limit
+	// price then paper executor refreshed with LTP), rescale SL/TP to the actual fill
+	// price so the user's configured percentages are preserved exactly.
+	if signalPrice > 0 && entryPrice != signalPrice {
+		if order.StopLoss != nil && *order.StopLoss > 0 {
+			ratio := *order.StopLoss / signalPrice
+			rescaled := entryPrice * ratio
+			order.StopLoss = &rescaled
+		}
+		if order.TakeProfit != nil && *order.TakeProfit > 0 {
+			ratio := *order.TakeProfit / signalPrice
+			rescaled := entryPrice * ratio
+			order.TakeProfit = &rescaled
 		}
 	}
 

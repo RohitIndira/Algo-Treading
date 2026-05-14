@@ -20,6 +20,16 @@ const (
 	binMsgWelcome    byte = 0x02
 )
 
+// TickData is a single market tick captured from the WebSocket stream.
+// It is sent to the tick store (localhost Redis) for full tick history.
+type TickData struct {
+	Symbol    string  `json:"symbol"`
+	Token     string  `json:"token"`
+	Exchange  string  `json:"exchange"`
+	LTP       float64 `json:"ltp"`
+	Timestamp int64   `json:"ts"` // Unix nanoseconds
+}
+
 // Client maintains a persistent WebSocket connection to the enhanced-stream
 // market data server and keeps an in-memory LTP cache keyed by "exchange:token"
 // (e.g. "nse:2475"). It supports dynamic subscribe/unsubscribe and auto-reconnects.
@@ -53,6 +63,10 @@ type Client struct {
 	// Used by PriceMonitor for event-driven evaluation.
 	onPriceUpdate func(key string, ltp float64)
 
+	// tickCh is an optional send-only channel for full tick history storage.
+	// If nil (default), no tick data is forwarded — zero overhead.
+	tickCh chan<- TickData
+
 	healthy   bool
 	healthyMu sync.RWMutex
 
@@ -79,6 +93,12 @@ func New(wsURL string) *Client {
 // key format: "exchange:token" (e.g. "nse:2475"), ltp is the latest traded price.
 func (c *Client) SetOnPriceUpdate(fn func(key string, ltp float64)) {
 	c.onPriceUpdate = fn
+}
+
+// SetTickWriter wires a send-only channel for full tick history.
+// Every decoded tick is forwarded non-blocking — the algo path is never delayed.
+func (c *Client) SetTickWriter(ch chan<- TickData) {
+	c.tickCh = ch
 }
 
 // Start connects and begins consuming market data. Auto-reconnects on failure.
@@ -415,6 +435,21 @@ func (c *Client) updateCache(symbol, token, exchange string, ltp float64) {
 	// Fire event-driven callback (PriceMonitor.OnPriceUpdate)
 	if c.onPriceUpdate != nil {
 		c.onPriceUpdate(key, ltp)
+	}
+
+	// Forward full tick to the tick store (non-blocking — never delays algo path).
+	// tickCh is nil by default; this block costs only a nil pointer check when disabled.
+	if c.tickCh != nil {
+		select {
+		case c.tickCh <- TickData{
+			Symbol:    symbol,
+			Token:     token,
+			Exchange:  strings.ToLower(exchange),
+			LTP:       ltp,
+			Timestamp: time.Now().UnixNano(),
+		}:
+		default: // channel full — drop tick, never block
+		}
 	}
 }
 

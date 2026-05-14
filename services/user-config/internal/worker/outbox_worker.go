@@ -10,6 +10,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/events"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
+	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -168,7 +169,19 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_ACTIVATED outbox id=%d, skipping+marking processed\n", event.ID)
 			return true, nil
 		}
-		kafkaEvent = events.ToThinConfigEvent(events.ConfigResumed, thin.UserID, thin.StrategyID, thin.Version)
+		// Emit a full CONFIG_UPDATED (not thin CONFIG_RESUMED) so the rules engine can
+		// upsert the strategy even after a restart. A thin CONFIG_RESUMED silently no-ops
+		// when the rules engine restarted between deactivation and reactivation, because
+		// inactive strategies are absent from its in-memory Paused map after bulk-load.
+		strategyUUID, err := uuid.Parse(thin.StrategyID)
+		if err != nil {
+			return false, fmt.Errorf("invalid strategy_id in STRATEGY_ACTIVATED outbox id=%d: %w", event.ID, err)
+		}
+		fullStrategy, err := w.repo.GetByID(ctx, strategyUUID, thin.UserID)
+		if err != nil {
+			return false, fmt.Errorf("failed to fetch strategy for STRATEGY_ACTIVATED outbox id=%d: %w", event.ID, err)
+		}
+		kafkaEvent = events.ToFullConfigEvent(events.ConfigUpdated, fullStrategy)
 
 	case "STRATEGY_DEACTIVATED":
 		var thin activationOutboxPayload
