@@ -304,14 +304,21 @@ func buildIndiraSymbol(sym SymbolSpec) string {
 	return fmt.Sprintf("STK_%s_EQ_%s_%s", sym.Symbol, sym.Exchange, sym.ExchangeToken)
 }
 
-// productType maps our config to Indira's wire value. "INTRADAY" → "MIS",
-// "DELIVERY" → "DELIVERY". Anything else falls back to DELIVERY (safer).
+// productType maps our config to Indira's wire value.
+//
+// Indira's prdType field accepts the LITERAL strings "INTRADAY",
+// "DELIVERY", "CASH" — NOT the broker-jargon "MIS"/"CNC". Sending "MIS"
+// gets rejected with "EG001: Invalid request" (observed live 2026-05-14
+// on the first HFT order test). We accept the jargon aliases as INPUT
+// but always emit Indira's canonical value.
 func productType(sym SymbolSpec) string {
 	switch sym.ProductType {
 	case "INTRADAY", "MIS":
-		return "MIS"
+		return "INTRADAY"
 	case "CNC", "DELIVERY":
 		return "DELIVERY"
+	case "CASH":
+		return "CASH"
 	default:
 		return "DELIVERY"
 	}

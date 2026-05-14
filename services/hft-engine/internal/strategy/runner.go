@@ -266,10 +266,26 @@ func (r *Runner) publishSnapshot() {
 	r.snap.Store(cp)
 }
 
-// allSidesDone returns true when both BUY and SELL legs have terminated
-// (either filled to cap or halted). Used to auto-exit the goroutine.
+// allSidesDone returns true when every CONFIGURED leg has terminated
+// (filled to cap or halted). Used to auto-exit the goroutine.
+//
+// Respects Cfg.Side — a BUY-only strategy never runs the Sell leg, so
+// Sell.Done stays false forever; waiting on it would leave the goroutine
+// running idle after Buy completes. We only require the leg(s) the
+// strategy actually trades:
+//
+//   Side == BUY   → done when Buy.Done
+//   Side == SELL  → done when Sell.Done
+//   Side == BOTH  → done when both
 func (r *Runner) allSidesDone() bool {
-	return r.live.Buy.Done && r.live.Sell.Done
+	switch r.Cfg.Side {
+	case state.SideBuy:
+		return r.live.Buy.Done
+	case state.SideSell:
+		return r.live.Sell.Done
+	default: // BOTH (or empty — treated as BOTH per repo defaults)
+		return r.live.Buy.Done && r.live.Sell.Done
+	}
 }
 
 // haltAll forces both sides into Done with the given reason. Used by

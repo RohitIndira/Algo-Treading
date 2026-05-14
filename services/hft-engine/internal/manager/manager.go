@@ -13,6 +13,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -169,16 +170,6 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 			return fmt.Errorf("order-status WS subscribe: %w", oerr)
 		}
 	}
-	sym := broker.SymbolSpec{
-		Symbol:      cfg.Symbol,
-		ISIN:        cfg.ISIN,
-		Exchange:    cfg.Exchange,
-		ProductType: cfg.ProductType,
-		TickSize:    cfg.TickSize,
-		// ExchangeToken is empty in Phase 2 — IndiraBroker (Phase 3)
-		// resolves it from external Redis at construction.
-	}
-
 	// Subscribe to the ODIN broadcast feed for this symbol BEFORE we
 	// spawn the runner — if subscribe fails (symbol not in external
 	// Redis, ODIN feed down), Entry fails fast with a clear error.
@@ -193,6 +184,19 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 	sub, err := m.mws.Subscribe(ctx, strategyID, cfg.ISIN, cfg.Symbol)
 	if err != nil {
 		return fmt.Errorf("marketws subscribe: %w", err)
+	}
+
+	// SymbolSpec — built AFTER Subscribe so ExchangeToken can be
+	// populated from the resolved security code. IndiraBroker composes
+	// "STK_{Symbol}_EQ_{Exchange}_{ExchangeToken}" for every order; an
+	// empty token would produce a malformed symbol the broker rejects.
+	sym := broker.SymbolSpec{
+		Symbol:        cfg.Symbol,
+		ISIN:          cfg.ISIN,
+		Exchange:      cfg.Exchange,
+		ExchangeToken: strconv.FormatInt(sub.SecurityCode, 10),
+		ProductType:   cfg.ProductType,
+		TickSize:      cfg.TickSize,
 	}
 
 	runner := strategy.NewRunner(*cfg, auth, sym, m.br, m.audit, m.logger)
