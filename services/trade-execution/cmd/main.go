@@ -34,6 +34,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/tickstore"
 )
 
 func main() {
@@ -336,7 +337,7 @@ func main() {
 	// Initialize Redis price client — used for accurate order fill prices, PnL fallback,
 	// and dynamic tick size lookup for limit order price rounding.
 	// Non-fatal: if Redis is unavailable the service still runs with hardcoded tick sizes.
-	redisPrices, redisErr := paper.NewRedisPriceClient(cfg.RedisAddr, cfg.RedisPassword)
+	redisPrices, redisErr := paper.NewRedisPriceClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 	var priceLookup executor.PriceLookup
 	if redisErr != nil {
 		log.Printf("[paper] Redis price client unavailable (non-fatal): %v", redisErr)
@@ -375,6 +376,7 @@ func main() {
 	paperMonitor := paper.NewPaperTradeMonitor(orderRepo, paperExec, paperWSServer, paperMarketClient, redisPrices)
 	paperMonitorRef = paperMonitor
 	paperWSServer.SetMonitor(paperMonitor)
+	// paperMarketClient tick writer wired below after tickStoreWriter is created (line ~415).
 	log.Println("✓ Paper trading layer initialized")
 	// ─────────────────────────────────────────────────────────────────────────
 
@@ -383,6 +385,7 @@ func main() {
 	// Fallback: Redis MGET polling for any tokens not covered by WSS.
 	var priceMonitorRef *scheduler.PriceMonitor
 	var priceMonitorWSClient *marketws.Client
+	var tickStoreWriter *tickstore.TickWriter
 	{
 		// RoutingExecutor: live orders → orderExecutor, paper orders → paperExec.
 		// This lets the PriceMonitor handle below_min paper orders without broker calls.
@@ -401,6 +404,19 @@ func main() {
 		priceMonitorRef.SetWSClient(priceMonitorWSClient)
 		// Event-driven: WSS tick → immediate evaluation (no polling delay)
 		priceMonitorWSClient.SetOnPriceUpdate(priceMonitorRef.OnPriceUpdate)
+
+		// Tick store: persist every socket tick to localhost Redis DB=1 for testing.
+		// Wired to both WebSocket clients (paper-market + price-monitor).
+		// Non-fatal — if localhost Redis is unavailable the algo runs unchanged.
+		// Goroutine is started below after ctx is defined.
+		if tw, err := tickstore.NewTickWriter("localhost:6379", ""); err != nil {
+			log.Printf("[tickstore] unavailable, tick history disabled (non-fatal): %v", err)
+		} else {
+			paperMarketClient.SetTickWriter(tw.InCh())   // paper SL/TP orders
+			priceMonitorWSClient.SetTickWriter(tw.InCh()) // below_min price monitor orders
+			tickStoreWriter = tw
+			log.Println("✓ Tick writer connected — all socket ticks will be stored to localhost Redis DB=1")
+		}
 
 		signalProcessor.SetPriceMonitor(priceMonitorRef)
 		strategyEventsConsumer.SetPriceMonitor(priceMonitorRef)
@@ -542,6 +558,10 @@ func main() {
 		paperMonitor.UpdateCachedOrderSL(entryOrderID, newSL)
 	}
 
+	// Wire ML manager into strategy events consumer so paper partial exits are
+	// recorded for remaining ML qty when a strategy is paused or deleted.
+	strategyEventsConsumer.SetMLManager(mlManager)
+
 	log.Println("✓ Multi-level SL/TP layer initialized")
 	// ──────────────────────────────────────────────────────────────────────
 
@@ -579,6 +599,12 @@ func main() {
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start tick store drain loop now that ctx is available.
+	if tickStoreWriter != nil {
+		go tickStoreWriter.Start(ctx)
+		log.Println("✓ Tick writer drain loop started (localhost Redis DB=1, ticks:{exchange}:{token}, TTL=12h)")
+	}
 
 	// ── Lifecycle: ordered graceful shutdown ──────────────────────────────────
 	lc := lifecycle.New(cancel, 15*time.Second)
@@ -755,6 +781,7 @@ type Config struct {
 	// Redis (market price feed)
 	RedisAddr     string
 	RedisPassword string
+	RedisDB       int
 	// Observability
 	MetricsPort int
 	// Auto square-off
@@ -784,6 +811,7 @@ func loadConfig() Config {
 		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", ""),
 		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
 		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
+		RedisDB:          getEnvInt("REDIS_DB", 0),
 		MetricsPort:      getEnvInt("METRICS_PORT", 9090),
 		AutoSquareOffTime: getEnv("AUTO_SQUARE_OFF_TIME", "15:05"),
 	}
