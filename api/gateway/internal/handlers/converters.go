@@ -37,10 +37,37 @@ func mapStrategyType(t string) pb.StrategyType {
 		return pb.StrategyType_WEEK52_BREAKOUT
 	case "MANTHAN":
 		return pb.StrategyType_MANTHAN
+	case "HFT_BIDDING":
+		return pb.StrategyType_HFT_BIDDING
 	case "NEWS":
 		return pb.StrategyType_NEWS
 	default:
 		return pb.StrategyType_NEWS
+	}
+}
+
+// dtoHFTConfigToProto converts the JSON HFT config DTO to its proto form.
+// Returns nil when the DTO is nil (non-HFT strategies).
+func dtoHFTConfigToProto(h *dto.HFTConfig) *pb.HFTConfig {
+	if h == nil {
+		return nil
+	}
+	return &pb.HFTConfig{
+		Symbol:              h.Symbol,
+		Isin:                h.ISIN,
+		Exchange:            h.Exchange,
+		Side:                h.Side,
+		ProductType:         h.ProductType,
+		TickSize:            h.TickSize,
+		MaxBuyQty:           h.MaxBuyQty,
+		MaxSellQty:          h.MaxSellQty,
+		SingleBuyQty:        h.SingleBuyQty,
+		SingleSellQty:       h.SingleSellQty,
+		BuyLimitPrice:       h.BuyLimitPrice,
+		SellLimitPrice:      h.SellLimitPrice,
+		WindowStart:         h.WindowStart,
+		WindowEnd:           h.WindowEnd,
+		ModifyOnPriceChange: h.ModifyOnPriceChange,
 	}
 }
 
@@ -226,6 +253,9 @@ func dtoUpdateStrategyToProto(reqDTO *dto.UpdateStrategyRequest) *pb.UpdateStrat
 		tm := mapTradingMode(*reqDTO.TradingMode)
 		req.TradingMode = &tm
 	}
+	if reqDTO.HFTConfig != nil {
+		req.HftConfig = dtoHFTConfigToProto(reqDTO.HFTConfig)
+	}
 
 	return req
 }
@@ -267,4 +297,40 @@ func buildManthanResponse(resp *pb.CreateStrategyResponse) map[string]interface{
 		"strategy_type": "MANTHAN",
 		"trading_mode":  fmt.Sprintf("%v", s.TradingMode),
 	}
+}
+
+// buildHFTResponse creates a clean JSON response for HFT_BIDDING strategies,
+// echoing back the resolved HFT config so the frontend can confirm what was
+// stored (engine-applied defaults included).
+func buildHFTResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
+	s := resp.Strategy
+	out := map[string]interface{}{
+		"success":       true,
+		"strategy_id":   s.StrategyId,
+		"user_id":       s.UserId,
+		"strategy_name": s.StrategyName,
+		"strategy_type": "HFT_BIDDING",
+		"active":        s.Active,
+		"trading_mode":  fmt.Sprintf("%v", s.TradingMode),
+	}
+	if h := s.HftConfig; h != nil {
+		out["hft_config"] = map[string]interface{}{
+			"symbol":                 h.Symbol,
+			"isin":                   h.Isin,
+			"exchange":               h.Exchange,
+			"side":                   h.Side,
+			"product_type":           h.ProductType,
+			"tick_size":              h.TickSize,
+			"max_buy_qty":            h.MaxBuyQty,
+			"max_sell_qty":           h.MaxSellQty,
+			"single_buy_qty":         h.SingleBuyQty,
+			"single_sell_qty":        h.SingleSellQty,
+			"buy_limit_price":        h.BuyLimitPrice,
+			"sell_limit_price":       h.SellLimitPrice,
+			"window_start":           h.WindowStart,
+			"window_end":             h.WindowEnd,
+			"modify_on_price_change": h.ModifyOnPriceChange,
+		}
+	}
+	return out
 }

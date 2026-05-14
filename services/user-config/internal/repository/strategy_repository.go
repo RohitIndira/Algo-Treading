@@ -136,6 +136,19 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		strategy.Conditions = req.Conditions
 	}
 
+	// HFT strategies carry every runtime param in trade_configs.config_extra.
+	// Serialize the typed HFTConfig into that JSONB blob before the insert.
+	if req.StrategyType == models.StrategyTypeHFTBidding && req.HFTConfig != nil {
+		blob, mErr := json.Marshal(req.HFTConfig)
+		if mErr != nil {
+			return nil, fmt.Errorf("failed to marshal hft_config: %w", mErr)
+		}
+		if req.TradeConfig == nil {
+			req.TradeConfig = &models.TradeConfig{}
+		}
+		req.TradeConfig.ConfigExtra = blob
+	}
+
 	// Insert trade config
 	if req.TradeConfig != nil {
 		tradeConfigID := uuid.New()
@@ -143,9 +156,17 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			INSERT INTO trade_configs (
 				trade_config_id, strategy_id, order_type, product_type, validity, quantity,
 				exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price,
-				position_sizing_mode, total_capital, max_positions, per_stock_amount
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+				position_sizing_mode, total_capital, max_positions, per_stock_amount, config_extra
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 			RETURNING created_at`
+
+		// config_extra is jsonb — pass a string (postgres assignment-casts
+		// text→jsonb) or nil for NULL. Never pass []byte: lib/pq sends that
+		// as bytea, which jsonb won't accept.
+		var configExtraArg interface{}
+		if len(req.TradeConfig.ConfigExtra) > 0 {
+			configExtraArg = string(req.TradeConfig.ConfigExtra)
+		}
 
 		err = tx.QueryRowxContext(ctx, tradeQuery,
 			tradeConfigID, strategy.StrategyID, req.TradeConfig.OrderType,
@@ -154,7 +175,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.TradeConfig.StopLossPct, req.TradeConfig.TakeProfitPct,
 			req.TradeConfig.TrailingSLPct, req.TradeConfig.StopLossType, req.TradeConfig.LimitPrice,
 			req.TradeConfig.PositionSizingMode, req.TradeConfig.TotalCapital,
-			req.TradeConfig.MaxPositions, req.TradeConfig.PerStockAmount,
+			req.TradeConfig.MaxPositions, req.TradeConfig.PerStockAmount, configExtraArg,
 		).Scan(&req.TradeConfig.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert trade config: %w", err)
@@ -163,6 +184,10 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		req.TradeConfig.StrategyID = strategy.StrategyID
 		strategy.TradeConfig = req.TradeConfig
 	}
+
+	// Echo the typed HFTConfig back on the returned strategy so the
+	// CreateStrategy response carries it.
+	strategy.HFTConfig = req.HFTConfig
 
 	// Insert risk limits
 	if req.RiskLimits != nil {
@@ -247,6 +272,16 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 		strategy.TradeConfig = tradeConfig
 	}
 
+	// For HFT strategies, decode trade_configs.config_extra into the typed
+	// HFTConfig so callers don't have to parse raw JSON.
+	if strategy.StrategyType == models.StrategyTypeHFTBidding &&
+		strategy.TradeConfig != nil && len(strategy.TradeConfig.ConfigExtra) > 0 {
+		hft := &models.HFTConfig{}
+		if uErr := json.Unmarshal(strategy.TradeConfig.ConfigExtra, hft); uErr == nil {
+			strategy.HFTConfig = hft
+		}
+	}
+
 	// Get risk limits
 	riskLimits := &models.RiskLimits{}
 	riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = $1`
@@ -310,6 +345,15 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 		err = r.db.GetContext(ctx, tradeConfig, tradeQuery, strategy.StrategyID)
 		if err == nil {
 			strategy.TradeConfig = tradeConfig
+		}
+
+		// Decode HFT config_extra into the typed HFTConfig.
+		if strategy.StrategyType == models.StrategyTypeHFTBidding &&
+			strategy.TradeConfig != nil && len(strategy.TradeConfig.ConfigExtra) > 0 {
+			hft := &models.HFTConfig{}
+			if uErr := json.Unmarshal(strategy.TradeConfig.ConfigExtra, hft); uErr == nil {
+				strategy.HFTConfig = hft
+			}
 		}
 
 		// Load risk limits
@@ -394,6 +438,40 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update trade config: %w", err)
+		}
+	}
+
+	// Update HFT config_extra if provided. The proto HFTConfig carries no
+	// `mode` field, so derive it: an explicit trading_mode change wins,
+	// otherwise preserve the mode already stored in config_extra (never
+	// silently blank it — the hft-engine gates LIVE/PAPER on it).
+	if req.HFTConfig != nil {
+		mode := ""
+		if req.TradingMode != nil {
+			mode = string(*req.TradingMode)
+		} else {
+			var existing []byte
+			_ = tx.QueryRowContext(ctx,
+				`SELECT config_extra FROM trade_configs WHERE strategy_id = $1`,
+				req.StrategyID).Scan(&existing)
+			if len(existing) > 0 {
+				var old models.HFTConfig
+				if json.Unmarshal(existing, &old) == nil {
+					mode = old.Mode
+				}
+			}
+		}
+		req.HFTConfig.Mode = mode
+
+		blob, mErr := json.Marshal(req.HFTConfig)
+		if mErr != nil {
+			return nil, fmt.Errorf("failed to marshal hft_config: %w", mErr)
+		}
+		_, err = tx.ExecContext(ctx,
+			`UPDATE trade_configs SET config_extra = $1 WHERE strategy_id = $2`,
+			string(blob), req.StrategyID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update hft config: %w", err)
 		}
 	}
 

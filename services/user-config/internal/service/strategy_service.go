@@ -338,6 +338,96 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		return fmt.Errorf("invalid trading_mode: %s", req.TradingMode)
 	}
 
+	// --- HFT_BIDDING strategy: all runtime params live in HFTConfig,
+	// persisted as trade_configs.config_extra. No trade_config required
+	// from the caller — checked before the generic trade_config gate. ---
+	if req.StrategyType == models.StrategyTypeHFTBidding {
+		if len(req.StrategyName) < 3 || len(req.StrategyName) > 100 {
+			return fmt.Errorf("strategy_name must be between 3 and 100 characters")
+		}
+		if req.HFTConfig == nil {
+			return fmt.Errorf("hft_config is required for HFT_BIDDING strategy")
+		}
+		h := req.HFTConfig
+		if h.Symbol == "" {
+			return fmt.Errorf("hft_config.symbol is required")
+		}
+		if h.ISIN == "" {
+			return fmt.Errorf("hft_config.isin is required")
+		}
+		if h.Exchange == "" {
+			h.Exchange = "NSE"
+		}
+		switch h.Side {
+		case "":
+			h.Side = "BOTH"
+		case "BUY", "SELL", "BOTH":
+			// ok
+		default:
+			return fmt.Errorf("hft_config.side must be BUY, SELL, or BOTH")
+		}
+		switch h.ProductType {
+		case "":
+			h.ProductType = "INTRADAY"
+		case "INTRADAY", "DELIVERY", "CASH":
+			// ok
+		default:
+			return fmt.Errorf("hft_config.product_type must be INTRADAY, DELIVERY, or CASH")
+		}
+		if h.TickSize <= 0 {
+			h.TickSize = 0.05
+		}
+		if h.Side == "BUY" || h.Side == "BOTH" {
+			if h.MaxBuyQty <= 0 {
+				return fmt.Errorf("hft_config.max_buy_qty must be > 0 for side %s", h.Side)
+			}
+			if h.SingleBuyQty < 1 || h.SingleBuyQty > h.MaxBuyQty {
+				return fmt.Errorf("hft_config.single_buy_qty must be between 1 and max_buy_qty")
+			}
+		}
+		if h.Side == "SELL" || h.Side == "BOTH" {
+			if h.MaxSellQty <= 0 {
+				return fmt.Errorf("hft_config.max_sell_qty must be > 0 for side %s", h.Side)
+			}
+			if h.SingleSellQty < 1 || h.SingleSellQty > h.MaxSellQty {
+				return fmt.Errorf("hft_config.single_sell_qty must be between 1 and max_sell_qty")
+			}
+		}
+		if h.BuyLimitPrice < 0 || h.SellLimitPrice < 0 {
+			return fmt.Errorf("hft_config limit prices must be non-negative")
+		}
+		// Mode mirrors the strategy's trading mode — the hft-engine gates
+		// on it to refuse a PAPER strategy on a LIVE engine and vice versa.
+		h.Mode = string(req.TradingMode)
+
+		// The hft-engine reads every runtime param from config_extra; the
+		// trade_configs typed columns are unused for HFT, but the row must
+		// still exist (FK + repo invariant). Fill harmless placeholders.
+		if req.TradeConfig == nil {
+			req.TradeConfig = &models.TradeConfig{}
+		}
+		req.TradeConfig.OrderType = "LIMIT"
+		req.TradeConfig.ProductType = h.ProductType
+		req.TradeConfig.Validity = "DAY"
+		req.TradeConfig.Exchange = h.Exchange
+		req.TradeConfig.OrderSide = "BUY"
+		req.TradeConfig.StopLossType = "FIXED"        // chk_stop_loss_type
+		req.TradeConfig.PositionSizingMode = "FIXED_QTY" // trade_configs_position_sizing_mode_check
+		if req.TradeConfig.Quantity <= 0 {
+			req.TradeConfig.Quantity = 1
+		}
+		if req.Conditions == nil {
+			req.Conditions = &models.StrategyCondition{}
+		}
+		if req.RiskLimits == nil {
+			req.RiskLimits = &models.RiskLimits{
+				EnableRiskChecks:    true,
+				EnableAutoSquareOff: false,
+			}
+		}
+		return nil
+	}
+
 	if req.TradeConfig == nil {
 		return fmt.Errorf("trade_config is required")
 	}

@@ -13,6 +13,7 @@ func NewRouter(
 	websocketHandler *handlers.WebSocketHandler,
 	paperHandler *handlers.PaperTradingHandler,
 	manthanHandler *handlers.ManthanHandler,
+	hftHandler *handlers.HFTHandler,
 	healthHandler *handlers.HealthHandler,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
@@ -86,6 +87,14 @@ func NewRouter(
 	// Manthan aggregated overview
 	if manthanHandler != nil {
 		api.HandleFunc("/manthan/overview", manthanHandler.GetOverview).Methods("GET")
+	}
+
+	// HFT strategy lifecycle — drives an already-created HFT_BIDDING
+	// strategy in the hft-engine. Creation goes through /strategies above.
+	if hftHandler != nil {
+		api.HandleFunc("/hft/{strategy_id}/start", hftHandler.StartHFT).Methods("POST")
+		api.HandleFunc("/hft/{strategy_id}/stop", hftHandler.StopHFT).Methods("POST")
+		api.HandleFunc("/hft/{strategy_id}/state", hftHandler.GetHFTState).Methods("GET")
 	}
 
 	// WebSocket routes for live match feed

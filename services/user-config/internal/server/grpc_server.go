@@ -39,6 +39,7 @@ func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStr
 		RiskLimits:          protoRiskLimitsToModel(req.RiskLimits),
 		ActivateImmediately: req.ActivateImmediately,
 		TradingMode:         protoTradingModeToModel(req.TradingMode),
+		HFTConfig:           protoHFTConfigToModel(req.HftConfig),
 	}
 
 	// Extract Indira auth context if provided
@@ -106,6 +107,9 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 	if req.TradingMode != nil {
 		mode := protoTradingModeToModel(*req.TradingMode)
 		modelReq.TradingMode = &mode
+	}
+	if req.HftConfig != nil {
+		modelReq.HFTConfig = protoHFTConfigToModel(req.HftConfig)
 	}
 
 	strategy, err := s.service.UpdateStrategy(ctx, modelReq)
@@ -501,6 +505,8 @@ func modelStrategyTypeToProto(t models.StrategyType) pb.StrategyType {
 		return pb.StrategyType_WEEK52_BREAKOUT
 	case models.StrategyTypeManthan:
 		return pb.StrategyType_MANTHAN
+	case models.StrategyTypeHFTBidding:
+		return pb.StrategyType_HFT_BIDDING
 	case models.StrategyTypeNews:
 		return pb.StrategyType_NEWS
 	default:
@@ -525,10 +531,63 @@ func protoStrategyTypeToModel(t pb.StrategyType) models.StrategyType {
 		return models.StrategyType52WBreakout
 	case pb.StrategyType_MANTHAN:
 		return models.StrategyTypeManthan
+	case pb.StrategyType_HFT_BIDDING:
+		return models.StrategyTypeHFTBidding
 	case pb.StrategyType_NEWS:
 		return models.StrategyTypeNews
 	default:
 		return models.StrategyTypeNews
+	}
+}
+
+// protoHFTConfigToModel converts the proto HFTConfig to the domain model.
+// Returns nil when proto is nil (non-HFT strategies). Mode is left empty —
+// the service layer fills it from the request TradingMode.
+func protoHFTConfigToModel(p *pb.HFTConfig) *models.HFTConfig {
+	if p == nil {
+		return nil
+	}
+	return &models.HFTConfig{
+		Symbol:              p.Symbol,
+		ISIN:                p.Isin,
+		Exchange:            p.Exchange,
+		Side:                p.Side,
+		ProductType:         p.ProductType,
+		TickSize:            p.TickSize,
+		MaxBuyQty:           p.MaxBuyQty,
+		MaxSellQty:          p.MaxSellQty,
+		SingleBuyQty:        p.SingleBuyQty,
+		SingleSellQty:       p.SingleSellQty,
+		BuyLimitPrice:       p.BuyLimitPrice,
+		SellLimitPrice:      p.SellLimitPrice,
+		WindowStart:         p.WindowStart,
+		WindowEnd:           p.WindowEnd,
+		ModifyOnPriceChange: p.ModifyOnPriceChange,
+	}
+}
+
+// modelHFTConfigToProto converts the domain HFTConfig back to proto for
+// responses. Returns nil when model is nil.
+func modelHFTConfigToProto(m *models.HFTConfig) *pb.HFTConfig {
+	if m == nil {
+		return nil
+	}
+	return &pb.HFTConfig{
+		Symbol:              m.Symbol,
+		Isin:                m.ISIN,
+		Exchange:            m.Exchange,
+		Side:                m.Side,
+		ProductType:         m.ProductType,
+		TickSize:            m.TickSize,
+		MaxBuyQty:           m.MaxBuyQty,
+		MaxSellQty:          m.MaxSellQty,
+		SingleBuyQty:        m.SingleBuyQty,
+		SingleSellQty:       m.SingleSellQty,
+		BuyLimitPrice:       m.BuyLimitPrice,
+		SellLimitPrice:      m.SellLimitPrice,
+		WindowStart:         m.WindowStart,
+		WindowEnd:           m.WindowEnd,
+		ModifyOnPriceChange: m.ModifyOnPriceChange,
 	}
 }
 
@@ -729,6 +788,9 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 	}
 	if model.RiskLimits != nil {
 		strategy.RiskLimits = modelRiskLimitsToProto(model.RiskLimits)
+	}
+	if model.HFTConfig != nil {
+		strategy.HftConfig = modelHFTConfigToProto(model.HFTConfig)
 	}
 
 	return strategy

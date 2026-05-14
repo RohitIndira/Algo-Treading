@@ -44,6 +44,22 @@ func main() {
 
 	log.Printf("Connected to User Config Service at %s", cfg.Services.UserConfigAddr)
 
+	// gRPC client: hft-engine. Non-fatal — grpc.Dial is lazy, so this only
+	// errors on a malformed address; if it does, HFT routes stay disabled
+	// (router nil-checks the handler) but the rest of the gateway runs.
+	var hftHandler *handlers.HFTHandler
+	hftClient, err := grpc_clients.NewHFTClient(
+		cfg.Services.HFTEngineAddr,
+		cfg.Server.GRPCTimeout,
+	)
+	if err != nil {
+		log.Printf("Warning: HFT engine client init failed: %v (HFT routes disabled)", err)
+	} else {
+		defer hftClient.Close()
+		hftHandler = handlers.NewHFTHandler(hftClient)
+		log.Printf("Connected to HFT Engine at %s", cfg.Services.HFTEngineAddr)
+	}
+
 	// Initialize handlers
 	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient)
 
@@ -189,7 +205,7 @@ func main() {
 	}
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

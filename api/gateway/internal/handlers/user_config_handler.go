@@ -87,6 +87,7 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		Conditions:          dtoConditionsToProto(reqDTO.Conditions),
 		TradeConfig:         dtoTradeConfigToProto(reqDTO.TradeConfig),
 		RiskLimits:          dtoRiskLimitsToProto(reqDTO.RiskLimits),
+		HftConfig:           dtoHFTConfigToProto(reqDTO.HFTConfig),
 		IndiraAuth: &common.IndiraAuthContext{
 			UserId:      userIdHeader,
 			AppId:       appId,
@@ -115,6 +116,9 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 			return
 		case pb.StrategyType_MANTHAN:
 			respondWithJSON(w, http.StatusCreated, buildManthanResponse(resp))
+			return
+		case pb.StrategyType_HFT_BIDDING:
+			respondWithJSON(w, http.StatusCreated, buildHFTResponse(resp))
 			return
 		}
 	}

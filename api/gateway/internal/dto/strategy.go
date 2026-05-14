@@ -5,12 +5,13 @@ type CreateStrategyRequest struct {
 	UserID              string              `json:"user_id"`
 	StrategyName        string              `json:"strategy_name"`
 	Description         string              `json:"description"`
-	StrategyType        string              `json:"strategy_type"` // "NEWS", "52W_BREAKOUT"
+	StrategyType        string              `json:"strategy_type"` // "NEWS", "52W_BREAKOUT", "MANTHAN", "HFT_BIDDING"
 	Conditions          *StrategyConditions `json:"conditions"`
 	TradeConfig         *TradeConfig        `json:"trade_config"`
 	RiskLimits          *RiskLimits         `json:"risk_limits"`
 	ActivateImmediately bool                `json:"activate_immediately"`
 	TradingMode         string              `json:"trading_mode"` // "PAPER", "LIVE"
+	HFTConfig           *HFTConfig          `json:"hft_config"`   // required for HFT_BIDDING
 }
 
 // UpdateStrategyRequest represents the JSON body for updating a strategy
@@ -22,7 +23,29 @@ type UpdateStrategyRequest struct {
 	TradeConfig  *TradeConfig        `json:"trade_config"`
 	RiskLimits   *RiskLimits         `json:"risk_limits"`
 	TradingMode  *string             `json:"trading_mode"`
+	HFTConfig    *HFTConfig          `json:"hft_config"`
 	Version      int32               `json:"version"`
+}
+
+// HFTConfig represents the JSON HFT bidding strategy configuration. Mirrors
+// the user_config.HFTConfig proto message; `mode` is not accepted from the
+// client — the user-config service derives it from trading_mode.
+type HFTConfig struct {
+	Symbol              string  `json:"symbol"`
+	ISIN                string  `json:"isin"`
+	Exchange            string  `json:"exchange"`
+	Side                string  `json:"side"`         // "BUY", "SELL", "BOTH"
+	ProductType         string  `json:"product_type"` // "INTRADAY", "DELIVERY", "CASH"
+	TickSize            float64 `json:"tick_size"`
+	MaxBuyQty           int32   `json:"max_buy_qty"`
+	MaxSellQty          int32   `json:"max_sell_qty"`
+	SingleBuyQty        int32   `json:"single_buy_qty"`
+	SingleSellQty       int32   `json:"single_sell_qty"`
+	BuyLimitPrice       float64 `json:"buy_limit_price"`
+	SellLimitPrice      float64 `json:"sell_limit_price"`
+	WindowStart         string  `json:"window_start"` // "HH:MM" (optional)
+	WindowEnd           string  `json:"window_end"`   // "HH:MM" (optional)
+	ModifyOnPriceChange bool    `json:"modify_on_price_change"`
 }
 
 // StrategyConditions represents JSON conditions
