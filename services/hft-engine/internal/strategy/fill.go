@@ -94,6 +94,50 @@ func (r *Runner) applyFill(side *state.SideState, sideC string, f state.FillEven
 	}
 }
 
+// selfHealFilledChunk reconciles a chunk the broker says is already fully
+// executed but for which we never received an order-status WS fill event.
+// It is the EG003 ("FULLY_EXECUTED order not allowed to MODIFY") recovery
+// path: without it, the tick loop retries the MODIFY against a dead order
+// forever and the next chunk never places.
+//
+// We reconcile optimistically — the whole remaining qty is treated as
+// filled at the chunk's last known LimitPrice. The exact average fill
+// price is corrected later by the trade-book reconciler; what matters
+// here is unblocking the state machine. Mirrors applyFill's completion
+// branch.
+func (r *Runner) selfHealFilledChunk(side *state.SideState, sideC string) {
+	if side.Current == nil {
+		return
+	}
+	chunk := side.Current
+	remaining := chunk.Qty - chunk.Filled
+	if remaining > 0 {
+		side.Position += remaining
+		chunk.Filled = chunk.Qty
+	}
+	chunk.Status = state.ChunkFilled
+
+	r.auditRow("FILL_RECONCILED", sideC, chunk.Seq,
+		remaining, chunk.LimitPrice, chunk.BrokerOrderID,
+		"broker reports order fully executed (modify rejected EG003)")
+
+	r.logger.Warn("self-healed chunk: broker says fully executed but no WS fill event arrived",
+		zap.String("side", sideC),
+		zap.Int("chunk_seq", chunk.Seq),
+		zap.String("broker_order_id", chunk.BrokerOrderID),
+		zap.Int("reconciled_qty", remaining),
+		zap.Int("side_position", side.Position))
+
+	side.History = append(side.History, *chunk)
+	side.Current = nil
+
+	maxQty := r.maxQtyFor(sideC)
+	if side.Position >= maxQty {
+		side.Done = true
+		side.HaltReason = state.HaltMaxReached
+	}
+}
+
 // applyCancelAck handles a broker confirmation that our cancel went
 // through (or that the order was already gone). Moves the chunk to
 // History as CANCELLED and clears side.Current.

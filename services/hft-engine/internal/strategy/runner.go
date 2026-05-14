@@ -210,12 +210,13 @@ func (r *Runner) Run(parent context.Context) {
 			zap.String("sell_halt", string(r.live.Sell.HaltReason)))
 	}()
 
-	// No-data watchdog. Fires every NoDataCheckInterval (5s); if the
-	// last tick is older than NoDataHaltAfter (30s), halt both sides
-	// with HaltNoData. The clock starts on Run entry — if the engine
-	// boots inside market hours and ODIN is up, the first tick lands
-	// within milliseconds. If we never get a tick (feed down / wrong
-	// symbol), we halt cleanly after 30s instead of trading blind.
+	// No-data watchdog. Fires every NoDataCheckInterval; if the last
+	// tick is older than NoDataHaltAfter, halt both sides with
+	// HaltNoData (which cancels any resting order). The clock starts on
+	// Run entry. The threshold is deliberately long — illiquid stocks
+	// routinely go many minutes between touchline updates, and a resting
+	// limit order is still protective while we wait. We only give up
+	// (halt + cancel) once the feed is genuinely dead / the symbol wrong.
 	watchdog := time.NewTicker(NoDataCheckInterval)
 	defer watchdog.Stop()
 	r.live.LastTickAt = time.Now() // grace period starts now, not Unix epoch
@@ -250,13 +251,16 @@ func (r *Runner) Run(parent context.Context) {
 	}
 }
 
-// NoDataHaltAfter is how long without a tick before both sides HALT.
-// 30s matches the design doc; production tweak to taste.
-const NoDataHaltAfter = 30 * time.Second
+// NoDataHaltAfter is how long without a tick before both sides HALT
+// (and any resting order is cancelled). Set long on purpose — illiquid
+// symbols routinely go minutes between touchline updates, and we'd
+// rather keep a protective limit order resting than kill the strategy
+// on a quiet tape. 30min only trips on a genuinely dead feed.
+const NoDataHaltAfter = 30 * time.Minute
 
-// NoDataCheckInterval is how often the watchdog re-evaluates. 5s is fine
-// granularity for a 30s threshold without spamming.
-const NoDataCheckInterval = 5 * time.Second
+// NoDataCheckInterval is how often the watchdog re-evaluates. 30s is
+// fine granularity for a 30min threshold without spamming.
+const NoDataCheckInterval = 30 * time.Second
 
 // publishSnapshot deep-copies r.live and atomically stores it.
 // Called by Run after any state mutation. Cheap — copies are small

@@ -53,9 +53,29 @@ type Manager struct {
 	// rootCtx is the parent ctx every Runner derives from. Cancelling it
 	// (in main.go on shutdown) cleanly stops every active strategy.
 	rootCtx context.Context
+
+	// pendingFills buffers FillEvents that arrived before any Runner
+	// claimed their broker_order_id. The order-status WS can deliver a
+	// FILL before PlaceLimit's HTTP response hands the id back to the
+	// Runner — the fill literally beats the ack. reapPendingFills retries
+	// routing these for a short window before giving up.
+	//
+	// pendingMu is independent of mu — never hold both at once. RouteFill
+	// takes mu, releases it, then takes pendingMu; retryPendingFills takes
+	// pendingMu, releases it, then takes mu.
+	pendingMu    sync.Mutex
+	pendingFills map[string][]pendingFill
 }
 
-// New wires dependencies. Cheap; no goroutines started.
+// pendingFill is a FillEvent buffered because no Runner owned its
+// broker_order_id at arrival time. received ages it out.
+type pendingFill struct {
+	ev       state.FillEvent
+	received time.Time
+}
+
+// New wires dependencies and starts the pending-fill reaper goroutine
+// (process-lifetime; exits when rootCtx is cancelled).
 //
 // rootCtx is typically context.Background() in tests and the
 // process-lifetime ctx in main.go.
@@ -67,17 +87,20 @@ func New(rootCtx context.Context, r *repo.Repo, a *audit.Writer, br broker.Broke
 	if engineMode == "" {
 		engineMode = state.ModePaper
 	}
-	return &Manager{
-		runners:    make(map[string]*strategy.Runner),
-		repo:       r,
-		audit:      a,
-		br:         br,
-		mws:        mws,
-		ows:        ows,
-		engineMode: engineMode,
-		logger:     logger.Named("manager"),
-		rootCtx:    rootCtx,
+	m := &Manager{
+		runners:      make(map[string]*strategy.Runner),
+		repo:         r,
+		audit:        a,
+		br:           br,
+		mws:          mws,
+		ows:          ows,
+		engineMode:   engineMode,
+		logger:       logger.Named("manager"),
+		rootCtx:      rootCtx,
+		pendingFills: make(map[string][]pendingFill),
 	}
+	go m.reapPendingFills()
+	return m
 }
 
 // RouteFill is the orderws.Router callback. Called from the orderws read
@@ -96,18 +119,127 @@ func (m *Manager) RouteFill(ev state.FillEvent) {
 			break
 		}
 	}
+	runnerCount := len(m.runners)
 	m.mu.Unlock()
 
-	if target == nil {
-		// Common: events arrive for orders we cancelled milliseconds ago
-		// (broker reports CANCELLED after we've already moved the chunk
-		// to History). Debug-only; not an error.
-		m.logger.Debug("fill event with no matching runner — ignored",
+	if target != nil {
+		target.SendFill(ev)
+		return
+	}
+
+	// Indira's order WSS streams EVERY order on the user's account —
+	// including orders placed by other services (Manthan, trade-execution,
+	// the replayer, ...). With no HFT runner active, nothing here could
+	// ever own this event, so there is nothing to buffer for: drop it.
+	if runnerCount == 0 {
+		m.logger.Debug("fill event ignored — no strategies running",
 			zap.String("broker_order_id", ev.BrokerOrderID),
 			zap.String("event_type", ev.EventType))
 		return
 	}
-	target.SendFill(ev)
+
+	// A runner IS active but none owns this id yet. Usual cause is a
+	// race: the order-status WS delivered the FILL before PlaceLimit's
+	// HTTP response handed the id back to the Runner (the fill beat the
+	// ack). Buffer it — reapPendingFills retries routing every 10ms.
+	// Foreign-account events that never get claimed age out after
+	// pendingFillTTL and are dropped.
+	m.pendingMu.Lock()
+	m.pendingFills[ev.BrokerOrderID] = append(m.pendingFills[ev.BrokerOrderID],
+		pendingFill{ev: ev, received: time.Now()})
+	m.pendingMu.Unlock()
+	m.logger.Debug("fill event buffered — no matching runner yet",
+		zap.String("broker_order_id", ev.BrokerOrderID),
+		zap.String("event_type", ev.EventType))
+}
+
+// pendingFillTTL bounds how long a buffered fill is retried before we
+// give up on it. The place-vs-fill race resolves in well under a second
+// (place-order HTTP responses return in ~300ms); 2s covers it with
+// margin while getting foreign-account events out of the buffer fast.
+const pendingFillTTL = 2 * time.Second
+
+// reapPendingFills runs for the life of the process. Every 10ms it
+// retries routing buffered FillEvents whose Runner has since registered
+// its broker_order_id. Exits when rootCtx is cancelled.
+//
+// When the buffer is empty (the common case) a tick is just one mutex
+// lock + length check — cheap enough to run at 10ms.
+func (m *Manager) reapPendingFills() {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.rootCtx.Done():
+			return
+		case <-ticker.C:
+			m.retryPendingFills()
+		}
+	}
+}
+
+// retryPendingFills re-attempts routing for every buffered fill. A fill
+// whose Runner now owns the id is delivered; one older than pendingFillTTL
+// with still no owner is dropped with a WARN.
+//
+// Lock discipline: detach the buffer under pendingMu, release it, THEN
+// scan runners under mu — never hold both locks at once (RouteFill
+// acquires them in the reverse-free order).
+func (m *Manager) retryPendingFills() {
+	m.pendingMu.Lock()
+	if len(m.pendingFills) == 0 {
+		m.pendingMu.Unlock()
+		return
+	}
+	batch := m.pendingFills
+	m.pendingFills = make(map[string][]pendingFill)
+	m.pendingMu.Unlock()
+
+	now := time.Now()
+	leftover := make(map[string][]pendingFill)
+
+	for id, events := range batch {
+		m.mu.Lock()
+		var target *strategy.Runner
+		for _, r := range m.runners {
+			if r.OwnsBrokerOrderID(id) {
+				target = r
+				break
+			}
+		}
+		m.mu.Unlock()
+
+		if target != nil {
+			for _, pf := range events {
+				target.SendFill(pf.ev)
+			}
+			continue
+		}
+
+		// Still unclaimed — keep the ones inside the TTL, drop the rest.
+		// A drop is normally just a foreign-account order event (another
+		// service placed it), so this is Debug, not Warn.
+		for _, pf := range events {
+			if now.Sub(pf.received) < pendingFillTTL {
+				leftover[id] = append(leftover[id], pf)
+			} else {
+				m.logger.Debug("dropping orphan fill event — no runner claimed it (likely foreign-account order)",
+					zap.String("broker_order_id", id),
+					zap.String("event_type", pf.ev.EventType),
+					zap.Duration("age", now.Sub(pf.received)))
+			}
+		}
+	}
+
+	if len(leftover) > 0 {
+		m.pendingMu.Lock()
+		for id, evs := range leftover {
+			// leftover entries are older than anything RouteFill appended
+			// while we were scanning — keep them first to preserve order.
+			m.pendingFills[id] = append(evs, m.pendingFills[id]...)
+		}
+		m.pendingMu.Unlock()
+	}
 }
 
 // Start begins running a strategy. Loads config + credentials, builds a

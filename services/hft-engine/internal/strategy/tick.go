@@ -4,18 +4,18 @@
 // Reference state diagram lives in the design doc. The condensed rules
 // implemented here:
 //
-//   IDLE       + tick(in band, in window, pos < max) → PLACE → CHUNK_OPEN
-//              + tick(out of band) → HALT(price_band)
-//              + tick(out of window) → HALT(window_closed)
+//	IDLE       + tick(in band, in window, pos < max) → PLACE → CHUNK_OPEN
+//	           + tick(out of band) → HALT(price_band)
+//	           + tick(out of window) → HALT(window_closed)
 //
-//   CHUNK_OPEN + tick(price changed, still in band) → MODIFY (stays CHUNK_OPEN)
-//              + tick(out of band) → CANCEL → HALT(price_band)
-//              + tick(out of window) → CANCEL → HALT(window_closed)
-//              (FILL events handled in fill.go)
+//	CHUNK_OPEN + tick(price changed, still in band) → MODIFY (stays CHUNK_OPEN)
+//	           + tick(out of band) → CANCEL → HALT(price_band)
+//	           + tick(out of window) → CANCEL → HALT(window_closed)
+//	           (FILL events handled in fill.go)
 //
-//   CHUNK_PARTIAL — same transitions as CHUNK_OPEN.
+//	CHUNK_PARTIAL — same transitions as CHUNK_OPEN.
 //
-//   HALTED — terminal; tick is ignored.
+//	HALTED — terminal; tick is ignored.
 //
 // Critical invariant: a second chunk is NEVER placed while side.Current != nil.
 // The state machine's IDLE→PLACE edge is the only place we create a chunk.
@@ -24,6 +24,7 @@ package strategy
 import (
 	"context"
 	"math"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -124,8 +125,22 @@ func (r *Runner) handleSide(
 			side.Current.BrokerOrderID, side.Current.Qty, newPrice)
 		cancel()
 		if err != nil {
-			// Leave the resting order at its old price; next tick may
-			// try again. Don't halt — the order is still protective.
+			// EG003 / "FULLY_EXECUTED": the broker already fully filled
+			// this order, but its order-status WS fill event never
+			// reached us. Retrying the MODIFY every tick against a dead
+			// order loops forever — self-heal by reconciling the chunk
+			// as filled so the next chunk can place.
+			if isAlreadyFilledErr(err) {
+				r.logger.Warn("modify rejected — order already fully executed; reconciling chunk as filled",
+					zap.String("side", string(sideEnum)),
+					zap.String("broker_order_id", side.Current.BrokerOrderID),
+					zap.Error(err))
+				r.selfHealFilledChunk(side, sideC)
+				return
+			}
+			// Other errors: leave the resting order at its old price;
+			// next tick may try again. Don't halt — the order is still
+			// protective.
 			r.logger.Warn("modify failed — leaving chunk resting at old price",
 				zap.String("side", string(sideEnum)),
 				zap.String("broker_order_id", side.Current.BrokerOrderID),
@@ -216,9 +231,9 @@ func (r *Runner) haltSide(side *state.SideState, sideC string, reason state.Halt
 	if side.Done {
 		return
 	}
-	if side.Current != nil {
-		r.cancelCurrentChunk(side, sideC, string(reason))
-	}
+	// if side.Current != nil {
+	// 	r.cancelCurrentChunk(side, sideC, string(reason))
+	// }
 	side.Done = true
 	side.HaltReason = reason
 }
@@ -236,4 +251,18 @@ func roundToTick(price, tick float64) float64 {
 		return price
 	}
 	return math.Floor(price/tick) * tick
+}
+
+// isAlreadyFilledErr detects the broker's "you can't touch this order, it
+// already fully executed" rejection (Indira error code EG003). When we see
+// this on a MODIFY, the chunk has filled and we simply lost the
+// order-status WS fill event for it.
+func isAlreadyFilledErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToUpper(err.Error())
+	return strings.Contains(s, "EG003") ||
+		strings.Contains(s, "FULLY_EXECUTED") ||
+		strings.Contains(s, "FULLY EXECUTED")
 }
