@@ -484,20 +484,46 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		}
 	}
 
-	// Reload full strategy for Outbox
-	fullStrategy, err := r.GetByID(ctx, req.StrategyID, req.UserID)
-	if err == nil {
-		// Insert into Execution Outbox
-		payloadBytes, err := json.Marshal(fullStrategy)
-		if err == nil {
-			outboxQuery := `
-				INSERT INTO execution_outbox (aggregate_id, event_type, payload)
-				VALUES ($1, $2, $3)`
+	// Build the outbox payload by reading sub-records within the transaction so
+	// we see the uncommitted updates (new version, updated conditions/config/limits).
+	// Using r.db here would return pre-commit data under READ COMMITTED isolation,
+	// causing the rules engine to receive the old version and discard the event.
+	outboxStrategy := *strategy // copy strategy-level fields (new version from RETURNING)
+	{
+		cond := &models.StrategyCondition{}
+		condSel := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
+		if err2 := tx.GetContext(ctx, cond, condSel, strategy.StrategyID); err2 == nil {
+			outboxStrategy.Conditions = cond
+		}
 
-			_, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", string(payloadBytes))
-			if ctxErr != nil {
-				return nil, fmt.Errorf("failed to insert into execution outbox: %w", ctxErr)
+		tc := &models.TradeConfig{}
+		tcSel := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
+		if err2 := tx.GetContext(ctx, tc, tcSel, strategy.StrategyID); err2 == nil {
+			var mlRaw struct {
+				MultiLevelSL []byte `db:"multi_level_sl"`
+				MultiLevelTP []byte `db:"multi_level_tp"`
 			}
+			if err3 := tx.GetContext(ctx, &mlRaw, `SELECT multi_level_sl, multi_level_tp FROM trade_configs WHERE strategy_id = $1`, strategy.StrategyID); err3 == nil {
+				if len(mlRaw.MultiLevelSL) > 0 {
+					_ = json.Unmarshal(mlRaw.MultiLevelSL, &tc.MultiLevelSL)
+				}
+				if len(mlRaw.MultiLevelTP) > 0 {
+					_ = json.Unmarshal(mlRaw.MultiLevelTP, &tc.MultiLevelTP)
+				}
+			}
+			outboxStrategy.TradeConfig = tc
+		}
+
+		rl := &models.RiskLimits{}
+		if err2 := tx.GetContext(ctx, rl, `SELECT * FROM risk_limits WHERE strategy_id = $1`, strategy.StrategyID); err2 == nil {
+			outboxStrategy.RiskLimits = rl
+		}
+	}
+
+	if payloadBytes, err2 := json.Marshal(&outboxStrategy); err2 == nil {
+		outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
+		if _, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", string(payloadBytes)); ctxErr != nil {
+			return nil, fmt.Errorf("failed to insert into execution outbox: %w", ctxErr)
 		}
 	}
 
@@ -505,7 +531,7 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return fullStrategy, nil
+	return &outboxStrategy, nil
 }
 
 // Delete deletes a strategy
@@ -669,6 +695,113 @@ func (r *StrategyRepository) DeactivateAllActive(ctx context.Context) (int, erro
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("failed to commit bulk deactivation: %w", err)
+	}
+
+	return len(rows), nil
+}
+
+// DeactivateAllActiveByMode deactivates every active, non-deleted strategy whose
+// trading_mode matches the given mode ("PAPER" or "LIVE"). Writes one
+// STRATEGY_DEACTIVATED outbox entry per strategy. Returns the count deactivated.
+func (r *StrategyRepository) DeactivateAllActiveByMode(ctx context.Context, tradingMode string) (int, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	type deactivatedRow struct {
+		StrategyID uuid.UUID `db:"strategy_id"`
+		UserID     string    `db:"user_id"`
+		Version    int64     `db:"version"`
+	}
+
+	updateQuery := `
+		UPDATE strategies
+		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
+		WHERE active = true AND deleted_at IS NULL AND trading_mode = $1
+		RETURNING strategy_id, user_id, version`
+
+	rows := []deactivatedRow{}
+	if err := tx.SelectContext(ctx, &rows, updateQuery, tradingMode); err != nil {
+		return 0, fmt.Errorf("failed to bulk-deactivate %s strategies: %w", tradingMode, err)
+	}
+
+	if len(rows) == 0 {
+		return 0, tx.Commit()
+	}
+
+	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
+	for _, row := range rows {
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"strategy_id": row.StrategyID,
+			"user_id":     row.UserID,
+			"version":     row.Version,
+			"active":      false,
+		})
+		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", string(payloadBytes)); err != nil {
+			return 0, fmt.Errorf("failed to insert outbox entry for strategy %s: %w", row.StrategyID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit %s strategy deactivation: %w", tradingMode, err)
+	}
+
+	return len(rows), nil
+}
+
+// DeactivateActiveByAutoSquareOffTime deactivates all active strategies that have
+// enable_auto_square_off=true and auto_square_off_time matching squareOffTime (HH:MM).
+// Writes one STRATEGY_DEACTIVATED outbox entry per deactivated strategy.
+func (r *StrategyRepository) DeactivateActiveByAutoSquareOffTime(ctx context.Context, squareOffTime string) (int, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	type deactivatedRow struct {
+		StrategyID uuid.UUID `db:"strategy_id"`
+		UserID     string    `db:"user_id"`
+		Version    int64     `db:"version"`
+	}
+
+	// JOIN with risk_limits because enable_auto_square_off / auto_square_off_time
+	// live in that table, not in strategies.
+	updateQuery := `
+		UPDATE strategies s
+		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
+		FROM risk_limits rl
+		WHERE s.strategy_id = rl.strategy_id
+		  AND s.active = true AND s.deleted_at IS NULL
+		  AND rl.enable_auto_square_off = true AND rl.auto_square_off_time = $1
+		RETURNING s.strategy_id, s.user_id, s.version`
+
+	rows := []deactivatedRow{}
+	if err := tx.SelectContext(ctx, &rows, updateQuery, squareOffTime); err != nil {
+		return 0, fmt.Errorf("failed to deactivate strategies at sq-off time %s: %w", squareOffTime, err)
+	}
+
+	if len(rows) == 0 {
+		return 0, tx.Commit()
+	}
+
+	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
+	for _, row := range rows {
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"strategy_id": row.StrategyID,
+			"user_id":     row.UserID,
+			"version":     row.Version,
+			"active":      false,
+		})
+		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", string(payloadBytes)); err != nil {
+			return 0, fmt.Errorf("failed to insert outbox entry for strategy %s: %w", row.StrategyID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit deactivation at sq-off time %s: %w", squareOffTime, err)
 	}
 
 	return len(rows), nil

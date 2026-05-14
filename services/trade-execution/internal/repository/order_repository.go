@@ -741,8 +741,12 @@ func (r *orderRepository) GetActiveOrdersByStrategy(ctx context.Context, strateg
 // Used when a strategy is deactivated or deleted to ensure no positions remain open.
 // For filled paper orders, paper_exit_price is set to filled_price so they appear in the
 // closed positions view (which requires paper_exit_price IS NOT NULL).
+// Also cancels any PENDING/ACTIVE multi_level_exit_levels rows for those orders so they
+// are not left orphaned in the DB after the in-memory manager group is torn down.
 func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error {
-	query := `
+	now := time.Now()
+
+	ordersQuery := `
 		UPDATE orders SET
 			status = 'CANCELLED',
 			rejection_reason = 'Strategy deactivated or deleted',
@@ -756,15 +760,34 @@ func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strateg
 				THEN 0
 				ELSE paper_pnl
 			END,
+			paper_exit_time = CASE
+				WHEN is_paper_trade = true AND filled_price IS NOT NULL AND paper_exit_time IS NULL
+				THEN $1
+				ELSE paper_exit_time
+			END,
 			updated_at = $1
 		WHERE strategy_id = $2
 		AND user_id = $3
 		AND status NOT IN ('CANCELLED', 'REJECTED', 'A.REJECTED')
 	`
-	_, err := r.db.ExecContext(ctx, query, time.Now(), strategyID, userID)
-	if err != nil {
+	if _, err := r.db.ExecContext(ctx, ordersQuery, now, strategyID, userID); err != nil {
 		return fmt.Errorf("failed to cancel orders for strategy %s user %s: %w", strategyID, userID, err)
 	}
+
+	mlQuery := `
+		UPDATE multi_level_exit_levels
+		SET status     = 'CANCELLED',
+		    updated_at = $1
+		WHERE entry_order_id IN (
+			SELECT order_id FROM orders
+			WHERE strategy_id = $2 AND user_id = $3
+		)
+		AND status IN ('PENDING', 'ACTIVE')
+	`
+	if _, err := r.db.ExecContext(ctx, mlQuery, now, strategyID, userID); err != nil {
+		return fmt.Errorf("failed to cancel ml levels for strategy %s user %s: %w", strategyID, userID, err)
+	}
+
 	return nil
 }
 
@@ -832,41 +855,51 @@ func (r *orderRepository) GetExitableLiveOrdersByStrategy(ctx context.Context, s
 	return orders, nil
 }
 
-// UpdatePaperTradeExit marks a paper order as exited with the given price and PnL
+// UpdatePaperTradeExit marks a paper order as exited with the given price and PnL.
+// Covers all exit scenarios: SL hit, TP hit, trailing SL, force exit, auto square-off.
+// The WHERE clause guards paper_exit_price IS NULL so that if a position was already
+// closed (e.g. SL fired right as auto square-off ran), the first exit wins and the
+// exit time is never overwritten by a second call.
 func (r *orderRepository) UpdatePaperTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	now := time.Now()
 	query := `
 		UPDATE orders SET
 			status = 'CANCELLED',
 			paper_exit_price = $1,
 			paper_pnl = $2,
+			paper_exit_time = $3,
 			updated_at = $3
 		WHERE order_id = $4
+		AND paper_exit_price IS NULL
 	`
-	result, err := r.db.ExecContext(ctx, query, exitPrice, pnl, time.Now(), orderID)
+	result, err := r.db.ExecContext(ctx, query, exitPrice, pnl, now, orderID)
 	if err != nil {
 		return fmt.Errorf("failed to update paper trade exit: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("paper order not found: %s", orderID)
+		// Either the order does not exist or it was already exited — both are safe no-ops.
+		return nil
 	}
 	return nil
 }
 
-// UpdatePaperExitPrice sets paper_exit_price and paper_pnl WITHOUT changing status.
+// UpdatePaperExitPrice sets paper_exit_price, paper_pnl, and paper_exit_time WITHOUT changing status.
 // Used during strategy deactivation/deletion so that CancelAllOrdersByStrategy can still
 // set rejection_reason and status=CANCELLED in the same bulk pass.
 func (r *orderRepository) UpdatePaperExitPrice(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	now := time.Now()
 	query := `
 		UPDATE orders SET
 			paper_exit_price = $1,
 			paper_pnl = $2,
+			paper_exit_time = $3,
 			updated_at = $3
 		WHERE order_id = $4
 		AND is_paper_trade = true
 		AND paper_exit_price IS NULL
 	`
-	_, err := r.db.ExecContext(ctx, query, exitPrice, pnl, time.Now(), orderID)
+	_, err := r.db.ExecContext(ctx, query, exitPrice, pnl, now, orderID)
 	if err != nil {
 		return fmt.Errorf("failed to update paper exit price for order %s: %w", orderID, err)
 	}

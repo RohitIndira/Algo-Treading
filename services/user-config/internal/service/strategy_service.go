@@ -223,10 +223,18 @@ func (s *StrategyService) ListAllActiveStrategies(ctx context.Context, limit, of
 	return s.repo.ListAllActive(ctx, limit, offset)
 }
 
-// DeactivateAllActiveStrategies deactivates every active strategy (used by the
-// end-of-day scheduler at market close). Returns the count of strategies deactivated.
-func (s *StrategyService) DeactivateAllActiveStrategies(ctx context.Context) (int, error) {
-	return s.repo.DeactivateAllActive(ctx)
+// DeactivateAllActiveStrategiesByMode deactivates every active strategy of the given
+// trading mode ("PAPER" or "LIVE"). Called by the EOD scheduler at the corresponding
+// square-off time (15:00 for PAPER, 15:05 for LIVE).
+func (s *StrategyService) DeactivateAllActiveStrategiesByMode(ctx context.Context, tradingMode string) (int, error) {
+	return s.repo.DeactivateAllActiveByMode(ctx, tradingMode)
+}
+
+// DeactivateStrategiesAtAutoSquareOffTime deactivates all active strategies whose
+// enable_auto_square_off=true and auto_square_off_time matches squareOffTime (HH:MM).
+// Called every minute by the EOD scheduler to align strategy deactivation with position square-off.
+func (s *StrategyService) DeactivateStrategiesAtAutoSquareOffTime(ctx context.Context, squareOffTime string) (int, error) {
+	return s.repo.DeactivateActiveByAutoSquareOffTime(ctx, squareOffTime)
 }
 
 // validateCreateRequest validates a create strategy request
