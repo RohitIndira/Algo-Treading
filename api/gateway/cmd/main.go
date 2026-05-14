@@ -78,8 +78,16 @@ func main() {
 		AllowedHeaders: cfg.CORS.AllowedHeaders,
 	}
 
+	// Auth config
+	authConfig := middleware.AuthConfig{
+		VerifyURL: cfg.Auth.VerifyURL,
+		Timeout:   cfg.Auth.Timeout,
+	}
+
+	log.Printf("Auth middleware configured: verify URL=%s timeout=%s", authConfig.VerifyURL, authConfig.Timeout)
+
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, corsConfig, authConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

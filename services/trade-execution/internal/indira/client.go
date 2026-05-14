@@ -384,10 +384,11 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		}
 		if order.StopLoss != nil {
 			req.TriggerPrice = indiraClient.Price2DP(roundClamp(*order.StopLoss))
-			// Force order type to SL (stoploss-limit) when a trigger price is present.
-			// A plain LIMIT order ignores triggerPrice at the broker — the order must
-			// be SL so it stays pending until price hits the trigger, then fills at limitPrice.
-			req.OrdType = "SL"
+			// SL-M orders keep their type; SL-Limit orders need the explicit "SL" type
+			// so the broker treats them as stop orders rather than plain limit orders.
+			if req.OrdType != "SL-M" {
+				req.OrdType = "SL"
+			}
 		}
 		// Do NOT set BoStpLoss / BoTgtPrice for plain (non-bracket) orders.
 		// The broker interprets any order carrying these fields (even as 0) as a

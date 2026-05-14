@@ -742,11 +742,13 @@ func (r *StrategyRepository) DeactivateActiveByAutoSquareOffTime(ctx context.Con
 	}
 
 	updateQuery := `
-		UPDATE strategies
+		UPDATE strategies s
 		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
-		WHERE active = true AND deleted_at IS NULL
-		  AND enable_auto_square_off = true AND auto_square_off_time = $1
-		RETURNING strategy_id, user_id, version`
+		FROM risk_limits rl
+		WHERE s.strategy_id = rl.strategy_id
+		  AND s.active = true AND s.deleted_at IS NULL
+		  AND rl.enable_auto_square_off = true AND rl.auto_square_off_time = $1
+		RETURNING s.strategy_id, s.user_id, s.version`
 
 	rows := []deactivatedRow{}
 	if err := tx.SelectContext(ctx, &rows, updateQuery, squareOffTime); err != nil {

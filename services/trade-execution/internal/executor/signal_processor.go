@@ -166,9 +166,9 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 			return fmt.Errorf("below_min order %s has no target price", order.OrderID)
 		}
 
-		// For MULTI_LEVEL orders, routeToMultiLevel cannot run at signal-arrival time
-		// because the order must first wait for price target. Pass a closure that runs
-		// RegisterEntry + OnEntryFill after the price monitor triggers and fills the order.
+		// For MULTI_LEVEL and TRAILING SL orders, routeToMultiLevel / OCO adoption
+		// cannot run at signal-arrival time because the order must first wait for the
+		// price target. Pass a closure that activates the right manager after fill.
 		var onAfterFill func(*models.Order)
 		if isMultiLevel && p.multiLevelManager != nil {
 			capturedSignal := signal
@@ -204,11 +204,43 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 					)
 				}
 			}
+		} else if isTrailingSL && !order.IsPaperTrade && p.ocoManager != nil && hasAuth {
+			// below_min + TRAILING SL + FIXED TP: adopt the placed order into OCO
+			// after the price monitor fires so trailing SL protection is active.
+			capturedSignal := signal
+			onAfterFill = func(filled *models.Order) {
+				if filled.IndiraOrderID == nil {
+					return
+				}
+				var auth *indiraClient.AuthContext
+				if filled.BearerToken != nil && filled.AppId != nil && filled.Source != nil {
+					auth = &indiraClient.AuthContext{
+						UserId:      filled.UserID,
+						BearerToken: *filled.BearerToken,
+						AppId:       *filled.AppId,
+						Source:      *filled.Source,
+					}
+				}
+				trailPct := capturedSignal.TrailingSLPct
+				p.ocoManager.AdoptOrder(filled, capturedSignal.StopLossPct, capturedSignal.TakeProfitPct, true, trailPct, auth)
+			}
 		}
 
 		p.priceMonitor.Watch(order, targetPrice, onAfterFill)
 		p.logOrderTiming(signal, "price_monitor", kafkaTime, processStart, idempotencyMs, dbMs, nil)
 		return nil
+	}
+
+	// ── Paper trading with SL or TP → ML manager for LTP-based monitoring ──
+	// Paper trades have no real broker orders, so SL/TP exits must be simulated
+	// via Redis LTP polling. The ML manager already does this for multi-level;
+	// we reuse it for single-level Fixed SL, Fixed TP, and Trailing SL paper trades
+	// by synthesizing single-level SL/TP configs from StopLossPct/TakeProfitPct.
+	hasSLOrTP := signal.StopLossPct > 0 || signal.TakeProfitPct > 0
+	if order.IsPaperTrade && hasSLOrTP && !isMultiLevel && p.multiLevelManager != nil {
+		err := p.routeToPaperSLTP(ctx, order, signal)
+		p.logOrderTiming(signal, "paper_sl_tp", kafkaTime, processStart, idempotencyMs, dbMs, err)
+		return err
 	}
 
 	// ── Route 1: Trailing SL → Custom OCO ───────────────────────────────
@@ -231,19 +263,28 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 		return err
 	}
 
-	// ── Route 3: Default → Broker API (bracket or regular order) ────────
+	// ── Route 3: Default → Broker API (plain INTRADAY order) ───────────
+	// Strip BRACKET_ORDER for all non-ML, non-below-min orders — we never
+	// send broker bracket orders; SL/TP legs are managed separately after fill.
+	if order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO" {
+		order.ProductType = "INTRADAY"
+	}
+
 	err = p.executor.ExecuteOrder(ctx, order)
 	p.logOrderTiming(signal, "executor", kafkaTime, processStart, idempotencyMs, dbMs, err)
 	if err != nil {
 		return fmt.Errorf("order execution failed: %w", err)
 	}
 
-	// If a trailing-SL order reached Route 3 (e.g. auth was unavailable at
-	// Route 1 check but the executor resolved it from cache), the position
-	// has no OCO protection. Retroactively adopt the placed order into an
-	// OCO group so that handleEntryUpdate fires on the WS EXECUTED event
-	// and places SL/TP legs from the actual fill price.
-	if isTrailingSL && p.ocoManager != nil && !order.IsPaperTrade && order.IndiraOrderID != nil {
+	// For LIVE orders with any SL or TP: adopt into OCO so that when the broker
+	// WS EXECUTED event fires, placeOCOLegs places the SL-M and/or LIMIT TP legs
+	// from the actual fill price. Covers:
+	//   • Fixed SL + Fixed TP  (trailingSL=false)
+	//   • Fixed SL only        (trailingSL=false, tpPct=0)
+	//   • No SL + Fixed TP     (trailingSL=false, slPct=0)
+	//   • Trailing SL fallback (trailingSL=true)  — auth was unavailable at Route 1
+	hasAnySLOrTP := signal.StopLossPct > 0 || signal.TakeProfitPct > 0
+	if hasAnySLOrTP && !order.IsPaperTrade && p.ocoManager != nil && order.IndiraOrderID != nil {
 		var auth *indiraClient.AuthContext
 		if order.BearerToken != nil && order.AppId != nil && order.Source != nil {
 			auth = &indiraClient.AuthContext{
@@ -253,15 +294,20 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 				Source:      *order.Source,
 			}
 		}
-		trailPct := 0.0
-		if order.TrailingSLPct != nil {
-			trailPct = *order.TrailingSLPct
+		if auth != nil {
+			trailPct := 0.0
+			if order.TrailingSLPct != nil {
+				trailPct = *order.TrailingSLPct
+			}
+			p.ocoManager.AdoptOrder(order, signal.StopLossPct, signal.TakeProfitPct, isTrailingSL, trailPct, auth)
+			p.logger.Info("order adopted into OCO for post-fill SL/TP placement",
+				zap.String("order_id", order.OrderID.String()),
+				zap.String("broker_id", *order.IndiraOrderID),
+				zap.String("symbol", order.Symbol),
+				zap.Bool("trailing_sl", isTrailingSL),
+				zap.Float64("sl_pct", signal.StopLossPct),
+				zap.Float64("tp_pct", signal.TakeProfitPct))
 		}
-		p.ocoManager.AdoptOrder(order, signal.StopLossPct, signal.TakeProfitPct, trailPct, auth)
-		p.logger.Info("Trailing SL order adopted into OCO after Route 3 placement",
-			zap.String("order_id", order.OrderID.String()),
-			zap.String("broker_id", *order.IndiraOrderID),
-			zap.String("symbol", order.Symbol))
 	}
 
 	return nil
@@ -308,11 +354,82 @@ func (p *SignalProcessor) logOrderTiming(signal *models.TradeSignal, route strin
 
 
 
+// routeToPaperSLTP handles paper-trade entry orders that have a Fixed or Trailing SL
+// and/or a Fixed TP. It synthesizes single-level SL/TP configs from StopLossPct and
+// TakeProfitPct, registers them with the multi-level manager (which already has Redis
+// LTP polling for paper-trade exit simulation), and then executes the entry order.
+//
+// Covered combinations (paper mode only):
+//   - Fixed SL + Fixed TP
+//   - Fixed SL only
+//   - Trailing SL + Fixed TP
+//   - Trailing SL only
+//   - No SL + Fixed TP
+func (p *SignalProcessor) routeToPaperSLTP(ctx context.Context, order *models.Order, signal *models.TradeSignal) error {
+	slMode := "FIXED"
+	if order.StopLossType != nil && *order.StopLossType == "TRAILING" {
+		slMode = "TRAILING"
+	}
+
+	// Synthesize single-level SL/TP from percentage configs.
+	// QtyPct=100 means the single level exits the full position.
+	var slLevels []models.MultiLevelExitLevel
+	if signal.StopLossPct > 0 {
+		slLevels = []models.MultiLevelExitLevel{
+			{LevelNum: 1, PricePct: signal.StopLossPct, QtyPct: 100},
+		}
+	}
+	var tpLevels []models.MultiLevelExitLevel
+	if signal.TakeProfitPct > 0 {
+		tpLevels = []models.MultiLevelExitLevel{
+			{LevelNum: 1, PricePct: signal.TakeProfitPct, QtyPct: 100},
+		}
+	}
+
+	// Register BEFORE placing so that if the paper executor fires the fill
+	// callback synchronously, the group is already in the map.
+	p.multiLevelManager.RegisterEntry(
+		order,
+		slMode, "FIXED",
+		slLevels, tpLevels,
+		signal.StopLossPct, signal.TrailingSLPct,
+		nil, // no live auth for paper trading
+	)
+
+	if err := p.executor.ExecuteOrder(ctx, order); err != nil {
+		return fmt.Errorf("paper sl/tp entry order failed: %w", err)
+	}
+
+	// Paper fill is immediate — trigger ML exit monitoring now.
+	if order.FilledQuantity > 0 && order.FilledPrice != nil {
+		p.multiLevelManager.OnEntryFill(
+			ctx, order.OrderID, *order.FilledPrice,
+			order.FilledQuantity, slLevels, tpLevels,
+		)
+	}
+
+	p.logger.Info("paper order routed to ML manager for SL/TP monitoring",
+		zap.String("order_id", order.OrderID.String()),
+		zap.String("symbol", order.Symbol),
+		zap.String("sl_mode", slMode),
+		zap.Float64("sl_pct", signal.StopLossPct),
+		zap.Float64("tp_pct", signal.TakeProfitPct))
+
+	return nil
+}
+
 // routeToMultiLevel places the entry order via the regular executor then registers
 // the order with the multi-level exit manager. For paper trades the fill is
 // immediate, so OnEntryFill is called inline. For live trades the ML manager
 // waits for the broker WS EXECUTED event via HandleBrokerUpdate.
 func (p *SignalProcessor) routeToMultiLevel(ctx context.Context, order *models.Order, signal *models.TradeSignal) error {
+	// The multi-level manager places SL/TP legs itself after entry fills.
+	// The entry order must NOT be a broker bracket order — strip the bracket
+	// product type so the Indira client sends a plain INTRADAY order.
+	if order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO" {
+		order.ProductType = "INTRADAY"
+	}
+
 	slMode := signal.StopLossType
 	if slMode == "" {
 		slMode = "FIXED"

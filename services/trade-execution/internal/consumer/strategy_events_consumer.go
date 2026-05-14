@@ -24,8 +24,10 @@ type PaperPriceLookup interface {
 type configEventType string
 
 const (
-	configPaused  configEventType = "CONFIG_PAUSED"
-	configDeleted configEventType = "CONFIG_DELETED"
+	configPaused   configEventType = "CONFIG_PAUSED"
+	configDeleted  configEventType = "CONFIG_DELETED"
+	configCreated  configEventType = "CONFIG_CREATED"
+	configUpdated  configEventType = "CONFIG_UPDATED"
 )
 
 type strategyEvent struct {
@@ -41,14 +43,30 @@ type OrderUnwatcher interface {
 	UnwatchByStrategy(strategyID string) int
 }
 
+// PaperOrderPurger removes paper orders from the paper monitor's in-memory cache.
+// Implemented by *paper.PaperTradeMonitor.
+type PaperOrderPurger interface {
+	RemoveOrdersByStrategy(strategyID string)
+}
+
+// CredentialsInvalidator evicts a user's cached broker credentials so the next
+// order re-reads the fresh token from DB. Implemented by *executor.CredentialsCache.
+type CredentialsInvalidator interface {
+	Invalidate(userID string)
+}
+
 // StrategyEventsConsumer listens to user-config-events and closes all open
 // positions / cancels all pending orders when a strategy is deactivated or deleted.
+// It also invalidates the credentials cache when a strategy is created or updated
+// so the next order for that user picks up the latest bearer token from DB.
 type StrategyEventsConsumer struct {
 	reader       *kafka.Reader
 	orderRepo    repository.OrderRepository
 	executor     *executor.OrderExecutor
-	priceMonitor OrderUnwatcher    // nil-safe: may be unset if PriceMonitor is disabled
-	priceClient  PaperPriceLookup  // nil-safe: used to get LTP for paper exit PnL
+	priceMonitor OrderUnwatcher       // nil-safe
+	priceClient  PaperPriceLookup     // nil-safe
+	paperMonitor PaperOrderPurger     // nil-safe
+	credsCache   CredentialsInvalidator // nil-safe
 	logger       *zap.Logger
 }
 
@@ -89,6 +107,19 @@ func (c *StrategyEventsConsumer) SetPriceMonitor(pm OrderUnwatcher) {
 // SetPriceClient wires the Redis price client so paper exits use real LTP instead of entry price.
 func (c *StrategyEventsConsumer) SetPriceClient(pc PaperPriceLookup) {
 	c.priceClient = pc
+}
+
+// SetPaperMonitor wires the paper trade monitor so its in-memory cache is purged
+// when a strategy is deactivated, stopping stale Redis scan log lines.
+func (c *StrategyEventsConsumer) SetPaperMonitor(pm PaperOrderPurger) {
+	c.paperMonitor = pm
+}
+
+// SetCredentialsCache wires the credentials cache so that CONFIG_CREATED and
+// CONFIG_UPDATED events evict the stale entry — forcing the next order to
+// re-read the fresh bearer token from broker_accounts.
+func (c *StrategyEventsConsumer) SetCredentialsCache(cc CredentialsInvalidator) {
+	c.credsCache = cc
 }
 
 // Start begins consuming user-config-events. Blocks until ctx is cancelled.
@@ -141,6 +172,16 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 	switch ev.Type {
 	case configPaused, configDeleted:
 		return c.closeStrategyPositions(ctx, ev)
+	case configCreated, configUpdated:
+		// Invalidate cached credentials so the next live order re-reads the fresh
+		// bearer token that user-config just wrote to broker_accounts.
+		if c.credsCache != nil && ev.UserID != "" {
+			c.credsCache.Invalidate(ev.UserID)
+			c.logger.Info("credentials cache invalidated on strategy event",
+				zap.String("event_type", string(ev.Type)),
+				zap.String("user_id", ev.UserID))
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -168,6 +209,11 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 				zap.String("strategy_id", ev.StrategyID),
 				zap.Int("removed", removed))
 		}
+	}
+	// Purge from paper monitor in-memory cache so the Redis scan loop stops
+	// logging these positions after the strategy is deactivated.
+	if c.paperMonitor != nil {
+		c.paperMonitor.RemoveOrdersByStrategy(ev.StrategyID)
 	}
 
 	orders, err := c.orderRepo.GetActiveOrdersByStrategy(ctx, ev.StrategyID, ev.UserID)

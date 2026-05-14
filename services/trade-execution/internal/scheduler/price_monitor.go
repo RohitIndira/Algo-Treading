@@ -607,10 +607,25 @@ func (pm *PriceMonitor) triggerOrder(ctx context.Context, entry *watchEntry, ltp
 		}
 	}
 
-	// Promote from STOP_LOSS → LIMIT so the executor places a Limit + BRACKET_ORDER.
+	// Promote from STOP_LOSS → LIMIT so the executor places the order at broker.
 	// The PriceMonitor already waited for the price to reach the target level.
 	// Set limit price = LTP + 0.5% buffer to cross the spread and fill immediately.
 	order.OrderType = models.OrderTypeLimit
+
+	// If onAfterFill is set, an ML manager or OCO manager will place its own SL/TP
+	// legs after the entry fills. Keep ProductType as INTRADAY so the broker does NOT
+	// place bracket legs that would conflict (or be rejected when SL/TP=0 in ML mode).
+	slVal := 0.0
+	tpVal := 0.0
+	if order.StopLoss != nil {
+		slVal = *order.StopLoss
+	}
+	if order.TakeProfit != nil {
+		tpVal = *order.TakeProfit
+	}
+	if entry.onAfterFill != nil || (slVal == 0 && tpVal == 0) {
+		order.ProductType = "INTRADAY"
+	}
 	adjustedLimit := ltp * 1.005
 
 	// Fetch per-instrument tick size from Redis; fall back to NSE default (0.05).

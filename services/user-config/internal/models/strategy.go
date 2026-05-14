@@ -178,4 +178,8 @@ type UpdateStrategyRequest struct {
 	RiskLimits   *RiskLimits        `json:"risk_limits,omitempty"`
 	TradingMode  *TradingMode       `json:"trading_mode,omitempty"`
 	Version      int32              `json:"version" validate:"required"`
+
+	// IndiraAuth refreshes the broker credentials for this user.
+	// Pass this whenever the Indira bearer token is renewed (tokens expire daily).
+	IndiraAuth *IndiraAuthContext `json:"indira_auth,omitempty"`
 }

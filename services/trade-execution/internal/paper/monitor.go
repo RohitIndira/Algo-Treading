@@ -351,6 +351,66 @@ func (m *PaperTradeMonitor) RemoveOrder(orderID uuid.UUID) {
 	m.exiting.Delete(orderID)
 }
 
+// RemoveOrdersByStrategy purges all cached orders belonging to strategyID from
+// the in-memory orderCache and cleans up trailing SL state. Called when a strategy
+// is paused or deleted so the Redis scan loop stops logging stale positions.
+func (m *PaperTradeMonitor) RemoveOrdersByStrategy(strategyID string) {
+	// Collect order IDs and symbols to clean up outside the cache lock.
+	type removed struct {
+		orderID uuid.UUID
+		symbol  string
+		meta    symbolMeta
+	}
+	var removedList []removed
+
+	m.cacheMu.Lock()
+	for sym, orders := range m.orderCache {
+		remaining := make([]*models.Order, 0, len(orders))
+		for _, o := range orders {
+			if o.StrategyID == strategyID {
+				removedList = append(removedList, removed{orderID: o.OrderID, symbol: sym, meta: m.symbolMeta[sym]})
+			} else {
+				remaining = append(remaining, o)
+			}
+		}
+		if len(remaining) == 0 {
+			delete(m.orderCache, sym)
+			delete(m.symbolMeta, sym)
+		} else {
+			m.orderCache[sym] = remaining
+		}
+	}
+	m.cacheMu.Unlock()
+
+	for _, r := range removedList {
+		m.cacheMu.RLock()
+		stillTracked := len(m.orderCache[r.symbol]) > 0
+		m.cacheMu.RUnlock()
+		if !stillTracked {
+			unsubs := []string{r.symbol}
+			tok := ""
+			if r.meta.token > 0 {
+				tok = strconv.FormatInt(r.meta.token, 10)
+				unsubs = append(unsubs, tok)
+			}
+			m.marketClient.Unsubscribe(unsubs)
+			m.priceMu.Lock()
+			delete(m.latestLTP, r.symbol)
+			delete(m.wssLastSeen, r.symbol)
+			m.priceMu.Unlock()
+			if tok != "" {
+				m.cacheMu.Lock()
+				delete(m.tokenToSym, tok)
+				m.cacheMu.Unlock()
+			}
+		}
+		m.trailMu.Lock()
+		delete(m.trailStates, r.orderID)
+		m.trailMu.Unlock()
+		m.exiting.Delete(r.orderID)
+	}
+}
+
 // UpdateCachedOrderQty updates the in-memory FilledQuantity for a paper order
 // after a partial ML exit so that subsequent PnL broadcasts use the remaining qty.
 func (m *PaperTradeMonitor) UpdateCachedOrderQty(orderID uuid.UUID, remainingQty int32) {

@@ -296,6 +296,15 @@ func (m *OCOManager) CreateOCOEntry(
 		OCOGroupID: &groupID,
 		OCORole:    stringPtr(string(RoleEntry)),
 	}
+	// Persist trailing SL config on the entry order so reconstructGroup can
+	// restore TrailingSL = true after a service restart.
+	if trailingSL {
+		s := "TRAILING"
+		entryOrder.StopLossType = &s
+	}
+	if trailingSLPct > 0 {
+		entryOrder.TrailingSLPct = &trailingSLPct
+	}
 
 	// Persist entry order to DB
 	if err := m.repo.Create(ctx, entryOrder); err != nil {
@@ -442,6 +451,31 @@ func (m *OCOManager) HandleBrokerUpdate(ctx context.Context, order *models.Order
 		m.handleSLLegUpdate(ctx, group, order, brokerStatusUpper)
 	case group.TPBrokerID:
 		m.handleTPLegUpdate(ctx, group, order, brokerStatusUpper)
+	default:
+		// Race: WS PENDING/EXECUTED arrived for a leg before placeOCOLegs stored
+		// the broker ID on the group (race window between PlaceOrder returning and
+		// the post-wg.Wait mutex section). Use OCORole from the DB-loaded order to
+		// route correctly, and backfill the broker ID so future events hit the
+		// normal switch cases above.
+		if order.OCORole == nil || group.State.IsTerminal() {
+			return
+		}
+		switch *order.OCORole {
+		case string(RoleSLLeg):
+			if group.SLBrokerID == "" {
+				group.SLBrokerID = brokerID
+				m.brokerIndex.Store(brokerID, group.GroupID)
+				log.Printf("[oco] Race-recovery: backfilled SL broker ID %s for group %s", brokerID, group.GroupID)
+			}
+			m.handleSLLegUpdate(ctx, group, order, brokerStatusUpper)
+		case string(RoleTPLeg):
+			if group.TPBrokerID == "" {
+				group.TPBrokerID = brokerID
+				m.brokerIndex.Store(brokerID, group.GroupID)
+				log.Printf("[oco] Race-recovery: backfilled TP broker ID %s for group %s", brokerID, group.GroupID)
+			}
+			m.handleTPLegUpdate(ctx, group, order, brokerStatusUpper)
+		}
 	}
 }
 
@@ -956,30 +990,43 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		if slBrokerID != "" {
 			group.SLBrokerID = slBrokerID
 			m.brokerIndex.Store(slBrokerID, group.GroupID)
+			group.SLLegConfirmed = true // broker API accepted — pre-confirm to avoid stuck LEGS_SUBMITTED
 		}
 		group.TPLegConfirmed = true // no TP leg to wait for
 		group.State = StateLegsSubmitted
 		group.UpdatedAt = time.Now()
+		m.checkLegsConfirmed(group)
 		if m.wsBroadcaster != nil {
 			m.wsBroadcaster(group.UserID, "oco_tp_rejected", slOrder)
 		}
 		return
 	}
 
-	// All placed legs succeeded — register broker IDs and await WS confirmation
+	// All placed legs succeeded — register broker IDs and pre-confirm immediately.
+	// Pre-confirming (rather than waiting for WS PENDING) eliminates the race window
+	// where the WS event arrives before brokerIndex is populated and gets dropped
+	// by HandleBrokerUpdate, causing the group to get stuck in LEGS_SUBMITTED forever
+	// and miss the trailing SL monitor. WS PENDING events that arrive later are
+	// idempotent — handleSLLegUpdate / handleTPLegUpdate return early when the
+	// confirmed flags are already true.
 	if slBrokerID != "" {
 		group.SLBrokerID = slBrokerID
 		m.brokerIndex.Store(slBrokerID, group.GroupID)
+		group.SLLegConfirmed = true
 	}
 	if tpBrokerID != "" {
 		group.TPBrokerID = tpBrokerID
 		m.brokerIndex.Store(tpBrokerID, group.GroupID)
+		group.TPLegConfirmed = true
 	}
 	group.State = StateLegsSubmitted
 	group.UpdatedAt = time.Now()
 
-	log.Printf("[oco] Group %s LEGS_SUBMITTED: SL(broker=%s trigger=%.2f) TP(broker=%s limit=%.2f) — awaiting WS confirmation",
+	log.Printf("[oco] Group %s LEGS_SUBMITTED: SL(broker=%s trigger=%.2f) TP(broker=%s limit=%.2f)",
 		group.GroupID, slBrokerID, slTrigger, tpBrokerID, tpLimit)
+
+	// Transition to ACTIVE immediately — both legs accepted by broker API.
+	m.checkLegsConfirmed(group)
 
 	if m.wsBroadcaster != nil {
 		m.wsBroadcaster(group.UserID, "oco_legs_submitted", slOrder)
@@ -1356,8 +1403,21 @@ func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigge
 		ProductType:   group.ProductType,
 	}
 
-	if err := m.indiraClient.ModifyOrder(ctx, slOrder, group.Auth); err != nil {
-		return fmt.Errorf("modify SL leg failed: %w", err)
+	currentAuth := group.Auth
+	modifyErr := m.indiraClient.ModifyOrder(ctx, slOrder, currentAuth)
+	if modifyErr != nil && isSessionExpiredError(modifyErr) && m.credsCache != nil {
+		// 401: refresh credentials and retry once.
+		// We hold the group mutex here; refreshAuth may do a DB read but that is
+		// bounded by the caller's 10-second context so it won't block indefinitely.
+		newAuth := m.refreshAuth(ctx, group.UserID, currentAuth)
+		if newAuth != nil {
+			group.Auth = newAuth // update so future modify/cancel calls use fresh token
+			currentAuth = newAuth
+			modifyErr = m.indiraClient.ModifyOrder(ctx, slOrder, currentAuth)
+		}
+	}
+	if modifyErr != nil {
+		return fmt.Errorf("modify SL leg failed: %w", modifyErr)
 	}
 
 	// Update in-memory state ATOMICALLY — both SLTriggerPrice and HighestPrice
@@ -1786,14 +1846,17 @@ func (m *OCOManager) IsKnownBrokerID(brokerID string) bool {
 // when the broker WS sends EXECUTED, handleEntryUpdate fires and places
 // SL/TP legs from the actual fill price.
 //
-// This is used when a trailing-SL order couldn't be routed through
-// CreateOCOEntry (e.g. auth was unavailable at signal time) but was
-// successfully placed via the default execution path. Without adoption,
-// the position would have no SL/TP protection.
+// Used when an order was placed via the default executor path and needs OCO
+// management retroactively — either because trailing SL auth was unavailable
+// at signal time, or for fixed SL/TP orders that go through Route 3.
+//
+// trailingSL=true enables the trailing SL monitor; false places a fixed SL-M
+// that is never modified after placement.
 func (m *OCOManager) AdoptOrder(
 	order *models.Order,
 	slPercent float64,
 	tpPercent float64,
+	trailingSL bool,
 	trailingSLPct float64,
 	auth *indiraClient.AuthContext,
 ) {
@@ -1814,7 +1877,7 @@ func (m *OCOManager) AdoptOrder(
 		EntryBrokerID: brokerID,
 		SLPercent:     slPercent,
 		TPPercent:     tpPercent,
-		TrailingSL:    true,
+		TrailingSL:    trailingSL,
 		TrailingSLPct: trailingSLPct,
 		State:         StatePendingEntry,
 		Symbol:        order.Symbol,
@@ -1831,15 +1894,24 @@ func (m *OCOManager) AdoptOrder(
 		UpdatedAt:     time.Now(),
 	}
 
-	// Tag the order in DB so HandleBrokerUpdate can find it
+	// Tag the order in DB so HandleBrokerUpdate can find it and reconstructGroup
+	// can restore TrailingSL after a service restart.
 	gid := groupID
 	role := string(RoleEntry)
+	slType := "FIXED"
+	if trailingSL {
+		slType = "TRAILING"
+	}
 	order.OCOGroupID = &gid
 	order.OCORole = &role
+	order.StopLossType = &slType
+	if trailingSLPct > 0 {
+		order.TrailingSLPct = &trailingSLPct
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := m.repo.Update(ctx, order); err != nil {
+		if err := m.repo.UpdateOCOTag(ctx, order.OrderID, groupID, role); err != nil {
 			log.Printf("[oco] AdoptOrder: failed to tag order %s with OCO group: %v", order.OrderID, err)
 		}
 	}()
@@ -1848,8 +1920,8 @@ func (m *OCOManager) AdoptOrder(
 	m.groups.Store(groupID, group)
 	m.brokerIndex.Store(brokerID, groupID)
 
-	log.Printf("[oco] Adopted order %s (broker=%s) into OCO group %s: symbol=%s SL=%.1f%% TP=%.1f%% trailing=true",
-		order.OrderID, brokerID, groupID, order.Symbol, slPercent, tpPercent)
+	log.Printf("[oco] Adopted order %s (broker=%s) into OCO group %s: symbol=%s SL=%.1f%% TP=%.1f%% trailing=%v",
+		order.OrderID, brokerID, groupID, order.Symbol, slPercent, tpPercent, trailingSL)
 }
 
 // ════════════════════════════════════════════════════════════════════════════

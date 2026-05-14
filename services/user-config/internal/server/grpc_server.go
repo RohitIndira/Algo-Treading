@@ -106,6 +106,14 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 		mode := protoTradingModeToModel(*req.TradingMode)
 		modelReq.TradingMode = &mode
 	}
+	if req.IndiraAuth != nil {
+		modelReq.IndiraAuth = &models.IndiraAuthContext{
+			UserID:      req.IndiraAuth.UserId,
+			AppID:       req.IndiraAuth.AppId,
+			Source:      req.IndiraAuth.Source,
+			BearerToken: req.IndiraAuth.BearerToken,
+		}
+	}
 
 	strategy, err := s.service.UpdateStrategy(ctx, modelReq)
 	if err != nil {
@@ -248,7 +256,9 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 		}, nil
 	}
 
-	strategy, err := s.service.ActivateStrategy(ctx, strategyID, req.UserId)
+	// ActivateStrategyRequest has no IndiraAuth field in the proto.
+	// Credential refresh is handled by the gateway calling UpdateUserCredentials separately.
+	strategy, err := s.service.ActivateStrategy(ctx, strategyID, req.UserId, nil)
 	if err != nil {
 		return &pb.ActivateStrategyResponse{
 			Success: false,
@@ -263,6 +273,39 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 		Success:  true,
 		Strategy: modelStrategyToProto(strategy),
 	}, nil
+}
+
+// UpdateUserCredentials stores fresh Indira credentials for a user.
+// Called by the gateway on strategy activate to refresh the bearer token in DB.
+func (s *UserConfigServer) UpdateUserCredentials(ctx context.Context, req *pb.UpdateUserCredentialsRequest) (*pb.UpdateUserCredentialsResponse, error) {
+	if req.UserId == "" || req.IndiraAuth == nil || req.IndiraAuth.BearerToken == "" {
+		return &pb.UpdateUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "INVALID_REQUEST",
+				Message: "user_id and indira_auth.bearer_token are required",
+			},
+		}, nil
+	}
+
+	auth := &models.IndiraAuthContext{
+		UserID:      req.IndiraAuth.UserId,
+		AppID:       req.IndiraAuth.AppId,
+		Source:      req.IndiraAuth.Source,
+		BearerToken: req.IndiraAuth.BearerToken,
+	}
+
+	if err := s.service.UpdateCredentials(ctx, req.UserId, auth); err != nil {
+		return &pb.UpdateUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "UPDATE_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.UpdateUserCredentialsResponse{Success: true}, nil
 }
 
 // DeactivateStrategy deactivates a strategy

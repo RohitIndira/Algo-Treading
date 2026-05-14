@@ -125,6 +125,10 @@ type OrderRepository interface {
 	// original_exit_qty is written only on the first rebalance (subsequent calls preserve it).
 	// rebalance_reason example: "SL_L1_TRIGGERED", "TP_L2_TRIGGERED".
 	UpdateMLLevelRebalancedQty(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, originalQty, newQty int32, reason string) error
+	// UpdateOCOTag sets the oco_group_id and oco_role columns on an already-existing order.
+	// Used by AdoptOrder to tag an entry order that was placed before OCO adoption.
+	// The generic Update() method omits these columns, so a targeted query is required.
+	UpdateOCOTag(ctx context.Context, orderID uuid.UUID, groupID uuid.UUID, role string) error
 }
 
 type orderRepository struct {
@@ -149,11 +153,15 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			stop_loss, take_profit, stop_loss_type, trailing_sl_pct, validity, product_type,
 			status, risk_approved, risk_score,
 			is_paper_trade, trading_mode,
-			retry_count, created_at, updated_at
+			retry_count, created_at, updated_at,
+			oco_group_id, oco_role, parent_order_id,
+			bearer_token, app_id, source
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
 			$13, $14, $15, $16, $17, $18, $19, $20, $21,
-			$22, $23, $24, $25, $26
+			$22, $23, $24, $25, $26,
+			$27, $28, $29,
+			$30, $31, $32
 		) ON CONFLICT (order_id) DO NOTHING
 	`
 
@@ -165,6 +173,8 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 		order.Status, order.RiskApproved, order.RiskScore,
 		order.IsPaperTrade, order.TradingMode,
 		order.RetryCount, order.CreatedAt, order.UpdatedAt,
+		order.OCOGroupID, order.OCORole, order.ParentOrderID,
+		order.BearerToken, order.AppId, order.Source,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create order: %w", err)
@@ -264,6 +274,26 @@ func (r *orderRepository) Update(ctx context.Context, order *models.Order) error
 		return fmt.Errorf("order not found: %s", order.OrderID)
 	}
 
+	return nil
+}
+
+// UpdateOCOTag sets oco_group_id and oco_role on an already-existing order.
+// Used by AdoptOrder to tag an entry order placed before OCO adoption.
+func (r *orderRepository) UpdateOCOTag(ctx context.Context, orderID uuid.UUID, groupID uuid.UUID, role string) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE orders SET oco_group_id = $1, oco_role = $2, updated_at = $3 WHERE order_id = $4`,
+		groupID, role, time.Now(), orderID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to tag order with OCO group: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("order not found: %s", orderID)
+	}
 	return nil
 }
 

@@ -404,6 +404,8 @@ func main() {
 
 		signalProcessor.SetPriceMonitor(priceMonitorRef)
 		strategyEventsConsumer.SetPriceMonitor(priceMonitorRef)
+		strategyEventsConsumer.SetPaperMonitor(paperMonitor)
+		strategyEventsConsumer.SetCredentialsCache(orderExecutor.CredentialsCache())
 		paperWSServer.SetPriceMonitor(priceMonitorRef)
 		priceMonitorRef.SetOnTickDone(paperWSServer.BroadcastPriceWatches)
 		log.Println("✓ Price Monitor initialized (WSS primary, Redis fallback, 100ms check interval)")

@@ -414,13 +414,13 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			// Trailing SL → route to custom OCO in trade-execution.
 			// Use INTRADAY (not BRACKET) because OCO places SL+TP legs separately.
 			orderReq.ProductType = "INTRADAY"
+		} else if isMultiLevelSL || isMultiLevelTP {
+			// Any ML leg → INTRADAY so the broker does NOT place its own SL/TP legs.
+			// ML manager places N separate exit orders; a broker bracket leg would
+			// conflict (double-exit) or be rejected with TP=0.
+			orderReq.ProductType = "INTRADAY"
 		} else {
-			// Fixed SL or MULTI_LEVEL → INTRADAY; ML manager places its own exit orders.
-			if isMultiLevelSL {
-				orderReq.ProductType = "INTRADAY"
-			} else {
-				orderReq.ProductType = "BRACKET"
-			}
+			orderReq.ProductType = "BRACKET"
 		}
 
 		// SL/TP from the trigger price (LTP).
