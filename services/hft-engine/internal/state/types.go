@@ -133,6 +133,12 @@ type SideState struct {
 
 	Current *ChunkState   `json:"current"` // chunk in flight; nil ⇒ IDLE
 	History []ChunkState  `json:"history"` // closed chunks (FILLED or CANCELLED) in placement order
+
+	// ConsecutiveRejects counts broker REJECTs since the last successful
+	// FILL (reset to 0 on any fill). applyReject halts the side when this
+	// hits maxConsecutiveRejects — protects against burning broker rate
+	// limits on a permanently-failing condition (margin, risk, etc.).
+	ConsecutiveRejects int `json:"consecutive_rejects,omitempty"`
 }
 
 // MarketData is one bid/ask snapshot. Produced by internal/marketws and

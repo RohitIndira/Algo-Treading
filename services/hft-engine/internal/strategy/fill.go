@@ -17,10 +17,37 @@
 package strategy
 
 import (
+	"strings"
+
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/state"
 )
+
+// maxConsecutiveRejects bounds how many broker REJECTs in a row before
+// applyReject halts the side. Structural rejects (margin / risk / DPR)
+// trip the halt instantly via isStructuralReject; this catches every
+// other case so we don't spam broker rate limits indefinitely.
+const maxConsecutiveRejects = 5
+
+// isStructuralReject returns true when a broker reject reason indicates
+// the order can never succeed without external action (more margin,
+// smaller qty, lifted risk limit, fresh login). Placing again would just
+// keep getting rejected — caller should halt the side. Patterns are
+// observed live from Indira's order-status WS payloads (e.g.
+// "M.Lmt excd.S/OptCFS/=...SFall=...").
+func isStructuralReject(reason string) bool {
+	r := strings.ToLower(reason)
+	return strings.Contains(r, "m.lmt") ||
+		strings.Contains(r, "margin") ||
+		strings.Contains(r, "sfall") ||
+		strings.Contains(r, "shortfall") ||
+		strings.Contains(r, "insufficient") ||
+		strings.Contains(r, "exposure") ||
+		strings.Contains(r, "risk lmt") ||
+		strings.Contains(r, "risk limit") ||
+		strings.Contains(r, "dpr")
+}
 
 // onFill applies one event to the matching side. If the event's
 // broker_order_id doesn't match any current chunk, it's logged and
@@ -63,6 +90,9 @@ func (r *Runner) applyFill(side *state.SideState, sideC string, f state.FillEven
 	chunk := side.Current
 	chunk.Filled += f.FillQty
 	side.Position += f.FillQty
+	// Any successful fill clears the consecutive-reject counter — whatever
+	// transient condition caused recent rejects is no longer in effect.
+	side.ConsecutiveRejects = 0
 
 	r.auditRow("FILL", sideC, chunk.Seq, f.FillQty, f.FillPrice, chunk.BrokerOrderID, "")
 
@@ -165,10 +195,17 @@ func (r *Runner) applyCancelAck(side *state.SideState, sideC string, f state.Fil
 		zap.String("reason", f.Reason))
 }
 
-// applyReject handles broker rejections. For a chunk that was OPEN with
-// 0 fills, this is the "place was rejected after-the-fact" case — we
-// already audited the place. We move the chunk to History as CANCELLED
-// (closest semantic) and reset Current so the next tick can retry.
+// applyReject handles broker rejections. Moves the chunk to History as
+// CANCELLED, clears side.Current, and halts the side under either of
+// two conditions:
+//   - structural reject (margin/risk/DPR) — re-placing would just keep
+//     getting rejected, so halt immediately.
+//   - maxConsecutiveRejects transient rejects in a row — protects broker
+//     rate limits if we somehow keep hitting non-structural rejects
+//     (e.g. price slipped through every retry).
+//
+// Anything else falls through and the next tick re-attempts — a single
+// transient reject is recoverable.
 func (r *Runner) applyReject(side *state.SideState, sideC string, f state.FillEvent) {
 	if side.Current == nil {
 		return
@@ -186,9 +223,30 @@ func (r *Runner) applyReject(side *state.SideState, sideC string, f state.FillEv
 
 	side.History = append(side.History, *chunk)
 	side.Current = nil
-	// Note: we do NOT halt — a single reject is recoverable. If the
-	// broker keeps rejecting we'd accumulate many failed-place audit
-	// rows and the operator would notice from the dashboard.
+	side.ConsecutiveRejects++
+
+	// Structural rejects (margin / risk / DPR) cannot self-heal — placing
+	// again would just keep getting rejected. Halt the side immediately.
+	if isStructuralReject(f.Reason) {
+		r.logger.Warn("structural broker reject — halting side",
+			zap.String("side", sideC),
+			zap.String("reason", f.Reason),
+			zap.Int("consecutive_rejects", side.ConsecutiveRejects))
+		side.Done = true
+		side.HaltReason = state.HaltBrokerHardFail
+		return
+	}
+
+	// Halt after too many transient rejects in a row — last-resort guard
+	// against spamming broker rate limits on a non-recovering condition.
+	if side.ConsecutiveRejects >= maxConsecutiveRejects {
+		r.logger.Warn("too many consecutive rejects — halting side",
+			zap.String("side", sideC),
+			zap.Int("consecutive_rejects", side.ConsecutiveRejects))
+		side.Done = true
+		side.HaltReason = state.HaltBrokerHardFail
+		return
+	}
 }
 
 // findChunkOwner returns the side + sideChar whose Current chunk has

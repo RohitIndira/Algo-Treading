@@ -65,6 +65,17 @@ type Manager struct {
 	// pendingMu, releases it, then takes mu.
 	pendingMu    sync.Mutex
 	pendingFills map[string][]pendingFill
+
+	// completedSnapshots keeps the FINAL snapshot of strategies that have
+	// auto-exited (max_reached, window_closed, price_band, no_data) or
+	// been Stop'd. Frontends polling /state right up to the completion
+	// event see the final {active:false, halt_reason, position, history}
+	// for a grace window instead of a 404 the instant the strategy ends.
+	// Entries TTL-evict on read (no background goroutine needed).
+	//
+	// completedMu is independent of mu and pendingMu — never held with either.
+	completedMu        sync.Mutex
+	completedSnapshots map[string]completedSnapshot
 }
 
 // pendingFill is a FillEvent buffered because no Runner owned its
@@ -73,6 +84,19 @@ type pendingFill struct {
 	ev       state.FillEvent
 	received time.Time
 }
+
+// completedSnapshot holds one finished strategy's last snapshot + the
+// time it finished. Get serves it during the post-mortem window.
+type completedSnapshot struct {
+	snap       *state.Strategy
+	finishedAt time.Time
+}
+
+// completedSnapshotTTL bounds how long a finished strategy's snapshot is
+// kept in memory after the runner exits. Long enough for the frontend to
+// poll a couple of times and render the completion; short enough that
+// the map doesn't grow without bound.
+const completedSnapshotTTL = 10 * time.Minute
 
 // New wires dependencies and starts the pending-fill reaper goroutine
 // (process-lifetime; exits when rootCtx is cancelled).
@@ -88,16 +112,17 @@ func New(rootCtx context.Context, r *repo.Repo, a *audit.Writer, br broker.Broke
 		engineMode = state.ModePaper
 	}
 	m := &Manager{
-		runners:      make(map[string]*strategy.Runner),
-		repo:         r,
-		audit:        a,
-		br:           br,
-		mws:          mws,
-		ows:          ows,
-		engineMode:   engineMode,
-		logger:       logger.Named("manager"),
-		rootCtx:      rootCtx,
-		pendingFills: make(map[string][]pendingFill),
+		runners:            make(map[string]*strategy.Runner),
+		repo:               r,
+		audit:              a,
+		br:                 br,
+		mws:                mws,
+		ows:                ows,
+		engineMode:         engineMode,
+		logger:             logger.Named("manager"),
+		rootCtx:            rootCtx,
+		pendingFills:       make(map[string][]pendingFill),
+		completedSnapshots: make(map[string]completedSnapshot),
 	}
 	go m.reapPendingFills()
 	return m
@@ -344,10 +369,26 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 	}()
 
 	// Spawn the runner goroutine. When Run exits (Stop, both-sides-done,
-	// or ctx done), we unsubscribe and prune from the map.
+	// or ctx done), we capture the final snapshot for the post-mortem
+	// grace window, unsubscribe, and prune from the live runner map.
 	go func() {
 		runner.Run(m.rootCtx)
 		sub.Unsubscribe() // closes sub.Ticks → ends forwarder goroutine
+
+		// Stash the final snapshot so /state can serve it for
+		// completedSnapshotTTL after the strategy auto-exits — without
+		// this the frontend gets a 404 the instant max_reached fires
+		// and can't render the completion.
+		if final := runner.Snapshot(); final != nil {
+			final.Active = false
+			m.completedMu.Lock()
+			m.completedSnapshots[strategyID] = completedSnapshot{
+				snap:       final,
+				finishedAt: time.Now(),
+			}
+			m.completedMu.Unlock()
+		}
+
 		m.mu.Lock()
 		if m.runners[strategyID] == runner {
 			delete(m.runners, strategyID)
@@ -390,17 +431,37 @@ func (m *Manager) Stop(ctx context.Context, strategyID string) error {
 	return nil
 }
 
-// Get returns the current snapshot of one strategy. Nil if not running.
+// Get returns the current snapshot of one strategy. Nil if neither
+// running nor in the recently-completed cache.
+//
+// For a still-running strategy the snapshot has Active=true and live
+// position/current-chunk data. For one that has just finished, Get falls
+// through to completedSnapshots and returns the final {Active:false,
+// halt_reason, position, history} for completedSnapshotTTL after exit —
+// so the frontend's polling loop sees the completion, not a 404.
+//
 // Snapshot is a deep-copied *state.Strategy — caller can read freely
 // without holding any lock.
 func (m *Manager) Get(strategyID string) *state.Strategy {
 	m.mu.Lock()
 	runner, ok := m.runners[strategyID]
 	m.mu.Unlock()
-	if !ok {
-		return nil
+	if ok {
+		return runner.Snapshot()
 	}
-	return runner.Snapshot()
+
+	// Not running — try the post-mortem cache, evicting on read if expired.
+	m.completedMu.Lock()
+	cs, found := m.completedSnapshots[strategyID]
+	if found && time.Since(cs.finishedAt) > completedSnapshotTTL {
+		delete(m.completedSnapshots, strategyID)
+		found = false
+	}
+	m.completedMu.Unlock()
+	if found {
+		return cs.snap
+	}
+	return nil
 }
 
 // GetRunner exposes the live Runner for producers (market WS in Phase 4,

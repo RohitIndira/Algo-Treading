@@ -56,6 +56,12 @@ type Config struct {
 
 	// ── Defaults applied to strategies when their config doesn't set them
 	DefaultMode string // "PAPER" or "LIVE" — engine-wide safety default
+
+	// EncryptionKey is the AES key used to decrypt indira_bearer_token from
+	// the user_credentials table. user-config and trade-execution store the
+	// broker JWT *encrypted* (pkg/crypto); the hft-engine must decrypt it
+	// with the SAME key or it hands Indira ciphertext and gets 401s.
+	EncryptionKey string
 }
 
 // DBConfig is one Postgres connection's params.
@@ -131,6 +137,10 @@ func Load() *Config {
 		// Safety: default PAPER so a fresh deploy or a strategy that forgot
 		// to set its own `mode` never accidentally places real orders.
 		DefaultMode: env("HFT_DEFAULT_MODE", "PAPER"),
+
+		// Must match user-config / trade-execution's ENCRYPTION_KEY — the
+		// broker JWT in user_credentials is AES-encrypted at rest.
+		EncryptionKey: env("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef"),
 	}
 }
 

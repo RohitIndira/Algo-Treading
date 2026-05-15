@@ -91,7 +91,7 @@ func main() {
 	defer tradingExecDB.Close()
 
 	// ── 4. Wire repo + audit + broker + manager ──────────────────────────
-	r := repo.New(tradingDB, tradingExecDB)
+	r := repo.New(tradingDB, tradingExecDB, cfg.EncryptionKey)
 	auditWriter := audit.New(r, logger, audit.Config{}) // defaults: 1000 buf, 200 batch, 1s flush
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	auditWriter.Start(rootCtx)

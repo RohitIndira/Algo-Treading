@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/crypto"
 	"github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/state"
 )
 
@@ -29,19 +30,35 @@ import (
 type Repo struct {
 	tradingDB     *sql.DB
 	tradingExecDB *sql.DB
+
+	// encryptionKey decrypts indira_bearer_token — user-config and
+	// trade-execution store the broker JWT AES-encrypted at rest.
+	encryptionKey string
 }
 
 // New wires the two DB handles. main.go opens both, passes them here.
-func New(tradingDB, tradingExecDB *sql.DB) *Repo {
-	return &Repo{tradingDB: tradingDB, tradingExecDB: tradingExecDB}
+// encryptionKey must match user-config / trade-execution's ENCRYPTION_KEY.
+func New(tradingDB, tradingExecDB *sql.DB, encryptionKey string) *Repo {
+	return &Repo{
+		tradingDB:     tradingDB,
+		tradingExecDB: tradingExecDB,
+		encryptionKey: encryptionKey,
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Strategy config loading
 // ─────────────────────────────────────────────────────────────────────────
 
+// ErrStrategyNotFound means the strategy id doesn't resolve to a live,
+// non-deleted HFT_BIDDING strategy with a trade_configs row. Callers (the
+// gRPC Entry handler) should surface this as a clean 4xx, not a 500 — it
+// is a user/state problem, not a server fault.
+var ErrStrategyNotFound = fmt.Errorf("strategy not found, deleted, or not an HFT_BIDDING strategy")
+
 // LoadConfig fetches one strategy by id and returns its parsed Config.
-// Returns sql.ErrNoRows if the strategy doesn't exist or has been soft-deleted.
+// Returns ErrStrategyNotFound if the strategy doesn't exist, has been
+// soft-deleted, isn't an HFT_BIDDING strategy, or has no trade_configs row.
 //
 // Schema note: the `strategies` table PK is `strategy_id` (not `id`), and
 // `trade_configs.config_extra` is a JSONB column (added by migration 013)
@@ -67,6 +84,12 @@ func (r *Repo) LoadConfig(ctx context.Context, strategyID string) (*state.Config
 	)
 	err := r.tradingDB.QueryRowContext(ctx, q, strategyID).
 		Scan(&userID, &strategyType, &configJSON)
+	if err == sql.ErrNoRows {
+		// No row could mean: unknown id, soft-deleted, wrong strategy_type,
+		// or missing trade_configs row. Return a clean, actionable error
+		// instead of leaking the raw "sql: no rows in result set".
+		return nil, fmt.Errorf("%w (strategy_id=%s)", ErrStrategyNotFound, strategyID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load strategy %s: %w", strategyID, err)
 	}
@@ -122,6 +145,17 @@ func (r *Repo) LoadCredentials(ctx context.Context, userID string) (*Credentials
 	if err != nil {
 		return nil, fmt.Errorf("load creds for %s: %w", userID, err)
 	}
+
+	// The bearer token is AES-encrypted at rest (written by user-config /
+	// trade-execution via pkg/crypto). Decrypt with the shared key before
+	// handing it to the broker. crypto.Decrypt is graceful — a token that
+	// is already plaintext (legacy rows) passes through unchanged.
+	plain, derr := crypto.Decrypt(c.BearerToken, r.encryptionKey)
+	if derr != nil {
+		return nil, fmt.Errorf("decrypt bearer token for %s: %w", userID, derr)
+	}
+	c.BearerToken = plain
+
 	return &c, nil
 }
 
