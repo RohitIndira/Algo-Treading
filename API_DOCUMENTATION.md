@@ -150,7 +150,7 @@ Create a new strategy. For Manthan strategies, use `strategy_type: "MANTHAN"`. T
 | Field | Type | Description |
 |---|---|---|
 | `strategy_name` | string | Required. Display name. |
-| `strategy_type` | string | `"MANTHAN"` for ATH-breakout, `"52W_BREAKOUT"` for 52-week, `"NEWS"` for news-driven. |
+| `strategy_type` | string | `"MANTHAN"` for ATH-breakout, `"52W_BREAKOUT"` for 52-week, `"NEWS"` for news-driven, `"HFT_BIDDING"` for the HFT engine (see [HFT Bidding Strategy](#hft-bidding-strategy)). |
 | `trading_mode` | string | `"LIVE"` (real orders) or `"PAPER"` (simulated). |
 | `activate_immediately` | bool | If `true`, strategy starts trading immediately. |
 | `trade_config.total_capital` | number | Total ₹ to deploy across all positions. |
@@ -324,6 +324,218 @@ One aggregated payload for the Manthan dashboard — covers active positions, to
 
 ---
 
+# HFT Bidding Strategy
+
+The HFT (high-frequency bidding) engine runs a chunk-aware bid/ask strategy on a single symbol — it places a stream of small LIMIT orders, chasing the touch price, until a target quantity is accumulated. **Create / edit / delete / get / list** go through the same `/api/v1/strategies` surface as every other strategy type; **runtime control** (start / stop / live-state) has its own `/api/v1/hft/*` endpoints that talk to the hft-engine directly.
+
+**Lifecycle:** Create → (Edit) → Start → poll State → Stop. Delete removes the config.
+
+All 8 endpoints require the standard 4 auth headers (see [Authentication](#authentication)).
+
+## The `hft_config` object
+
+Every HFT create/edit carries an `hft_config` block. It is stored verbatim and consumed by the hft-engine.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `symbol` | string | **yes** | Trading symbol, e.g. `"AARON"`. |
+| `isin` | string | **yes** | ISIN, e.g. `"INE721Z01010"`. Must be resolvable to a security code by the engine — an unknown ISIN makes `start` fail. |
+| `exchange` | string | no | `"NSE"` \| `"BSE"`. Default `"NSE"`. |
+| `side` | string | no | `"BUY"` \| `"SELL"` \| `"BOTH"`. Default `"BOTH"`. |
+| `product_type` | string | no | `"INTRADAY"` \| `"DELIVERY"` \| `"CASH"`. Default `"INTRADAY"`. |
+| `tick_size` | number | no | Price tick. Default `0.05`. |
+| `max_buy_qty` | int | yes if side has BUY | Total buy-side quantity cap. |
+| `single_buy_qty` | int | yes if side has BUY | Quantity per buy chunk. Must be `1 … max_buy_qty`. |
+| `max_sell_qty` | int | yes if side has SELL | Total sell-side quantity cap. |
+| `single_sell_qty` | int | yes if side has SELL | Quantity per sell chunk. Must be `1 … max_sell_qty`. |
+| `buy_limit_price` | number | no | Buy-side price-band ceiling — the engine halts the buy side if the ask rises above this. Must be ≥ 0. |
+| `sell_limit_price` | number | no | Sell-side price-band floor — halts the sell side if the bid drops below this. Must be ≥ 0. |
+| `window_start` | string | no | Trade-window open, `"HH:MM"` IST. Empty = no window restriction. |
+| `window_end` | string | no | Trade-window close, `"HH:MM"` IST. |
+| `modify_on_price_change` | bool | no | If `true`, the engine chases the market by MODIFYing the resting order on every price change. |
+
+> **Do not send `mode`** in `hft_config` — the engine's PAPER/LIVE mode is derived from the strategy's `trading_mode`.
+
+---
+
+### 1. `POST /api/v1/strategies` — Create HFT strategy
+
+Set `strategy_type: "HFT_BIDDING"` and include `hft_config`. No `trade_config` / `risk_limits` / `conditions` are needed for HFT.
+
+**Body**:
+```json
+{
+  "user_id": "ND03920",
+  "strategy_name": "AARON HFT",
+  "description": "HFT bidding on AARON",
+  "strategy_type": "HFT_BIDDING",
+  "trading_mode": "LIVE",
+  "activate_immediately": false,
+  "hft_config": {
+    "symbol": "AARON",
+    "isin": "INE721Z01010",
+    "exchange": "NSE",
+    "side": "BUY",
+    "product_type": "INTRADAY",
+    "tick_size": 0.01,
+    "max_buy_qty": 25,
+    "single_buy_qty": 1,
+    "buy_limit_price": 157.39,
+    "modify_on_price_change": true
+  }
+}
+```
+
+**Response `201`**:
+```json
+{
+  "success": true,
+  "strategy_id": "6577e72a-8249-4f07-b9cb-8c23d64dcfd8",
+  "user_id": "ND03920",
+  "strategy_name": "AARON HFT",
+  "strategy_type": "HFT_BIDDING",
+  "active": false,
+  "trading_mode": "LIVE",
+  "hft_config": { "...resolved config — engine defaults filled in..." }
+}
+```
+
+`activate_immediately` only flags the DB row active — it does **not** start the engine. Use endpoint 6 (`/start`) to actually run it.
+
+---
+
+### 2. `GET /api/v1/strategies/{strategy_id}?user_id={userId}` — Get HFT strategy
+
+`user_id` is a **query parameter** (not a body field). Returns the stored strategy including its `hft_config`.
+
+---
+
+### 3. `GET /api/v1/users/{user_id}/strategies` — List strategies
+
+Lists all strategies for the user (every type). Filter for HFT client-side on `strategy_type == "HFT_BIDDING"`. Supports `?active_only=true`, `?page=`, `?page_size=`.
+
+---
+
+### 4. `PUT /api/v1/strategies/{strategy_id}` — Edit HFT strategy
+
+Send the **full** `hft_config` you want stored (it replaces the existing config) plus the current `version` (optimistic concurrency — read it from a prior GET).
+
+**Body**:
+```json
+{
+  "user_id": "ND03920",
+  "strategy_name": "AARON HFT (updated)",
+  "trading_mode": "LIVE",
+  "hft_config": { "...full hft_config, same shape as create..." },
+  "version": 1
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `version` | **yes** | Current version from a prior GET. A stale version is rejected. |
+| `hft_config` | no | Full replacement of the stored config. Omit to leave it unchanged. |
+| `strategy_name`, `description`, `trading_mode` | no | Only provided fields are updated. |
+
+A `trading_mode` change propagates into the stored config's mode; omit it and the existing mode is preserved.
+
+---
+
+### 5. `DELETE /api/v1/strategies/{strategy_id}?user_id={userId}` — Delete HFT strategy
+
+`user_id` is a **query parameter**. Soft-delete. If the strategy is currently running, stop it first (endpoint 8).
+
+**Response `200`**: `{"success": true, "message": "Strategy deleted successfully"}`
+
+---
+
+### 6. `POST /api/v1/hft/{strategy_id}/start` — Start the engine
+
+Tells the hft-engine to begin running the strategy. **For a `LIVE` strategy this places real orders.**
+
+**Body** (optional — omit the body entirely to use the stored config):
+```json
+{ "side": "BUY", "lots": 25 }
+```
+| Field | Description |
+|---|---|
+| `side` | Runtime override of the configured side: `BUY` \| `SELL` \| `BOTH`. |
+| `lots` | Runtime override of the per-side quantity cap. |
+
+**Response `200`**:
+```json
+{ "success": true, "status": "RUNNING", "strategy_id": "6577e72a-..." }
+```
+`status` is `"RUNNING"` \| `"ALREADY_RUNNING"` \| `"ERROR"`. On failure: `{"success": false, "status": "ERROR", "error": "...", "strategy_id": "..."}` — e.g. `"mode mismatch"`, `"market-data feed disconnected"`, `"marketws subscribe: ..."` (unresolvable ISIN).
+
+A strategy auto-stops itself once its configured side(s) reach `max_qty` — you don't have to call `/stop` for a normal completion.
+
+---
+
+### 7. `GET /api/v1/hft/{strategy_id}/state` — Live state snapshot
+
+The engine's live view of a running strategy. Poll this (~1s) to drive a running-strategy dashboard.
+
+**Response `200`** (running):
+```json
+{
+  "success": true,
+  "snapshot": {
+    "strategy_id": "6577e72a-...",
+    "user_id": "ND03920",
+    "symbol": "AARON",
+    "active": true,
+    "mode": "LIVE",
+    "started_at_unix": 1778745774,
+    "last_tick_at_unix": 1778746073,
+    "last_bid": 132.44,
+    "last_ask": 132.45,
+    "buy": {
+      "position": 7,
+      "max_qty": 25,
+      "done": false,
+      "halt_reason": "",
+      "current": {
+        "seq": 8, "qty": 1, "filled": 0, "limit_price": 132.45,
+        "broker_order_id": "NZWKE0033F>5", "status": "OPEN",
+        "modify_count": 0, "placed_at_unix": 1778746073
+      },
+      "history": [ "...completed chunks, same shape as current..." ]
+    },
+    "sell": { "...same shape as buy..." }
+  }
+}
+```
+
+**Response `404`** (not started / unknown strategy):
+```json
+{ "success": false, "error": "strategy not running", "strategy_id": "6577e72a-..." }
+```
+
+| Field | Use case |
+|---|---|
+| `buy.position` / `buy.max_qty` | Progress bar — quantity accumulated vs target. |
+| `buy.done` + `buy.halt_reason` | `done: true` = side finished. `halt_reason`: `""` \| `max_reached` \| `price_band` \| `window_closed` \| `no_data`. |
+| `buy.current` | The currently-resting chunk; `null` when the side is idle between chunks. |
+| `buy.history[]` | Completed/cancelled chunks — order-by-order audit trail. |
+| `last_bid` / `last_ask` | Latest market touch for the symbol. |
+
+(The `sell` block is present and identically shaped when the strategy's side is `SELL` or `BOTH`.)
+
+---
+
+### 8. `POST /api/v1/hft/{strategy_id}/stop` — Stop the engine
+
+Halts the strategy and cancels any resting orders. Already-filled quantity is **not** exited — it remains as a position.
+
+**Response `200`**:
+```json
+{ "success": true, "status": "STOPPED", "strategy_id": "6577e72a-..." }
+```
+`status` is `"STOPPED"` \| `"NOT_RUNNING"` \| `"ERROR"`.
+
+---
+
 # Live order endpoints (real broker)
 
 ### `GET /api/v1/live-orders?user_id=X`
@@ -415,6 +627,29 @@ The last one signals the JWT has expired — the frontend should prompt re-login
 ### `wss://manthan.stockk.trade/ws/paper-trades?user_id=X&token=<jwt>...`
 Same as `/ws/live-orders` but for paper-trade fills (simulated).
 
+### `wss://manthan.stockk.trade/ws/notifications?user_id=X`
+Per-user notification stream. Bridges the Kafka topic `manthan.notifications` (produced by rules-engine + trade-execution) to the frontend. Drives the broker-session-expired banner, JWT-expiring warnings, manual-exit toasts, and any future user-facing event.
+
+After a `{"type":"connected",...}` welcome and periodic `{"type":"heartbeat",...}` keep-alives, each event is:
+```json
+{
+  "type": "SESSION_EXPIRED",
+  "severity": "error",
+  "user_id": "ND03920",
+  "strategy_id": "fb7831f5-...",
+  "signal_id": "",
+  "symbol": "",
+  "title": "Broker session expired",
+  "message": "Your broker session was invalidated. Open positions are unprotected until you re-login.",
+  "action_hint": "RELOGIN",
+  "timestamp": "2026-05-15T10:42:11.123Z"
+}
+```
+
+**Frontend integration**: see `NOTIFICATIONS_FRONTEND_GUIDE.md` at the repo root for the `useNotifications` hook, `BrokerSessionBanner` wiring, and re-login → `/api/v1/auth/credentials` flow.
+
+Server-side filters by `user_id` — the connection only receives events whose `user_id` matches the query param. Per-user delivery is enforced; you do not need to re-filter.
+
 ---
 
 # Sample integration flow (frontend bootstrap)
@@ -463,3 +698,5 @@ Same as `/ws/live-orders` but for paper-trade fills (simulated).
 3. **One Manthan strategy per user is recommended** — multiple Manthan strategies on the same user share the broker's position book and can fight each other for capital.
 4. **`force-exit-all` is irreversible** — it places MARKET SELL on every open position. Add a confirmation dialog.
 5. **Top-up + SL behaviour**: when a Manthan top-up fills, the SL on the broker is extended to cover the combined qty (fix shipped 2026-05-12). The trailing SL trigger never lowers — it's ratcheted to the higher of (existing trigger, top-up × 0.80).
+6. **HFT: create ≠ run.** Creating (or `activate_immediately`-ing) an HFT strategy only persists the config — it does **not** start trading. The frontend must call `POST /api/v1/hft/{id}/start` explicitly, and `POST .../stop` to halt. Treat `/hft/{id}/state` `success:false "strategy not running"` as the idle state, not an error.
+7. **HFT LIVE places real orders the moment `/start` is called.** Gate the Start button behind a confirmation for `trading_mode: "LIVE"` strategies.
