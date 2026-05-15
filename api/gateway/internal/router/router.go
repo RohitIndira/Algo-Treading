@@ -101,5 +101,10 @@ func NewRouter(
 	r.HandleFunc("/ws/matches", websocketHandler.HandleMatchesFeed)        // Single user
 	r.HandleFunc("/ws/matches/all", websocketHandler.HandleAllMatchesFeed) // All users
 
+	// Per-user notification stream — bridges Kafka `manthan.notifications`
+	// → frontend WS so the user sees broker-session-expired, manual-exit,
+	// JWT-expiring, etc. and the UI can prompt re-login / show toasts.
+	r.HandleFunc("/ws/notifications", websocketHandler.HandleNotificationsFeed)
+
 	return r
 }

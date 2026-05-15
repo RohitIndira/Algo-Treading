@@ -25,6 +25,11 @@ type ServicesConfig struct {
 	UserConfigAddr         string
 	TradeExecutionPaperURL string
 	HFTEngineAddr          string
+
+	// Kafka — consumed by the notifications bridge (manthan.notifications
+	// → /ws/notifications). Brokers comma-separated.
+	KafkaBrokers       []string
+	NotificationsTopic string
 }
 
 type CORSConfig struct {
@@ -53,6 +58,8 @@ func Load() (*Config, error) {
 			UserConfigAddr:         getEnv("USER_CONFIG_GRPC_ADDR", "localhost:50051"),
 			TradeExecutionPaperURL: getEnv("TRADE_EXECUTION_PAPER_URL", "http://localhost:8081"),
 			HFTEngineAddr:          getEnv("HFT_ENGINE_GRPC_ADDR", "localhost:29090"),
+			KafkaBrokers:           strings.Split(getEnv("KAFKA_BROKERS", "localhost:9092"), ","),
+			NotificationsTopic:     getEnv("MANTHAN_NOTIFICATIONS_TOPIC", "manthan.notifications"),
 		},
 		CORS: CORSConfig{
 			AllowedOrigins: strings.Split(getEnv("CORS_ALLOWED_ORIGINS", "*"), ","),

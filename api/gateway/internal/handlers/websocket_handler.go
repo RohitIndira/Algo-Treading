@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/notifications"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -22,16 +23,90 @@ var upgrader = websocket.Upgrader{
 
 type WebSocketHandler struct {
 	redisClient *redis.Client
+	notifs      *notifications.Broadcaster // nil = /ws/notifications disabled
 	logger      *zap.Logger
 	clients     map[string]map[*websocket.Conn]bool // user_id -> set of connections
 	mu          sync.RWMutex
 }
 
-func NewWebSocketHandler(redisClient *redis.Client, logger *zap.Logger) *WebSocketHandler {
+// NewWebSocketHandler wires the live-feeds handler. notifs may be nil —
+// when nil, the /ws/notifications route returns 503 but the matches
+// feeds still work.
+func NewWebSocketHandler(redisClient *redis.Client, notifs *notifications.Broadcaster, logger *zap.Logger) *WebSocketHandler {
 	return &WebSocketHandler{
 		redisClient: redisClient,
+		notifs:      notifs,
 		logger:      logger,
 		clients:     make(map[string]map[*websocket.Conn]bool),
+	}
+}
+
+// HandleNotificationsFeed pushes one user's notification events to a
+// WebSocket. GET /ws/notifications?user_id=X
+//
+// The events come from the manthan.notifications Kafka topic (consumed
+// by internal/notifications.Consumer) and are fanned out per-user by
+// the Broadcaster. Each event is the producer's JSON shape verbatim,
+// plus a periodic {"type":"heartbeat"} to keep the connection warm.
+func (h *WebSocketHandler) HandleNotificationsFeed(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "user_id is required", http.StatusBadRequest)
+		return
+	}
+	if h.notifs == nil {
+		http.Error(w, "notifications feed not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		h.logger.Error("Failed to upgrade WS (notifications)", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	ch, cancel := h.notifs.Subscribe(userID)
+	defer cancel()
+
+	h.logger.Info("notifications WS opened", zap.String("user_id", userID))
+	defer h.logger.Info("notifications WS closed", zap.String("user_id", userID))
+
+	// Welcome — same shape convention as /ws/matches.
+	_ = conn.WriteJSON(map[string]interface{}{
+		"type":    "connected",
+		"message": "Connected to notifications feed",
+		"user_id": userID,
+	})
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case n, ok := <-ch:
+			if !ok {
+				// Broadcaster cancelled the subscription (shouldn't
+				// happen unless cancel() was called twice — defensive).
+				return
+			}
+			if err := conn.WriteJSON(n); err != nil {
+				// Client disconnected. Don't log loud — this is normal.
+				h.logger.Debug("notifications WS write failed (client gone)",
+					zap.String("user_id", userID),
+					zap.Error(err))
+				return
+			}
+		case <-ticker.C:
+			if err := conn.WriteJSON(map[string]interface{}{
+				"type":      "heartbeat",
+				"timestamp": time.Now().Unix(),
+			}); err != nil {
+				return
+			}
+		case <-r.Context().Done():
+			return
+		}
 	}
 }
 

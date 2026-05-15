@@ -20,6 +20,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/handlers"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/middleware"
+	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/notifications"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/router"
 )
 
@@ -83,8 +84,30 @@ func main() {
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 
+	// Notifications bridge: Kafka `manthan.notifications` → /ws/notifications.
+	// Broadcaster is in-process per-user fan-out; consumer pumps Kafka
+	// into it. Bridge is best-effort — if Kafka is down we log and run
+	// without it (the WS route stays mounted; the broadcaster just has
+	// no producer feeding it).
+	notifBroadcaster := notifications.NewBroadcaster(logger)
+	notifConsumer, ncErr := notifications.NewConsumer(notifications.Config{
+		Brokers: cfg.Services.KafkaBrokers,
+		Topic:   cfg.Services.NotificationsTopic,
+	}, notifBroadcaster, logger)
+	if ncErr != nil {
+		log.Printf("Warning: notifications consumer init failed: %v (notifications WS will be silent)", ncErr)
+	} else {
+		go func() {
+			if rErr := notifConsumer.Run(context.Background()); rErr != nil {
+				log.Printf("notifications consumer stopped: %v", rErr)
+			}
+		}()
+		log.Printf("Notifications bridge running: Kafka %v / topic=%s → /ws/notifications",
+			cfg.Services.KafkaBrokers, cfg.Services.NotificationsTopic)
+	}
+
 	// Initialize WebSocket handler
-	websocketHandler := handlers.NewWebSocketHandler(redisClient, logger)
+	websocketHandler := handlers.NewWebSocketHandler(redisClient, notifBroadcaster, logger)
 
 	// Initialize Paper Trading handler
 	paperTradingHandler := handlers.NewPaperTradingHandler(cfg.Services.TradeExecutionPaperURL)
