@@ -164,7 +164,10 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success":  true,
+		"strategy": slimStrategy(resp.Strategy),
+	})
 }
 
 // DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}
@@ -229,7 +232,10 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success":  true,
+		"strategy": slimStrategy(resp.Strategy),
+	})
 }
 
 // ListUserStrategies handles GET /api/v1/users/{user_id}/strategies
@@ -278,7 +284,11 @@ func (h *UserConfigHandler) ListUserStrategies(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success":    true,
+		"strategies": slimStrategies(resp.Strategies),
+		"pagination": slimPagination(resp.Pagination),
+	})
 }
 
 // ActivateStrategy handles POST /api/v1/strategies/{strategy_id}/activate

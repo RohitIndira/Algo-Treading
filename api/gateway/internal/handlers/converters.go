@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/dto"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
@@ -260,77 +261,149 @@ func dtoUpdateStrategyToProto(reqDTO *dto.UpdateStrategyRequest) *pb.UpdateStrat
 	return req
 }
 
-// build52WResponse creates a clean JSON response for 52W strategies.
-// Only includes fields relevant to 52W — no news conditions, no bracket order fields.
-func build52WResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
-	s := resp.Strategy
-	tc := s.TradeConfig
+// strategyTypeName converts the proto enum to the frontend-facing string.
+// Centralised so list/get/create/update all emit the same canonical names.
+func strategyTypeName(t pb.StrategyType) string {
+	switch t {
+	case pb.StrategyType_NEWS:
+		return "NEWS"
+	case pb.StrategyType_WEEK52_BREAKOUT:
+		return "52W_BREAKOUT"
+	case pb.StrategyType_MANTHAN:
+		return "MANTHAN"
+	case pb.StrategyType_HFT_BIDDING:
+		return "HFT_BIDDING"
+	default:
+		return "UNSPECIFIED"
+	}
+}
 
-	result := map[string]interface{}{
-		"success": true,
-		"strategy": map[string]interface{}{
-			"strategy_id":   s.StrategyId,
-			"user_id":       s.UserId,
-			"strategy_name": s.StrategyName,
-			"strategy_type": "52W_BREAKOUT",
-			"active":        s.Active,
-			"trading_mode":  fmt.Sprintf("%v", s.TradingMode),
-			"trade_config": map[string]interface{}{
+func tradingModeName(m pb.TradingMode) string {
+	switch m {
+	case pb.TradingMode_PAPER:
+		return "PAPER"
+	case pb.TradingMode_LIVE:
+		return "LIVE"
+	default:
+		return "UNSPECIFIED"
+	}
+}
+
+func stopLossTypeName(t pb.StopLossType) string {
+	switch t {
+	case pb.StopLossType_FIXED:
+		return "FIXED"
+	case pb.StopLossType_TRAILING:
+		return "TRAILING"
+	default:
+		return "UNSPECIFIED"
+	}
+}
+
+// tsToRFC3339 renders a proto Timestamp as RFC3339 (UTC), or "" if absent —
+// the frontend previously had to deal with {seconds, nanos}.
+func tsToRFC3339(t *common.Timestamp) string {
+	if t == nil || t.Seconds == 0 {
+		return ""
+	}
+	return time.Unix(t.Seconds, int64(t.Nanos)).UTC().Format(time.RFC3339)
+}
+
+// slimStrategy is the single source of truth for what the gateway returns
+// to the frontend for any strategy object — list, get, create, update.
+// Drops zero-filled blocks (NEWS conditions, risk_limits) and per-type
+// irrelevant trade_config fields. Per-type sub-block is keyed off
+// strategy_type so the response carries only what's meaningful.
+func slimStrategy(s *pb.Strategy) map[string]interface{} {
+	if s == nil {
+		return nil
+	}
+	out := map[string]interface{}{
+		"strategy_id":   s.StrategyId,
+		"user_id":       s.UserId,
+		"strategy_name": s.StrategyName,
+		"description":   s.Description,
+		"strategy_type": strategyTypeName(s.StrategyType),
+		"trading_mode":  tradingModeName(s.TradingMode),
+		"active":        s.Active,
+		"version":       s.Version,
+		"created_at":    tsToRFC3339(s.CreatedAt),
+		"updated_at":    tsToRFC3339(s.UpdatedAt),
+	}
+
+	switch s.StrategyType {
+	case pb.StrategyType_MANTHAN, pb.StrategyType_WEEK52_BREAKOUT:
+		if tc := s.TradeConfig; tc != nil {
+			out["trade_config"] = map[string]interface{}{
 				"total_capital":    tc.TotalCapital,
 				"max_positions":    tc.MaxPositions,
 				"per_stock_amount": tc.PerStockAmount,
 				"stop_loss_pct":    tc.StopLossPct,
-				"take_profit_pct":  tc.TakeProfitPct,
-			},
-		},
-	}
-
-	return result
-}
-
-func buildManthanResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
-	s := resp.Strategy
-	return map[string]interface{}{
-		"success":       true,
-		"strategy_id":   s.StrategyId,
-		"strategy_name": s.StrategyName,
-		"strategy_type": "MANTHAN",
-		"trading_mode":  fmt.Sprintf("%v", s.TradingMode),
-	}
-}
-
-// buildHFTResponse creates a clean JSON response for HFT_BIDDING strategies,
-// echoing back the resolved HFT config so the frontend can confirm what was
-// stored (engine-applied defaults included).
-func buildHFTResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
-	s := resp.Strategy
-	out := map[string]interface{}{
-		"success":       true,
-		"strategy_id":   s.StrategyId,
-		"user_id":       s.UserId,
-		"strategy_name": s.StrategyName,
-		"strategy_type": "HFT_BIDDING",
-		"active":        s.Active,
-		"trading_mode":  fmt.Sprintf("%v", s.TradingMode),
-	}
-	if h := s.HftConfig; h != nil {
-		out["hft_config"] = map[string]interface{}{
-			"symbol":                 h.Symbol,
-			"isin":                   h.Isin,
-			"exchange":               h.Exchange,
-			"side":                   h.Side,
-			"product_type":           h.ProductType,
-			"tick_size":              h.TickSize,
-			"max_buy_qty":            h.MaxBuyQty,
-			"max_sell_qty":           h.MaxSellQty,
-			"single_buy_qty":         h.SingleBuyQty,
-			"single_sell_qty":        h.SingleSellQty,
-			"buy_limit_price":        h.BuyLimitPrice,
-			"sell_limit_price":       h.SellLimitPrice,
-			"window_start":           h.WindowStart,
-			"window_end":             h.WindowEnd,
-			"modify_on_price_change": h.ModifyOnPriceChange,
+				"trailing_sl_pct":  tc.TrailingSlPct,
+				"stop_loss_type":   stopLossTypeName(tc.StopLossType),
+				"exchange":         tc.Exchange.String(),
+				"product_type":     tc.ProductType.String(),
+			}
+		}
+	case pb.StrategyType_HFT_BIDDING:
+		if h := s.HftConfig; h != nil {
+			out["hft_config"] = map[string]interface{}{
+				"symbol":                 h.Symbol,
+				"isin":                   h.Isin,
+				"exchange":               h.Exchange,
+				"side":                   h.Side,
+				"product_type":           h.ProductType,
+				"tick_size":              h.TickSize,
+				"max_buy_qty":            h.MaxBuyQty,
+				"max_sell_qty":           h.MaxSellQty,
+				"single_buy_qty":         h.SingleBuyQty,
+				"single_sell_qty":        h.SingleSellQty,
+				"buy_limit_price":        h.BuyLimitPrice,
+				"sell_limit_price":       h.SellLimitPrice,
+				"window_start":           h.WindowStart,
+				"window_end":             h.WindowEnd,
+				"modify_on_price_change": h.ModifyOnPriceChange,
+			}
 		}
 	}
 	return out
 }
+
+func slimStrategies(list []*pb.Strategy) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(list))
+	for _, s := range list {
+		out = append(out, slimStrategy(s))
+	}
+	return out
+}
+
+func slimPagination(p *common.PaginationResponse) map[string]interface{} {
+	if p == nil {
+		return nil
+	}
+	return map[string]interface{}{
+		"page":         p.Page,
+		"page_size":    p.PageSize,
+		"total_items":  p.TotalItems,
+		"total_pages":  p.TotalPages,
+		"has_next":     p.HasNext,
+		"has_previous": p.HasPrevious,
+	}
+}
+
+// build52WResponse / buildManthanResponse / buildHFTResponse all delegate
+// to slimStrategy so the create-response shape matches list/get/update.
+func build52WResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
+	return map[string]interface{}{"success": true, "strategy": slimStrategy(resp.Strategy)}
+}
+
+func buildManthanResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
+	return map[string]interface{}{"success": true, "strategy": slimStrategy(resp.Strategy)}
+}
+
+func buildHFTResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
+	return map[string]interface{}{"success": true, "strategy": slimStrategy(resp.Strategy)}
+}
+
+// Keep fmt referenced — used elsewhere in this file if any helpers remain.
+var _ = fmt.Sprintf
