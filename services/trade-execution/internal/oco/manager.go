@@ -130,6 +130,18 @@ func isSessionExpiredError(err error) bool {
 	return strings.Contains(msg, "HTTP error 401") || strings.Contains(msg, "Session expired")
 }
 
+// isSessionNotReadyError returns true if the broker rejected the order because its
+// trading session hasn't finished initializing after a WS reconnect (AU004).
+// This is a transient condition — the session typically becomes ready within
+// a few seconds, so the caller should wait longer than a 401 retry before retrying.
+func isSessionNotReadyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "AU004") || strings.Contains(msg, "Session data not received")
+}
+
 // refreshAuth invalidates the cache for userID, reloads fresh credentials from DB,
 // and returns an updated AuthContext. Returns nil if refresh is unavailable or fails.
 func (m *OCOManager) refreshAuth(ctx context.Context, userID string, currentAuth *indiraClient.AuthContext) *indiraClient.AuthContext {
@@ -311,13 +323,20 @@ func (m *OCOManager) CreateOCOEntry(
 		return nil, fmt.Errorf("failed to persist OCO entry order: %w", err)
 	}
 
-	// Place the entry SL order at broker with retry on 401 (session expired).
+	// Place the entry SL order at broker with retry on 401 (session expired) and
+	// AU004 (session not ready yet after WS reconnect).
 	var brokerID string
 	var placeErr error
 	currentAuth := auth
 	for attempt := 0; attempt <= maxEntryRetries; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			delay := time.Duration(attempt) * 500 * time.Millisecond
+			// AU004 means the broker session is still initializing after a WS
+			// reconnect — use a longer backoff to give it time to become ready.
+			if isSessionNotReadyError(placeErr) {
+				delay = time.Duration(attempt) * 3 * time.Second
+			}
+			time.Sleep(delay)
 
 			// On 401, refresh credentials from DB before retrying.
 			if isSessionExpiredError(placeErr) {
@@ -341,8 +360,9 @@ func (m *OCOManager) CreateOCOEntry(
 		log.Printf("[oco] Entry order placement attempt %d failed for group %s: %v",
 			attempt+1, groupID, placeErr)
 
-		// Only retry on 401; other errors are not retryable here.
-		if !isSessionExpiredError(placeErr) {
+		// Retry on 401 (stale token) and AU004 (broker session not yet ready).
+		// All other broker rejections are permanent — stop retrying immediately.
+		if !isSessionExpiredError(placeErr) && !isSessionNotReadyError(placeErr) {
 			break
 		}
 	}
@@ -509,11 +529,16 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 		}
 
 		// Capture fill price from the WS event.
+		// FilledPrice (TradedPrice from broker WS) is the actual execution price.
+		// order.Price is the LIMIT price used to place the entry — for OCO LIMIT entries
+		// it is signal_price * 1.005, which is higher than the actual fill. Using it as
+		// HighestPrice would prevent trailing SL from ever firing (stock never exceeds
+		// the limit price that was already above market at entry time).
 		fillPrice := 0.0
-		if order.Price != nil && *order.Price > 0 {
-			fillPrice = *order.Price
-		} else if order.FilledPrice != nil && *order.FilledPrice > 0 {
+		if order.FilledPrice != nil && *order.FilledPrice > 0 {
 			fillPrice = *order.FilledPrice
+		} else if order.Price != nil && *order.Price > 0 {
+			fillPrice = *order.Price
 		}
 		if fillPrice <= 0 {
 			log.Printf("[oco] WARNING: Entry fill price is 0 for group %s — cannot place legs", group.GroupID)
@@ -547,12 +572,12 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 			log.Printf("[oco] Entry PARTIALLY FILLED for group %s: %d/%d — placing SL+TP legs for filled qty",
 				group.GroupID, filledQty, group.Quantity)
 
-			// Capture fill price from the WS event
+			// Capture fill price from the WS event (FilledPrice = TradedPrice, actual execution price)
 			fillPrice := 0.0
-			if order.Price != nil && *order.Price > 0 {
-				fillPrice = *order.Price
-			} else if order.FilledPrice != nil && *order.FilledPrice > 0 {
+			if order.FilledPrice != nil && *order.FilledPrice > 0 {
 				fillPrice = *order.FilledPrice
+			} else if order.Price != nil && *order.Price > 0 {
+				fillPrice = *order.Price
 			}
 			if fillPrice <= 0 {
 				log.Printf("[oco] WARNING: Partial fill price is 0 for group %s — cannot place legs", group.GroupID)

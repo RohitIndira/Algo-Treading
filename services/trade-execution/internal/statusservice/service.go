@@ -406,10 +406,12 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		}
 	}
 
-	// Mark execution time using broker's OrderTimeStamp from WSS (e.g. "18-Mar-2026 15:12:30")
+	// Mark execution time: OrderEntryTime → OrderTimeStamp → leave nil.
 	if brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED" {
-		if brokerTime := parseBrokerTime(wsStatus.OrderTimeStamp); !brokerTime.IsZero() {
-			order.ExecutedAt = &brokerTime
+		if t := parseBrokerTime(wsStatus.OrderEntryTime); !t.IsZero() {
+			order.ExecutedAt = &t
+		} else if t := parseBrokerTime(wsStatus.OrderTimeStamp); !t.IsZero() {
+			order.ExecutedAt = &t
 		}
 	}
 
@@ -512,18 +514,19 @@ func decimalLocator(dl string) float64 {
 	return 1
 }
 
-// parseBrokerTime parses an Indira broker OrderTimeStamp string into time.Time (IST).
-// Expected format: "18-Mar-2026 15:12:30" (DD-Mon-YYYY HH:MM:SS).
-// Returns zero time if the string is empty or does not match.
+// parseBrokerTime parses an Indira broker time string into time.Time (IST).
+// Handles both colon-separated (OrderTimeStamp "15-May-2026 12:31:29")
+// and dot-separated (OrderEntryTime "15-May-2026 12.31.30") formats.
 func parseBrokerTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
 	}
-	t, err := time.ParseInLocation("02-Jan-2006 15:04:05", s, timezone.IST)
-	if err != nil {
-		return time.Time{}
+	for _, layout := range []string{"02-Jan-2006 15:04:05", "02-Jan-2006 15.04.05"} {
+		if t, err := time.ParseInLocation(layout, s, timezone.IST); err == nil {
+			return t
+		}
 	}
-	return t
+	return time.Time{}
 }
 
 func (s *OrderStatusService) publishNotification(ctx context.Context, order *models.Order, wsStatus *indiraClient.WSOrderStatus) {
@@ -608,7 +611,11 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 				tradedQty, wsStatus.OrderOriginalQty, order.Symbol, tradedPriceStr,
 				order.Exchange, brokerRef, wsStatus.OrderEntryTime,
 			)
-			execDetails.ExecutedAt = time.Now()
+			if t := parseBrokerTime(wsStatus.OrderEntryTime); !t.IsZero() {
+				execDetails.ExecutedAt = t
+			} else {
+				execDetails.ExecutedAt = time.Now()
+			}
 		}
 		update.StatusEmoji = "✅"
 		update.StatusColor = "#00C851"

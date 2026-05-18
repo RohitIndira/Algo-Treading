@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
@@ -28,6 +29,20 @@ type SignalProcessor struct {
 	ocoManager        *oco.OCOManager
 	multiLevelManager MultiLevelManager
 	logger            *zap.Logger
+
+	// haltedStrategies holds strategy IDs that have been deactivated.
+	// Signals for halted strategies are dropped immediately, preventing
+	// in-flight Kafka messages from opening new positions after deactivation.
+	haltedStrategies sync.Map // map[string]struct{}
+}
+
+// HaltStrategy marks a strategy as deactivated so that any subsequent
+// Kafka signals for it are silently dropped by ProcessTradeSignal.
+// Safe to call concurrently. Implements consumer.StrategyHalter.
+func (p *SignalProcessor) HaltStrategy(strategyID string) {
+	p.haltedStrategies.Store(strategyID, struct{}{})
+	p.logger.Info("strategy halted — new signals will be dropped",
+		zap.String("strategy_id", strategyID))
 }
 
 // MultiLevelManager is the interface the SignalProcessor uses to register
@@ -86,6 +101,19 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 	order, err := p.convertSignalToOrder(signal)
 	if err != nil {
 		return fmt.Errorf("failed to convert signal to order: %w", err)
+	}
+
+	// Reject signals for strategies that have been deactivated. The halt is set
+	// by StrategyEventsConsumer when a CONFIG_PAUSED/CONFIG_DELETED event arrives.
+	// This prevents in-flight rules-engine messages from opening new positions
+	// after deactivation — which combined with auto square-off would create a
+	// net short sell and incur a SEBI penalty.
+	if _, halted := p.haltedStrategies.Load(order.StrategyID); halted {
+		p.logger.Info("signal dropped — strategy is deactivated",
+			zap.String("oid", signal.OrderID),
+			zap.String("strategy_id", order.StrategyID),
+			zap.String("symbol", order.Symbol))
+		return nil
 	}
 
 	// Persist order — ON CONFLICT DO NOTHING combines the idempotency check
@@ -223,6 +251,28 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 				}
 				trailPct := capturedSignal.TrailingSLPct
 				p.ocoManager.AdoptOrder(filled, capturedSignal.StopLossPct, capturedSignal.TakeProfitPct, true, trailPct, auth)
+			}
+		} else if !order.IsPaperTrade && p.ocoManager != nil && hasAuth && (signal.StopLossPct > 0 || signal.TakeProfitPct > 0) {
+			// below_min + Fixed SL and/or Fixed TP (non-trailing, non-multi-level):
+			// adopt into OCO after the price monitor fills the entry so that SL-M
+			// and/or LIMIT TP legs are placed from the actual fill price.
+			// Without this, onAfterFill is nil → triggerOrder keeps ProductType=BRACKET
+			// and sends a broker BRACKET order with no separate OCO management.
+			capturedSignal := signal
+			onAfterFill = func(filled *models.Order) {
+				if filled.IndiraOrderID == nil {
+					return
+				}
+				var auth *indiraClient.AuthContext
+				if filled.BearerToken != nil && filled.AppId != nil && filled.Source != nil {
+					auth = &indiraClient.AuthContext{
+						UserId:      filled.UserID,
+						BearerToken: *filled.BearerToken,
+						AppId:       *filled.AppId,
+						Source:      *filled.Source,
+					}
+				}
+				p.ocoManager.AdoptOrder(filled, capturedSignal.StopLossPct, capturedSignal.TakeProfitPct, false, 0, auth)
 			}
 		}
 

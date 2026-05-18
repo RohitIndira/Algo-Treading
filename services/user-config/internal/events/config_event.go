@@ -95,5 +95,7 @@ type RiskLimitsPayload struct {
 	EnableRiskChecks        bool    `json:"enable_risk_checks"`
 	EnableAutoSquareOff     bool    `json:"enable_auto_square_off"`
 	AutoSquareOffTime       string  `json:"auto_square_off_time"`
+	MaxAmountPerStock       float64 `json:"max_amount_per_stock"`
+	MaxTradesPerStrategy    int32   `json:"max_trades_per_strategy"`
 	CreatedAt               int64   `json:"created_at"` // UnixNano
 }

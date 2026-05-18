@@ -7,14 +7,21 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
 	"github.com/gorilla/websocket"
 )
 
 // PriceCallback is called whenever a new LTP is received for a symbol.
 type PriceCallback func(symbol string, ltp float64)
+
+// TickUpdateCallback is called with the full tick context (exchange, token, ltp).
+// Used by the multi-level manager which indexes groups by numeric instrument token.
+// Key format expected by the ML manager: "<exchange>:<token>" (e.g. "nse:2475").
+type TickUpdateCallback func(exchange, token string, ltp float64)
 
 // Binary message type bytes (matches binaryDecoder.ts and the Go binary WS server)
 const (
@@ -43,44 +50,64 @@ const (
 //	[next]   uint8   exchange code  (0=nse, 1=bse, 2=nfo, 3=mcx)
 //	[next]   float32 ltp
 //	…
-func decodeBinaryTick(data []byte) (symbol string, ltp float64, ok bool) {
+func decodeBinaryTick(data []byte) (symbol, token, exchange string, ltp float64, ok bool) {
 	if len(data) < 10 || data[0] != binMsgMarketData {
-		return "", 0, false
+		return "", "", "", 0, false
 	}
 
 	offset := 1 + 8 // skip type(1) + timestamp(8)
 
-	// token (length-prefixed string) — skip it
+	// token (length-prefixed string)
 	if offset >= len(data) {
-		return "", 0, false
+		return "", "", "", 0, false
 	}
 	tokenLen := int(data[offset])
 	offset++
+	if offset+tokenLen > len(data) {
+		return "", "", "", 0, false
+	}
+	token = string(data[offset : offset+tokenLen])
 	offset += tokenLen
 
 	// symbol (length-prefixed string)
 	if offset >= len(data) {
-		return "", 0, false
+		return "", "", "", 0, false
 	}
 	symbolLen := int(data[offset])
 	offset++
 	if offset+symbolLen > len(data) {
-		return "", 0, false
+		return "", "", "", 0, false
 	}
 	symbol = string(data[offset : offset+symbolLen])
 	offset += symbolLen
 
-	// exchange (1 byte) — skip
+	// exchange (1 byte)
+	if offset >= len(data) {
+		return "", "", "", 0, false
+	}
+	exchByte := data[offset]
 	offset++
+	switch exchByte {
+	case 0:
+		exchange = "nse"
+	case 1:
+		exchange = "bse"
+	case 2:
+		exchange = "nfo"
+	case 3:
+		exchange = "mcx"
+	default:
+		exchange = "nse"
+	}
 
 	// ltp (float32 LE, 4 bytes)
 	if offset+4 > len(data) {
-		return "", 0, false
+		return "", "", "", 0, false
 	}
 	ltpBits := binary.LittleEndian.Uint32(data[offset : offset+4])
 	ltp = float64(math.Float32frombits(ltpBits))
 
-	return symbol, ltp, ltp > 0
+	return symbol, token, exchange, ltp, ltp > 0
 }
 
 // PaperMarketClient maintains a single persistent WebSocket connection to the
@@ -90,12 +117,33 @@ type PaperMarketClient struct {
 	clientID string
 	callback PriceCallback
 
+	// tickUpdateCb receives full tick context (exchange, token, ltp) for components
+	// that need to look up positions by instrument token rather than symbol name.
+	// Nil-safe: set via SetTickUpdateCallback before starting.
+	tickUpdateCb TickUpdateCallback
+
 	mu         sync.Mutex
 	conn       *websocket.Conn
 	subscribed map[string]bool // token → subscribed
 
+	// tickCh is an optional send-only channel for full tick history storage.
+	// If nil (default), no tick data is forwarded — zero overhead.
+	tickCh chan<- marketws.TickData
+
 	stopCh chan struct{}
 	once   sync.Once
+}
+
+// SetTickWriter wires a send-only channel for full tick history.
+// Every decoded tick is forwarded non-blocking — the callback path is never delayed.
+func (c *PaperMarketClient) SetTickWriter(ch chan<- marketws.TickData) {
+	c.tickCh = ch
+}
+
+// SetTickUpdateCallback wires a callback that receives exchange+token info on each tick.
+// Must be called before Start. Used by the multi-level manager for token-based routing.
+func (c *PaperMarketClient) SetTickUpdateCallback(cb TickUpdateCallback) {
+	c.tickUpdateCb = cb
 }
 
 // NewPaperMarketClient creates the market data client.
@@ -296,9 +344,20 @@ func (c *PaperMarketClient) processMessage(msg []byte) {
 	// JSON messages start with '{' (0x7B) which won't match any binary type byte.
 	switch msg[0] {
 	case binMsgMarketData:
-		symbol, ltp, ok := decodeBinaryTick(msg)
-		if ok && c.callback != nil {
-			c.callback(symbol, ltp)
+		symbol, token, exchange, ltp, ok := decodeBinaryTick(msg)
+		if ok {
+			if c.callback != nil {
+				c.callback(symbol, ltp)
+			}
+			if c.tickUpdateCb != nil && exchange != "" && token != "" {
+				c.tickUpdateCb(exchange, token, ltp)
+			}
+			if c.tickCh != nil {
+				select {
+				case c.tickCh <- marketws.TickData{Symbol: symbol, Token: token, Exchange: exchange, LTP: ltp, Timestamp: time.Now().UnixNano()}:
+				default:
+				}
+			}
 		}
 		return
 
@@ -323,6 +382,8 @@ func (c *PaperMarketClient) processMessage(msg []byte) {
 	case "market_data":
 		// Symbol is at the top level.
 		symbol := extractString(envelope, "symbol")
+		token := extractString(envelope, "token")
+		exchange := strings.ToLower(extractString(envelope, "exchange"))
 
 		// ltp is inside the nested "data" object (see socket.md §5.7).
 		// Do NOT fall back to "close" — that field carries historical/prev-day prices
@@ -332,8 +393,19 @@ func (c *PaperMarketClient) processMessage(msg []byte) {
 			ltp = extractFloat(nested, "ltp", "last_traded_price")
 		}
 
-		if symbol != "" && ltp > 0 && c.callback != nil {
-			c.callback(symbol, ltp)
+		if symbol != "" && ltp > 0 {
+			if c.callback != nil {
+				c.callback(symbol, ltp)
+			}
+			if c.tickUpdateCb != nil && exchange != "" && token != "" {
+				c.tickUpdateCb(exchange, token, ltp)
+			}
+			if c.tickCh != nil {
+				select {
+				case c.tickCh <- marketws.TickData{Symbol: symbol, Token: token, Exchange: exchange, LTP: ltp, Timestamp: time.Now().UnixNano()}:
+				default:
+				}
+			}
 		}
 
 	case "periodic_52week_data":

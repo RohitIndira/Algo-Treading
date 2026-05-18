@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
+	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
@@ -34,6 +35,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/tickstore"
 )
 
 func main() {
@@ -260,6 +262,13 @@ func main() {
 		return orderExecutor.ExecuteOrder(ctx, exitOrder)
 	})
 
+	// Wire LiveBrokerCanceller — used by force-exit-all to cancel submitted orders at the
+	// broker before bulk-cancelling in DB. Delegates to OrderExecutor which handles the
+	// broker API call and local status update in one step.
+	paperWSServer.SetLiveBrokerCanceller(func(ctx context.Context, order *models.Order, reason string) error {
+		return orderExecutor.CancelOrder(ctx, order, reason)
+	})
+
 	// Link OrderStatusService → live orders WS so every status change received from
 	// the Indira broker WebSocket (SUBMITTED→FILLED, PARTIALLY_FILLED, REJECTED, etc.)
 	// is pushed to the frontend immediately without requiring a page refresh.
@@ -314,6 +323,10 @@ func main() {
 	}
 	var positionDebouncers sync.Map // userID → *positionDebounce
 	statusService.SetOnOrderFilled(func(userID string, auth *indiraPkg.AuthContext) {
+		// Cache credentials so PushPositions can be triggered on the next WS connect
+		// without waiting for another fill event.
+		paperWSServer.StoreAuth(userID, auth.BearerToken, auth.AppId, auth.Source)
+
 		val, _ := positionDebouncers.LoadOrStore(userID, &positionDebounce{})
 		d := val.(*positionDebounce)
 		d.mu.Lock()
@@ -336,7 +349,7 @@ func main() {
 	// Initialize Redis price client — used for accurate order fill prices, PnL fallback,
 	// and dynamic tick size lookup for limit order price rounding.
 	// Non-fatal: if Redis is unavailable the service still runs with hardcoded tick sizes.
-	redisPrices, redisErr := paper.NewRedisPriceClient(cfg.RedisAddr, cfg.RedisPassword)
+	redisPrices, redisErr := paper.NewRedisPriceClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 	var priceLookup executor.PriceLookup
 	if redisErr != nil {
 		log.Printf("[paper] Redis price client unavailable (non-fatal): %v", redisErr)
@@ -348,7 +361,8 @@ func main() {
 		// Wire Redis tick size lookup into the Indira execution client
 		indiraClient.SetTickSizeLookup(redisPrices)
 		indiraClient.SetDPRLookup(redisPrices)
-		log.Println("✓ Dynamic tick size + DPR lookup enabled (Redis market data)")
+		indiraClient.SetLTPLookup(redisPrices)
+		log.Println("✓ Dynamic tick size + DPR + LTP lookup enabled (Redis market data)")
 		// Wire Redis price lookup into strategy events consumer for accurate paper exit PnL
 		strategyEventsConsumer.SetPriceClient(redisPrices)
 	}
@@ -375,6 +389,7 @@ func main() {
 	paperMonitor := paper.NewPaperTradeMonitor(orderRepo, paperExec, paperWSServer, paperMarketClient, redisPrices)
 	paperMonitorRef = paperMonitor
 	paperWSServer.SetMonitor(paperMonitor)
+	// paperMarketClient tick writer wired below after tickStoreWriter is created (line ~415).
 	log.Println("✓ Paper trading layer initialized")
 	// ─────────────────────────────────────────────────────────────────────────
 
@@ -383,6 +398,7 @@ func main() {
 	// Fallback: Redis MGET polling for any tokens not covered by WSS.
 	var priceMonitorRef *scheduler.PriceMonitor
 	var priceMonitorWSClient *marketws.Client
+	var tickStoreWriter *tickstore.TickWriter
 	{
 		// RoutingExecutor: live orders → orderExecutor, paper orders → paperExec.
 		// This lets the PriceMonitor handle below_min paper orders without broker calls.
@@ -401,6 +417,19 @@ func main() {
 		priceMonitorRef.SetWSClient(priceMonitorWSClient)
 		// Event-driven: WSS tick → immediate evaluation (no polling delay)
 		priceMonitorWSClient.SetOnPriceUpdate(priceMonitorRef.OnPriceUpdate)
+
+		// Tick store: persist every socket tick to localhost Redis DB=1 for testing.
+		// Wired to both WebSocket clients (paper-market + price-monitor).
+		// Non-fatal — if localhost Redis is unavailable the algo runs unchanged.
+		// Goroutine is started below after ctx is defined.
+		if tw, err := tickstore.NewTickWriter("localhost:6379", ""); err != nil {
+			log.Printf("[tickstore] unavailable, tick history disabled (non-fatal): %v", err)
+		} else {
+			paperMarketClient.SetTickWriter(tw.InCh())   // paper SL/TP orders
+			priceMonitorWSClient.SetTickWriter(tw.InCh()) // below_min price monitor orders
+			tickStoreWriter = tw
+			log.Println("✓ Tick writer connected — all socket ticks will be stored to localhost Redis DB=1")
+		}
 
 		signalProcessor.SetPriceMonitor(priceMonitorRef)
 		strategyEventsConsumer.SetPriceMonitor(priceMonitorRef)
@@ -544,6 +573,20 @@ func main() {
 		paperMonitor.UpdateCachedOrderSL(entryOrderID, newSL)
 	}
 
+	// Wire ML manager into strategy events consumer so paper partial exits are
+	// recorded for remaining ML qty when a strategy is paused or deleted.
+	strategyEventsConsumer.SetMLManager(mlManager)
+
+	// Wire paper market WSS as the price feed for the ML manager.
+	// paperMarketClient fires ticks with (symbol, ltp); the ML manager needs
+	// "exchange:token" key format so groups can be found by stockCode.
+	// SetTickUpdateCallback delivers exchange+token on each tick for this purpose.
+	paperMarketClient.SetTickUpdateCallback(func(exchange, token string, ltp float64) {
+		mlManager.OnPriceUpdate(exchange+":"+token, ltp)
+	})
+	// Use the same WSS connection for ML group subscription management.
+	mlManager.SetWSClient(paperMarketClient)
+
 	log.Println("✓ Multi-level SL/TP layer initialized")
 	// ──────────────────────────────────────────────────────────────────────
 
@@ -581,6 +624,12 @@ func main() {
 	// Start services
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start tick store drain loop now that ctx is available.
+	if tickStoreWriter != nil {
+		go tickStoreWriter.Start(ctx)
+		log.Println("✓ Tick writer drain loop started (localhost Redis DB=1, ticks:{exchange}:{token}, TTL=12h)")
+	}
 
 	// ── Lifecycle: ordered graceful shutdown ──────────────────────────────────
 	lc := lifecycle.New(cancel, 15*time.Second)
@@ -690,6 +739,12 @@ func main() {
 		ocoTrailingMonitor.Start(ctx)
 	}()
 
+	// Start multi-level SL/TP manager worker pool.
+	// Must be called before Kafka consumer starts so eval workers are ready
+	// when the first multi-level paper order fills and enqueues price jobs.
+	mlManager.Start(ctx)
+	log.Println("✓ Multi-level SL/TP manager worker pool started")
+
 	// Start Kafka consumer — primary intake path (rules-engine trade-signals)
 	go func() {
 		log.Println("Starting Kafka consumer (trade-signals)...")
@@ -757,6 +812,7 @@ type Config struct {
 	// Redis (market price feed)
 	RedisAddr     string
 	RedisPassword string
+	RedisDB       int
 	// Observability
 	MetricsPort int
 	// Auto square-off
@@ -786,6 +842,7 @@ func loadConfig() Config {
 		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", ""),
 		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
 		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
+		RedisDB:          getEnvInt("REDIS_DB", 0),
 		MetricsPort:      getEnvInt("METRICS_PORT", 9090),
 		AutoSquareOffTime: getEnv("AUTO_SQUARE_OFF_TIME", "15:05"),
 	}
@@ -887,7 +944,28 @@ func trim(s string) string {
 }
 
 func initLogger() (*zap.Logger, error) {
-	return zap.NewProduction()
+	env := os.Getenv("ENVIRONMENT")
+	if env == "" {
+		env = "development"
+	}
+	logLevel := os.Getenv("LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	logDir := os.Getenv("LOG_DIR")
+	if logDir == "" {
+		logDir = "logs"
+	}
+	lgr, err := pkglogger.New(pkglogger.Config{
+		Environment: env,
+		Level:       logLevel,
+		ServiceName: "trade-execution",
+		LogDir:      logDir,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return lgr.Logger, nil
 }
 
 // checkRequiredTables ensures critical tables for this service exist.

@@ -102,9 +102,10 @@ func (r *TradeSignalRepository) SaveTradeSignal(ctx context.Context, orderReq *m
 	return nil
 }
 
-// HasSignalToday returns true if the strategy already has any signal for this
-// stock on today's IST date AND after sinceTime (the strategy's last activation).
-// This enforces the daily per-stock lock and resets when the strategy is reactivated.
+// HasSignalToday returns true if the strategy already has any LIVE-or-PENDING
+// signal for this stock on today's IST date AND after sinceTime (the strategy's
+// last activation). Signals that ended in FAILED or CANCELLED do not consume the
+// per-stock daily slot — the strategy may retry the same stock that day.
 func (r *TradeSignalRepository) HasSignalToday(ctx context.Context, strategyID string, stockCode int64, sinceTime time.Time) (bool, error) {
 	query := `
 		SELECT EXISTS(
@@ -114,6 +115,7 @@ func (r *TradeSignalRepository) HasSignalToday(ctx context.Context, strategyID s
 			  AND (created_at AT TIME ZONE 'Asia/Kolkata')::date
 			      = (NOW()    AT TIME ZONE 'Asia/Kolkata')::date
 			  AND created_at >= $3
+			  AND status NOT IN ('FAILED', 'CANCELLED')
 		)
 	`
 	var exists bool
@@ -121,6 +123,26 @@ func (r *TradeSignalRepository) HasSignalToday(ctx context.Context, strategyID s
 		return false, fmt.Errorf("failed to check daily signal: %w", err)
 	}
 	return exists, nil
+}
+
+// GetStrategyTradesToday returns the number of trade signals already emitted for
+// the given strategy on today's IST date and after sinceTime (last activation).
+// FAILED and CANCELLED signals are excluded so that broker-rejected orders do
+// not consume the daily cap.
+func (r *TradeSignalRepository) GetStrategyTradesToday(ctx context.Context, strategyID string, sinceTime time.Time) (int, error) {
+	query := `
+		SELECT COUNT(*) FROM trade_signals
+		WHERE strategy_id = $1
+		  AND (created_at AT TIME ZONE 'Asia/Kolkata')::date
+		      = (NOW()    AT TIME ZONE 'Asia/Kolkata')::date
+		  AND created_at >= $2
+		  AND status NOT IN ('FAILED', 'CANCELLED')
+	`
+	var count int
+	if err := r.db.QueryRowContext(ctx, query, strategyID, sinceTime).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count strategy trades: %w", err)
+	}
+	return count, nil
 }
 
 // UpdateSignalStatus updates the execution status of a trade signal

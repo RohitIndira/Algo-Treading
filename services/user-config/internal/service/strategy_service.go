@@ -320,9 +320,15 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		return fmt.Errorf("impact_score_min cannot be greater than impact_score_max")
 	}
 
-	// Validate trade config
-	if req.TradeConfig.Quantity <= 0 {
+	// Validate trade config.
+	// Allow quantity=0 when amount-based sizing is in use (max_amount_per_stock > 0);
+	// rules-engine derives the actual share count from the budget at execution time.
+	amountBased := req.RiskLimits.MaxAmountPerStock != nil && *req.RiskLimits.MaxAmountPerStock > 0
+	if !amountBased && req.TradeConfig.Quantity <= 0 {
 		return fmt.Errorf("quantity must be greater than 0")
+	}
+	if amountBased && req.TradeConfig.Quantity < 0 {
+		return fmt.Errorf("quantity must be non-negative")
 	}
 	if req.TradeConfig.OrderType == "" {
 		return fmt.Errorf("order_type is required")
@@ -376,8 +382,15 @@ func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyReques
 	}
 
 	if req.TradeConfig != nil {
-		if req.TradeConfig.Quantity <= 0 {
+		// Allow quantity=0 when amount-based sizing is configured on this update
+		// (or, if RiskLimits is absent, defer to the existing stored value — the
+		// repository will reject the row only if neither qty nor budget is set).
+		amountBased := req.RiskLimits != nil && req.RiskLimits.MaxAmountPerStock != nil && *req.RiskLimits.MaxAmountPerStock > 0
+		if !amountBased && req.TradeConfig.Quantity <= 0 {
 			return fmt.Errorf("quantity must be greater than 0")
+		}
+		if amountBased && req.TradeConfig.Quantity < 0 {
+			return fmt.Errorf("quantity must be non-negative")
 		}
 		if req.TradeConfig.StopLossPct != nil && *req.TradeConfig.StopLossPct < 0 {
 			return fmt.Errorf("stop_loss_pct must be non-negative")

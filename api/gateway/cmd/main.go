@@ -12,9 +12,8 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
-	"go.uber.org/zap"
-
 	"github.com/RohitIndira/Algo-Treading/api/gateway/config"
+	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/handlers"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/middleware"
@@ -62,8 +61,9 @@ func main() {
 	defer redisClient.Close()
 
 	// Initialize logger for WebSocket handler
-	logger, _ := zap.NewProduction()
-	defer logger.Sync()
+	pkgLgr, _ := pkglogger.NewWithDefaults("api-gateway")
+	defer pkgLgr.Close()
+	logger := pkgLgr.Logger
 
 	// Initialize WebSocket handler
 	websocketHandler := handlers.NewWebSocketHandler(redisClient, logger)

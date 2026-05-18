@@ -77,4 +77,8 @@ type RiskLimits struct {
 	EnableAutoSquareOff     bool    `json:"enable_auto_square_off"`
 	AutoSquareOffTime       string  `json:"auto_square_off_time"`
 	PositionSizing          string  `json:"position_sizing"` // "FIXED", "PERCENTAGE", "RISK_BASED"
+	// Maximum investment amount per stock per order (₹). 0 = no limit.
+	MaxAmountPerStock float64 `json:"max_amount_per_stock"`
+	// Maximum number of trades this strategy may execute per day. 0 = no limit.
+	MaxTradesPerStrategy int32 `json:"max_trades_per_strategy"`
 }

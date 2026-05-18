@@ -140,14 +140,20 @@ type Order struct {
 	AutoSquareOffTime *string `json:"auto_square_off_time,omitempty" db:"auto_square_off_time"`
 
 	// Paper trading fields
-	IsPaperTrade    bool     `json:"is_paper_trade" db:"is_paper_trade"`               // True for paper trade orders
-	TradingMode     string   `json:"trading_mode" db:"trading_mode"`                    // PAPER or LIVE
-	PaperExitPrice  *float64 `json:"paper_exit_price,omitempty" db:"paper_exit_price"` // Exit price for paper positions
-	PaperPnL        *float64 `json:"paper_pnl,omitempty" db:"paper_pnl"`               // Final P&L for paper positions
+	IsPaperTrade    bool       `json:"is_paper_trade" db:"is_paper_trade"`               // True for paper trade orders
+	TradingMode     string     `json:"trading_mode" db:"trading_mode"`                    // PAPER or LIVE
+	PaperExitPrice  *float64   `json:"paper_exit_price,omitempty" db:"paper_exit_price"` // Exit price for paper positions
+	PaperPnL        *float64   `json:"paper_pnl,omitempty" db:"paper_pnl"`               // Final P&L for paper positions
+	// PaperExitTime is the exact timestamp when the paper position was closed.
+	// entry time is ExecutedAt (set when the order fills).
+	PaperExitTime   *time.Time `json:"paper_exit_time,omitempty" db:"paper_exit_time"`
 
 	// Live trading exit fields
-	LiveExitPrice *float64 `json:"live_exit_price,omitempty" db:"live_exit_price"` // Exit price for live positions (force-exit)
-	LivePnL       *float64 `json:"live_pnl,omitempty" db:"live_pnl"`               // Final P&L for live positions (force-exit)
+	LiveExitPrice *float64   `json:"live_exit_price,omitempty" db:"live_exit_price"` // Exit price for live positions (force-exit)
+	LivePnL       *float64   `json:"live_pnl,omitempty" db:"live_pnl"`               // Final P&L for live positions (force-exit)
+	// LiveExitTime is the exact timestamp when the live position was closed.
+	// Entry time is ExecutedAt (set from broker OrderEntryTime/OrderTimeStamp on fill).
+	LiveExitTime  *time.Time `json:"live_exit_time,omitempty" db:"live_exit_time"`
 
 	// CurrentPctChange is the stock's percentage change at the time the order was created.
 	CurrentPctChange float64 `json:"current_pct_change,omitempty" db:"current_pct_change"`

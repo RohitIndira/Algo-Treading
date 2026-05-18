@@ -456,6 +456,216 @@ func (m *Manager) cancelGroupInternal(ctx context.Context, g *Group) {
 	_ = remaining // persist if needed
 }
 
+// cancelSLOrder cancels the single SL broker order for the group (FIXED/TRAILING mode).
+func (m *Manager) cancelSLOrder(ctx context.Context, group *Group) {
+	group.mu.Lock()
+	brokerID := group.SingleSLBrokerID
+	group.SingleSLBrokerID = ""
+	group.mu.Unlock()
+
+	if brokerID == "" || group.broker == nil || group.Auth == nil {
+		return
+	}
+	if err := group.broker.CancelOrder(ctx, group.Exchange, brokerID, group.Symbol, group.Auth); err != nil {
+		m.logger.Warn("ml_cancel_sl_failed",
+			zap.String("group_id", group.GroupID.String()),
+			zap.String("broker_id", brokerID),
+			zap.Error(err))
+	}
+}
+
+// cancelTPOrder cancels a single active TP limit order and marks the level cancelled.
+func (m *Manager) cancelTPOrder(ctx context.Context, group *Group, level *ExitLevelState, brokerID string) {
+	if group.broker == nil || group.Auth == nil {
+		return
+	}
+	if err := group.broker.CancelOrder(ctx, group.Exchange, brokerID, group.Symbol, group.Auth); err != nil {
+		m.logger.Warn("ml_cancel_tp_failed",
+			zap.String("group_id", group.GroupID.String()),
+			zap.Int("level", level.LevelNum),
+			zap.Error(err))
+	} else {
+		level.markCancelled()
+		m.mlLevelIndex.Delete(brokerID)
+		_ = m.repo.UpdateMultiLevelLevelStatus(ctx, group.EntryOrderID, models.MLExitTypeTP, level.LevelNum,
+			models.MLStatusCancelled, 0)
+	}
+}
+
+// recordPaperPartialExit writes a paper closed-position row for one partial ML exit
+// (SL/TP level or strategy deactivation). The row appears in the Closed Positions tab.
+func (m *Manager) recordPaperPartialExit(ctx context.Context, group *Group, qty int32, exitPrice float64, reason string, levelNum int) {
+	if qty <= 0 {
+		m.logger.Warn("ml_paper_exit_skipped_zero_qty",
+			zap.String("group_id", group.GroupID.String()),
+			zap.Int("level", levelNum),
+			zap.String("reason", reason))
+		return
+	}
+	log.Printf("[ml] Paper partial exit: group=%s level=%d qty=%d price=%.2f reason=%s",
+		group.GroupID, levelNum, qty, exitPrice, reason)
+
+	reverseSide := "SELL"
+	if group.OrderSide == "SELL" {
+		reverseSide = "BUY"
+	}
+
+	paperID := fmt.Sprintf("PAPER-ML-%s-L%d-%s", group.EntryOrderID.String()[:8], levelNum, reason)
+	now := time.Now()
+	entryPrice := group.FillPrice
+
+	var partialPnL float64
+	if group.OrderSide == "BUY" {
+		partialPnL = (exitPrice - entryPrice) * float64(qty)
+	} else {
+		partialPnL = (entryPrice - exitPrice) * float64(qty)
+	}
+
+	exitOrder := &models.Order{
+		OrderID:          uuid.New(),
+		UserID:           group.UserID,
+		StrategyID:       group.StrategyID,
+		StrategyName:     group.StrategyName,
+		StockCode:        group.StockCode,
+		Exchange:         models.Exchange(group.Exchange),
+		Symbol:           group.Symbol,
+		OrderType:        models.OrderTypeMarket,
+		OrderSide:        models.OrderSide(reverseSide),
+		Quantity:         qty,
+		Price:            &entryPrice,
+		Validity:         "IOC",
+		ProductType:      group.ProductType,
+		Status:           models.StatusFilled,
+		IsPaperTrade:     true,
+		TradingMode:      "PAPER",
+		FilledQuantity:   qty,
+		FilledPrice:      &exitPrice,
+		PaperExitPrice:   &exitPrice,
+		PaperPnL:         &partialPnL,
+		IsSquareOffOrder: true,
+		RiskApproved:     true,
+		IndiraOrderID:    &paperID,
+		SubmittedAt:      &now,
+		ExecutedAt:       &now,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := m.repo.CreatePaperPartialExit(ctx, exitOrder); err != nil {
+		m.logger.Error("ml_paper_exit_order_create_failed",
+			zap.String("group_id", group.GroupID.String()),
+			zap.Error(err))
+	}
+}
+
+// CancelGroupForExit cancels an active ML group and, for paper positions with remaining
+// qty, records a partial exit at exitPrice. Used during square-off and force-exit.
+func (m *Manager) CancelGroupForExit(ctx context.Context, entryOrderID uuid.UUID, exitPrice float64, reason string) {
+	v, ok := m.groupsByEntry.Load(entryOrderID)
+	if !ok {
+		return
+	}
+	group := v.(*Group)
+
+	group.mu.Lock()
+	if group.State != GroupStateActive {
+		group.mu.Unlock()
+		return
+	}
+	remaining := group.RemainingQty
+	tradingMode := group.TradingMode
+	group.State = GroupStateCancelled
+	cancel := group.cancelMonitor
+	group.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	for _, level := range group.TPLevels {
+		level.mu.Lock()
+		if level.Status == LevelActive && level.BrokerOrderID != "" {
+			bid := level.BrokerOrderID
+			level.mu.Unlock()
+			m.cancelTPOrder(ctx, group, level, bid)
+		} else {
+			level.mu.Unlock()
+		}
+	}
+	m.cancelSLOrder(ctx, group)
+
+	if tradingMode == "PAPER" && remaining > 0 && exitPrice > 0 {
+		m.recordPaperPartialExit(ctx, group, remaining, exitPrice, reason, 0)
+		if err := m.repo.UpdatePaperPositionFilledQty(ctx, entryOrderID, 0); err != nil {
+			m.logger.Warn("ml_cancel_for_exit_qty_update_failed",
+				zap.String("group_id", group.GroupID.String()),
+				zap.Error(err))
+		}
+	}
+
+	m.groupsByEntry.Delete(entryOrderID)
+	m.unsubscribeGroup(group)
+	m.singleSLIndex.Delete(group.SingleSLBrokerID)
+	m.logger.Info("ml_group_cancelled_for_exit",
+		zap.String("group_id", group.GroupID.String()),
+		zap.Float64("exit_price", exitPrice),
+		zap.String("reason", reason),
+		zap.Int32("remaining_qty", remaining))
+}
+
+// CancelGroupsByStrategy cancels all active groups for a user+strategy.
+// For paper positions with remaining qty, a partial exit is recorded at the current
+// LTP so the closed-positions tab shows a row for the deactivation exit.
+// Called by StrategyEventsConsumer when a strategy is paused or deleted.
+func (m *Manager) CancelGroupsByStrategy(ctx context.Context, userID, strategyID string) {
+	m.groupsByEntry.Range(func(k, v interface{}) bool {
+		g := v.(*Group)
+		if g.UserID != userID || g.StrategyID != strategyID {
+			return true
+		}
+
+		g.mu.Lock()
+		if g.State != GroupStateActive {
+			g.mu.Unlock()
+			return true
+		}
+		remaining := g.RemainingQty
+		tradingMode := g.TradingMode
+		g.State = GroupStateCancelled
+		cancel := g.cancelMonitor
+		g.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+
+		if tradingMode == "PAPER" && remaining > 0 && m.priceLookup != nil {
+			ltp, err := m.priceLookup.GetLTP(ctx, g.Exchange, g.StockCode)
+			if err == nil && ltp > 0 {
+				m.recordPaperPartialExit(ctx, g, remaining, ltp, "STRATEGY_DEACTIVATED", 0)
+				if err2 := m.repo.UpdatePaperPositionFilledQty(ctx, g.EntryOrderID, 0); err2 != nil {
+					m.logger.Warn("ml_cancel_strategy_qty_update_failed",
+						zap.String("group_id", g.GroupID.String()),
+						zap.Error(err2))
+				}
+			} else {
+				m.logger.Warn("ml_cancel_strategy_ltp_unavailable",
+					zap.String("group_id", g.GroupID.String()),
+					zap.String("symbol", g.Symbol),
+					zap.Error(err))
+			}
+		}
+
+		m.groupsByEntry.Delete(g.EntryOrderID)
+		m.unsubscribeGroup(g)
+		m.logger.Info("ml_group_cancelled_by_strategy",
+			zap.String("group_id", g.GroupID.String()),
+			zap.String("strategy_id", strategyID),
+			zap.Int32("remaining_qty", remaining))
+
+		return true
+	})
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Internal: price evaluation worker
 // ══════════════════════════════════════════════════════════════════════════════
@@ -560,15 +770,18 @@ func (m *Manager) evaluateTPLevels(ctx context.Context, g *Group, ltp float64) {
 			zap.Float64("trigger", triggerPrice),
 			zap.Int32("qty", qty))
 
-		g.mu.Lock()
-		g.RemainingQty -= qty
-		remaining := g.RemainingQty
-		if remaining <= 0 {
-			g.State = GroupStateCompleted
-		}
-		g.mu.Unlock()
-
 		if g.TradingMode == "LIVE" {
+			// For live: decrement here — broker EXECUTED for these market IOC orders
+			// is not routed back through onMultiLevelFilled (only mlLevelIndex orders
+			// are), so this is the single point of truth for the qty update.
+			g.mu.Lock()
+			g.RemainingQty -= qty
+			remaining := g.RemainingQty
+			if remaining <= 0 {
+				g.State = GroupStateCompleted
+			}
+			g.mu.Unlock()
+
 			go m.placeExitOrderMarket(ctx, g, level, qty, ltp, models.MLExitTypeTP)
 			// Re-size the single SL order to match the reduced position.
 			if g.SingleSLBrokerID != "" {
@@ -579,13 +792,14 @@ func (m *Manager) evaluateTPLevels(ctx context.Context, g *Group, ltp float64) {
 					go m.replaceSLTrailing(ctx, g, remaining)
 				}
 			}
+			if remaining <= 0 {
+				m.finishGroup(ctx, g)
+			}
 		} else {
+			// For paper: recordPaperExit owns the qty decrement, DB records,
+			// callbacks, and finishGroupPaper when all levels have exited.
+			// Do NOT decrement here — recordPaperExit is the single decrement point.
 			m.recordPaperExit(ctx, g, level, qty, ltp, models.MLExitTypeTP)
-		}
-
-		if remaining <= 0 {
-			m.finishGroup(ctx, g)
-			return
 		}
 
 		return // only one TP fires per tick for strict sequential ordering
@@ -929,6 +1143,7 @@ func (m *Manager) onSingleSLFilled(ctx context.Context, g *Group, fillPrice *flo
 // ══════════════════════════════════════════════════════════════════════════════
 
 // recordPaperExit records a simulated exit for paper trading.
+// It is the single point of truth for the qty decrement on paper SL/TP level triggers.
 func (m *Manager) recordPaperExit(ctx context.Context, g *Group, level *ExitLevelState, qty int32, exitPrice float64, exitType string) {
 	g.mu.Lock()
 	g.RemainingQty -= qty
@@ -942,9 +1157,31 @@ func (m *Manager) recordPaperExit(ctx context.Context, g *Group, level *ExitLeve
 
 	_ = m.repo.UpdateMultiLevelLevelStatus(ctx, entryOrderID, exitType, level.LevelNum, models.MLStatusTriggered, exitPrice)
 
+	// Create a closed-position row so the partial exit appears in the Closed tab.
+	// recordPaperPartialExit writes a new order record (is_square_off_order=true)
+	// that the closed-positions query returns alongside full-position exits.
+	m.recordPaperPartialExit(ctx, g, qty, exitPrice, exitType, level.LevelNum)
+
+	// Update the entry order's filled_quantity in the DB so the open-positions
+	// REST endpoint and on-restart recovery both reflect the remaining qty.
+	_ = m.repo.UpdatePaperPositionFilledQty(ctx, entryOrderID, remaining)
+
 	if m.OnPaperQtyUpdated != nil {
 		m.OnPaperQtyUpdated(entryOrderID, remaining)
 	}
+
+	// Rebalance the opposite-side levels' ExitQty to reflect the reduced position,
+	// mirroring what onMultiLevelFilled does for live trading. BrokerOrderID is always
+	// empty on paper levels so rebalanceAndModifyLevels skips all broker calls.
+	if remaining > 0 {
+		switch exitType {
+		case models.MLExitTypeTP:
+			m.rebalanceAndModifyLevels(ctx, g, g.SLLevels, g.SLLevelConfigs, remaining, nil, models.MLExitTypeSL)
+		case models.MLExitTypeSL:
+			m.rebalanceAndModifyLevels(ctx, g, g.TPLevels, g.TPLevelConfigs, remaining, nil, models.MLExitTypeTP)
+		}
+	}
+
 	if m.OnPaperLevelTriggered != nil {
 		m.OnPaperLevelTriggered(userID, entryOrderID.String(), exitType, level.LevelNum, exitPrice, remaining, "", 0)
 	}

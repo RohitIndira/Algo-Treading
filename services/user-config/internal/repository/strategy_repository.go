@@ -215,8 +215,9 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			INSERT INTO risk_limits (
 				risk_limit_id, strategy_id, max_daily_trades, max_per_trade_risk,
 				max_portfolio_exposure_pct, max_loss_per_day, enable_risk_checks,
-				enable_auto_square_off, auto_square_off_time
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				enable_auto_square_off, auto_square_off_time,
+				max_amount_per_stock, max_trades_per_strategy
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, riskQuery,
@@ -224,6 +225,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.RiskLimits.MaxPerTradeRisk, req.RiskLimits.MaxPortfolioExposurePct,
 			req.RiskLimits.MaxLossPerDay, req.RiskLimits.EnableRiskChecks,
 			req.RiskLimits.EnableAutoSquareOff, req.RiskLimits.AutoSquareOffTime,
+			req.RiskLimits.MaxAmountPerStock, req.RiskLimits.MaxTradesPerStrategy,
 		).Scan(&req.RiskLimits.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert risk limits: %w", err)
@@ -470,34 +472,62 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 			UPDATE risk_limits
 			SET max_daily_trades = $1, max_per_trade_risk = $2, max_portfolio_exposure_pct = $3,
 			    max_loss_per_day = $4, enable_risk_checks = $5, enable_auto_square_off = $6,
-			    auto_square_off_time = $7
-			WHERE strategy_id = $8`
+			    auto_square_off_time = $7, max_amount_per_stock = $8, max_trades_per_strategy = $9
+			WHERE strategy_id = $10`
 
 		_, err = tx.ExecContext(ctx, riskQuery,
 			req.RiskLimits.MaxDailyTrades, req.RiskLimits.MaxPerTradeRisk,
 			req.RiskLimits.MaxPortfolioExposurePct, req.RiskLimits.MaxLossPerDay,
 			req.RiskLimits.EnableRiskChecks, req.RiskLimits.EnableAutoSquareOff,
-			req.RiskLimits.AutoSquareOffTime, req.StrategyID,
+			req.RiskLimits.AutoSquareOffTime,
+			req.RiskLimits.MaxAmountPerStock, req.RiskLimits.MaxTradesPerStrategy,
+			req.StrategyID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update risk limits: %w", err)
 		}
 	}
 
-	// Reload full strategy for Outbox
-	fullStrategy, err := r.GetByID(ctx, req.StrategyID, req.UserID)
-	if err == nil {
-		// Insert into Execution Outbox
-		payloadBytes, err := json.Marshal(fullStrategy)
-		if err == nil {
-			outboxQuery := `
-				INSERT INTO execution_outbox (aggregate_id, event_type, payload)
-				VALUES ($1, $2, $3)`
+	// Build the outbox payload by reading sub-records within the transaction so
+	// we see the uncommitted updates (new version, updated conditions/config/limits).
+	// Using r.db here would return pre-commit data under READ COMMITTED isolation,
+	// causing the rules engine to receive the old version and discard the event.
+	outboxStrategy := *strategy // copy strategy-level fields (new version from RETURNING)
+	{
+		cond := &models.StrategyCondition{}
+		condSel := `SELECT condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max, sentiments, news_categories, min_market_cap, max_market_cap, market_cap_types, min_price_change_pct, max_price_change_pct, exchanges, created_at FROM strategy_conditions WHERE strategy_id = $1`
+		if err2 := tx.GetContext(ctx, cond, condSel, strategy.StrategyID); err2 == nil {
+			outboxStrategy.Conditions = cond
+		}
 
-			_, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", string(payloadBytes))
-			if ctxErr != nil {
-				return nil, fmt.Errorf("failed to insert into execution outbox: %w", ctxErr)
+		tc := &models.TradeConfig{}
+		tcSel := `SELECT trade_config_id, strategy_id, order_type, product_type, validity, quantity, exchange, order_side, stop_loss_pct, take_profit_pct, trailing_sl_pct, stop_loss_type, limit_price, take_profit_type, trade_window_start, trade_window_end, created_at FROM trade_configs WHERE strategy_id = $1`
+		if err2 := tx.GetContext(ctx, tc, tcSel, strategy.StrategyID); err2 == nil {
+			var mlRaw struct {
+				MultiLevelSL []byte `db:"multi_level_sl"`
+				MultiLevelTP []byte `db:"multi_level_tp"`
 			}
+			if err3 := tx.GetContext(ctx, &mlRaw, `SELECT multi_level_sl, multi_level_tp FROM trade_configs WHERE strategy_id = $1`, strategy.StrategyID); err3 == nil {
+				if len(mlRaw.MultiLevelSL) > 0 {
+					_ = json.Unmarshal(mlRaw.MultiLevelSL, &tc.MultiLevelSL)
+				}
+				if len(mlRaw.MultiLevelTP) > 0 {
+					_ = json.Unmarshal(mlRaw.MultiLevelTP, &tc.MultiLevelTP)
+				}
+			}
+			outboxStrategy.TradeConfig = tc
+		}
+
+		rl := &models.RiskLimits{}
+		if err2 := tx.GetContext(ctx, rl, `SELECT * FROM risk_limits WHERE strategy_id = $1`, strategy.StrategyID); err2 == nil {
+			outboxStrategy.RiskLimits = rl
+		}
+	}
+
+	if payloadBytes, err2 := json.Marshal(&outboxStrategy); err2 == nil {
+		outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
+		if _, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", string(payloadBytes)); ctxErr != nil {
+			return nil, fmt.Errorf("failed to insert into execution outbox: %w", ctxErr)
 		}
 	}
 
@@ -505,7 +535,7 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return fullStrategy, nil
+	return &outboxStrategy, nil
 }
 
 // Delete deletes a strategy
@@ -741,6 +771,8 @@ func (r *StrategyRepository) DeactivateActiveByAutoSquareOffTime(ctx context.Con
 		Version    int64     `db:"version"`
 	}
 
+	// JOIN with risk_limits because enable_auto_square_off / auto_square_off_time
+	// live in that table, not in strategies.
 	updateQuery := `
 		UPDATE strategies s
 		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1

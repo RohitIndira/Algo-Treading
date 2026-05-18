@@ -81,6 +81,10 @@ type OrderRepository interface {
 	// GetExitableLiveOrdersByStrategy is like GetFilledLiveOrdersByStrategy but also
 	// includes CANCELLED orders that had been filled, so force-exit works after deletion.
 	GetExitableLiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error)
+	// GetExitableLiveOrdersByUser returns today's filled live entry orders that haven't been
+	// exited yet (live_exit_price IS NULL). Excludes square-off orders and already-exited
+	// orders. Safe to call multiple times — idempotent by design.
+	GetExitableLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	// Price monitor: pending STOP_LOSS orders waiting for price trigger
 	GetPendingMonitorOrders(ctx context.Context) ([]*models.Order, error)
 	// Dashboard stats
@@ -98,6 +102,10 @@ type OrderRepository interface {
 	// matches timeStr ("HH:MM" IST) in user_square_off_config. Used by the scheduler
 	// to trigger per-user square-offs at user-configured times.
 	GetUsersWithAutoSquareOffAtTime(ctx context.Context, timeStr string) ([]string, error)
+	// GetUsersWithExpiredAutoSquareOff returns user IDs whose enabled custom square_off_time
+	// is <= beforeTime ("HH:MM" IST). Used on startup to catch-up positions for users whose
+	// configured time already passed while the service was down.
+	GetUsersWithExpiredAutoSquareOff(ctx context.Context, beforeTime string) ([]string, error)
 	// GetOpenOrdersByUser returns FILLED/PARTIALLY_FILLED INTRADAY live orders for a single
 	// user today that haven't been square-offed yet. Used for per-user live square-off.
 	GetOpenOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
@@ -153,15 +161,18 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			stop_loss, take_profit, stop_loss_type, trailing_sl_pct, validity, product_type,
 			status, risk_approved, risk_score,
 			is_paper_trade, trading_mode,
+			is_square_off_order,
 			retry_count, created_at, updated_at,
 			oco_group_id, oco_role, parent_order_id,
 			bearer_token, app_id, source
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
 			$13, $14, $15, $16, $17, $18, $19, $20, $21,
-			$22, $23, $24, $25, $26,
-			$27, $28, $29,
-			$30, $31, $32
+			$22, $23,
+			$24,
+			$25, $26, $27,
+			$28, $29, $30,
+			$31, $32, $33
 		) ON CONFLICT (order_id) DO NOTHING
 	`
 
@@ -172,6 +183,7 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 		order.StopLoss, order.TakeProfit, order.StopLossType, order.TrailingSLPct, order.Validity, order.ProductType,
 		order.Status, order.RiskApproved, order.RiskScore,
 		order.IsPaperTrade, order.TradingMode,
+		order.IsSquareOffOrder,
 		order.RetryCount, order.CreatedAt, order.UpdatedAt,
 		order.OCOGroupID, order.OCORole, order.ParentOrderID,
 		order.BearerToken, order.AppId, order.Source,
@@ -422,6 +434,10 @@ func (r *orderRepository) RecordExecutionEvent(ctx context.Context, orderID uuid
 }
 
 // GetOpenOrders retrieves all FILLED or PARTIALLY_FILLED INTRADAY live (non-paper) orders
+// that have not already been squared off today. Excludes:
+//   - Orders with live_exit_price set (force-exited by user)
+//   - Orders for which a square-off order already exists today (prevents double square-off
+//     on service restart — the earlier run placed an exit order the DB still marks as open)
 func (r *orderRepository) GetOpenOrders(ctx context.Context) ([]*models.Order, error) {
 	var orders []*models.Order
 	query := `
@@ -431,7 +447,17 @@ func (r *orderRepository) GetOpenOrders(ctx context.Context) ([]*models.Order, e
 		AND is_square_off_order = false
 		AND is_paper_trade = false
 		AND strategy_id != ''
+		AND live_exit_price IS NULL
 		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		AND NOT EXISTS (
+			SELECT 1 FROM orders sq
+			WHERE sq.user_id = orders.user_id
+			AND sq.symbol = orders.symbol
+			AND sq.strategy_id = orders.strategy_id
+			AND sq.is_square_off_order = true
+			AND sq.is_paper_trade = false
+			AND DATE(sq.created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		)
 		ORDER BY created_at ASC
 	`
 
@@ -470,7 +496,7 @@ func (r *orderRepository) GetAllActivePaperOrders(ctx context.Context) ([]*model
 		SELECT * FROM orders
 		WHERE is_paper_trade = true
 		AND is_square_off_order = false
-		AND status IN ('FILLED', 'EXECUTED', 'TRADED')
+		AND status IN ('FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY_FILLED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED')
 		AND paper_exit_price IS NULL
 		AND filled_quantity > 0
 		ORDER BY created_at ASC
@@ -512,7 +538,7 @@ func (r *orderRepository) GetFilledPaperOrdersByUser(ctx context.Context, userID
 		WHERE user_id = $1
 		AND is_paper_trade = true
 		AND is_square_off_order = false
-		AND status IN ('FILLED', 'EXECUTED', 'TRADED')
+		AND status IN ('FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY_FILLED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED')
 		AND filled_quantity > 0
 		AND filled_price IS NOT NULL
 		AND paper_exit_price IS NULL
@@ -563,7 +589,8 @@ func (r *orderRepository) GetAllTodayLiveOrdersByUser(ctx context.Context, userI
 	return orders, nil
 }
 
-// CancelAllLiveOrdersByUser cancels all active live (non-paper) orders for a user
+// CancelAllLiveOrdersByUser cancels all active live entry orders for a user.
+// Excludes square-off orders so freshly placed exit orders are not cancelled.
 func (r *orderRepository) CancelAllLiveOrdersByUser(ctx context.Context, userID string) error {
 	query := `
 		UPDATE orders SET
@@ -572,6 +599,7 @@ func (r *orderRepository) CancelAllLiveOrdersByUser(ctx context.Context, userID 
 			updated_at = $1
 		WHERE user_id = $2
 		AND is_paper_trade = false
+		AND is_square_off_order = false
 		AND status IN ('FILLED', 'PARTIALLY_FILLED', 'RECEIVED', 'PENDING', 'SUBMITTED')
 	`
 	_, err := r.db.ExecContext(ctx, query, time.Now(), userID)
@@ -582,18 +610,31 @@ func (r *orderRepository) CancelAllLiveOrdersByUser(ctx context.Context, userID 
 }
 
 // GetClosedPaperOrdersByUser retrieves closed paper positions for a user.
-// Includes two record types:
+// Includes three record types:
 //  1. Fully closed entry orders (paper_exit_price IS NOT NULL, is_square_off_order = false)
 //  2. Partial exit records (is_square_off_order = true) — each represents one ML level
 //     that fired; they have paper_exit_price set by recordPaperPartialExit so
 //     the Closed tab can show per-level closes with correct qty and P&L.
+//  3. Partially-closed entry orders (paper_exit_price IS NULL but has TRIGGERED ML levels) —
+//     included so the frontend always has the entry order's executed_at as the correct
+//     entry time anchor for the ML group, even while some levels are still open.
 func (r *orderRepository) GetClosedPaperOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	orders := make([]*models.Order, 0)
 	query := `
 		SELECT * FROM orders
 		WHERE user_id = $1
 		AND is_paper_trade = true
-		AND paper_exit_price IS NOT NULL
+		AND (
+			paper_exit_price IS NOT NULL
+			OR (
+				is_square_off_order = false
+				AND EXISTS (
+					SELECT 1 FROM multi_level_exit_levels ml
+					WHERE ml.entry_order_id = order_id
+					AND ml.status = 'TRIGGERED'
+				)
+			)
+		)
 		ORDER BY updated_at DESC
 	`
 	err := r.db.SelectContext(ctx, &orders, query, userID)
@@ -604,7 +645,7 @@ func (r *orderRepository) GetClosedPaperOrdersByUser(ctx context.Context, userID
 }
 
 // GetClosedLiveOrdersByUser retrieves today's closed live orders (IST date boundary).
-// Covers both force-exited orders (live_exit_price IS NOT NULL) and CANCELLED orders placed today.
+// Covers force-exited orders (live_exit_price IS NOT NULL), CANCELLED, REJECTED, and FAILED orders.
 func (r *orderRepository) GetClosedLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	orders := make([]*models.Order, 0)
 	query := `
@@ -613,7 +654,7 @@ func (r *orderRepository) GetClosedLiveOrdersByUser(ctx context.Context, userID 
 		AND is_paper_trade = false
 		AND (
 			live_exit_price IS NOT NULL
-			OR status = 'CANCELLED'
+			OR status IN ('CANCELLED', 'REJECTED', 'FAILED')
 		)
 		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
 		ORDER BY updated_at DESC
@@ -625,24 +666,29 @@ func (r *orderRepository) GetClosedLiveOrdersByUser(ctx context.Context, userID 
 	return orders, nil
 }
 
-// UpdateLiveTradeExit marks a live order as force-exited with exit price and PnL
+// UpdateLiveTradeExit marks a live order as force-exited with exit price, PnL, and exit timestamp.
+// Guards on live_exit_price IS NULL so concurrent calls are idempotent — the first writer wins.
 func (r *orderRepository) UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	now := time.Now()
 	query := `
 		UPDATE orders SET
 			status = 'CANCELLED',
 			live_exit_price = $1,
 			live_pnl = $2,
+			live_exit_time = $3,
 			rejection_reason = 'Force exit by user',
 			updated_at = $3
 		WHERE order_id = $4
+		AND live_exit_price IS NULL
 	`
-	result, err := r.db.ExecContext(ctx, query, exitPrice, pnl, time.Now(), orderID)
+	result, err := r.db.ExecContext(ctx, query, exitPrice, pnl, now, orderID)
 	if err != nil {
 		return fmt.Errorf("failed to update live trade exit: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("live order not found: %s", orderID)
+		// Either already exited (concurrent call) or not found — both are safe no-ops.
+		return nil
 	}
 	return nil
 }
@@ -771,8 +817,12 @@ func (r *orderRepository) GetActiveOrdersByStrategy(ctx context.Context, strateg
 // Used when a strategy is deactivated or deleted to ensure no positions remain open.
 // For filled paper orders, paper_exit_price is set to filled_price so they appear in the
 // closed positions view (which requires paper_exit_price IS NOT NULL).
+// Also cancels any PENDING/ACTIVE multi_level_exit_levels rows for those orders so they
+// are not left orphaned in the DB after the in-memory manager group is torn down.
 func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strategyID, userID string) error {
-	query := `
+	now := time.Now()
+
+	ordersQuery := `
 		UPDATE orders SET
 			status = 'CANCELLED',
 			rejection_reason = 'Strategy deactivated or deleted',
@@ -786,15 +836,34 @@ func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strateg
 				THEN 0
 				ELSE paper_pnl
 			END,
+			paper_exit_time = CASE
+				WHEN is_paper_trade = true AND filled_price IS NOT NULL AND paper_exit_time IS NULL
+				THEN $1
+				ELSE paper_exit_time
+			END,
 			updated_at = $1
 		WHERE strategy_id = $2
 		AND user_id = $3
 		AND status NOT IN ('CANCELLED', 'REJECTED', 'A.REJECTED')
 	`
-	_, err := r.db.ExecContext(ctx, query, time.Now(), strategyID, userID)
-	if err != nil {
+	if _, err := r.db.ExecContext(ctx, ordersQuery, now, strategyID, userID); err != nil {
 		return fmt.Errorf("failed to cancel orders for strategy %s user %s: %w", strategyID, userID, err)
 	}
+
+	mlQuery := `
+		UPDATE multi_level_exit_levels
+		SET status     = 'CANCELLED',
+		    updated_at = $1
+		WHERE entry_order_id IN (
+			SELECT order_id FROM orders
+			WHERE strategy_id = $2 AND user_id = $3
+		)
+		AND status IN ('PENDING', 'ACTIVE')
+	`
+	if _, err := r.db.ExecContext(ctx, mlQuery, now, strategyID, userID); err != nil {
+		return fmt.Errorf("failed to cancel ml levels for strategy %s user %s: %w", strategyID, userID, err)
+	}
+
 	return nil
 }
 
@@ -862,41 +931,74 @@ func (r *orderRepository) GetExitableLiveOrdersByStrategy(ctx context.Context, s
 	return orders, nil
 }
 
-// UpdatePaperTradeExit marks a paper order as exited with the given price and PnL
+// GetExitableLiveOrdersByUser returns today's filled live entry orders for a user that
+// haven't been exited yet. Excludes square-off orders and already-exited orders so
+// force-exit-all is safe to retry and never double-exits a position.
+func (r *orderRepository) GetExitableLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		AND is_paper_trade = false
+		AND is_square_off_order = false
+		AND filled_price IS NOT NULL
+		AND filled_quantity > 0
+		AND live_exit_price IS NULL
+		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		ORDER BY created_at DESC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, userID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get exitable live orders for user %s: %w", userID, err)
+	}
+	return orders, nil
+}
+
+// UpdatePaperTradeExit marks a paper order as exited with the given price and PnL.
+// Covers all exit scenarios: SL hit, TP hit, trailing SL, force exit, auto square-off.
+// The WHERE clause guards paper_exit_price IS NULL so that if a position was already
+// closed (e.g. SL fired right as auto square-off ran), the first exit wins and the
+// exit time is never overwritten by a second call.
 func (r *orderRepository) UpdatePaperTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	now := time.Now()
 	query := `
 		UPDATE orders SET
 			status = 'CANCELLED',
 			paper_exit_price = $1,
 			paper_pnl = $2,
-			updated_at = $3
-		WHERE order_id = $4
+			paper_exit_time = $3,
+			updated_at = $4
+		WHERE order_id = $5
+		AND paper_exit_price IS NULL
 	`
-	result, err := r.db.ExecContext(ctx, query, exitPrice, pnl, time.Now(), orderID)
+	result, err := r.db.ExecContext(ctx, query, exitPrice, pnl, now, now, orderID)
 	if err != nil {
 		return fmt.Errorf("failed to update paper trade exit: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("paper order not found: %s", orderID)
+		// Either the order does not exist or it was already exited — both are safe no-ops.
+		return nil
 	}
 	return nil
 }
 
-// UpdatePaperExitPrice sets paper_exit_price and paper_pnl WITHOUT changing status.
+// UpdatePaperExitPrice sets paper_exit_price, paper_pnl, and paper_exit_time WITHOUT changing status.
 // Used during strategy deactivation/deletion so that CancelAllOrdersByStrategy can still
 // set rejection_reason and status=CANCELLED in the same bulk pass.
 func (r *orderRepository) UpdatePaperExitPrice(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	now := time.Now()
 	query := `
 		UPDATE orders SET
 			paper_exit_price = $1,
 			paper_pnl = $2,
-			updated_at = $3
-		WHERE order_id = $4
+			paper_exit_time = $3,
+			updated_at = $4
+		WHERE order_id = $5
 		AND is_paper_trade = true
 		AND paper_exit_price IS NULL
 	`
-	_, err := r.db.ExecContext(ctx, query, exitPrice, pnl, time.Now(), orderID)
+	_, err := r.db.ExecContext(ctx, query, exitPrice, pnl, now, now, orderID)
 	if err != nil {
 		return fmt.Errorf("failed to update paper exit price for order %s: %w", orderID, err)
 	}
@@ -1226,6 +1328,24 @@ func isTableNotFoundErr(err error) bool {
 	return strings.Contains(err.Error(), "does not exist")
 }
 
+// GetUsersWithExpiredAutoSquareOff returns user IDs whose enabled custom square_off_time
+// is <= beforeTime ("HH:MM" IST). Used on startup to catch-up missed per-user square-offs.
+func (r *orderRepository) GetUsersWithExpiredAutoSquareOff(ctx context.Context, beforeTime string) ([]string, error) {
+	query := `
+		SELECT user_id FROM user_square_off_config
+		WHERE enabled = true
+		AND square_off_time <= $1
+	`
+	var userIDs []string
+	if err := r.db.SelectContext(ctx, &userIDs, query, beforeTime); err != nil && err != sql.ErrNoRows {
+		if isTableNotFoundErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get users with expired sq-off before %s: %w", beforeTime, err)
+	}
+	return userIDs, nil
+}
+
 // GetOpenOrdersByUser returns FILLED/PARTIALLY_FILLED INTRADAY live orders for a single
 // user placed today that have not been square-offed yet. Used for per-user live square-off.
 func (r *orderRepository) GetOpenOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
@@ -1238,7 +1358,17 @@ func (r *orderRepository) GetOpenOrdersByUser(ctx context.Context, userID string
 		AND is_square_off_order = false
 		AND is_paper_trade = false
 		AND strategy_id != ''
+		AND live_exit_price IS NULL
 		AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		AND NOT EXISTS (
+			SELECT 1 FROM orders sq
+			WHERE sq.user_id = orders.user_id
+			AND sq.symbol = orders.symbol
+			AND sq.strategy_id = orders.strategy_id
+			AND sq.is_square_off_order = true
+			AND sq.is_paper_trade = false
+			AND DATE(sq.created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		)
 		ORDER BY created_at ASC
 	`
 	err := r.db.SelectContext(ctx, &orders, query, userID)

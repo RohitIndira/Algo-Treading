@@ -221,6 +221,12 @@ message RiskLimits {
 
   // Position sizing strategy
   common.PositionSizing position_sizing = 9;
+
+  // Maximum investment amount per stock per order (₹). 0 = no limit.
+  double max_amount_per_stock = 10;
+
+  // Maximum number of trades this strategy may execute per day. 0 = no limit.
+  int32 max_trades_per_strategy = 11;
 }
 
 // Trading strategy definition
