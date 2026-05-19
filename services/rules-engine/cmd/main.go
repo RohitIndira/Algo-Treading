@@ -27,6 +27,8 @@ import (
 
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+
+	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
 )
 
 func main() {
@@ -43,11 +45,12 @@ func main() {
 	}
 
 	// Initialize logger
-	logger, err := zap.NewProduction()
+	pkgLgr, err := pkglogger.NewWithDefaults("rules-engine")
 	if err != nil {
 		panic(fmt.Sprintf("failed to initialize logger: %v", err))
 	}
-	defer logger.Sync()
+	defer pkgLgr.Close()
+	logger := pkgLgr.Logger
 
 	logger.Info("Starting Rules Engine Service",
 		zap.String("version", cfg.ServiceVersion),

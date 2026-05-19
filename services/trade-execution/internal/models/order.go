@@ -149,8 +149,11 @@ type Order struct {
 	PaperExitTime   *time.Time `json:"paper_exit_time,omitempty" db:"paper_exit_time"`
 
 	// Live trading exit fields
-	LiveExitPrice *float64 `json:"live_exit_price,omitempty" db:"live_exit_price"` // Exit price for live positions (force-exit)
-	LivePnL       *float64 `json:"live_pnl,omitempty" db:"live_pnl"`               // Final P&L for live positions (force-exit)
+	LiveExitPrice *float64   `json:"live_exit_price,omitempty" db:"live_exit_price"` // Exit price for live positions (force-exit)
+	LivePnL       *float64   `json:"live_pnl,omitempty" db:"live_pnl"`               // Final P&L for live positions (force-exit)
+	// LiveExitTime is the exact timestamp when the live position was closed.
+	// Entry time is ExecutedAt (set from broker OrderEntryTime/OrderTimeStamp on fill).
+	LiveExitTime  *time.Time `json:"live_exit_time,omitempty" db:"live_exit_time"`
 
 	// CurrentPctChange is the stock's percentage change at the time the order was created.
 	CurrentPctChange float64 `json:"current_pct_change,omitempty" db:"current_pct_change"`

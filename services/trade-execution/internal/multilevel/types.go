@@ -26,13 +26,12 @@ package multilevel
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/google/uuid"
 )
-
-// ── State constants ──────────────────────────────────────────────────────────
 
 // GroupState is the lifecycle state of a MultiLevelGroup.
 type GroupState string
@@ -61,8 +60,6 @@ const (
 	TPModeFixed      = "FIXED"
 	TPModeMultiLevel = "MULTI_LEVEL"
 )
-
-// ── Level types ──────────────────────────────────────────────────────────────
 
 // ExitLevelConfig is the immutable user-configured spec for one exit level.
 type ExitLevelConfig struct {
@@ -99,6 +96,23 @@ func (l *ExitLevelState) markTriggered(price float64) {
 	l.ExitPrice = price
 }
 
+// tryMarkTriggered atomically checks Status==LevelActive and transitions to
+// LevelTriggered in one lock acquisition. Returns false if already triggered
+// or cancelled — callers must skip the exit when false to prevent double-firing
+// when two workers race on the same level from rapid consecutive price updates.
+func (l *ExitLevelState) tryMarkTriggered(price float64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.Status != LevelActive {
+		return false
+	}
+	now := time.Now()
+	l.Status = LevelTriggered
+	l.TriggeredAt = &now
+	l.ExitPrice = price
+	return true
+}
+
 func (l *ExitLevelState) markCancelled() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -113,8 +127,6 @@ func (l *ExitLevelState) markActive(brokerOrderID string, exitOrderID uuid.UUID)
 	l.ExitOrderID = exitOrderID
 }
 
-// ── Group ────────────────────────────────────────────────────────────────────
-
 // Group tracks the full runtime state of multi-level exits for one entry order.
 //
 // Locking: the outer mu guards State, RemainingQty, and slice-level operations.
@@ -122,12 +134,10 @@ func (l *ExitLevelState) markActive(brokerOrderID string, exitOrderID uuid.UUID)
 type Group struct {
 	mu sync.Mutex
 
-	// ── Identity ──────────────────────────────────────────────────────────
 	GroupID      uuid.UUID
 	EntryOrderID uuid.UUID
 	UserID       string
 
-	// ── Instrument ────────────────────────────────────────────────────────
 	Symbol      string
 	Exchange    string
 	StockCode   int64
@@ -135,53 +145,67 @@ type Group struct {
 	ProductType string
 	Validity    string
 
-	// ── Fill info (populated after entry fills) ───────────────────────────
+	// Populated after entry fills.
 	FillPrice float64
 	TotalQty  int32
 
-	// ── Exit levels ───────────────────────────────────────────────────────
 	SLLevels []*ExitLevelState // sorted: shallowest first (level 1 = smallest % move)
 	TPLevels []*ExitLevelState // sorted: nearest first (level 1 = smallest % move)
 
-	// ── SL mode context for mixed combinations ────────────────────────────
-	// When SLMode is FIXED or TRAILING, a single broker SL order covers
-	// remaining qty. We track its broker ID so we can cancel/replace it as
-	// TP levels fill.
-	SLMode          string  // "FIXED" | "TRAILING" | "MULTI_LEVEL"
-	FixedSLPct      float64 // used when SLMode == FIXED
-	TrailingSLPct   float64 // used when SLMode == TRAILING
-	HighestPrice    float64 // for trailing SL tracking
-	SingleSLBrokerID string // broker order ID of the single SL order (FIXED/TRAILING)
+	// When SLMode is FIXED or TRAILING, a single broker SL order covers remaining qty.
+	// We track its broker ID so we can cancel/replace it as TP levels fill.
+	SLMode           string  // "FIXED" | "TRAILING" | "MULTI_LEVEL"
+	FixedSLPct       float64 // initial SL distance from fill price (e.g. 1%)
+	TrailingSLPct    float64 // trailing increment threshold (e.g. 0.2%)
+	HighestPrice     float64 // peak LTP seen since entry (for trailing SL)
+	CurrentSLTrigger float64 // the SL trigger price currently live at broker (TRAILING mode)
+	SingleSLBrokerID string  // broker order ID of the single SL order (FIXED/TRAILING)
 	SingleSLOrderID  uuid.UUID
 
-	// ── TP mode ───────────────────────────────────────────────────────────
 	TPMode string // "FIXED" | "MULTI_LEVEL"
 
-	// ── State ─────────────────────────────────────────────────────────────
 	State        GroupState
 	RemainingQty int32 // decremented as levels trigger
 
-	// ── Trading context ───────────────────────────────────────────────────
 	TradingMode string // "PAPER" | "LIVE"
 	Auth        *indiraClient.AuthContext
-	broker      BrokerOrderPlacer // nil for paper trading
+	// AuthBearer/AuthAppID/AuthSource are copies of Auth fields — used for
+	// goroutines that outlive the Auth pointer lifetime.
+	AuthBearer string
+	AuthAppID  string
+	AuthSource string
+	broker     BrokerOrderPlacer // nil for paper trading
 
-	// ── Strategy context ──────────────────────────────────────────────────
 	StrategyID   string
 	StrategyName string
 	EventID      uuid.UUID
 
-	// ── Original level configs (stored for use in OnEntryFill from WS) ──
 	// For live orders: RegisterEntry stores these; HandleBrokerUpdate uses them
 	// when the entry order's EXECUTED event fires via broker WS.
 	SLLevelConfigs []SLTPLevelConfig
 	TPLevelConfigs []SLTPLevelConfig
 
-	// ── Internal ──────────────────────────────────────────────────────────
-	entryFilled   bool              // true once OnEntryFill has been called
-	cancelMonitor context.CancelFunc // stops the price-monitor goroutine
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	entryFilled   bool               // true once OnEntryFill has been called
+	cancelMonitor context.CancelFunc // kept for backward compat; nil in shared-worker mode
+
+	// evaluating is a CAS guard — 1 while a shared worker holds this group.
+	// Prevents two workers from concurrently mutating RemainingQty / level state
+	// when rapid price updates enqueue multiple jobs for the same group.
+	evaluating int32
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// tryClaimEvaluation atomically claims exclusive evaluation rights for this group.
+// Returns false if another worker is already evaluating it — caller must drop the job.
+func (g *Group) tryClaimEvaluation() bool {
+	return atomic.CompareAndSwapInt32(&g.evaluating, 0, 1)
+}
+
+// releaseEvaluation releases the per-group evaluation lock after a worker finishes.
+func (g *Group) releaseEvaluation() {
+	atomic.StoreInt32(&g.evaluating, 0)
 }
 
 // SLTPLevelConfig stores the immutable user config for a single exit level.
@@ -237,48 +261,69 @@ func (g *Group) TPReached(limitPrice, ltp float64) bool {
 	return ltp <= limitPrice
 }
 
-// CalcTrailingSL computes a new SL trigger price given the current LTP
-// using the same proportional trailing logic as the OCO manager.
+// CalcTrailingSL computes a new SL trigger price given the current LTP.
+//
+// Must be called BEFORE g.HighestPrice is updated to currentLTP — the caller
+// (evaluateTrailingSL) only updates HighestPrice after this returns true.
+//
+// Logic:
+//   - New SL = currentLTP ± TrailingSLPct% (0.2% below for BUY, above for SELL).
+//   - Only emits an update when the new trigger is strictly better than the
+//     currently placed SL (CurrentSLTrigger), and the movement is at least
+//     TrailingSLPct% (prevents broker API spam on tiny ticks).
 func (g *Group) CalcTrailingSL(currentLTP float64) (trigger float64, shouldUpdate bool) {
-	if g.SLMode != SLModeTrailing || g.HighestPrice <= 0 || g.SingleSLBrokerID == "" {
+	if g.SLMode != SLModeTrailing || g.SingleSLBrokerID == "" {
 		return 0, false
 	}
 
-	// Compute current SL trigger from highest price
-	currentSLTrigger := g.CalcSLTriggerPrice(g.TrailingSLPct)
-
-	if g.OrderSide == "BUY" {
-		if currentLTP <= g.HighestPrice {
-			return 0, false
-		}
-		trigger = currentSLTrigger * (currentLTP / g.HighestPrice)
-		if trigger <= currentSLTrigger {
-			return 0, false
-		}
-	} else {
-		if currentLTP >= g.HighestPrice {
-			return 0, false
-		}
-		trigger = currentSLTrigger * (currentLTP / g.HighestPrice)
-		if trigger >= currentSLTrigger {
-			return 0, false
-		}
-	}
-
-	// Only update when SL has moved by at least the trailing threshold
 	minPct := g.TrailingSLPct
 	if minPct <= 0 {
 		minPct = 0.1
 	}
-	changePct := (trigger - currentSLTrigger) / currentSLTrigger * 100
-	if changePct < 0 {
-		changePct = -changePct
-	}
-	if changePct < minPct {
-		return 0, false
+
+	if g.OrderSide == "BUY" {
+		// HighestPrice has NOT been updated yet; currentLTP > HighestPrice is the caller's guard.
+		if currentLTP <= g.HighestPrice {
+			return 0, false
+		}
+		newTrigger := roundNSE(currentLTP * (1 - g.TrailingSLPct/100))
+		// Only move the SL upward.
+		if g.CurrentSLTrigger > 0 && newTrigger <= g.CurrentSLTrigger {
+			return 0, false
+		}
+		// Require a minimum tick movement to avoid API spam.
+		if g.CurrentSLTrigger > 0 {
+			changePct := (newTrigger - g.CurrentSLTrigger) / g.CurrentSLTrigger * 100
+			if changePct < minPct {
+				return 0, false
+			}
+		}
+		return newTrigger, true
 	}
 
-	return roundNSE(trigger), true
+	// SELL: HighestPrice tracks the lowest price (best for short position).
+	if g.HighestPrice <= 0 || currentLTP >= g.HighestPrice {
+		return 0, false
+	}
+	newTrigger := roundNSE(currentLTP * (1 + g.TrailingSLPct/100))
+	if g.CurrentSLTrigger > 0 && newTrigger >= g.CurrentSLTrigger {
+		return 0, false
+	}
+	if g.CurrentSLTrigger > 0 {
+		changePct := (g.CurrentSLTrigger - newTrigger) / g.CurrentSLTrigger * 100
+		if changePct < minPct {
+			return 0, false
+		}
+	}
+	return newTrigger, true
+}
+
+// mlLevelRef links a broker order ID to the group and exit level it belongs to.
+// Stored in Manager.mlLevelIndex for O(1) broker WS → level routing.
+type mlLevelRef struct {
+	group    *Group
+	exitType string // models.MLExitTypeSL or models.MLExitTypeTP
+	levelNum int
 }
 
 // roundNSE rounds a price to NSE tick size (₹0.05).

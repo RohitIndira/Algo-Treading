@@ -106,6 +106,14 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 		mode := protoTradingModeToModel(*req.TradingMode)
 		modelReq.TradingMode = &mode
 	}
+	if req.IndiraAuth != nil {
+		modelReq.IndiraAuth = &models.IndiraAuthContext{
+			UserID:      req.IndiraAuth.UserId,
+			AppID:       req.IndiraAuth.AppId,
+			Source:      req.IndiraAuth.Source,
+			BearerToken: req.IndiraAuth.BearerToken,
+		}
+	}
 
 	strategy, err := s.service.UpdateStrategy(ctx, modelReq)
 	if err != nil {
@@ -248,7 +256,9 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 		}, nil
 	}
 
-	strategy, err := s.service.ActivateStrategy(ctx, strategyID, req.UserId)
+	// ActivateStrategyRequest has no IndiraAuth field in the proto.
+	// Credential refresh is handled by the gateway calling UpdateUserCredentials separately.
+	strategy, err := s.service.ActivateStrategy(ctx, strategyID, req.UserId, nil)
 	if err != nil {
 		return &pb.ActivateStrategyResponse{
 			Success: false,
@@ -263,6 +273,39 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 		Success:  true,
 		Strategy: modelStrategyToProto(strategy),
 	}, nil
+}
+
+// UpdateUserCredentials stores fresh Indira credentials for a user.
+// Called by the gateway on strategy activate to refresh the bearer token in DB.
+func (s *UserConfigServer) UpdateUserCredentials(ctx context.Context, req *pb.UpdateUserCredentialsRequest) (*pb.UpdateUserCredentialsResponse, error) {
+	if req.UserId == "" || req.IndiraAuth == nil || req.IndiraAuth.BearerToken == "" {
+		return &pb.UpdateUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "INVALID_REQUEST",
+				Message: "user_id and indira_auth.bearer_token are required",
+			},
+		}, nil
+	}
+
+	auth := &models.IndiraAuthContext{
+		UserID:      req.IndiraAuth.UserId,
+		AppID:       req.IndiraAuth.AppId,
+		Source:      req.IndiraAuth.Source,
+		BearerToken: req.IndiraAuth.BearerToken,
+	}
+
+	if err := s.service.UpdateCredentials(ctx, req.UserId, auth); err != nil {
+		return &pb.UpdateUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "UPDATE_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	return &pb.UpdateUserCredentialsResponse{Success: true}, nil
 }
 
 // DeactivateStrategy deactivates a strategy
@@ -615,37 +658,21 @@ func protoRiskLimitsToModel(proto *pb.RiskLimits) *models.RiskLimits {
 	}
 
 	limits := &models.RiskLimits{
-		MaxDailyTrades: &proto.MaxDailyTrades,
-		MaxLossPerDay:  &proto.MaxLossPerDay,
-		// PositionSizing:          positionSizingToString(proto.PositionSizing), // Check if model has this field. Yes it does.
-		// Wait, did I keep PositionSizing in model?
-		// Let's check step 91. RiskLimits struct:
-		/*
-			type RiskLimits struct {
-				// ...
-				// PositionSizing string // I removed it in Step 91?
-				// Checking Step 91 content for RiskLimits...
-				// In Step 91, RiskLimits does NOT have PositionSizing!
-				// Creating RiskLimits struct in step 91:
-				// RiskLimits struct {
-				// 	RiskLimitID             uuid.UUID `db:"risk_limit_id" json:"risk_limit_id"`
-				// 	StrategyID              uuid.UUID `db:"strategy_id" json:"strategy_id"`
-				// 	MaxDailyTrades          *int32    `db:"max_daily_trades" json:"max_daily_trades,omitempty"`
-				// 	MaxPerTradeRisk         *float64  `db:"max_per_trade_risk" json:"max_per_trade_risk,omitempty"`
-				// 	MaxPortfolioExposurePct *float64  `db:"max_portfolio_exposure_pct" json:"max_portfolio_exposure_pct,omitempty"`
-				// 	MaxLossPerDay           *float64  `db:"max_loss_per_day" json:"max_loss_per_day,omitempty"`
-				// 	EnableRiskChecks        bool      `db:"enable_risk_checks" json:"enable_risk_checks"`
-				// 	EnableAutoSquareOff     bool      `db:"enable_auto_square_off" json:"enable_auto_square_off"`
-				// 	AutoSquareOffTime       string    `db:"auto_square_off_time" json:"auto_square_off_time"`
-				// 	CreatedAt               time.Time `db:"created_at" json:"created_at"`
-				// }
-				// So PositionSizing is NOT in model.
-		*/
+		MaxDailyTrades:          &proto.MaxDailyTrades,
+		MaxLossPerDay:           &proto.MaxLossPerDay,
 		MaxPortfolioExposurePct: &proto.MaxPortfolioExposurePct,
 		MaxPerTradeRisk:         &proto.MaxPerTradeRisk,
 		EnableRiskChecks:        proto.EnableRiskChecks,
 		EnableAutoSquareOff:     proto.EnableAutoSquareOff,
 		AutoSquareOffTime:       proto.AutoSquareOffTime,
+	}
+	if proto.MaxAmountPerStock > 0 {
+		v := proto.MaxAmountPerStock
+		limits.MaxAmountPerStock = &v
+	}
+	if proto.MaxTradesPerStrategy > 0 {
+		v := proto.MaxTradesPerStrategy
+		limits.MaxTradesPerStrategy = &v
 	}
 
 	return limits
@@ -824,6 +851,12 @@ func modelRiskLimitsToProto(model *models.RiskLimits) *pb.RiskLimits {
 	}
 	if model.MaxPerTradeRisk != nil {
 		limits.MaxPerTradeRisk = *model.MaxPerTradeRisk
+	}
+	if model.MaxAmountPerStock != nil {
+		limits.MaxAmountPerStock = *model.MaxAmountPerStock
+	}
+	if model.MaxTradesPerStrategy != nil {
+		limits.MaxTradesPerStrategy = *model.MaxTradesPerStrategy
 	}
 
 	return limits

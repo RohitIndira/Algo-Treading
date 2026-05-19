@@ -201,11 +201,14 @@ func (g *OCOGroup) CalculateTrailingSL(currentLTP float64) (trigger, limit float
 		}
 	}
 
-	// Minimum update threshold: only send modify to broker when SL has
-	// moved by at least trailPct% from its current position.
+	// Minimum broker-API call threshold: only send modify when the SL has
+	// moved by at least minPct from its current value (avoids API spam).
+	// Cap at 0.5% so that a user-configured TrailingSLPct (e.g. 2%) does not
+	// make the trailing effectively unresponsive (2% SL × 2% step = SL never trails
+	// until price rises by the full SL distance above entry).
 	minPct := g.TrailingSLPct
-	if minPct <= 0 {
-		minPct = 0.1 // default 0.1% minimum threshold
+	if minPct <= 0 || minPct > 0.5 {
+		minPct = 0.1
 	}
 	changePct := (trigger - g.SLTriggerPrice) / g.SLTriggerPrice * 100
 	if changePct < 0 {

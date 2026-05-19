@@ -13,6 +13,7 @@ type Config struct {
 	Server   ServerConfig
 	Services ServicesConfig
 	CORS     CORSConfig
+	Auth     AuthConfig
 	Logging  LoggingConfig
 }
 
@@ -32,6 +33,11 @@ type CORSConfig struct {
 	AllowedHeaders []string
 }
 
+type AuthConfig struct {
+	VerifyURL string
+	Timeout   time.Duration
+}
+
 type LoggingConfig struct {
 	Level string
 }
@@ -42,6 +48,8 @@ func Load() (*Config, error) {
 
 	httpPort, _ := strconv.Atoi(getEnv("HTTP_PORT", "8081"))
 	grpcTimeout, _ := time.ParseDuration(getEnv("GRPC_TIMEOUT", "30s"))
+
+	authTimeout, _ := time.ParseDuration(getEnv("AUTH_TIMEOUT", "5s"))
 
 	return &Config{
 		Server: ServerConfig{
@@ -56,6 +64,10 @@ func Load() (*Config, error) {
 			AllowedOrigins: strings.Split(getEnv("CORS_ALLOWED_ORIGINS", "*"), ","),
 			AllowedMethods: strings.Split(getEnv("CORS_ALLOWED_METHODS", "GET,POST,PUT,DELETE,OPTIONS"), ","),
 			AllowedHeaders: strings.Split(getEnv("CORS_ALLOWED_HEADERS", "Content-Type,Authorization,source,appId,userId"), ","),
+		},
+		Auth: AuthConfig{
+			VerifyURL: getEnv("AUTH_VERIFY_URL", "https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token"),
+			Timeout:   authTimeout,
 		},
 		Logging: LoggingConfig{
 			Level: getEnv("LOG_LEVEL", "INFO"),

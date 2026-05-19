@@ -90,8 +90,8 @@ func validateStrategyConfig(s *models.StrategyConfig) error {
 	if s.TradeConfig.Quantity <= 0 {
 		return fmt.Errorf("quantity <= 0")
 	}
-	if s.RiskLimits.MaxDailyTrades <= 0 {
-		return fmt.Errorf("max_daily_trades <= 0")
+	if s.RiskLimits.MaxDailyTrades < 0 {
+		return fmt.Errorf("max_daily_trades < 0")
 	}
 	return nil
 }

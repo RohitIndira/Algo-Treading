@@ -13,6 +13,7 @@ func NewRouter(
 	websocketHandler *handlers.WebSocketHandler,
 	paperHandler *handlers.PaperTradingHandler,
 	corsConfig middleware.CORSConfig,
+	authConfig middleware.AuthConfig,
 ) http.Handler {
 
 	r := mux.NewRouter()
@@ -32,6 +33,9 @@ func NewRouter(
 
 	// /api/v1 prefix
 	api := r.PathPrefix("/api/v1").Subrouter()
+	// Auth verification — runs on all /api/v1 routes; health and OPTIONS are
+	// skipped inside the middleware itself.
+	api.Use(middleware.Auth(authConfig))
 
 	// Global OPTIONS route for preflight
 	api.Methods(http.MethodOptions).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

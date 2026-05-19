@@ -206,6 +206,8 @@ func dtoRiskLimitsToProto(rl *dto.RiskLimits) *pb.RiskLimits {
 		EnableAutoSquareOff:     rl.EnableAutoSquareOff,
 		AutoSquareOffTime:       rl.AutoSquareOffTime,
 		PositionSizing:          mapPositionSizing(rl.PositionSizing),
+		MaxAmountPerStock:        rl.MaxAmountPerStock,
+		MaxTradesPerStrategy:     rl.MaxTradesPerStrategy,
 	}
 }
 

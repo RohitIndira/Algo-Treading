@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS orders (
     trading_mode          VARCHAR(10)     NOT NULL DEFAULT 'LIVE',
     paper_exit_price      DECIMAL(15,2),
     paper_pnl             DECIMAL(15,2),
+    paper_exit_time       TIMESTAMPTZ,
 
     -- Live exit
     live_exit_price       DECIMAL(15,2),
@@ -178,6 +179,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_paper_trade                      ON orders
 CREATE INDEX IF NOT EXISTS idx_orders_paper_symbol                     ON orders(symbol, is_paper_trade, status) WHERE is_paper_trade = true;
 CREATE INDEX IF NOT EXISTS idx_orders_paper_closed                     ON orders(user_id, is_paper_trade, paper_exit_price) WHERE is_paper_trade = true AND paper_exit_price IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_paper_open                       ON orders(user_id, is_paper_trade, status) WHERE is_paper_trade = true AND status = 'FILLED';
+CREATE INDEX IF NOT EXISTS idx_orders_paper_exit_time                  ON orders(user_id, paper_exit_time) WHERE is_paper_trade = true AND paper_exit_time IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_live_closed                      ON orders(user_id, is_paper_trade, live_exit_price) WHERE is_paper_trade = false AND live_exit_price IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_live_open                        ON orders(user_id, is_paper_trade, status) WHERE is_paper_trade = false AND status IN ('FILLED', 'PARTIALLY_FILLED');
 

@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS risk_limits (
     enable_risk_checks        BOOLEAN    DEFAULT true,
     enable_auto_square_off    BOOLEAN    DEFAULT false,
     auto_square_off_time      VARCHAR(5) DEFAULT '15:15',
+    max_amount_per_stock      NUMERIC(20, 4) DEFAULT NULL,
+    max_trades_per_strategy   INTEGER        DEFAULT NULL,
     created_at                TIMESTAMPTZ DEFAULT NOW()
 );
 

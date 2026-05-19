@@ -168,6 +168,24 @@ func (s *StrategyService) UpdateStrategy(ctx context.Context, req *models.Update
 		return nil, fmt.Errorf("failed to update strategy: %w", err)
 	}
 
+	// Refresh broker credentials if the frontend sent a renewed bearer token.
+	// Indira tokens expire daily — this is the primary way to update them without
+	// requiring a strategy delete+recreate.
+	if req.IndiraAuth != nil && req.IndiraAuth.BearerToken != "" {
+		if err := s.credsRepo.StoreIndiraCredentials(
+			ctx,
+			req.UserID,
+			req.IndiraAuth.UserID,
+			req.IndiraAuth.AppID,
+			req.IndiraAuth.Source,
+			req.IndiraAuth.BearerToken,
+		); err != nil {
+			log.Printf("[WARN] user-config: failed to refresh credentials for user %s: %v", req.UserID, err)
+		} else {
+			log.Printf("[INFO] user-config: refreshed Indira credentials for user %s", req.UserID)
+		}
+	}
+
 	return strategy, nil
 }
 
@@ -181,11 +199,30 @@ func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UU
 	return nil
 }
 
-// ActivateStrategy activates a strategy
-func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string) (*models.Strategy, error) {
+// ActivateStrategy activates a strategy.
+// If auth is non-nil and contains a bearer token, credentials are refreshed in
+// broker_accounts so trade-execution picks up the latest Indira session token.
+func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string, auth *models.IndiraAuthContext) (*models.Strategy, error) {
 	// Activate in database
 	if err := s.repo.Activate(ctx, strategyID, userID); err != nil {
 		return nil, fmt.Errorf("failed to activate strategy: %w", err)
+	}
+
+	// Refresh credentials so the next order uses the caller's current session token.
+	// This is the primary mechanism for recovering from expired-token 401 failures.
+	if auth != nil && auth.BearerToken != "" {
+		if err := s.credsRepo.StoreIndiraCredentials(
+			ctx,
+			userID,
+			auth.UserID,
+			auth.AppID,
+			auth.Source,
+			auth.BearerToken,
+		); err != nil {
+			log.Printf("[WARN] user-config: failed to refresh credentials on activate for user %s: %v", userID, err)
+		} else {
+			log.Printf("[INFO] user-config: refreshed Indira credentials on activate for user %s", userID)
+		}
 	}
 
 	// Get updated strategy
@@ -195,6 +232,15 @@ func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.
 	}
 
 	return strategy, nil
+}
+
+// UpdateCredentials upserts Indira broker credentials for a user.
+// Called standalone when credentials need refreshing without a strategy config change.
+func (s *StrategyService) UpdateCredentials(ctx context.Context, userID string, auth *models.IndiraAuthContext) error {
+	if auth == nil || auth.BearerToken == "" {
+		return fmt.Errorf("bearer token is required")
+	}
+	return s.credsRepo.StoreIndiraCredentials(ctx, userID, auth.UserID, auth.AppID, auth.Source, auth.BearerToken)
 }
 
 // DeactivateStrategy deactivates a strategy
@@ -274,9 +320,15 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		return fmt.Errorf("impact_score_min cannot be greater than impact_score_max")
 	}
 
-	// Validate trade config
-	if req.TradeConfig.Quantity <= 0 {
+	// Validate trade config.
+	// Allow quantity=0 when amount-based sizing is in use (max_amount_per_stock > 0);
+	// rules-engine derives the actual share count from the budget at execution time.
+	amountBased := req.RiskLimits.MaxAmountPerStock != nil && *req.RiskLimits.MaxAmountPerStock > 0
+	if !amountBased && req.TradeConfig.Quantity <= 0 {
 		return fmt.Errorf("quantity must be greater than 0")
+	}
+	if amountBased && req.TradeConfig.Quantity < 0 {
+		return fmt.Errorf("quantity must be non-negative")
 	}
 	if req.TradeConfig.OrderType == "" {
 		return fmt.Errorf("order_type is required")
@@ -330,8 +382,15 @@ func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyReques
 	}
 
 	if req.TradeConfig != nil {
-		if req.TradeConfig.Quantity <= 0 {
+		// Allow quantity=0 when amount-based sizing is configured on this update
+		// (or, if RiskLimits is absent, defer to the existing stored value — the
+		// repository will reject the row only if neither qty nor budget is set).
+		amountBased := req.RiskLimits != nil && req.RiskLimits.MaxAmountPerStock != nil && *req.RiskLimits.MaxAmountPerStock > 0
+		if !amountBased && req.TradeConfig.Quantity <= 0 {
 			return fmt.Errorf("quantity must be greater than 0")
+		}
+		if amountBased && req.TradeConfig.Quantity < 0 {
+			return fmt.Errorf("quantity must be non-negative")
 		}
 		if req.TradeConfig.StopLossPct != nil && *req.TradeConfig.StopLossPct < 0 {
 			return fmt.Errorf("stop_loss_pct must be non-negative")

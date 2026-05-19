@@ -215,8 +215,9 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			INSERT INTO risk_limits (
 				risk_limit_id, strategy_id, max_daily_trades, max_per_trade_risk,
 				max_portfolio_exposure_pct, max_loss_per_day, enable_risk_checks,
-				enable_auto_square_off, auto_square_off_time
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				enable_auto_square_off, auto_square_off_time,
+				max_amount_per_stock, max_trades_per_strategy
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			RETURNING created_at`
 
 		err = tx.QueryRowxContext(ctx, riskQuery,
@@ -224,6 +225,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 			req.RiskLimits.MaxPerTradeRisk, req.RiskLimits.MaxPortfolioExposurePct,
 			req.RiskLimits.MaxLossPerDay, req.RiskLimits.EnableRiskChecks,
 			req.RiskLimits.EnableAutoSquareOff, req.RiskLimits.AutoSquareOffTime,
+			req.RiskLimits.MaxAmountPerStock, req.RiskLimits.MaxTradesPerStrategy,
 		).Scan(&req.RiskLimits.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert risk limits: %w", err)
@@ -470,14 +472,16 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 			UPDATE risk_limits
 			SET max_daily_trades = $1, max_per_trade_risk = $2, max_portfolio_exposure_pct = $3,
 			    max_loss_per_day = $4, enable_risk_checks = $5, enable_auto_square_off = $6,
-			    auto_square_off_time = $7
-			WHERE strategy_id = $8`
+			    auto_square_off_time = $7, max_amount_per_stock = $8, max_trades_per_strategy = $9
+			WHERE strategy_id = $10`
 
 		_, err = tx.ExecContext(ctx, riskQuery,
 			req.RiskLimits.MaxDailyTrades, req.RiskLimits.MaxPerTradeRisk,
 			req.RiskLimits.MaxPortfolioExposurePct, req.RiskLimits.MaxLossPerDay,
 			req.RiskLimits.EnableRiskChecks, req.RiskLimits.EnableAutoSquareOff,
-			req.RiskLimits.AutoSquareOffTime, req.StrategyID,
+			req.RiskLimits.AutoSquareOffTime,
+			req.RiskLimits.MaxAmountPerStock, req.RiskLimits.MaxTradesPerStrategy,
+			req.StrategyID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update risk limits: %w", err)

@@ -297,6 +297,34 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Write fresh credentials to broker_accounts BEFORE activating the strategy.
+	// Order matters: ActivateStrategy publishes CONFIG_UPDATED via Kafka, which
+	// causes trade-execution to invalidate its credentials cache and immediately
+	// re-read from DB (via subscribe-broker-ws). If we wrote credentials AFTER
+	// activation, trade-execution would re-cache the stale token from DB before
+	// our write lands, causing 401 on the next order.
+	bearerToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	appId := r.Header.Get("appId")
+	source := r.Header.Get("source")
+	userIdHeader := r.Header.Get("userId")
+	if bearerToken != "" && appId != "" && source != "" && userIdHeader != "" {
+		credsReq := &pb.UpdateUserCredentialsRequest{
+			UserId: reqBody.UserID,
+			IndiraAuth: &common.IndiraAuthContext{
+				UserId:      userIdHeader,
+				AppId:       appId,
+				Source:      source,
+				BearerToken: bearerToken,
+			},
+		}
+		if _, credsErr := h.client.UpdateUserCredentials(r.Context(), credsReq); credsErr != nil {
+			log.Printf("WARN ActivateStrategy: credential refresh failed for user %s: %v", reqBody.UserID, credsErr)
+		}
+	} else {
+		log.Printf("WARN ActivateStrategy: missing auth headers for user %s — credentials NOT refreshed (bearer=%v appId=%v source=%v userId=%v)",
+			reqBody.UserID, bearerToken != "", appId != "", source != "", userIdHeader != "")
+	}
+
 	req := &pb.ActivateStrategyRequest{
 		StrategyId: strategyID,
 		UserId:     reqBody.UserID,

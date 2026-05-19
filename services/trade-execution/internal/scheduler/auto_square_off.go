@@ -47,6 +47,10 @@ type AutoSquareOffScheduler struct {
 	// paperForceExitUser, if set, is called with a specific userID to close that user's paper
 	// positions at their custom auto_square_off_time.
 	paperForceExitUser func(ctx context.Context, userID string) error
+
+	// positionChecker, if set, queries the broker position book before placing a
+	// square-off order and skips symbols whose NetQty is already 0. Nil-safe.
+	positionChecker *PositionChecker
 }
 
 // NewAutoSquareOffScheduler creates a new auto square-off scheduler.
@@ -84,11 +88,21 @@ func (s *AutoSquareOffScheduler) SetPaperForceExitUser(fn func(ctx context.Conte
 	s.paperForceExitUser = fn
 }
 
+// SetPositionChecker wires the broker position-book checker so square-off skips
+// symbols already flat (NetQty == 0) at the broker. Without it, every live
+// square-off proceeds based on local DB state alone (legacy behaviour).
+func (s *AutoSquareOffScheduler) SetPositionChecker(pc *PositionChecker) {
+	s.positionChecker = pc
+}
+
 // Start begins the auto square-off check loop (every 1 minute).
 // Paper positions close at paperSquareOffTime (15:00); live positions close at squareOffTime (15:05).
 func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
 	log.Printf("[auto-square-off] Scheduler started (live: %s IST, paper: %s IST, weekdays only)",
 		s.squareOffTime, s.paperSquareOffTime)
+
+	// Fire immediately for any square-off windows missed while the service was down.
+	s.runStartupCatchUp(ctx)
 
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -128,6 +142,129 @@ func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
 // Stop stops the scheduler gracefully.
 func (s *AutoSquareOffScheduler) Stop() {
 	close(s.stopChan)
+}
+
+// marketCloseMinutes is the hard cutoff (15:30 IST) after which live orders cannot be placed.
+// NSE closes the continuous session at 15:30; any order sent after this becomes an AMO
+// (After Market Order) and executes the next morning at open — which is never what we want.
+const marketCloseMinutes = 15*60 + 30 // 15:30 IST
+
+// runStartupCatchUp fires square-off for any windows that were missed while
+// the service was down (e.g. restarted after 15:05). Safe to call multiple
+// times — the lastExecuteDate guards prevent double-execution.
+func (s *AutoSquareOffScheduler) runStartupCatchUp(ctx context.Context) {
+	now := time.Now().In(timezone.IST)
+	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+		return
+	}
+	today := now.Format("2006-01-02")
+	currentMinutes := now.Hour()*60 + now.Minute()
+
+	// Paper catch-up — paper is simulated so no AMO risk; always safe to fire.
+	ph, pm := s.parseTime(s.paperSquareOffTime)
+	if ph != -1 && currentMinutes > ph*60+pm && s.paperSquareOff != nil {
+		s.mu.Lock()
+		alreadyRan := s.lastPaperExecuteDate == today
+		if !alreadyRan {
+			s.lastPaperExecuteDate = today
+		}
+		s.mu.Unlock()
+		if !alreadyRan {
+			log.Printf("[auto-square-off] Startup catch-up: missed paper square-off at %s — firing now", s.paperSquareOffTime)
+			if err := s.paperSquareOff(ctx); err != nil {
+				log.Printf("[auto-square-off] Startup paper catch-up error: %v", err)
+			}
+		}
+	}
+
+	// Live catch-up — ONLY if we are still before market close (15:30 IST).
+	// After 15:30 the exchange has closed all intraday positions already; placing any
+	// exit order after this point creates an AMO that executes the next morning.
+	lh, lm := s.parseTime(s.squareOffTime)
+	scheduledMinutes := lh*60 + lm
+	if lh != -1 && currentMinutes > scheduledMinutes {
+		if currentMinutes < marketCloseMinutes {
+			// Still within market hours — safe to place exit orders.
+			s.mu.Lock()
+			alreadyRan := s.lastExecuteDate == today
+			if !alreadyRan {
+				s.lastExecuteDate = today
+			}
+			s.mu.Unlock()
+			if !alreadyRan {
+				log.Printf("[auto-square-off] Startup catch-up: missed live square-off at %s — firing now", s.squareOffTime)
+				if err := s.squareOffAllPositions(ctx); err != nil {
+					log.Printf("[auto-square-off] Startup live catch-up error: %v", err)
+				}
+			}
+		} else {
+			// Past market close — mark today done WITHOUT placing orders to prevent AMOs.
+			s.mu.Lock()
+			if s.lastExecuteDate != today {
+				s.lastExecuteDate = today
+				log.Printf("[auto-square-off] Startup: market already closed (now %02d:%02d IST) — skipping live catch-up to prevent AMOs",
+					now.Hour(), now.Minute())
+			}
+			s.mu.Unlock()
+		}
+	}
+
+	// Per-user custom time catch-up
+	s.runStartupUserCatchUp(ctx, now, today, currentMinutes)
+}
+
+// runStartupUserCatchUp closes positions for users whose custom square-off time
+// has already passed today (e.g. service was down during their configured time).
+// Live orders are only placed if we are still before market close (15:30 IST).
+func (s *AutoSquareOffScheduler) runStartupUserCatchUp(ctx context.Context, now time.Time, today string, currentMinutes int) {
+	currentTimeStr := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
+
+	users, err := s.orderRepo.GetUsersWithExpiredAutoSquareOff(ctx, currentTimeStr)
+	if err != nil {
+		log.Printf("[auto-square-off] Startup user catch-up: failed to fetch users: %v", err)
+		return
+	}
+	if len(users) == 0 {
+		return
+	}
+
+	log.Printf("[auto-square-off] Startup user catch-up: %d user(s) with custom time already passed", len(users))
+
+	// If we're past market close, mark all users done without placing orders.
+	if currentMinutes >= marketCloseMinutes {
+		log.Printf("[auto-square-off] Startup user catch-up: market already closed (now %02d:%02d IST) — marking users done without placing orders to prevent AMOs",
+			now.Hour(), now.Minute())
+		s.mu.Lock()
+		for _, userID := range users {
+			guardKey := userID + ":startup-catchup"
+			s.lastUserExecuteDates[guardKey] = today
+		}
+		s.mu.Unlock()
+		return
+	}
+
+	for _, userID := range users {
+		// Use a distinct guard key so this doesn't collide with the per-minute tick guards.
+		guardKey := userID + ":startup-catchup"
+		s.mu.Lock()
+		if s.lastUserExecuteDates[guardKey] == today {
+			s.mu.Unlock()
+			continue
+		}
+		s.lastUserExecuteDates[guardKey] = today
+		s.mu.Unlock()
+
+		log.Printf("[auto-square-off] Startup catch-up: closing positions for user=%s", userID)
+
+		if s.paperForceExitUser != nil {
+			if err := s.paperForceExitUser(ctx, userID); err != nil {
+				log.Printf("[auto-square-off] Startup paper force-exit failed user=%s: %v", userID, err)
+			}
+		}
+		if err := s.squareOffUserPositions(ctx, userID); err != nil {
+			log.Printf("[auto-square-off] Startup live sq-off failed user=%s: %v", userID, err)
+		}
+	}
 }
 
 // shouldSquareOff returns true when current IST time matches squareOffTime (live) on a
@@ -213,8 +350,29 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 	now := time.Now().In(timezone.IST)
 	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
 
+	// One position-book fetch per user — used to skip orders whose underlying
+	// position is already flat (NetQty == 0) at the broker. Fail-open: if the
+	// fetch errors we leave the user's snapshot nil and the check is bypassed.
+	openByUser := make(map[string]*OpenPositions)
+	if s.positionChecker != nil {
+		seen := make(map[string]struct{})
+		for _, o := range openOrders {
+			if _, ok := seen[o.UserID]; ok {
+				continue
+			}
+			seen[o.UserID] = struct{}{}
+			snapshot, fetchErr := s.positionChecker.FetchOpenPositions(ctx, o.UserID)
+			if fetchErr != nil {
+				log.Printf("[auto-square-off] Position-book check unavailable for user=%s; proceeding without skip: %v", o.UserID, fetchErr)
+				continue
+			}
+			openByUser[o.UserID] = snapshot
+		}
+	}
+
 	successCount := 0
 	failCount := 0
+	skippedCount := 0
 
 	for _, order := range openOrders {
 		// Skip orders with zero filled quantity — nothing to reverse
@@ -231,6 +389,15 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 			continue
 		}
 
+		// Skip if broker already shows NetQty == 0 for this symbol — squaring off
+		// a flat position would open a fresh short.
+		if snapshot := openByUser[order.UserID]; snapshot.IsExited(order) {
+			log.Printf("[auto-square-off] Skipping order %s: broker NetQty=0 for user=%s symbol=%s (already exited)",
+				order.OrderID, order.UserID, order.Symbol)
+			skippedCount++
+			continue
+		}
+
 		log.Printf("[auto-square-off] Squaring off: user=%s strategy=%s symbol=%s side=%s filled_qty=%d",
 			order.UserID, order.StrategyID, order.Symbol, order.OrderSide, order.FilledQuantity)
 
@@ -243,7 +410,8 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 		successCount++
 	}
 
-	log.Printf("[auto-square-off] ========== LIVE COMPLETE: %d succeeded, %d failed ==========", successCount, failCount)
+	log.Printf("[auto-square-off] ========== LIVE COMPLETE: %d succeeded, %d failed, %d skipped (already flat) ==========",
+		successCount, failCount, skippedCount)
 
 	return nil
 }
@@ -307,8 +475,25 @@ func (s *AutoSquareOffScheduler) squareOffUserPositions(ctx context.Context, use
 
 	log.Printf("[auto-square-off] Squaring off %d live position(s) for user=%s", len(openOrders), userID)
 
+	// Fetch broker positions once for this user — skip orders already flat.
+	// Fail-open: a nil snapshot bypasses the check.
+	var snapshot *OpenPositions
+	if s.positionChecker != nil {
+		var fetchErr error
+		snapshot, fetchErr = s.positionChecker.FetchOpenPositions(ctx, userID)
+		if fetchErr != nil {
+			log.Printf("[auto-square-off] Position-book check unavailable for user=%s; proceeding without skip: %v", userID, fetchErr)
+			snapshot = nil
+		}
+	}
+
 	for _, order := range openOrders {
 		if order.FilledQuantity <= 0 {
+			continue
+		}
+		if snapshot.IsExited(order) {
+			log.Printf("[auto-square-off] Skipping live sq-off order=%s user=%s symbol=%s: broker NetQty=0 (already exited)",
+				order.OrderID, userID, order.Symbol)
 			continue
 		}
 		if err := s.createAndExecuteSquareOffOrder(ctx, order); err != nil {
@@ -321,6 +506,13 @@ func (s *AutoSquareOffScheduler) squareOffUserPositions(ctx context.Context, use
 // createAndExecuteSquareOffOrder creates a reverse order to close a position
 // and executes it via the broker.
 func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Context, originalOrder *models.Order) error {
+	// Hard guard: never place live orders after market close (15:30 IST).
+	// This is the last line of defence against AMOs regardless of how this function was reached.
+	now := time.Now().In(timezone.IST)
+	if now.Hour()*60+now.Minute() >= marketCloseMinutes {
+		return fmt.Errorf("market closed (%02d:%02d IST ≥ 15:30) — refusing to place order to avoid AMO", now.Hour(), now.Minute())
+	}
+
 	// Determine reverse side
 	reverseSide := models.OrderSideSell
 	if originalOrder.OrderSide == models.OrderSideSell {
