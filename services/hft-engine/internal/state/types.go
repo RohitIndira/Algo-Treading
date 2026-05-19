@@ -151,11 +151,13 @@ type SideState struct {
 	// limits on a permanently-failing condition (margin, risk, etc.).
 	ConsecutiveRejects int `json:"consecutive_rejects,omitempty"`
 
-	// Armed is the trigger gate. False = waiting for LTP to cross the
-	// trigger price; the IDLE→PLACE edge is blocked. Once true, normal
-	// state machine runs. While Position == 0 a cross-back below the
-	// trigger flips Armed back to false and cancels any resting chunk;
-	// once Position > 0 the trigger is no longer checked.
+	// Armed is the trigger gate — continuous, re-evaluated on every tick.
+	// True = LTP is currently inside the trigger zone (BUY: LTP >= trigger;
+	// SELL: LTP <= trigger); IDLE→PLACE is allowed.
+	// False = waiting (Position == 0) OR paused (Position > 0, LTP left
+	// the zone). On every PAUSE the resting chunk is cancelled; Position
+	// is NOT reset — the next zone re-entry RESUMEs from where we left off.
+	// The side only becomes terminal via price-band halt or max_reached.
 	Armed bool `json:"armed"`
 }
 

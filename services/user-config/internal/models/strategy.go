@@ -45,11 +45,13 @@ type HFTConfig struct {
 	WindowStart         string  `json:"window_start"`
 	WindowEnd           string  `json:"window_end"`
 	ModifyOnPriceChange bool    `json:"modify_on_price_change"`
-	// Trigger price gate (direction is side-dependent):
-	//   BUY  arms when LTP >= BuyTriggerPrice  (breakout buy)
-	//   SELL arms when LTP <= SellTriggerPrice (breakdown sell)
-	// While Position == 0 a cross-back cancels any resting chunk and
-	// re-disarms. JSON keys must match hft-engine state.Config tags.
+	// Trigger price gate — continuous (re-evaluated every tick):
+	//   BUY  in-zone when LTP >= BuyTriggerPrice  (breakout buy)
+	//   SELL in-zone when LTP <= SellTriggerPrice (breakdown sell)
+	// Out-of-zone PAUSEs the side (cancels resting chunk, stops placing)
+	// while preserving accumulated fills; next zone re-entry RESUMEs.
+	// Side becomes terminal only via price-band halt or max_reached.
+	// JSON keys must match hft-engine state.Config tags.
 	BuyTriggerPrice  float64 `json:"buy_trigger_price"`
 	SellTriggerPrice float64 `json:"sell_trigger_price"`
 	Mode             string  `json:"mode"` // PAPER | LIVE — set by the service from TradingMode

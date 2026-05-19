@@ -97,55 +97,75 @@ func (r *Runner) handleSide(
 		return
 	}
 
-	// Trigger gate. Runs BEFORE price-band so a never-armed side
-	// doesn't trip the halt by being out-of-band — until armed, the
-	// side is conceptually idle and waiting, not actively trading.
+	// Trigger gate — continuous, re-evaluated on EVERY tick.
 	//
-	// Disabled (back-compat) when triggerPrice <= 0: side is armed
-	// immediately. New strategies always have a positive trigger
-	// (validated by user-config), so this branch is for legacy rows
-	// only.
+	// Direction is side-dependent:
+	//   BUY  is "in zone" when LTP >= trigger (breakout buy)
+	//   SELL is "in zone" when LTP <= trigger (breakdown sell)
+	//
+	// State machine (Position is preserved across all transitions —
+	// only fills change it; trigger only gates whether we place):
+	//
+	//   !Armed && !inZone → no-op (waiting / paused; return early)
+	//   !Armed &&  inZone → ARM (first entry, Position==0)
+	//                       or RESUME (re-entry after prior fills);
+	//                       fall through to normal place/modify flow
+	//    Armed &&  inZone → normal place/modify flow (no transition)
+	//    Armed && !inZone → PAUSE: cancel any resting chunk, set
+	//                       Armed=false, KEEP Position; return.
+	//
+	// Done is never set by this gate — only price-band halt or
+	// max_reached can flip the side terminal.
+	//
+	// Disabled (back-compat) when triggerPrice <= 0: side is treated as
+	// permanently armed. New strategies always have a positive trigger
+	// (user-config validates this); this branch is for legacy rows only.
 	if triggerPrice > 0 {
-		// Direction is side-dependent:
-		//   BUY  arms when LTP >= trigger (breakout buy — wait for price
-		//        to rise to entry level), disarms on cross-back DOWN.
-		//   SELL arms when LTP <= trigger (breakdown sell — wait for price
-		//        to drop to exit level), disarms on cross-back UP.
-		// Cross-back DISARM only fires while Position == 0; once any fill
-		// has happened, the trigger is no longer consulted and the side
-		// rides to max_qty under the existing price-band rules.
-		var armNow, crossedBack bool
+		var inZone bool
 		if sideEnum == state.SideBuy {
-			armNow = ltp >= triggerPrice
-			crossedBack = ltp < triggerPrice
+			inZone = ltp >= triggerPrice
 		} else {
-			armNow = ltp <= triggerPrice
-			crossedBack = ltp > triggerPrice
+			inZone = ltp <= triggerPrice
 		}
 
-		if !side.Armed {
-			if armNow {
-				side.Armed = true
-				r.auditRow("ARM", sideC, 0, 0, ltp, "", "")
-				r.logger.Info("trigger armed",
-					zap.String("side", string(sideEnum)),
-					zap.Float64("ltp", ltp),
-					zap.Float64("trigger", triggerPrice))
-			} else {
-				return // still waiting — don't place, don't halt
-			}
-		} else if side.Position == 0 && crossedBack {
+		switch {
+		case !side.Armed && !inZone:
+			// Waiting (or paused) for LTP to come back into the zone.
+			return
+		case side.Armed && !inZone:
+			// PAUSE — cancel any resting chunk so we don't leave an
+			// open order at a price the user didn't authorise. Keep
+			// Position; next zone re-entry resumes from there.
 			if side.Current != nil {
-				r.cancelCurrentChunk(side, sideC, "trigger_disarm")
+				r.cancelCurrentChunk(side, sideC, "trigger_pause")
 			}
 			side.Armed = false
-			r.auditRow("DISARM", sideC, 0, 0, ltp, "", "")
-			r.logger.Info("trigger disarmed (cross-back, no fills yet)",
+			r.auditRow("PAUSE", sideC, 0, 0, ltp, "", "")
+			r.logger.Info("trigger left zone — paused",
 				zap.String("side", string(sideEnum)),
 				zap.Float64("ltp", ltp),
-				zap.Float64("trigger", triggerPrice))
+				zap.Float64("trigger", triggerPrice),
+				zap.Int("position", side.Position))
 			return
+		case !side.Armed && inZone:
+			// Entering zone — ARM (first time, Position==0) or RESUME
+			// (re-entry after we already filled some). Same downstream
+			// effect; distinguish only in audit/log for clarity.
+			side.Armed = true
+			action := "ARM"
+			if side.Position > 0 {
+				action = "RESUME"
+			}
+			r.auditRow(action, sideC, 0, 0, ltp, "", "")
+			r.logger.Info("trigger entered zone",
+				zap.String("side", string(sideEnum)),
+				zap.String("action", action),
+				zap.Float64("ltp", ltp),
+				zap.Float64("trigger", triggerPrice),
+				zap.Int("position", side.Position))
+			// Fall through to normal place/modify flow.
 		}
+		// Armed && inZone: normal flow, no transition; fall through.
 	}
 
 	// Price-band halt. Applies whether or not a chunk is resting. If a
