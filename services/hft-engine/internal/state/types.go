@@ -97,12 +97,14 @@ type Config struct {
 	SellLimitPrice float64 `json:"sell_limit_price"`
 	TickSize       float64 `json:"tick_size"` // rounding granularity for limit prices
 
-	// Trigger price gate — a side stays ARMED:false until LTP >= trigger.
-	// While Position == 0 a cross-back (LTP < trigger) cancels any resting
-	// chunk and re-disarms. Once even one fill happens, trigger is no
-	// longer consulted. Zero means "no gate" (back-compat for any rows
-	// persisted before the field existed); user-config rejects zero on
-	// new strategies via its own validation.
+	// Trigger price gate — direction is side-dependent:
+	//   BUY  arms when LTP >= buy_trigger_price  (breakout buy)
+	//   SELL arms when LTP <= sell_trigger_price (breakdown sell)
+	// While Position == 0 a cross-back (BUY: LTP < trigger; SELL: LTP >
+	// trigger) cancels any resting chunk and re-disarms. Once even one
+	// fill happens, trigger is no longer consulted. Zero means "no gate"
+	// (back-compat for any rows persisted before the field existed);
+	// user-config rejects zero on new strategies via its own validation.
 	BuyTriggerPrice  float64 `json:"buy_trigger_price"`
 	SellTriggerPrice float64 `json:"sell_trigger_price"`
 

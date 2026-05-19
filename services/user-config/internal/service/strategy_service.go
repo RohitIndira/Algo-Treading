@@ -374,8 +374,12 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		default:
 			return fmt.Errorf("hft_config.product_type must be INTRADAY, DELIVERY, or CASH")
 		}
+		// tick_size is required from the caller — never default it here.
+		// Sub-Rs-100 NSE names tick at 0.01, larger caps tick at 0.05, and
+		// some series differ; a silent default rounds limit prices to the
+		// wrong grid and causes broker rejects or off-tick fills.
 		if h.TickSize <= 0 {
-			h.TickSize = 0.05
+			return fmt.Errorf("hft_config.tick_size is required (use 0.01 for sub-Rs-100 NSE names, 0.05 for larger caps)")
 		}
 		if h.Side == "BUY" || h.Side == "BOTH" {
 			if h.MaxBuyQty <= 0 {
@@ -396,13 +400,16 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		if h.BuyLimitPrice < 0 || h.SellLimitPrice < 0 {
 			return fmt.Errorf("hft_config limit prices must be non-negative")
 		}
-		// Trigger price gate (required per active side).
-		// BUY arms when LTP >= buy_trigger_price; SELL arms when LTP >= sell_trigger_price.
-		// Sanity guards:
-		//   - BUY: trigger must sit BELOW the limit ceiling, otherwise we arm
-		//     at a price already above the halt threshold and never trade.
-		//   - SELL: trigger must sit ABOVE the limit floor, otherwise we arm
-		//     at a price already below the floor and instantly halt.
+		// Trigger price gate (required per active side; direction is side-specific):
+		//   BUY  arms when LTP >= buy_trigger_price  (breakout buy)
+		//   SELL arms when LTP <= sell_trigger_price (breakdown sell)
+		// Sanity guards (same shape both sides — trigger sits between the
+		// arm price and the halt threshold so we never arm directly into a
+		// halt):
+		//   - BUY: trigger BELOW limit ceiling, otherwise we arm at a price
+		//     already above the halt threshold (ASK>limit) and never trade.
+		//   - SELL: trigger ABOVE limit floor, otherwise we arm at a price
+		//     already below the floor (BID<limit) and instantly halt.
 		if h.Side == "BUY" || h.Side == "BOTH" {
 			if h.BuyTriggerPrice <= 0 {
 				return fmt.Errorf("hft_config.buy_trigger_price must be > 0 for side %s", h.Side)

@@ -112,7 +112,11 @@ func (r *Repo) LoadConfig(ctx context.Context, strategyID string) (*state.Config
 		cfg.Side = "BOTH"
 	}
 	if cfg.TickSize <= 0 {
-		cfg.TickSize = 0.05 // NSE equity default; broker_adapter falls back to this too
+		// No silent default — wrong tick rounds limit prices off-grid and
+		// causes broker rejects (e.g. 0.05 tick for IDEA whose actual tick
+		// is 0.01). user-config now requires tick_size on create; if a row
+		// reaches here with 0 it's a legacy strategy that must be updated.
+		return nil, fmt.Errorf("hft strategy %s has invalid tick_size=%.4f — re-create with the correct tick (0.01 for sub-Rs-100 NSE names, 0.05 for larger caps)", strategyID, cfg.TickSize)
 	}
 
 	return &cfg, nil

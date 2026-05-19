@@ -106,8 +106,25 @@ func (r *Runner) handleSide(
 	// (validated by user-config), so this branch is for legacy rows
 	// only.
 	if triggerPrice > 0 {
+		// Direction is side-dependent:
+		//   BUY  arms when LTP >= trigger (breakout buy — wait for price
+		//        to rise to entry level), disarms on cross-back DOWN.
+		//   SELL arms when LTP <= trigger (breakdown sell — wait for price
+		//        to drop to exit level), disarms on cross-back UP.
+		// Cross-back DISARM only fires while Position == 0; once any fill
+		// has happened, the trigger is no longer consulted and the side
+		// rides to max_qty under the existing price-band rules.
+		var armNow, crossedBack bool
+		if sideEnum == state.SideBuy {
+			armNow = ltp >= triggerPrice
+			crossedBack = ltp < triggerPrice
+		} else {
+			armNow = ltp <= triggerPrice
+			crossedBack = ltp > triggerPrice
+		}
+
 		if !side.Armed {
-			if ltp >= triggerPrice {
+			if armNow {
 				side.Armed = true
 				r.auditRow("ARM", sideC, 0, 0, ltp, "", "")
 				r.logger.Info("trigger armed",
@@ -117,10 +134,7 @@ func (r *Runner) handleSide(
 			} else {
 				return // still waiting — don't place, don't halt
 			}
-		} else if side.Position == 0 && ltp < triggerPrice {
-			// Cross-back before any fill: cancel resting chunk + re-disarm.
-			// Once any fill has happened (Position > 0), the trigger is
-			// no longer consulted — we ride to max_qty.
+		} else if side.Position == 0 && crossedBack {
 			if side.Current != nil {
 				r.cancelCurrentChunk(side, sideC, "trigger_disarm")
 			}
