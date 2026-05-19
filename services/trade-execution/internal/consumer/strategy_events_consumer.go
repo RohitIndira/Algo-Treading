@@ -81,6 +81,19 @@ type MLGroupCanceller interface {
 	CancelGroupsByStrategy(ctx context.Context, userID, strategyID string)
 }
 
+// OpenPositionsSnapshot reports whether an order's underlying position is
+// already flat (NetQty == 0) at the broker. Implemented by
+// *scheduler.OpenPositions.
+type OpenPositionsSnapshot interface {
+	IsExited(order *models.Order) bool
+}
+
+// OpenPositionsLookup queries the broker position book for a user.
+// Implemented by an adapter around *scheduler.PositionChecker. Nil-safe.
+type OpenPositionsLookup interface {
+	FetchOpenPositions(ctx context.Context, userID string) (OpenPositionsSnapshot, error)
+}
+
 // StrategyEventsConsumer listens to user-config-events and closes all open
 // positions / cancels all pending orders when a strategy is deactivated or deleted.
 // It also invalidates the credentials cache when a strategy is created or updated
@@ -95,6 +108,7 @@ type StrategyEventsConsumer struct {
 	priceClient    PaperPriceLookup        // nil-safe: used to get LTP for paper exit PnL
 	mlManager      MLGroupCanceller        // nil-safe: creates paper partial exits for remaining ML qty
 	strategyHalter StrategyHalter          // nil-safe: halts new signals for deactivated strategies
+	positions      OpenPositionsLookup     // nil-safe: skips square-off for already-flat broker positions
 	logger         *zap.Logger
 }
 
@@ -160,6 +174,13 @@ func (c *StrategyEventsConsumer) SetMLManager(ml MLGroupCanceller) {
 // strategies are rejected before they reach the broker. Call before Start().
 func (c *StrategyEventsConsumer) SetStrategyHalter(h StrategyHalter) {
 	c.strategyHalter = h
+}
+
+// SetPositionsLookup wires the broker position-book checker. With it, strategy
+// deactivation skips reverse orders for symbols already flat (NetQty == 0) at
+// the broker — preventing a redundant square-off from opening a fresh short.
+func (c *StrategyEventsConsumer) SetPositionsLookup(p OpenPositionsLookup) {
+	c.positions = p
 }
 
 // Start begins consuming user-config-events. Blocks until ctx is cancelled.
@@ -317,9 +338,32 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 			zap.String("strategy_id", ev.StrategyID),
 			zap.Error(fetchErr))
 	} else if len(filledOrders) > 0 {
+		// Fetch broker positions once for this user — skip orders whose
+		// underlying position is already flat at the broker (NetQty == 0).
+		// Fail-open: a nil snapshot bypasses the check.
+		var snapshot OpenPositionsSnapshot
+		if c.positions != nil {
+			snap, posErr := c.positions.FetchOpenPositions(ctx, ev.UserID)
+			if posErr != nil {
+				c.logger.Warn("Position-book check unavailable for deactivation; proceeding without skip",
+					zap.String("user_id", ev.UserID),
+					zap.String("strategy_id", ev.StrategyID),
+					zap.Error(posErr))
+			} else {
+				snapshot = snap
+			}
+		}
+
 		var sqWg sync.WaitGroup
 		for _, o := range filledOrders {
 			if o.FilledQuantity <= 0 {
+				continue
+			}
+			if snapshot != nil && snapshot.IsExited(o) {
+				c.logger.Info("Skipping square-off on deactivation: broker NetQty=0 (already exited)",
+					zap.String("order_id", o.OrderID.String()),
+					zap.String("symbol", o.Symbol),
+					zap.String("user_id", o.UserID))
 				continue
 			}
 			sqWg.Add(1)

@@ -45,6 +45,42 @@ func (p *SignalProcessor) HaltStrategy(strategyID string) {
 		zap.String("strategy_id", strategyID))
 }
 
+// HaltedStrategiesLoader is a hook the main package can implement to repopulate
+// the halted-strategy set on startup from an authoritative source (e.g. the
+// user-config gRPC service). Without this, a strategy paused while the service
+// was down is briefly eligible to receive signals after restart, until the next
+// CONFIG_PAUSED event arrives on Kafka. Implementations should be idempotent
+// and read-only; they fan out to HaltStrategy for each paused strategy ID.
+type HaltedStrategiesLoader interface {
+	LoadPaused(ctx context.Context) ([]string, error)
+}
+
+// LoadHaltedFromSource hydrates haltedStrategies from the supplied loader.
+// Safe to call once on startup. Returns the number of strategies halted.
+//
+// Defensive design: if the loader fails, signal processing continues as today
+// (in-memory map empty) — the existing chain of safety (rules-engine pauses →
+// stops publishing) still protects the system. The number of strategies halted
+// is logged so operators can verify the seeding worked.
+func (p *SignalProcessor) LoadHaltedFromSource(ctx context.Context, loader HaltedStrategiesLoader) (int, error) {
+	if loader == nil {
+		return 0, nil
+	}
+	ids, err := loader.LoadPaused(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		p.haltedStrategies.Store(id, struct{}{})
+	}
+	p.logger.Info("halted-strategy set hydrated from source",
+		zap.Int("count", len(ids)))
+	return len(ids), nil
+}
+
 // MultiLevelManager is the interface the SignalProcessor uses to register
 // entry orders with the multi-level exit manager. Implemented by *multilevel.Manager.
 type MultiLevelManager interface {

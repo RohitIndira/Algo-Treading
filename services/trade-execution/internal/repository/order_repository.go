@@ -66,6 +66,11 @@ type OrderRepository interface {
 	// Live trading
 	GetLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	GetAllTodayLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
+	// GetOpenLivePositionAttributionOrders returns non-paper orders whose broker
+	// position could still be open today — used solely by enrichPositions to map
+	// broker positions back to the strategy that placed them. Widens the today-only
+	// lookback so positions opened on a prior session aren't orphaned as broker-direct.
+	GetOpenLivePositionAttributionOrders(ctx context.Context, userID string) ([]*models.Order, error)
 	GetClosedLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
 	UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error
 	CancelAllLiveOrdersByUser(ctx context.Context, userID string) error
@@ -92,6 +97,23 @@ type OrderRepository interface {
 	// GetDistinctActiveUserIDs returns unique user IDs that have non-terminal live orders.
 	// Used on startup to pre-warm the credentials cache.
 	GetDistinctActiveUserIDs(ctx context.Context) ([]string, error)
+	// GetUsersWithLiveExposure returns user IDs whose broker positions may still be
+	// open right now — used on startup to eagerly re-subscribe their broker WS so
+	// fill/cancel/reject events that happened during downtime aren't missed.
+	// Includes non-terminal in-flight orders AND filled live entries whose
+	// live_exit_price is NULL.
+	GetUsersWithLiveExposure(ctx context.Context) ([]string, error)
+	// GetReconciliationCandidates returns non-paper orders that have an
+	// indira_order_id but are still in a non-terminal status — they may have
+	// progressed at the broker while we were down. Bounded by maxAgeHours so
+	// the reconciliation pass is O(recent orders), not O(history). Orders
+	// younger than minAgeSeconds are excluded to avoid racing live placement.
+	GetReconciliationCandidates(ctx context.Context, maxAgeHours int, minAgeSeconds int) ([]*models.Order, error)
+	// GetActiveMLEntries returns entry orders whose multi-level exit groups
+	// are still in progress (at least one level still PENDING or ACTIVE) so
+	// the multilevel.Manager can rebuild its in-memory state on startup.
+	// Filters: entry is FILLED, not paper, not square-off, live_exit_price IS NULL.
+	GetActiveMLEntries(ctx context.Context) ([]*models.Order, error)
 	// OCO (One-Cancels-the-Other) queries
 	GetActiveOCOOrders(ctx context.Context) ([]*models.Order, error)
 	GetOCOGroupOrders(ctx context.Context, groupID uuid.UUID) ([]*models.Order, error)
@@ -589,6 +611,38 @@ func (r *orderRepository) GetAllTodayLiveOrdersByUser(ctx context.Context, userI
 	return orders, nil
 }
 
+// GetOpenLivePositionAttributionOrders returns non-paper orders that could still
+// correspond to an open broker position, so enrichPositions can attribute the
+// position to the strategy that placed it. Includes:
+//   - any order from the last 7 IST days (covers carry-over positions opened
+//     before today that the today-only filter would orphan as broker-direct), and
+//   - any older order that has NOT been marked exited (live_exit_price IS NULL)
+//     and is not paper, as a long-tail safety net.
+//
+// Result is read-only and never used for status mutation, so widening the window
+// here has no effect on order-state transitions, OCO logic, or the closed-orders
+// endpoints — those continue to use GetAllTodayLiveOrdersByUser /
+// GetClosedLiveOrdersByUser unchanged.
+func (r *orderRepository) GetOpenLivePositionAttributionOrders(ctx context.Context, userID string) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		AND is_paper_trade = false
+		AND (
+			created_at AT TIME ZONE 'Asia/Kolkata'
+				>= (DATE(NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '7 days')
+			OR live_exit_price IS NULL
+		)
+		ORDER BY created_at DESC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, userID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get open live position attribution orders: %w", err)
+	}
+	return orders, nil
+}
+
 // CancelAllLiveOrdersByUser cancels all active live entry orders for a user.
 // Excludes square-off orders so freshly placed exit orders are not cancelled.
 func (r *orderRepository) CancelAllLiveOrdersByUser(ctx context.Context, userID string) error {
@@ -1052,6 +1106,93 @@ func (r *orderRepository) GetDistinctActiveUserIDs(ctx context.Context) ([]strin
 	var userIDs []string
 	if err := r.db.SelectContext(ctx, &userIDs, query); err != nil {
 		return nil, fmt.Errorf("failed to get distinct active user IDs: %w", err)
+	}
+	return userIDs, nil
+}
+
+// GetActiveMLEntries returns FILLED non-paper entry orders that still have at
+// least one PENDING or ACTIVE multi-level exit level. Used by the multilevel
+// manager on startup to reconstruct in-memory group state so price ticks and
+// broker WS events continue to route correctly after a restart. The query is
+// intentionally restrictive — it does not return groups whose entry was
+// force-exited or whose levels have all triggered/cancelled.
+func (r *orderRepository) GetActiveMLEntries(ctx context.Context) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT o.* FROM orders o
+		WHERE o.is_paper_trade = false
+		AND o.is_square_off_order = false
+		AND o.status IN ('FILLED', 'EXECUTED', 'TRADED')
+		AND o.live_exit_price IS NULL
+		AND EXISTS (
+			SELECT 1 FROM multi_level_exit_levels ml
+			WHERE ml.entry_order_id = o.order_id
+			AND ml.status IN ('PENDING', 'ACTIVE')
+		)
+		ORDER BY o.created_at DESC
+	`
+	if err := r.db.SelectContext(ctx, &orders, query); err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get active ML entries: %w", err)
+	}
+	return orders, nil
+}
+
+// GetReconciliationCandidates returns non-paper orders that are still in a
+// non-terminal status but have an indira_order_id, so a reconciliation pass can
+// fetch their authoritative state from the broker. The pass is bounded:
+//   - by maxAgeHours so the query is cheap and only covers recent activity, and
+//   - excludes orders younger than minAgeSeconds so the normal placement →
+//     broker-WS-update path is not raced.
+func (r *orderRepository) GetReconciliationCandidates(ctx context.Context, maxAgeHours int, minAgeSeconds int) ([]*models.Order, error) {
+	if maxAgeHours <= 0 {
+		maxAgeHours = 24
+	}
+	if minAgeSeconds <= 0 {
+		minAgeSeconds = 30
+	}
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE is_paper_trade = false
+		AND indira_order_id IS NOT NULL
+		AND indira_order_id <> ''
+		AND status IN ('RECEIVED', 'PENDING', 'SUBMITTED', 'PARTIALLY_FILLED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED')
+		AND created_at >= NOW() - ($1::int * INTERVAL '1 hour')
+		AND updated_at <= NOW() - ($2::int * INTERVAL '1 second')
+		ORDER BY created_at DESC
+	`
+	if err := r.db.SelectContext(ctx, &orders, query, maxAgeHours, minAgeSeconds); err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get reconciliation candidates: %w", err)
+	}
+	return orders, nil
+}
+
+// GetUsersWithLiveExposure returns user IDs whose broker positions may still be
+// open right now. Used on startup to eagerly re-subscribe their broker WS.
+// A user qualifies if any of:
+//   - they have a non-terminal live order in flight (still awaiting fill/cancel), or
+//   - they have a filled live entry order whose position has not been exited
+//     (live_exit_price IS NULL, not a square-off order).
+// The 7-day cap bounds the query — positions older than that are stale and
+// should be reconciled manually, not via auto-resubscribe.
+func (r *orderRepository) GetUsersWithLiveExposure(ctx context.Context) ([]string, error) {
+	query := `
+		SELECT DISTINCT user_id FROM orders
+		WHERE is_paper_trade = false
+		AND created_at AT TIME ZONE 'Asia/Kolkata'
+			>= (DATE(NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '7 days')
+		AND (
+			status IN ('RECEIVED', 'PENDING', 'SUBMITTED', 'PARTIALLY_FILLED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED')
+			OR (
+				status IN ('FILLED', 'EXECUTED', 'TRADED')
+				AND live_exit_price IS NULL
+				AND is_square_off_order = false
+			)
+		)
+	`
+	var userIDs []string
+	if err := r.db.SelectContext(ctx, &userIDs, query); err != nil {
+		return nil, fmt.Errorf("failed to get users with live exposure: %w", err)
 	}
 	return userIDs, nil
 }

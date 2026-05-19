@@ -267,6 +267,51 @@ type strategyShare struct {
 	OrderSide    string // side of the entry order
 }
 
+// knownSymbolSeriesSuffixes are the exchange series suffixes Indira appends to
+// the base trading symbol on some venues. We strip them on both the broker side
+// (bp.Symbol) and the orders-table side (order.Symbol) before matching so a
+// strategy that stored "GENUSPOWER" still attributes a broker position reported
+// as "GENUSPOWER-EQ" / "GENUSPOWER-BE". Order matters: longer suffixes first so
+// "-BE" doesn't shadow "-BZ".
+var knownSymbolSeriesSuffixes = []string{
+	"-EQ", "-BE", "-BZ", "-BL", "-IL", "-SM", "-ST", "-IT",
+	"_EQ", "_BE", "_BZ",
+}
+
+// normalizeSymbol uppercases and strips known exchange series suffixes from a
+// trading symbol so equivalent listings match exactly in the enrichment map.
+// Trailing whitespace is trimmed defensively. This is intentionally conservative
+// — only suffixes seen from Indira are stripped, so unrelated symbols never
+// collide (e.g. "KRBL" vs "KRBLINDIA" remain distinct).
+func normalizeSymbol(s string) string {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	for _, sfx := range knownSymbolSeriesSuffixes {
+		if strings.HasSuffix(s, sfx) && len(s) > len(sfx) {
+			return s[:len(s)-len(sfx)]
+		}
+	}
+	return s
+}
+
+// pickEntrySide returns the broker avg-price and qty corresponding to the
+// strategy's entry direction. For closed positions (NetQty==0) the NetQty sign
+// is no longer meaningful, so we prefer the explicit OrderSide; for open
+// positions either signal works. When OrderSide is unknown (broker-direct
+// positions), fall back to NetQty sign.
+func pickEntrySide(bp BrokerPosition, orderSide string) (float64, int) {
+	side := strings.ToUpper(strings.TrimSpace(orderSide))
+	if side == "" {
+		if bp.NetQty < 0 {
+			return bp.SellAvgPrice, bp.SellQty
+		}
+		return bp.BuyAvgPrice, bp.BuyQty
+	}
+	if side == "SELL" {
+		return bp.SellAvgPrice, bp.SellQty
+	}
+	return bp.BuyAvgPrice, bp.BuyQty
+}
+
 // enrichPositions uses broker positions as the source of truth for quantities,
 // prices, exchange data, and P&L. Our orders DB is used ONLY to determine which
 // strategy each position belongs to.
@@ -305,10 +350,11 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 		if order.OCORole != nil && (*order.OCORole == "SL_LEG" || *order.OCORole == "TP_LEG") {
 			continue
 		}
-		// Skip all cancelled/rejected orders — they are no longer open broker positions.
-		// A CANCELLED order with filled_qty > 0 means the entry executed then was reversed/exited;
-		// the resulting broker position (if any) will be attributed via the surviving EXECUTED orders.
-		if order.Status == models.StatusCancelled || order.Status == models.StatusRejected {
+		// Skip cancelled/rejected orders ONLY when they never filled. A CANCELLED order
+		// with filled_quantity > 0 was partially executed before the cancel took effect,
+		// so the resulting qty is sitting at the broker and must still be attributed to
+		// this strategy — otherwise the surviving broker qty falls into broker-direct.
+		if (order.Status == models.StatusCancelled || order.Status == models.StatusRejected) && order.FilledQuantity == 0 {
 			continue
 		}
 		// Skip orders whose position was already force-exited (live_exit_price is set).
@@ -317,7 +363,7 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 			continue
 		}
 
-		sym := strings.ToUpper(order.Symbol)
+		sym := normalizeSymbol(order.Symbol)
 		sid := order.StrategyID
 		if sid == "" {
 			sid = "__manual__"
@@ -352,7 +398,11 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 			share.StrategyName = stratName
 		}
 
-		share.EntryQty += int(order.Quantity)
+		// Use FilledQuantity (actual broker fill), not Quantity (placed). The
+		// broker's BuyQty/SellQty only reflect filled trades, so the ratio
+		// denominator must too — otherwise a strategy with an unfilled or
+		// partially-filled entry gets credited with broker qty it doesn't own.
+		share.EntryQty += int(order.FilledQuantity)
 
 		// Track earliest entry order for metadata.
 		// Priority: OrderEntryTime/OrderTimeStamp from broker WSS data > executed_at column.
@@ -382,17 +432,23 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 	result := make([]EnrichedAlgoPosition, 0, len(brokerPositions))
 
 	for _, bp := range brokerPositions {
-		// NetQty == 0 means the position is fully flat — closed by the exchange, EOD
-		// auto-square-off, or a broker-level SL/TP. Never emit these as open positions.
-		if bp.NetQty == 0 {
+		// Skip rows with no activity today (no buys AND no sells). These are
+		// stale/placeholder entries the broker may return for instruments the
+		// user touched on a prior session.
+		// We DO emit NetQty==0 rows that have BuyQty>0 AND SellQty>0 — those
+		// are positions opened AND closed today; the frontend renders them
+		// using the broker's authoritative buy_avg_price / sell_avg_price for
+		// realized P&L instead of falling back to our (less accurate) DB rows.
+		if bp.NetQty == 0 && (bp.BuyQty == 0 || bp.SellQty == 0) {
 			continue
 		}
 
-		bpSym := strings.ToUpper(bp.Symbol)
+		bpSym := normalizeSymbol(bp.Symbol)
 
 		// Find matching strategies: try exact match first, then prefix-only fallback.
-		// Prefix matching handles exchange suffixes (e.g. "JISLJALEQ" vs "JISLJALEQS")
-		// without the false positives of arbitrary substring matching (e.g. "KRBL" inside "KRBLINDIA").
+		// Both sides are already normalized (suffixes stripped), so exact match catches
+		// the common case. The prefix fallback is retained as a safety net for any
+		// suffix not yet in knownSymbolSeriesSuffixes (e.g. legacy listings).
 		stratShares, matched := symbolShares[bpSym]
 		if !matched {
 			for sym, ss := range symbolShares {
@@ -411,7 +467,17 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 		}
 
 		if !matched || len(stratShares) == 0 {
-			// No algo orders for this symbol — emit as broker-direct/manual position
+			// No algo orders for this symbol — emit as broker-direct/manual position.
+			// Log enough context to debug surprise broker-direct attributions: the
+			// broker symbol seen, normalized form, and the symbol keys we considered.
+			// Cheap (only fires when a position is unattributed) and read-only, so
+			// it cannot affect order state.
+			knownSyms := make([]string, 0, len(symbolShares))
+			for k := range symbolShares {
+				knownSyms = append(knownSyms, k)
+			}
+			log.Printf("[live-ws] enrichPositions: broker-direct (no algo match) symbol=%q normalized=%q net_qty=%d algo_orders=%d candidate_symbols=%v",
+				bp.Symbol, bpSym, bp.NetQty, len(algoOrders), knownSyms)
 			result = append(result, EnrichedAlgoPosition{
 				Symbol:       bp.Symbol,
 				Exchange:     bp.Exchange,
@@ -432,13 +498,10 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 		if len(stratShares) == 1 {
 			// Single strategy owns the entire broker position — no splitting needed.
 			ss := stratShares[0]
-			// Choose avg price and qty based on net direction: long→buy side, short→sell side.
-			filledPrice := bp.BuyAvgPrice
-			filledQty := bp.BuyQty
-			if bp.NetQty < 0 {
-				filledPrice = bp.SellAvgPrice
-				filledQty = bp.SellQty
-			}
+			// Choose entry-side avg price/qty. For open positions, NetQty sign
+			// reliably gives direction; for closed positions (NetQty==0) it
+			// does not, so we fall back to the strategy's entry OrderSide.
+			filledPrice, filledQty := pickEntrySide(bp, ss.OrderSide)
 			result = append(result, EnrichedAlgoPosition{
 				Symbol:       bp.Symbol,
 				Exchange:     bp.Exchange,
@@ -502,10 +565,12 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 			// P&L is proportional to this strategy's share.
 			splitPnL := bp.PnL * ratio
 
-			// Choose avg price and split qty based on net direction.
+			// Choose entry-side avg price. Use the strategy's OrderSide
+			// (entry direction) — NetQty sign is unreliable for closed
+			// positions (NetQty==0). Split qty matches the chosen side.
 			splitFilledPrice := bp.BuyAvgPrice
 			splitFilledQty := splitBuyQty
-			if bp.NetQty < 0 {
+			if ss.OrderSide == "SELL" || (ss.OrderSide == "" && bp.NetQty < 0) {
 				splitFilledPrice = bp.SellAvgPrice
 				splitFilledQty = splitSellQty
 			}
@@ -1486,8 +1551,10 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// 2. Get ALL of today's algo orders (including CANCELLED) for enrichment.
-	algoOrders, err := s.repo.GetAllTodayLiveOrdersByUser(r.Context(), userID)
+	// 2. Get algo orders that could still own an open broker position. This widens
+	//    the today-only window so positions opened on a prior session are still
+	//    attributed to their strategy instead of falling into broker-direct.
+	algoOrders, err := s.repo.GetOpenLivePositionAttributionOrders(r.Context(), userID)
 	if err != nil {
 		log.Printf("[live-ws] Failed to fetch algo orders for user %s: %v", userID, err)
 		http.Error(w, "failed to fetch algo orders", http.StatusInternalServerError)
@@ -1562,7 +1629,7 @@ func (s *PaperWSServer) PushPositions(ctx context.Context, userID, bearerToken, 
 		log.Printf("[live-ws] PushPositions: failed to fetch for user %s: %v", userID, err)
 		return
 	}
-	algoOrders, err := s.repo.GetAllTodayLiveOrdersByUser(ctx, userID)
+	algoOrders, err := s.repo.GetOpenLivePositionAttributionOrders(ctx, userID)
 	if err != nil {
 		log.Printf("[live-ws] PushPositions: failed to fetch algo orders for user %s: %v", userID, err)
 		return

@@ -47,6 +47,10 @@ type AutoSquareOffScheduler struct {
 	// paperForceExitUser, if set, is called with a specific userID to close that user's paper
 	// positions at their custom auto_square_off_time.
 	paperForceExitUser func(ctx context.Context, userID string) error
+
+	// positionChecker, if set, queries the broker position book before placing a
+	// square-off order and skips symbols whose NetQty is already 0. Nil-safe.
+	positionChecker *PositionChecker
 }
 
 // NewAutoSquareOffScheduler creates a new auto square-off scheduler.
@@ -82,6 +86,13 @@ func (s *AutoSquareOffScheduler) SetPaperSquareOff(fn func(ctx context.Context) 
 // Pass paperMonitor.ForceExitAll to wire it up.
 func (s *AutoSquareOffScheduler) SetPaperForceExitUser(fn func(ctx context.Context, userID string) error) {
 	s.paperForceExitUser = fn
+}
+
+// SetPositionChecker wires the broker position-book checker so square-off skips
+// symbols already flat (NetQty == 0) at the broker. Without it, every live
+// square-off proceeds based on local DB state alone (legacy behaviour).
+func (s *AutoSquareOffScheduler) SetPositionChecker(pc *PositionChecker) {
+	s.positionChecker = pc
 }
 
 // Start begins the auto square-off check loop (every 1 minute).
@@ -339,8 +350,29 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 	now := time.Now().In(timezone.IST)
 	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
 
+	// One position-book fetch per user — used to skip orders whose underlying
+	// position is already flat (NetQty == 0) at the broker. Fail-open: if the
+	// fetch errors we leave the user's snapshot nil and the check is bypassed.
+	openByUser := make(map[string]*OpenPositions)
+	if s.positionChecker != nil {
+		seen := make(map[string]struct{})
+		for _, o := range openOrders {
+			if _, ok := seen[o.UserID]; ok {
+				continue
+			}
+			seen[o.UserID] = struct{}{}
+			snapshot, fetchErr := s.positionChecker.FetchOpenPositions(ctx, o.UserID)
+			if fetchErr != nil {
+				log.Printf("[auto-square-off] Position-book check unavailable for user=%s; proceeding without skip: %v", o.UserID, fetchErr)
+				continue
+			}
+			openByUser[o.UserID] = snapshot
+		}
+	}
+
 	successCount := 0
 	failCount := 0
+	skippedCount := 0
 
 	for _, order := range openOrders {
 		// Skip orders with zero filled quantity — nothing to reverse
@@ -357,6 +389,15 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 			continue
 		}
 
+		// Skip if broker already shows NetQty == 0 for this symbol — squaring off
+		// a flat position would open a fresh short.
+		if snapshot := openByUser[order.UserID]; snapshot.IsExited(order) {
+			log.Printf("[auto-square-off] Skipping order %s: broker NetQty=0 for user=%s symbol=%s (already exited)",
+				order.OrderID, order.UserID, order.Symbol)
+			skippedCount++
+			continue
+		}
+
 		log.Printf("[auto-square-off] Squaring off: user=%s strategy=%s symbol=%s side=%s filled_qty=%d",
 			order.UserID, order.StrategyID, order.Symbol, order.OrderSide, order.FilledQuantity)
 
@@ -369,7 +410,8 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 		successCount++
 	}
 
-	log.Printf("[auto-square-off] ========== LIVE COMPLETE: %d succeeded, %d failed ==========", successCount, failCount)
+	log.Printf("[auto-square-off] ========== LIVE COMPLETE: %d succeeded, %d failed, %d skipped (already flat) ==========",
+		successCount, failCount, skippedCount)
 
 	return nil
 }
@@ -433,8 +475,25 @@ func (s *AutoSquareOffScheduler) squareOffUserPositions(ctx context.Context, use
 
 	log.Printf("[auto-square-off] Squaring off %d live position(s) for user=%s", len(openOrders), userID)
 
+	// Fetch broker positions once for this user — skip orders already flat.
+	// Fail-open: a nil snapshot bypasses the check.
+	var snapshot *OpenPositions
+	if s.positionChecker != nil {
+		var fetchErr error
+		snapshot, fetchErr = s.positionChecker.FetchOpenPositions(ctx, userID)
+		if fetchErr != nil {
+			log.Printf("[auto-square-off] Position-book check unavailable for user=%s; proceeding without skip: %v", userID, fetchErr)
+			snapshot = nil
+		}
+	}
+
 	for _, order := range openOrders {
 		if order.FilledQuantity <= 0 {
+			continue
+		}
+		if snapshot.IsExited(order) {
+			log.Printf("[auto-square-off] Skipping live sq-off order=%s user=%s symbol=%s: broker NetQty=0 (already exited)",
+				order.OrderID, userID, order.Symbol)
 			continue
 		}
 		if err := s.createAndExecuteSquareOffOrder(ctx, order); err != nil {

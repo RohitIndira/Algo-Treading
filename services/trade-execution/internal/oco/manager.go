@@ -1817,37 +1817,29 @@ func (m *OCOManager) CancelGroupsByStrategy(ctx context.Context, userID, strateg
 	}
 }
 
-// CancelGroupsBySymbol cancels non-terminal OCO groups for a user+symbol that are
-// NOT bound to a strategy. Strategy-bound groups are managed by their own lifecycle
-// (CancelGroupsByStrategy, strategy deletion/deactivation) and must not be affected
-// by blanket symbol-level cancellation — otherwise force-exiting one strategy's
-// position would cancel SL/TP for another strategy trading the same stock.
+// CancelGroupsBySymbol cancels every non-terminal OCO group for (userID, symbol).
+// Called when a manual exit is detected on the broker terminal — the underlying
+// position is gone, so any open SL/TP legs (across all strategies trading this
+// symbol) must be cancelled to prevent orphaned orders firing into a flat book.
+//
+// Per-strategy cancellation (e.g. strategy delete/deactivate) goes through
+// CancelGroupsByStrategy and does NOT call this function.
 func (m *OCOManager) CancelGroupsBySymbol(ctx context.Context, userID string, symbol string) {
 	var toCancel []uuid.UUID
-	var skippedStrategy int
 	m.groups.Range(func(key, value any) bool {
 		group := value.(*OCOGroup)
 		if group.UserID == userID && group.Symbol == symbol && !group.State.IsTerminal() {
-			// Skip strategy-bound groups — they are cancelled via CancelGroupsByStrategy.
-			if group.StrategyID != "" {
-				skippedStrategy++
-				return true
-			}
 			toCancel = append(toCancel, group.GroupID)
 		}
 		return true
 	})
 
 	if len(toCancel) == 0 {
-		if skippedStrategy > 0 {
-			log.Printf("[oco] Manual exit detected for %s/%s: skipped %d strategy-bound groups (use CancelGroupsByStrategy instead)",
-				userID, symbol, skippedStrategy)
-		}
 		return
 	}
 
-	log.Printf("[oco] Manual exit detected: cancelling %d non-strategy OCO groups for %s/%s (skipped %d strategy-bound)",
-		len(toCancel), userID, symbol, skippedStrategy)
+	log.Printf("[oco] Manual exit detected: cancelling %d OCO group(s) for %s/%s",
+		len(toCancel), userID, symbol)
 	for _, gid := range toCancel {
 		if err := m.CancelGroup(ctx, gid); err != nil {
 			log.Printf("[oco] Failed to cancel group %s: %v", gid, err)

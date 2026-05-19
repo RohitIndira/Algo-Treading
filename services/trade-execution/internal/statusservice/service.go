@@ -74,6 +74,24 @@ type OrderStatusService struct {
 	// Serves two purposes: (1) tracks who is subscribed, (2) enables re-subscription
 	// after a reconnect using the stored auth context.
 	subscriberAuths sync.Map
+
+	// orderMutexes: brokerOrderID → *sync.Mutex
+	// Serializes handleStatusUpdate for the same broker order so concurrent
+	// goroutines (one per WS event) can't read-modify-write the same row out of
+	// order and overwrite a newer fill with stale TradedQTY/TradedPrice.
+	// Why: the broker pushes one WS event per partial fill, and each event is
+	// dispatched on a fresh goroutine (see processUpdates). Without this mutex,
+	// event B (cumulative qty=80) can land in the DB after event C (cumulative
+	// qty=100), leaving filled_quantity/filled_price stuck at the older snapshot
+	// and surfacing as wrong values on /ws/live-orders.
+	orderMutexes sync.Map
+}
+
+// lockOrder returns the mutex guarding all WS updates for one broker order ID.
+// Callers MUST defer Unlock immediately after acquiring.
+func (s *OrderStatusService) lockOrder(brokerOrderID string) *sync.Mutex {
+	muVal, _ := s.orderMutexes.LoadOrStore(brokerOrderID, &sync.Mutex{})
+	return muVal.(*sync.Mutex)
 }
 
 // SetWSBroadcaster wires a callback so live order status changes are pushed
@@ -290,24 +308,37 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		return
 	}
 
+	// Serialize all WS events for the same broker order. processUpdates spawns
+	// one goroutine per event; without this, two events that arrive close together
+	// for the same order can read the same DB row, mutate it independently, and
+	// both write back — last writer wins, which is frequently the older event and
+	// surfaces as wrong filled_quantity / filled_price to /ws/live-orders.
+	mu := s.lockOrder(indiraID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	order, err := s.repo.GetByIndiraOrderID(ctx, indiraID)
 	if err != nil {
 		// Order not in DB yet — race between background DB persist and WS callback.
-		// Retry after a short delay: our system's exit/OCO orders may still be writing.
+		// Retry after a short delay: our system's exit/OCO/ML orders may still be writing.
 		isKnownOCO := s.ocoHandler != nil && s.ocoHandler.IsKnownBrokerID(indiraID)
+		isKnownML := s.mlHandler != nil && s.mlHandler.IsKnownBrokerID(indiraID)
+		isKnownInternal := isKnownOCO || isKnownML
 		brokerStatusUpper := strings.ToUpper(strings.TrimSpace(wsStatus.OrderStatus))
 		isFill := brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED"
 
-		// Always retry once after 500ms — handles force-exit orders, OCO legs,
+		// Always retry once after 500ms — handles force-exit orders, OCO/ML legs,
 		// and any other orders where the DB write races the broker WS callback.
 		time.Sleep(500 * time.Millisecond)
 		order, err = s.repo.GetByIndiraOrderID(ctx, indiraID)
 		if err != nil {
-			if isKnownOCO {
-				s.logger.Warn("OCO broker ID recognised in memory but DB lookup still failed after retry",
+			if isKnownInternal {
+				s.logger.Warn("Internal SL/TP broker ID recognised in memory but DB lookup still failed after retry",
 					zap.String("broker_id", indiraID),
+					zap.Bool("oco", isKnownOCO),
+					zap.Bool("ml", isKnownML),
 					zap.Error(err))
-			} else if isFill && wsStatus.Symbol != "" && s.ocoHandler != nil {
+			} else if isFill && wsStatus.Symbol != "" && (s.ocoHandler != nil || s.mlHandler != nil) {
 				// Genuinely not our order — manual exit from broker app.
 				s.handleManualExitDetection(ctx, wsStatus)
 			}
@@ -386,12 +417,54 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	// Extract fill details using DecimalLocator for correct price
 	dl := decimalLocator(string(wsStatus.DecimalLocator))
 
-	// Always update traded qty and price from broker
-	if qty, err := strconv.Atoi(string(wsStatus.TradedQTY)); err == nil {
-		order.FilledQuantity = int32(qty)
+	// Update filled qty and price using a running volume-weighted average.
+	// Indira sends TradedQTY as CUMULATIVE across all partial fills, but
+	// TradedPrice as the price of THIS individual trade only — so the naive
+	// "FilledPrice = TradedPrice" shows only the last partial's price.
+	// VWAP formula: (prev_avg * prev_qty + this_price * delta_qty) / new_cum_qty.
+	// Stale events (newCumQty < prevQty) are dropped: the per-order mutex
+	// serializes execution but goroutine acquire order is non-deterministic,
+	// so an older event can still run after a newer one.
+	newCumQty := -1
+	if q, err := strconv.Atoi(string(wsStatus.TradedQTY)); err == nil {
+		newCumQty = q
 	}
-	if price, err := strconv.ParseFloat(wsStatus.TradedPrice, 64); err == nil && price > 0 {
-		order.FilledPrice = &price
+	thisTradePrice := 0.0
+	if p, err := strconv.ParseFloat(wsStatus.TradedPrice, 64); err == nil && p > 0 {
+		thisTradePrice = p
+	}
+	if newCumQty >= 0 {
+		prevQty := int(order.FilledQuantity)
+		switch {
+		case newCumQty > prevQty:
+			// Forward progress — compute VWAP using the delta from this event.
+			deltaQty := newCumQty - prevQty
+			var newAvg float64
+			switch {
+			case thisTradePrice <= 0:
+				// Status-only event with no usable price — preserve prev avg.
+				if order.FilledPrice != nil {
+					newAvg = *order.FilledPrice
+				}
+			case prevQty <= 0:
+				// First fill — this event's price IS the average.
+				newAvg = thisTradePrice
+			default:
+				prevAvg := 0.0
+				if order.FilledPrice != nil {
+					prevAvg = *order.FilledPrice
+				}
+				newAvg = (prevAvg*float64(prevQty) + thisTradePrice*float64(deltaQty)) / float64(newCumQty)
+			}
+			order.FilledQuantity = int32(newCumQty)
+			if newAvg > 0 {
+				order.FilledPrice = &newAvg
+			}
+		case newCumQty == prevQty && thisTradePrice > 0 && order.FilledPrice == nil:
+			// No qty progress but we now have a price and didn't before — backfill.
+			order.FilledPrice = &thisTradePrice
+		}
+		// newCumQty < prevQty → stale event, drop the numeric update.
 	}
 
 	// Update order price from broker
@@ -475,24 +548,59 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	s.publishNotification(ctx, order, wsStatus)
 }
 
-// handleManualExitDetection is called when we see an EXECUTED order that is
-// NOT in our database — this means the user placed it manually from their
-// broker app. If they have active OCO groups for that symbol, cancel them
-// to prevent orphaned SL/TP legs from triggering unwanted positions.
+// ReconcileOrderFromBrokerBook applies a broker-book snapshot to a single
+// order, but only if the broker's reported status differs from the DB.
+//
+// This is the surgical entry point for the startup reconciliation pass: it
+// reuses the same handleStatusUpdate path that broker WS events take (so OCO,
+// ML, publisher, and execution_event hooks all fire identically), but it never
+// invokes the path when the DB already matches the broker — preventing spurious
+// duplicate notifications for orders that were already up-to-date.
+//
+// Caller responsibility: build a WSOrderStatus from the broker order-book row
+// (UniqueCode = indira_order_id, OrderStatus = broker status, plus any fields
+// the caller has). This method does not call the broker.
+func (s *OrderStatusService) ReconcileOrderFromBrokerBook(ctx context.Context, dbOrder *models.Order, snapshot *indiraClient.WSOrderStatus) (changed bool, err error) {
+	if dbOrder == nil || snapshot == nil {
+		return false, fmt.Errorf("nil order or snapshot")
+	}
+	brokerStatusUpper := strings.ToUpper(strings.TrimSpace(snapshot.OrderStatus))
+	dbStatusUpper := strings.ToUpper(strings.TrimSpace(string(dbOrder.Status)))
+	if brokerStatusUpper == "" || brokerStatusUpper == dbStatusUpper {
+		// Nothing to do — broker agrees with DB or has no opinion.
+		return false, nil
+	}
+	s.logger.Info("startup reconciliation: applying broker snapshot",
+		zap.String("order_id", dbOrder.OrderID.String()),
+		zap.String("indira_id", snapshot.UniqueCode),
+		zap.String("db_status", dbStatusUpper),
+		zap.String("broker_status", brokerStatusUpper))
+	s.handleStatusUpdate(ctx, snapshot)
+	return true, nil
+}
+
+// handleManualExitDetection runs when an EXECUTED order arrives whose broker ID
+// is not in our DB — i.e. the user placed an exit from the broker terminal.
+// Cancel any active OCO and multi-level SL/TP groups for that user+symbol so
+// orphaned legs don't fire into a flat position.
 func (s *OrderStatusService) handleManualExitDetection(ctx context.Context, wsStatus *indiraClient.WSOrderStatus) {
-	// Extract user ID from the WS message
 	userID := wsStatus.UCC // UCC is the client code (user ID)
 	if userID == "" {
 		return
 	}
 
 	symbol := wsStatus.Symbol
-	s.logger.Info("Manual exit detected — cancelling OCO groups for symbol",
+	s.logger.Info("Manual exit detected — cancelling SL/TP groups for symbol",
 		zap.String("user_id", userID),
 		zap.String("symbol", symbol),
 		zap.String("unique_code", wsStatus.UniqueCode))
 
-	go s.ocoHandler.CancelGroupsBySymbol(context.Background(), userID, symbol)
+	if s.ocoHandler != nil {
+		go s.ocoHandler.CancelGroupsBySymbol(context.Background(), userID, symbol)
+	}
+	if s.mlHandler != nil {
+		go s.mlHandler.CancelGroupsBySymbol(context.Background(), userID, symbol)
+	}
 }
 
 // flexToInt converts a FlexInt to int, returning 0 on failure.
