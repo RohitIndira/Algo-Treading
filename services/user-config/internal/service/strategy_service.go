@@ -3,12 +3,14 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
+	goredis "github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 )
@@ -20,17 +22,59 @@ type StrategyService struct {
 	kafkaWriter  *kafka.Writer
 	kafkaTopic   string
 	kafkaEnabled bool
+
+	// extRedis is the external Indira Redis where the symbol↔isin master
+	// data lives (keys: `symbol:{TICKER}` → {"symbol":"...","isin":"..."}).
+	// Used to derive ISIN at create-time when the caller supplies only a
+	// symbol. May be nil — in that case the service still accepts requests
+	// that already carry ISIN and rejects symbol-only requests with a clear
+	// error so the caller can fall back to providing ISIN explicitly.
+	extRedis *goredis.Client
 }
 
 // NewStrategyService creates a new strategy service
-func NewStrategyService(repo *repository.StrategyRepository, credsRepo repository.CredentialsRepository, kafkaWriter *kafka.Writer, kafkaTopic string) *StrategyService {
+func NewStrategyService(repo *repository.StrategyRepository, credsRepo repository.CredentialsRepository, kafkaWriter *kafka.Writer, kafkaTopic string, extRedis *goredis.Client) *StrategyService {
 	return &StrategyService{
 		repo:         repo,
 		credsRepo:    credsRepo,
 		kafkaWriter:  kafkaWriter,
 		kafkaTopic:   kafkaTopic,
 		kafkaEnabled: kafkaWriter != nil,
+		extRedis:     extRedis,
 	}
+}
+
+// resolveISINFromSymbol looks up the ISIN for a symbol via the ext-Redis
+// `symbol:{TICKER}` master-data key. Returns the ISIN, or an error if
+// ext-Redis isn't wired, the symbol is unknown, or the blob is malformed.
+// 2-second bound on the Redis call so a slow network doesn't hang validation.
+func (s *StrategyService) resolveISINFromSymbol(ctx context.Context, symbol string) (string, error) {
+	if s.extRedis == nil {
+		return "", fmt.Errorf("symbol-only create requires ext-Redis (EXT_REDIS_ADDR) to be configured on user-config; either set the env or supply hft_config.isin explicitly")
+	}
+	if symbol == "" {
+		return "", fmt.Errorf("symbol is empty")
+	}
+	rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	raw, err := s.extRedis.Get(rctx, "symbol:"+symbol).Result()
+	if errors.Is(err, goredis.Nil) {
+		return "", fmt.Errorf("unknown symbol %q — not present in NSE EQ master data; verify the ticker or supply isin explicitly", symbol)
+	}
+	if err != nil {
+		return "", fmt.Errorf("ext-Redis lookup symbol:%s: %w", symbol, err)
+	}
+	var blob struct {
+		Symbol string `json:"symbol"`
+		ISIN   string `json:"isin"`
+	}
+	if err := json.Unmarshal([]byte(raw), &blob); err != nil {
+		return "", fmt.Errorf("parse symbol:%s value: %w", symbol, err)
+	}
+	if blob.ISIN == "" {
+		return "", fmt.Errorf("symbol:%s blob has no isin field", symbol)
+	}
+	return blob.ISIN, nil
 }
 
 // ConfigEvent represents a strategy configuration event for Kafka
@@ -195,7 +239,7 @@ func min(a, b int) int {
 // CreateStrategy creates a new strategy
 func (s *StrategyService) CreateStrategy(ctx context.Context, req *models.CreateStrategyRequest) (*models.Strategy, error) {
 	// Validate request
-	if err := s.validateCreateRequest(req); err != nil {
+	if err := s.validateCreateRequest(ctx, req); err != nil {
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
 
@@ -317,8 +361,10 @@ func (s *StrategyService) DeactivateAllActiveStrategies(ctx context.Context) (in
 	return s.repo.DeactivateAllActive(ctx)
 }
 
-// validateCreateRequest validates a create strategy request
-func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyRequest) error {
+// validateCreateRequest validates a create strategy request.
+// Takes ctx because HFT_BIDDING may do an ext-Redis lookup to resolve
+// symbol → ISIN when the caller supplies only a symbol.
+func (s *StrategyService) validateCreateRequest(ctx context.Context, req *models.CreateStrategyRequest) error {
 	if req.UserID == "" {
 		return fmt.Errorf("user_id is required")
 	}
@@ -352,8 +398,16 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		if h.Symbol == "" {
 			return fmt.Errorf("hft_config.symbol is required")
 		}
+		// ISIN is optional in the API contract — caller may supply it
+		// directly (e.g. for non-NSE-EQ instruments not in our reverse
+		// map), or omit it in which case we resolve via the ext-Redis
+		// `symbol:{TICKER}` master-data lookup.
 		if h.ISIN == "" {
-			return fmt.Errorf("hft_config.isin is required")
+			resolved, err := s.resolveISINFromSymbol(ctx, h.Symbol)
+			if err != nil {
+				return fmt.Errorf("hft_config.isin not supplied and could not be resolved from symbol: %w", err)
+			}
+			h.ISIN = resolved
 		}
 		if h.Exchange == "" {
 			h.Exchange = "NSE"

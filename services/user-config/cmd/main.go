@@ -20,6 +20,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/worker"
+	goredis "github.com/go-redis/redis/v8"
 	"github.com/jmoiron/sqlx"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -101,8 +102,35 @@ func main() {
 		lgr.Warn("Using no-op credentials repository — credentials will not be persisted")
 	}
 
+	// Optional ext-Redis client. user-config reads `symbol:{TICKER}` master
+	// data so HFT_BIDDING strategies can be created with just a symbol; ISIN
+	// is derived at validation time. If the env isn't set or the dial fails,
+	// the service still works — it'll just require callers to supply ISIN
+	// directly (rejected at validation with a clear error otherwise).
+	var extRedis *goredis.Client
+	if addr := os.Getenv("EXT_REDIS_ADDR"); addr != "" {
+		extRedis = goredis.NewClient(&goredis.Options{
+			Addr:         addr,
+			Password:     os.Getenv("EXT_REDIS_PASSWORD"),
+			DB:           0,
+			ReadTimeout:  2 * time.Second,
+			WriteTimeout: 2 * time.Second,
+		})
+		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := extRedis.Ping(pCtx).Err(); err != nil {
+			lgr.Warn("ext-Redis ping failed — symbol→ISIN resolution disabled",
+				zap.String("addr", addr), zap.Error(err))
+			_ = extRedis.Close()
+			extRedis = nil
+		} else {
+			lgr.Info("ext-Redis connected for symbol→ISIN resolution", zap.String("addr", addr))
+			defer extRedis.Close()
+		}
+		pCancel()
+	}
+
 	// Initialize service
-	svc := service.NewStrategyService(repo, credsRepo, kafkaWriter, cfg.Kafka.Topic)
+	svc := service.NewStrategyService(repo, credsRepo, kafkaWriter, cfg.Kafka.Topic, extRedis)
 
 	// Initialize Outbox Worker
 	if cfg.Kafka.Enabled && kafkaWriter != nil {
