@@ -9,6 +9,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/dto"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
+	hftpb "github.com/RohitIndira/Algo-Treading/api/proto/hft_engine"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/gorilla/mux"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -17,11 +18,18 @@ import (
 
 type UserConfigHandler struct {
 	client *grpc_clients.UserConfigClient
+	// hftClient is optional. When set, CreateStrategy auto-fires Entry on
+	// the hft-engine for HFT_BIDDING strategies created with
+	// activate_immediately=true, turning the two-step
+	// create→start dance into one round-trip. nil is fine — auto-start
+	// is then a no-op and the operator must POST /hft/{id}/start manually.
+	hftClient *grpc_clients.HFTClient
 }
 
-func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHandler {
+func NewUserConfigHandler(client *grpc_clients.UserConfigClient, hftClient *grpc_clients.HFTClient) *UserConfigHandler {
 	return &UserConfigHandler{
-		client: client,
+		client:    client,
+		hftClient: hftClient,
 	}
 }
 
@@ -118,7 +126,44 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 			respondWithJSON(w, http.StatusCreated, buildManthanResponse(resp))
 			return
 		case pb.StrategyType_HFT_BIDDING:
-			respondWithJSON(w, http.StatusCreated, buildHFTResponse(resp))
+			out := buildHFTResponse(resp)
+			// Auto-fire Entry on the hft-engine when the caller wanted the
+			// strategy live immediately. activate_immediately=true previously
+			// only set the DB row's active=true bit but did NOT subscribe
+			// the engine to market data, so nothing actually ran until the
+			// operator made a second POST /hft/{id}/start call. We now
+			// chain the two together for HFT_BIDDING.
+			//
+			// Failure mode is best-effort: a failed auto-start does NOT
+			// roll back the create (the row stays, the operator can retry
+			// /hft/start manually). We surface the failure in the response
+			// so the UI can show it without a 500.
+			if h.hftClient != nil && reqDTO.ActivateImmediately {
+				entryResp, entryErr := h.hftClient.Entry(r.Context(), &hftpb.EntryRequest{
+					StrategyId: resp.Strategy.StrategyId,
+				})
+				switch {
+				case entryErr != nil:
+					out["auto_start"] = map[string]interface{}{
+						"success": false,
+						"error":   "hft-engine Entry call failed: " + entryErr.Error(),
+						"hint":    "strategy created but engine not running — retry POST /api/v1/hft/{id}/start",
+					}
+				case entryResp != nil && !entryResp.Success:
+					out["auto_start"] = map[string]interface{}{
+						"success": false,
+						"status":  entryResp.Status,
+						"error":   entryResp.Error,
+						"hint":    "strategy created but engine refused Entry — retry POST /api/v1/hft/{id}/start after fixing the underlying cause",
+					}
+				default:
+					out["auto_start"] = map[string]interface{}{
+						"success": true,
+						"status":  entryResp.Status,
+					}
+				}
+			}
+			respondWithJSON(w, http.StatusCreated, out)
 			return
 		}
 	}

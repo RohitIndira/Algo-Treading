@@ -61,8 +61,12 @@ func main() {
 		log.Printf("Connected to HFT Engine at %s", cfg.Services.HFTEngineAddr)
 	}
 
-	// Initialize handlers
-	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient)
+	// Initialize handlers. hftClient is passed through to UserConfigHandler
+	// so CreateStrategy can auto-fire Entry on HFT_BIDDING strategies with
+	// activate_immediately=true — turning the create→start dance into a
+	// single round-trip. nil-safe: if hftClient init failed above, auto-start
+	// is silently skipped (operator can still POST /hft/{id}/start manually).
+	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient, hftClient)
 
 	// Initialize Redis client for WebSocket pub/sub
 	redisClient := redis.NewClient(&redis.Options{
