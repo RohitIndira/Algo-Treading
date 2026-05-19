@@ -351,11 +351,22 @@ func classifyHandlerErr(err error) string {
 	if errors.As(err, &pe) {
 		return InboxErrPoison
 	}
+	msg := err.Error()
+	// Pre-check rejections are permanent for the current evaluation cycle —
+	// "too close to market close", "market not open yet", "market closed —
+	// Saturday", "stock at lower circuit", "margin pre-check: insufficient",
+	// "SL modify pre-check: ..." all key off wall-clock / data-snapshot
+	// conditions that the next retry cannot fix. Send straight to DLQ so we
+	// don't burn 50 retries on a deterministic-fail. Operator re-issues the
+	// signal once the underlying condition (funding, market hours, etc.) is
+	// resolved.
+	if strings.Contains(msg, "pre-check:") {
+		return InboxErrPoison
+	}
 	// "no active SL order found", "resolve symbol", "broker rejected" all
 	// land here. Most are operationally transient (state will catch up
 	// from a fill event, or the operator will fix the data); a small number
 	// are permanent. We rely on max-attempts → DLQ to bound the retry.
-	msg := err.Error()
 	if strings.Contains(msg, "rejected") ||
 		strings.Contains(msg, "DPR") ||
 		strings.Contains(msg, "tick") {
