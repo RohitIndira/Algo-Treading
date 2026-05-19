@@ -93,9 +93,16 @@ func TestValidateStrategyConfig_InvalidCases(t *testing.T) {
 	}
 
 	c3 := *base
-	c3.RiskLimits.MaxDailyTrades = 0
+	c3.RiskLimits.MaxDailyTrades = -1
 	if err := validateStrategyConfig(&c3); err == nil {
-		t.Fatalf("expected error")
+		t.Fatalf("expected error for negative max_daily_trades")
+	}
+
+	// MaxDailyTrades == 0 means "unlimited / use system default" and must be accepted.
+	c4 := *base
+	c4.RiskLimits.MaxDailyTrades = 0
+	if err := validateStrategyConfig(&c4); err != nil {
+		t.Fatalf("expected zero max_daily_trades to be accepted, got: %v", err)
 	}
 }
 

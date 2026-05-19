@@ -4,6 +4,7 @@ const url = require('url');
 
 const PORT = 3001;
 const TARGET_HOST = 'livemiddleware.indiratrade.com';
+const PORTFOLIO_HOST = 'indira.indiratrade.com';
 const TOKEN_PATH = '/order-notify/ws/createWsToken';
 
 const server = http.createServer((req, res) => {
@@ -67,6 +68,47 @@ const server = http.createServer((req, res) => {
 
         proxyReq.on('error', (err) => {
             console.error(`[${new Date().toLocaleTimeString()}] Proxy error:`, err.message);
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'NOT_OK', message: `Proxy error: ${err.message}` }));
+        });
+
+        proxyReq.end();
+        return;
+    }
+
+    // Proxy portfolio/position-book API
+    if (parsed.pathname === '/api/position-book') {
+        const sessionToken = parsed.query.token;
+        if (!sessionToken) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'NOT_OK', message: 'Missing token parameter' }));
+            return;
+        }
+
+        const options = {
+            hostname: PORTFOLIO_HOST,
+            port: 443,
+            path: '/portfolio-services/api/portfolio/v1/position-book',
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${sessionToken}`,
+                'Content-Type': 'application/json'
+            }
+        };
+
+        console.log(`[${new Date().toLocaleTimeString()}] Proxying position-book request...`);
+
+        const proxyReq = https.request(options, (proxyRes) => {
+            let body = '';
+            proxyRes.on('data', (chunk) => { body += chunk; });
+            proxyRes.on('end', () => {
+                console.log(`[${new Date().toLocaleTimeString()}] position-book: ${proxyRes.statusCode}`);
+                res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
+                res.end(body);
+            });
+        });
+
+        proxyReq.on('error', (err) => {
             res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'NOT_OK', message: `Proxy error: ${err.message}` }));
         });

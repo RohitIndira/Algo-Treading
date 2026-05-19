@@ -24,6 +24,11 @@ type DPRLookup interface {
 	GetDPR(ctx context.Context, exchange string, token int64) (lower float64, upper float64, err error)
 }
 
+// LTPLookup retrieves the last-traded price for an instrument from Redis market data.
+type LTPLookup interface {
+	GetLTP(ctx context.Context, exchange string, token int64) (float64, error)
+}
+
 // ExecutionClient wraps Indira API for trade execution
 // This client is stateless and thread-safe for concurrent use by multiple users
 type ExecutionClient struct {
@@ -42,6 +47,10 @@ type ExecutionClient struct {
 	// dprLookup fetches Daily Price Range (circuit limits) from Redis.
 	// Nil-safe: if unavailable, no DPR clamping is applied.
 	dprLookup DPRLookup
+
+	// ltpLookup fetches current LTP from Redis.
+	// Used to set BUY limitPrice to LTP+0.5% for faster fills.
+	ltpLookup LTPLookup
 }
 
 // NewExecutionClient creates a new execution client for Indira Securities
@@ -64,6 +73,11 @@ func (c *ExecutionClient) SetTickSizeLookup(tsl TickSizeLookup) {
 // SetDPRLookup sets the DPR lookup (e.g. RedisPriceClient).
 func (c *ExecutionClient) SetDPRLookup(dpr DPRLookup) {
 	c.dprLookup = dpr
+}
+
+// SetLTPLookup sets the LTP lookup (e.g. RedisPriceClient).
+func (c *ExecutionClient) SetLTPLookup(ltp LTPLookup) {
+	c.ltpLookup = ltp
 }
 
 // resolveTickSize fetches the tick size for an instrument from Redis.
@@ -96,6 +110,17 @@ func (c *ExecutionClient) resolveDPR(exchange string, stockCode int64) (lower, u
 		return 0, 0
 	}
 	return lo, hi
+}
+
+// resolveLTP fetches the last-traded price for an instrument from Redis.
+// Returns 0 on any error (caller falls back to signal price).
+func (c *ExecutionClient) resolveLTP(exchange string, stockCode int64) (float64, error) {
+	if c.ltpLookup == nil {
+		return 0, fmt.Errorf("ltp lookup not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	return c.ltpLookup.GetLTP(ctx, exchange, stockCode)
 }
 
 // clampDPR clamps a price to within the Daily Price Range [lower, upper].
@@ -378,16 +403,43 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 			req.BoTgtPrice = &zero
 		}
 	} else {
-		// Non-bracket orders: limitPrice for limit/SL orders; broker ignores it for Market.
-		if order.Price != nil {
-			req.LimitPrice = indiraClient.Price2DP(roundClamp(*order.Price))
-		}
-		if order.StopLoss != nil {
+		// Non-bracket orders.
+		// convertSignalToOrder always wraps zero-values as &0.0 (never nil), so use > 0
+		// to distinguish "configured" from "not set".
+		//
+		// BUY orders (any type): place as Limit at LTP+0.5% for immediate fill.
+		//   - MARKET BUY → converted to Limit with limitPrice = LTP*1.005
+		//   - SL BUY (trigger>0) → trigger kept, limitPrice = LTP*1.005
+		//   - LTP unavailable → SL BUY falls back to trigger*1.005; plain BUY uses signal price
+		// SELL orders: signal prices used unchanged.
+		hasTrigger := order.StopLoss != nil && *order.StopLoss > 0
+		hasPrice := order.Price != nil && *order.Price > 0
+
+		if hasTrigger {
 			req.TriggerPrice = indiraClient.Price2DP(roundClamp(*order.StopLoss))
-			// Force order type to SL (stoploss-limit) when a trigger price is present.
-			// A plain LIMIT order ignores triggerPrice at the broker — the order must
-			// be SL so it stays pending until price hits the trigger, then fills at limitPrice.
-			req.OrdType = "SL"
+			if req.OrdType != "SL-M" {
+				req.OrdType = "SL"
+			}
+		}
+
+		if order.OrderSide == models.OrderSideBuy {
+			ltp, ltpErr := c.resolveLTP(symbolBuilder.Exchange, order.StockCode)
+			if ltpErr == nil && ltp > 0 {
+				limitPrice := roundClamp(ltp * 1.005)
+				req.LimitPrice = indiraClient.Price2DP(limitPrice)
+				if !hasTrigger {
+					req.OrdType = "Limit"
+				}
+				log.Printf("[ltp-limit] BUY %s: limitPrice=%.2f (LTP=%.2f +0.5%%)", order.Symbol, limitPrice, ltp)
+			} else if hasTrigger {
+				limitPrice := roundClamp(*order.StopLoss * 1.005)
+				req.LimitPrice = indiraClient.Price2DP(limitPrice)
+				log.Printf("[sl-limit] BUY %s: trigger=%.2f limitPrice=%.2f (+0.5%%, LTP unavailable)", order.Symbol, *order.StopLoss, limitPrice)
+			} else if hasPrice {
+				req.LimitPrice = indiraClient.Price2DP(roundClamp(*order.Price))
+			}
+		} else if hasPrice {
+			req.LimitPrice = indiraClient.Price2DP(roundClamp(*order.Price))
 		}
 		// Do NOT set BoStpLoss / BoTgtPrice for plain (non-bracket) orders.
 		// The broker interprets any order carrying these fields (even as 0) as a

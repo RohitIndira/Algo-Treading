@@ -130,6 +130,18 @@ func isSessionExpiredError(err error) bool {
 	return strings.Contains(msg, "HTTP error 401") || strings.Contains(msg, "Session expired")
 }
 
+// isSessionNotReadyError returns true if the broker rejected the order because its
+// trading session hasn't finished initializing after a WS reconnect (AU004).
+// This is a transient condition — the session typically becomes ready within
+// a few seconds, so the caller should wait longer than a 401 retry before retrying.
+func isSessionNotReadyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "AU004") || strings.Contains(msg, "Session data not received")
+}
+
 // refreshAuth invalidates the cache for userID, reloads fresh credentials from DB,
 // and returns an updated AuthContext. Returns nil if refresh is unavailable or fails.
 func (m *OCOManager) refreshAuth(ctx context.Context, userID string, currentAuth *indiraClient.AuthContext) *indiraClient.AuthContext {
@@ -296,19 +308,35 @@ func (m *OCOManager) CreateOCOEntry(
 		OCOGroupID: &groupID,
 		OCORole:    stringPtr(string(RoleEntry)),
 	}
+	// Persist trailing SL config on the entry order so reconstructGroup can
+	// restore TrailingSL = true after a service restart.
+	if trailingSL {
+		s := "TRAILING"
+		entryOrder.StopLossType = &s
+	}
+	if trailingSLPct > 0 {
+		entryOrder.TrailingSLPct = &trailingSLPct
+	}
 
 	// Persist entry order to DB
 	if err := m.repo.Create(ctx, entryOrder); err != nil {
 		return nil, fmt.Errorf("failed to persist OCO entry order: %w", err)
 	}
 
-	// Place the entry SL order at broker with retry on 401 (session expired).
+	// Place the entry SL order at broker with retry on 401 (session expired) and
+	// AU004 (session not ready yet after WS reconnect).
 	var brokerID string
 	var placeErr error
 	currentAuth := auth
 	for attempt := 0; attempt <= maxEntryRetries; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			delay := time.Duration(attempt) * 500 * time.Millisecond
+			// AU004 means the broker session is still initializing after a WS
+			// reconnect — use a longer backoff to give it time to become ready.
+			if isSessionNotReadyError(placeErr) {
+				delay = time.Duration(attempt) * 3 * time.Second
+			}
+			time.Sleep(delay)
 
 			// On 401, refresh credentials from DB before retrying.
 			if isSessionExpiredError(placeErr) {
@@ -332,8 +360,9 @@ func (m *OCOManager) CreateOCOEntry(
 		log.Printf("[oco] Entry order placement attempt %d failed for group %s: %v",
 			attempt+1, groupID, placeErr)
 
-		// Only retry on 401; other errors are not retryable here.
-		if !isSessionExpiredError(placeErr) {
+		// Retry on 401 (stale token) and AU004 (broker session not yet ready).
+		// All other broker rejections are permanent — stop retrying immediately.
+		if !isSessionExpiredError(placeErr) && !isSessionNotReadyError(placeErr) {
 			break
 		}
 	}
@@ -442,6 +471,31 @@ func (m *OCOManager) HandleBrokerUpdate(ctx context.Context, order *models.Order
 		m.handleSLLegUpdate(ctx, group, order, brokerStatusUpper)
 	case group.TPBrokerID:
 		m.handleTPLegUpdate(ctx, group, order, brokerStatusUpper)
+	default:
+		// Race: WS PENDING/EXECUTED arrived for a leg before placeOCOLegs stored
+		// the broker ID on the group (race window between PlaceOrder returning and
+		// the post-wg.Wait mutex section). Use OCORole from the DB-loaded order to
+		// route correctly, and backfill the broker ID so future events hit the
+		// normal switch cases above.
+		if order.OCORole == nil || group.State.IsTerminal() {
+			return
+		}
+		switch *order.OCORole {
+		case string(RoleSLLeg):
+			if group.SLBrokerID == "" {
+				group.SLBrokerID = brokerID
+				m.brokerIndex.Store(brokerID, group.GroupID)
+				log.Printf("[oco] Race-recovery: backfilled SL broker ID %s for group %s", brokerID, group.GroupID)
+			}
+			m.handleSLLegUpdate(ctx, group, order, brokerStatusUpper)
+		case string(RoleTPLeg):
+			if group.TPBrokerID == "" {
+				group.TPBrokerID = brokerID
+				m.brokerIndex.Store(brokerID, group.GroupID)
+				log.Printf("[oco] Race-recovery: backfilled TP broker ID %s for group %s", brokerID, group.GroupID)
+			}
+			m.handleTPLegUpdate(ctx, group, order, brokerStatusUpper)
+		}
 	}
 }
 
@@ -475,11 +529,16 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 		}
 
 		// Capture fill price from the WS event.
+		// FilledPrice (TradedPrice from broker WS) is the actual execution price.
+		// order.Price is the LIMIT price used to place the entry — for OCO LIMIT entries
+		// it is signal_price * 1.005, which is higher than the actual fill. Using it as
+		// HighestPrice would prevent trailing SL from ever firing (stock never exceeds
+		// the limit price that was already above market at entry time).
 		fillPrice := 0.0
-		if order.Price != nil && *order.Price > 0 {
-			fillPrice = *order.Price
-		} else if order.FilledPrice != nil && *order.FilledPrice > 0 {
+		if order.FilledPrice != nil && *order.FilledPrice > 0 {
 			fillPrice = *order.FilledPrice
+		} else if order.Price != nil && *order.Price > 0 {
+			fillPrice = *order.Price
 		}
 		if fillPrice <= 0 {
 			log.Printf("[oco] WARNING: Entry fill price is 0 for group %s — cannot place legs", group.GroupID)
@@ -513,12 +572,12 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 			log.Printf("[oco] Entry PARTIALLY FILLED for group %s: %d/%d — placing SL+TP legs for filled qty",
 				group.GroupID, filledQty, group.Quantity)
 
-			// Capture fill price from the WS event
+			// Capture fill price from the WS event (FilledPrice = TradedPrice, actual execution price)
 			fillPrice := 0.0
-			if order.Price != nil && *order.Price > 0 {
-				fillPrice = *order.Price
-			} else if order.FilledPrice != nil && *order.FilledPrice > 0 {
+			if order.FilledPrice != nil && *order.FilledPrice > 0 {
 				fillPrice = *order.FilledPrice
+			} else if order.Price != nil && *order.Price > 0 {
+				fillPrice = *order.Price
 			}
 			if fillPrice <= 0 {
 				log.Printf("[oco] WARNING: Partial fill price is 0 for group %s — cannot place legs", group.GroupID)
@@ -956,30 +1015,43 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		if slBrokerID != "" {
 			group.SLBrokerID = slBrokerID
 			m.brokerIndex.Store(slBrokerID, group.GroupID)
+			group.SLLegConfirmed = true // broker API accepted — pre-confirm to avoid stuck LEGS_SUBMITTED
 		}
 		group.TPLegConfirmed = true // no TP leg to wait for
 		group.State = StateLegsSubmitted
 		group.UpdatedAt = time.Now()
+		m.checkLegsConfirmed(group)
 		if m.wsBroadcaster != nil {
 			m.wsBroadcaster(group.UserID, "oco_tp_rejected", slOrder)
 		}
 		return
 	}
 
-	// All placed legs succeeded — register broker IDs and await WS confirmation
+	// All placed legs succeeded — register broker IDs and pre-confirm immediately.
+	// Pre-confirming (rather than waiting for WS PENDING) eliminates the race window
+	// where the WS event arrives before brokerIndex is populated and gets dropped
+	// by HandleBrokerUpdate, causing the group to get stuck in LEGS_SUBMITTED forever
+	// and miss the trailing SL monitor. WS PENDING events that arrive later are
+	// idempotent — handleSLLegUpdate / handleTPLegUpdate return early when the
+	// confirmed flags are already true.
 	if slBrokerID != "" {
 		group.SLBrokerID = slBrokerID
 		m.brokerIndex.Store(slBrokerID, group.GroupID)
+		group.SLLegConfirmed = true
 	}
 	if tpBrokerID != "" {
 		group.TPBrokerID = tpBrokerID
 		m.brokerIndex.Store(tpBrokerID, group.GroupID)
+		group.TPLegConfirmed = true
 	}
 	group.State = StateLegsSubmitted
 	group.UpdatedAt = time.Now()
 
-	log.Printf("[oco] Group %s LEGS_SUBMITTED: SL(broker=%s trigger=%.2f) TP(broker=%s limit=%.2f) — awaiting WS confirmation",
+	log.Printf("[oco] Group %s LEGS_SUBMITTED: SL(broker=%s trigger=%.2f) TP(broker=%s limit=%.2f)",
 		group.GroupID, slBrokerID, slTrigger, tpBrokerID, tpLimit)
+
+	// Transition to ACTIVE immediately — both legs accepted by broker API.
+	m.checkLegsConfirmed(group)
 
 	if m.wsBroadcaster != nil {
 		m.wsBroadcaster(group.UserID, "oco_legs_submitted", slOrder)
@@ -1356,8 +1428,21 @@ func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigge
 		ProductType:   group.ProductType,
 	}
 
-	if err := m.indiraClient.ModifyOrder(ctx, slOrder, group.Auth); err != nil {
-		return fmt.Errorf("modify SL leg failed: %w", err)
+	currentAuth := group.Auth
+	modifyErr := m.indiraClient.ModifyOrder(ctx, slOrder, currentAuth)
+	if modifyErr != nil && isSessionExpiredError(modifyErr) && m.credsCache != nil {
+		// 401: refresh credentials and retry once.
+		// We hold the group mutex here; refreshAuth may do a DB read but that is
+		// bounded by the caller's 10-second context so it won't block indefinitely.
+		newAuth := m.refreshAuth(ctx, group.UserID, currentAuth)
+		if newAuth != nil {
+			group.Auth = newAuth // update so future modify/cancel calls use fresh token
+			currentAuth = newAuth
+			modifyErr = m.indiraClient.ModifyOrder(ctx, slOrder, currentAuth)
+		}
+	}
+	if modifyErr != nil {
+		return fmt.Errorf("modify SL leg failed: %w", modifyErr)
 	}
 
 	// Update in-memory state ATOMICALLY — both SLTriggerPrice and HighestPrice
@@ -1732,37 +1817,29 @@ func (m *OCOManager) CancelGroupsByStrategy(ctx context.Context, userID, strateg
 	}
 }
 
-// CancelGroupsBySymbol cancels non-terminal OCO groups for a user+symbol that are
-// NOT bound to a strategy. Strategy-bound groups are managed by their own lifecycle
-// (CancelGroupsByStrategy, strategy deletion/deactivation) and must not be affected
-// by blanket symbol-level cancellation — otherwise force-exiting one strategy's
-// position would cancel SL/TP for another strategy trading the same stock.
+// CancelGroupsBySymbol cancels every non-terminal OCO group for (userID, symbol).
+// Called when a manual exit is detected on the broker terminal — the underlying
+// position is gone, so any open SL/TP legs (across all strategies trading this
+// symbol) must be cancelled to prevent orphaned orders firing into a flat book.
+//
+// Per-strategy cancellation (e.g. strategy delete/deactivate) goes through
+// CancelGroupsByStrategy and does NOT call this function.
 func (m *OCOManager) CancelGroupsBySymbol(ctx context.Context, userID string, symbol string) {
 	var toCancel []uuid.UUID
-	var skippedStrategy int
 	m.groups.Range(func(key, value any) bool {
 		group := value.(*OCOGroup)
 		if group.UserID == userID && group.Symbol == symbol && !group.State.IsTerminal() {
-			// Skip strategy-bound groups — they are cancelled via CancelGroupsByStrategy.
-			if group.StrategyID != "" {
-				skippedStrategy++
-				return true
-			}
 			toCancel = append(toCancel, group.GroupID)
 		}
 		return true
 	})
 
 	if len(toCancel) == 0 {
-		if skippedStrategy > 0 {
-			log.Printf("[oco] Manual exit detected for %s/%s: skipped %d strategy-bound groups (use CancelGroupsByStrategy instead)",
-				userID, symbol, skippedStrategy)
-		}
 		return
 	}
 
-	log.Printf("[oco] Manual exit detected: cancelling %d non-strategy OCO groups for %s/%s (skipped %d strategy-bound)",
-		len(toCancel), userID, symbol, skippedStrategy)
+	log.Printf("[oco] Manual exit detected: cancelling %d OCO group(s) for %s/%s",
+		len(toCancel), userID, symbol)
 	for _, gid := range toCancel {
 		if err := m.CancelGroup(ctx, gid); err != nil {
 			log.Printf("[oco] Failed to cancel group %s: %v", gid, err)
@@ -1786,14 +1863,17 @@ func (m *OCOManager) IsKnownBrokerID(brokerID string) bool {
 // when the broker WS sends EXECUTED, handleEntryUpdate fires and places
 // SL/TP legs from the actual fill price.
 //
-// This is used when a trailing-SL order couldn't be routed through
-// CreateOCOEntry (e.g. auth was unavailable at signal time) but was
-// successfully placed via the default execution path. Without adoption,
-// the position would have no SL/TP protection.
+// Used when an order was placed via the default executor path and needs OCO
+// management retroactively — either because trailing SL auth was unavailable
+// at signal time, or for fixed SL/TP orders that go through Route 3.
+//
+// trailingSL=true enables the trailing SL monitor; false places a fixed SL-M
+// that is never modified after placement.
 func (m *OCOManager) AdoptOrder(
 	order *models.Order,
 	slPercent float64,
 	tpPercent float64,
+	trailingSL bool,
 	trailingSLPct float64,
 	auth *indiraClient.AuthContext,
 ) {
@@ -1814,7 +1894,7 @@ func (m *OCOManager) AdoptOrder(
 		EntryBrokerID: brokerID,
 		SLPercent:     slPercent,
 		TPPercent:     tpPercent,
-		TrailingSL:    true,
+		TrailingSL:    trailingSL,
 		TrailingSLPct: trailingSLPct,
 		State:         StatePendingEntry,
 		Symbol:        order.Symbol,
@@ -1831,15 +1911,24 @@ func (m *OCOManager) AdoptOrder(
 		UpdatedAt:     time.Now(),
 	}
 
-	// Tag the order in DB so HandleBrokerUpdate can find it
+	// Tag the order in DB so HandleBrokerUpdate can find it and reconstructGroup
+	// can restore TrailingSL after a service restart.
 	gid := groupID
 	role := string(RoleEntry)
+	slType := "FIXED"
+	if trailingSL {
+		slType = "TRAILING"
+	}
 	order.OCOGroupID = &gid
 	order.OCORole = &role
+	order.StopLossType = &slType
+	if trailingSLPct > 0 {
+		order.TrailingSLPct = &trailingSLPct
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := m.repo.Update(ctx, order); err != nil {
+		if err := m.repo.UpdateOCOTag(ctx, order.OrderID, groupID, role); err != nil {
 			log.Printf("[oco] AdoptOrder: failed to tag order %s with OCO group: %v", order.OrderID, err)
 		}
 	}()
@@ -1848,8 +1937,8 @@ func (m *OCOManager) AdoptOrder(
 	m.groups.Store(groupID, group)
 	m.brokerIndex.Store(brokerID, groupID)
 
-	log.Printf("[oco] Adopted order %s (broker=%s) into OCO group %s: symbol=%s SL=%.1f%% TP=%.1f%% trailing=true",
-		order.OrderID, brokerID, groupID, order.Symbol, slPercent, tpPercent)
+	log.Printf("[oco] Adopted order %s (broker=%s) into OCO group %s: symbol=%s SL=%.1f%% TP=%.1f%% trailing=%v",
+		order.OrderID, brokerID, groupID, order.Symbol, slPercent, tpPercent, trailingSL)
 }
 
 // ════════════════════════════════════════════════════════════════════════════

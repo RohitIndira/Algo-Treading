@@ -134,6 +134,12 @@ func (c *UserConfigClient) DeactivateStrategy(ctx context.Context, req *pb.Deact
 	return c.client.DeactivateStrategy(ctx, req)
 }
 
+func (c *UserConfigClient) UpdateUserCredentials(ctx context.Context, req *pb.UpdateUserCredentialsRequest) (*pb.UpdateUserCredentialsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.UpdateUserCredentials(ctx, req)
+}
+
 func (c *UserConfigClient) HealthCheck(ctx context.Context, req *common.HealthCheckRequest) (*common.HealthCheckResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()

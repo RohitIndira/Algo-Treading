@@ -221,6 +221,12 @@ message RiskLimits {
 
   // Position sizing strategy
   common.PositionSizing position_sizing = 9;
+
+  // Maximum investment amount per stock per order (₹). 0 = no limit.
+  double max_amount_per_stock = 10;
+
+  // Maximum number of trades this strategy may execute per day. 0 = no limit.
+  int32 max_trades_per_strategy = 11;
 }
 
 // Trading strategy definition
@@ -300,6 +306,10 @@ message UpdateStrategyRequest {
   
   // Version for optimistic locking
   int32 version = 9;
+
+  // Optional: pass renewed Indira credentials. Indira bearer tokens expire daily;
+  // send this field whenever the token is refreshed so orders keep executing.
+  optional common.IndiraAuthContext indira_auth = 10;
 }
 
 message UpdateStrategyResponse {

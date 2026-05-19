@@ -131,7 +131,11 @@ type RiskLimits struct {
 	EnableRiskChecks        bool      `db:"enable_risk_checks" json:"enable_risk_checks"`
 	EnableAutoSquareOff     bool      `db:"enable_auto_square_off" json:"enable_auto_square_off"`
 	AutoSquareOffTime       string    `db:"auto_square_off_time" json:"auto_square_off_time"`
-	CreatedAt               time.Time `db:"created_at" json:"created_at"`
+	// MaxAmountPerStock caps total order value (quantity × price) per stock. NULL = no limit.
+	MaxAmountPerStock    *float64 `db:"max_amount_per_stock" json:"max_amount_per_stock,omitempty"`
+	// MaxTradesPerStrategy caps how many trades this strategy may fire per day. NULL = no limit.
+	MaxTradesPerStrategy *int32   `db:"max_trades_per_strategy" json:"max_trades_per_strategy,omitempty"`
+	CreatedAt            time.Time `db:"created_at" json:"created_at"`
 }
 
 // ExecutionOutbox represents the outbox table for transactional messaging
@@ -178,4 +182,8 @@ type UpdateStrategyRequest struct {
 	RiskLimits   *RiskLimits        `json:"risk_limits,omitempty"`
 	TradingMode  *TradingMode       `json:"trading_mode,omitempty"`
 	Version      int32              `json:"version" validate:"required"`
+
+	// IndiraAuth refreshes the broker credentials for this user.
+	// Pass this whenever the Indira bearer token is renewed (tokens expire daily).
+	IndiraAuth *IndiraAuthContext `json:"indira_auth,omitempty"`
 }

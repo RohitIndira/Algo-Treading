@@ -33,6 +33,22 @@ type Handler struct {
 	marketHours    *utils.MarketHours
 	enforceHours   bool
 	holidayChecker *holiday.Checker
+	// strategyLocks serializes the per-strategy "count → cap check → insert"
+	// window so concurrent worker goroutines cannot both pass a near-limit
+	// check and over-issue trade signals. Keyed by strategy_id.
+	strategyLocks sync.Map
+}
+
+// lockStrategy returns a function that releases a per-strategy mutex. Callers
+// must defer the returned func. The mutex covers the daily-cap check and the
+// signal save so that two events for the same strategy cannot race past the
+// limit. Process-local only — assumes a single rules-engine instance owns each
+// strategy's Kafka partition, which the current deployment guarantees.
+func (h *Handler) lockStrategy(strategyID string) func() {
+	v, _ := h.strategyLocks.LoadOrStore(strategyID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // NewHandler creates a new event handler
@@ -263,6 +279,11 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return fmt.Errorf("strategy is nil in match")
 	}
 
+	// Serialize this strategy's processing so the daily-cap check and the
+	// signal insert cannot race with another goroutine for the same strategy.
+	// Held until the function returns (covers cap check, order build, and save).
+	defer h.lockStrategy(strategy.StrategyID)()
+
 	// ── Trade window check ──────────────────────────────────────────────────
 	// If the strategy has a trade window configured, only place orders when
 	// the current IST time is within that window.
@@ -296,7 +317,28 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return nil
 	}
 
-	if strategy.TradeConfig.Quantity <= 0 {
+	// ── Per-strategy daily trade cap ──────────────────────────────────────────
+	if limit := strategy.RiskLimits.MaxTradesPerStrategy; limit > 0 && h.signalRepo != nil {
+		count, err := h.signalRepo.GetStrategyTradesToday(ctx, strategy.StrategyID, strategy.UpdatedAt)
+		if err != nil {
+			h.logger.Error("Failed to fetch strategy trade count, skipping to be safe",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.Error(err))
+			return nil
+		}
+		if int32(count) >= limit {
+			h.logger.Info("Skipping — strategy has reached its daily trade limit",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("user_id", strategy.UserID),
+				zap.Int("trades_today", count),
+				zap.Int32("max_trades_per_strategy", limit))
+			return nil
+		}
+	}
+
+	// When amount-based sizing is active, quantity is derived from the budget at
+	// execution time — skip the stored-qty check in that case.
+	if strategy.RiskLimits.MaxAmountPerStock == 0 && strategy.TradeConfig.Quantity <= 0 {
 		h.logger.Error("Strategy has invalid quantity in trade_config",
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("user_id", strategy.UserID),
@@ -383,6 +425,12 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	orderReq := models.NewOrderRequest(match, event, strategy)
 	orderReq.Price = ltp // will be overridden below for Case 1/2
 
+	// sizingPrice = the price the order is expected to actually FILL at.
+	// For Case 2 (STOP_LOSS + BRACKET) orderReq.Price holds the trigger price,
+	// not the limit price, so we track the limit separately for budget sizing.
+	// Defaults to orderReq.Price; switch cases below override when they diverge.
+	sizingPrice := orderReq.Price
+
 	// ── Price-change case routing ───────────────────────────────────────
 	// entryPrice = the limit price the order will actually execute at.
 	// slBasePrice = the price from which SL/TP percentages are computed.
@@ -409,18 +457,19 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 		orderReq.OrderType = "LIMIT"
 		orderReq.Price = limitPrice
+		sizingPrice = limitPrice
 
 		if isTrailingSL {
 			// Trailing SL → route to custom OCO in trade-execution.
 			// Use INTRADAY (not BRACKET) because OCO places SL+TP legs separately.
 			orderReq.ProductType = "INTRADAY"
+		} else if isMultiLevelSL || isMultiLevelTP {
+			// Any ML leg → INTRADAY so the broker does NOT place its own SL/TP legs.
+			// ML manager places N separate exit orders; a broker bracket leg would
+			// conflict (double-exit) or be rejected with TP=0.
+			orderReq.ProductType = "INTRADAY"
 		} else {
-			// Fixed SL or MULTI_LEVEL → INTRADAY; ML manager places its own exit orders.
-			if isMultiLevelSL {
-				orderReq.ProductType = "INTRADAY"
-			} else {
-				orderReq.ProductType = "BRACKET"
-			}
+			orderReq.ProductType = "BRACKET"
 		}
 
 		// SL/TP from the trigger price (LTP).
@@ -476,6 +525,10 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 		orderReq.OrderType = "STOP_LOSS"
 		orderReq.Price = targetMonitorPrice // PriceMonitor watches this level
+		// Size against the limit price (target + 0.5% buffer) — that is what the
+		// order will actually fill at, so the budget cap is honored on fill, not
+		// underestimated against the lower trigger price.
+		sizingPrice = limitPrice
 		// Always BRACKET for below_min — price monitor detects this combination
 		// (STOP_LOSS + BRACKET) to route to watch queue. SL type (FIXED/TRAILING)
 		// is carried by stop_loss_type and handled after the price monitor fires.
@@ -524,6 +577,43 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		if !isMultiLevelTP && tpPct > 0 {
 			orderReq.TakeProfit = roundToTickSize(ltp*(1+tpPct/100), tickSize)
 		}
+	}
+
+	// ── Amount-based position sizing ─────────────────────────────────────────
+	// When max_amount_per_stock > 0 the user chose amount-based sizing: we derive
+	// the share count from 98% of their budget at the resolved fill price
+	// (sizingPrice — the limit price the order will actually execute at). The
+	// 2% headroom covers spread, brokerage, and minor slippage so the order
+	// never exceeds the stated limit. math.Floor makes truncation explicit and
+	// guards against any future signed-input regression. This qty is forwarded
+	// to trade-execution for SL / TP legs unchanged.
+	if maxAmt := strategy.RiskLimits.MaxAmountPerStock; maxAmt > 0 {
+		if sizingPrice <= 0 {
+			h.logger.Error("Skipping — invalid sizing price for amount-based budget",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("symbol", event.StockData.Symbol),
+				zap.Float64("sizing_price", sizingPrice))
+			return nil
+		}
+		effectiveBudget := maxAmt * 0.98
+		computedQty := int32(math.Floor(effectiveBudget / sizingPrice))
+		if computedQty < 1 {
+			h.logger.Info("Skipping — cannot afford even 1 share within max_amount_per_stock budget",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("user_id", strategy.UserID),
+				zap.String("symbol", event.StockData.Symbol),
+				zap.Float64("max_amount_per_stock", maxAmt),
+				zap.Float64("effective_budget_98pct", effectiveBudget),
+				zap.Float64("sizing_price", sizingPrice))
+			return nil
+		}
+		orderReq.Quantity = computedQty
+		h.logger.Info("Amount-based sizing: derived quantity from budget",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.Float64("max_amount_per_stock", maxAmt),
+			zap.Float64("effective_budget_98pct", effectiveBudget),
+			zap.Float64("sizing_price", sizingPrice),
+			zap.Int32("computed_qty", computedQty))
 	}
 
 	// Warn when both SL and TP are disabled (pct = 0) on a non-multi-level order.

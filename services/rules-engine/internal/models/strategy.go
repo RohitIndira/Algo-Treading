@@ -95,13 +95,17 @@ type TradeConfig struct {
 
 // RiskLimits represents risk limits
 type RiskLimits struct {
-	MaxDailyTrades      int32   `json:"max_daily_trades" bson:"max_daily_trades"`
-	MaxLossPerDay       float64 `json:"max_loss_per_day" bson:"max_loss_per_day"`
-	MaxPositionSize     float64 `json:"max_position_size" bson:"max_position_size"`
-	MaxPerTradeRisk     float64 `json:"max_per_trade_risk" bson:"max_per_trade_risk"`
-	PositionSizing      string  `json:"position_sizing" bson:"position_sizing"` // FIXED, PERCENTAGE
-	EnableAutoSquareOff bool    `json:"enable_auto_square_off" bson:"enable_auto_square_off"`
-	AutoSquareOffTime   string  `json:"auto_square_off_time" bson:"auto_square_off_time"` // "15:05" format
+	MaxDailyTrades       int32   `json:"max_daily_trades" bson:"max_daily_trades"`
+	MaxLossPerDay        float64 `json:"max_loss_per_day" bson:"max_loss_per_day"`
+	MaxPositionSize      float64 `json:"max_position_size" bson:"max_position_size"`
+	MaxPerTradeRisk      float64 `json:"max_per_trade_risk" bson:"max_per_trade_risk"`
+	PositionSizing       string  `json:"position_sizing" bson:"position_sizing"` // FIXED, PERCENTAGE
+	EnableAutoSquareOff  bool    `json:"enable_auto_square_off" bson:"enable_auto_square_off"`
+	AutoSquareOffTime    string  `json:"auto_square_off_time" bson:"auto_square_off_time"` // "15:05" format
+	// MaxAmountPerStock caps total order value (quantity × price) per stock. 0 = no limit.
+	MaxAmountPerStock    float64 `json:"max_amount_per_stock" bson:"max_amount_per_stock"`
+	// MaxTradesPerStrategy caps how many trades this strategy may fire per day. 0 = no limit.
+	MaxTradesPerStrategy int32   `json:"max_trades_per_strategy" bson:"max_trades_per_strategy"`
 }
 
 // NOTE: ElasticsearchStrategy + ToElasticsearchStrategy removed.
@@ -128,7 +132,9 @@ func (s *Strategy) Validate() error {
 	if s.Conditions.ImpactScoreMax < 0 || s.Conditions.ImpactScoreMax > 10 {
 		return ErrInvalidImpactScore
 	}
-	if s.TradeConfig.Quantity <= 0 {
+	// Allow quantity=0 only when amount-based sizing is configured; the handler
+	// derives the actual quantity at execution time from max_amount_per_stock.
+	if s.RiskLimits.MaxAmountPerStock == 0 && s.TradeConfig.Quantity <= 0 {
 		return ErrInvalidQuantity
 	}
 	if s.TradeConfig.OrderType != "MARKET" && s.TradeConfig.OrderType != "LIMIT" && s.TradeConfig.OrderType != "BRACKET" && s.TradeConfig.OrderType != "STOP_LOSS" {

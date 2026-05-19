@@ -278,18 +278,30 @@ func (c *OCOMarketClient) processMessage(msg []byte) {
 	// ── Binary path ──────────────────────────────────────────────────────
 	switch msg[0] {
 	case wsMsgMarketData:
-		symbol, ltp, ok := decodeBinaryTick(msg)
+		token, symbol, ltp, ok := decodeBinaryTick(msg)
 		if !ok {
 			return
 		}
-		// Update LTP cache
+		// Update LTP cache by symbol name (primary) and token string (fallback).
+		// symbolGroups in TrailingMonitor is keyed by both, so either key fires trailing.
 		c.ltpCacheMu.Lock()
-		c.ltpCache[symbol] = ltp
+		if symbol != "" {
+			c.ltpCache[symbol] = ltp
+		}
+		if token != "" && token != symbol {
+			c.ltpCache[token] = ltp
+		}
 		c.ltpCacheMu.Unlock()
 
-		// Invoke callback
+		// Invoke callback with both keys so TrailingMonitor can look up by symbol first,
+		// then by token as fallback (handles format mismatches between g.Symbol and WSS).
 		if c.priceCallback != nil {
-			c.priceCallback(symbol, ltp)
+			if symbol != "" {
+				c.priceCallback(symbol, ltp)
+			}
+			if token != "" && token != symbol {
+				c.priceCallback(token, ltp)
+			}
 		}
 		return
 
@@ -343,28 +355,34 @@ func (c *OCOMarketClient) processMessage(msg []byte) {
 
 // decodeBinaryTick decodes a binary MARKET_DATA frame.
 // Layout per GetLivePrice.md: type(1) + timestamp(8) + tokenLen(1) + token + symLen(1) + symbol + exchange(1) + ltp(float32 LE)
-func decodeBinaryTick(data []byte) (symbol string, ltp float64, ok bool) {
+// Returns both the token string (numeric, e.g. "11536") and the symbol name (e.g. "RELIANCE")
+// so callers can look up by either key.
+func decodeBinaryTick(data []byte) (token string, symbol string, ltp float64, ok bool) {
 	if len(data) < 10 || data[0] != wsMsgMarketData {
-		return "", 0, false
+		return "", "", 0, false
 	}
 	offset := 1 + 8 // skip type + timestamp
 
-	// token (length-prefixed)
+	// token (length-prefixed) — read it for dual-key lookup
 	if offset >= len(data) {
-		return "", 0, false
+		return "", "", 0, false
 	}
 	tokenLen := int(data[offset])
 	offset++
+	if offset+tokenLen > len(data) {
+		return "", "", 0, false
+	}
+	token = string(data[offset : offset+tokenLen])
 	offset += tokenLen
 
 	// symbol (length-prefixed)
 	if offset >= len(data) {
-		return "", 0, false
+		return "", "", 0, false
 	}
 	symbolLen := int(data[offset])
 	offset++
 	if offset+symbolLen > len(data) {
-		return "", 0, false
+		return "", "", 0, false
 	}
 	symbol = string(data[offset : offset+symbolLen])
 	offset += symbolLen
@@ -374,12 +392,12 @@ func decodeBinaryTick(data []byte) (symbol string, ltp float64, ok bool) {
 
 	// ltp (float32 LE)
 	if offset+4 > len(data) {
-		return "", 0, false
+		return "", "", 0, false
 	}
 	ltpBits := binary.LittleEndian.Uint32(data[offset : offset+4])
 	ltp = float64(math.Float32frombits(ltpBits))
 
-	return symbol, ltp, ltp > 0
+	return token, symbol, ltp, ltp > 0
 }
 
 func extractString(m map[string]interface{}, keys ...string) string {
@@ -511,21 +529,16 @@ func (t *TrailingMonitor) Stop() {
 // This is the PRIMARY price source — sub-millisecond reaction.
 func (t *TrailingMonitor) OnPriceUpdate(symbol string, ltp float64) {
 	t.symbolGroupsMu.RLock()
-	groups, ok := t.symbolGroups[symbol]
+	groups := t.symbolGroups[symbol]
 	t.symbolGroupsMu.RUnlock()
 
-	if !ok || len(groups) == 0 {
+	if len(groups) == 0 {
 		return
 	}
 
 	for _, group := range groups {
 		if group.State != StateActive || !group.TrailingSL {
 			continue
-		}
-		// Log trailing evaluation for diagnostics
-		if ltp > group.HighestPrice {
-			log.Printf("[oco-trailing] New high for %s: ltp=%.2f highest=%.2f sl_trigger=%.2f group=%s",
-				symbol, ltp, group.HighestPrice, group.SLTriggerPrice, group.GroupID)
 		}
 		t.evaluateTrailing(group, ltp)
 	}
@@ -541,9 +554,21 @@ func (t *TrailingMonitor) evaluateTrailing(group *OCOGroup, ltp float64) {
 
 	newTrigger, newLimit, shouldUpdate := group.CalculateTrailingSL(ltp)
 	if !shouldUpdate {
+		// Only log when ltp is genuinely above the highest — otherwise it's just a normal tick below highest.
+		if ltp > group.HighestPrice {
+			minPct := group.TrailingSLPct
+			if minPct <= 0 || minPct > 0.5 {
+				minPct = 0.1
+			}
+			log.Printf("[oco-trailing] New high for %s skipped: ltp=%.2f highest=%.2f trigger_change<%.2f%% threshold group=%s",
+				group.Symbol, ltp, group.HighestPrice, minPct, group.GroupID)
+		}
 		mu.Unlock()
 		return
 	}
+
+	log.Printf("[oco-trailing] Trailing SL update for %s: ltp=%.2f highest=%.2f sl=%.2f→%.2f group=%s",
+		group.Symbol, ltp, group.HighestPrice, group.SLTriggerPrice, newTrigger, group.GroupID)
 
 	// DO NOT update HighestPrice here — it must only be advanced after the
 	// broker modify succeeds. ModifySLLeg updates both SLTriggerPrice and
@@ -575,10 +600,17 @@ func (t *TrailingMonitor) refreshGroups() {
 		if !g.TrailingSL {
 			continue
 		}
+		// Index by symbol name (matches WSS binary frame symbol field for most cases).
 		newMap[g.Symbol] = append(newMap[g.Symbol], g)
 
-		// Check if we need to subscribe this token
+		// Also index by numeric token string as a fallback: if the WSS binary frame
+		// delivers a symbol in a different format than g.Symbol (e.g., "RELIANCE-EQ"
+		// vs "RELIANCE"), OnPriceUpdate would miss it. The token string is unambiguous
+		// and stable — use it as a second lookup key.
 		token := fmt.Sprintf("%d", g.StockCode)
+		if token != g.Symbol { // avoid duplicate slice entries for same key
+			newMap[token] = append(newMap[token], g)
+		}
 		if t.marketClient != nil {
 			t.marketClient.Subscribe([]string{token})
 		}

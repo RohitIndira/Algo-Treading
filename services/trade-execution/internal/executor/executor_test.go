@@ -95,6 +95,18 @@ func (m *mockRepo) GetOCOGroupOrders(ctx context.Context, groupID uuid.UUID) ([]
 func (m *mockRepo) GetAllTodayLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	return nil, nil
 }
+func (m *mockRepo) GetOpenLivePositionAttributionOrders(ctx context.Context, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetUsersWithLiveExposure(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetReconciliationCandidates(ctx context.Context, maxAgeHours int, minAgeSeconds int) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetActiveMLEntries(ctx context.Context) ([]*models.Order, error) {
+	return nil, nil
+}
 func (m *mockRepo) GetFilledLiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error) {
 	return nil, nil
 }

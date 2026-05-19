@@ -388,6 +388,9 @@ func (c *Client) processMessage(msg []byte) {
 	}
 
 	msgType, _ := envelope["type"].(string)
+	if msgType == "periodic_52week_data" {
+		return
+	}
 	switch msgType {
 	case "market_data":
 		symbol, _ := envelope["symbol"].(string)

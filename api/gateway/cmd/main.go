@@ -12,9 +12,8 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
-	"go.uber.org/zap"
-
 	"github.com/RohitIndira/Algo-Treading/api/gateway/config"
+	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/handlers"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/middleware"
@@ -62,8 +61,9 @@ func main() {
 	defer redisClient.Close()
 
 	// Initialize logger for WebSocket handler
-	logger, _ := zap.NewProduction()
-	defer logger.Sync()
+	pkgLgr, _ := pkglogger.NewWithDefaults("api-gateway")
+	defer pkgLgr.Close()
+	logger := pkgLgr.Logger
 
 	// Initialize WebSocket handler
 	websocketHandler := handlers.NewWebSocketHandler(redisClient, logger)
@@ -78,8 +78,16 @@ func main() {
 		AllowedHeaders: cfg.CORS.AllowedHeaders,
 	}
 
+	// Auth config
+	authConfig := middleware.AuthConfig{
+		VerifyURL: cfg.Auth.VerifyURL,
+		Timeout:   cfg.Auth.Timeout,
+	}
+
+	log.Printf("Auth middleware configured: verify URL=%s timeout=%s", authConfig.VerifyURL, authConfig.Timeout)
+
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, corsConfig, authConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

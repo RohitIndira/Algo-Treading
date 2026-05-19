@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
@@ -20,11 +22,13 @@ import (
 
 	"github.com/google/uuid"
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
+	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/lifecycle"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/oco"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/multilevel"
@@ -92,6 +96,11 @@ func main() {
 		cfg.RetryDelay,
 	)
 	log.Println("✓ Order executor initialized")
+
+	// Position-book checker: used by auto-square-off and strategy deactivation
+	// to skip reverse orders for symbols already flat (NetQty == 0) at the
+	// broker. Without it, a redundant square-off would open a fresh short.
+	positionChecker := scheduler.NewPositionChecker(indiraClient, orderExecutor.CredentialsCache())
 
 	// Pre-warm credentials cache with active live-trading users so the first
 	// order per user hits memory instead of DB + decrypt.
@@ -261,6 +270,13 @@ func main() {
 		return orderExecutor.ExecuteOrder(ctx, exitOrder)
 	})
 
+	// Wire LiveBrokerCanceller — used by force-exit-all to cancel submitted orders at the
+	// broker before bulk-cancelling in DB. Delegates to OrderExecutor which handles the
+	// broker API call and local status update in one step.
+	paperWSServer.SetLiveBrokerCanceller(func(ctx context.Context, order *models.Order, reason string) error {
+		return orderExecutor.CancelOrder(ctx, order, reason)
+	})
+
 	// Link OrderStatusService → live orders WS so every status change received from
 	// the Indira broker WebSocket (SUBMITTED→FILLED, PARTIALLY_FILLED, REJECTED, etc.)
 	// is pushed to the frontend immediately without requiring a page refresh.
@@ -315,6 +331,10 @@ func main() {
 	}
 	var positionDebouncers sync.Map // userID → *positionDebounce
 	statusService.SetOnOrderFilled(func(userID string, auth *indiraPkg.AuthContext) {
+		// Cache credentials so PushPositions can be triggered on the next WS connect
+		// without waiting for another fill event.
+		paperWSServer.StoreAuth(userID, auth.BearerToken, auth.AppId, auth.Source)
+
 		val, _ := positionDebouncers.LoadOrStore(userID, &positionDebounce{})
 		d := val.(*positionDebounce)
 		d.mu.Lock()
@@ -349,7 +369,8 @@ func main() {
 		// Wire Redis tick size lookup into the Indira execution client
 		indiraClient.SetTickSizeLookup(redisPrices)
 		indiraClient.SetDPRLookup(redisPrices)
-		log.Println("✓ Dynamic tick size + DPR lookup enabled (Redis market data)")
+		indiraClient.SetLTPLookup(redisPrices)
+		log.Println("✓ Dynamic tick size + DPR + LTP lookup enabled (Redis market data)")
 		// Wire Redis price lookup into strategy events consumer for accurate paper exit PnL
 		strategyEventsConsumer.SetPriceClient(redisPrices)
 	}
@@ -420,6 +441,9 @@ func main() {
 
 		signalProcessor.SetPriceMonitor(priceMonitorRef)
 		strategyEventsConsumer.SetPriceMonitor(priceMonitorRef)
+		strategyEventsConsumer.SetPaperMonitor(paperMonitor)
+		strategyEventsConsumer.SetCredentialsCache(orderExecutor.CredentialsCache())
+		strategyEventsConsumer.SetPositionsLookup(positionsLookupAdapter{pc: positionChecker})
 		paperWSServer.SetPriceMonitor(priceMonitorRef)
 		priceMonitorRef.SetOnTickDone(paperWSServer.BroadcastPriceWatches)
 		log.Println("✓ Price Monitor initialized (WSS primary, Redis fallback, 100ms check interval)")
@@ -562,6 +586,16 @@ func main() {
 	// recorded for remaining ML qty when a strategy is paused or deleted.
 	strategyEventsConsumer.SetMLManager(mlManager)
 
+	// Wire paper market WSS as the price feed for the ML manager.
+	// paperMarketClient fires ticks with (symbol, ltp); the ML manager needs
+	// "exchange:token" key format so groups can be found by stockCode.
+	// SetTickUpdateCallback delivers exchange+token on each tick for this purpose.
+	paperMarketClient.SetTickUpdateCallback(func(exchange, token string, ltp float64) {
+		mlManager.OnPriceUpdate(exchange+":"+token, ltp)
+	})
+	// Use the same WSS connection for ML group subscription management.
+	mlManager.SetWSClient(paperMarketClient)
+
 	log.Println("✓ Multi-level SL/TP layer initialized")
 	// ──────────────────────────────────────────────────────────────────────
 
@@ -579,7 +613,9 @@ func main() {
 	autoSquareOff.SetPaperSquareOff(paperMonitor.SquareOffAll)
 	// Wire per-user paper exit: closes a specific user's paper positions at their custom time.
 	autoSquareOff.SetPaperForceExitUser(paperMonitor.ForceExitAll)
-	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-user: enabled)", cfg.AutoSquareOffTime)
+	// Wire broker position-book check so flat positions (NetQty == 0) aren't squared off again.
+	autoSquareOff.SetPositionChecker(positionChecker)
+	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-user: enabled, broker netQty check: enabled)", cfg.AutoSquareOffTime)
 
 	// Backfill user_square_off_config from today's orders on every startup.
 	// Covers orders placed before the per-user custom square-off fix was deployed,
@@ -593,6 +629,257 @@ func main() {
 		} else if n > 0 {
 			log.Printf("[auto-square-off] Backfilled square-off config for %d user(s) from today's orders", n)
 		}
+	}()
+	// ──────────────────────────────────────────────────────────────────────
+
+	// ── Startup Recovery: broker WS pre-warm ─────────────────────────────
+	// Eagerly re-subscribe the Indira order-status WS for every user with
+	// live exposure (in-flight orders or open positions). Without this, fills,
+	// cancels and rejections that occur during a restart are silently dropped
+	// until the user takes a new action — leaving the DB out of sync with the
+	// broker. Idempotent: StartSubscription tolerates already-subscribed users.
+	go func() {
+		subsystem := "broker_ws"
+		metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(0)
+		start := time.Now()
+		defer func() {
+			metrics.StartupRecoveryDuration.WithLabelValues(subsystem).Observe(time.Since(start).Seconds())
+			metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(1)
+		}()
+
+		warmCtx, warmCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer warmCancel()
+
+		userIDs, err := orderRepo.GetUsersWithLiveExposure(warmCtx)
+		if err != nil {
+			log.Printf("[startup-recovery] broker-ws: list users failed (non-fatal): %v", err)
+			metrics.StartupRecoveryItems.WithLabelValues(subsystem, "error").Inc()
+			return
+		}
+		if len(userIDs) == 0 {
+			log.Println("[startup-recovery] broker-ws: no users with live exposure — skipping pre-warm")
+			return
+		}
+
+		log.Printf("[startup-recovery] broker-ws: pre-warming subscriptions for %d user(s)", len(userIDs))
+		for _, userID := range userIDs {
+			userCtx, userCancel := context.WithTimeout(warmCtx, 5*time.Second)
+			brokerUserId, appId, source, bearerToken, err := credsRepo.GetIndiraCredentials(userCtx, userID)
+			if err != nil {
+				log.Printf("[startup-recovery] broker-ws: skip user=%s creds_error=%v", userID, err)
+				metrics.StartupRecoveryItems.WithLabelValues(subsystem, "skip").Inc()
+				userCancel()
+				continue
+			}
+			auth := &indiraPkg.AuthContext{
+				UserId:      brokerUserId,
+				AppId:       appId,
+				Source:      source,
+				BearerToken: bearerToken,
+			}
+			if err := statusService.StartSubscription(userCtx, userID, auth); err != nil {
+				log.Printf("[startup-recovery] broker-ws: subscribe failed user=%s err=%v", userID, err)
+				metrics.StartupRecoveryItems.WithLabelValues(subsystem, "error").Inc()
+				userCancel()
+				continue
+			}
+			// Cache the auth on paperWSServer so PushPositions can fire without
+			// waiting for the next fill — matches the lazy path's behavior.
+			paperWSServer.StoreAuth(userID, bearerToken, appId, source)
+			metrics.StartupRecoveryItems.WithLabelValues(subsystem, "ok").Inc()
+			userCancel()
+		}
+		log.Printf("[startup-recovery] broker-ws: pre-warm complete")
+	}()
+	// ──────────────────────────────────────────────────────────────────────
+
+	// ── Startup Recovery: in-flight order reconciliation ─────────────────
+	// For each non-terminal order with an indira_order_id, fetch the broker's
+	// authoritative state via GetOrderBook and apply the snapshot if it differs
+	// from the DB. Covers fills/cancels/rejects that landed while we were down.
+	// Gated by ENABLE_STARTUP_RECONCILE — opt-in until we've validated it on
+	// staging. Read-only against the broker; only writes the DB when a change
+	// is observed, and only via the same handleStatusUpdate path used for
+	// real-time WS events.
+	if cfg.EnableStartupReconcile {
+		go func() {
+			subsystem := "reconcile"
+			metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(0)
+			start := time.Now()
+			defer func() {
+				metrics.StartupRecoveryDuration.WithLabelValues(subsystem).Observe(time.Since(start).Seconds())
+				metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(1)
+			}()
+
+			rcCtx, rcCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer rcCancel()
+
+			candidates, err := orderRepo.GetReconciliationCandidates(rcCtx, 24, 30)
+			if err != nil {
+				log.Printf("[startup-recovery] reconcile: list candidates failed: %v", err)
+				metrics.StartupRecoveryItems.WithLabelValues(subsystem, "error").Inc()
+				return
+			}
+			if len(candidates) == 0 {
+				log.Println("[startup-recovery] reconcile: no in-flight orders to reconcile")
+				return
+			}
+
+			// Group orders by user so we make at most one GetOrderBook call per user.
+			byUser := make(map[string][]*models.Order, 8)
+			for _, o := range candidates {
+				byUser[o.UserID] = append(byUser[o.UserID], o)
+			}
+			log.Printf("[startup-recovery] reconcile: %d order(s) across %d user(s)", len(candidates), len(byUser))
+
+			for userID, orders := range byUser {
+				userCtx, userCancel := context.WithTimeout(rcCtx, 15*time.Second)
+				brokerUserId, appId, source, bearerToken, err := credsRepo.GetIndiraCredentials(userCtx, userID)
+				if err != nil {
+					log.Printf("[startup-recovery] reconcile: skip user=%s creds_error=%v", userID, err)
+					metrics.StartupRecoveryItems.WithLabelValues(subsystem, "skip").Add(float64(len(orders)))
+					userCancel()
+					continue
+				}
+				auth := &indiraPkg.AuthContext{
+					UserId:      brokerUserId,
+					AppId:       appId,
+					Source:      source,
+					BearerToken: bearerToken,
+				}
+				book, err := indiraClient.GetOrderBook(userCtx, auth)
+				if err != nil {
+					log.Printf("[startup-recovery] reconcile: order book fetch failed user=%s err=%v", userID, err)
+					metrics.StartupRecoveryItems.WithLabelValues(subsystem, "error").Add(float64(len(orders)))
+					userCancel()
+					continue
+				}
+				// Index broker book by OrdId for O(1) lookup.
+				byOrdID := make(map[string]*indiraPkg.OrderBook, len(book))
+				for i := range book {
+					byOrdID[book[i].OrdId] = &book[i]
+				}
+				for _, o := range orders {
+					if o.IndiraOrderID == nil || *o.IndiraOrderID == "" {
+						metrics.StartupRecoveryItems.WithLabelValues(subsystem, "skip").Inc()
+						continue
+					}
+					bk, ok := byOrdID[*o.IndiraOrderID]
+					if !ok {
+						// Order not in today's book — could be older than the book's window.
+						// Skip rather than assume terminal state.
+						metrics.StartupRecoveryItems.WithLabelValues(subsystem, "skip").Inc()
+						continue
+					}
+					// Build a minimal WSOrderStatus snapshot from the order-book row.
+					// Only fields handleStatusUpdate consults need to be populated;
+					// others can remain zero values.
+					snapshot := &indiraPkg.WSOrderStatus{
+						UniqueCode:   *o.IndiraOrderID,
+						OrderStatus:  bk.Status,
+						Symbol:       bk.Symbol,
+						OrderNumber:  bk.OrdId,
+						TradedQTY:    indiraPkg.FlexInt(fmt.Sprintf("%d", bk.TradedQty)),
+						OrderPrice:   fmt.Sprintf("%f", bk.LimitPrice),
+						TriggerPrice: bk.TriggerPrice,
+						Product:      bk.PrdType,
+						OrderType:    bk.OrdType,
+						BuySell:      bk.OrdAction,
+					}
+					changed, rerr := statusService.ReconcileOrderFromBrokerBook(userCtx, o, snapshot)
+					if rerr != nil {
+						log.Printf("[startup-recovery] reconcile: apply failed order=%s err=%v", o.OrderID, rerr)
+						metrics.StartupRecoveryItems.WithLabelValues(subsystem, "error").Inc()
+						continue
+					}
+					if changed {
+						metrics.StartupRecoveryItems.WithLabelValues(subsystem, "ok").Inc()
+					} else {
+						metrics.StartupRecoveryItems.WithLabelValues(subsystem, "skip").Inc()
+					}
+				}
+				userCancel()
+			}
+			log.Printf("[startup-recovery] reconcile: complete")
+		}()
+	} else {
+		log.Println("[startup-recovery] reconcile: disabled (ENABLE_STARTUP_RECONCILE=false)")
+	}
+	// ──────────────────────────────────────────────────────────────────────
+
+	// ── Startup Recovery: multi-level exit group reload ─────────────────
+	// Rebuild in-memory state for entry orders whose ML SL/TP groups are
+	// still in progress, so price ticks and broker WS events keep routing
+	// correctly after a restart. Read-only against the DB; the manager places
+	// no broker orders during reload. Gated by ENABLE_ML_RELOAD until validated.
+	if cfg.EnableMLReload {
+		go func() {
+			subsystem := "ml_reload"
+			metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(0)
+			start := time.Now()
+			defer func() {
+				metrics.StartupRecoveryDuration.WithLabelValues(subsystem).Observe(time.Since(start).Seconds())
+				metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(1)
+			}()
+			// Wait briefly so mlManager.Start (worker pool) and the price WSS
+			// have had a chance to come up before we register groups.
+			time.Sleep(2 * time.Second)
+			rlCtx, rlCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer rlCancel()
+			stats, err := mlManager.Reload(rlCtx)
+			if err != nil {
+				log.Printf("[startup-recovery] ml_reload: error: %v", err)
+				metrics.StartupRecoveryItems.WithLabelValues(subsystem, "error").Inc()
+				return
+			}
+			metrics.StartupRecoveryItems.WithLabelValues(subsystem, "ok").Add(float64(stats.GroupsRestored))
+			metrics.StartupRecoveryItems.WithLabelValues(subsystem, "skip").Add(float64(stats.GroupsSkipped))
+			log.Printf("[startup-recovery] ml_reload: restored=%d skipped=%d levels=%d sl_lost=%d",
+				stats.GroupsRestored, stats.GroupsSkipped, stats.LevelsRestored, stats.WarnSingleSLLost)
+		}()
+	} else {
+		log.Println("[startup-recovery] ml_reload: disabled (ENABLE_ML_RELOAD=false)")
+	}
+	// ──────────────────────────────────────────────────────────────────────
+
+	// ── Startup Recovery: halted-strategy set hydration ──────────────────
+	// The in-memory haltedStrategies map starts empty on each restart. The
+	// primary defense against signals for paused strategies is upstream
+	// (rules-engine itself stops publishing for paused strategies), but a
+	// strategy paused while trade-execution was offline is briefly eligible
+	// for signals after restart until rules-engine re-emits the pause.
+	//
+	// LoadHaltedFromSource accepts a HaltedStrategiesLoader implementation;
+	// supplying a user-config gRPC client here would close the gap fully.
+	// For now we log readiness with a nil loader so the extension point is
+	// visible and the metric/log surface exists for future wiring.
+	go func() {
+		subsystem := "halted_strategies"
+		metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(0)
+		start := time.Now()
+		defer func() {
+			metrics.StartupRecoveryDuration.WithLabelValues(subsystem).Observe(time.Since(start).Seconds())
+			metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(1)
+		}()
+		// No loader is wired yet — this is the extension point. Once a
+		// user-config client is available, construct it here and pass to
+		// LoadHaltedFromSource.
+		var loader executor.HaltedStrategiesLoader = nil
+		if loader == nil {
+			log.Println("[startup-recovery] halted_strategies: no loader configured — set empty (relies on rules-engine to not publish for paused strategies)")
+			metrics.StartupRecoveryItems.WithLabelValues(subsystem, "skip").Inc()
+			return
+		}
+		hCtx, hCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer hCancel()
+		n, err := signalProcessor.LoadHaltedFromSource(hCtx, loader)
+		if err != nil {
+			log.Printf("[startup-recovery] halted_strategies: load failed (non-fatal): %v", err)
+			metrics.StartupRecoveryItems.WithLabelValues(subsystem, "error").Inc()
+			return
+		}
+		metrics.StartupRecoveryItems.WithLabelValues(subsystem, "ok").Add(float64(n))
+		log.Printf("[startup-recovery] halted_strategies: hydrated %d strategy ID(s)", n)
 	}()
 	// ──────────────────────────────────────────────────────────────────────
 
@@ -633,8 +920,38 @@ func main() {
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
 	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		// Liveness only — process is up. Keep semantics unchanged so existing
+		// orchestrators / probes that hit this endpoint behave identically.
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
+	})
+	// /readyz reports whether the per-subsystem startup recovery has completed.
+	// Orchestrators that want to delay traffic until recovery is done can probe
+	// this instead of /healthz. Subsystems are listed only if their goroutine
+	// actually runs in this build/config; unstarted subsystems are reported
+	// as "not started" rather than blocking ready forever.
+	metricsMux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		// We expose readiness for the subsystems that ALWAYS run on startup.
+		// Optional ones (reconcile, ml_reload) are gated by env flags; if they
+		// didn't start, their gauge stays at 0 and they shouldn't gate readiness.
+		required := []string{"broker_ws"}
+		notReady := make([]string, 0, len(required))
+		for _, name := range required {
+			m := &dto.Metric{}
+			if err := metrics.StartupRecoveryReady.WithLabelValues(name).Write(m); err == nil {
+				if g := m.GetGauge(); g != nil && g.GetValue() >= 1 {
+					continue
+				}
+			}
+			notReady = append(notReady, name)
+		}
+		if len(notReady) > 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, "not ready: %v\n", notReady)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ready"))
 	})
 	metricsServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
@@ -714,6 +1031,12 @@ func main() {
 		ocoTrailingMonitor.Start(ctx)
 	}()
 
+	// Start multi-level SL/TP manager worker pool.
+	// Must be called before Kafka consumer starts so eval workers are ready
+	// when the first multi-level paper order fills and enqueues price jobs.
+	mlManager.Start(ctx)
+	log.Println("✓ Multi-level SL/TP manager worker pool started")
+
 	// Start Kafka consumer — primary intake path (rules-engine trade-signals)
 	go func() {
 		log.Println("Starting Kafka consumer (trade-signals)...")
@@ -786,6 +1109,11 @@ type Config struct {
 	MetricsPort int
 	// Auto square-off
 	AutoSquareOffTime string // "HH:MM" format, default "15:05"
+	// Startup recovery toggles. Both are read-only / additive recovery passes
+	// gated by env flags so they can be rolled out independently and rolled
+	// back without redeploy.
+	EnableStartupReconcile bool // poll broker for in-flight orders on startup
+	EnableMLReload         bool // rebuild multi-level exit groups on startup
 }
 
 func loadConfig() Config {
@@ -814,6 +1142,8 @@ func loadConfig() Config {
 		RedisDB:          getEnvInt("REDIS_DB", 0),
 		MetricsPort:      getEnvInt("METRICS_PORT", 9090),
 		AutoSquareOffTime: getEnv("AUTO_SQUARE_OFF_TIME", "15:05"),
+		EnableStartupReconcile: getEnvBool("ENABLE_STARTUP_RECONCILE", false),
+		EnableMLReload:         getEnvBool("ENABLE_ML_RELOAD", false),
 	}
 }
 
@@ -871,6 +1201,17 @@ func getEnvInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
+func getEnvBool(key string, defaultValue bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return defaultValue
+}
+
 func splitAndTrim(s, sep string) []string {
 	if s == "" {
 		return []string{}
@@ -913,7 +1254,28 @@ func trim(s string) string {
 }
 
 func initLogger() (*zap.Logger, error) {
-	return zap.NewProduction()
+	env := os.Getenv("ENVIRONMENT")
+	if env == "" {
+		env = "development"
+	}
+	logLevel := os.Getenv("LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	logDir := os.Getenv("LOG_DIR")
+	if logDir == "" {
+		logDir = "logs"
+	}
+	lgr, err := pkglogger.New(pkglogger.Config{
+		Environment: env,
+		Level:       logLevel,
+		ServiceName: "trade-execution",
+		LogDir:      logDir,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return lgr.Logger, nil
 }
 
 // checkRequiredTables ensures critical tables for this service exist.
@@ -937,4 +1299,20 @@ func checkRequiredTables(db *sqlx.DB) error {
 	}
 
 	return nil
+}
+
+// positionsLookupAdapter bridges *scheduler.PositionChecker (which returns the
+// concrete *scheduler.OpenPositions) to consumer.OpenPositionsLookup (which
+// expects the interface consumer.OpenPositionsSnapshot). On error it explicitly
+// returns a nil interface so the consumer's nil-check fail-open path triggers.
+type positionsLookupAdapter struct {
+	pc *scheduler.PositionChecker
+}
+
+func (a positionsLookupAdapter) FetchOpenPositions(ctx context.Context, userID string) (consumer.OpenPositionsSnapshot, error) {
+	snap, err := a.pc.FetchOpenPositions(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return snap, nil
 }

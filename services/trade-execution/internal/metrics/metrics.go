@@ -221,4 +221,29 @@ var (
 		Help:      "Time to process a single broker WS status update (DB lookup + update + publish).",
 		Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5},
 	})
+
+	// StartupRecoveryItems counts items recovered per subsystem on service start.
+	// subsystem = "broker_ws" | "reconcile" | "ml_reload" | "halted_strategies"
+	// outcome   = "ok" | "skip" | "error"
+	StartupRecoveryItems = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "trade_execution",
+		Name:      "startup_recovery_items_total",
+		Help:      "Items processed by startup recovery subsystems, by outcome.",
+	}, []string{"subsystem", "outcome"})
+
+	// StartupRecoveryDuration tracks how long each startup recovery subsystem took.
+	StartupRecoveryDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "trade_execution",
+		Name:      "startup_recovery_duration_seconds",
+		Help:      "Wall time per startup recovery subsystem.",
+		Buckets:   []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+	}, []string{"subsystem"})
+
+	// StartupRecoveryReady is 1 once the named subsystem has finished its
+	// (possibly empty) recovery pass. Used by /healthz to delay readiness.
+	StartupRecoveryReady = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "trade_execution",
+		Name:      "startup_recovery_ready",
+		Help:      "1 when the subsystem has completed its startup recovery pass.",
+	}, []string{"subsystem"})
 )

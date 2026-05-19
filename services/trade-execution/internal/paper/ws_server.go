@@ -40,6 +40,32 @@ func fmtISTPtr(t *time.Time) *string {
 	return &s
 }
 
+// entryTimeFromWSData reads OrderEntryTime then OrderTimeStamp from stored broker_ws_data JSON.
+// Priority matches the broker WSS field priority: OrderEntryTime → OrderTimeStamp.
+func entryTimeFromWSData(data string) time.Time {
+	if data == "" {
+		return time.Time{}
+	}
+	var m struct {
+		OrderEntryTime string `json:"OrderEntryTime"`
+		OrderTimeStamp string `json:"OrderTimeStamp"`
+	}
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return time.Time{}
+	}
+	for _, layouts := range []string{m.OrderEntryTime, m.OrderTimeStamp} {
+		if layouts == "" {
+			continue
+		}
+		for _, layout := range []string{"02-Jan-2006 15:04:05", "02-Jan-2006 15.04.05"} {
+			if t, err := time.ParseInLocation(layout, layouts, timezone.IST); err == nil {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
 // orderISTWrapper shadows the time.Time timestamp fields of models.Order with
 // IST-formatted RFC3339 strings so the frontend receives IST times directly.
 type orderISTWrapper struct {
@@ -47,9 +73,10 @@ type orderISTWrapper struct {
 	CreatedAt     string  `json:"created_at"`
 	UpdatedAt     string  `json:"updated_at"`
 	SubmittedAt   *string `json:"submitted_at,omitempty"`
-	ExecutedAt    *string `json:"executed_at,omitempty"`   // entry_time alias
-	EntryTime     *string `json:"entry_time,omitempty"`    // same as executed_at, explicit label
-	PaperExitTime *string `json:"paper_exit_time,omitempty"` // exit_time for paper positions
+	ExecutedAt    *string `json:"executed_at,omitempty"`     // entry_time alias
+	EntryTime     *string `json:"entry_time,omitempty"`      // same as executed_at, explicit label
+	PaperExitTime *string `json:"paper_exit_time,omitempty"` // exit timestamp for paper positions
+	LiveExitTime  *string `json:"live_exit_time,omitempty"`  // exit timestamp for live positions
 }
 
 func wrapOrderIST(o *models.Order) *orderISTWrapper {
@@ -61,6 +88,7 @@ func wrapOrderIST(o *models.Order) *orderISTWrapper {
 		ExecutedAt:    fmtISTPtr(o.ExecutedAt),
 		EntryTime:     fmtISTPtr(o.ExecutedAt),
 		PaperExitTime: fmtISTPtr(o.PaperExitTime),
+		LiveExitTime:  fmtISTPtr(o.LiveExitTime),
 	}
 }
 
@@ -239,6 +267,51 @@ type strategyShare struct {
 	OrderSide    string // side of the entry order
 }
 
+// knownSymbolSeriesSuffixes are the exchange series suffixes Indira appends to
+// the base trading symbol on some venues. We strip them on both the broker side
+// (bp.Symbol) and the orders-table side (order.Symbol) before matching so a
+// strategy that stored "GENUSPOWER" still attributes a broker position reported
+// as "GENUSPOWER-EQ" / "GENUSPOWER-BE". Order matters: longer suffixes first so
+// "-BE" doesn't shadow "-BZ".
+var knownSymbolSeriesSuffixes = []string{
+	"-EQ", "-BE", "-BZ", "-BL", "-IL", "-SM", "-ST", "-IT",
+	"_EQ", "_BE", "_BZ",
+}
+
+// normalizeSymbol uppercases and strips known exchange series suffixes from a
+// trading symbol so equivalent listings match exactly in the enrichment map.
+// Trailing whitespace is trimmed defensively. This is intentionally conservative
+// — only suffixes seen from Indira are stripped, so unrelated symbols never
+// collide (e.g. "KRBL" vs "KRBLINDIA" remain distinct).
+func normalizeSymbol(s string) string {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	for _, sfx := range knownSymbolSeriesSuffixes {
+		if strings.HasSuffix(s, sfx) && len(s) > len(sfx) {
+			return s[:len(s)-len(sfx)]
+		}
+	}
+	return s
+}
+
+// pickEntrySide returns the broker avg-price and qty corresponding to the
+// strategy's entry direction. For closed positions (NetQty==0) the NetQty sign
+// is no longer meaningful, so we prefer the explicit OrderSide; for open
+// positions either signal works. When OrderSide is unknown (broker-direct
+// positions), fall back to NetQty sign.
+func pickEntrySide(bp BrokerPosition, orderSide string) (float64, int) {
+	side := strings.ToUpper(strings.TrimSpace(orderSide))
+	if side == "" {
+		if bp.NetQty < 0 {
+			return bp.SellAvgPrice, bp.SellQty
+		}
+		return bp.BuyAvgPrice, bp.BuyQty
+	}
+	if side == "SELL" {
+		return bp.SellAvgPrice, bp.SellQty
+	}
+	return bp.BuyAvgPrice, bp.BuyQty
+}
+
 // enrichPositions uses broker positions as the source of truth for quantities,
 // prices, exchange data, and P&L. Our orders DB is used ONLY to determine which
 // strategy each position belongs to.
@@ -258,46 +331,50 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 		}
 	}
 
-	// Step 1: From our orders, find the FIRST BUY entry order per (symbol, strategy_id).
-	// We only look at the initial entry order to determine each strategy's share.
-	// Use a dedup key to avoid counting duplicate/retry orders.
+	// Step 1: Find all entry orders per (symbol, strategy_id) to determine each strategy's share.
+	// Works for both long (BUY entry) and short (SELL entry) strategies.
+	// Dedup by order_id to guard against any duplicate rows.
 	type symStratKey struct {
 		Symbol     string
 		StrategyID string
 	}
 
 	shares := make(map[symStratKey]*strategyShare)
-	// Track (symbol, strategy_id, side, qty) to deduplicate identical orders
-	type dedupKey struct {
-		Symbol     string
-		StrategyID string
-		Side       string
-		Qty        int32
-	}
-	seen := make(map[dedupKey]bool)
+	seen := make(map[string]bool) // order_id → already counted
 
 	for _, order := range algoOrders {
 		if order.IsSquareOffOrder {
 			continue
 		}
-		// Only consider entry orders (BUY side for long strategies).
-		// Skip SL/TP legs which are SELL orders for the same strategy.
-		if order.OrderSide != models.OrderSideBuy {
+		// Skip OCO SL/TP legs — these are exit legs placed after entry, not entry positions.
+		if order.OCORole != nil && (*order.OCORole == "SL_LEG" || *order.OCORole == "TP_LEG") {
+			continue
+		}
+		// Skip cancelled/rejected orders ONLY when they never filled. A CANCELLED order
+		// with filled_quantity > 0 was partially executed before the cancel took effect,
+		// so the resulting qty is sitting at the broker and must still be attributed to
+		// this strategy — otherwise the surviving broker qty falls into broker-direct.
+		if (order.Status == models.StatusCancelled || order.Status == models.StatusRejected) && order.FilledQuantity == 0 {
+			continue
+		}
+		// Skip orders whose position was already force-exited (live_exit_price is set).
+		// Using them would wrongly attribute still-open broker positions to exited strategies.
+		if order.LiveExitPrice != nil {
 			continue
 		}
 
-		sym := strings.ToUpper(order.Symbol)
+		sym := normalizeSymbol(order.Symbol)
 		sid := order.StrategyID
 		if sid == "" {
 			sid = "__manual__"
 		}
 
-		// Deduplicate: skip if we've already seen an identical (symbol, strategy, side, qty) order.
-		dk := dedupKey{Symbol: sym, StrategyID: sid, Side: string(order.OrderSide), Qty: order.Quantity}
-		if seen[dk] {
+		// Deduplicate by order_id — each DB row is unique, but guard defensively.
+		oid := order.OrderID.String()
+		if seen[oid] {
 			continue
 		}
-		seen[dk] = true
+		seen[oid] = true
 
 		// Resolve strategy name: order itself > lookup from all orders
 		stratName := order.StrategyName
@@ -321,14 +398,23 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 			share.StrategyName = stratName
 		}
 
-		share.EntryQty += int(order.Quantity)
+		// Use FilledQuantity (actual broker fill), not Quantity (placed). The
+		// broker's BuyQty/SellQty only reflect filled trades, so the ratio
+		// denominator must too — otherwise a strategy with an unfilled or
+		// partially-filled entry gets credited with broker qty it doesn't own.
+		share.EntryQty += int(order.FilledQuantity)
 
-		// Track earliest entry order for metadata
+		// Track earliest entry order for metadata.
+		// Priority: OrderEntryTime/OrderTimeStamp from broker WSS data > executed_at column.
+		// created_at is NOT used — it is submission time, not execution time.
 		entryTime := ""
-		if order.ExecutedAt != nil {
+		if order.BrokerWSData != nil {
+			if t := entryTimeFromWSData(*order.BrokerWSData); !t.IsZero() {
+				entryTime = fmtIST(t)
+			}
+		}
+		if entryTime == "" && order.ExecutedAt != nil {
 			entryTime = fmtIST(*order.ExecutedAt)
-		} else if !order.CreatedAt.IsZero() {
-			entryTime = fmtIST(order.CreatedAt)
 		}
 		if share.EntryOrderID == "" || (entryTime != "" && entryTime < share.EntryTime) {
 			share.EntryOrderID = order.OrderID.String()
@@ -346,13 +432,33 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 	result := make([]EnrichedAlgoPosition, 0, len(brokerPositions))
 
 	for _, bp := range brokerPositions {
-		bpSym := strings.ToUpper(bp.Symbol)
+		// Skip rows with no activity today (no buys AND no sells). These are
+		// stale/placeholder entries the broker may return for instruments the
+		// user touched on a prior session.
+		// We DO emit NetQty==0 rows that have BuyQty>0 AND SellQty>0 — those
+		// are positions opened AND closed today; the frontend renders them
+		// using the broker's authoritative buy_avg_price / sell_avg_price for
+		// realized P&L instead of falling back to our (less accurate) DB rows.
+		if bp.NetQty == 0 && (bp.BuyQty == 0 || bp.SellQty == 0) {
+			continue
+		}
 
-		// Find matching strategies: try exact match, then substring
+		bpSym := normalizeSymbol(bp.Symbol)
+
+		// Find matching strategies: try exact match first, then prefix-only fallback.
+		// Both sides are already normalized (suffixes stripped), so exact match catches
+		// the common case. The prefix fallback is retained as a safety net for any
+		// suffix not yet in knownSymbolSeriesSuffixes (e.g. legacy listings).
 		stratShares, matched := symbolShares[bpSym]
 		if !matched {
 			for sym, ss := range symbolShares {
-				if strings.Contains(bpSym, sym) || strings.Contains(sym, bpSym) {
+				// Only match if one is a prefix of the other AND the length difference is small (≤4 chars).
+				// This covers exchange-appended suffixes like "-EQ", "-BE", "S" without cross-symbol collisions.
+				lenDiff := len(bpSym) - len(sym)
+				if lenDiff < 0 {
+					lenDiff = -lenDiff
+				}
+				if lenDiff <= 4 && (strings.HasPrefix(bpSym, sym) || strings.HasPrefix(sym, bpSym)) {
 					stratShares = ss
 					matched = true
 					break
@@ -361,7 +467,17 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 		}
 
 		if !matched || len(stratShares) == 0 {
-			// No algo orders for this symbol — emit as broker-direct/manual position
+			// No algo orders for this symbol — emit as broker-direct/manual position.
+			// Log enough context to debug surprise broker-direct attributions: the
+			// broker symbol seen, normalized form, and the symbol keys we considered.
+			// Cheap (only fires when a position is unattributed) and read-only, so
+			// it cannot affect order state.
+			knownSyms := make([]string, 0, len(symbolShares))
+			for k := range symbolShares {
+				knownSyms = append(knownSyms, k)
+			}
+			log.Printf("[live-ws] enrichPositions: broker-direct (no algo match) symbol=%q normalized=%q net_qty=%d algo_orders=%d candidate_symbols=%v",
+				bp.Symbol, bpSym, bp.NetQty, len(algoOrders), knownSyms)
 			result = append(result, EnrichedAlgoPosition{
 				Symbol:       bp.Symbol,
 				Exchange:     bp.Exchange,
@@ -382,6 +498,10 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 		if len(stratShares) == 1 {
 			// Single strategy owns the entire broker position — no splitting needed.
 			ss := stratShares[0]
+			// Choose entry-side avg price/qty. For open positions, NetQty sign
+			// reliably gives direction; for closed positions (NetQty==0) it
+			// does not, so we fall back to the strategy's entry OrderSide.
+			filledPrice, filledQty := pickEntrySide(bp, ss.OrderSide)
 			result = append(result, EnrichedAlgoPosition{
 				Symbol:       bp.Symbol,
 				Exchange:     bp.Exchange,
@@ -400,8 +520,8 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 				StrategyID:   ss.StrategyID,
 				StrategyName: ss.StrategyName,
 				OrderSide:    ss.OrderSide,
-				FilledPrice:  bp.BuyAvgPrice,
-				FilledQty:    int32(bp.BuyQty),
+				FilledPrice:  filledPrice,
+				FilledQty:    int32(filledQty),
 				TradingMode:  ss.TradingMode,
 				Status:       "FILLED",
 				ExecutedAt:   ss.EntryTime,
@@ -445,6 +565,15 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 			// P&L is proportional to this strategy's share.
 			splitPnL := bp.PnL * ratio
 
+			// Choose entry-side avg price. Use the strategy's OrderSide
+			// (entry direction) — NetQty sign is unreliable for closed
+			// positions (NetQty==0). Split qty matches the chosen side.
+			splitFilledPrice := bp.BuyAvgPrice
+			splitFilledQty := splitBuyQty
+			if ss.OrderSide == "SELL" || (ss.OrderSide == "" && bp.NetQty < 0) {
+				splitFilledPrice = bp.SellAvgPrice
+				splitFilledQty = splitSellQty
+			}
 			result = append(result, EnrichedAlgoPosition{
 				Symbol:       bp.Symbol,
 				Exchange:     bp.Exchange,
@@ -463,8 +592,8 @@ func enrichPositions(brokerPositions []BrokerPosition, algoOrders []*models.Orde
 				StrategyID:   ss.StrategyID,
 				StrategyName: ss.StrategyName,
 				OrderSide:    ss.OrderSide,
-				FilledPrice:  bp.BuyAvgPrice,
-				FilledQty:    int32(splitBuyQty),
+				FilledPrice:  splitFilledPrice,
+				FilledQty:    int32(splitFilledQty),
 				TradingMode:  ss.TradingMode,
 				Status:       "FILLED",
 				ExecutedAt:   ss.EntryTime,
@@ -491,6 +620,10 @@ type OCOCanceller interface {
 // limitPrice is LTP±1% to ensure immediate fill without using a market order (compliance).
 // Wired in main.go to OrderExecutor.
 type ExitOrderPlacer func(ctx context.Context, originalOrder *models.Order, limitPrice float64, bearerToken, appId, source string) error
+
+// LiveBrokerCanceller sends a cancel request to the broker for a submitted live order.
+// Wired in main.go to OrderExecutor.CancelOrder.
+type LiveBrokerCanceller func(ctx context.Context, order *models.Order, reason string) error
 
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
@@ -521,12 +654,26 @@ type PaperWSServer struct {
 	// exitOrderPlacer places reverse limit orders at the broker for live position exits.
 	exitOrderPlacer ExitOrderPlacer
 
+	// liveBrokerCanceller sends cancel requests to the broker for submitted orders.
+	liveBrokerCanceller LiveBrokerCanceller
+
 	// Paper trade clients: sync.Map[userID string → *sync.Map[*websocket.Conn → *sync.Mutex]]
 	// Lock-free reads on the hot path (Broadcast).
 	clients sync.Map
 
 	// Live order clients: sync.Map[userID string → *sync.Map[*websocket.Conn → *sync.Mutex]]
 	liveClients sync.Map
+
+	// lastBrokerAuth caches the most recent broker credentials per user.
+	// Updated by StoreAuth whenever a fill event arrives with fresh auth.
+	// Used to push positions on WS connect without waiting for the next fill.
+	lastBrokerAuth sync.Map // userID → brokerAuthEntry
+}
+
+type brokerAuthEntry struct {
+	BearerToken string
+	AppId       string
+	Source      string
 }
 
 // NewPaperWSServer creates the WebSocket server.
@@ -551,9 +698,39 @@ func (s *PaperWSServer) SetExitOrderPlacer(fn ExitOrderPlacer) {
 	s.exitOrderPlacer = fn
 }
 
+// SetLiveBrokerCanceller wires the callback that sends cancel requests to the broker
+// for submitted live orders on force-exit.
+func (s *PaperWSServer) SetLiveBrokerCanceller(fn LiveBrokerCanceller) {
+	s.liveBrokerCanceller = fn
+}
+
 // SetPositionsFetcher wires the Indira positions fetcher used by the indira-positions endpoint.
 func (s *PaperWSServer) SetPositionsFetcher(fn PositionsFetcher) {
 	s.positionsFetcher = fn
+}
+
+// StoreAuth caches the latest broker credentials for a user.
+// Called from main.go whenever a fill event carries fresh auth so the credentials
+// are available for on-connect position pushes even when no fill happens.
+func (s *PaperWSServer) StoreAuth(userID, bearerToken, appId, source string) {
+	if bearerToken == "" {
+		return
+	}
+	s.lastBrokerAuth.Store(userID, brokerAuthEntry{
+		BearerToken: bearerToken,
+		AppId:       appId,
+		Source:      source,
+	})
+}
+
+// GetAuth returns the last cached broker credentials for a user.
+func (s *PaperWSServer) GetAuth(userID string) (bearerToken, appId, source string, ok bool) {
+	val, exists := s.lastBrokerAuth.Load(userID)
+	if !exists {
+		return "", "", "", false
+	}
+	e := val.(brokerAuthEntry)
+	return e.BearerToken, e.AppId, e.Source, true
 }
 
 // SetStatusService wires the broker WS subscription starter.
@@ -930,6 +1107,13 @@ func (s *PaperWSServer) handleLiveOrdersWS(w http.ResponseWriter, r *http.Reques
 	connMu := s.registerLiveClient(userID, conn)
 	defer s.unregisterLiveClient(userID, conn)
 
+	// Push fresh broker positions immediately on connect using cached credentials.
+	// This ensures the frontend sees up-to-date data even when positions were closed
+	// by EOD auto-square-off or broker-level SL/TP hits between the last fill event.
+	if bearerToken, appId, source, ok := s.GetAuth(userID); ok {
+		go s.PushPositions(r.Context(), userID, bearerToken, appId, source)
+	}
+
 	// Server-side ping loop: keeps the connection alive through proxies/load balancers.
 	go func() {
 		ticker := time.NewTicker(pingPeriod)
@@ -1002,18 +1186,17 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	orders, err := s.repo.GetLiveOrdersByUser(r.Context(), body.UserID)
+	// exitableOrders: entry positions that need a reverse exit order placed at the broker.
+	// Filters: is_square_off_order=false, filled_quantity>0, live_exit_price IS NULL.
+	// Safe to retry — UpdateLiveTradeExit is now idempotent.
+	exitableOrders, err := s.repo.GetExitableLiveOrdersByUser(r.Context(), body.UserID)
 	if err != nil {
 		http.Error(w, "failed to fetch live orders: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	exitCount := 0
-	for _, order := range orders {
-		if !models.IsFilledStatus(order.Status) || order.FilledQuantity == 0 {
-			continue
-		}
-
+	for _, order := range exitableOrders {
 		exitPrice := safeF(order.FilledPrice)
 		if s.monitor != nil {
 			if p := s.monitor.ResolveExitPrice(r.Context(), order); p > 0 {
@@ -1047,6 +1230,50 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 	// Cancel all active OCO groups — their SL/TP legs must be removed from exchange
 	if s.ocoCanceller != nil {
 		s.ocoCanceller.CancelAllGroupsByUser(r.Context(), body.UserID)
+	}
+
+	// Broker-cancel all non-terminal entry orders still live at the exchange (SUBMITTED /
+	// PARTIALLY_FILLED). We fetch ALL of today's orders here because some may be SUBMITTED
+	// with filled_price IS NULL (not in exitableOrders) yet sitting at the broker.
+	// Fully-filled orders are skipped — they already have a reverse exit order above.
+	// RECEIVED/PENDING orders (IndiraOrderID == nil) are handled by the DB bulk cancel below.
+	if s.liveBrokerCanceller != nil {
+		allOrders, fetchErr := s.repo.GetLiveOrdersByUser(r.Context(), body.UserID)
+		if fetchErr != nil {
+			log.Printf("[live-ws] Failed to fetch all orders for broker cancel (user %s): %v", body.UserID, fetchErr)
+		} else {
+			var cancelWg sync.WaitGroup
+			for _, order := range allOrders {
+				if order.IsSquareOffOrder {
+					continue // never cancel exit orders placed above
+				}
+				if models.IsTerminalStatus(order.Status) {
+					continue
+				}
+				// Skip fully-filled orders — exit order already placed for these above.
+				if models.IsFilledStatus(order.Status) && order.FilledQuantity >= order.Quantity {
+					continue
+				}
+				if order.IndiraOrderID == nil {
+					continue // not yet at broker; DB bulk cancel handles these
+				}
+				cancelWg.Add(1)
+				go func(o *models.Order) {
+					defer cancelWg.Done()
+					if err := s.liveBrokerCanceller(r.Context(), o, "Force exit by user"); err != nil {
+						log.Printf("[live-ws] Broker cancel failed for order %s: %v", o.OrderID, err)
+					}
+				}(order)
+			}
+			cancelWg.Wait()
+		}
+	}
+
+	// Bulk-cancel all remaining non-terminal entry orders in DB (RECEIVED, PENDING, SUBMITTED,
+	// and any broker cancellation that failed above). Square-off orders are excluded by the
+	// fixed CancelAllLiveOrdersByUser query so freshly placed exit orders are not wiped.
+	if err := s.repo.CancelAllLiveOrdersByUser(r.Context(), body.UserID); err != nil {
+		log.Printf("[live-ws] Failed to bulk cancel orders for user %s: %v", body.UserID, err)
 	}
 
 	// Broadcast completion then push the updated closed orders so the frontend doesn't
@@ -1194,10 +1421,36 @@ func (s *PaperWSServer) handleGetClosedPaperOrders(w http.ResponseWriter, r *htt
 		http.Error(w, "failed to fetch closed paper orders: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Collect entry order IDs (not square-off rows) for ML level enrichment.
+	var entryIDs []uuid.UUID
+	for _, o := range orders {
+		if !o.IsSquareOffOrder {
+			entryIDs = append(entryIDs, o.OrderID)
+		}
+	}
+	mlLevelsByOrder, _ := s.repo.GetMultiLevelExitLevelsBatch(r.Context(), entryIDs)
+
+	// Build DTOs enriched with ML level data so the frontend can correctly
+	// identify and render multi-level strategies in the Closed tab.
+	// Square-off rows pass through with empty ML fields (omitted via omitempty).
+	dtos := make([]*paperPositionDTO, 0, len(orders))
+	for _, o := range orders {
+		dto := &paperPositionDTO{Order: o}
+		for _, l := range mlLevelsByOrder[o.OrderID] {
+			if l.ExitType == models.MLExitTypeSL {
+				dto.MultiLevelSL = append(dto.MultiLevelSL, l)
+			} else {
+				dto.MultiLevelTP = append(dto.MultiLevelTP, l)
+			}
+		}
+		dtos = append(dtos, dto)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"orders":  wrapOrdersIST(orders),
+		"orders":  dtos,
 	})
 }
 
@@ -1298,8 +1551,10 @@ func (s *PaperWSServer) handleIndiraPositions(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// 2. Get ALL of today's algo orders (including CANCELLED) for enrichment.
-	algoOrders, err := s.repo.GetAllTodayLiveOrdersByUser(r.Context(), userID)
+	// 2. Get algo orders that could still own an open broker position. This widens
+	//    the today-only window so positions opened on a prior session are still
+	//    attributed to their strategy instead of falling into broker-direct.
+	algoOrders, err := s.repo.GetOpenLivePositionAttributionOrders(r.Context(), userID)
 	if err != nil {
 		log.Printf("[live-ws] Failed to fetch algo orders for user %s: %v", userID, err)
 		http.Error(w, "failed to fetch algo orders", http.StatusInternalServerError)
@@ -1374,7 +1629,7 @@ func (s *PaperWSServer) PushPositions(ctx context.Context, userID, bearerToken, 
 		log.Printf("[live-ws] PushPositions: failed to fetch for user %s: %v", userID, err)
 		return
 	}
-	algoOrders, err := s.repo.GetAllTodayLiveOrdersByUser(ctx, userID)
+	algoOrders, err := s.repo.GetOpenLivePositionAttributionOrders(ctx, userID)
 	if err != nil {
 		log.Printf("[live-ws] PushPositions: failed to fetch algo orders for user %s: %v", userID, err)
 		return

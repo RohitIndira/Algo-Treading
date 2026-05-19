@@ -68,12 +68,14 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 
 	// Risk limits
 	s.RiskLimits = models.RiskLimits{
-		MaxDailyTrades:      p.RiskLimits.MaxDailyTrades,
-		MaxPerTradeRisk:     p.RiskLimits.MaxPerTradeRisk,
-		MaxLossPerDay:       p.RiskLimits.MaxLossPerDay,
-		EnableAutoSquareOff: p.RiskLimits.EnableAutoSquareOff,
-		AutoSquareOffTime:   p.RiskLimits.AutoSquareOffTime,
-		MaxPositionSize:     0,
+		MaxDailyTrades:       p.RiskLimits.MaxDailyTrades,
+		MaxPerTradeRisk:      p.RiskLimits.MaxPerTradeRisk,
+		MaxLossPerDay:        p.RiskLimits.MaxLossPerDay,
+		EnableAutoSquareOff:  p.RiskLimits.EnableAutoSquareOff,
+		AutoSquareOffTime:    p.RiskLimits.AutoSquareOffTime,
+		MaxPositionSize:      0,
+		MaxAmountPerStock:    p.RiskLimits.MaxAmountPerStock,
+		MaxTradesPerStrategy: p.RiskLimits.MaxTradesPerStrategy,
 	}
 
 	return s, nil

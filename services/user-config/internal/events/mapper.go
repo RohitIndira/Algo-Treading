@@ -111,6 +111,8 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 			EnableRiskChecks:        s.RiskLimits.EnableRiskChecks,
 			EnableAutoSquareOff:     s.RiskLimits.EnableAutoSquareOff,
 			AutoSquareOffTime:       s.RiskLimits.AutoSquareOffTime,
+			MaxAmountPerStock:       valueOrZeroFloat64(s.RiskLimits.MaxAmountPerStock),
+			MaxTradesPerStrategy:    valueOrZeroInt32(s.RiskLimits.MaxTradesPerStrategy),
 			CreatedAt:               s.RiskLimits.CreatedAt.UnixNano(),
 		}
 	}

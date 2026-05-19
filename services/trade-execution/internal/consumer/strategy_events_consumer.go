@@ -10,9 +10,24 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/timezone"
+	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
+
+// isEODSquareOffWindow returns true during the EOD square-off window (15:00–15:10 IST,
+// weekdays). During this window, AutoSquareOffScheduler is the sole owner of live
+// position closure; StrategyEventsConsumer must NOT also place reverse broker orders
+// or the same position gets closed twice → net short → SEBI penalty.
+func isEODSquareOffWindow() bool {
+	now := time.Now().In(timezone.IST)
+	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+		return false
+	}
+	totalMin := now.Hour()*60 + now.Minute()
+	return totalMin >= 15*60 && totalMin <= 15*60+10
+}
 
 // PaperPriceLookup looks up the current LTP for an instrument from Redis.
 // Satisfied by *paper.RedisPriceClient.
@@ -24,8 +39,10 @@ type PaperPriceLookup interface {
 type configEventType string
 
 const (
-	configPaused  configEventType = "CONFIG_PAUSED"
-	configDeleted configEventType = "CONFIG_DELETED"
+	configPaused   configEventType = "CONFIG_PAUSED"
+	configDeleted  configEventType = "CONFIG_DELETED"
+	configCreated  configEventType = "CONFIG_CREATED"
+	configUpdated  configEventType = "CONFIG_UPDATED"
 )
 
 type strategyEvent struct {
@@ -41,22 +58,58 @@ type OrderUnwatcher interface {
 	UnwatchByStrategy(strategyID string) int
 }
 
+// PaperOrderPurger removes paper orders from the paper monitor's in-memory cache.
+// Implemented by *paper.PaperTradeMonitor.
+type PaperOrderPurger interface {
+	RemoveOrdersByStrategy(strategyID string)
+}
+
+// CredentialsInvalidator evicts a user's cached broker credentials so the next
+// order re-reads the fresh token from DB. Implemented by *executor.CredentialsCache.
+type CredentialsInvalidator interface {
+	Invalidate(userID string)
+}
+
+// StrategyHalter blocks new order execution for a strategy that has been deactivated.
+// Implemented by *executor.SignalProcessor.
+type StrategyHalter interface {
+	HaltStrategy(strategyID string)
+}
 // MLGroupCanceller cancels active multi-level groups for a strategy, recording
 // paper partial exits for remaining qty. Implemented by *multilevel.Manager.
 type MLGroupCanceller interface {
 	CancelGroupsByStrategy(ctx context.Context, userID, strategyID string)
 }
 
+// OpenPositionsSnapshot reports whether an order's underlying position is
+// already flat (NetQty == 0) at the broker. Implemented by
+// *scheduler.OpenPositions.
+type OpenPositionsSnapshot interface {
+	IsExited(order *models.Order) bool
+}
+
+// OpenPositionsLookup queries the broker position book for a user.
+// Implemented by an adapter around *scheduler.PositionChecker. Nil-safe.
+type OpenPositionsLookup interface {
+	FetchOpenPositions(ctx context.Context, userID string) (OpenPositionsSnapshot, error)
+}
+
 // StrategyEventsConsumer listens to user-config-events and closes all open
 // positions / cancels all pending orders when a strategy is deactivated or deleted.
+// It also invalidates the credentials cache when a strategy is created or updated
+// so the next order for that user picks up the latest bearer token from DB.
 type StrategyEventsConsumer struct {
-	reader       *kafka.Reader
-	orderRepo    repository.OrderRepository
-	executor     *executor.OrderExecutor
-	priceMonitor OrderUnwatcher    // nil-safe: may be unset if PriceMonitor is disabled
-	priceClient  PaperPriceLookup  // nil-safe: used to get LTP for paper exit PnL
-	mlManager    MLGroupCanceller  // nil-safe: creates paper partial exits for remaining ML qty
-	logger       *zap.Logger
+	reader         *kafka.Reader
+	orderRepo      repository.OrderRepository
+	executor       *executor.OrderExecutor
+	paperMonitor   PaperOrderPurger       // nil-safe
+	credsCache     CredentialsInvalidator  // nil-safe
+	priceMonitor   OrderUnwatcher          // nil-safe: may be unset if PriceMonitor is disabled
+	priceClient    PaperPriceLookup        // nil-safe: used to get LTP for paper exit PnL
+	mlManager      MLGroupCanceller        // nil-safe: creates paper partial exits for remaining ML qty
+	strategyHalter StrategyHalter          // nil-safe: halts new signals for deactivated strategies
+	positions      OpenPositionsLookup     // nil-safe: skips square-off for already-flat broker positions
+	logger         *zap.Logger
 }
 
 // NewStrategyEventsConsumer creates a consumer for the user-config-events topic.
@@ -98,10 +151,36 @@ func (c *StrategyEventsConsumer) SetPriceClient(pc PaperPriceLookup) {
 	c.priceClient = pc
 }
 
+// SetPaperMonitor wires the paper trade monitor so its in-memory cache is purged
+// when a strategy is deactivated, stopping stale Redis scan log lines.
+func (c *StrategyEventsConsumer) SetPaperMonitor(pm PaperOrderPurger) {
+	c.paperMonitor = pm
+}
+
+// SetCredentialsCache wires the credentials cache so that CONFIG_CREATED and
+// CONFIG_UPDATED events evict the stale entry — forcing the next order to
+// re-read the fresh bearer token from broker_accounts.
+func (c *StrategyEventsConsumer) SetCredentialsCache(cc CredentialsInvalidator) {
+	c.credsCache = cc
+}
+
 // SetMLManager wires the multi-level manager so paper partial exits are recorded
 // for remaining ML qty when a strategy is deactivated.
 func (c *StrategyEventsConsumer) SetMLManager(ml MLGroupCanceller) {
 	c.mlManager = ml
+}
+
+// SetStrategyHalter wires the signal processor so new trade signals for deactivated
+// strategies are rejected before they reach the broker. Call before Start().
+func (c *StrategyEventsConsumer) SetStrategyHalter(h StrategyHalter) {
+	c.strategyHalter = h
+}
+
+// SetPositionsLookup wires the broker position-book checker. With it, strategy
+// deactivation skips reverse orders for symbols already flat (NetQty == 0) at
+// the broker — preventing a redundant square-off from opening a fresh short.
+func (c *StrategyEventsConsumer) SetPositionsLookup(p OpenPositionsLookup) {
+	c.positions = p
 }
 
 // Start begins consuming user-config-events. Blocks until ctx is cancelled.
@@ -153,7 +232,22 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 
 	switch ev.Type {
 	case configPaused, configDeleted:
+		// Immediately block new Kafka signals for this strategy so no new orders
+		// are placed after deactivation, even if the rules-engine has in-flight messages.
+		if c.strategyHalter != nil {
+			c.strategyHalter.HaltStrategy(ev.StrategyID)
+		}
 		return c.closeStrategyPositions(ctx, ev)
+	case configCreated, configUpdated:
+		// Invalidate cached credentials so the next live order re-reads the fresh
+		// bearer token that user-config just wrote to broker_accounts.
+		if c.credsCache != nil && ev.UserID != "" {
+			c.credsCache.Invalidate(ev.UserID)
+			c.logger.Info("credentials cache invalidated on strategy event",
+				zap.String("event_type", string(ev.Type)),
+				zap.String("user_id", ev.UserID))
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -181,6 +275,11 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 				zap.String("strategy_id", ev.StrategyID),
 				zap.Int("removed", removed))
 		}
+	}
+	// Purge from paper monitor in-memory cache so the Redis scan loop stops
+	// logging these positions after the strategy is deactivated.
+	if c.paperMonitor != nil {
+		c.paperMonitor.RemoveOrdersByStrategy(ev.StrategyID)
 	}
 
 	orders, err := c.orderRepo.GetActiveOrdersByStrategy(ctx, ev.StrategyID, ev.UserID)
@@ -222,6 +321,63 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 	// levels that already fired).
 	if c.mlManager != nil {
 		c.mlManager.CancelGroupsByStrategy(ctx, ev.UserID, ev.StrategyID)
+	}
+
+	// Step 1.5: square off live positions already filled at the broker.
+	// SKIP during the EOD window (15:00–15:10 IST): AutoSquareOffScheduler fires at
+	// 15:05 and is the sole owner of EOD position closure. If we also place reverse
+	// orders here, the same position gets closed twice → net short sell → SEBI penalty.
+	// Outside the EOD window (manual deactivation during trading hours) we do need to
+	// place the reverse broker order ourselves.
+	if isEODSquareOffWindow() {
+		c.logger.Info("Skipping live square-off on deactivation — EOD window active; AutoSquareOffScheduler owns this",
+			zap.String("strategy_id", ev.StrategyID),
+			zap.String("user_id", ev.UserID))
+	} else if filledOrders, fetchErr := c.orderRepo.GetExitableLiveOrdersByStrategy(ctx, ev.StrategyID, ev.UserID); fetchErr != nil {
+		c.logger.Error("Failed to fetch filled live orders for square-off on deactivation",
+			zap.String("strategy_id", ev.StrategyID),
+			zap.Error(fetchErr))
+	} else if len(filledOrders) > 0 {
+		// Fetch broker positions once for this user — skip orders whose
+		// underlying position is already flat at the broker (NetQty == 0).
+		// Fail-open: a nil snapshot bypasses the check.
+		var snapshot OpenPositionsSnapshot
+		if c.positions != nil {
+			snap, posErr := c.positions.FetchOpenPositions(ctx, ev.UserID)
+			if posErr != nil {
+				c.logger.Warn("Position-book check unavailable for deactivation; proceeding without skip",
+					zap.String("user_id", ev.UserID),
+					zap.String("strategy_id", ev.StrategyID),
+					zap.Error(posErr))
+			} else {
+				snapshot = snap
+			}
+		}
+
+		var sqWg sync.WaitGroup
+		for _, o := range filledOrders {
+			if o.FilledQuantity <= 0 {
+				continue
+			}
+			if snapshot != nil && snapshot.IsExited(o) {
+				c.logger.Info("Skipping square-off on deactivation: broker NetQty=0 (already exited)",
+					zap.String("order_id", o.OrderID.String()),
+					zap.String("symbol", o.Symbol),
+					zap.String("user_id", o.UserID))
+				continue
+			}
+			sqWg.Add(1)
+			go func(ord *models.Order) {
+				defer sqWg.Done()
+				if sqErr := c.squareOffLivePosition(ctx, ord); sqErr != nil {
+					c.logger.Error("Square-off failed on strategy deactivation",
+						zap.String("order_id", ord.OrderID.String()),
+						zap.String("symbol", ord.Symbol),
+						zap.Error(sqErr))
+				}
+			}(o)
+		}
+		sqWg.Wait()
 	}
 
 	// Step 2: for filled paper orders, record the actual LTP as exit price so that
@@ -272,6 +428,59 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 		zap.String("strategy_id", ev.StrategyID),
 		zap.String("user_id", ev.UserID),
 		zap.Int("orders_processed", len(orders)))
+
+	return nil
+}
+
+// squareOffLivePosition places a reverse MARKET/IOC order to close a live position
+// already filled at the broker. Only the FilledQuantity is reversed so partial fills
+// don't over-exit.
+func (c *StrategyEventsConsumer) squareOffLivePosition(ctx context.Context, original *models.Order) error {
+	reverseSide := models.OrderSideSell
+	if original.OrderSide == models.OrderSideSell {
+		reverseSide = models.OrderSideBuy
+	}
+
+	sqOrder := &models.Order{
+		OrderID:          uuid.New(),
+		EventID:          uuid.New(),
+		UserID:           original.UserID,
+		StrategyID:       original.StrategyID,
+		StrategyName:     original.StrategyName,
+		StockCode:        original.StockCode,
+		Exchange:         original.Exchange,
+		Symbol:           original.Symbol,
+		OrderType:        models.OrderTypeMarket,
+		OrderSide:        reverseSide,
+		Quantity:         original.FilledQuantity,
+		Validity:         "IOC",
+		ProductType:      original.ProductType,
+		Status:           models.StatusReceived,
+		IsSquareOffOrder: true,
+		IsPaperTrade:     false,
+		TradingMode:      "LIVE",
+		RiskApproved:     true,
+		BearerToken:      original.BearerToken,
+		AppId:            original.AppId,
+		Source:           original.Source,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
+	}
+
+	if err := c.orderRepo.Create(ctx, sqOrder); err != nil {
+		return fmt.Errorf("save square-off order: %w", err)
+	}
+
+	if err := c.executor.ExecuteOrder(ctx, sqOrder); err != nil {
+		return fmt.Errorf("execute square-off order: %w", err)
+	}
+
+	c.logger.Info("Live position squared off on strategy deactivation",
+		zap.String("original_order_id", original.OrderID.String()),
+		zap.String("square_off_order_id", sqOrder.OrderID.String()),
+		zap.String("symbol", original.Symbol),
+		zap.String("reverse_side", string(reverseSide)),
+		zap.Int32("qty", original.FilledQuantity))
 
 	return nil
 }

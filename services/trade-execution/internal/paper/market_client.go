@@ -18,6 +18,11 @@ import (
 // PriceCallback is called whenever a new LTP is received for a symbol.
 type PriceCallback func(symbol string, ltp float64)
 
+// TickUpdateCallback is called with the full tick context (exchange, token, ltp).
+// Used by the multi-level manager which indexes groups by numeric instrument token.
+// Key format expected by the ML manager: "<exchange>:<token>" (e.g. "nse:2475").
+type TickUpdateCallback func(exchange, token string, ltp float64)
+
 // Binary message type bytes (matches binaryDecoder.ts and the Go binary WS server)
 const (
 	binMsgMarketData      byte = 0x01
@@ -112,6 +117,11 @@ type PaperMarketClient struct {
 	clientID string
 	callback PriceCallback
 
+	// tickUpdateCb receives full tick context (exchange, token, ltp) for components
+	// that need to look up positions by instrument token rather than symbol name.
+	// Nil-safe: set via SetTickUpdateCallback before starting.
+	tickUpdateCb TickUpdateCallback
+
 	mu         sync.Mutex
 	conn       *websocket.Conn
 	subscribed map[string]bool // token → subscribed
@@ -128,6 +138,12 @@ type PaperMarketClient struct {
 // Every decoded tick is forwarded non-blocking — the callback path is never delayed.
 func (c *PaperMarketClient) SetTickWriter(ch chan<- marketws.TickData) {
 	c.tickCh = ch
+}
+
+// SetTickUpdateCallback wires a callback that receives exchange+token info on each tick.
+// Must be called before Start. Used by the multi-level manager for token-based routing.
+func (c *PaperMarketClient) SetTickUpdateCallback(cb TickUpdateCallback) {
+	c.tickUpdateCb = cb
 }
 
 // NewPaperMarketClient creates the market data client.
@@ -333,6 +349,9 @@ func (c *PaperMarketClient) processMessage(msg []byte) {
 			if c.callback != nil {
 				c.callback(symbol, ltp)
 			}
+			if c.tickUpdateCb != nil && exchange != "" && token != "" {
+				c.tickUpdateCb(exchange, token, ltp)
+			}
 			if c.tickCh != nil {
 				select {
 				case c.tickCh <- marketws.TickData{Symbol: symbol, Token: token, Exchange: exchange, LTP: ltp, Timestamp: time.Now().UnixNano()}:
@@ -377,6 +396,9 @@ func (c *PaperMarketClient) processMessage(msg []byte) {
 		if symbol != "" && ltp > 0 {
 			if c.callback != nil {
 				c.callback(symbol, ltp)
+			}
+			if c.tickUpdateCb != nil && exchange != "" && token != "" {
+				c.tickUpdateCb(exchange, token, ltp)
 			}
 			if c.tickCh != nil {
 				select {
