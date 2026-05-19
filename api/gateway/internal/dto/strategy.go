@@ -46,6 +46,12 @@ type HFTConfig struct {
 	WindowStart         string  `json:"window_start"` // "HH:MM" (optional)
 	WindowEnd           string  `json:"window_end"`   // "HH:MM" (optional)
 	ModifyOnPriceChange bool    `json:"modify_on_price_change"`
+	// Trigger price gate (required per active side; user-config rejects 0).
+	// BUY side arms when LTP >= buy_trigger_price; SELL same with sell_trigger_price.
+	// While Position == 0 a cross-back below trigger cancels any resting chunk
+	// and re-disarms. Once any fill happens, trigger is no longer consulted.
+	BuyTriggerPrice  float64 `json:"buy_trigger_price"`
+	SellTriggerPrice float64 `json:"sell_trigger_price"`
 }
 
 // StrategyConditions represents JSON conditions

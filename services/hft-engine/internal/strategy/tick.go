@@ -54,12 +54,12 @@ func (r *Runner) handleTick(md state.MarketData) {
 	// from handleSide so this is cheap.
 	if r.Cfg.Side != state.SideSell {
 		r.handleSide(&r.live.Buy, "B", state.SideBuy,
-			md.Ask, r.Cfg.BuyLimitPrice,
+			md.Ask, r.Cfg.BuyLimitPrice, r.Cfg.BuyTriggerPrice, md.LTP,
 			r.Cfg.MaxBuyQty, r.Cfg.SingleBuyQty)
 	}
 	if r.Cfg.Side != state.SideBuy {
 		r.handleSide(&r.live.Sell, "S", state.SideSell,
-			md.Bid, r.Cfg.SellLimitPrice,
+			md.Bid, r.Cfg.SellLimitPrice, r.Cfg.SellTriggerPrice, md.LTP,
 			r.Cfg.MaxSellQty, r.Cfg.SingleSellQty)
 	}
 
@@ -78,6 +78,8 @@ func (r *Runner) handleSide(
 	sideEnum state.Side, // BUY or SELL for broker.PlaceLimit
 	touch float64, // ASK for BUY side, BID for SELL side
 	limitPrice float64, // halt threshold
+	triggerPrice float64, // arm gate; <=0 disables the gate (back-compat)
+	ltp float64, // last traded price — what the trigger watches
 	maxQty int,
 	chunkQty int,
 ) {
@@ -93,6 +95,43 @@ func (r *Runner) handleSide(
 		side.Done = true
 		side.HaltReason = state.HaltMaxReached
 		return
+	}
+
+	// Trigger gate. Runs BEFORE price-band so a never-armed side
+	// doesn't trip the halt by being out-of-band — until armed, the
+	// side is conceptually idle and waiting, not actively trading.
+	//
+	// Disabled (back-compat) when triggerPrice <= 0: side is armed
+	// immediately. New strategies always have a positive trigger
+	// (validated by user-config), so this branch is for legacy rows
+	// only.
+	if triggerPrice > 0 {
+		if !side.Armed {
+			if ltp >= triggerPrice {
+				side.Armed = true
+				r.auditRow("ARM", sideC, 0, 0, ltp, "", "")
+				r.logger.Info("trigger armed",
+					zap.String("side", string(sideEnum)),
+					zap.Float64("ltp", ltp),
+					zap.Float64("trigger", triggerPrice))
+			} else {
+				return // still waiting — don't place, don't halt
+			}
+		} else if side.Position == 0 && ltp < triggerPrice {
+			// Cross-back before any fill: cancel resting chunk + re-disarm.
+			// Once any fill has happened (Position > 0), the trigger is
+			// no longer consulted — we ride to max_qty.
+			if side.Current != nil {
+				r.cancelCurrentChunk(side, sideC, "trigger_disarm")
+			}
+			side.Armed = false
+			r.auditRow("DISARM", sideC, 0, 0, ltp, "", "")
+			r.logger.Info("trigger disarmed (cross-back, no fills yet)",
+				zap.String("side", string(sideEnum)),
+				zap.Float64("ltp", ltp),
+				zap.Float64("trigger", triggerPrice))
+			return
+		}
 	}
 
 	// Price-band halt. Applies whether or not a chunk is resting. If a

@@ -69,6 +69,8 @@ func dtoHFTConfigToProto(h *dto.HFTConfig) *pb.HFTConfig {
 		WindowStart:         h.WindowStart,
 		WindowEnd:           h.WindowEnd,
 		ModifyOnPriceChange: h.ModifyOnPriceChange,
+		BuyTriggerPrice:     h.BuyTriggerPrice,
+		SellTriggerPrice:    h.SellTriggerPrice,
 	}
 }
 
@@ -360,6 +362,8 @@ func slimStrategy(s *pb.Strategy) map[string]interface{} {
 				"single_sell_qty":        h.SingleSellQty,
 				"buy_limit_price":        h.BuyLimitPrice,
 				"sell_limit_price":       h.SellLimitPrice,
+				"buy_trigger_price":      h.BuyTriggerPrice,
+				"sell_trigger_price":     h.SellTriggerPrice,
 				"window_start":           h.WindowStart,
 				"window_end":             h.WindowEnd,
 				"modify_on_price_change": h.ModifyOnPriceChange,

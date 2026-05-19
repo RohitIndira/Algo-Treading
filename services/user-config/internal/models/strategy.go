@@ -45,7 +45,12 @@ type HFTConfig struct {
 	WindowStart         string  `json:"window_start"`
 	WindowEnd           string  `json:"window_end"`
 	ModifyOnPriceChange bool    `json:"modify_on_price_change"`
-	Mode                string  `json:"mode"` // PAPER | LIVE — set by the service from TradingMode
+	// Trigger price gate. Side stays in ARMED:false until LTP >= trigger;
+	// while Position == 0 a cross-back below trigger cancels the resting
+	// chunk and re-disarms. JSON keys must match hft-engine state.Config tags.
+	BuyTriggerPrice  float64 `json:"buy_trigger_price"`
+	SellTriggerPrice float64 `json:"sell_trigger_price"`
+	Mode             string  `json:"mode"` // PAPER | LIVE — set by the service from TradingMode
 }
 
 // Strategy represents a user trading strategy

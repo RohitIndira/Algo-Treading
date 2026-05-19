@@ -563,6 +563,8 @@ func protoHFTConfigToModel(p *pb.HFTConfig) *models.HFTConfig {
 		WindowStart:         p.WindowStart,
 		WindowEnd:           p.WindowEnd,
 		ModifyOnPriceChange: p.ModifyOnPriceChange,
+		BuyTriggerPrice:     p.BuyTriggerPrice,
+		SellTriggerPrice:    p.SellTriggerPrice,
 	}
 }
 
@@ -588,6 +590,8 @@ func modelHFTConfigToProto(m *models.HFTConfig) *pb.HFTConfig {
 		WindowStart:         m.WindowStart,
 		WindowEnd:           m.WindowEnd,
 		ModifyOnPriceChange: m.ModifyOnPriceChange,
+		BuyTriggerPrice:     m.BuyTriggerPrice,
+		SellTriggerPrice:    m.SellTriggerPrice,
 	}
 }
 

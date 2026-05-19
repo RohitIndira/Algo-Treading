@@ -172,6 +172,7 @@ func hftSideToMap(side *hftpb.SideSnapshot) map[string]interface{} {
 		"max_qty":     side.MaxQty,
 		"done":        side.Done,
 		"halt_reason": side.HaltReason,
+		"armed":       side.Armed,
 		"current":     hftChunkToMap(side.Current),
 		"history":     history,
 	}

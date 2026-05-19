@@ -208,6 +208,13 @@ message HFTConfig {
   string window_start = 13;          // "HH:MM" trade window open (optional)
   string window_end = 14;            // "HH:MM" trade window close (optional)
   bool modify_on_price_change = 15;  // chase the market with MODIFY
+  // Trigger price gate — side stays in ARMED:false until LTP >= trigger.
+  // While Position == 0 and any subsequent tick drops LTP < trigger, the
+  // resting chunk is cancelled and the side re-disarms. Once even one
+  // chunk has filled, the trigger is no longer consulted (the side rides
+  // to max_qty under the existing price-band rules).
+  double buy_trigger_price = 16;     // BUY arms when LTP >= this (required iff side in {BUY, BOTH})
+  double sell_trigger_price = 17;    // SELL arms when LTP >= this (required iff side in {SELL, BOTH})
 }
 
 // Risk management limits

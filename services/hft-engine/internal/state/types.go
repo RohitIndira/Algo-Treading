@@ -97,6 +97,15 @@ type Config struct {
 	SellLimitPrice float64 `json:"sell_limit_price"`
 	TickSize       float64 `json:"tick_size"` // rounding granularity for limit prices
 
+	// Trigger price gate — a side stays ARMED:false until LTP >= trigger.
+	// While Position == 0 a cross-back (LTP < trigger) cancels any resting
+	// chunk and re-disarms. Once even one fill happens, trigger is no
+	// longer consulted. Zero means "no gate" (back-compat for any rows
+	// persisted before the field existed); user-config rejects zero on
+	// new strategies via its own validation.
+	BuyTriggerPrice  float64 `json:"buy_trigger_price"`
+	SellTriggerPrice float64 `json:"sell_trigger_price"`
+
 	// Trade window in IST. "HH:MM" strings; "" means no window enforcement.
 	WindowStart string `json:"window_start"` // e.g. "09:15"
 	WindowEnd   string `json:"window_end"`   // e.g. "15:30"
@@ -139,6 +148,13 @@ type SideState struct {
 	// hits maxConsecutiveRejects — protects against burning broker rate
 	// limits on a permanently-failing condition (margin, risk, etc.).
 	ConsecutiveRejects int `json:"consecutive_rejects,omitempty"`
+
+	// Armed is the trigger gate. False = waiting for LTP to cross the
+	// trigger price; the IDLE→PLACE edge is blocked. Once true, normal
+	// state machine runs. While Position == 0 a cross-back below the
+	// trigger flips Armed back to false and cancels any resting chunk;
+	// once Position > 0 the trigger is no longer checked.
+	Armed bool `json:"armed"`
 }
 
 // MarketData is one bid/ask snapshot. Produced by internal/marketws and

@@ -194,6 +194,7 @@ func sideSnapshot(side *state.SideState, maxQty int) *pb.SideSnapshot {
 		MaxQty:     int32(maxQty),
 		Done:       side.Done,
 		HaltReason: string(side.HaltReason),
+		Armed:      side.Armed,
 		History:    make([]*pb.ChunkSnapshot, 0, len(side.History)),
 	}
 	if side.Current != nil {

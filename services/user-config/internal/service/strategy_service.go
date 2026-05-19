@@ -396,6 +396,29 @@ func (s *StrategyService) validateCreateRequest(req *models.CreateStrategyReques
 		if h.BuyLimitPrice < 0 || h.SellLimitPrice < 0 {
 			return fmt.Errorf("hft_config limit prices must be non-negative")
 		}
+		// Trigger price gate (required per active side).
+		// BUY arms when LTP >= buy_trigger_price; SELL arms when LTP >= sell_trigger_price.
+		// Sanity guards:
+		//   - BUY: trigger must sit BELOW the limit ceiling, otherwise we arm
+		//     at a price already above the halt threshold and never trade.
+		//   - SELL: trigger must sit ABOVE the limit floor, otherwise we arm
+		//     at a price already below the floor and instantly halt.
+		if h.Side == "BUY" || h.Side == "BOTH" {
+			if h.BuyTriggerPrice <= 0 {
+				return fmt.Errorf("hft_config.buy_trigger_price must be > 0 for side %s", h.Side)
+			}
+			if h.BuyLimitPrice > 0 && h.BuyTriggerPrice >= h.BuyLimitPrice {
+				return fmt.Errorf("hft_config.buy_trigger_price (%.2f) must be < buy_limit_price (%.2f)", h.BuyTriggerPrice, h.BuyLimitPrice)
+			}
+		}
+		if h.Side == "SELL" || h.Side == "BOTH" {
+			if h.SellTriggerPrice <= 0 {
+				return fmt.Errorf("hft_config.sell_trigger_price must be > 0 for side %s", h.Side)
+			}
+			if h.SellLimitPrice > 0 && h.SellTriggerPrice <= h.SellLimitPrice {
+				return fmt.Errorf("hft_config.sell_trigger_price (%.2f) must be > sell_limit_price (%.2f)", h.SellTriggerPrice, h.SellLimitPrice)
+			}
+		}
 		// Mode mirrors the strategy's trading mode — the hft-engine gates
 		// on it to refuse a PAPER strategy on a LIVE engine and vice versa.
 		h.Mode = string(req.TradingMode)

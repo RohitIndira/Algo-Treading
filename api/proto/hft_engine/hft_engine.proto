@@ -117,6 +117,10 @@ message SideSnapshot {
   int32  max_qty     = 2;
   bool   done        = 3;
   string halt_reason = 4;          // "" | "max_reached" | "price_band" | ...
+  // Trigger gate state. False = waiting for LTP to cross buy/sell_trigger_price;
+  // IDLE→PLACE is blocked. Flips true on the first qualifying tick (audit ARM)
+  // and back to false on a cross-back while Position == 0 (audit DISARM).
+  bool   armed       = 5;
 
   // Current chunk (nil unless one is in flight).
   ChunkSnapshot current = 10;
