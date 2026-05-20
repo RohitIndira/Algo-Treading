@@ -100,6 +100,40 @@ func wrapOrdersIST(orders []*models.Order) []*orderISTWrapper {
 	return wrapped
 }
 
+// mlLevelISTWrapper shadows the time.Time fields of MultiLevelExitRecord with
+// IST-formatted RFC3339 strings so the frontend receives IST times directly.
+// updated_at equals the level's exit/cancellation time (set in the same SQL
+// UPDATE that flips status to TRIGGERED/CANCELLED), so no separate exit_time
+// field is needed.
+type mlLevelISTWrapper struct {
+	*models.MultiLevelExitRecord
+	TriggeredAt  *string `json:"triggered_at"`
+	RebalancedAt *string `json:"rebalanced_at,omitempty"`
+	CreatedAt    string  `json:"created_at"`
+	UpdatedAt    string  `json:"updated_at"`
+}
+
+func wrapMLLevelIST(l *models.MultiLevelExitRecord) *mlLevelISTWrapper {
+	return &mlLevelISTWrapper{
+		MultiLevelExitRecord: l,
+		TriggeredAt:          fmtISTPtr(l.TriggeredAt),
+		RebalancedAt:         fmtISTPtr(l.RebalancedAt),
+		CreatedAt:            fmtIST(l.CreatedAt),
+		UpdatedAt:            fmtIST(l.UpdatedAt),
+	}
+}
+
+func wrapMLLevelsIST(levels []*models.MultiLevelExitRecord) []*mlLevelISTWrapper {
+	if levels == nil {
+		return nil
+	}
+	wrapped := make([]*mlLevelISTWrapper, len(levels))
+	for i, l := range levels {
+		wrapped[i] = wrapMLLevelIST(l)
+	}
+	return wrapped
+}
+
 // PaperUpdate is the message sent to frontend clients over the paper trading WebSocket.
 type PaperUpdate struct {
 	Type       string          `json:"type"`                 // connected | pnl_update | position_exit | force_exit_done | initial_orders | new_order | ml_level_triggered
@@ -868,13 +902,13 @@ type paperPositionDTO struct {
 func (dto *paperPositionDTO) MarshalJSON() ([]byte, error) {
 	type shadow struct {
 		*orderISTWrapper
-		MultiLevelSL []*models.MultiLevelExitRecord `json:"multi_level_sl,omitempty"`
-		MultiLevelTP []*models.MultiLevelExitRecord `json:"multi_level_tp,omitempty"`
+		MultiLevelSL []*mlLevelISTWrapper `json:"multi_level_sl,omitempty"`
+		MultiLevelTP []*mlLevelISTWrapper `json:"multi_level_tp,omitempty"`
 	}
 	return json.Marshal(&shadow{
 		orderISTWrapper: wrapOrderIST(dto.Order),
-		MultiLevelSL:    dto.MultiLevelSL,
-		MultiLevelTP:    dto.MultiLevelTP,
+		MultiLevelSL:    wrapMLLevelsIST(dto.MultiLevelSL),
+		MultiLevelTP:    wrapMLLevelsIST(dto.MultiLevelTP),
 	})
 }
 

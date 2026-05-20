@@ -281,9 +281,16 @@ func (m *Manager) OnEntryFill(
 		}
 	}
 
-	// Build SL exit level states
-	for _, cfg := range g.SLLevelConfigs {
-		qty := int32(float64(filledQty) * cfg.QtyPct / 100)
+	// Sort configs by LevelNum so the "last level absorbs the remainder" rule in
+	// computeInitialExitQtys lands on the highest-numbered level deterministically.
+	sort.Slice(g.SLLevelConfigs, func(i, j int) bool { return g.SLLevelConfigs[i].LevelNum < g.SLLevelConfigs[j].LevelNum })
+	sort.Slice(g.TPLevelConfigs, func(i, j int) bool { return g.TPLevelConfigs[i].LevelNum < g.TPLevelConfigs[j].LevelNum })
+
+	// Build SL exit level states. Quantities are computed via computeInitialExitQtys
+	// so the rounding remainder lands on the last level and Σ ExitQty == filledQty.
+	slQtys := computeInitialExitQtys(g.SLLevelConfigs, filledQty, m.logger, "SL", entryOrderID)
+	for i, cfg := range g.SLLevelConfigs {
+		qty := slQtys[i]
 		g.SLLevels = append(g.SLLevels, &ExitLevelState{
 			LevelNum:        cfg.LevelNum,
 			TriggerPrice:    g.CalcSLTriggerPrice(cfg.PricePct),
@@ -294,9 +301,10 @@ func (m *Manager) OnEntryFill(
 		})
 	}
 
-	// Build TP exit level states
-	for _, cfg := range g.TPLevelConfigs {
-		qty := int32(float64(filledQty) * cfg.QtyPct / 100)
+	// Build TP exit level states (same remainder-on-last-level rule as SL).
+	tpQtys := computeInitialExitQtys(g.TPLevelConfigs, filledQty, m.logger, "TP", entryOrderID)
+	for i, cfg := range g.TPLevelConfigs {
+		qty := tpQtys[i]
 		g.TPLevels = append(g.TPLevels, &ExitLevelState{
 			LevelNum:        cfg.LevelNum,
 			TriggerPrice:    g.CalcTPLimitPrice(cfg.PricePct),
@@ -1791,6 +1799,58 @@ func computeRebalancedQtys(activePcts []float64, totalPct float64, remainingQty 
 	}
 
 	return rounded
+}
+
+// computeInitialExitQtys distributes filledQty across configs in slice order.
+// Each non-last level gets floor(filledQty * QtyPct / 100); the last level
+// absorbs whatever remainder is left so Σ result == filledQty exactly, even
+// when individual percentages don't divide filledQty cleanly. Caller must pass
+// configs sorted by LevelNum ascending so the remainder lands on the highest
+// level deterministically.
+//
+// Misconfiguration handling:
+//   - If cumulative assignment would push the last level below zero (Σ QtyPct
+//     for non-last levels > 100), early levels are clamped so the last level
+//     receives 0 and a warn log is emitted.
+//   - If Σ QtyPct < 100, the last level still gets the full remainder (caller's
+//     contract is "all of filledQty must exit across these levels").
+//
+// logger/exitType/entryOrderID are only used for the misconfig warn log and may
+// be nil/empty in tests.
+func computeInitialExitQtys(configs []SLTPLevelConfig, filledQty int32, logger *zap.Logger, exitType string, entryOrderID uuid.UUID) []int32 {
+	n := len(configs)
+	if n == 0 {
+		return nil
+	}
+	qtys := make([]int32, n)
+	if filledQty <= 0 {
+		return qtys
+	}
+	var assigned int32
+	clamped := false
+	for i := 0; i < n-1; i++ {
+		q := int32(float64(filledQty) * configs[i].QtyPct / 100)
+		// Clamp so we never overshoot filledQty (would otherwise make last level negative).
+		if assigned+q > filledQty {
+			q = filledQty - assigned
+			if q < 0 {
+				q = 0
+			}
+			clamped = true
+		}
+		qtys[i] = q
+		assigned += q
+	}
+	qtys[n-1] = filledQty - assigned // last level absorbs the remainder
+	if clamped && logger != nil {
+		logger.Warn("ml_qty_pct_overflow",
+			zap.String("entry_order_id", entryOrderID.String()),
+			zap.String("exit_type", exitType),
+			zap.Int32("filled_qty", filledQty),
+			zap.Any("configs", configs),
+		)
+	}
+	return qtys
 }
 
 // modifyLevelOrder issues a broker ModifyOrder for a single exit level with updated qty.
