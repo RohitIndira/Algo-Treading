@@ -104,6 +104,14 @@ message StateSnapshot {
   string mode        = 5;          // "PAPER" | "LIVE"
   int64  started_at_unix = 6;
   int64  last_tick_at_unix = 7;
+  // Lifecycle status — the single field the dashboard should drive the
+  // strategy card off, instead of deriving from active/done/halt_reason:
+  //   RUNNING   — active, trading
+  //   COMPLETED — every active side hit max_reached
+  //   HALTED    — stopped on a hard halt (price_band, auth, broker, no_data,
+  //               window_closed)
+  //   STOPPED   — user pressed Stop, or finished without completing
+  string status = 8;
 
   double last_bid = 10;
   double last_ask = 11;

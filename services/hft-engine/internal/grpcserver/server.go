@@ -178,6 +178,7 @@ func snapshotFromState(s *state.Strategy) *pb.StateSnapshot {
 		UserId:         s.Cfg.UserID,
 		Symbol:         s.Cfg.Symbol,
 		Active:         s.Active,
+		Status:         s.Status(),
 		Mode:           string(s.Cfg.Mode),
 		StartedAtUnix:  s.StartedAt.Unix(),
 		LastTickAtUnix: s.LastTickAt.Unix(),

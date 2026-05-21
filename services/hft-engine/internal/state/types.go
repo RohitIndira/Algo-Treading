@@ -202,3 +202,46 @@ type Strategy struct {
 	LastTickAt time.Time
 	Active     bool // false after Exit / halt
 }
+
+// Status returns the dashboard-facing lifecycle status. Single source of
+// truth — used by both the /state response and the persisted runtime row,
+// so the frontend never has to derive state from active/done/halt_reason.
+//
+//	RUNNING   — still active
+//	COMPLETED — every active side hit max_reached
+//	HALTED    — an active side stopped on a hard halt (price band, auth,
+//	            broker hard-fail, no-data, window closed)
+//	STOPPED   — user pressed Stop, or finished without completing
+func (s *Strategy) Status() string {
+	if s.Active {
+		return "RUNNING"
+	}
+	reasons := make([]HaltReason, 0, 2)
+	if s.Cfg.MaxBuyQty > 0 {
+		reasons = append(reasons, s.Buy.HaltReason)
+	}
+	if s.Cfg.MaxSellQty > 0 {
+		reasons = append(reasons, s.Sell.HaltReason)
+	}
+	if len(reasons) == 0 {
+		return "STOPPED"
+	}
+	allMax, anyHardHalt := true, false
+	for _, r := range reasons {
+		if r != HaltMaxReached {
+			allMax = false
+		}
+		switch r {
+		case HaltPriceBand, HaltWindowClosed, HaltAuthExpired, HaltBrokerHardFail, HaltNoData:
+			anyHardHalt = true
+		}
+	}
+	switch {
+	case allMax:
+		return "COMPLETED"
+	case anyHardHalt:
+		return "HALTED"
+	default:
+		return "STOPPED"
+	}
+}

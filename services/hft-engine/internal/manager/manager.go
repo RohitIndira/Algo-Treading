@@ -393,7 +393,7 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 			// COMPLETED/HALTED/STOPPED status forever, surviving the TTL
 			// and engine restarts. Best-effort: a DB blip must not wedge
 			// the runner-exit path.
-			status := terminalStatus(final)
+			status := final.Status()
 			dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if err := m.repo.UpsertRuntimeState(dbCtx, strategyID, status, final); err != nil {
 				m.logger.Warn("persist terminal runtime state failed",
@@ -437,43 +437,8 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 	return nil
 }
 
-// terminalStatus derives the dashboard status from a finished strategy's
-// final snapshot. A side "counts" only if it had a positive max qty.
-//   COMPLETED — every active side hit max_reached
-//   HALTED    — any active side stopped on a hard halt (price band, auth,
-//               broker hard-fail, no-data, window closed)
-//   STOPPED   — everything else (user pressed Stop, or partial then exit)
-func terminalStatus(s *state.Strategy) string {
-	reasons := make([]state.HaltReason, 0, 2)
-	if s.Cfg.MaxBuyQty > 0 {
-		reasons = append(reasons, s.Buy.HaltReason)
-	}
-	if s.Cfg.MaxSellQty > 0 {
-		reasons = append(reasons, s.Sell.HaltReason)
-	}
-	if len(reasons) == 0 {
-		return "STOPPED"
-	}
-	allMax, anyHardHalt := true, false
-	for _, r := range reasons {
-		if r != state.HaltMaxReached {
-			allMax = false
-		}
-		switch r {
-		case state.HaltPriceBand, state.HaltWindowClosed, state.HaltAuthExpired,
-			state.HaltBrokerHardFail, state.HaltNoData:
-			anyHardHalt = true
-		}
-	}
-	switch {
-	case allMax:
-		return "COMPLETED"
-	case anyHardHalt:
-		return "HALTED"
-	default:
-		return "STOPPED"
-	}
-}
+// terminal status is derived by state.Strategy.Status() — single source of
+// truth shared with the /state response.
 
 // Stop signals the Runner to halt and waits up to 5 seconds for it to
 // finish (cancel resting orders + flush audit). The Runner removes

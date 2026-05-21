@@ -149,6 +149,7 @@ func hftSnapshotToMap(s *hftpb.StateSnapshot) map[string]interface{} {
 		"user_id":           s.UserId,
 		"symbol":            s.Symbol,
 		"active":            s.Active,
+		"status":            s.Status, // RUNNING | COMPLETED | HALTED | STOPPED
 		"mode":              s.Mode,
 		"started_at_unix":   s.StartedAtUnix,
 		"last_tick_at_unix": s.LastTickAtUnix,
