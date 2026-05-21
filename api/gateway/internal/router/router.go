@@ -15,6 +15,7 @@ func NewRouter(
 	manthanHandler *handlers.ManthanHandler,
 	hftHandler *handlers.HFTHandler,
 	healthHandler *handlers.HealthHandler,
+	marketHandler *handlers.MarketHandler,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
 
@@ -87,6 +88,13 @@ func NewRouter(
 	// Manthan aggregated overview
 	if manthanHandler != nil {
 		api.HandleFunc("/manthan/overview", manthanHandler.GetOverview).Methods("GET")
+	}
+
+	// Live market quote — reads the ext-Redis tick feed. Public market data,
+	// no auth. Frontend passes ?symbol= (resolved via symbol→isin→token) or
+	// ?token= directly.
+	if marketHandler != nil {
+		api.HandleFunc("/market/quote", marketHandler.GetQuote).Methods("GET")
 	}
 
 	// HFT strategy lifecycle — drives an already-created HFT_BIDDING

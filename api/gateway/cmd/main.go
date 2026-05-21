@@ -133,6 +133,7 @@ func main() {
 	// to enrich positions + signals with live LTP. Env: EXT_REDIS_ADDR / EXT_REDIS_PASSWORD.
 	var manthanHandler *handlers.ManthanHandler
 	var healthHandler *handlers.HealthHandler
+	var extRedis *redis.Client // hoisted: reused by the market-quote handler
 	{
 		pgHost := envOr("POSTGRES_HOST", "localhost")
 		pgPort := envOr("POSTGRES_PORT", "5432")
@@ -185,8 +186,7 @@ func main() {
 			defer ordersDB.Close()
 		}
 
-		// Optional external Redis for live LTP
-		var extRedis *redis.Client
+		// Optional external Redis for live LTP (assigns the hoisted var)
 		if extAddr := os.Getenv("EXT_REDIS_ADDR"); extAddr != "" {
 			extRedis = redis.NewClient(&redis.Options{
 				Addr:         extAddr,
@@ -231,8 +231,16 @@ func main() {
 		AllowedHeaders: cfg.CORS.AllowedHeaders,
 	}
 
+	// Market-quote handler — serves live quotes off the ext-Redis tick feed.
+	// Reuses the same extRedis client built above (nil-safe: route is
+	// gated on the handler in the router).
+	var marketHandler *handlers.MarketHandler
+	if extRedis != nil {
+		marketHandler = handlers.NewMarketHandler(extRedis)
+	}
+
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
