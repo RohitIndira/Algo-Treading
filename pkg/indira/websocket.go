@@ -41,11 +41,10 @@ var tokenExpiredDelays = [3]time.Duration{
 	10 * time.Minute,
 }
 
-// WSClient manages a WebSocket connection.
-// In shared-connection mode the same WSClient is used for multiple users:
-// additional users subscribe via Subscribe(ctx, auth), which sends a
-// WSConnectionRequest on the live connection; the server fans updates back
-// on the same stream with each message carrying the UserID field for routing.
+// WSClient manages a single user's WebSocket connection to the Indira broker.
+// One WSClient = one user = one TCP connection: it owns that user's order
+// token, heartbeat, reconnect loop and token-expiry handling. The broker binds
+// a connection to a single authenticated user, so connections are never shared.
 type WSClient struct {
 	client *Client
 	auth   *AuthContext
@@ -101,27 +100,6 @@ func (w *WSClient) ResumeWithNewAuth(auth *AuthContext) {
 	default:
 	}
 	w.resumeCh <- auth
-}
-
-// Subscribe authenticates an additional user on the shared connection.
-// It fetches a per-user WS order token then sends WSConnectionRequest
-// over the existing live connection. Safe to call concurrently.
-func (w *WSClient) Subscribe(ctx context.Context, auth *AuthContext) error {
-	resp, err := w.client.doRequest(ctx, auth, "GET", wsTokenAPI, nil)
-	if err != nil {
-		return fmt.Errorf("get WS token for user %s: %w", auth.UserId, err)
-	}
-	var tokenResp WebSocketTokenResponse
-	if err := json.Unmarshal(resp.Data, &tokenResp); err != nil {
-		return fmt.Errorf("unmarshal WS token: %w", err)
-	}
-	if len(tokenResp.Result) == 0 || tokenResp.Result[0].OrderToken == "" {
-		return fmt.Errorf("no order token received for user %s", auth.UserId)
-	}
-	return w.SendMessage(WSConnectionRequest{
-		UserId:     auth.UserId,
-		OrderToken: tokenResp.Result[0].OrderToken,
-	})
 }
 
 // SendMessage enqueues a payload to be written on the active WS connection.
@@ -307,6 +285,15 @@ func (w *WSClient) readPump(conn *websocket.Conn) {
 	}
 }
 
+// authUserID returns the current broker user ID under lock. w.auth can be
+// swapped by tryAuthRefresh / ResumeWithNewAuth, so the heartbeat must read it
+// synchronized to always carry this client's correct, current user ID.
+func (w *WSClient) authUserID() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.auth.UserId
+}
+
 // writePump sends heartbeats and queued outbound messages on the given conn.
 // Owns its own conn and stopCh references — safe against reconnects.
 func (w *WSClient) writePump(conn *websocket.Conn, stopCh chan struct{}) {
@@ -337,7 +324,8 @@ func (w *WSClient) writePump(conn *websocket.Conn, stopCh chan struct{}) {
 				return
 			}
 			// Also send application-level heartbeat that the broker expects.
-			hb := WSHeartbeat{UserId: w.auth.UserId, Heartbeat: "h"}
+			// Per-client: this conn's own 45s ticker, this client's user ID.
+			hb := WSHeartbeat{UserId: w.authUserID(), Heartbeat: "h"}
 			hbBytes, _ := json.Marshal(hb)
 			if err := conn.WriteMessage(websocket.TextMessage, hbBytes); err != nil {
 				return

@@ -424,6 +424,32 @@ func (m *Manager) CancelGroup(ctx context.Context, entryOrderID uuid.UUID) {
 	m.cancelGroupInternal(ctx, val.(*Group))
 }
 
+// MarkGroupClosedExternally tears down the ML group for an entry order whose
+// position has been fully closed by an external exit path (the paper monitor's
+// SL/TP safety-net, square-off, or force-exit).
+//
+// Unlike CancelGroup it also marks every still-pending ladder level as SUPERSEDED
+// so the un-fired levels are not later mislabelled CANCELLED — making it clear in
+// the data that the remaining qty WAS exited (by the external path), just not via
+// this level. It records NO paper exit row and NO P&L: the external exit path
+// (ExitPaperPosition) is the single owner of the remaining-qty exit record.
+//
+// Safe to call for non-ML orders (no group, no levels) — it is then a no-op.
+func (m *Manager) MarkGroupClosedExternally(ctx context.Context, entryOrderID uuid.UUID) {
+	if val, ok := m.groupsByEntry.Load(entryOrderID); ok {
+		// Stops the price-monitor goroutine, unsubscribes, and cancels any live
+		// broker SL/TP orders — identical teardown to CancelGroup.
+		m.cancelGroupInternal(ctx, val.(*Group))
+	}
+	// Always reconcile the DB levels: the group may already have been torn down,
+	// and a no-op UPDATE for a non-ML order is harmless (indexed by entry_order_id).
+	if err := m.repo.SupersedeMultiLevelLevels(ctx, entryOrderID); err != nil {
+		m.logger.Warn("ml_supersede_levels_failed",
+			zap.String("entry_order_id", entryOrderID.String()),
+			zap.Error(err))
+	}
+}
+
 func (m *Manager) cancelGroupInternal(ctx context.Context, g *Group) {
 	g.mu.Lock()
 	if g.State != GroupStateActive {

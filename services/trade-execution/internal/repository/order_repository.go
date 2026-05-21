@@ -146,6 +146,11 @@ type OrderRepository interface {
 	// ── Multi-level exit level operations ─────────────────────────────────────
 	UpsertMultiLevelExitLevel(ctx context.Context, rec *models.MultiLevelExitRecord) error
 	UpdateMultiLevelLevelStatus(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, status string, exitPrice float64) error
+	// SupersedeMultiLevelLevels marks every still-pending (PENDING/ACTIVE) level for an
+	// entry order as SUPERSEDED — used when the position is fully closed by an external
+	// exit (monitor SL/TP, square-off, force-exit) so the un-fired levels are not later
+	// mislabelled CANCELLED. Already-terminal (TRIGGERED/CANCELLED) levels are untouched.
+	SupersedeMultiLevelLevels(ctx context.Context, entryOrderID uuid.UUID) error
 	UpdateMultiLevelLevelBrokerID(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, brokerOrderID string, exitOrderID uuid.UUID) error
 	GetMultiLevelExitLevels(ctx context.Context, entryOrderID uuid.UUID) ([]*models.MultiLevelExitRecord, error)
 	// GetMultiLevelExitLevelsBatch fetches ML levels for multiple entry orders in one query.
@@ -1322,6 +1327,25 @@ func (r *orderRepository) UpdateMultiLevelLevelStatus(
 		status, triggeredAt, exitPricePtr, entryOrderID, exitType, levelNum)
 	if err != nil {
 		return fmt.Errorf("failed to update multi-level level status: %w", err)
+	}
+	return nil
+}
+
+// SupersedeMultiLevelLevels marks all still-pending (PENDING/ACTIVE) levels for an
+// entry order as SUPERSEDED. Called when the position is fully closed by an external
+// exit path so the un-fired ladder levels are not later mislabelled as CANCELLED.
+// Already-terminal levels (TRIGGERED/CANCELLED/SUPERSEDED) are left unchanged.
+func (r *orderRepository) SupersedeMultiLevelLevels(ctx context.Context, entryOrderID uuid.UUID) error {
+	query := `
+		UPDATE multi_level_exit_levels
+		SET status     = $1,
+		    updated_at = NOW()
+		WHERE entry_order_id = $2 AND status IN ($3, $4)
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		models.MLStatusSuperseded, entryOrderID, models.MLStatusPending, models.MLStatusActive)
+	if err != nil {
+		return fmt.Errorf("failed to supersede multi-level levels: %w", err)
 	}
 	return nil
 }

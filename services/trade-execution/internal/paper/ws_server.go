@@ -107,15 +107,32 @@ func wrapOrdersIST(orders []*models.Order) []*orderISTWrapper {
 // field is needed.
 type mlLevelISTWrapper struct {
 	*models.MultiLevelExitRecord
+	// Status shadows the embedded record's status. SUPERSEDED is a backend-only
+	// status; it is mapped to CANCELLED here so the frontend — which only knows
+	// the four original statuses — keeps working unchanged. The DB row keeps the
+	// truthful SUPERSEDED value for backend reporting.
+	Status       string  `json:"status"`
 	TriggeredAt  *string `json:"triggered_at"`
 	RebalancedAt *string `json:"rebalanced_at,omitempty"`
 	CreatedAt    string  `json:"created_at"`
 	UpdatedAt    string  `json:"updated_at"`
 }
 
+// apiLevelStatus maps an ML level's internal status to the value exposed in the
+// API. SUPERSEDED (level never fired because the position was closed by an
+// external exit) is presented to the UI as CANCELLED — visually a non-fired
+// level — so no frontend change is needed. All other statuses pass through.
+func apiLevelStatus(status string) string {
+	if status == models.MLStatusSuperseded {
+		return models.MLStatusCancelled
+	}
+	return status
+}
+
 func wrapMLLevelIST(l *models.MultiLevelExitRecord) *mlLevelISTWrapper {
 	return &mlLevelISTWrapper{
 		MultiLevelExitRecord: l,
+		Status:               apiLevelStatus(l.Status),
 		TriggeredAt:          fmtISTPtr(l.TriggeredAt),
 		RebalancedAt:         fmtISTPtr(l.RebalancedAt),
 		CreatedAt:            fmtIST(l.CreatedAt),

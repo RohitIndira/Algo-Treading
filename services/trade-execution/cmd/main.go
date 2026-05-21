@@ -586,6 +586,23 @@ func main() {
 	// recorded for remaining ML qty when a strategy is paused or deleted.
 	strategyEventsConsumer.SetMLManager(mlManager)
 
+	// Wire the broker WS starter: a CONFIG_CREATED / CONFIG_UPDATED event opens
+	// the user's per-user order-status socket immediately — loading their broker
+	// credentials and calling StartSubscription — so order updates stream from
+	// the moment the strategy is active, not only after the first order.
+	strategyEventsConsumer.SetBrokerWSStarter(func(ctx context.Context, userID string) error {
+		brokerUserId, appId, source, bearerToken, err := credsRepo.GetIndiraCredentials(ctx, userID)
+		if err != nil {
+			return fmt.Errorf("load broker credentials: %w", err)
+		}
+		return statusService.StartSubscription(ctx, userID, &indiraPkg.AuthContext{
+			UserId:      brokerUserId,
+			AppId:       appId,
+			Source:      source,
+			BearerToken: bearerToken,
+		})
+	})
+
 	// Wire paper market WSS as the price feed for the ML manager.
 	// paperMarketClient fires ticks with (symbol, ltp); the ML manager needs
 	// "exchange:token" key format so groups can be found by stockCode.
@@ -893,6 +910,12 @@ func main() {
 		log.Println("✓ Tick writer drain loop started (localhost Redis DB=1, ticks:{exchange}:{token}, TTL=12h)")
 	}
 
+	// Idle broker-WS sweep: periodically close per-user broker WebSocket
+	// connections for users with no live exposure so connections don't
+	// accumulate over the trading day.
+	statusService.StartIdleSweep(ctx, 15*time.Minute)
+	log.Println("✓ Broker WS idle-connection sweep started (15m interval)")
+
 	// ── Lifecycle: ordered graceful shutdown ──────────────────────────────────
 	lc := lifecycle.New(cancel, 15*time.Second)
 
@@ -910,6 +933,11 @@ func main() {
 	lc.RegisterCloseable("Kafka publisher", kafkaPub)
 	// 4. Auto Square-Off Scheduler
 	lc.RegisterStoppable("Auto Square-Off Scheduler", autoSquareOff)
+	// 4b. Per-user broker WebSocket connections (stop receiving order updates)
+	lc.Register(lifecycle.Component{
+		Name:   "Broker WS connections",
+		StopFn: statusService.CloseAll,
+	})
 	// 5. PostgreSQL (release connections)
 	lc.Register(lifecycle.Component{
 		Name:    "PostgreSQL",

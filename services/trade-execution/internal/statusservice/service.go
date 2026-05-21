@@ -44,9 +44,11 @@ type MLHandler interface {
 	IsKnownBrokerID(brokerID string) bool
 }
 
-// OrderStatusService listens to a single shared WebSocket connection and
-// routes order-status updates to the correct user by WSOrderStatus.UserID.
-// All active users share one TCP connection to Indira instead of one per user.
+// OrderStatusService maintains one dedicated WebSocket connection per user to
+// the Indira broker. The broker binds a connection to a single authenticated
+// user, so order statuses for multiple users cannot share a connection — each
+// subscribed user gets its own WSClient (own token, heartbeat, reconnect loop)
+// and its own processUpdates goroutine draining that client's Updates channel.
 type OrderStatusService struct {
 	execClient    *inexec.ExecutionClient
 	repo          repository.OrderRepository
@@ -65,14 +67,24 @@ type OrderStatusService struct {
 	// Wired in main.go to fetch and push updated positions via /ws/live-orders.
 	onOrderFilled func(userID string, auth *indiraClient.AuthContext)
 
-	// Single shared WS client. Protected by wsMu for first-connect init only.
-	wsMu             sync.Mutex
-	wsClient         *indiraClient.WSClient // nil until first StartSubscription
-	processorRunning bool                   // true while processUpdates goroutine is alive
+	// userMu: userID → *sync.Mutex. Serializes StartSubscription/StopSubscription
+	// for the SAME user (so concurrent calls can't create duplicate clients).
+	// Per-user — NOT a single global lock — because StartSubscription holds it
+	// across a blocking broker connect; a global lock would let one user's slow
+	// connect freeze every other user's subscription.
+	userMu sync.Map
+
+	// wsClients: userID → *indiraClient.WSClient. One dedicated broker
+	// connection per subscribed user.
+	wsClients sync.Map
+
+	// processors: userID → context.CancelFunc. Cancels that user's
+	// processUpdates goroutine on StopSubscription.
+	processors sync.Map
 
 	// subscriberAuths: userID → *indiraClient.AuthContext
-	// Serves two purposes: (1) tracks who is subscribed, (2) enables re-subscription
-	// after a reconnect using the stored auth context.
+	// Tracks who is subscribed and supplies the latest auth for position
+	// fetches after a fill and for re-login (ResumeUserSubscription).
 	subscriberAuths sync.Map
 
 	// orderMutexes: brokerOrderID → *sync.Mutex
@@ -91,6 +103,15 @@ type OrderStatusService struct {
 // Callers MUST defer Unlock immediately after acquiring.
 func (s *OrderStatusService) lockOrder(brokerOrderID string) *sync.Mutex {
 	muVal, _ := s.orderMutexes.LoadOrStore(brokerOrderID, &sync.Mutex{})
+	return muVal.(*sync.Mutex)
+}
+
+// lockUser returns the mutex serializing StartSubscription/StopSubscription for
+// one user. Each user has its own mutex, so a slow broker connect for one user
+// never blocks subscription work for another. Entries are never deleted: a
+// concurrent caller may already hold a pointer to the mutex.
+func (s *OrderStatusService) lockUser(userID string) *sync.Mutex {
+	muVal, _ := s.userMu.LoadOrStore(userID, &sync.Mutex{})
 	return muVal.(*sync.Mutex)
 }
 
@@ -115,15 +136,13 @@ func (s *OrderStatusService) SetOnOrderFilled(fn func(userID string, auth *indir
 }
 
 // ResumeUserSubscription supplies a fresh AuthContext after the user re-logins.
-// It updates the stored auth and tells the shared WS client to reconnect immediately.
+// It updates the stored auth and tells that user's WS client to reconnect
+// immediately with the new credentials.
 func (s *OrderStatusService) ResumeUserSubscription(userID string, auth *indiraClient.AuthContext) {
 	authCopy := *auth
 	s.subscriberAuths.Store(userID, &authCopy)
-	s.wsMu.Lock()
-	ws := s.wsClient
-	s.wsMu.Unlock()
-	if ws != nil {
-		ws.ResumeWithNewAuth(&authCopy)
+	if v, ok := s.wsClients.Load(userID); ok {
+		v.(*indiraClient.WSClient).ResumeWithNewAuth(&authCopy)
 		s.logger.Info("Auth resume sent to WS client", zap.String("user_id", userID))
 	}
 }
@@ -155,68 +174,149 @@ func NewOrderStatusService(execClient *inexec.ExecutionClient, repo repository.O
 	}
 }
 
-// StartSubscription subscribes userID to the shared WS connection.
-// The first call establishes the connection; subsequent calls send a
-// WSConnectionRequest message on the existing connection. Idempotent.
+// StartSubscription opens a dedicated broker WebSocket connection for userID.
+// Idempotent: if the user already has a connection, it only refreshes the
+// stored auth — the client's own monitorReconnect loop self-heals any drop,
+// so no further action is needed.
 func (s *OrderStatusService) StartSubscription(ctx context.Context, userID string, auth *indiraClient.AuthContext) error {
 	// Always refresh stored auth (bearer token may have rotated).
 	authCopy := *auth
 	s.subscriberAuths.Store(userID, &authCopy)
 
-	s.wsMu.Lock()
-	defer s.wsMu.Unlock()
+	// Per-user lock: concurrent Start/Stop for the SAME user serialize, but
+	// different users never block each other — one user's slow broker connect
+	// must not freeze anyone else's subscription.
+	mu := s.lockUser(userID)
+	mu.Lock()
+	defer mu.Unlock()
 
-	if s.wsClient == nil {
-		// First user — establish the shared connection.
-		wsClient, err := s.execClient.GetSharedWSClient(ctx, auth)
-		if err != nil {
-			s.subscriberAuths.Delete(userID)
-			return fmt.Errorf("failed to connect shared WS: %w", err)
-		}
-		s.wsClient = wsClient
-		// Re-subscribe all stored users after any reconnect.
-		s.wsClient.OnReconnected = s.resubscribeAll
-		// On 401, reload credentials from DB so the WS can recover
-		// without waiting for the user to place a new order.
-		s.wsClient.OnAuthRefresh = s.refreshAuthFromDB
-		// On confirmed token expiry (30s retry also failed), notify ALL subscribed users.
-		// The shared WS represents all users — when it can't reconnect, every user loses
-		// real-time order updates and should be prompted to re-login.
-		s.wsClient.OnTokenExpired = func(_ string) {
-			if s.tokenExpiredNotifier == nil {
-				return
-			}
-			s.subscriberAuths.Range(func(key, _ any) bool {
-				userID := key.(string)
-				go s.tokenExpiredNotifier(userID)
-				return true
-			})
-		}
-	}
-
-	// Ensure the update processor goroutine is always running.
-	// Uses context.Background() because it must live for the entire
-	// service lifetime, not be tied to the caller's context.
-	if !s.processorRunning {
-		s.processorRunning = true
-		go s.processUpdates(context.Background())
-		s.logger.Info("Shared WS established", zap.String("first_user", userID))
+	// Already connected for this user — nothing to do. The per-user WSClient's
+	// monitorReconnect goroutine handles all future drops on its own.
+	if _, ok := s.wsClients.Load(userID); ok {
 		return nil
 	}
 
-	// Subsequent user — subscribe on the live connection.
-	if err := s.wsClient.Subscribe(ctx, auth); err != nil {
-		return fmt.Errorf("subscribe user %s on shared WS: %w", userID, err)
+	client := s.execClient.NewUserWSClient(&authCopy)
+
+	// Wire per-user callbacks. userID is captured from the closure (our system
+	// user ID) rather than taken from the WSClient's broker auth, so DB and
+	// notifier lookups always use the correct key.
+	client.OnReconnected = func() {
+		metrics.BrokerWSReconnects.Inc()
+		s.logger.Info("Broker WS reconnected", zap.String("user_id", userID))
 	}
-	s.logger.Info("User subscribed on shared WS", zap.String("user_id", userID))
+	// On 401, reload credentials from DB so the WS can recover without waiting
+	// for the user to place a new order.
+	client.OnAuthRefresh = func(_ string) (*indiraClient.AuthContext, error) {
+		return s.refreshAuthFromDB(userID)
+	}
+	// On confirmed token expiry (30s retry also failed), notify only THIS user —
+	// each user has an independent connection, so one expired token no longer
+	// affects anyone else.
+	client.OnTokenExpired = func(_ string) {
+		if s.tokenExpiredNotifier != nil {
+			go s.tokenExpiredNotifier(userID)
+		}
+	}
+
+	// Bound the broker connect (token fetch + WS dial). Callers pass
+	// context.Background(), so without this a hung broker token API would
+	// block this goroutine — and this user's lock — indefinitely.
+	connectCtx, connectCancel := context.WithTimeout(ctx, 20*time.Second)
+	err := client.Connect(connectCtx)
+	connectCancel()
+	if err != nil {
+		return fmt.Errorf("connect broker WS for user %s: %w", userID, err)
+	}
+
+	// Dedicated processor goroutine for this user's Updates channel.
+	// Background context for the loop's own lifetime — cancelled by StopSubscription.
+	procCtx, cancel := context.WithCancel(context.Background())
+	s.processors.Store(userID, cancel)
+	s.wsClients.Store(userID, client)
+	metrics.BrokerWSActiveConnections.Inc()
+
+	go s.processUpdates(procCtx, userID, client)
+	s.logger.Info("Per-user broker WS established", zap.String("user_id", userID))
 	return nil
 }
 
-// StopSubscription removes a user from the subscription map.
-// The shared WS connection stays open for remaining users.
+// StopSubscription closes a user's broker WebSocket connection and stops its
+// processor goroutine. Safe to call for an unknown user (no-op). Used both for
+// explicit unsubscribe and by the idle-connection sweep.
 func (s *OrderStatusService) StopSubscription(userID string) {
+	mu := s.lockUser(userID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if cancel, ok := s.processors.LoadAndDelete(userID); ok {
+		cancel.(context.CancelFunc)()
+	}
+	if v, ok := s.wsClients.LoadAndDelete(userID); ok {
+		v.(*indiraClient.WSClient).Close()
+		metrics.BrokerWSActiveConnections.Dec()
+		s.logger.Info("Closed broker WS connection", zap.String("user_id", userID))
+	}
 	s.subscriberAuths.Delete(userID)
-	s.logger.Info("Unsubscribed user from shared WS", zap.String("user_id", userID))
+}
+
+// CloseAll shuts down every per-user broker WebSocket connection. Called on
+// service shutdown.
+func (s *OrderStatusService) CloseAll() {
+	s.wsClients.Range(func(key, _ any) bool {
+		s.StopSubscription(key.(string))
+		return true
+	})
+}
+
+// StartIdleSweep launches a background loop that periodically closes broker WS
+// connections for users that no longer have live exposure (no in-flight orders
+// and no open positions). Without this, per-user connections only accumulate
+// over a trading day. The loop stops when ctx is cancelled.
+func (s *OrderStatusService) StartIdleSweep(ctx context.Context, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.sweepIdleConnections(ctx)
+			}
+		}
+	}()
+}
+
+// sweepIdleConnections closes connections for users absent from the live-exposure set.
+func (s *OrderStatusService) sweepIdleConnections(ctx context.Context) {
+	sweepCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	active, err := s.repo.GetUsersWithLiveExposure(sweepCtx)
+	if err != nil {
+		s.logger.Warn("Idle WS sweep: failed to list users with live exposure", zap.Error(err))
+		return
+	}
+	keep := make(map[string]struct{}, len(active))
+	for _, u := range active {
+		keep[u] = struct{}{}
+	}
+
+	var idle []string
+	s.wsClients.Range(func(key, _ any) bool {
+		userID := key.(string)
+		if _, ok := keep[userID]; !ok {
+			idle = append(idle, userID)
+		}
+		return true
+	})
+	for _, userID := range idle {
+		s.StopSubscription(userID)
+	}
+	if len(idle) > 0 {
+		s.logger.Info("Idle WS sweep closed connections", zap.Int("count", len(idle)))
+	}
 }
 
 // refreshAuthFromDB reloads credentials from the DB for the given user.
@@ -237,57 +337,32 @@ func (s *OrderStatusService) refreshAuthFromDB(userID string) (*indiraClient.Aut
 		Source:      source,
 		BearerToken: bearerToken,
 	}
-	// Also update subscriberAuths so resubscribeAll uses the fresh token.
+	// Also update subscriberAuths so position fetches use the fresh token.
 	s.subscriberAuths.Store(userID, newAuth)
 	s.logger.Info("Refreshed auth from DB for WS reconnect", zap.String("user_id", userID))
 	return newAuth, nil
 }
 
-// resubscribeAll is called by WSClient.OnReconnected after a reconnect.
-// It re-sends WSConnectionRequest for every stored user so Indira resumes
-// streaming their updates on the new session.
-func (s *OrderStatusService) resubscribeAll() {
-	metrics.BrokerWSReconnects.Inc()
-	s.logger.Info("Shared WS reconnected — re-subscribing all users")
-	s.subscriberAuths.Range(func(key, value any) bool {
-		userID := key.(string)
-		auth := value.(*indiraClient.AuthContext)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			if err := s.wsClient.Subscribe(ctx, auth); err != nil {
-				s.logger.Error("Re-subscribe after reconnect failed",
-					zap.String("user_id", userID), zap.Error(err))
-			}
-		}()
-		return true
-	})
-}
-
-// processUpdates reads from the shared WS channel and dispatches each update
-// to a goroutine so DB operations never block the read loop.
-// Started exactly once when the shared connection is established.
-func (s *OrderStatusService) processUpdates(ctx context.Context) {
-	s.logger.Info("Shared WS update processor started")
-	defer func() {
-		s.wsMu.Lock()
-		s.processorRunning = false
-		s.wsMu.Unlock()
-		s.logger.Warn("Shared WS update processor exited — will restart on next subscription")
-	}()
+// processUpdates drains one user's WSClient.Updates channel and dispatches
+// each update to its own goroutine so DB operations never block the read loop.
+// One processor runs per subscribed user; it exits when ctx is cancelled by
+// StopSubscription. Each update is handled with a background context so a
+// StopSubscription mid-update never aborts an in-flight DB write.
+func (s *OrderStatusService) processUpdates(ctx context.Context, userID string, client *indiraClient.WSClient) {
+	s.logger.Info("Broker WS update processor started", zap.String("user_id", userID))
+	defer s.logger.Info("Broker WS update processor stopped", zap.String("user_id", userID))
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("WS update processor shutting down")
 			return
-		case wsStatus, ok := <-s.wsClient.Updates:
+		case wsStatus, ok := <-client.Updates:
 			if !ok {
-				// Updates channel is never closed by WSClient; this branch
-				// is a safety net only.
-				s.logger.Warn("Shared WS updates channel closed unexpectedly")
+				// Updates channel is never closed by WSClient; safety net only.
+				s.logger.Warn("Broker WS updates channel closed unexpectedly",
+					zap.String("user_id", userID))
 				return
 			}
-			go s.handleStatusUpdate(ctx, wsStatus)
+			go s.handleStatusUpdate(context.Background(), wsStatus)
 		}
 	}
 }
@@ -735,7 +810,7 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		update.Message = fmt.Sprintf("%d of %d shares filled for %s", tradedQty, wsStatus.OrderOriginalQty, order.Symbol)
 		update.DetailedMessage = fmt.Sprintf(
 			"Partially filled %d/%d at %s | Pending qty: %d | Broker ref: %s",
-			tradedQty, wsStatus.OrderOriginalQty, tradedPriceStr, wsStatus.PendingQty, brokerRef,
+			tradedQty, wsStatus.OrderOriginalQty, tradedPriceStr, flexToInt(wsStatus.PendingQty), brokerRef,
 		)
 		update.StatusEmoji = "🔶"
 		update.StatusColor = "#FFBB33"

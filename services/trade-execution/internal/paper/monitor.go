@@ -46,6 +46,11 @@ type MLGroupCanceller interface {
 	// CancelGroupForExit stops the group and, for paper positions, records a
 	// partial exit at exitPrice so closed-positions shows a distinct exit row.
 	CancelGroupForExit(ctx context.Context, entryOrderID uuid.UUID, exitPrice float64, reason string)
+	// MarkGroupClosedExternally tears down the group and marks un-fired ladder
+	// levels SUPERSEDED when the whole position is closed by an external exit
+	// (monitor SL/TP, square-off, force-exit). It records no exit row / no P&L —
+	// ExitPaperPosition is the single owner of the remaining-qty exit record.
+	MarkGroupClosedExternally(ctx context.Context, entryOrderID uuid.UUID)
 }
 
 // PaperTradeMonitor is the SL/TP engine and live PnL broadcaster.
@@ -874,12 +879,9 @@ func (m *PaperTradeMonitor) ForceExitAll(ctx context.Context, userID string) err
 			continue
 		}
 
-		// Resolve exit price first so CancelGroupForExit can record the partial
-		// exit at the same price used by exitPosition below.
+		// exitPosition closes any ML group (MarkGroupClosedExternally) and is the
+		// single recorder of the exit — no separate ML call is needed here.
 		exitPrice := m.resolveExitPrice(ctx, order)
-		if m.mlCanceller != nil {
-			m.mlCanceller.CancelGroupForExit(ctx, order.OrderID, exitPrice, "FORCE_EXIT")
-		}
 
 		wg.Add(1)
 		go func(o *models.Order, price float64) {
@@ -918,10 +920,9 @@ func (m *PaperTradeMonitor) ForceExitByStrategy(ctx context.Context, userID, str
 			continue
 		}
 
+		// exitPosition closes any ML group (MarkGroupClosedExternally) and is the
+		// single recorder of the exit — no separate ML call is needed here.
 		exitPrice := m.resolveExitPrice(ctx, order)
-		if m.mlCanceller != nil {
-			m.mlCanceller.CancelGroupForExit(ctx, order.OrderID, exitPrice, "FORCE_EXIT")
-		}
 
 		wg.Add(1)
 		go func(o *models.Order, price float64) {
@@ -987,11 +988,14 @@ func (m *PaperTradeMonitor) resolveExitPrice(ctx context.Context, order *models.
 func (m *PaperTradeMonitor) exitPosition(ctx context.Context, order *models.Order, exitPrice float64, reason string) {
 	defer m.exiting.Delete(order.OrderID)
 
-	// Cancel any active ML group for this order BEFORE writing to DB so the ML
+	// Close any active ML group for this order BEFORE writing to DB so the ML
 	// price-monitor goroutine stops immediately and cannot place further partial
 	// exits on a position that is already being closed by the regular monitor.
+	// MarkGroupClosedExternally also marks un-fired ladder levels SUPERSEDED so
+	// they are not later mislabelled CANCELLED; it records no exit row / no P&L —
+	// the ExitPaperPosition call below is the single owner of the exit record.
 	if m.mlCanceller != nil {
-		m.mlCanceller.CancelGroup(ctx, order.OrderID)
+		m.mlCanceller.MarkGroupClosedExternally(ctx, order.OrderID)
 	}
 
 	if err := m.paperExec.ExitPaperPosition(ctx, order, exitPrice, reason); err != nil {
@@ -1190,10 +1194,9 @@ func (m *PaperTradeMonitor) SquareOffAll(ctx context.Context) error {
 		if _, already := m.exiting.LoadOrStore(order.OrderID, true); already {
 			continue
 		}
+		// exitPosition closes any ML group (MarkGroupClosedExternally) and is the
+		// single recorder of the exit — no separate ML call is needed here.
 		exitPrice := m.resolveExitPrice(ctx, order)
-		if m.mlCanceller != nil {
-			m.mlCanceller.CancelGroupForExit(ctx, order.OrderID, exitPrice, "SQUARE_OFF")
-		}
 		wg.Add(1)
 		go func(o *models.Order, price float64) {
 			defer wg.Done()
@@ -1228,10 +1231,9 @@ func (m *PaperTradeMonitor) SquareOffAll(ctx context.Context) error {
 				if _, already := m.exiting.LoadOrStore(order.OrderID, true); already {
 					continue
 				}
+				// exitPosition closes any ML group (MarkGroupClosedExternally) and
+				// is the single recorder of the exit — no separate ML call needed.
 				exitPrice := m.resolveExitPrice(ctx, order)
-				if m.mlCanceller != nil {
-					m.mlCanceller.CancelGroupForExit(ctx, order.OrderID, exitPrice, "SQUARE_OFF")
-				}
 				wg2.Add(1)
 				go func(o *models.Order, price float64) {
 					defer wg2.Done()
