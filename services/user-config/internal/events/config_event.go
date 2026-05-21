@@ -37,6 +37,10 @@ type StrategyPayload struct {
 	Version      uint64             `json:"version"`
 	CreatedAt    int64              `json:"created_at"` // UnixNano
 	UpdatedAt    int64              `json:"updated_at"` // UnixNano
+
+	// ProcessAfterMarketNews tells rules-engine to run the after-market-news
+	// backfill when this strategy's CONFIG_CREATED event is consumed.
+	ProcessAfterMarketNews bool `json:"process_after_market_news"`
 }
 
 type ConditionsPayload struct {

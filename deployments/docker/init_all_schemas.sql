@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS strategies (
     active         BOOLEAN      DEFAULT false,
     trading_mode   VARCHAR(20)  DEFAULT 'PAPER' CHECK (trading_mode IN ('PAPER', 'LIVE')),
     version        INTEGER      DEFAULT 1,
+    -- After-Market News backfill opt-in (user-config migration 004).
+    process_after_market_news BOOLEAN DEFAULT false NOT NULL,
     created_at     TIMESTAMPTZ  DEFAULT NOW(),
     updated_at     TIMESTAMPTZ  DEFAULT NOW(),
     deleted_at     TIMESTAMPTZ  DEFAULT NULL
@@ -52,6 +54,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_strategies_user_name
 
 CREATE TRIGGER update_strategies_updated_at BEFORE UPDATE ON strategies
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- After-Market News backfill execution state (rules-engine owned).
+-- See user-config migration 004 for column semantics.
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+    strategy_id       UUID         PRIMARY KEY REFERENCES strategies(strategy_id) ON DELETE CASCADE,
+    user_id           VARCHAR(255) NOT NULL,
+    status            VARCHAR(20)  NOT NULL DEFAULT 'PENDING'
+                          CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED')),
+    window_start      TIMESTAMPTZ  NOT NULL,
+    window_end        TIMESTAMPTZ  NOT NULL,
+    dispatch_after    TIMESTAMPTZ  NOT NULL,
+    matches_found     INTEGER      NOT NULL DEFAULT 0,
+    orders_dispatched INTEGER      NOT NULL DEFAULT 0,
+    error             TEXT,
+    created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backfill_jobs_pending
+    ON backfill_jobs(status)
+    WHERE status = 'PENDING';
 
 -- Strategy conditions (one row per strategy)
 CREATE TABLE IF NOT EXISTS strategy_conditions (

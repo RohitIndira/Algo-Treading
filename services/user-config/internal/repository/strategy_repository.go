@@ -117,23 +117,25 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 
 	// Insert strategy
 	strategy := &models.Strategy{
-		StrategyID:   uuid.New(),
-		UserID:       req.UserID,
-		StrategyName: req.StrategyName,
-		Description:  req.Description,
-		Active:       req.ActivateImmediately,
-		TradingMode:  req.TradingMode,
-		Version:      1,
+		StrategyID:             uuid.New(),
+		UserID:                 req.UserID,
+		StrategyName:           req.StrategyName,
+		Description:            req.Description,
+		Active:                 req.ActivateImmediately,
+		TradingMode:            req.TradingMode,
+		Version:                1,
+		ProcessAfterMarketNews: req.ProcessAfterMarketNews,
 	}
 
 	query := `
-		INSERT INTO strategies (strategy_id, user_id, strategy_name, description, active, trading_mode, version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO strategies (strategy_id, user_id, strategy_name, description, active, trading_mode, version, process_after_market_news)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING created_at, updated_at`
 
 	err = tx.QueryRowxContext(ctx, query,
 		strategy.StrategyID, strategy.UserID, strategy.StrategyName,
 		strategy.Description, strategy.Active, strategy.TradingMode, strategy.Version,
+		strategy.ProcessAfterMarketNews,
 	).Scan(&strategy.CreatedAt, &strategy.UpdatedAt)
 	if err != nil {
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {

@@ -42,14 +42,15 @@ func ToThinConfigEvent(eventType ConfigEventType, userID string, strategyID stri
 
 func toPayload(s *models.Strategy) *StrategyPayload {
 	p := &StrategyPayload{
-		StrategyID:   s.StrategyID.String(),
-		UserID:       s.UserID,
-		StrategyName: s.StrategyName,
-		Active:       s.Active,
-		TradingMode:  string(s.TradingMode),
-		Version:      uint64(s.Version),
-		CreatedAt:    s.CreatedAt.UnixNano(),
-		UpdatedAt:    s.UpdatedAt.UnixNano(),
+		StrategyID:             s.StrategyID.String(),
+		UserID:                 s.UserID,
+		StrategyName:           s.StrategyName,
+		Active:                 s.Active,
+		TradingMode:            string(s.TradingMode),
+		Version:                uint64(s.Version),
+		CreatedAt:              s.CreatedAt.UnixNano(),
+		UpdatedAt:              s.UpdatedAt.UnixNano(),
+		ProcessAfterMarketNews: s.ProcessAfterMarketNews,
 		Conditions: ConditionsPayload{
 			Sentiments:     []string{},
 			Categories:     []string{},

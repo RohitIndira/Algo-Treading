@@ -18,14 +18,15 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 	}
 
 	s := &models.Strategy{
-		StrategyID:   p.StrategyID,
-		UserID:       p.UserID,
-		StrategyName: p.StrategyName,
-		Version:      p.Version,
-		Active:       p.Active,
-		TradingMode:  p.TradingMode,
-		CreatedAt:    unixNanosToTime(p.CreatedAt),
-		UpdatedAt:    unixNanosToTime(p.UpdatedAt),
+		StrategyID:             p.StrategyID,
+		UserID:                 p.UserID,
+		StrategyName:           p.StrategyName,
+		Version:                p.Version,
+		Active:                 p.Active,
+		TradingMode:            p.TradingMode,
+		CreatedAt:              unixNanosToTime(p.CreatedAt),
+		UpdatedAt:              unixNanosToTime(p.UpdatedAt),
+		ProcessAfterMarketNews: p.ProcessAfterMarketNews,
 	}
 
 	// Conditions

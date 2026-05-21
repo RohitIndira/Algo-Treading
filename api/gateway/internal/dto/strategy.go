@@ -10,6 +10,10 @@ type CreateStrategyRequest struct {
 	RiskLimits          *RiskLimits         `json:"risk_limits"`
 	ActivateImmediately bool                `json:"activate_immediately"`
 	TradingMode         string              `json:"trading_mode"` // "PAPER", "LIVE"
+
+	// ProcessAfterMarketNews opts the strategy into the rules-engine
+	// after-market-news backfill (orders tagged signal_source=BACKFILL_AMN).
+	ProcessAfterMarketNews bool `json:"process_after_market_news"`
 }
 
 // UpdateStrategyRequest represents the JSON body for updating a strategy

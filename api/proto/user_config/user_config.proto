@@ -269,6 +269,14 @@ message Strategy {
 
   // Soft-delete timestamp (null if not deleted)
   optional common.Timestamp deleted_at = 13;
+
+  // After-Market News backfill flag.
+  // When true, on strategy creation rules-engine processes news from the
+  // previous trading day's 15:31 IST close up to creation time (or, if created
+  // outside market hours / on a non-trading day, up to the next trading day's
+  // 09:15 IST open) and places orders (tagged signal_source=BACKFILL_AMN) for
+  // any matches at live LTP. Backfill runs once per strategy.
+  bool process_after_market_news = 14;
 }
 
 message CreateStrategyRequest {
@@ -280,9 +288,12 @@ message CreateStrategyRequest {
     RiskLimits risk_limits = 6;
     bool activate_immediately = 7;
     TradingMode trading_mode = 8;
-    
+
     // Indira Securities authentication
     common.IndiraAuthContext indira_auth = 9;
+
+    // After-Market News backfill flag (see Strategy.process_after_market_news).
+    bool process_after_market_news = 10;
 }
 
 message CreateStrategyResponse {

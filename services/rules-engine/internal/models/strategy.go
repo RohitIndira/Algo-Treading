@@ -19,6 +19,12 @@ type Strategy struct {
 	CreatedAt    time.Time   `json:"created_at" bson:"created_at"`
 	UpdatedAt    time.Time   `json:"updated_at" bson:"updated_at"`
 
+	// ProcessAfterMarketNews drives the BackfillService: on CONFIG_CREATED the
+	// rules-engine scans news from the previous trading day's 15:31 IST close
+	// through "now" (or the next 09:15 IST when created outside market hours)
+	// and places orders for matches at live LTP, tagged signal_source=BACKFILL_AMN.
+	ProcessAfterMarketNews bool `json:"process_after_market_news" bson:"process_after_market_news"`
+
 	// Frontend authentication data (stored with strategy)
 	BearerToken string `json:"bearer_token" bson:"bearer_token"` // JWT bearer token
 	AppId       string `json:"app_id" bson:"app_id"`             // Application ID

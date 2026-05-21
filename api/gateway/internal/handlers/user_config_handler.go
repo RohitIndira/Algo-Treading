@@ -79,14 +79,15 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 
 	// Map DTO to Proto
 	pbReq := &pb.CreateStrategyRequest{
-		UserId:              reqDTO.UserID,
-		StrategyName:        reqDTO.StrategyName,
-		Description:         reqDTO.Description,
-		ActivateImmediately: reqDTO.ActivateImmediately,
-		TradingMode:         mapTradingMode(reqDTO.TradingMode),
-		Conditions:          dtoConditionsToProto(reqDTO.Conditions),
-		TradeConfig:         dtoTradeConfigToProto(reqDTO.TradeConfig),
-		RiskLimits:          dtoRiskLimitsToProto(reqDTO.RiskLimits),
+		UserId:                 reqDTO.UserID,
+		StrategyName:           reqDTO.StrategyName,
+		Description:            reqDTO.Description,
+		ActivateImmediately:    reqDTO.ActivateImmediately,
+		TradingMode:            mapTradingMode(reqDTO.TradingMode),
+		Conditions:             dtoConditionsToProto(reqDTO.Conditions),
+		TradeConfig:            dtoTradeConfigToProto(reqDTO.TradeConfig),
+		RiskLimits:             dtoRiskLimitsToProto(reqDTO.RiskLimits),
+		ProcessAfterMarketNews: reqDTO.ProcessAfterMarketNews,
 		IndiraAuth: &common.IndiraAuthContext{
 			UserId:      userIdHeader,
 			AppId:       appId,

@@ -10,6 +10,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/holiday"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
@@ -17,6 +18,25 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/utils"
 	"go.uber.org/zap"
 )
+
+// signalSourceCtxKey threads the signal source ("BACKFILL_AMN" etc.) into
+// processMatch without changing its signature. Live-news callers don't set it
+// (empty source); the backfill dispatcher attaches it via withSignalSource.
+type signalSourceCtxKey struct{}
+
+func withSignalSource(ctx context.Context, src string) context.Context {
+	if src == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, signalSourceCtxKey{}, src)
+}
+
+func signalSourceFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(signalSourceCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 
 
@@ -424,6 +444,9 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	// ── Create order request (template — SL/TP filled below) ────────────
 	orderReq := models.NewOrderRequest(match, event, strategy)
 	orderReq.Price = ltp // will be overridden below for Case 1/2
+	// Tag the signal source so trade-execution / UI can tell a backfilled
+	// order from a live-news one. Empty for live news (omitted via omitempty).
+	orderReq.SignalSource = signalSourceFromCtx(ctx)
 
 	// sizingPrice = the price the order is expected to actually FILL at.
 	// For Case 2 (STOP_LOSS + BRACKET) orderReq.Price holds the trigger price,
@@ -731,4 +754,68 @@ func ltpSource(_ *models.MarketEvent, md *MarketDataResult) string {
 		return "redis"
 	}
 	return "none"
+}
+
+// DispatchBackfillMatch is the entry point used by the after-market-news
+// BackfillService. It deliberately skips the holiday / market-hours guards at
+// the top of HandleEvent (the backfill intends to fire for news that arrived
+// outside market hours) but routes every other step — Redis market-data
+// prefetch, per-stock daily lock, per-strategy trade cap, trade-window check,
+// risk approval, order build, Kafka publish, PostgreSQL persistence — through
+// the same processMatch path used for live signals.
+//
+// signalSource ("BACKFILL_AMN") is threaded to processMatch via context so the
+// live path is untouched, and is stamped onto OrderRequest.SignalSource.
+//
+// A nil return with no order placed is normal (e.g. no live LTP for a thinly
+// traded stock) — such cases are logged and skipped, not surfaced as errors.
+func (h *Handler) DispatchBackfillMatch(
+	ctx context.Context,
+	event *models.MarketEvent,
+	strategy *models.Strategy,
+	result *matcher.EvaluationResult,
+	signalSource string,
+) error {
+	if event == nil || strategy == nil || result == nil {
+		return fmt.Errorf("dispatch backfill match: nil input")
+	}
+
+	// Build a RuleMatch shaped exactly like one produced by engine.EvaluateEvent
+	// so processMatch behaves identically to the live path.
+	match := &models.RuleMatch{
+		UserID:            strategy.UserID,
+		StrategyID:        strategy.StrategyID,
+		StrategyName:      strategy.StrategyName,
+		Strategy:          strategy,
+		MatchScore:        0,
+		MatchedConditions: result.MatchedConditions,
+		FailedConditions:  result.FailedConditions,
+		ApprovedByRisk:    false,
+		Timestamp:         time.Now(),
+		EventID:           event.EventID,
+		PctChangeStatus:   string(result.PctChangeStatus),
+	}
+
+	// Prefetch market data from Redis, same single GET HandleEvent uses.
+	md, err := getMarketDataFromRedis(ctx, h.redisCache, event.StockData, h.logger)
+	if err != nil {
+		// No Redis data and no usable LTP on the historical event → cannot
+		// price an order. Expected for illiquid stocks; log and skip.
+		if event.MarketData.LastTradedPrice <= 0 {
+			h.logger.Warn("backfill: no market data available, skipping match",
+				zap.String("event_id", event.EventID),
+				zap.String("symbol", event.StockData.Symbol),
+				zap.Error(err))
+			return nil
+		}
+	}
+	if md != nil {
+		h.tickCache.Set(event.StockData.StockCode, md.TickSize)
+	}
+
+	h.stats.IncrementMatchesFound()
+	h.stats.RecordStrategyMatch(match.StrategyID, match.StrategyName)
+	h.stats.RecordStockMatch(event.StockData.StockCode, event.StockData.Symbol)
+
+	return h.processMatch(withSignalSource(ctx, signalSource), match, event, md)
 }

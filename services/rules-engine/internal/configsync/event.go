@@ -36,6 +36,9 @@ type StrategyPayload struct {
 	Version      uint64             `json:"version"`
 	CreatedAt    int64              `json:"created_at"` // UnixNano
 	UpdatedAt    int64              `json:"updated_at"` // UnixNano
+
+	// ProcessAfterMarketNews triggers the BackfillService on CONFIG_CREATED.
+	ProcessAfterMarketNews bool `json:"process_after_market_news"`
 }
 
 type ConditionsPayload struct {

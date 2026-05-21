@@ -48,9 +48,16 @@ type Config struct {
 	MongoDB MongoDBConfig
 }
 
-// MongoDBConfig holds MongoDB connection configuration
+// MongoDBConfig holds MongoDB connection configuration.
+//
+// URI is shared by every MongoDB-backed component (holiday checker, news
+// backfill). Database / NewsCollection target the collection that
+// data-ingestion writes news to — they MUST match data-ingestion's
+// MONGO_DATABASE / MONGO_NEWS_COLLECTION exactly.
 type MongoDBConfig struct {
-	URI string
+	URI            string
+	Database       string
+	NewsCollection string
 }
 
 // KafkaConfig holds Kafka-specific configuration
@@ -276,6 +283,14 @@ func LoadConfig() (*Config, error) {
 
 		MongoDB: MongoDBConfig{
 			URI: getEnv("MONGODB_URI", "mongodb://localhost:27017"),
+			// Defaults match data-ingestion's own defaults (CAG_CHATBOT /
+			// NewsImpactDashboard). MONGODB_DATABASE is accepted as a legacy
+			// alias for MONGO_DATABASE.
+			Database: firstNonEmptyEnv(
+				[]string{"MONGO_DATABASE", "MONGODB_DATABASE"},
+				"CAG_CHATBOT",
+			),
+			NewsCollection: getEnv("MONGO_NEWS_COLLECTION", "NewsImpactDashboard"),
 		},
 	}
 
@@ -385,4 +400,16 @@ func getEnvAsSlice(key string, defaultValue []string) []string {
 		return defaultValue
 	}
 	return strings.Split(valueStr, ",")
+}
+
+// firstNonEmptyEnv returns the first non-empty environment variable among keys,
+// or defaultValue if none are set. Lets a config field accept both a preferred
+// name and a legacy alias.
+func firstNonEmptyEnv(keys []string, defaultValue string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return defaultValue
 }

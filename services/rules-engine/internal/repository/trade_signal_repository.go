@@ -17,6 +17,16 @@ type TradeSignalRepository struct {
 	logger *zap.Logger
 }
 
+// DB exposes the underlying PostgreSQL pool so sibling packages (e.g.
+// backfill.JobStore) can reuse this connection instead of opening a second
+// pool against the same database.
+func (r *TradeSignalRepository) DB() *sql.DB {
+	if r == nil {
+		return nil
+	}
+	return r.db
+}
+
 // NewTradeSignalRepository creates a new trade signal repository
 func NewTradeSignalRepository(dbHost, dbPort, dbUser, dbPassword, dbName, dbSSLMode string, logger *zap.Logger) (*TradeSignalRepository, error) {
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",

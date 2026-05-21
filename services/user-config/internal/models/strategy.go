@@ -24,10 +24,14 @@ type Strategy struct {
 	Active       bool        `db:"active" json:"active"`
 	TradingMode  TradingMode `db:"trading_mode" json:"trading_mode"`
 	Version      int32       `db:"version" json:"version"`
-	CreatedAt    time.Time   `db:"created_at" json:"created_at"`
-	UpdatedAt    time.Time   `db:"updated_at" json:"updated_at"`
-	DeletedAt    *time.Time  `db:"deleted_at" json:"deleted_at,omitempty"`
-	
+	// ProcessAfterMarketNews: when true, rules-engine backfills news from the
+	// previous trading day's close (15:31 IST) through creation time and places
+	// orders (signal_source=BACKFILL_AMN) at live LTP for any matches.
+	ProcessAfterMarketNews bool      `db:"process_after_market_news" json:"process_after_market_news"`
+	CreatedAt              time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt              time.Time `db:"updated_at" json:"updated_at"`
+	DeletedAt              *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+
 	// These are now separate tables, so we use pointers and `db:"-"` or handle in repo
 	Conditions   *StrategyCondition `db:"-" json:"conditions,omitempty"`
 	TradeConfig  *TradeConfig       `db:"-" json:"trade_config,omitempty"`
@@ -158,6 +162,9 @@ type CreateStrategyRequest struct {
 	RiskLimits          *RiskLimits        `json:"risk_limits" validate:"required"`
 	ActivateImmediately bool               `json:"activate_immediately"`
 	TradingMode         TradingMode        `json:"trading_mode"`
+
+	// ProcessAfterMarketNews enables the rules-engine after-market-news backfill.
+	ProcessAfterMarketNews bool `json:"process_after_market_news"`
 
 	// Frontend authentication data
 	IndiraAuth *IndiraAuthContext `json:"indira_auth,omitempty"`

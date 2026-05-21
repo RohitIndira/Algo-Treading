@@ -12,12 +12,14 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/config"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/backfill"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/holiday"
 	intkafka "github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/kafka"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
@@ -184,6 +186,43 @@ func main() {
 	eng.Start(ctx)
 	handler := consumer.NewHandler(eng, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours, holidayChecker)
 
+	// ── After-Market News backfill ──────────────────────────────────────────
+	// Requires both MongoDB (historical news) and the PostgreSQL signal repo
+	// (job state). If either is unavailable the feature is disabled and
+	// rules-engine still serves live news normally.
+	istLoc, locErr := time.LoadLocation(cfg.MarketHours.Timezone)
+	if locErr != nil || istLoc == nil {
+		istLoc = time.FixedZone("IST", 5*60*60+30*60)
+	}
+	var backfillSvc *backfill.Service
+	mongoNewsRepo, mongoErr := repository.NewMongoNewsRepository(
+		ctx, cfg.MongoDB.URI, cfg.MongoDB.Database, cfg.MongoDB.NewsCollection, logger)
+	switch {
+	case mongoErr != nil:
+		logger.Warn("After-Market News backfill DISABLED: cannot connect to MongoDB news collection",
+			zap.String("database", cfg.MongoDB.Database),
+			zap.String("collection", cfg.MongoDB.NewsCollection),
+			zap.Error(mongoErr))
+	case signalRepo == nil || signalRepo.DB() == nil:
+		logger.Warn("After-Market News backfill DISABLED: PostgreSQL signal repository unavailable")
+		_ = mongoNewsRepo.Close(context.Background())
+	default:
+		backfillSvc = backfill.New(backfill.Config{
+			NewsRepo:   mongoNewsRepo,
+			JobStore:   backfill.NewJobStore(signalRepo.DB()),
+			Evaluator:  matcher.NewEvaluator(logger),
+			Dispatcher: handler,
+			Strategies: store,
+			Holidays:   holidayChecker,
+			Timezone:   istLoc,
+			Logger:     logger,
+		})
+		defer func() { _ = mongoNewsRepo.Close(context.Background()) }()
+		logger.Info("After-Market News backfill ENABLED",
+			zap.String("mongo_database", cfg.MongoDB.Database),
+			zap.String("mongo_collection", cfg.MongoDB.NewsCollection))
+	}
+
 	// Step 5: Start config consumer BEFORE news consumer
 	configReader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        cfg.Kafka.Brokers,
@@ -194,7 +233,11 @@ func main() {
 		CommitInterval: time.Second,
 		StartOffset:    startOffsetFor(cfg.Kafka.ConfigOffsetReset, kafka.FirstOffset),
 	})
-	configConsumer := intkafka.NewConfigConsumer(configReader, store)
+	var backfillTrigger intkafka.BackfillTrigger
+	if backfillSvc != nil {
+		backfillTrigger = backfillSvc
+	}
+	configConsumer := intkafka.NewConfigConsumerWithBackfill(configReader, store, backfillTrigger)
 
 	// Step 6: Start news consumer AFTER config consumer
 	newsReader := kafka.NewReader(kafka.ReaderConfig{
@@ -214,6 +257,14 @@ func main() {
 	logger.Info("Config consumer started")
 	<-lc.NewsConsumerStarted
 	logger.Info("News consumer started — system is LIVE")
+
+	// Recover any after-market-news backfill jobs left PENDING by a previous
+	// run — either deferred to a future 09:15 IST or interrupted by a restart.
+	// Runs after bootstrap (config store populated) so strategies resolve.
+	// Async so a slow recovery never delays the service going live.
+	if backfillSvc != nil {
+		go backfillSvc.RecoverPending(ctx)
+	}
 
 	// TODO: Start existing gRPC server (if any) - currently none in rules-engine.
 	// TODO: Start existing Redis Pub/Sub publisher - handled in consumer handler via redisCache.Publish.

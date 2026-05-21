@@ -30,14 +30,15 @@ func NewUserConfigServer(service *service.StrategyService) *UserConfigServer {
 func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStrategyRequest) (*pb.CreateStrategyResponse, error) {
 	// Convert proto request to domain model
 	modelReq := &models.CreateStrategyRequest{
-		UserID:              req.UserId,
-		StrategyName:        req.StrategyName,
-		Description:         req.Description,
-		Conditions:          protoConditionsToModel(req.Conditions),
-		TradeConfig:         protoTradeConfigToModel(req.TradeConfig),
-		RiskLimits:          protoRiskLimitsToModel(req.RiskLimits),
-		ActivateImmediately: req.ActivateImmediately,
-		TradingMode:         protoTradingModeToModel(req.TradingMode),
+		UserID:                 req.UserId,
+		StrategyName:           req.StrategyName,
+		Description:            req.Description,
+		Conditions:             protoConditionsToModel(req.Conditions),
+		TradeConfig:            protoTradeConfigToModel(req.TradeConfig),
+		RiskLimits:             protoRiskLimitsToModel(req.RiskLimits),
+		ActivateImmediately:    req.ActivateImmediately,
+		TradingMode:            protoTradingModeToModel(req.TradingMode),
+		ProcessAfterMarketNews: req.ProcessAfterMarketNews,
 	}
 
 	// Extract Indira auth context if provided
@@ -684,15 +685,16 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 	}
 
 	strategy := &pb.Strategy{
-		StrategyId:   model.StrategyID.String(),
-		UserId:       model.UserID,
-		StrategyName: model.StrategyName,
-		Description:  model.Description,
-		Active:       model.Active,
-		TradingMode:  modelTradingModeToProto(model.TradingMode),
-		Version:      model.Version,
-		CreatedAt:    &common.Timestamp{Seconds: model.CreatedAt.Unix()},
-		UpdatedAt:    &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
+		StrategyId:             model.StrategyID.String(),
+		UserId:                 model.UserID,
+		StrategyName:           model.StrategyName,
+		Description:            model.Description,
+		Active:                 model.Active,
+		TradingMode:            modelTradingModeToProto(model.TradingMode),
+		Version:                model.Version,
+		CreatedAt:              &common.Timestamp{Seconds: model.CreatedAt.Unix()},
+		UpdatedAt:              &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
+		ProcessAfterMarketNews: model.ProcessAfterMarketNews,
 	}
 	if model.DeletedAt != nil {
 		strategy.DeletedAt = &common.Timestamp{Seconds: model.DeletedAt.Unix()}
