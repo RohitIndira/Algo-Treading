@@ -8,10 +8,14 @@ import (
 
 // MultiLevel exit status constants.
 const (
-	MLStatusPending   = "PENDING"   // Level configured, not yet active
-	MLStatusActive    = "ACTIVE"    // TP limit order placed (live) / price monitor watching (SL/paper)
-	MLStatusTriggered = "TRIGGERED" // Exit order filled
-	MLStatusCancelled = "CANCELLED" // Cancelled before triggering
+	MLStatusPending    = "PENDING"    // Level configured, not yet active
+	MLStatusActive     = "ACTIVE"     // TP limit order placed (live) / price monitor watching (SL/paper)
+	MLStatusTriggered  = "TRIGGERED"  // Exit order filled
+	MLStatusCancelled  = "CANCELLED"  // Cancelled before triggering (strategy deactivated/deleted)
+	MLStatusSuperseded = "SUPERSEDED" // Position fully closed by an external exit (monitor SL/TP,
+	//                                   square-off or force-exit) before this level could fire.
+	//                                   Distinct from CANCELLED: the qty WAS exited, just not via
+	//                                   this ladder level — see the PAPER_EXITED execution event.
 )
 
 // MultiLevel exit type constants.

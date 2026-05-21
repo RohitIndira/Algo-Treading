@@ -70,6 +70,11 @@ type CredentialsInvalidator interface {
 	Invalidate(userID string)
 }
 
+// BrokerWSStarter opens the per-user broker order-status WebSocket for a user.
+// Implemented in main.go as: load the user's broker credentials, then call
+// statusservice.StartSubscription. Idempotent — safe to call repeatedly.
+type BrokerWSStarter func(ctx context.Context, userID string) error
+
 // StrategyHalter blocks new order execution for a strategy that has been deactivated.
 // Implemented by *executor.SignalProcessor.
 type StrategyHalter interface {
@@ -104,6 +109,7 @@ type StrategyEventsConsumer struct {
 	executor       *executor.OrderExecutor
 	paperMonitor   PaperOrderPurger       // nil-safe
 	credsCache     CredentialsInvalidator  // nil-safe
+	startBrokerWS  BrokerWSStarter         // nil-safe: opens broker WS on strategy create/update
 	priceMonitor   OrderUnwatcher          // nil-safe: may be unset if PriceMonitor is disabled
 	priceClient    PaperPriceLookup        // nil-safe: used to get LTP for paper exit PnL
 	mlManager      MLGroupCanceller        // nil-safe: creates paper partial exits for remaining ML qty
@@ -162,6 +168,14 @@ func (c *StrategyEventsConsumer) SetPaperMonitor(pm PaperOrderPurger) {
 // re-read the fresh bearer token from broker_accounts.
 func (c *StrategyEventsConsumer) SetCredentialsCache(cc CredentialsInvalidator) {
 	c.credsCache = cc
+}
+
+// SetBrokerWSStarter wires the per-user broker WebSocket starter so a
+// CONFIG_CREATED / CONFIG_UPDATED event opens the user's order-status socket
+// immediately — before their first order — instead of waiting for the first
+// live signal. Call before Start().
+func (c *StrategyEventsConsumer) SetBrokerWSStarter(fn BrokerWSStarter) {
+	c.startBrokerWS = fn
 }
 
 // SetMLManager wires the multi-level manager so paper partial exits are recorded
@@ -246,6 +260,22 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 			c.logger.Info("credentials cache invalidated on strategy event",
 				zap.String("event_type", string(ev.Type)),
 				zap.String("user_id", ev.UserID))
+		}
+		// Open this user's broker order-status socket now, so order updates stream
+		// from the moment the strategy is active — not only after the first order.
+		// Runs in the background: the connect makes broker network calls and must
+		// not block Kafka offset commits. StartSubscription is idempotent, so a
+		// CONFIG_UPDATED for an already-connected user is a cheap no-op.
+		if c.startBrokerWS != nil && ev.UserID != "" {
+			userID := ev.UserID
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := c.startBrokerWS(bgCtx, userID); err != nil {
+					c.logger.Warn("broker WS subscription on strategy event failed",
+						zap.String("user_id", userID), zap.Error(err))
+				}
+			}()
 		}
 		return nil
 	default:

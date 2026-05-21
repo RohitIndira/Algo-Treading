@@ -115,11 +115,19 @@ var (
 		Help:      "Order status updates received from broker WS, by new_status.",
 	}, []string{"status"})
 
-	// BrokerWSReconnects counts reconnections to the shared Indira WS.
+	// BrokerWSReconnects counts reconnections across all per-user Indira WS connections.
 	BrokerWSReconnects = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "trade_execution",
 		Name:      "broker_ws_reconnects_total",
 		Help:      "Number of broker WebSocket reconnection events.",
+	})
+
+	// BrokerWSActiveConnections is the current number of open per-user broker
+	// WebSocket connections (one connection per subscribed user).
+	BrokerWSActiveConnections = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "trade_execution",
+		Name:      "broker_ws_active_connections",
+		Help:      "Current number of open per-user broker WebSocket connections.",
 	})
 )
 

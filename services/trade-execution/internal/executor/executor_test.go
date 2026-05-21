@@ -119,6 +119,9 @@ func (m *mockRepo) UpsertMultiLevelExitLevel(ctx context.Context, rec *models.Mu
 func (m *mockRepo) UpdateMultiLevelLevelStatus(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, status string, exitPrice float64) error {
 	return nil
 }
+func (m *mockRepo) SupersedeMultiLevelLevels(ctx context.Context, entryOrderID uuid.UUID) error {
+	return nil
+}
 func (m *mockRepo) UpdateMultiLevelLevelBrokerID(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, brokerOrderID string, exitOrderID uuid.UUID) error {
 	return nil
 }
