@@ -209,3 +209,63 @@ func nilIfEmpty(s string) any {
 	}
 	return s
 }
+
+// UpsertRuntimeState persists a strategy's runtime/terminal state to
+// hft_runtime_state. Called on Entry (status=RUNNING) and on runner exit
+// (status=COMPLETED|HALTED|STOPPED). The full snapshot is stored as JSONB
+// so GET /state can replay a finished strategy forever — surviving the
+// manager's in-memory completed-snapshot TTL and engine restarts.
+//
+// ended_at is set only on a terminal status; COALESCE keeps an earlier
+// ended_at if a duplicate terminal write ever lands.
+func (r *Repo) UpsertRuntimeState(ctx context.Context, strategyID, status string, snap *state.Strategy) error {
+	if snap == nil {
+		return fmt.Errorf("nil snapshot")
+	}
+	blob, err := json.Marshal(snap)
+	if err != nil {
+		return fmt.Errorf("marshal snapshot: %w", err)
+	}
+	var endedAt any
+	if status != "RUNNING" {
+		endedAt = time.Now()
+	}
+	const q = `
+		INSERT INTO hft_runtime_state
+			(strategy_id, user_id, symbol, mode, status,
+			 buy_position, sell_position, snapshot, started_at, ended_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
+		ON CONFLICT (strategy_id) DO UPDATE SET
+			status        = EXCLUDED.status,
+			buy_position  = EXCLUDED.buy_position,
+			sell_position = EXCLUDED.sell_position,
+			snapshot      = EXCLUDED.snapshot,
+			ended_at      = COALESCE(hft_runtime_state.ended_at, EXCLUDED.ended_at),
+			updated_at    = NOW()`
+	_, err = r.tradingExecDB.ExecContext(ctx, q,
+		strategyID, snap.Cfg.UserID, snap.Cfg.Symbol, string(snap.Cfg.Mode), status,
+		snap.Buy.Position, snap.Sell.Position, blob, snap.StartedAt, endedAt,
+	)
+	return err
+}
+
+// GetRuntimeState returns the persisted snapshot for a strategy, or
+// (nil, nil) if there's no row. Used as the /state fallback when the
+// strategy has no live runner and isn't in the in-memory cache.
+func (r *Repo) GetRuntimeState(ctx context.Context, strategyID string) (*state.Strategy, error) {
+	var blob []byte
+	err := r.tradingExecDB.QueryRowContext(ctx,
+		`SELECT snapshot FROM hft_runtime_state WHERE strategy_id = $1`, strategyID,
+	).Scan(&blob)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var s state.Strategy
+	if err := json.Unmarshal(blob, &s); err != nil {
+		return nil, fmt.Errorf("unmarshal snapshot for %s: %w", strategyID, err)
+	}
+	return &s, nil
+}

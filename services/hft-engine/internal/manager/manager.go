@@ -387,6 +387,23 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 				finishedAt: time.Now(),
 			}
 			m.completedMu.Unlock()
+
+			// Durable terminal state — the in-memory cache above is only a
+			// 10-min fast path. This row makes /state report the final
+			// COMPLETED/HALTED/STOPPED status forever, surviving the TTL
+			// and engine restarts. Best-effort: a DB blip must not wedge
+			// the runner-exit path.
+			status := terminalStatus(final)
+			dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := m.repo.UpsertRuntimeState(dbCtx, strategyID, status, final); err != nil {
+				m.logger.Warn("persist terminal runtime state failed",
+					zap.String("strategy_id", strategyID),
+					zap.String("status", status), zap.Error(err))
+			} else {
+				m.logger.Info("strategy terminal state persisted",
+					zap.String("strategy_id", strategyID), zap.String("status", status))
+			}
+			cancel()
 		}
 
 		m.mu.Lock()
@@ -405,7 +422,57 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 		zap.Int("max_buy_qty", cfg.MaxBuyQty),
 		zap.Int("max_sell_qty", cfg.MaxSellQty),
 		zap.Int64("security_code", sub.SecurityCode))
+
+	// Best-effort: mark RUNNING in the durable runtime-state table so the
+	// dashboard can distinguish "running" from "never started". Terminal
+	// status is written by the runner-exit goroutine above.
+	if snap := runner.Snapshot(); snap != nil {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := m.repo.UpsertRuntimeState(dbCtx, strategyID, "RUNNING", snap); err != nil {
+			m.logger.Warn("persist RUNNING runtime state failed",
+				zap.String("strategy_id", strategyID), zap.Error(err))
+		}
+		cancel()
+	}
 	return nil
+}
+
+// terminalStatus derives the dashboard status from a finished strategy's
+// final snapshot. A side "counts" only if it had a positive max qty.
+//   COMPLETED — every active side hit max_reached
+//   HALTED    — any active side stopped on a hard halt (price band, auth,
+//               broker hard-fail, no-data, window closed)
+//   STOPPED   — everything else (user pressed Stop, or partial then exit)
+func terminalStatus(s *state.Strategy) string {
+	reasons := make([]state.HaltReason, 0, 2)
+	if s.Cfg.MaxBuyQty > 0 {
+		reasons = append(reasons, s.Buy.HaltReason)
+	}
+	if s.Cfg.MaxSellQty > 0 {
+		reasons = append(reasons, s.Sell.HaltReason)
+	}
+	if len(reasons) == 0 {
+		return "STOPPED"
+	}
+	allMax, anyHardHalt := true, false
+	for _, r := range reasons {
+		if r != state.HaltMaxReached {
+			allMax = false
+		}
+		switch r {
+		case state.HaltPriceBand, state.HaltWindowClosed, state.HaltAuthExpired,
+			state.HaltBrokerHardFail, state.HaltNoData:
+			anyHardHalt = true
+		}
+	}
+	switch {
+	case allMax:
+		return "COMPLETED"
+	case anyHardHalt:
+		return "HALTED"
+	default:
+		return "STOPPED"
+	}
 }
 
 // Stop signals the Runner to halt and waits up to 5 seconds for it to
@@ -461,7 +528,20 @@ func (m *Manager) Get(strategyID string) *state.Strategy {
 	if found {
 		return cs.snap
 	}
-	return nil
+
+	// Final fallback — the durable hft_runtime_state table. This is what
+	// makes a completed strategy keep reporting COMPLETED/HALTED/STOPPED
+	// forever instead of 404-ing once the in-memory TTL lapses or the
+	// engine restarts. Returns nil only if the strategy genuinely never ran.
+	dbCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	persisted, err := m.repo.GetRuntimeState(dbCtx, strategyID)
+	if err != nil {
+		m.logger.Warn("runtime-state DB fallback failed",
+			zap.String("strategy_id", strategyID), zap.Error(err))
+		return nil
+	}
+	return persisted
 }
 
 // GetRunner exposes the live Runner for producers (market WS in Phase 4,
