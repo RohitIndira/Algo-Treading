@@ -35,11 +35,6 @@ type ExecutionClient struct {
 	client    *indiraClient.Client
 	wsManager *indiraClient.WSManager
 
-	// sharedWS is the single shared WebSocket connection used by statusservice
-	// to receive order updates for ALL users on one TCP connection.
-	sharedWSMu sync.Mutex
-	sharedWS   *indiraClient.WSClient
-
 	// tickSizeLookup fetches per-instrument tick size from Redis market data.
 	// Nil-safe: falls back to hardcoded NSE defaults if unavailable.
 	tickSizeLookup TickSizeLookup
@@ -196,28 +191,15 @@ func (c *ExecutionClient) GetOrderStatus(ctx context.Context, orderID string, au
 	return trail[len(trail)-1], nil
 }
 
-// GetSharedWSClient returns (or creates) the single shared WebSocket client.
-// The first call establishes the connection using auth; subsequent calls return
-// the existing client regardless of auth (caller should use wsClient.Subscribe
-// to register additional users on the live connection).
-func (c *ExecutionClient) GetSharedWSClient(ctx context.Context, auth *indiraClient.AuthContext) (*indiraClient.WSClient, error) {
-	c.sharedWSMu.Lock()
-	defer c.sharedWSMu.Unlock()
-
-	if c.sharedWS != nil && c.sharedWS.IsActive {
-		return c.sharedWS, nil
-	}
-
-	// Create or reconnect.
-	if c.sharedWS == nil {
-		c.sharedWS = indiraClient.NewWSClient(c.client, auth)
-	}
-	if err := c.sharedWS.Connect(ctx); err != nil {
-		c.sharedWS = nil
-		return nil, fmt.Errorf("shared WS connect: %w", err)
-	}
-	log.Printf("[indira] Shared WS connection established for user %s", auth.UserId)
-	return c.sharedWS, nil
+// NewUserWSClient creates a fresh, unconnected WebSocket client bound to a
+// single user's auth context. The caller (statusservice) owns the returned
+// client's full lifecycle: wiring callbacks, calling Connect, and Close.
+//
+// One connection per user — the broker binds a WebSocket to a single
+// authenticated user, so order statuses for multiple users cannot share a
+// connection. statusservice keeps one of these per subscribed user.
+func (c *ExecutionClient) NewUserWSClient(auth *indiraClient.AuthContext) *indiraClient.WSClient {
+	return indiraClient.NewWSClient(c.client, auth)
 }
 
 // SubscribeOrderStatus starts or gets the WebSocket connection for a user and returns a channel pouring real-time order updates
