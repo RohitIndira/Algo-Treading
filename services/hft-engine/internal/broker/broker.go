@@ -72,6 +72,14 @@ type Broker interface {
 	// cancelled" (idempotent semantics — both are terminal-good for us).
 	Cancel(ctx context.Context, auth *AuthContext, sym SymbolSpec,
 		brokerOrderID string) error
+
+	// FetchFills returns the qty-weighted average traded price for each
+	// given broker order id, read from the broker's trade book. Used to
+	// backfill the REAL fill price for fills whose order-status WS frame
+	// carried no traded price (a known broker race). Only order ids that
+	// actually have trades appear in the result map.
+	FetchFills(ctx context.Context, auth *AuthContext,
+		brokerOrderIDs []string) (map[string]float64, error)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -150,4 +158,11 @@ func (b *PaperBroker) Cancel(ctx context.Context, auth *AuthContext, sym SymbolS
 		b.OnCancel(brokerOrderID)
 	}
 	return nil
+}
+
+// FetchFills is a no-op for paper trading — synthetic fills always carry a
+// price, so a paper chunk is never price-pending. Returns an empty map.
+func (b *PaperBroker) FetchFills(ctx context.Context, auth *AuthContext,
+	brokerOrderIDs []string) (map[string]float64, error) {
+	return map[string]float64{}, nil
 }

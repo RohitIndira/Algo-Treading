@@ -59,6 +59,10 @@ type Runner struct {
 	// Buffered (256) so a brief slow tick or fill burst doesn't drop events.
 	tickCh chan state.MarketData
 	fillCh chan state.FillEvent
+	// priceCh delivers real broker fill prices (orderID → avg traded price)
+	// from the manager's TradeBook reconciler. Applied on this goroutine so
+	// chunk state is never raced.
+	priceCh chan map[string]float64
 
 	// Lifecycle
 	ctx     context.Context
@@ -93,9 +97,10 @@ func NewRunner(
 		logger: logger.Named("strategy").With(zap.String("strategy_id", cfg.StrategyID)),
 		auth:   auth,
 		sym:    sym,
-		tickCh: make(chan state.MarketData, 256),
-		fillCh: make(chan state.FillEvent, 256),
-		done:   make(chan struct{}),
+		tickCh:  make(chan state.MarketData, 256),
+		fillCh:  make(chan state.FillEvent, 256),
+		priceCh: make(chan map[string]float64, 8),
+		done:    make(chan struct{}),
 	}
 	r.publishSnapshot() // seed snap so Snapshot() never returns nil
 	return r
@@ -122,6 +127,20 @@ func (r *Runner) SendFill(f state.FillEvent) {
 		r.logger.Warn("fill channel full — dropping",
 			zap.String("broker_order_id", f.BrokerOrderID),
 			zap.String("event_type", f.EventType))
+	}
+}
+
+// SendResolvedPrices delivers real broker fill prices (orderID → avg
+// traded price) from the manager's reconciler. Non-blocking. The run
+// loop applies them so chunk state stays single-writer.
+func (r *Runner) SendResolvedPrices(prices map[string]float64) {
+	if len(prices) == 0 {
+		return
+	}
+	select {
+	case r.priceCh <- prices:
+	default:
+		// reconciler runs on a timer — a dropped batch just retries next tick
 	}
 }
 
@@ -238,6 +257,9 @@ func (r *Runner) Run(parent context.Context) {
 			if r.allSidesDone() {
 				return
 			}
+
+		case prices := <-r.priceCh:
+			r.applyResolvedPrices(prices)
 
 		case <-watchdog.C:
 			if time.Since(r.live.LastTickAt) >= NoDataHaltAfter {

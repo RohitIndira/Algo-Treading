@@ -210,6 +210,39 @@ type Strategy struct {
 	Active     bool // false after Exit / halt
 }
 
+// ApplyResolvedPrices backfills the REAL broker fill price onto chunks
+// that filled but whose order-status WS frame carried no traded price.
+// prices maps brokerOrderID → qty-weighted average traded price (from the
+// broker trade book). Returns the count of chunks resolved. Single source
+// of truth — used by the live reconciler and the at-exit reconcile.
+func (s *Strategy) ApplyResolvedPrices(prices map[string]float64) int {
+	resolved := 0
+	fix := func(side *SideState) {
+		for i := range side.History {
+			resolved += resolveChunk(&side.History[i], prices)
+		}
+		if side.Current != nil {
+			resolved += resolveChunk(side.Current, prices)
+		}
+	}
+	fix(&s.Buy)
+	fix(&s.Sell)
+	return resolved
+}
+
+func resolveChunk(c *ChunkState, prices map[string]float64) int {
+	if c.PricePendingQty <= 0 {
+		return 0
+	}
+	px, ok := prices[c.BrokerOrderID]
+	if !ok || px <= 0 {
+		return 0
+	}
+	c.FilledValue += px * float64(c.PricePendingQty)
+	c.PricePendingQty = 0
+	return 1
+}
+
 // Status returns the dashboard-facing lifecycle status. Single source of
 // truth — used by both the /state response and the persisted runtime row,
 // so the frontend never has to derive state from active/done/halt_reason.

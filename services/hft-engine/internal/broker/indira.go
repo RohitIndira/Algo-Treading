@@ -191,6 +191,49 @@ func (b *IndiraBroker) Cancel(
 	return nil
 }
 
+// FetchFills reads the broker trade book for the given order ids and
+// returns the qty-weighted average traded price per order. One batched
+// trade-book call. An order with no trades is simply absent from the map.
+func (b *IndiraBroker) FetchFills(
+	ctx context.Context, auth *AuthContext, brokerOrderIDs []string,
+) (map[string]float64, error) {
+	if len(brokerOrderIDs) == 0 {
+		return map[string]float64{}, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, b.callTimeout)
+	defer cancel()
+	trades, err := b.client.GetTradeBook(cctx, b.toIndiraAuth(auth), brokerOrderIDs...)
+	if err != nil {
+		return nil, err
+	}
+	// An order can have multiple trade rows (partial fills at different
+	// prices) — accumulate value + qty, then average.
+	type acc struct {
+		value float64
+		qty   int
+	}
+	byOrder := make(map[string]*acc, len(brokerOrderIDs))
+	for _, t := range trades {
+		if t.OrdId == "" || t.TradedQty <= 0 || t.TradedPrice <= 0 {
+			continue
+		}
+		a := byOrder[t.OrdId]
+		if a == nil {
+			a = &acc{}
+			byOrder[t.OrdId] = a
+		}
+		a.value += t.TradedPrice * float64(t.TradedQty)
+		a.qty += t.TradedQty
+	}
+	out := make(map[string]float64, len(byOrder))
+	for id, a := range byOrder {
+		if a.qty > 0 {
+			out[id] = a.value / float64(a.qty)
+		}
+	}
+	return out, nil
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // AU004 retry wrappers — one extra refresh on auth failure, then fail.
 // ─────────────────────────────────────────────────────────────────────────

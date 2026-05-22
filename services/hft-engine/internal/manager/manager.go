@@ -76,6 +76,11 @@ type Manager struct {
 	// completedMu is independent of mu and pendingMu — never held with either.
 	completedMu        sync.Mutex
 	completedSnapshots map[string]completedSnapshot
+
+	// authByStrategy holds each running strategy's broker auth so the
+	// trade-book reconciler can call the broker on its behalf. Guarded by
+	// mu (set in Start, deleted on runner exit).
+	authByStrategy map[string]*broker.AuthContext
 }
 
 // pendingFill is a FillEvent buffered because no Runner owned its
@@ -123,9 +128,92 @@ func New(rootCtx context.Context, r *repo.Repo, a *audit.Writer, br broker.Broke
 		rootCtx:            rootCtx,
 		pendingFills:       make(map[string][]pendingFill),
 		completedSnapshots: make(map[string]completedSnapshot),
+		authByStrategy:     make(map[string]*broker.AuthContext),
 	}
 	go m.reapPendingFills()
+	go m.reconcileFillPrices()
 	return m
+}
+
+// fillPriceReconcileInterval — how often the reconciler sweeps running
+// strategies for chunks whose broker fill price never arrived on the
+// order-status WS, and backfills them from the broker trade book.
+const fillPriceReconcileInterval = 20 * time.Second
+
+// reconcileFillPrices runs for the manager's lifetime. Every interval it
+// walks each running strategy, collects broker order ids with a missing
+// fill price (PricePendingQty > 0), batch-queries the broker trade book,
+// and feeds the real prices back to the runner. Never blocks trading —
+// the broker call is here, the apply is on the runner goroutine.
+func (m *Manager) reconcileFillPrices() {
+	t := time.NewTicker(fillPriceReconcileInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.rootCtx.Done():
+			return
+		case <-t.C:
+			m.reconcileOnce()
+		}
+	}
+}
+
+func (m *Manager) reconcileOnce() {
+	// Snapshot the runner set + auth under the lock, then do the slow
+	// broker I/O without holding it.
+	type job struct {
+		runner *strategy.Runner
+		auth   *broker.AuthContext
+	}
+	m.mu.Lock()
+	jobs := make([]job, 0, len(m.runners))
+	for id, runner := range m.runners {
+		jobs = append(jobs, job{runner: runner, auth: m.authByStrategy[id]})
+	}
+	m.mu.Unlock()
+
+	for _, j := range jobs {
+		if j.auth == nil {
+			continue
+		}
+		snap := j.runner.Snapshot()
+		if snap == nil {
+			continue
+		}
+		ids := pendingPriceOrderIDs(snap)
+		if len(ids) == 0 {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(m.rootCtx, 10*time.Second)
+		prices, err := m.br.FetchFills(ctx, j.auth, ids)
+		cancel()
+		if err != nil {
+			m.logger.Warn("fill-price reconcile: trade-book fetch failed",
+				zap.String("strategy_id", snap.Cfg.StrategyID),
+				zap.Int("pending_orders", len(ids)), zap.Error(err))
+			continue
+		}
+		j.runner.SendResolvedPrices(prices)
+	}
+}
+
+// pendingPriceOrderIDs collects the broker order ids of every chunk that
+// filled but whose price the order-status WS never delivered.
+func pendingPriceOrderIDs(s *state.Strategy) []string {
+	var ids []string
+	scan := func(side *state.SideState) {
+		for i := range side.History {
+			if c := &side.History[i]; c.PricePendingQty > 0 && c.BrokerOrderID != "" {
+				ids = append(ids, c.BrokerOrderID)
+			}
+		}
+		if c := side.Current; c != nil && c.PricePendingQty > 0 && c.BrokerOrderID != "" {
+			ids = append(ids, c.BrokerOrderID)
+		}
+	}
+	scan(&s.Buy)
+	scan(&s.Sell)
+	return ids
 }
 
 // RouteFill is the orderws.Router callback. Called from the orderws read
@@ -358,6 +446,7 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 
 	runner := strategy.NewRunner(*cfg, auth, sym, m.br, m.audit, m.logger)
 	m.runners[strategyID] = runner
+	m.authByStrategy[strategyID] = auth // for the trade-book reconciler
 
 	// Forwarder goroutine: pipes ticks from the marketws subscription
 	// into the runner's tickCh. Exits when sub.Ticks is closed (i.e.
@@ -381,6 +470,24 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 		// and can't render the completion.
 		if final := runner.Snapshot(); final != nil {
 			final.Active = false
+
+			// Final fill-price reconcile — backfill any chunk whose broker
+			// price never arrived on the WS, so the persisted terminal
+			// snapshot carries real prices, not price-pending placeholders.
+			if ids := pendingPriceOrderIDs(final); len(ids) > 0 {
+				rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if prices, ferr := m.br.FetchFills(rctx, auth, ids); ferr == nil {
+					if n := final.ApplyResolvedPrices(prices); n > 0 {
+						m.logger.Info("at-exit reconcile backfilled fill prices",
+							zap.String("strategy_id", strategyID), zap.Int("chunks", n))
+					}
+				} else {
+					m.logger.Warn("at-exit fill-price reconcile failed",
+						zap.String("strategy_id", strategyID), zap.Error(ferr))
+				}
+				rcancel()
+			}
+
 			m.completedMu.Lock()
 			m.completedSnapshots[strategyID] = completedSnapshot{
 				snap:       final,
@@ -409,6 +516,7 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 		m.mu.Lock()
 		if m.runners[strategyID] == runner {
 			delete(m.runners, strategyID)
+			delete(m.authByStrategy, strategyID)
 		}
 		m.mu.Unlock()
 	}()

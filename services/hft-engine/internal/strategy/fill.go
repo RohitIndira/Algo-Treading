@@ -79,6 +79,19 @@ func (r *Runner) onFill(f state.FillEvent) {
 	r.publishSnapshot()
 }
 
+// applyResolvedPrices backfills REAL broker fill prices for chunks that
+// filled without a price in the order-status WS frame (a known broker
+// race). Called only on the run goroutine (via priceCh) so chunk state
+// stays single-writer. The actual chunk math is state.Strategy's — single
+// source of truth shared with the manager's at-exit reconcile.
+func (r *Runner) applyResolvedPrices(prices map[string]float64) {
+	if n := r.live.ApplyResolvedPrices(prices); n > 0 {
+		r.logger.Info("backfilled real fill prices from trade book",
+			zap.Int("chunks_resolved", n))
+		r.publishSnapshot()
+	}
+}
+
 // applyFill increments chunk.Filled + side.Position. Promotes the chunk
 // to FILLED status when it reaches Qty, then clears side.Current so the
 // next tick can place chunk #2.
