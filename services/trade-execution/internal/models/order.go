@@ -154,6 +154,10 @@ type Order struct {
 	// LiveExitTime is the exact timestamp when the live position was closed.
 	// Entry time is ExecutedAt (set from broker OrderEntryTime/OrderTimeStamp on fill).
 	LiveExitTime  *time.Time `json:"live_exit_time,omitempty" db:"live_exit_time"`
+	// LiveExitReason records why a live position was closed: STOP_LOSS, TAKE_PROFIT,
+	// FORCE_EXIT, SQUARE_OFF, or MANUAL. Mirrors the paper-trade exit reason so the
+	// frontend can render identical exit context for live positions.
+	LiveExitReason *string `json:"live_exit_reason,omitempty" db:"live_exit_reason"`
 
 	// CurrentPctChange is the stock's percentage change at the time the order was created.
 	CurrentPctChange float64 `json:"current_pct_change,omitempty" db:"current_pct_change"`

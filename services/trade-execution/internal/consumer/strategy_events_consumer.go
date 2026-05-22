@@ -493,8 +493,11 @@ func (c *StrategyEventsConsumer) squareOffLivePosition(ctx context.Context, orig
 		BearerToken:      original.BearerToken,
 		AppId:            original.AppId,
 		Source:           original.Source,
-		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
+		// Link back to the entry order so statusservice records the exact exit
+		// price / P&L on the parent when this reverse order fills.
+		ParentOrderID: &original.OrderID,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 
 	if err := c.orderRepo.Create(ctx, sqOrder); err != nil {

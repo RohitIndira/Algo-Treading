@@ -413,9 +413,10 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 					zap.Bool("oco", isKnownOCO),
 					zap.Bool("ml", isKnownML),
 					zap.Error(err))
-			} else if isFill && wsStatus.Symbol != "" && (s.ocoHandler != nil || s.mlHandler != nil) {
-				// Genuinely not our order — manual exit from broker app.
-				s.handleManualExitDetection(ctx, wsStatus)
+			} else if isFill && wsStatus.Symbol != "" {
+				// Genuinely not our order — position closed outside our system
+				// (manual broker-terminal exit or broker EOD MIS square-off).
+				s.handleExternalExit(ctx, wsStatus)
 			}
 			return
 		}
@@ -596,6 +597,17 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		s.wsBroadcaster(orderCopy.UserID, &orderCopy)
 	}
 
+	// On fill of an auto-square-off reverse order, record the exit on the parent
+	// entry position using the reverse order's actual broker fill price — so the
+	// closed-orders view and the position_exit event show the true exit price.
+	// Scoped to IsSquareOffOrder + ParentOrderID: OCO legs (IsSquareOffOrder=false)
+	// and ML legs (ParentOrderID=nil) are excluded; they record their own exits.
+	if (brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED") &&
+		order.IsSquareOffOrder && order.ParentOrderID != nil {
+		sqCopy := *order
+		go s.recordSquareOffExit(context.Background(), &sqCopy)
+	}
+
 	// On fill: push updated positions to frontend via /ws/live-orders so the
 	// frontend doesn't need to poll the positions REST API.
 	if (brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED") && s.onOrderFilled != nil {
@@ -654,28 +666,198 @@ func (s *OrderStatusService) ReconcileOrderFromBrokerBook(ctx context.Context, d
 	return true, nil
 }
 
-// handleManualExitDetection runs when an EXECUTED order arrives whose broker ID
-// is not in our DB — i.e. the user placed an exit from the broker terminal.
-// Cancel any active OCO and multi-level SL/TP groups for that user+symbol so
-// orphaned legs don't fire into a flat position.
-func (s *OrderStatusService) handleManualExitDetection(ctx context.Context, wsStatus *indiraClient.WSOrderStatus) {
+// normalizeBuySell maps the broker WS Buy_Sell field to "BUY"/"SELL". The broker
+// sends it inconsistently as "1"/"2", "B"/"S", or the full word.
+func normalizeBuySell(v string) string {
+	switch strings.ToUpper(strings.TrimSpace(v)) {
+	case "1", "B", "BUY":
+		return "BUY"
+	case "2", "S", "SELL":
+		return "SELL"
+	}
+	return ""
+}
+
+// normalizeExitSymbol uppercases and strips exchange series suffixes so the WS
+// Symbol matches the plain symbol stored on our orders.
+func normalizeExitSymbol(s string) string {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	for _, sfx := range []string{"-EQ", "-BE", "-BZ", "-BL", "-SM", "-ST", "_EQ", "_BE"} {
+		if strings.HasSuffix(s, sfx) && len(s) > len(sfx) {
+			return s[:len(s)-len(sfx)]
+		}
+	}
+	return s
+}
+
+// handleExternalExit runs when an EXECUTED order arrives whose broker ID is not
+// in our DB — the position was closed outside our system (a manual sell from the
+// broker terminal, or the broker's own EOD MIS auto-square-off).
+//
+// It does two things:
+//  1. Cancels any active OCO / multi-level SL/TP groups for that user+symbol so
+//     orphaned legs don't fire into a now-flat position.
+//  2. Records the exit on the matching open algo entry order(s) — using the
+//     order WebSocket event's actual fill price and exchange timestamp — so the
+//     position shows a complete round trip (entry + exit price/time/P&L) instead
+//     of being stuck with no exit data.
+func (s *OrderStatusService) handleExternalExit(ctx context.Context, wsStatus *indiraClient.WSOrderStatus) {
 	userID := wsStatus.UCC // UCC is the client code (user ID)
 	if userID == "" {
 		return
 	}
-
 	symbol := wsStatus.Symbol
-	s.logger.Info("Manual exit detected — cancelling SL/TP groups for symbol",
+
+	s.logger.Info("External exit detected on order WS",
 		zap.String("user_id", userID),
 		zap.String("symbol", symbol),
 		zap.String("unique_code", wsStatus.UniqueCode))
 
+	// (1) Tear down protective SL/TP groups for the now-closed position.
 	if s.ocoHandler != nil {
 		go s.ocoHandler.CancelGroupsBySymbol(context.Background(), userID, symbol)
 	}
 	if s.mlHandler != nil {
 		go s.mlHandler.CancelGroupsBySymbol(context.Background(), userID, symbol)
 	}
+
+	// (2) Record the exit on the matching open entry order(s).
+	fillSide := normalizeBuySell(wsStatus.BuySell)
+	if fillSide == "" {
+		return // can't tell direction — skip exit recording
+	}
+
+	entries, err := s.repo.GetOpenLiveEntriesByUserSymbol(ctx, userID, normalizeExitSymbol(symbol))
+	if err != nil {
+		s.logger.Warn("handleExternalExit: failed to load open entries", zap.Error(err))
+		return
+	}
+	if len(entries) == 0 {
+		return // nothing of ours to close
+	}
+
+	// Exit price from the WS event (TradedPrice, scaled by DecimalLocator),
+	// falling back to OrderPrice.
+	dl := decimalLocator(string(wsStatus.DecimalLocator))
+	exitPrice := 0.0
+	if p, e := strconv.ParseFloat(wsStatus.TradedPrice, 64); e == nil && p > 0 {
+		exitPrice = p / dl
+	}
+	if exitPrice <= 0 {
+		if p, e := strconv.ParseFloat(wsStatus.OrderPrice, 64); e == nil && p > 0 {
+			exitPrice = p
+		}
+	}
+	if exitPrice <= 0 {
+		s.logger.Warn("handleExternalExit: no usable exit price — skipping", zap.String("symbol", symbol))
+		return
+	}
+
+	// Exit timestamp straight from the broker WS event.
+	exitTime := parseBrokerTime(wsStatus.OrderEntryTime)
+	if exitTime.IsZero() {
+		exitTime = parseBrokerTime(wsStatus.OrderTimeStamp)
+	}
+	if exitTime.IsZero() {
+		exitTime = time.Now()
+	}
+
+	remainingExitQty := flexToInt(wsStatus.TradedQTY)
+	if remainingExitQty <= 0 {
+		return
+	}
+
+	// Allocate the exit quantity FIFO across our open entries. Only an
+	// opposite-side fill closes an entry (a SELL closes a BUY, and vice versa).
+	for _, entry := range entries {
+		if remainingExitQty <= 0 {
+			break
+		}
+		entrySide := strings.ToUpper(string(entry.OrderSide))
+		if (entrySide == "BUY" && fillSide != "SELL") || (entrySide == "SELL" && fillSide != "BUY") {
+			continue // same-side fill — a new position, not an exit
+		}
+		qty := int(entry.FilledQuantity)
+		if qty > remainingExitQty {
+			// External fill covers only part of this entry — don't mark a
+			// position fully exited on a partial close. Stop here (FIFO).
+			break
+		}
+		remainingExitQty -= qty
+
+		entryPrice := 0.0
+		if entry.FilledPrice != nil {
+			entryPrice = *entry.FilledPrice
+		}
+		var pnl float64
+		if entrySide == "BUY" {
+			pnl = (exitPrice - entryPrice) * float64(qty)
+		} else {
+			pnl = (entryPrice - exitPrice) * float64(qty)
+		}
+
+		if err := s.repo.UpdateLiveTradeExit(ctx, entry.OrderID, exitPrice, pnl, exitTime, "MANUAL"); err != nil {
+			s.logger.Warn("handleExternalExit: failed to record exit",
+				zap.String("entry_order", entry.OrderID.String()), zap.Error(err))
+			continue
+		}
+		// Audit trail — the external order isn't in our DB, so record the event
+		// against the entry order it closed.
+		s.repo.RecordExecutionEvent(ctx, entry.OrderID, "EXTERNAL_EXIT", map[string]interface{}{
+			"exit_price":  exitPrice,
+			"exit_qty":    qty,
+			"pnl":         pnl,
+			"exit_time":   exitTime,
+			"fill_side":   fillSide,
+			"unique_code": wsStatus.UniqueCode,
+			"symbol":      symbol,
+		})
+		s.logger.Info("External exit recorded on entry order",
+			zap.String("entry_order", entry.OrderID.String()),
+			zap.String("symbol", symbol),
+			zap.Float64("exit_price", exitPrice),
+			zap.Float64("pnl", pnl))
+	}
+}
+
+// recordSquareOffExit marks the parent entry position closed when its
+// auto-square-off reverse order fills. The reverse order's actual broker fill
+// price is the true exit price, so the recorded exit price / P&L match exactly
+// what executed at the exchange. Idempotent — UpdateLiveTradeExit guards on
+// live_exit_price IS NULL, so a race with an OCO/ML exit resolves cleanly.
+func (s *OrderStatusService) recordSquareOffExit(ctx context.Context, sqOrder *models.Order) {
+	if sqOrder.ParentOrderID == nil || sqOrder.FilledPrice == nil {
+		return
+	}
+	entry, err := s.repo.GetByID(ctx, *sqOrder.ParentOrderID)
+	if err != nil || entry == nil || entry.FilledPrice == nil {
+		return
+	}
+	exitPrice := *sqOrder.FilledPrice
+	qty := float64(sqOrder.FilledQuantity)
+	if qty <= 0 {
+		qty = float64(entry.FilledQuantity)
+	}
+	var pnl float64
+	if entry.OrderSide == models.OrderSideBuy {
+		pnl = (exitPrice - *entry.FilledPrice) * qty
+	} else {
+		pnl = (*entry.FilledPrice - exitPrice) * qty
+	}
+	exitTime := time.Now()
+	if sqOrder.ExecutedAt != nil && !sqOrder.ExecutedAt.IsZero() {
+		exitTime = *sqOrder.ExecutedAt
+	}
+	if err := s.repo.UpdateLiveTradeExit(ctx, entry.OrderID, exitPrice, pnl, exitTime, "SQUARE_OFF"); err != nil {
+		s.logger.Warn("recordSquareOffExit: failed to record entry exit",
+			zap.String("entry_order", entry.OrderID.String()), zap.Error(err))
+		return
+	}
+	s.logger.Info("Square-off exit recorded on entry order",
+		zap.String("entry_order", entry.OrderID.String()),
+		zap.String("square_off_order", sqOrder.OrderID.String()),
+		zap.Float64("exit_price", exitPrice),
+		zap.Float64("pnl", pnl))
 }
 
 // flexToInt converts a FlexInt to int, returning 0 on failure.

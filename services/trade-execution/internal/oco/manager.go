@@ -194,6 +194,35 @@ func (m *OCOManager) dbUpdateAsync(order *models.Order, label string) {
 	}()
 }
 
+// recordEntryExit writes the exit price, final P&L, exit time, and exit reason
+// onto the OCO group's ENTRY order when an SL or TP leg fills. Without this the
+// entry order would never be marked closed in the DB — the closed-orders view
+// and the LiveOrderMonitor's position_exit event both depend on live_exit_price
+// being set. exitPrice is the leg's actual broker fill price, so what the user
+// sees always matches what executed at the exchange.
+//
+// Idempotent: the repository guards on live_exit_price IS NULL, so a race
+// between the SL fill and an EOD square-off resolves to first-writer-wins.
+// Runs async so it never blocks the broker WS read loop.
+func (m *OCOManager) recordEntryExit(group *OCOGroup, exitPrice float64, reason string, exitTime *time.Time) {
+	t := time.Now()
+	if exitTime != nil && !exitTime.IsZero() {
+		t = *exitTime
+	}
+	pnl := group.PnL
+	entryID := group.EntryOrderID
+	groupID := group.GroupID
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+		defer cancel()
+		if err := m.repo.UpdateLiveTradeExit(ctx, entryID, exitPrice, pnl, t, reason); err != nil {
+			log.Printf("[oco] Failed to record entry exit for group %s: %v", groupID, err)
+			return
+		}
+		log.Printf("[oco] Entry exit recorded for group %s: exit=%.2f pnl=%.2f reason=%s", groupID, exitPrice, pnl, reason)
+	}()
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // STEP 1: Create OCO Entry Order
 // ════════════════════════════════════════════════════════════════════════════
@@ -680,6 +709,8 @@ func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, ord
 			} else {
 				group.PnL = (group.EntryFillPrice - *order.FilledPrice) * float64(pnlQty)
 			}
+			// Mark the entry position closed in the DB at the SL leg's actual fill price.
+			m.recordEntryExit(group, *order.FilledPrice, "STOP_LOSS", order.ExecutedAt)
 		}
 
 		// Cancel TP leg if one was placed; otherwise complete directly (SL-only mode)
@@ -760,6 +791,8 @@ func (m *OCOManager) handleTPLegUpdate(ctx context.Context, group *OCOGroup, ord
 			} else {
 				group.PnL = (group.EntryFillPrice - *order.FilledPrice) * float64(pnlQty)
 			}
+			// Mark the entry position closed in the DB at the TP leg's actual fill price.
+			m.recordEntryExit(group, *order.FilledPrice, "TAKE_PROFIT", order.ExecutedAt)
 		}
 
 		// Cancel SL leg if one was placed; otherwise complete directly (TP-only mode)

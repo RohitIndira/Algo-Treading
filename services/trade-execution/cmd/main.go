@@ -401,6 +401,27 @@ func main() {
 	log.Println("✓ Paper trading layer initialized")
 	// ─────────────────────────────────────────────────────────────────────────
 
+	// ── Live position monitor ──────────────────────────────────────────────
+	// Brings /ws/live-orders to parity with /ws/paper-trades: it broadcasts
+	// per-position live P&L ticks (pnl_update), new_order, and position_exit
+	// events for LIVE positions. It uses its OWN market WSS connection so its
+	// symbol subscriptions never interfere with the paper monitor's shared
+	// subscription set.
+	var liveMonitorRef *paper.LiveOrderMonitor
+	liveMarketClient := paper.NewPaperMarketClient(
+		cfg.PaperMarketWSURL,
+		func(symbol string, ltp float64) {
+			if liveMonitorRef != nil {
+				liveMonitorRef.OnPriceUpdate(symbol, ltp)
+			}
+		},
+	)
+	liveMonitor := paper.NewLiveOrderMonitor(orderRepo, paperWSServer, liveMarketClient, redisPrices)
+	liveMonitorRef = liveMonitor
+	paperWSServer.SetLiveMonitor(liveMonitor)
+	log.Println("✓ Live order monitor initialized")
+	// ─────────────────────────────────────────────────────────────────────────
+
 	// Initialize PriceMonitor for below_min orders (Case 2).
 	// Primary: WebSocket (enhanced-stream) for real-time push prices.
 	// Fallback: Redis MGET polling for any tokens not covered by WSS.
@@ -1019,6 +1040,20 @@ func main() {
 		time.Sleep(2 * time.Second) // wait for WSS to connect
 		if err := paperMonitor.Initialize(ctx); err != nil {
 			log.Printf("[paper] Monitor init error (non-fatal): %v", err)
+		}
+	}()
+
+	// Start live market WSS client (dedicated feed for the live order monitor)
+	go func() {
+		log.Println("Starting live market WSS client...")
+		liveMarketClient.Start(ctx)
+	}()
+
+	// Load open live positions and subscribe symbols for live P&L broadcasting
+	go func() {
+		time.Sleep(2 * time.Second) // wait for WSS to connect
+		if err := liveMonitor.Initialize(ctx); err != nil {
+			log.Printf("[live] Monitor init error (non-fatal): %v", err)
 		}
 	}()
 

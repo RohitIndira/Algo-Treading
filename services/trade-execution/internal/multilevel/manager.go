@@ -371,7 +371,7 @@ func (m *Manager) HandleBrokerUpdate(ctx context.Context, order *models.Order, b
 	if isFilledStatus(brokerStatus) && order.IndiraOrderID != nil {
 		if val, ok := m.mlLevelIndex.Load(*order.IndiraOrderID); ok {
 			ref := val.(*mlLevelRef)
-			go m.onMultiLevelFilled(ctx, ref.group, ref.exitType, ref.levelNum, order.FilledPrice, order.FilledQuantity)
+			go m.onMultiLevelFilled(ctx, ref.group, ref.exitType, ref.levelNum, order.FilledPrice, order.FilledQuantity, order.ExecutedAt)
 			return
 		}
 	}
@@ -380,7 +380,7 @@ func (m *Manager) HandleBrokerUpdate(ctx context.Context, order *models.Order, b
 	if isFilledStatus(brokerStatus) && order.IndiraOrderID != nil {
 		if val, ok := m.singleSLIndex.Load(*order.IndiraOrderID); ok {
 			g := val.(*Group)
-			go m.onSingleSLFilled(ctx, g, order.FilledPrice, order.FilledQuantity)
+			go m.onSingleSLFilled(ctx, g, order.FilledPrice, order.FilledQuantity, order.ExecutedAt)
 		}
 	}
 }
@@ -1103,7 +1103,7 @@ func (m *Manager) replaceSLTrailing(ctx context.Context, g *Group, remainingQty 
 }
 
 // onSingleSLFilled handles a broker EXECUTED event for the fixed/trailing SL order.
-func (m *Manager) onSingleSLFilled(ctx context.Context, g *Group, fillPrice *float64, filledQty int32) {
+func (m *Manager) onSingleSLFilled(ctx context.Context, g *Group, fillPrice *float64, filledQty int32, exitTime *time.Time) {
 	price := 0.0
 	if fillPrice != nil {
 		price = *fillPrice
@@ -1163,6 +1163,8 @@ func (m *Manager) onSingleSLFilled(ctx context.Context, g *Group, fillPrice *flo
 	_ = m.repo.UpdateMultiLevelLevelStatus(ctx, entryOrderID, models.MLExitTypeSL, 0, models.MLStatusTriggered, price)
 
 	if remaining <= 0 {
+		// Single SL fully filled — mark the live entry position closed in the DB.
+		m.recordLiveGroupExit(ctx, g, price, "STOP_LOSS", exitTime)
 		m.finishGroup(ctx, g)
 	}
 
@@ -1299,6 +1301,66 @@ func (m *Manager) finishGroupPaper(ctx context.Context, g *Group, lastExitPrice 
 	}
 
 	m.OnPaperGroupCompleted(g.UserID, g.EntryOrderID.String(), pnl, avgExitPrice)
+}
+
+// recordLiveGroupExit marks a LIVE entry order closed in the DB when its
+// multi-level / single-SL exit group fully completes. The exit price is the
+// quantity-weighted average of every triggered level's actual broker fill
+// price (falls back to lastExitPrice when no per-level data is available), so
+// what the user sees matches what executed at the exchange. The LiveOrderMonitor
+// picks up the live_exit_price write on its next reconcile and broadcasts the
+// position_exit event — no direct WS call is needed here.
+func (m *Manager) recordLiveGroupExit(ctx context.Context, g *Group, lastExitPrice float64, reason string, exitTime *time.Time) {
+	if g.TradingMode == "PAPER" {
+		return // paper exits are recorded separately via UpdatePaperTradeExit
+	}
+	// Prefer the broker fill timestamp of the leg that completed the exit;
+	// fall back to now only when the WS event carried no usable time.
+	t := time.Now()
+	if exitTime != nil && !exitTime.IsZero() {
+		t = *exitTime
+	}
+	var totalExitValue float64
+	var totalExitQty int32
+	for _, lvl := range g.SLLevels {
+		lvl.mu.Lock()
+		if lvl.Status == LevelTriggered {
+			totalExitValue += lvl.ExitPrice * float64(lvl.OriginalExitQty)
+			totalExitQty += lvl.OriginalExitQty
+		}
+		lvl.mu.Unlock()
+	}
+	for _, lvl := range g.TPLevels {
+		lvl.mu.Lock()
+		if lvl.Status == LevelTriggered {
+			totalExitValue += lvl.ExitPrice * float64(lvl.OriginalExitQty)
+			totalExitQty += lvl.OriginalExitQty
+		}
+		lvl.mu.Unlock()
+	}
+	avgExitPrice := lastExitPrice
+	if totalExitQty > 0 {
+		avgExitPrice = totalExitValue / float64(totalExitQty)
+	}
+	if avgExitPrice <= 0 {
+		return // no usable exit price — leave it for the next reconcile
+	}
+	var pnl float64
+	if g.OrderSide == "BUY" {
+		pnl = (avgExitPrice - g.FillPrice) * float64(g.TotalQty)
+	} else {
+		pnl = (g.FillPrice - avgExitPrice) * float64(g.TotalQty)
+	}
+	if err := m.repo.UpdateLiveTradeExit(ctx, g.EntryOrderID, avgExitPrice, pnl, t, reason); err != nil {
+		m.logger.Warn("recordLiveGroupExit: failed to record entry exit",
+			zap.String("group", g.GroupID.String()), zap.Error(err))
+		return
+	}
+	m.logger.Info("Live ML group exit recorded",
+		zap.String("entry_order", g.EntryOrderID.String()),
+		zap.Float64("exit_price", avgExitPrice),
+		zap.Float64("pnl", pnl),
+		zap.String("reason", reason))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1588,7 +1650,7 @@ func (m *Manager) placeMultiTPOrders(ctx context.Context, g *Group) {
 // onMultiLevelFilled handles a broker EXECUTED event for one per-level SL or TP order.
 // Marks the level triggered, decrements RemainingQty, then proportionally rebalances
 // all remaining active levels on BOTH sides and issues ModifyOrder for each.
-func (m *Manager) onMultiLevelFilled(ctx context.Context, g *Group, exitType string, levelNum int, fillPrice *float64, filledQty int32) {
+func (m *Manager) onMultiLevelFilled(ctx context.Context, g *Group, exitType string, levelNum int, fillPrice *float64, filledQty int32, exitTime *time.Time) {
 	price := 0.0
 	if fillPrice != nil {
 		price = *fillPrice
@@ -1690,6 +1752,13 @@ func (m *Manager) onMultiLevelFilled(ctx context.Context, g *Group, exitType str
 				}
 			}()
 		}
+		// Record the entry position as closed in the DB. The reason reflects the
+		// side of the level that completed the exit.
+		exitReason := "TAKE_PROFIT"
+		if exitType == models.MLExitTypeSL {
+			exitReason = "STOP_LOSS"
+		}
+		m.recordLiveGroupExit(ctx, g, price, exitReason, exitTime)
 		m.finishGroup(ctx, g)
 		return
 	}

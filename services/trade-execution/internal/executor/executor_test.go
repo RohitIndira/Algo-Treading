@@ -59,8 +59,14 @@ func (m *mockRepo) GetLiveOrdersByUser(ctx context.Context, userID string) ([]*m
 func (m *mockRepo) GetClosedLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
 	return nil, nil
 }
-func (m *mockRepo) UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+func (m *mockRepo) UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64, exitTime time.Time, reason string) error {
 	return nil
+}
+func (m *mockRepo) GetAllActiveLivePositions(ctx context.Context) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetOpenLiveEntriesByUserSymbol(ctx context.Context, userID, symbol string) ([]*models.Order, error) {
+	return nil, nil
 }
 func (m *mockRepo) CancelAllLiveOrdersByUser(ctx context.Context, userID string) error {
 	return nil

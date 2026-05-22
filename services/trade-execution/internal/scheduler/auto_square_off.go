@@ -537,6 +537,9 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 		IsSquareOffOrder: true,  // mark so it won't be picked up again
 		IsPaperTrade:     false, // live order
 		TradingMode:      "LIVE",
+		// Link back to the entry order so statusservice can record the exact
+		// exit price / P&L on the parent when this reverse order fills.
+		ParentOrderID: &originalOrder.OrderID,
 		RiskApproved:     true, // auto square-off bypasses risk checks
 		BearerToken:      originalOrder.BearerToken,
 		AppId:            originalOrder.AppId,

@@ -72,7 +72,19 @@ type OrderRepository interface {
 	// lookback so positions opened on a prior session aren't orphaned as broker-direct.
 	GetOpenLivePositionAttributionOrders(ctx context.Context, userID string) ([]*models.Order, error)
 	GetClosedLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
-	UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error
+	// UpdateLiveTradeExit marks a live order as closed, recording the exact exit
+	// price, P&L, exit timestamp, and exit reason (STOP_LOSS, TAKE_PROFIT,
+	// FORCE_EXIT, SQUARE_OFF, MANUAL). Idempotent — first writer wins.
+	UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64, exitTime time.Time, reason string) error
+	// GetAllActiveLivePositions returns every open live position across all users:
+	// filled live entry orders that haven't been exited yet (live_exit_price IS NULL).
+	// Used by the LiveOrderMonitor to subscribe market data and broadcast live P&L.
+	GetAllActiveLivePositions(ctx context.Context) ([]*models.Order, error)
+	// GetOpenLiveEntriesByUserSymbol returns filled live entry orders for one user
+	// on one symbol that have not been exited yet, oldest first (FIFO). Used by
+	// statusservice to record an exit on the matching entry when an external
+	// (manual / broker-side) close event arrives on the order WebSocket.
+	GetOpenLiveEntriesByUserSymbol(ctx context.Context, userID, symbol string) ([]*models.Order, error)
 	CancelAllLiveOrdersByUser(ctx context.Context, userID string) error
 	// Strategy-level cancellation (used on deactivate/delete)
 	GetActiveOrdersByStrategy(ctx context.Context, strategyID, userID string) ([]*models.Order, error)
@@ -725,22 +737,30 @@ func (r *orderRepository) GetClosedLiveOrdersByUser(ctx context.Context, userID 
 	return orders, nil
 }
 
-// UpdateLiveTradeExit marks a live order as force-exited with exit price, PnL, and exit timestamp.
-// Guards on live_exit_price IS NULL so concurrent calls are idempotent — the first writer wins.
-func (r *orderRepository) UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
-	now := time.Now()
+// UpdateLiveTradeExit marks a live order as closed with the exact exit price, PnL,
+// exit timestamp, and exit reason. exitTime should be the broker fill time of the
+// closing order when available, so it reflects when the position actually closed.
+// Guards on live_exit_price IS NULL so concurrent calls are idempotent — the first
+// writer wins (e.g. an OCO SL fill racing the EOD square-off sweep).
+func (r *orderRepository) UpdateLiveTradeExit(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64, exitTime time.Time, reason string) error {
+	if exitTime.IsZero() {
+		exitTime = time.Now()
+	}
+	if reason == "" {
+		reason = "FORCE_EXIT"
+	}
 	query := `
 		UPDATE orders SET
 			status = 'CANCELLED',
 			live_exit_price = $1,
 			live_pnl = $2,
 			live_exit_time = $3,
-			rejection_reason = 'Force exit by user',
+			live_exit_reason = $4,
 			updated_at = $3
-		WHERE order_id = $4
+		WHERE order_id = $5
 		AND live_exit_price IS NULL
 	`
-	result, err := r.db.ExecContext(ctx, query, exitPrice, pnl, now, orderID)
+	result, err := r.db.ExecContext(ctx, query, exitPrice, pnl, exitTime, reason, orderID)
 	if err != nil {
 		return fmt.Errorf("failed to update live trade exit: %w", err)
 	}
@@ -750,6 +770,32 @@ func (r *orderRepository) UpdateLiveTradeExit(ctx context.Context, orderID uuid.
 		return nil
 	}
 	return nil
+}
+
+// GetAllActiveLivePositions returns every open live position across all users:
+// filled live entry orders that have not been exited yet. The LiveOrderMonitor
+// loads these on startup to subscribe market data and broadcast live P&L.
+//
+// Filters mirror GetExitableLiveOrdersByUser but span all users and are not
+// date-bounded — a position opened on a prior session is still open until
+// live_exit_price is set.
+func (r *orderRepository) GetAllActiveLivePositions(ctx context.Context) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE is_paper_trade = false
+		AND is_square_off_order = false
+		AND filled_price IS NOT NULL
+		AND filled_quantity > 0
+		AND live_exit_price IS NULL
+		AND status IN ('FILLED', 'EXECUTED', 'TRADED', 'PARTIALLY_FILLED', 'PARTIALLY TRADED', 'PARTIALLY EXECUTED')
+		ORDER BY created_at DESC
+	`
+	err := r.db.SelectContext(ctx, &orders, query)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get all active live positions: %w", err)
+	}
+	return orders, nil
 }
 
 // GetPendingMonitorOrders retrieves all PENDING orders with STOP_LOSS type and BRACKET product
@@ -904,6 +950,17 @@ func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strateg
 		WHERE strategy_id = $2
 		AND user_id = $3
 		AND status NOT IN ('CANCELLED', 'REJECTED', 'A.REJECTED')
+		-- Never cancel a FILLED live position that is still open: it must stay
+		-- FILLED so the square-off path (deactivation step 1.5 or the EOD
+		-- AutoSquareOffScheduler) can still find it via GetOpenOrders, close it,
+		-- and record the real exit price/P&L. Flipping it to CANCELLED here would
+		-- orphan the position — closed in our books but never squared off.
+		AND NOT (
+			is_paper_trade = false
+			AND is_square_off_order = false
+			AND filled_quantity > 0
+			AND live_exit_price IS NULL
+		)
 	`
 	if _, err := r.db.ExecContext(ctx, ordersQuery, now, strategyID, userID); err != nil {
 		return fmt.Errorf("failed to cancel orders for strategy %s user %s: %w", strategyID, userID, err)
@@ -1009,6 +1066,31 @@ func (r *orderRepository) GetExitableLiveOrdersByUser(ctx context.Context, userI
 	err := r.db.SelectContext(ctx, &orders, query, userID)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to get exitable live orders for user %s: %w", userID, err)
+	}
+	return orders, nil
+}
+
+// GetOpenLiveEntriesByUserSymbol returns filled live entry orders for one user
+// on one symbol that have not been exited yet, oldest first (FIFO). Used by
+// statusservice to record an exit on the matching entry order when an external
+// close event (manual broker-terminal sell, broker EOD MIS auto-square-off)
+// arrives on the order WebSocket. Symbol is matched case-insensitively.
+func (r *orderRepository) GetOpenLiveEntriesByUserSymbol(ctx context.Context, userID, symbol string) ([]*models.Order, error) {
+	orders := make([]*models.Order, 0)
+	query := `
+		SELECT * FROM orders
+		WHERE user_id = $1
+		AND is_paper_trade = false
+		AND is_square_off_order = false
+		AND filled_price IS NOT NULL
+		AND filled_quantity > 0
+		AND live_exit_price IS NULL
+		AND UPPER(symbol) = UPPER($2)
+		ORDER BY executed_at ASC NULLS LAST, created_at ASC
+	`
+	err := r.db.SelectContext(ctx, &orders, query, userID, symbol)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get open live entries for user %s symbol %s: %w", userID, symbol, err)
 	}
 	return orders, nil
 }

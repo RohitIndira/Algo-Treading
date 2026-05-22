@@ -9,11 +9,19 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
 	"github.com/gorilla/websocket"
 )
+
+// paperClientSeq guarantees a unique client_id per PaperMarketClient instance.
+// Two clients created in the same millisecond (e.g. the paper monitor's feed and
+// the live order monitor's feed, both built back-to-back in main.go) would
+// otherwise share a client_id — the enhanced-stream server treats that as a
+// duplicate and drops one connection (close 1006), causing a reconnect loop.
+var paperClientSeq atomic.Uint64
 
 // PriceCallback is called whenever a new LTP is received for a symbol.
 type PriceCallback func(symbol string, ltp float64)
@@ -149,7 +157,7 @@ func (c *PaperMarketClient) SetTickUpdateCallback(cb TickUpdateCallback) {
 // NewPaperMarketClient creates the market data client.
 // wsURL example: wss://stockkaskwebsocket.indiratrade.com/enhanced-stream
 func NewPaperMarketClient(wsURL string, callback PriceCallback) *PaperMarketClient {
-	clientID := fmt.Sprintf("PaperTrading_%d", time.Now().UnixMilli())
+	clientID := fmt.Sprintf("PaperTrading_%d_%d", time.Now().UnixMilli(), paperClientSeq.Add(1))
 	return &PaperMarketClient{
 		wsURL:      wsURL,
 		clientID:   clientID,

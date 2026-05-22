@@ -229,13 +229,33 @@ func (u PaperUpdate) MarshalJSON() ([]byte, error) {
 }
 
 // LiveOrderUpdate is the message sent to frontend clients over the live orders WebSocket.
+//
+// In addition to the order-status and positions events it already carried, it now
+// also carries the per-position lifecycle events that paper trading emits:
+//   - new_order      : a live entry order has filled and a position is now open
+//   - pnl_update     : a live tick — running P&L for one open position
+//   - position_exit  : a live position closed (exit price, final P&L, reason, times)
+// This brings /ws/live-orders to full parity with /ws/paper-trades.
 type LiveOrderUpdate struct {
-	Type         string                     `json:"type"`                    // connected | initial_orders | initial_closed_orders | order_update | closed_orders | force_exit_done | price_watches_snapshot | price_watch_cancelled | token_expired | positions
+	Type         string                     `json:"type"`                    // connected | initial_orders | initial_closed_orders | order_update | closed_orders | force_exit_done | price_watches_snapshot | price_watch_cancelled | token_expired | positions | new_order | pnl_update | position_exit
 	UserID       string                     `json:"user_id,omitempty"`
 	Orders       []*models.Order            `json:"orders,omitempty"`        // For initial_orders, initial_closed_orders, closed_orders
-	Order        *models.Order              `json:"order,omitempty"`         // For order_update
+	Order        *models.Order              `json:"order,omitempty"`         // For order_update, new_order
 	PriceWatches []scheduler.WatchSnapshot  `json:"price_watches,omitempty"` // For price_watches_snapshot
 	Positions    []EnrichedAlgoPosition     `json:"positions,omitempty"`     // For positions (event-driven push after fills)
+
+	// ── Per-position lifecycle fields (pnl_update / position_exit) ──────────
+	OrderID    string     `json:"order_id,omitempty"`
+	Symbol     string     `json:"symbol,omitempty"`
+	LTP        float64    `json:"ltp,omitempty"`         // last traded price driving this tick / the exit
+	LivePnL    float64    `json:"live_pnl"`              // running P&L (always sent, even when 0)
+	FinalPnL   float64    `json:"final_pnl,omitempty"`   // realized P&L on exit
+	CurrentSL  float64    `json:"current_sl,omitempty"`  // updated trailing SL (non-zero only when it moved)
+	Reason     string     `json:"reason,omitempty"`      // STOP_LOSS | TAKE_PROFIT | FORCE_EXIT | SQUARE_OFF | MANUAL
+	ExitPrice  float64    `json:"exit_price,omitempty"`  // actual broker fill price of the closing order
+	EntryPrice float64    `json:"entry_price,omitempty"` // broker fill price of the entry order
+	EntryTime  *time.Time `json:"-"`                     // serialised IST in MarshalJSON
+	ExitTime   *time.Time `json:"-"`                     // serialised IST in MarshalJSON
 }
 
 func (u LiveOrderUpdate) MarshalJSON() ([]byte, error) {
@@ -246,12 +266,34 @@ func (u LiveOrderUpdate) MarshalJSON() ([]byte, error) {
 		Order        *orderISTWrapper          `json:"order,omitempty"`
 		PriceWatches []scheduler.WatchSnapshot `json:"price_watches,omitempty"`
 		Positions    []EnrichedAlgoPosition    `json:"positions,omitempty"`
+		OrderID      string                    `json:"order_id,omitempty"`
+		Symbol       string                    `json:"symbol,omitempty"`
+		LTP          float64                   `json:"ltp,omitempty"`
+		LivePnL      float64                   `json:"live_pnl"`
+		FinalPnL     float64                   `json:"final_pnl,omitempty"`
+		CurrentSL    float64                   `json:"current_sl,omitempty"`
+		Reason       string                    `json:"reason,omitempty"`
+		ExitPrice    float64                   `json:"exit_price,omitempty"`
+		EntryPrice   float64                   `json:"entry_price,omitempty"`
+		EntryTime    *string                   `json:"entry_time,omitempty"`
+		ExitTime     *string                   `json:"exit_time,omitempty"`
 	}
 	a := alias{
 		Type:         u.Type,
 		UserID:       u.UserID,
 		PriceWatches: u.PriceWatches,
 		Positions:    u.Positions,
+		OrderID:      u.OrderID,
+		Symbol:       u.Symbol,
+		LTP:          u.LTP,
+		LivePnL:      u.LivePnL,
+		FinalPnL:     u.FinalPnL,
+		CurrentSL:    u.CurrentSL,
+		Reason:       u.Reason,
+		ExitPrice:    u.ExitPrice,
+		EntryPrice:   u.EntryPrice,
+		EntryTime:    fmtISTPtr(u.EntryTime),
+		ExitTime:     fmtISTPtr(u.ExitTime),
 	}
 	if u.Orders != nil {
 		a.Orders = wrapOrdersIST(u.Orders)
@@ -687,6 +729,7 @@ var wsUpgrader = websocket.Upgrader{
 type PaperWSServer struct {
 	repo             repository.OrderRepository
 	monitor          *PaperTradeMonitor // set after monitor is created
+	liveMonitor      *LiveOrderMonitor  // set via SetLiveMonitor — live P&L snapshot source
 	positionsFetcher PositionsFetcher   // set via SetPositionsFetcher
 	// startBrokerWS is wired in main.go to statusService.StartSubscription so the paper
 	// package doesn't import statusservice and create an import cycle.
@@ -737,6 +780,13 @@ func NewPaperWSServer(repo repository.OrderRepository) *PaperWSServer {
 // SetMonitor wires the monitor (must be called after both are created to break circular dep).
 func (s *PaperWSServer) SetMonitor(m *PaperTradeMonitor) {
 	s.monitor = m
+}
+
+// SetLiveMonitor wires the live-position P&L monitor so a freshly connected
+// /ws/live-orders client immediately receives a P&L snapshot for its open
+// live positions, mirroring the paper-trades connect behaviour.
+func (s *PaperWSServer) SetLiveMonitor(m *LiveOrderMonitor) {
+	s.liveMonitor = m
 }
 
 // SetOCOCanceller wires the OCO canceller for force-exit cleanup.
@@ -1155,6 +1205,14 @@ func (s *PaperWSServer) handleLiveOrdersWS(w http.ResponseWriter, r *http.Reques
 		})
 	}
 
+	// Immediately push a live P&L snapshot so the client doesn't wait for the
+	// next market tick — mirrors the paper-trades connect behaviour.
+	if s.liveMonitor != nil {
+		for _, snap := range s.liveMonitor.GetCurrentPnLSnapshot(r.Context(), userID) {
+			conn.WriteJSON(snap)
+		}
+	}
+
 	connMu := s.registerLiveClient(userID, conn)
 	defer s.unregisterLiveClient(userID, conn)
 
@@ -1263,7 +1321,7 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 			pnl = (safeF(order.FilledPrice) - exitPrice) * qty
 		}
 
-		if err := s.repo.UpdateLiveTradeExit(r.Context(), order.OrderID, exitPrice, pnl); err != nil {
+		if err := s.repo.UpdateLiveTradeExit(r.Context(), order.OrderID, exitPrice, pnl, time.Now(), "FORCE_EXIT"); err != nil {
 			log.Printf("[live-ws] Failed to record exit for order %s: %v", order.OrderID, err)
 		}
 
@@ -1404,7 +1462,7 @@ func (s *PaperWSServer) handleForceExitStrategyLive(w http.ResponseWriter, r *ht
 			pnl = (safeF(order.FilledPrice) - exitPrice) * qty
 		}
 
-		if err := s.repo.UpdateLiveTradeExit(r.Context(), order.OrderID, exitPrice, pnl); err != nil {
+		if err := s.repo.UpdateLiveTradeExit(r.Context(), order.OrderID, exitPrice, pnl, time.Now(), "FORCE_EXIT"); err != nil {
 			log.Printf("[live-ws] Failed to record exit for order %s: %v", order.OrderID, err)
 		}
 
