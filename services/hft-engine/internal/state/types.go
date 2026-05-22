@@ -128,6 +128,13 @@ type ChunkState struct {
 	Seq           int         `json:"seq"`              // 1, 2, 3, ... within this strategy run
 	Qty           int         `json:"qty"`              // requested chunk size (e.g. 10)
 	Filled        int         `json:"filled"`           // accumulated from FillEvents
+	// FilledValue is Σ (real broker fill_price × fill_qty) over fills whose
+	// price the broker actually gave us. PricePendingQty is the qty that
+	// filled but for which the broker sent no traded price — counted, but
+	// NOT averaged (we never invent a price). Real avg over priced fills:
+	//   avg = FilledValue / (Filled - PricePendingQty)
+	FilledValue     float64 `json:"filled_value"`
+	PricePendingQty int     `json:"price_pending_qty"`
 	LimitPrice    float64     `json:"limit_price"`      // current resting limit (changes on MODIFY)
 	BrokerOrderID string      `json:"broker_order_id"`  // Indira ordId
 	PlacedAt      time.Time   `json:"placed_at"`

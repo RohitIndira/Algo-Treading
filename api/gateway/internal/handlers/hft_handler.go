@@ -145,18 +145,22 @@ func hftSnapshotToMap(s *hftpb.StateSnapshot) map[string]interface{} {
 		return nil
 	}
 	return map[string]interface{}{
-		"strategy_id":       s.StrategyId,
-		"user_id":           s.UserId,
-		"symbol":            s.Symbol,
-		"active":            s.Active,
-		"status":            s.Status, // RUNNING | COMPLETED | HALTED | STOPPED
-		"mode":              s.Mode,
-		"started_at_unix":   s.StartedAtUnix,
-		"last_tick_at_unix": s.LastTickAtUnix,
-		"last_bid":          s.LastBid,
-		"last_ask":          s.LastAsk,
-		"buy":               hftSideToMap(s.Buy),
-		"sell":              hftSideToMap(s.Sell),
+		"strategy_id":           s.StrategyId,
+		"user_id":               s.UserId,
+		"symbol":                s.Symbol,
+		"active":                s.Active,
+		"status":                s.Status, // RUNNING | COMPLETED | HALTED | STOPPED
+		"mode":                  s.Mode,
+		"started_at_unix":       s.StartedAtUnix,
+		"last_tick_at_unix":     s.LastTickAtUnix,
+		"last_bid":              s.LastBid,
+		"last_ask":              s.LastAsk,
+		"last_ltp":              s.LastLtp,
+		"elapsed_seconds":       s.ElapsedSeconds,
+		"last_tick_age_seconds": s.LastTickAgeSeconds,
+		"unrealized_pnl":        s.UnrealizedPnl,
+		"buy":                   hftSideToMap(s.Buy),
+		"sell":                  hftSideToMap(s.Sell),
 	}
 }
 
@@ -169,13 +173,22 @@ func hftSideToMap(side *hftpb.SideSnapshot) map[string]interface{} {
 		history = append(history, hftChunkToMap(c))
 	}
 	return map[string]interface{}{
-		"position":    side.Position,
-		"max_qty":     side.MaxQty,
-		"done":        side.Done,
-		"halt_reason": side.HaltReason,
-		"armed":       side.Armed,
-		"current":     hftChunkToMap(side.Current),
-		"history":     history,
+		"position":            side.Position,
+		"max_qty":             side.MaxQty,
+		"pending_qty":         side.PendingQty,
+		"done":                side.Done,
+		"halt_reason":         side.HaltReason,
+		"armed":               side.Armed,
+		"avg_fill_price":      side.AvgFillPrice,
+		"total_filled_value":  side.TotalFilledValue,
+		"price_pending_qty":   side.PricePendingQty,
+		"chunks_placed":       side.ChunksPlaced,
+		"chunks_filled":       side.ChunksFilled,
+		"chunks_cancelled":    side.ChunksCancelled,
+		"modify_count":        side.ModifyCount,
+		"consecutive_rejects": side.ConsecutiveRejects,
+		"current":             hftChunkToMap(side.Current),
+		"history":             history,
 	}
 }
 
@@ -184,13 +197,15 @@ func hftChunkToMap(c *hftpb.ChunkSnapshot) map[string]interface{} {
 		return nil
 	}
 	return map[string]interface{}{
-		"seq":             c.Seq,
-		"qty":             c.Qty,
-		"filled":          c.Filled,
-		"limit_price":     c.LimitPrice,
-		"broker_order_id": c.BrokerOrderId,
-		"status":          c.Status,
-		"modify_count":    c.ModifyCount,
-		"placed_at_unix":  c.PlacedAtUnix,
+		"seq":               c.Seq,
+		"qty":               c.Qty,
+		"filled":            c.Filled,
+		"limit_price":       c.LimitPrice,
+		"avg_fill_price":    c.AvgFillPrice,
+		"price_pending_qty": c.PricePendingQty,
+		"broker_order_id":   c.BrokerOrderId,
+		"status":            c.Status,
+		"modify_count":      c.ModifyCount,
+		"placed_at_unix":    c.PlacedAtUnix,
 	}
 }

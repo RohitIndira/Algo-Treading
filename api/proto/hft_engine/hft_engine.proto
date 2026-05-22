@@ -116,6 +116,12 @@ message StateSnapshot {
   double last_bid = 10;
   double last_ask = 11;
 
+  // Enriched dashboard fields — computed at the read boundary.
+  double last_ltp              = 12;  // last traded price
+  int64  elapsed_seconds       = 13;  // now - started_at
+  int64  last_tick_age_seconds = 14;  // now - last_tick_at (feed-health)
+  double unrealized_pnl        = 15;  // (ltp - avg_buy) * buy_pos - (ltp - avg_sell)*sell_pos
+
   SideSnapshot buy  = 20;
   SideSnapshot sell = 21;
 }
@@ -129,6 +135,17 @@ message SideSnapshot {
   // IDLE→PLACE is blocked. Flips true on the first qualifying tick (audit ARM)
   // and back to false on a cross-back while Position == 0 (audit DISARM).
   bool   armed       = 5;
+
+  // Enriched dashboard fields — computed at the read boundary.
+  double avg_fill_price      = 6;   // VWAP over fills with a REAL broker price
+  double total_filled_value  = 7;   // Σ real fill_price × fill_qty
+  int32  pending_qty         = 8;   // max_qty - position (remaining to fill)
+  int32  price_pending_qty   = 9;   // filled qty whose broker price is unknown
+  int32  chunks_placed       = 12;
+  int32  chunks_filled       = 13;
+  int32  chunks_cancelled    = 14;
+  int32  modify_count        = 15;  // total MODIFYs across all chunks
+  int32  consecutive_rejects = 16;  // current reject streak (halt-protection counter)
 
   // Current chunk (nil unless one is in flight).
   ChunkSnapshot current = 10;
@@ -146,6 +163,9 @@ message ChunkSnapshot {
   string status          = 6;      // OPEN | PARTIAL | FILLED | CANCELLED
   int32  modify_count    = 7;
   int64  placed_at_unix  = 8;
+  // Per-chunk fill economics — real broker prices only (no assumptions).
+  double avg_fill_price    = 9;    // VWAP of this chunk's real-priced fills
+  int32  price_pending_qty = 10;   // qty filled with no broker price
 }
 
 // FillEvent — pushed by trade-execution's WS bridge per Indira broker event.

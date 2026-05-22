@@ -224,14 +224,12 @@ func (s *Service) handleUpdate(msg *indira.WSOrderStatus) {
 		"PARTIALLY TRADED", "PARTIALLY EXECUTED":
 		ev.EventType = "FILL"
 		ev.FillQty = atoi(string(msg.TradedQTY))
+		// FillPrice is the broker's authoritative traded price. We do NOT
+		// substitute the order's limit price when it's absent — that would
+		// be a made-up number. FillPrice <= 0 is an honest "price unknown"
+		// signal: applyFill records the qty as price-pending and the
+		// dashboard reports it as such instead of a fabricated average.
 		ev.FillPrice = atof(msg.TradedPrice)
-		// Fallback: some Indira EXECUTED frames carry traded_price=0
-		// (race between exchange ack and price publication). Use the
-		// order's own LimitPrice as a sane stand-in — the strategy will
-		// reconcile via the trade book on next reconciler tick.
-		if ev.FillPrice <= 0 {
-			ev.FillPrice = atof(msg.OrderPrice)
-		}
 
 	case "CANCELLED":
 		ev.EventType = "CANCEL"

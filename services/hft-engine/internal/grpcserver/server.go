@@ -173,49 +173,125 @@ func snapshotFromState(s *state.Strategy) *pb.StateSnapshot {
 	if s == nil {
 		return nil
 	}
+	buy := sideSnapshot(&s.Buy, s.Cfg.MaxBuyQty)
+	sell := sideSnapshot(&s.Sell, s.Cfg.MaxSellQty)
+
+	now := time.Now()
+	var elapsed, tickAge int64
+	if !s.StartedAt.IsZero() {
+		elapsed = int64(now.Sub(s.StartedAt).Seconds())
+	}
+	if !s.LastTickAt.IsZero() {
+		tickAge = int64(now.Sub(s.LastTickAt).Seconds())
+	}
+
+	// Unrealized P&L — computed ONLY over qty with a real broker price
+	// (pending-price shares are excluded, never marked-to-a-guess).
+	// BUY leg is long: (ltp - avg) × priced_qty. SELL leg is short:
+	// (avg - ltp) × priced_qty.
+	ltp := s.LastMD.LTP
+	var pnl float64
+	if ltp > 0 {
+		if buyPriced := buy.Position - buy.PricePendingQty; buyPriced > 0 && buy.AvgFillPrice > 0 {
+			pnl += (ltp - buy.AvgFillPrice) * float64(buyPriced)
+		}
+		if sellPriced := sell.Position - sell.PricePendingQty; sellPriced > 0 && sell.AvgFillPrice > 0 {
+			pnl += (sell.AvgFillPrice - ltp) * float64(sellPriced)
+		}
+	}
+
 	return &pb.StateSnapshot{
-		StrategyId:     s.Cfg.StrategyID,
-		UserId:         s.Cfg.UserID,
-		Symbol:         s.Cfg.Symbol,
-		Active:         s.Active,
-		Status:         s.Status(),
-		Mode:           string(s.Cfg.Mode),
-		StartedAtUnix:  s.StartedAt.Unix(),
-		LastTickAtUnix: s.LastTickAt.Unix(),
-		LastBid:        s.LastMD.Bid,
-		LastAsk:        s.LastMD.Ask,
-		Buy:            sideSnapshot(&s.Buy, s.Cfg.MaxBuyQty),
-		Sell:           sideSnapshot(&s.Sell, s.Cfg.MaxSellQty),
+		StrategyId:         s.Cfg.StrategyID,
+		UserId:             s.Cfg.UserID,
+		Symbol:             s.Cfg.Symbol,
+		Active:             s.Active,
+		Status:             s.Status(),
+		Mode:               string(s.Cfg.Mode),
+		StartedAtUnix:      s.StartedAt.Unix(),
+		LastTickAtUnix:     s.LastTickAt.Unix(),
+		LastBid:            s.LastMD.Bid,
+		LastAsk:            s.LastMD.Ask,
+		LastLtp:            ltp,
+		ElapsedSeconds:     elapsed,
+		LastTickAgeSeconds: tickAge,
+		UnrealizedPnl:      pnl,
+		Buy:                buy,
+		Sell:               sell,
 	}
 }
 
+// sideSnapshot converts one SideState, computing the enriched aggregates
+// (VWAP, totals, chunk counts) by walking current + history. All prices
+// are real broker prices; PricePendingQty is reported, never averaged.
 func sideSnapshot(side *state.SideState, maxQty int) *pb.SideSnapshot {
 	out := &pb.SideSnapshot{
-		Position:   int32(side.Position),
-		MaxQty:     int32(maxQty),
-		Done:       side.Done,
-		HaltReason: string(side.HaltReason),
-		Armed:      side.Armed,
-		History:    make([]*pb.ChunkSnapshot, 0, len(side.History)),
+		Position:           int32(side.Position),
+		MaxQty:             int32(maxQty),
+		Done:               side.Done,
+		HaltReason:         string(side.HaltReason),
+		Armed:              side.Armed,
+		ConsecutiveRejects: int32(side.ConsecutiveRejects),
+		History:            make([]*pb.ChunkSnapshot, 0, len(side.History)),
+	}
+	if maxQty > side.Position {
+		out.PendingQty = int32(maxQty - side.Position)
+	}
+
+	// Walk every chunk (closed history + the in-flight one) once.
+	var totalValue float64
+	var pricedQty, pendingQty, modifies, filledChunks, cancelledChunks int
+	visit := func(c *state.ChunkState) {
+		totalValue += c.FilledValue
+		pricedQty += c.Filled - c.PricePendingQty
+		pendingQty += c.PricePendingQty
+		modifies += c.ModifyCount
+		switch c.Status {
+		case state.ChunkFilled:
+			filledChunks++
+		case state.ChunkCancelled:
+			cancelledChunks++
+		}
+	}
+	for i := range side.History {
+		visit(&side.History[i])
 	}
 	if side.Current != nil {
+		visit(side.Current)
 		out.Current = chunkSnapshot(side.Current)
 	}
 	for i := range side.History {
 		out.History = append(out.History, chunkSnapshot(&side.History[i]))
 	}
+
+	out.TotalFilledValue = totalValue
+	out.PricePendingQty = int32(pendingQty)
+	out.ModifyCount = int32(modifies)
+	out.ChunksFilled = int32(filledChunks)
+	out.ChunksCancelled = int32(cancelledChunks)
+	out.ChunksPlaced = int32(len(side.History))
+	if side.Current != nil {
+		out.ChunksPlaced++
+	}
+	if pricedQty > 0 {
+		out.AvgFillPrice = totalValue / float64(pricedQty)
+	}
 	return out
 }
 
 func chunkSnapshot(c *state.ChunkState) *pb.ChunkSnapshot {
-	return &pb.ChunkSnapshot{
-		Seq:           int32(c.Seq),
-		Qty:           int32(c.Qty),
-		Filled:        int32(c.Filled),
-		LimitPrice:    c.LimitPrice,
-		BrokerOrderId: c.BrokerOrderID,
-		Status:        string(c.Status),
-		ModifyCount:   int32(c.ModifyCount),
-		PlacedAtUnix:  c.PlacedAt.Unix(),
+	out := &pb.ChunkSnapshot{
+		Seq:            int32(c.Seq),
+		Qty:            int32(c.Qty),
+		Filled:         int32(c.Filled),
+		LimitPrice:     c.LimitPrice,
+		BrokerOrderId:  c.BrokerOrderID,
+		Status:         string(c.Status),
+		ModifyCount:    int32(c.ModifyCount),
+		PlacedAtUnix:   c.PlacedAt.Unix(),
+		PricePendingQty: int32(c.PricePendingQty),
 	}
+	if priced := c.Filled - c.PricePendingQty; priced > 0 {
+		out.AvgFillPrice = c.FilledValue / float64(priced)
+	}
+	return out
 }

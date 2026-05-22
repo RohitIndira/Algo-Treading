@@ -90,6 +90,17 @@ func (r *Runner) applyFill(side *state.SideState, sideC string, f state.FillEven
 	chunk := side.Current
 	chunk.Filled += f.FillQty
 	side.Position += f.FillQty
+	// Record the REAL broker fill price. If the broker sent no traded
+	// price (FillPrice <= 0), count the qty as price-pending — never
+	// substitute a made-up price.
+	if f.FillPrice > 0 {
+		chunk.FilledValue += f.FillPrice * float64(f.FillQty)
+	} else {
+		chunk.PricePendingQty += f.FillQty
+		r.logger.Warn("fill with no broker price — counted as price-pending",
+			zap.String("side", sideC), zap.Int("chunk_seq", chunk.Seq),
+			zap.Int("fill_qty", f.FillQty), zap.String("broker_order_id", chunk.BrokerOrderID))
+	}
 	// Any successful fill clears the consecutive-reject counter — whatever
 	// transient condition caused recent rejects is no longer in effect.
 	side.ConsecutiveRejects = 0
@@ -144,6 +155,11 @@ func (r *Runner) selfHealFilledChunk(side *state.SideState, sideC string) {
 	if remaining > 0 {
 		side.Position += remaining
 		chunk.Filled = chunk.Qty
+		// EG003 self-heal: the broker says this order fully executed but
+		// no WS fill event (hence no traded price) ever arrived. We do NOT
+		// guess the price from LimitPrice — the reconciled qty is counted
+		// as price-pending; the dashboard reports it honestly.
+		chunk.PricePendingQty += remaining
 	}
 	chunk.Status = state.ChunkFilled
 
