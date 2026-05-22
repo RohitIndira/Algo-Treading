@@ -9,6 +9,7 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/notifications"
 	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
@@ -126,6 +127,45 @@ func (h *WebSocketHandler) HandleMatchesFeed(w http.ResponseWriter, r *http.Requ
 // GET /ws/matches/all
 func (h *WebSocketHandler) HandleAllMatchesFeed(w http.ResponseWriter, r *http.Request) {
 	h.handleAllUsersMatchFeed(w, r)
+}
+
+// HandleHFTFeed streams the live order/fill tape for one HFT strategy.
+// GET /ws/hft/{strategy_id} — subscribes to the Redis channel the
+// hft-engine publishes every PLACE/FILL/MODIFY/CANCEL/ARM/PAUSE/RESUME
+// event to (hft:events:{strategy_id}) and forwards each to the browser.
+func (h *WebSocketHandler) HandleHFTFeed(w http.ResponseWriter, r *http.Request) {
+	strategyID := mux.Vars(r)["strategy_id"]
+	if strategyID == "" {
+		http.Error(w, "strategy_id is required", http.StatusBadRequest)
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		h.logger.Error("Failed to upgrade HFT feed to WebSocket", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]interface{}{
+		"type":        "connected",
+		"message":     "Connected to live HFT event tape",
+		"strategy_id": strategyID,
+	}); err != nil {
+		return
+	}
+
+	// Cross-service contract: must match hft-engine eventbus.ChannelPrefix.
+	ctx := context.Background()
+	channel := "hft:events:" + strategyID
+	pubsub := h.redisClient.Subscribe(ctx, channel)
+	defer pubsub.Close()
+
+	h.logger.Info("HFT feed subscribed",
+		zap.String("channel", channel),
+		zap.String("remote_addr", conn.RemoteAddr().String()))
+
+	h.listenAndForward(ctx, conn, pubsub.Channel(), "hft:"+strategyID)
 }
 
 // handleUserMatchFeed handles match feed for a specific user

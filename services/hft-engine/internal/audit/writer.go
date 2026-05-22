@@ -36,10 +36,18 @@ type Sink interface {
 	InsertAuditOrder(ctx context.Context, e repo.AuditRow) error
 }
 
+// EventSink receives every audit event for live streaming (the dashboard
+// tape). Implemented by eventbus.Publisher. Publish MUST be non-blocking.
+// Optional — nil disables the live stream, DB audit is unaffected.
+type EventSink interface {
+	Publish(e repo.AuditRow)
+}
+
 // Writer drains a channel of repo.AuditRow into the configured Sink.
 type Writer struct {
 	cfg     Config
 	sink    Sink
+	events  EventSink // optional live-stream hook; nil = disabled
 	logger  *zap.Logger
 	ch      chan repo.AuditRow
 	stopCh  chan struct{}
@@ -47,6 +55,9 @@ type Writer struct {
 	dropped uint64        // total events dropped due to full channel — exported via metrics later
 	mu      sync.Mutex    // protects dropped (cheap atomic alternative; keeps things simple)
 }
+
+// SetEventSink wires the live-stream publisher. Call before Start.
+func (w *Writer) SetEventSink(s EventSink) { w.events = s }
 
 // New builds a Writer but does NOT start the worker. Call Start(ctx).
 // `sink` may be nil — the worker will still run but every flush will
@@ -85,6 +96,11 @@ func (w *Writer) Start(ctx context.Context) {
 func (w *Writer) Log(e repo.AuditRow) bool {
 	if e.CreatedAt.IsZero() {
 		e.CreatedAt = time.Now()
+	}
+	// Fan the event to the live-stream sink first (non-blocking) so the
+	// dashboard tape gets it even if the DB batch channel is saturated.
+	if w.events != nil {
+		w.events.Publish(e)
 	}
 	select {
 	case w.ch <- e:

@@ -114,5 +114,9 @@ func NewRouter(
 	// JWT-expiring, etc. and the UI can prompt re-login / show toasts.
 	r.HandleFunc("/ws/notifications", websocketHandler.HandleNotificationsFeed)
 
+	// Live HFT order/fill tape — streams every engine event (PLACE/FILL/
+	// MODIFY/CANCEL/ARM/PAUSE/RESUME) for one strategy to the dashboard.
+	r.HandleFunc("/ws/hft/{strategy_id}", websocketHandler.HandleHFTFeed)
+
 	return r
 }
