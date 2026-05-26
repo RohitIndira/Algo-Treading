@@ -334,19 +334,34 @@ func (r *Runner) haltAll(reason state.HaltReason) {
 // Each cancel goes through broker — PaperBroker just logs; IndiraBroker
 // (Phase 3) issues real cancels.
 func (r *Runner) cancelAllResting() {
-	for _, side := range []*state.SideState{&r.live.Buy, &r.live.Sell} {
+	sides := []*state.SideState{&r.live.Buy, &r.live.Sell}
+	chars := [...]string{"B", "S"}
+	for i, side := range sides {
 		if side.Current == nil {
 			continue
 		}
+		sideC := chars[i]
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		err := r.broker.Cancel(ctx, r.auth, r.sym, side.Current.BrokerOrderID)
 		cancel()
 		if err != nil {
+			// EG003 / "FULLY_EXECUTED": broker already filled this order.
+			// Same self-heal as the MODIFY/CANCEL paths in tick.go — without
+			// it, the persisted terminal snapshot mislabels real fills as
+			// cancellations.
+			if isAlreadyFilledErr(err) {
+				r.logger.Warn("cancel on exit rejected — order already fully executed; reconciling chunk as filled",
+					zap.String("side", sideC),
+					zap.String("broker_order_id", side.Current.BrokerOrderID),
+					zap.Error(err))
+				r.selfHealFilledChunk(side, sideC)
+				continue
+			}
 			r.logger.Warn("cancel on exit failed",
 				zap.String("broker_order_id", side.Current.BrokerOrderID),
 				zap.Error(err))
 		}
-		r.auditRow("CANCEL", sideChar(side), side.Current.Seq,
+		r.auditRow("CANCEL", sideC, side.Current.Seq,
 			side.Current.Qty-side.Current.Filled, side.Current.LimitPrice,
 			side.Current.BrokerOrderID, "")
 		side.Current.Status = state.ChunkCancelled

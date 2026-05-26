@@ -84,12 +84,40 @@ func (r *Runner) onFill(f state.FillEvent) {
 // race). Called only on the run goroutine (via priceCh) so chunk state
 // stays single-writer. The actual chunk math is state.Strategy's — single
 // source of truth shared with the manager's at-exit reconcile.
+//
+// For each resolved chunk we emit a FILL_PRICE_UPDATED audit row so the
+// audit log eventually carries the real broker price, not just the
+// LimitPrice placeholder written by selfHealFilledChunk. Without this
+// the audit log systematically under-reports price improvement (a SELL
+// filling above limit / a BUY filling below limit). Snapshot/dashboard
+// values are unaffected — they already hold the real price.
+//
+// Limit-band invariant: exchanges enforce BUY ≤ limit and SELL ≥ limit;
+// if the broker ever reports otherwise we log CRITICAL but do NOT halt.
+// A false positive from a broker-side glitch would block live trading
+// for no reason; a real violation is rare enough to investigate manually.
 func (r *Runner) applyResolvedPrices(prices map[string]float64) {
-	if n := r.live.ApplyResolvedPrices(prices); n > 0 {
-		r.logger.Info("backfilled real fill prices from trade book",
-			zap.Int("chunks_resolved", n))
-		r.publishSnapshot()
+	resolved := r.live.ApplyResolvedPrices(prices)
+	if len(resolved) == 0 {
+		return
 	}
+	for _, rf := range resolved {
+		if v := rf.LimitViolation(); v != "" {
+			r.logger.Error("CRITICAL — broker fill outside limit band",
+				zap.String("side", rf.Side),
+				zap.Int("chunk_seq", rf.Seq),
+				zap.String("broker_order_id", rf.BrokerOrderID),
+				zap.Float64("real_price", rf.RealPrice),
+				zap.Float64("limit_price", rf.LimitPrice),
+				zap.String("violation", v))
+		}
+		r.auditRow("FILL_PRICE_UPDATED", rf.Side, rf.Seq,
+			rf.FilledQty, rf.RealPrice, rf.BrokerOrderID,
+			"reconciled real fill price from trade-book")
+	}
+	r.logger.Info("backfilled real fill prices from trade book",
+		zap.Int("chunks_resolved", len(resolved)))
+	r.publishSnapshot()
 }
 
 // applyFill increments chunk.Filled + side.Position. Promotes the chunk

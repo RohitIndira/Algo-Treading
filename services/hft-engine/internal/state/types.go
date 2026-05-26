@@ -210,37 +210,87 @@ type Strategy struct {
 	Active     bool // false after Exit / halt
 }
 
+// ResolvedFill describes one chunk whose missing fill price was just
+// backfilled from the broker trade-book. ApplyResolvedPrices returns one
+// entry per resolved chunk so callers can emit a faithful audit row
+// (FILL_PRICE_UPDATED) and run the limit-band invariant check — without
+// it the audit_orders table would keep the LimitPrice placeholder written
+// at self-heal time and never reflect the real broker price.
+type ResolvedFill struct {
+	Side          string  // "B" or "S"
+	Seq           int     // chunk seq within the side's lifetime
+	BrokerOrderID string  // for cross-reference with PLACE / FILL_RECONCILED rows
+	FilledQty     int     // how many shares this round resolved (= prior PricePendingQty)
+	LimitPrice    float64 // chunk's placed limit (the prior audit placeholder)
+	RealPrice     float64 // qty-weighted avg traded price from the broker trade-book
+}
+
+// LimitViolation returns a non-empty reason string if the resolved real
+// fill price breaches the limit-order contract for the side. Empty
+// string is the expected case — exchanges enforce BUY ≤ limit and
+// SELL ≥ limit, so the check should never fire. If it does, the audit
+// log already carries the offending real price and callers log CRITICAL;
+// we deliberately do not halt automatically, since a false positive
+// (broker-side data glitch) would block live trading on a perfectly
+// safe fill.
+func (rf ResolvedFill) LimitViolation() string {
+	if rf.LimitPrice <= 0 {
+		return ""
+	}
+	const eps = 0.001 // forgive sub-paise rounding from float arithmetic
+	if rf.Side == "B" && rf.RealPrice > rf.LimitPrice+eps {
+		return "BUY filled above limit"
+	}
+	if rf.Side == "S" && rf.RealPrice < rf.LimitPrice-eps {
+		return "SELL filled below limit"
+	}
+	return ""
+}
+
 // ApplyResolvedPrices backfills the REAL broker fill price onto chunks
 // that filled but whose order-status WS frame carried no traded price.
 // prices maps brokerOrderID → qty-weighted average traded price (from the
-// broker trade book). Returns the count of chunks resolved. Single source
-// of truth — used by the live reconciler and the at-exit reconcile.
-func (s *Strategy) ApplyResolvedPrices(prices map[string]float64) int {
-	resolved := 0
-	fix := func(side *SideState) {
+// broker trade book). Returns one entry per resolved chunk. Single source
+// of truth — used by the live reconciler (Runner.applyResolvedPrices) and
+// the at-exit reconcile (Manager runner-exit goroutine).
+func (s *Strategy) ApplyResolvedPrices(prices map[string]float64) []ResolvedFill {
+	var resolved []ResolvedFill
+	fix := func(side *SideState, sideC string) {
 		for i := range side.History {
-			resolved += resolveChunk(&side.History[i], prices)
+			if rf := resolveChunk(&side.History[i], prices, sideC); rf != nil {
+				resolved = append(resolved, *rf)
+			}
 		}
 		if side.Current != nil {
-			resolved += resolveChunk(side.Current, prices)
+			if rf := resolveChunk(side.Current, prices, sideC); rf != nil {
+				resolved = append(resolved, *rf)
+			}
 		}
 	}
-	fix(&s.Buy)
-	fix(&s.Sell)
+	fix(&s.Buy, "B")
+	fix(&s.Sell, "S")
 	return resolved
 }
 
-func resolveChunk(c *ChunkState, prices map[string]float64) int {
+func resolveChunk(c *ChunkState, prices map[string]float64, side string) *ResolvedFill {
 	if c.PricePendingQty <= 0 {
-		return 0
+		return nil
 	}
 	px, ok := prices[c.BrokerOrderID]
 	if !ok || px <= 0 {
-		return 0
+		return nil
 	}
-	c.FilledValue += px * float64(c.PricePendingQty)
+	qty := c.PricePendingQty
+	c.FilledValue += px * float64(qty)
 	c.PricePendingQty = 0
-	return 1
+	return &ResolvedFill{
+		Side:          side,
+		Seq:           c.Seq,
+		BrokerOrderID: c.BrokerOrderID,
+		FilledQty:     qty,
+		LimitPrice:    c.LimitPrice,
+		RealPrice:     px,
+	}
 }
 
 // Status returns the dashboard-facing lifecycle status. Single source of

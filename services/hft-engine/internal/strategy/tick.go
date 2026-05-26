@@ -133,19 +133,24 @@ func (r *Runner) handleSide(
 			// Waiting (or paused) for LTP to come back into the zone.
 			return
 		case side.Armed && !inZone:
-			// PAUSE — cancel any resting chunk so we don't leave an
-			// open order at a price the user didn't authorise. Keep
-			// Position; next zone re-entry resumes from there.
-			if side.Current != nil {
-				r.cancelCurrentChunk(side, sideC, "trigger_pause")
-			}
+			// PAUSE — disarm but LEAVE any resting chunk on the book.
+			// The chunk's limit was already within the user's authorised
+			// band; a sub-tick LTP flicker out of the trigger zone does
+			// not invalidate it. We do NOT cancel because the cancel
+			// frequently races a sub-second fill — the broker replies
+			// EG003 FULLY_EXECUTED and we mis-record a real fill as a
+			// cancellation. Fill handling is event-driven and continues
+			// to work during pause. When LTP re-enters the zone, the
+			// !Armed && inZone branch RESUMEs and the normal modify-chase
+			// loop continues until the chunk fills.
 			side.Armed = false
 			r.auditRow("PAUSE", sideC, 0, 0, ltp, "", "")
-			r.logger.Info("trigger left zone — paused",
+			r.logger.Info("trigger left zone — paused (chunk left resting)",
 				zap.String("side", string(sideEnum)),
 				zap.Float64("ltp", ltp),
 				zap.Float64("trigger", triggerPrice),
-				zap.Int("position", side.Position))
+				zap.Int("position", side.Position),
+				zap.Bool("chunk_resting", side.Current != nil))
 			return
 		case !side.Armed && inZone:
 			// Entering zone — ARM (first time, Position==0) or RESUME
@@ -168,17 +173,46 @@ func (r *Runner) handleSide(
 		// Armed && inZone: normal flow, no transition; fall through.
 	}
 
-	// Price-band halt. Applies whether or not a chunk is resting. If a
-	// chunk IS resting, we cancel it before halting so we don't leave
-	// an open order on the book outside our intended range.
-	outOfBand := (sideEnum == state.SideBuy && touch > limitPrice) ||
-		(sideEnum == state.SideSell && touch < limitPrice)
+	// Unified band check — the trigger and limit configured by the user
+	// describe a CLOSED price range in which all placements must sit:
+	//
+	//   BUY:  [buy_trigger_price, buy_limit_price]    (trigger=floor,  limit=ceiling)
+	//   SELL: [sell_limit_price,  sell_trigger_price] (limit=floor,    trigger=ceiling)
+	//
+	// When the proposed limit price drifts OUTSIDE the band, the engine
+	// WAITS — it does not halt, and it does not cancel any resting
+	// chunk. Symmetric pause behaviour on both edges so the strategy
+	// resumes naturally when the market returns to the band: the next
+	// tick that brings touch back into [trigger, limit] re-enters the
+	// place/modify flow and the engine fires the next pending chunk
+	// toward max_qty without operator intervention.
+	//
+	// Replaces the legacy "HaltPriceBand TERMINAL" behaviour that used
+	// to set side.Done=true and exit the runner the moment touch poked
+	// above the ceiling — even a one-tick spike was unrecoverable
+	// because the runner goroutine had already exited. With pause-on-
+	// both-edges the runner stays alive and the strategy completes
+	// naturally when the market lets it.
+	//
+	// LimitPrice is always enforced. TriggerPrice is enforced only when
+	// configured (>0) so legacy strategies with no trigger keep their
+	// original "respect the ceiling only" semantics.
+	//
+	// We compare the proposed limit price (touch rounded to tick) rather
+	// than raw touch — a touch of 423.03 with tick 0.05 rounds down to
+	// 423.00, which IS exactly at a [422.95, 423.00] ceiling. Aligns the
+	// check with what we would actually quote to the broker.
+	proposed := roundToTick(touch, r.Cfg.TickSize)
+	var outOfBand bool
+	switch sideEnum {
+	case state.SideBuy:
+		outOfBand = (proposed > limitPrice) ||
+			(triggerPrice > 0 && proposed < triggerPrice)
+	case state.SideSell:
+		outOfBand = (proposed < limitPrice) ||
+			(triggerPrice > 0 && proposed > triggerPrice)
+	}
 	if outOfBand {
-		if side.Current != nil {
-			r.cancelCurrentChunk(side, sideC, "price_band")
-		}
-		side.Done = true
-		side.HaltReason = state.HaltPriceBand
 		return
 	}
 
@@ -271,35 +305,12 @@ func (r *Runner) handleSide(
 	r.auditRow("PLACE", sideC, side.Current.Seq, qty, price, brokerOrderID, "")
 }
 
-// cancelCurrentChunk issues a Cancel for the resting chunk and moves it
-// to History. Used by:
-//   - the price-band halt path (this file)
-//   - the window-closed halt path (haltSide below)
-//   - Run's deferred cancelAllResting on goroutine exit (in runner.go,
-//     which does its own cancel because it can't easily call back here).
-func (r *Runner) cancelCurrentChunk(side *state.SideState, sideC, reason string) {
-	if side.Current == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.ctx, 3*time.Second)
-	err := r.broker.Cancel(ctx, r.auth, r.sym, side.Current.BrokerOrderID)
-	cancel()
-	if err != nil {
-		r.logger.Warn("cancel failed",
-			zap.String("broker_order_id", side.Current.BrokerOrderID),
-			zap.String("reason", reason),
-			zap.Error(err))
-	}
-	side.Current.Status = state.ChunkCancelled
-	r.auditRow("CANCEL", sideC, side.Current.Seq,
-		side.Current.Qty-side.Current.Filled, side.Current.LimitPrice,
-		side.Current.BrokerOrderID, reason)
-	side.History = append(side.History, *side.Current)
-	side.Current = nil
-}
-
-// haltSide marks a side Done with the given reason and cancels any
-// resting chunk. Used by handleTick's window-closed branch.
+// haltSide marks a side terminal under the given reason. Used by
+// handleTick's window-closed branch. Resting chunks are NOT cancelled
+// here — the runner-exit goroutine (cancelAllResting in runner.go)
+// handles that defensively when the strategy unwinds, with the EG003
+// self-heal in place to handle the case where the chunk filled in the
+// race between our cancel request and the broker's response.
 func (r *Runner) haltSide(side *state.SideState, sideC string, reason state.HaltReason) {
 	if side.Done {
 		return

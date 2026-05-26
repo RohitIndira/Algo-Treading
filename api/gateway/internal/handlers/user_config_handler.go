@@ -216,6 +216,22 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 }
 
 // DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}
+//
+// Lifecycle ordering matters here. The hft-engine holds the strategy as an
+// in-memory Runner goroutine that places live broker orders on every tick;
+// the DB row is just configuration. Deleting only the DB row leaves a
+// zombie Runner that keeps trading until the engine restarts. So we stop
+// the engine FIRST, then delete the row.
+//
+//   - hftClient.Exit succeeds         → engine stopped, resting orders
+//                                       cancelled, terminal state persisted.
+//     Proceed with DB delete.
+//   - hftClient.Exit → NOT_RUNNING    → strategy wasn't live in engine
+//                                       memory (paper, never started, or
+//                                       already finished). Proceed.
+//   - hftClient.Exit → other error    → ABORT. We will not delete the row
+//                                       while a Runner may still be live.
+//                                       Caller retries.
 func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
@@ -224,6 +240,24 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 	if userID == "" {
 		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
 		return
+	}
+
+	if h.hftClient != nil {
+		exitResp, exitErr := h.hftClient.Exit(r.Context(), &hftpb.ExitRequest{
+			StrategyId: strategyID,
+		})
+		switch {
+		case exitErr != nil:
+			respondWithError(w, http.StatusBadGateway,
+				"Failed to stop strategy in hft-engine before delete: "+exitErr.Error()+
+					" — retry once the engine is reachable")
+			return
+		case exitResp != nil && !exitResp.Success && exitResp.Status != "NOT_RUNNING":
+			respondWithError(w, http.StatusConflict,
+				"hft-engine refused to stop the strategy: "+exitResp.Error+
+					" (status="+exitResp.Status+") — resolve and retry")
+			return
+		}
 	}
 
 	req := &pb.DeleteStrategyRequest{

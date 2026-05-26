@@ -474,18 +474,80 @@ func (m *Manager) Start(ctx context.Context, strategyID, sideOverride string, lo
 			// Final fill-price reconcile — backfill any chunk whose broker
 			// price never arrived on the WS, so the persisted terminal
 			// snapshot carries real prices, not price-pending placeholders.
-			if ids := pendingPriceOrderIDs(final); len(ids) > 0 {
-				rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
-				if prices, ferr := m.br.FetchFills(rctx, auth, ids); ferr == nil {
-					if n := final.ApplyResolvedPrices(prices); n > 0 {
-						m.logger.Info("at-exit reconcile backfilled fill prices",
-							zap.String("strategy_id", strategyID), zap.Int("chunks", n))
-					}
-				} else {
-					m.logger.Warn("at-exit fill-price reconcile failed",
-						zap.String("strategy_id", strategyID), zap.Error(ferr))
+			//
+			// Two-attempt loop with a CONDITIONAL sleep between attempts.
+			// The broker's trade-book has a ~1-3s propagation lag, so the
+			// very-last chunks before exit (e.g. seq 50 of a 50-target
+			// strategy that hit max_reached in one tick) may not be visible
+			// in the first call. If attempt 1 resolves everything (or there
+			// was nothing pending to begin with — the common case for
+			// long-running strategies whose periodic 20s reconciler already
+			// caught every chunk), we break BEFORE the sleep and exit at
+			// full speed. The 3s wait only kicks in when something is
+			// actually still pending. Bounded at 2 attempts so a slow
+			// broker can't block strategy exit indefinitely.
+			//
+			// For each chunk resolved here we also emit a FILL_PRICE_UPDATED
+			// audit row directly via m.audit (the Runner's audit emitter is
+			// no longer on the path — its goroutine has exited). This keeps
+			// the audit log faithful to broker truth for chunks that only
+			// got their real price at strategy exit (the last few before
+			// max_reached / user STOP).
+			const atExitMaxAttempts = 2
+			const atExitRetryDelay = 3 * time.Second
+			for attempt := 1; attempt <= atExitMaxAttempts; attempt++ {
+				ids := pendingPriceOrderIDs(final)
+				if len(ids) == 0 {
+					break
 				}
+				if attempt > 1 {
+					time.Sleep(atExitRetryDelay)
+				}
+				rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+				prices, ferr := m.br.FetchFills(rctx, auth, ids)
 				rcancel()
+				if ferr != nil {
+					m.logger.Warn("at-exit fill-price reconcile attempt failed",
+						zap.String("strategy_id", strategyID),
+						zap.Int("attempt", attempt),
+						zap.Int("pending_ids", len(ids)),
+						zap.Error(ferr))
+					continue
+				}
+				rfs := final.ApplyResolvedPrices(prices)
+				if len(rfs) == 0 {
+					continue
+				}
+				m.logger.Info("at-exit reconcile backfilled fill prices",
+					zap.String("strategy_id", strategyID),
+					zap.Int("attempt", attempt),
+					zap.Int("chunks", len(rfs)))
+				for _, rf := range rfs {
+					if v := rf.LimitViolation(); v != "" {
+						m.logger.Error("CRITICAL — broker fill outside limit band (at-exit)",
+							zap.String("strategy_id", strategyID),
+							zap.String("side", rf.Side),
+							zap.Int("chunk_seq", rf.Seq),
+							zap.String("broker_order_id", rf.BrokerOrderID),
+							zap.Float64("real_price", rf.RealPrice),
+							zap.Float64("limit_price", rf.LimitPrice),
+							zap.String("violation", v))
+					}
+					m.audit.Log(repo.AuditRow{
+						StrategyID:    strategyID,
+						UserID:        final.Cfg.UserID,
+						Symbol:        final.Cfg.Symbol,
+						Side:          rf.Side,
+						Action:        "FILL_PRICE_UPDATED",
+						ChunkSeq:      rf.Seq,
+						Qty:           rf.FilledQty,
+						Price:         rf.RealPrice,
+						BrokerOrderID: rf.BrokerOrderID,
+						ErrorMsg:      "reconciled real fill price from trade-book (at-exit)",
+						Mode:          string(final.Cfg.Mode),
+						CreatedAt:     time.Now(),
+					})
+				}
 			}
 
 			m.completedMu.Lock()
