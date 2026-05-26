@@ -887,10 +887,10 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 	}
 
 	// Calculate and validate prices for enabled legs only
-	var slTrigger, slLimit, tpLimit float64
+	var slTrigger, tpLimit float64
 
 	if hasSL {
-		slTrigger, slLimit = group.CalculateSLFromFill(fillPrice)
+		slTrigger = group.CalculateSLFromFill(fillPrice)
 		if group.OrderSide == "BUY" && slTrigger >= fillPrice {
 			log.Printf("[oco] CRITICAL: SL trigger %.2f >= fill %.2f for BUY group %s (SLPct=%.1f%%) — aborting legs",
 				slTrigger, fillPrice, group.GroupID, group.SLPercent)
@@ -948,8 +948,8 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		slOrderID := uuid.New()
 		group.SLOrderID = slOrderID
 		group.SLTriggerPrice = slTrigger
-		group.SLLimitPrice = slLimit
-		slOrder = m.buildLegOrder(group, slOrderID, exitSide, models.OrderTypeStopLoss, &slLimit, &slTrigger, RoleSLLeg)
+		group.SLLimitPrice = 0
+		slOrder = m.buildLegOrder(group, slOrderID, exitSide, models.OrderTypeStopLossMarket, nil, &slTrigger, RoleSLLeg)
 	} else {
 		group.SLLegConfirmed = true // no SL leg — skip WS confirmation
 	}
@@ -1296,7 +1296,6 @@ func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
 	slBrokerID := group.SLBrokerID
 	tpBrokerID := group.TPBrokerID
 	slTrigger := group.SLTriggerPrice
-	slLimit := group.SLLimitPrice
 	tpLimit := group.TPLimitPrice
 	mu.Unlock()
 
@@ -1310,10 +1309,10 @@ func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
 			StockCode:     group.StockCode,
 			Exchange:      models.Exchange(group.Exchange),
 			Symbol:        group.Symbol,
-			OrderType:     models.OrderTypeStopLoss,
+			OrderType:     models.OrderTypeStopLossMarket,
 			OrderSide:     models.OrderSide(group.ExitSide()),
 			Quantity:      newQty,
-			Price:         &slLimit,
+			Price:         nil,
 			StopLoss:      &slTrigger,
 			Validity:      group.Validity,
 			ProductType:   group.ProductType,
@@ -1452,10 +1451,10 @@ func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigge
 		StockCode:     group.StockCode,
 		Exchange:      models.Exchange(group.Exchange),
 		Symbol:        group.Symbol,
-		OrderType:     models.OrderTypeStopLoss,
+		OrderType:     models.OrderTypeStopLossMarket,
 		OrderSide:     models.OrderSide(group.ExitSide()),
 		Quantity:      legQty,
-		Price:         &newLimit,
+		Price:         nil,
 		StopLoss:      &newTrigger,
 		Validity:      group.Validity,
 		ProductType:   group.ProductType,

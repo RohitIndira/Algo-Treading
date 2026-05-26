@@ -190,9 +190,13 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Already connected for this user — nothing to do. The per-user WSClient's
-	// monitorReconnect goroutine handles all future drops on its own.
-	if _, ok := s.wsClients.Load(userID); ok {
+	// Already connected for this user — push fresh credentials into the existing
+	// client so the token refresh loop uses the new bearer token. This handles
+	// CONFIG_UPDATED: the REST order path re-reads from DB after cache invalidation,
+	// but the WSClient has its own internal w.auth that never gets updated otherwise.
+	// ResumeWithNewAuth resets the retry backoff and retries createWsToken immediately.
+	if v, ok := s.wsClients.Load(userID); ok {
+		v.(*indiraClient.WSClient).ResumeWithNewAuth(&authCopy)
 		return nil
 	}
 
