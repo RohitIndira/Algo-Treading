@@ -54,16 +54,62 @@ func (r *GSheetReader) ReadAll(ctx context.Context) (*ReadResult, error) {
 		return nil, fmt.Errorf("reader not connected — call Connect() first")
 	}
 
-	// Batch-fetch all 6 tabs in a single API call to reduce round trips.
-	ranges := []string{
-		SheetPEAndNetProfit + "!A:Z",
-		SheetFScore + "!A:Z",
-		SheetLifeTimeHigh + "!A:Z",
-		SheetBuySignal + "!A:AZ",
-		SheetIndicesGradeRange + "!A:AZ",
-		SheetIndustry + "!A:Z",
-		SheetExitStockDetail + "!A:D",
+	// First learn which tabs actually exist in this spreadsheet — the
+	// Sheets `BatchGet` is all-or-nothing: a single missing range makes
+	// the entire call return 404, which used to crash the pipeline if
+	// (for example) the operator removed the ExitStockDetail tab. By
+	// probing the metadata first we can filter our wanted ranges down
+	// to only the tabs that exist; the per-tab `record()` calls below
+	// already log a clear warning for tabs that didn't come back, so
+	// missing-tab handling stays uniform.
+	meta, err := r.svc.Spreadsheets.Get(r.sheetID).
+		Fields("sheets.properties.title").
+		Context(ctx).
+		Do()
+	if err != nil {
+		return nil, fmt.Errorf("sheets metadata Get: %w", err)
 	}
+	existing := make(map[string]bool, len(meta.Sheets))
+	for _, s := range meta.Sheets {
+		if s != nil && s.Properties != nil {
+			existing[s.Properties.Title] = true
+		}
+	}
+
+	// The full set of tabs the pipeline KNOWS HOW TO PARSE, paired with
+	// the read-range. Tabs not present in `existing` are skipped here.
+	wanted := []struct {
+		tab    string
+		rng    string
+	}{
+		{SheetPEAndNetProfit, SheetPEAndNetProfit + "!A:Z"},
+		{SheetFScore, SheetFScore + "!A:Z"},
+		{SheetLifeTimeHigh, SheetLifeTimeHigh + "!A:Z"},
+		{SheetBuySignal, SheetBuySignal + "!A:AZ"},
+		{SheetIndicesGradeRange, SheetIndicesGradeRange + "!A:AZ"},
+		{SheetIndustry, SheetIndustry + "!A:Z"},
+		{SheetExitStockDetail, SheetExitStockDetail + "!A:D"},
+	}
+	ranges := make([]string, 0, len(wanted))
+	skipped := make([]string, 0)
+	for _, w := range wanted {
+		if existing[w.tab] {
+			ranges = append(ranges, w.rng)
+		} else {
+			skipped = append(skipped, w.tab)
+		}
+	}
+	if len(skipped) > 0 {
+		r.logger.Warn("Sheet tabs missing from spreadsheet — skipping",
+			zap.Strings("missing_tabs", skipped),
+			zap.Int("present_tabs", len(ranges)))
+	}
+	if len(ranges) == 0 {
+		return nil, fmt.Errorf("sheets: none of the expected tabs %v are present in spreadsheet %s",
+			func() []string { out := make([]string, len(wanted)); for i, w := range wanted { out[i] = w.tab }; return out }(),
+			r.sheetID)
+	}
+
 	start := time.Now()
 	resp, err := r.svc.Spreadsheets.Values.BatchGet(r.sheetID).
 		Ranges(ranges...).
