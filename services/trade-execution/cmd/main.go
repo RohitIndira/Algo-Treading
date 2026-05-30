@@ -505,6 +505,12 @@ func main() {
 	// to the custom OCO system instead of broker's native bracket order.
 	signalProcessor.SetOCOManager(ocoManager)
 
+	// Wire OCO manager into PriceMonitor — required so reloadFromDB can
+	// rebuild the onAfterFill closure for below_min orders after restart.
+	// Without this, a below_min order whose entry triggers post-restart fills
+	// with no SL/TP protection (the original signal-time closure is gone).
+	priceMonitorRef.SetOCOAdopter(ocoManager)
+
 	// OCO market data WSS client (enhanced-stream binary, primary price source for trailing SL)
 	ocoMarketClient := oco.NewOCOMarketClient(cfg.PaperMarketWSURL, nil) // callback wired below
 
@@ -522,16 +528,19 @@ func main() {
 	// Re-create trailing monitor with the properly wired market client
 	ocoTrailingMonitor = oco.NewTrailingMonitor(ocoManager, ocoMarketClient, ocoRedisProvider, 500*time.Millisecond)
 
-	// Reload active OCO groups from DB (restart recovery)
-	go func() {
+	// Reload active OCO groups from DB (restart recovery).
+	// Run synchronously: the trailing SL monitor's first refreshGroups() must
+	// see the reconstructed groups, otherwise there is a window (≤5s, until
+	// the next refresh tick) where new highs go un-trailed after every restart.
+	{
 		reloadCtx, reloadCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer reloadCancel()
 		if err := ocoManager.Reload(reloadCtx); err != nil {
 			log.Printf("[oco] Reload failed (non-fatal): %v", err)
 		} else {
 			log.Printf("✓ OCO manager initialized (%d active groups)", ocoManager.ActiveCount())
 		}
-	}()
+		reloadCancel()
+	}
 
 	log.Println("✓ OCO layer initialized")
 	// ──────────────────────────────────────────────────────────────────────

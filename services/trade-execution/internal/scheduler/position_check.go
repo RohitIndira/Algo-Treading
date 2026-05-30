@@ -83,6 +83,23 @@ func (o *OpenPositions) IsExited(order *models.Order) bool {
 	return !stillOpen
 }
 
+// GetNetQty returns how many units the broker currently shows open for the
+// order's symbol+exchange+product-type. Returns 0 when the snapshot is nil
+// or the symbol is not present (position is flat).
+//
+// Used by position-book square-off to calculate the safe exit quantity:
+//
+//	squareQty = min(GetNetQty(order), order.FilledQuantity)
+//
+// This ensures we only close what our algo placed and never open a short
+// even when the user holds additional manual qty in the same symbol.
+func (o *OpenPositions) GetNetQty(order *models.Order) int {
+	if o == nil || order == nil {
+		return 0
+	}
+	return o.m[orderKey(order)]
+}
+
 // FetchOpenPositions returns the broker's open positions (NetQty != 0) for
 // userID. EXPIRY rows are dropped; only DAILY (intraday) positions are kept.
 //

@@ -143,6 +143,10 @@ type OrderRepository interface {
 	// GetOpenOrdersByUser returns FILLED/PARTIALLY_FILLED INTRADAY live orders for a single
 	// user today that haven't been square-offed yet. Used for per-user live square-off.
 	GetOpenOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
+	// GetDistinctActiveUsersToday returns the distinct set of user IDs that have at least
+	// one live, filled, un-exited order created today through a strategy.
+	// Used by position-book square-off to know which users to query the broker for.
+	GetDistinctActiveUsersToday(ctx context.Context) ([]string, error)
 
 	// ── Auto square-off config ────────────────────────────────────────────────
 	// UpsertUserSquareOffConfig stores or updates the auto square-off config for a user.
@@ -1623,6 +1627,30 @@ func (r *orderRepository) GetOpenOrdersByUser(ctx context.Context, userID string
 		return nil, fmt.Errorf("failed to get open orders for user %s: %w", userID, err)
 	}
 	return orders, nil
+}
+
+// GetDistinctActiveUsersToday returns the distinct set of user IDs that have
+// at least one live, filled, un-exited order placed today through a strategy.
+// Intentionally broad — no NOT EXISTS, no product_type filter — so that
+// position-book square-off can ask the broker for every user who may have an
+// open intraday position, regardless of how their bracket/exit legs are stored.
+func (r *orderRepository) GetDistinctActiveUsersToday(ctx context.Context) ([]string, error) {
+	var userIDs []string
+	query := `
+		SELECT DISTINCT user_id
+		FROM orders
+		WHERE is_paper_trade       = false
+		AND   is_square_off_order  = false
+		AND   filled_quantity      > 0
+		AND   live_exit_price      IS NULL
+		AND   DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		ORDER BY user_id
+	`
+	err := r.db.SelectContext(ctx, &userIDs, query)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get distinct active users today: %w", err)
+	}
+	return userIDs, nil
 }
 
 // ════════════════════════════════════════════════════════════════════════════

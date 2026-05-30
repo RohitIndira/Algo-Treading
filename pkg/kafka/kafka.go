@@ -3,6 +3,8 @@ package kafka
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/pkg/correlation"
@@ -176,28 +178,48 @@ func (c *Consumer) SetOffset(offset int64) error {
 	return c.reader.SetOffset(offset)
 }
 
-// CreateTopic creates a new Kafka topic
-func CreateTopic(brokers []string, topic string, numPartitions int, replicationFactor int) error {
-	conn, err := kafka.Dial("tcp", brokers[0])
-	if err != nil {
-		return fmt.Errorf("failed to dial Kafka: %w", err)
-	}
-	defer conn.Close()
-
-	topicConfig := kafka.TopicConfig{
-		Topic:             topic,
-		NumPartitions:     numPartitions,
-		ReplicationFactor: replicationFactor,
-	}
-
-	return conn.CreateTopics(topicConfig)
-}
-
-// ListTopics lists all Kafka topics
-func ListTopics(brokers []string) ([]string, error) {
+// dialController connects to the Kafka controller node.
+// Admin operations (CreateTopics, ReadPartitions) must be performed on the
+// controller; calling them on a regular broker causes a connection reset.
+func dialController(brokers []string) (*kafka.Conn, error) {
 	conn, err := kafka.Dial("tcp", brokers[0])
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial Kafka: %w", err)
+	}
+	defer conn.Close()
+
+	controller, err := conn.Controller()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get controller: %w", err)
+	}
+
+	controllerConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial controller: %w", err)
+	}
+	return controllerConn, nil
+}
+
+// CreateTopic creates a new Kafka topic.
+func CreateTopic(brokers []string, topic string, numPartitions int, replicationFactor int) error {
+	conn, err := dialController(brokers)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	return conn.CreateTopics(kafka.TopicConfig{
+		Topic:             topic,
+		NumPartitions:     numPartitions,
+		ReplicationFactor: replicationFactor,
+	})
+}
+
+// ListTopics lists all Kafka topics.
+func ListTopics(brokers []string) ([]string, error) {
+	conn, err := dialController(brokers)
+	if err != nil {
+		return nil, err
 	}
 	defer conn.Close()
 
@@ -215,39 +237,29 @@ func ListTopics(brokers []string) ([]string, error) {
 	for topic := range topicMap {
 		topics = append(topics, topic)
 	}
-
 	return topics, nil
 }
 
-// EnsureTopicExists checks if the topic exists; if not, creates it.
+// EnsureTopicExists creates the topic if it does not already exist.
+// It connects via the controller so that admin operations succeed reliably.
 func EnsureTopicExists(brokers []string, topic string, numPartitions, replicationFactor int) error {
-	conn, err := kafka.Dial("tcp", brokers[0])
+	conn, err := dialController(brokers)
 	if err != nil {
-		return fmt.Errorf("failed to dial Kafka: %w", err)
+		return err
 	}
 	defer conn.Close()
 
-	partitions, err := conn.ReadPartitions()
-	if err != nil {
-		return fmt.Errorf("failed to read partitions: %w", err)
-	}
-
-	// Check if topic already exists
-	for _, p := range partitions {
-		if p.Topic == topic {
-			return nil // already exists
-		}
-	}
-
-	// Create topic if missing
-	topicConfig := kafka.TopicConfig{
+	err = conn.CreateTopics(kafka.TopicConfig{
 		Topic:             topic,
 		NumPartitions:     numPartitions,
 		ReplicationFactor: replicationFactor,
-	}
-	if err := conn.CreateTopics(topicConfig); err != nil {
+	})
+	if err != nil {
+		// Topic already exists is not an error
+		if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr == kafka.TopicAlreadyExists {
+			return nil
+		}
 		return fmt.Errorf("failed to create topic: %w", err)
 	}
-
 	return nil
 }
