@@ -17,6 +17,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// OCOAdopter adopts a freshly-filled entry order into an OCO group, placing
+// SL and TP legs based on the percentages derived from the persisted order.
+// Satisfied by *oco.OCOManager.AdoptOrder. Declared here as an interface to
+// avoid a scheduler→oco import cycle.
+type OCOAdopter interface {
+	AdoptOrder(order *models.Order, slPercent, tpPercent float64, trailingSL bool, trailingSLPct float64, auth *indiraClient.AuthContext)
+}
+
 // LTPProvider fetches the latest traded price from Redis (fallback).
 // *paper.RedisPriceClient satisfies this interface.
 type LTPProvider interface {
@@ -101,6 +109,11 @@ type PriceMonitor struct {
 	// Used by PaperWSServer to broadcast price watch snapshots via WebSocket.
 	onTickDone func()
 
+	// ocoAdopter adopts triggered live entry orders into an OCO group on restart
+	// recovery. Set via SetOCOAdopter. When nil, reloaded orders that have SL/TP
+	// configuration on them will execute without OCO protection — log a warning.
+	ocoAdopter OCOAdopter
+
 	// Sharded index for O(1) lookup by stock and by order.
 	shards [shardCount]*stockShard
 
@@ -184,6 +197,15 @@ func (pm *PriceMonitor) SetOnTickDone(fn func()) {
 // When set, WSS prices are used first; Redis is only queried for keys missing from WSS.
 func (pm *PriceMonitor) SetWSClient(ws MarketWSClient) {
 	pm.wsClient = ws
+}
+
+// SetOCOAdopter wires the OCO manager so the price monitor can reconstruct
+// SL/TP protection for orders reloaded from DB after a service restart. The
+// original signal_processor closures (which carried SL%, TP%, trailing flag)
+// are lost on restart — without this, reloaded orders that hit their price
+// target would execute with NO stop-loss or take-profit protection.
+func (pm *PriceMonitor) SetOCOAdopter(a OCOAdopter) {
+	pm.ocoAdopter = a
 }
 
 // Watch registers an order for price monitoring.
@@ -872,6 +894,13 @@ func (pm *PriceMonitor) GetWatchSnapshot(userID string) []WatchSnapshot {
 
 // reloadFromDB loads pending STOP_LOSS+BRACKET orders from the DB and re-registers
 // them for monitoring. Also subscribes all reloaded tokens on the WSS client.
+//
+// Restart recovery: rebuilds the onAfterFill closure that the original signal
+// processor attached in-memory. Without this, a below_min order persisted to DB
+// would, on restart, trigger an entry placement but skip OCO adoption — the
+// position would fill with no SL/TP protection. The SL/TP percentages and
+// trailing flag are derived from the persisted order fields, so the closure
+// can be reconstructed without the original kafka signal context.
 func (pm *PriceMonitor) reloadFromDB(ctx context.Context) error {
 	if pm.orderRepo == nil {
 		return nil
@@ -887,7 +916,7 @@ func (pm *PriceMonitor) reloadFromDB(ctx context.Context) error {
 			log.Printf("[price-monitor] Skipping order %s — no target price set", order.OrderID)
 			continue
 		}
-		pm.Watch(order, *order.Price, nil)
+		pm.Watch(order, *order.Price, pm.buildReloadOnAfterFill(order))
 	}
 
 	if len(orders) > 0 {
@@ -895,4 +924,78 @@ func (pm *PriceMonitor) reloadFromDB(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// buildReloadOnAfterFill reconstructs the onAfterFill closure for a price-monitor
+// order loaded from DB. Returns nil if no OCO/SL/TP protection is configured or
+// if the adopter isn't wired (paper trades, or no SL/TP intent).
+//
+// SL/TP percentages are recovered from the absolute prices stored on the order:
+// order.StopLoss / order.TakeProfit hold target_price × (1 ± pct/100), so the
+// percentage is the deviation of that ratio from 1. This matches the rescaling
+// the live triggerOrder path does at fill time, so the percentages we hand to
+// the adopter are the same ones the original signal carried.
+func (pm *PriceMonitor) buildReloadOnAfterFill(order *models.Order) func(*models.Order) {
+	if order == nil || order.IsPaperTrade {
+		return nil // paper trades use a different exit path (ML manager simulates)
+	}
+	if pm.ocoAdopter == nil {
+		// Adopter not wired — log once so missing protection is observable.
+		log.Printf("[price-monitor] Reloaded order %s has no OCO adopter wired — SL/TP will be unprotected if it triggers",
+			order.OrderID)
+		return nil
+	}
+	if order.Price == nil || *order.Price <= 0 {
+		return nil
+	}
+	target := *order.Price
+
+	// Derive SL% from the stored absolute SL price. For BUY: SL = target × (1 - p/100)
+	// → p = (1 - SL/target) × 100. For SELL the sign is flipped. The ratio path
+	// is robust to either side since we apply Abs at the end.
+	var slPct, tpPct float64
+	if order.StopLoss != nil && *order.StopLoss > 0 {
+		ratio := *order.StopLoss / target
+		slPct = (1 - ratio) * 100
+		if slPct < 0 {
+			slPct = -slPct
+		}
+	}
+	if order.TakeProfit != nil && *order.TakeProfit > 0 {
+		ratio := *order.TakeProfit / target
+		tpPct = (ratio - 1) * 100
+		if tpPct < 0 {
+			tpPct = -tpPct
+		}
+	}
+
+	trailing := order.StopLossType != nil && *order.StopLossType == "TRAILING"
+	trailPct := 0.0
+	if order.TrailingSLPct != nil {
+		trailPct = *order.TrailingSLPct
+	}
+
+	// If nothing to protect, skip — caller would have routed plain instead.
+	if slPct <= 0 && tpPct <= 0 {
+		return nil
+	}
+
+	adopter := pm.ocoAdopter // capture so the field can be swapped later without affecting in-flight closures
+	return func(filled *models.Order) {
+		if filled.IndiraOrderID == nil || *filled.IndiraOrderID == "" {
+			return
+		}
+		var auth *indiraClient.AuthContext
+		if filled.BearerToken != nil && filled.AppId != nil && filled.Source != nil {
+			auth = &indiraClient.AuthContext{
+				UserId:      filled.UserID,
+				BearerToken: *filled.BearerToken,
+				AppId:       *filled.AppId,
+				Source:      *filled.Source,
+			}
+		}
+		log.Printf("[price-monitor] Reload-adopt: order=%s sl=%.2f%% tp=%.2f%% trailing=%v trailPct=%.2f",
+			filled.OrderID, slPct, tpPct, trailing, trailPct)
+		adopter.AdoptOrder(filled, slPct, tpPct, trailing, trailPct, auth)
+	}
 }

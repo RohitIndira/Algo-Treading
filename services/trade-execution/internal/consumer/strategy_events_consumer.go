@@ -86,11 +86,12 @@ type MLGroupCanceller interface {
 	CancelGroupsByStrategy(ctx context.Context, userID, strategyID string)
 }
 
-// OpenPositionsSnapshot reports whether an order's underlying position is
-// already flat (NetQty == 0) at the broker. Implemented by
-// *scheduler.OpenPositions.
+// OpenPositionsSnapshot reports the broker's view of an order's position:
+// whether it is already flat (IsExited) and the current open net qty (GetNetQty,
+// signed; 0 when flat or absent). Implemented by *scheduler.OpenPositions.
 type OpenPositionsSnapshot interface {
 	IsExited(order *models.Order) bool
+	GetNetQty(order *models.Order) int
 }
 
 // OpenPositionsLookup queries the broker position book for a user.
@@ -389,13 +390,32 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 			if o.FilledQuantity <= 0 {
 				continue
 			}
-			if snapshot != nil && snapshot.IsExited(o) {
-				c.logger.Info("Skipping square-off on deactivation: broker NetQty=0 (already exited)",
-					zap.String("order_id", o.OrderID.String()),
-					zap.String("symbol", o.Symbol),
-					zap.String("user_id", o.UserID))
-				continue
+			// Cap the reverse quantity at the broker's current open net qty for this
+			// symbol so we only unwind what is actually still open. If the position
+			// was partially closed before deactivation (e.g. a TP leg fired), the full
+			// FilledQuantity reverse would over-sell into a short. Mirrors the EOD
+			// AutoSquareOffScheduler.squareOffUserViaPositionBook. brokerQty is signed
+			// (negative for shorts), so take its magnitude. Fail-open: when the snapshot
+			// is unavailable (nil), reverse the full filled qty as before.
+			squareQty := int(o.FilledQuantity)
+			if snapshot != nil {
+				brokerQty := snapshot.GetNetQty(o)
+				if brokerQty < 0 {
+					brokerQty = -brokerQty
+				}
+				if brokerQty == 0 {
+					c.logger.Info("Skipping square-off on deactivation: broker NetQty=0 (already exited)",
+						zap.String("order_id", o.OrderID.String()),
+						zap.String("symbol", o.Symbol),
+						zap.String("user_id", o.UserID))
+					continue
+				}
+				if brokerQty < squareQty {
+					squareQty = brokerQty
+				}
 			}
+			ordCopy := *o
+			ordCopy.FilledQuantity = int32(squareQty)
 			sqWg.Add(1)
 			go func(ord *models.Order) {
 				defer sqWg.Done()
@@ -405,7 +425,7 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 						zap.String("symbol", ord.Symbol),
 						zap.Error(sqErr))
 				}
-			}(o)
+			}(&ordCopy)
 		}
 		sqWg.Wait()
 	}
@@ -490,9 +510,17 @@ func (c *StrategyEventsConsumer) squareOffLivePosition(ctx context.Context, orig
 		IsPaperTrade:     false,
 		TradingMode:      "LIVE",
 		RiskApproved:     true,
-		BearerToken:      original.BearerToken,
-		AppId:            original.AppId,
-		Source:           original.Source,
+		// BearerToken / AppId / Source intentionally omitted (left nil).
+		// The token stored on the entry order was captured at entry time and is
+		// likely expired by the time the strategy is deactivated. Copying it here
+		// makes executor.ExecuteOrder use credSource="signal" with that stale token,
+		// so the broker rejects the square-off and the position is left OPEN while
+		// SL/TP cancellation (a different code path) still appears to succeed —
+		// exactly the "SL/TP cancelled but position still open" symptom.
+		// Leaving them nil forces executor.go to fetch fresh credentials from the DB
+		// via CredentialsCache (credSource="cache"), with the 401-retry path picking
+		// up any token refresh. This mirrors the EOD AutoSquareOffScheduler's
+		// createAndExecuteSquareOffOrder, which is the established correct pattern.
 		// Link back to the entry order so statusservice records the exact exit
 		// price / P&L on the parent when this reverse order fills.
 		ParentOrderID: &original.OrderID,

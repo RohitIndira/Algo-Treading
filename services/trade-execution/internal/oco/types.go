@@ -130,31 +130,42 @@ func (g *OCOGroup) ExitSide() string {
 	return "BUY"
 }
 
-// CalculateSLFromFill computes SL trigger & limit prices from the actual fill.
-//
-//	BUY entry → SL trigger = fillPrice * (1 - slPct/100)
-//	            SL limit   = trigger * (1 - 0.005)   (0.5% below to ensure fill)
-//	SELL entry → mirror
-func (g *OCOGroup) CalculateSLFromFill(fillPrice float64) (trigger, limit float64) {
-	if g.OrderSide == "BUY" {
-		trigger = fillPrice * (1 - g.SLPercent/100)
-		limit = trigger * (1 - 0.005) // 0.5% below trigger
-	} else {
-		trigger = fillPrice * (1 + g.SLPercent/100)
-		limit = trigger * (1 + 0.005) // 0.5% above trigger
+// entryRef strips the BUY entry limit buffer (LTP×1.005) so that SL/TP
+// percentages are relative to LTP rather than the inflated fill price.
+// SELL entries carry no buffer, so fill≈LTP and no adjustment is needed.
+func entryRef(fillPrice float64, side string) float64 {
+	if side == "BUY" {
+		return fillPrice / 1.005
 	}
-	return roundNSE(trigger), roundNSE(limit)
+	return fillPrice
 }
 
-// CalculateTPFromFill computes TP limit price from the actual fill.
+// CalculateSLFromFill computes the SL trigger price from the actual fill.
+// Uses entryRef so the percentage is applied against LTP, not the fill price
+// (which is LTP×1.005 for BUY entries). Returns trigger only — SL legs are
+// placed as SL-M (stop market) so no limit price is needed.
 //
-//	BUY entry → TP limit = fillPrice * (1 + tpPct/100)
-//	SELL entry → TP limit = fillPrice * (1 - tpPct/100)
-func (g *OCOGroup) CalculateTPFromFill(fillPrice float64) float64 {
+//	BUY entry → trigger = entryRef(fill) * (1 - slPct/100)
+//	SELL entry → trigger = entryRef(fill) * (1 + slPct/100)
+func (g *OCOGroup) CalculateSLFromFill(fillPrice float64) float64 {
+	ref := entryRef(fillPrice, g.OrderSide)
 	if g.OrderSide == "BUY" {
-		return roundNSE(fillPrice * (1 + g.TPPercent/100))
+		return roundNSE(ref * (1 - g.SLPercent/100))
 	}
-	return roundNSE(fillPrice * (1 - g.TPPercent/100))
+	return roundNSE(ref * (1 + g.SLPercent/100))
+}
+
+// CalculateTPFromFill computes the TP limit price from the actual fill.
+// Uses entryRef so the percentage is applied against LTP, not the fill price.
+//
+//	BUY entry → TP limit = entryRef(fill) * (1 + tpPct/100)
+//	SELL entry → TP limit = entryRef(fill) * (1 - tpPct/100)
+func (g *OCOGroup) CalculateTPFromFill(fillPrice float64) float64 {
+	ref := entryRef(fillPrice, g.OrderSide)
+	if g.OrderSide == "BUY" {
+		return roundNSE(ref * (1 + g.TPPercent/100))
+	}
+	return roundNSE(ref * (1 - g.TPPercent/100))
 }
 
 // CalculateTrailingSL computes a new SL trigger given the current highest price.
@@ -184,7 +195,7 @@ func (g *OCOGroup) CalculateTrailingSL(currentLTP float64) (trigger, limit float
 		}
 		// Proportional: SL moves up by the same ratio as the price
 		trigger = g.SLTriggerPrice * (currentLTP / g.HighestPrice)
-		limit = trigger * (1 - 0.005) // 0.5% buffer below trigger
+		limit = trigger // SL-M: no limit price needed; kept for signature compatibility
 		if trigger <= g.SLTriggerPrice {
 			return 0, 0, false
 		}
@@ -195,7 +206,7 @@ func (g *OCOGroup) CalculateTrailingSL(currentLTP float64) (trigger, limit float
 		}
 		// Proportional: SL moves down by the same ratio as the price
 		trigger = g.SLTriggerPrice * (currentLTP / g.HighestPrice)
-		limit = trigger * (1 + 0.005) // 0.5% buffer above trigger
+		limit = trigger // SL-M: no limit price needed; kept for signature compatibility
 		if trigger >= g.SLTriggerPrice {
 			return 0, 0, false
 		}

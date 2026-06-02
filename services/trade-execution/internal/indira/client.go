@@ -271,6 +271,14 @@ func (c *ExecutionClient) GetOrderBook(ctx context.Context, auth *indiraClient.A
 	return c.client.GetOrderBook(ctx, auth)
 }
 
+// GetTradeBook retrieves trade-book entries for the given broker order IDs. The
+// trade book is the authoritative source for fill qty, price and — critically —
+// fill TIME: the order WebSocket omits TradedQTY and every timestamp on EXECUTED
+// messages, so exit/entry times can only be sourced reliably from here.
+func (c *ExecutionClient) GetTradeBook(ctx context.Context, auth *indiraClient.AuthContext, orderIds ...string) ([]indiraClient.TradeBook, error) {
+	return c.client.GetTradeBook(ctx, auth, orderIds...)
+}
+
 
 // FindRecentOrder checks the broker order book for an order matching symbol, side (BUY/SELL), and qty.
 // Used for idempotency: on network timeout we don't know if the order was placed; this checks before retrying.

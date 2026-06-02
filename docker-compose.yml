@@ -86,7 +86,7 @@ services:
     networks:
       - trading-network
     healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -103,6 +103,22 @@ services:
     volumes:
       - zookeeper-data:/var/lib/zookeeper/data
       - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: trading-kafka-ui
+    hostname: kafka-ui
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: trading-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
     networks:
       - trading-network
     restart: unless-stopped
@@ -244,6 +260,8 @@ services:
     restart: unless-stopped
 
 volumes:
+  postgres-data:
+    driver: local
   mongodb-data:
     driver: local
   mongodb-config:
@@ -254,3 +272,7 @@ volumes:
     driver: local
   zookeeper-logs:
     driver: local
+
+networks:
+  trading-network:
+    driver: bridge

@@ -142,6 +142,37 @@ func isSessionNotReadyError(err error) bool {
 	return strings.Contains(msg, "AU004") || strings.Contains(msg, "Session data not received")
 }
 
+// resolveAuth proactively checks the credentials cache for a fresher bearer token
+// than the one stored on the group, and updates group.Auth in place if so. This is
+// cheap (cache hit = single RLock + map lookup) and matters most for groups
+// reconstructed from DB on restart: their stored token may already be stale, but
+// another code path may have refreshed the cache in the meantime. Without this,
+// every restart-reconstructed group wastes one broker round-trip on a 401 before
+// recovering. Safe to call without holding the group mutex — the swap is a single
+// pointer write.
+//
+// Returns the auth to use (never nil — falls back to group.Auth on any error).
+func (m *OCOManager) resolveAuth(ctx context.Context, group *OCOGroup) *indiraClient.AuthContext {
+	if group.Auth == nil || m.credsCache == nil || group.UserID == "" {
+		return group.Auth
+	}
+	userId, appId, source, bearerToken, err := m.credsCache.Get(ctx, group.UserID)
+	if err != nil || bearerToken == "" {
+		return group.Auth
+	}
+	if bearerToken == group.Auth.BearerToken {
+		return group.Auth
+	}
+	fresh := &indiraClient.AuthContext{
+		UserId:      userId,
+		AppId:       appId,
+		Source:      source,
+		BearerToken: bearerToken,
+	}
+	group.Auth = fresh
+	return fresh
+}
+
 // refreshAuth invalidates the cache for userID, reloads fresh credentials from DB,
 // and returns an updated AuthContext. Returns nil if refresh is unavailable or fails.
 func (m *OCOManager) refreshAuth(ctx context.Context, userID string, currentAuth *indiraClient.AuthContext) *indiraClient.AuthContext {
@@ -415,6 +446,12 @@ func (m *OCOManager) CreateOCOEntry(
 	now := time.Now()
 	entryOrder.SubmittedAt = &now
 	group.EntryBrokerID = brokerID
+
+	// Persist SL/TP percentages on the entry order so reconstructGroup can restore
+	// group.SLPercent and group.TPPercent after a service restart.
+	// These are set AFTER PlaceOrder so the broker never sees them as TriggerPrice.
+	entryOrder.StopLoss = &slPercent
+	entryOrder.TakeProfit = &tpPercent
 
 	// Register in memory IMMEDIATELY — before DB persist.
 	// The broker WS can fire an EXECUTED update within milliseconds of PlaceOrder
@@ -887,10 +924,10 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 	}
 
 	// Calculate and validate prices for enabled legs only
-	var slTrigger, slLimit, tpLimit float64
+	var slTrigger, tpLimit float64
 
 	if hasSL {
-		slTrigger, slLimit = group.CalculateSLFromFill(fillPrice)
+		slTrigger = group.CalculateSLFromFill(fillPrice)
 		if group.OrderSide == "BUY" && slTrigger >= fillPrice {
 			log.Printf("[oco] CRITICAL: SL trigger %.2f >= fill %.2f for BUY group %s (SLPct=%.1f%%) — aborting legs",
 				slTrigger, fillPrice, group.GroupID, group.SLPercent)
@@ -948,8 +985,8 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		slOrderID := uuid.New()
 		group.SLOrderID = slOrderID
 		group.SLTriggerPrice = slTrigger
-		group.SLLimitPrice = slLimit
-		slOrder = m.buildLegOrder(group, slOrderID, exitSide, models.OrderTypeStopLoss, &slLimit, &slTrigger, RoleSLLeg)
+		group.SLLimitPrice = 0
+		slOrder = m.buildLegOrder(group, slOrderID, exitSide, models.OrderTypeStopLossMarket, nil, &slTrigger, RoleSLLeg)
 	} else {
 		group.SLLegConfirmed = true // no SL leg — skip WS confirmation
 	}
@@ -1265,7 +1302,8 @@ func (m *OCOManager) cancelEntryRemaining(group *OCOGroup) {
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 		}
 
-		err := m.indiraClient.CancelOrder(ctx, group.Exchange, brokerID, group.Symbol, group.Auth)
+		authToUse := m.resolveAuth(ctx, group)
+		err := m.indiraClient.CancelOrder(ctx, group.Exchange, brokerID, group.Symbol, authToUse)
 		if err != nil {
 			errLower := strings.ToLower(err.Error())
 			// If already traded/cancelled, the remaining qty is gone — nothing to cancel
@@ -1274,6 +1312,13 @@ func (m *OCOManager) cancelEntryRemaining(group *OCOGroup) {
 				strings.Contains(errLower, "executed") {
 				log.Printf("[oco] Entry order already in terminal state for group %s — cancel not needed", group.GroupID)
 				break
+			}
+			// On 401, invalidate + reload from DB once; next attempt uses the fresh token.
+			if isSessionExpiredError(err) && m.credsCache != nil {
+				if newAuth := m.refreshAuth(ctx, group.UserID, authToUse); newAuth != nil {
+					group.Auth = newAuth
+				}
+				continue
 			}
 			log.Printf("[oco] Cancel remaining entry attempt %d failed (group=%s broker=%s): %v",
 				attempt+1, group.GroupID, brokerID, err)
@@ -1296,11 +1341,26 @@ func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
 	slBrokerID := group.SLBrokerID
 	tpBrokerID := group.TPBrokerID
 	slTrigger := group.SLTriggerPrice
-	slLimit := group.SLLimitPrice
 	tpLimit := group.TPLimitPrice
 	mu.Unlock()
 
 	log.Printf("[oco] Modifying SL+TP legs qty to %d for group %s", newQty, group.GroupID)
+
+	// modifyWith401Retry wraps a single ModifyOrder call with a one-shot 401
+	// refresh+retry, mirroring the pattern in ModifySLLeg. Without this the
+	// first call after restart guarantees a failure when the stored token has
+	// expired, leaving leg quantities desynced between our DB and the broker.
+	modifyWith401Retry := func(label string, modOrder *models.Order) error {
+		authToUse := m.resolveAuth(ctx, group)
+		err := m.indiraClient.ModifyOrder(ctx, modOrder, authToUse)
+		if err != nil && isSessionExpiredError(err) && m.credsCache != nil {
+			if newAuth := m.refreshAuth(ctx, group.UserID, authToUse); newAuth != nil {
+				group.Auth = newAuth
+				err = m.indiraClient.ModifyOrder(ctx, modOrder, newAuth)
+			}
+		}
+		return err
+	}
 
 	// Modify SL leg
 	if slBrokerID != "" {
@@ -1310,15 +1370,15 @@ func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
 			StockCode:     group.StockCode,
 			Exchange:      models.Exchange(group.Exchange),
 			Symbol:        group.Symbol,
-			OrderType:     models.OrderTypeStopLoss,
+			OrderType:     models.OrderTypeStopLossMarket,
 			OrderSide:     models.OrderSide(group.ExitSide()),
 			Quantity:      newQty,
-			Price:         &slLimit,
+			Price:         nil,
 			StopLoss:      &slTrigger,
 			Validity:      group.Validity,
 			ProductType:   group.ProductType,
 		}
-		if err := m.indiraClient.ModifyOrder(ctx, slOrder, group.Auth); err != nil {
+		if err := modifyWith401Retry("SL", slOrder); err != nil {
 			log.Printf("[oco] Failed to modify SL leg qty to %d for group %s: %v", newQty, group.GroupID, err)
 		} else {
 			log.Printf("[oco] SL leg qty modified to %d for group %s (broker=%s)", newQty, group.GroupID, slBrokerID)
@@ -1341,7 +1401,7 @@ func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
 			Validity:      group.Validity,
 			ProductType:   group.ProductType,
 		}
-		if err := m.indiraClient.ModifyOrder(ctx, tpOrder, group.Auth); err != nil {
+		if err := modifyWith401Retry("TP", tpOrder); err != nil {
 			log.Printf("[oco] Failed to modify TP leg qty to %d for group %s: %v", newQty, group.GroupID, err)
 		} else {
 			log.Printf("[oco] TP leg qty modified to %d for group %s (broker=%s)", newQty, group.GroupID, tpBrokerID)
@@ -1374,10 +1434,21 @@ func (m *OCOManager) cancelLeg(group *OCOGroup, brokerID string, legName string,
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 		}
 
-		err := m.indiraClient.CancelOrder(ctx, group.Exchange, brokerID, group.Symbol, group.Auth)
+		// Pull a fresher token from the cache before each attempt so stale auth
+		// (e.g. on restart-reconstructed groups) doesn't burn a full 3-retry cycle.
+		authToUse := m.resolveAuth(ctx, group)
+		err := m.indiraClient.CancelOrder(ctx, group.Exchange, brokerID, group.Symbol, authToUse)
 		if err != nil {
 			log.Printf("[oco] Cancel %s leg attempt %d failed (group=%s broker=%s): %v",
 				legName, attempt+1, group.GroupID, brokerID, err)
+			// On 401, invalidate + reload from DB once; the next attempt picks up the
+			// new token via resolveAuth (after Invalidate, cache reload returns fresh).
+			if isSessionExpiredError(err) && m.credsCache != nil {
+				if newAuth := m.refreshAuth(ctx, group.UserID, authToUse); newAuth != nil {
+					group.Auth = newAuth
+				}
+				continue
+			}
 			// If error contains "already traded" or "already cancelled", stop retrying
 			if strings.Contains(strings.ToLower(err.Error()), "already") ||
 				strings.Contains(strings.ToLower(err.Error()), "traded") ||
@@ -1452,16 +1523,18 @@ func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigge
 		StockCode:     group.StockCode,
 		Exchange:      models.Exchange(group.Exchange),
 		Symbol:        group.Symbol,
-		OrderType:     models.OrderTypeStopLoss,
+		OrderType:     models.OrderTypeStopLossMarket,
 		OrderSide:     models.OrderSide(group.ExitSide()),
 		Quantity:      legQty,
-		Price:         &newLimit,
+		Price:         nil,
 		StopLoss:      &newTrigger,
 		Validity:      group.Validity,
 		ProductType:   group.ProductType,
 	}
 
-	currentAuth := group.Auth
+	// Proactively pull a fresher token from the cache if one exists — saves a
+	// guaranteed-401 round-trip for groups reconstructed from DB after restart.
+	currentAuth := m.resolveAuth(ctx, group)
 	modifyErr := m.indiraClient.ModifyOrder(ctx, slOrder, currentAuth)
 	if modifyErr != nil && isSessionExpiredError(modifyErr) && m.credsCache != nil {
 		// 401: refresh credentials and retry once.
@@ -1553,6 +1626,29 @@ func (m *OCOManager) Reload(ctx context.Context) error {
 			m.startPartialFillTimer(group)
 		}
 
+		// Recovery: if the entry filled before the crash but legs were never
+		// created in the DB, inferState returns StatePlacingLegs. Without this
+		// re-trigger the position stays naked forever — handleEntryUpdate early-
+		// returns once state != StatePendingEntry, so no future WS event will
+		// place the legs. placeOCOLegs is safe here because the only way to
+		// reach this branch is slStatus=="" && tpStatus=="" (no legs in DB),
+		// so no duplicate legs can be created.
+		if group.State == StatePlacingLegs {
+			if group.EntryFillPrice <= 0 {
+				log.Printf("[oco] Reload: group %s in StatePlacingLegs but EntryFillPrice unknown — cannot recover legs", group.GroupID)
+			} else if group.Auth == nil {
+				log.Printf("[oco] Reload: group %s in StatePlacingLegs but auth missing — cannot recover legs", group.GroupID)
+			} else {
+				log.Printf("[oco] Reload recovery: group %s in StatePlacingLegs — re-invoking placeOCOLegs (fill=%.2f)", group.GroupID, group.EntryFillPrice)
+				g := group
+				go func() {
+					legCtx, legCancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+					defer legCancel()
+					m.placeOCOLegs(legCtx, g)
+				}()
+			}
+		}
+
 		loaded++
 	}
 
@@ -1594,14 +1690,17 @@ func (m *OCOManager) reconstructGroup(groupID uuid.UUID, orders []*models.Order)
 			if o.IndiraOrderID != nil {
 				group.EntryBrokerID = *o.IndiraOrderID
 			}
-			// Use OrderPrice (order.Price) as the basis for SL/TP to avoid slippage.
-			// Fall back to TradedPrice (FilledPrice) if OrderPrice is unavailable.
-			if o.Price != nil && *o.Price > 0 {
-				group.EntryFillPrice = *o.Price
-				group.HighestPrice = *o.Price
-			} else if o.FilledPrice != nil {
+			// Prefer the actual execution price (FilledPrice from broker WS TradedPrice)
+			// over the LIMIT price the order was placed at. order.Price for BUY OCO entries
+			// is signal_price × 1.005 — using it as HighestPrice silently desensitizes the
+			// trailing SL after every restart (any tick below the inflated baseline is
+			// ignored). Fall back to order.Price only if FilledPrice is missing.
+			if o.FilledPrice != nil && *o.FilledPrice > 0 {
 				group.EntryFillPrice = *o.FilledPrice
 				group.HighestPrice = *o.FilledPrice
+			} else if o.Price != nil && *o.Price > 0 {
+				group.EntryFillPrice = *o.Price
+				group.HighestPrice = *o.Price
 			}
 			if o.StopLoss != nil {
 				group.SLPercent = *o.StopLoss // stored as percentage in entry

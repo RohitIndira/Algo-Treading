@@ -190,9 +190,13 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Already connected for this user — nothing to do. The per-user WSClient's
-	// monitorReconnect goroutine handles all future drops on its own.
-	if _, ok := s.wsClients.Load(userID); ok {
+	// Already connected for this user — push fresh credentials into the existing
+	// client so the token refresh loop uses the new bearer token. This handles
+	// CONFIG_UPDATED: the REST order path re-reads from DB after cache invalidation,
+	// but the WSClient has its own internal w.auth that never gets updated otherwise.
+	// ResumeWithNewAuth resets the retry backoff and retries createWsToken immediately.
+	if v, ok := s.wsClients.Load(userID); ok {
+		v.(*indiraClient.WSClient).ResumeWithNewAuth(&authCopy)
 		return nil
 	}
 
@@ -501,10 +505,11 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	// Stale events (newCumQty < prevQty) are dropped: the per-order mutex
 	// serializes execution but goroutine acquire order is non-deterministic,
 	// so an older event can still run after a newer one.
-	newCumQty := -1
-	if q, err := strconv.Atoi(string(wsStatus.TradedQTY)); err == nil {
-		newCumQty = q
-	}
+	// Cumulative filled qty. Prefers the broker's TradedQTY, but falls back to
+	// OrderOriginalQty/PendingQty when the broker reports EXECUTED/TRADED with an
+	// empty TradedQTY — otherwise a real fill is recorded as filled_quantity=0.
+	// See resolveFilledQty for why that 0 cascades into USER-DIRECT misattribution.
+	newCumQty := resolveFilledQty(wsStatus, int(order.Quantity))
 	thisTradePrice := 0.0
 	if p, err := strconv.ParseFloat(wsStatus.TradedPrice, 64); err == nil && p > 0 {
 		thisTradePrice = p
@@ -561,6 +566,29 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 			order.ExecutedAt = &t
 		} else if t := parseBrokerTime(wsStatus.OrderTimeStamp); !t.IsZero() {
 			order.ExecutedAt = &t
+		}
+	}
+
+	// Authoritative fill from the REST trade book. The broker WS omits TradedQTY
+	// and ALL timestamps on EXECUTED/TRADED events (the qty above is derived and
+	// ExecutedAt is usually still nil here), so pull the real fill qty, VWAP price
+	// and exact trade TIME from the trade book. This is what makes exit time
+	// populate: the OCO/ML/square-off exit recorders below all read the leg's
+	// ExecutedAt / FilledPrice. Guarded to the fill-status transition so it runs
+	// once per fill, not on every duplicate WS event. On any failure (error, race
+	// before the trade is booked) we keep the WS-derived values as a fallback.
+	if (brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED") &&
+		string(previousStatus) != brokerStatusUpper {
+		if qty, price, ts, ok := s.fillFromTradeBook(ctx, order.UserID, indiraID); ok {
+			if qty > 0 {
+				order.FilledQuantity = int32(qty)
+			}
+			if price > 0 {
+				order.FilledPrice = &price
+			}
+			if !ts.IsZero() {
+				order.ExecutedAt = &ts
+			}
 		}
 	}
 
@@ -753,16 +781,41 @@ func (s *OrderStatusService) handleExternalExit(ctx context.Context, wsStatus *i
 		return
 	}
 
-	// Exit timestamp straight from the broker WS event.
-	exitTime := parseBrokerTime(wsStatus.OrderEntryTime)
+	// Authoritative exit qty/price/time from the REST trade book. The broker WS
+	// closing event (a broker EOD MIS square-off or manual terminal sell) omits
+	// TradedQTY and every timestamp, so without this the exit time would just be
+	// time.Now() and the qty would have to be derived. UCC is the user id.
+	tbQty, tbPrice, tbTime, tbOK := s.fillFromTradeBook(ctx, userID, wsStatus.UniqueCode)
+
+	// Exit timestamp: trade book is authoritative; fall back to WS fields, then now.
+	exitTime := tbTime
+	if exitTime.IsZero() {
+		exitTime = parseBrokerTime(wsStatus.OrderEntryTime)
+	}
 	if exitTime.IsZero() {
 		exitTime = parseBrokerTime(wsStatus.OrderTimeStamp)
+	}
+	if exitTime.IsZero() {
+		exitTime = parseBrokerTime(wsStatus.LastModifiedTimeStamp)
 	}
 	if exitTime.IsZero() {
 		exitTime = time.Now()
 	}
 
-	remainingExitQty := flexToInt(wsStatus.TradedQTY)
+	// Prefer the trade book's authoritative fill price when the WS gave none.
+	if exitPrice <= 0 && tbOK && tbPrice > 0 {
+		exitPrice = tbPrice
+	}
+
+	// Quantity filled on the closing order. Trade book is authoritative; otherwise
+	// fall back to the WS fields (Indira reports EXECUTED/TRADED with an empty
+	// TradedQTY, the fill riding in OrderOriginalQty/PendingQty). Without a usable
+	// qty the exit is silently dropped and the position keeps blank exit data.
+	// placedQty=0: this order isn't ours, so there's no DB quantity to fall back to.
+	remainingExitQty := resolveFilledQty(wsStatus, 0)
+	if tbOK && tbQty > 0 {
+		remainingExitQty = tbQty
+	}
 	if remainingExitQty <= 0 {
 		return
 	}
@@ -866,6 +919,102 @@ func flexToInt(f indiraClient.FlexInt) int {
 	return v
 }
 
+// resolveFilledQty returns the cumulative filled quantity reported by a broker WS
+// event, or -1 when none can be derived (the caller then leaves filled_quantity
+// unchanged).
+//
+// Indira normally sends TradedQTY as the cumulative fill, but on some EXECUTED/
+// TRADED events it arrives empty — the fill only appears in OrderOriginalQty/
+// PendingQty. Without this fallback, filled_quantity stays 0 on a genuine fill,
+// which cascades into real bugs: the deactivation bulk-cancel guard
+// (filled_quantity > 0) fails to protect the position so it gets CANCELLED, the
+// square-off path never closes it so no exit is recorded, and enrichPositions
+// treats it as broker-direct ("USER DIRECT") instead of attributing it to its
+// strategy. An explicit TradedQTY (including "0") is always respected.
+func resolveFilledQty(ws *indiraClient.WSOrderStatus, placedQty int) int {
+	if q, err := strconv.Atoi(string(ws.TradedQTY)); err == nil {
+		return q
+	}
+	status := strings.ToUpper(strings.TrimSpace(ws.OrderStatus))
+	if status != "EXECUTED" && status != "TRADED" {
+		return -1
+	}
+	// Fully/partially filled cumulative qty = original − still-pending.
+	if d := ws.OrderOriginalQty - flexToInt(ws.PendingQty); d > 0 {
+		return d
+	}
+	if ws.OrderOriginalQty > 0 {
+		return ws.OrderOriginalQty
+	}
+	if placedQty > 0 {
+		return placedQty
+	}
+	return -1
+}
+
+// fillFromTradeBook fetches the broker trade book for one order and aggregates its
+// trades into the authoritative cumulative fill: total qty, VWAP price, and the
+// latest trade time. The order WebSocket omits TradedQTY and every timestamp on
+// EXECUTED messages, so this REST trade book is the only authoritative source for
+// fill quantity and — critically — fill/exit TIME. Returns ok=false on any error,
+// missing auth, or no matching trade, so the caller keeps its WS-derived fallback.
+func (s *OrderStatusService) fillFromTradeBook(ctx context.Context, userID, indiraOrderID string) (qty int, price float64, ts time.Time, ok bool) {
+	if s.execClient == nil || indiraOrderID == "" {
+		return 0, 0, time.Time{}, false
+	}
+	authVal, has := s.subscriberAuths.Load(userID)
+	if !has {
+		return 0, 0, time.Time{}, false
+	}
+	auth := authVal.(*indiraClient.AuthContext)
+
+	// Two attempts: the socket EXECUTED event can momentarily lead the broker's
+	// trade book, so an empty first result is retried once after a short delay
+	// before giving up (caller then keeps the WS-derived fallback).
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		trades, err := s.execClient.GetTradeBook(cctx, auth, indiraOrderID)
+		cancel()
+		if err != nil {
+			s.logger.Warn("trade book fetch failed — keeping WS-derived fill",
+				zap.String("indira_order_id", indiraOrderID), zap.Error(err))
+			return 0, 0, time.Time{}, false
+		}
+		if q, p, t, ok := aggregateTrades(trades, indiraOrderID); ok {
+			return q, p, t, true
+		}
+	}
+	return 0, 0, time.Time{}, false
+}
+
+// aggregateTrades reduces a trade-book response for one order into the cumulative
+// fill: total qty, volume-weighted average price, and the latest trade time.
+// Pure (no I/O) so it is unit-tested directly. ok=false when there is no usable
+// quantity, signalling the caller to keep its WS-derived fallback values.
+func aggregateTrades(trades []indiraClient.TradeBook, indiraOrderID string) (qty int, price float64, ts time.Time, ok bool) {
+	var totalQty int
+	var notional float64
+	var latest time.Time
+	for _, t := range trades {
+		// Defensive: the endpoint is queried per order, but skip any stray row.
+		if t.OrdId != "" && indiraOrderID != "" && !strings.EqualFold(t.OrdId, indiraOrderID) {
+			continue
+		}
+		totalQty += t.TradedQty
+		notional += float64(t.TradedQty) * t.TradedPrice
+		if tt := parseTradeBookTime(t.TradeTime); tt.After(latest) {
+			latest = tt
+		}
+	}
+	if totalQty <= 0 {
+		return 0, 0, time.Time{}, false
+	}
+	return totalQty, notional / float64(totalQty), latest, true
+}
+
 // decimalLocator returns the divisor encoded in the WS DecimalLocator field.
 // E.g. "100" means raw prices must be divided by 100 to get the actual value.
 // Returns 1 when the field is empty or unparseable (no-op divisor).
@@ -890,6 +1039,18 @@ func parseBrokerTime(s string) time.Time {
 		if t, err := time.ParseInLocation(layout, s, timezone.IST); err == nil {
 			return t
 		}
+	}
+	return time.Time{}
+}
+
+// parseTradeBookTime parses the REST trade-book TradeTime format ("2026-06-01
+// 14:38:41"), which differs from the WS order-event format parseBrokerTime handles.
+func parseTradeBookTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", s, timezone.IST); err == nil {
+		return t
 	}
 	return time.Time{}
 }

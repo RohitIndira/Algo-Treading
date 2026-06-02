@@ -51,6 +51,12 @@ type AutoSquareOffScheduler struct {
 	// positionChecker, if set, queries the broker position book before placing a
 	// square-off order and skips symbols whose NetQty is already 0. Nil-safe.
 	positionChecker *PositionChecker
+
+	// cancelProtectiveLegs, if set, cancels the broker SL/TP (OCO) and multi-level
+	// exit legs for one (user, symbol) right before its reverse square-off order is
+	// placed — so a resting stop can't fire into a now-flat book and open a fresh
+	// position. Nil-safe. Wired in main.go to OCO + ML CancelGroupsBySymbol.
+	cancelProtectiveLegs func(ctx context.Context, userID, symbol string)
 }
 
 // NewAutoSquareOffScheduler creates a new auto square-off scheduler.
@@ -93,6 +99,14 @@ func (s *AutoSquareOffScheduler) SetPaperForceExitUser(fn func(ctx context.Conte
 // square-off proceeds based on local DB state alone (legacy behaviour).
 func (s *AutoSquareOffScheduler) SetPositionChecker(pc *PositionChecker) {
 	s.positionChecker = pc
+}
+
+// SetProtectiveLegCanceller wires the OCO/ML SL-TP canceller invoked for each
+// symbol immediately before its reverse square-off order is placed, so protective
+// legs are removed from the exchange before the position goes flat. Nil-safe;
+// call before Start().
+func (s *AutoSquareOffScheduler) SetProtectiveLegCanceller(fn func(ctx context.Context, userID, symbol string)) {
+	s.cancelProtectiveLegs = fn
 }
 
 // Start begins the auto square-off check loop (every 1 minute).
@@ -332,6 +346,14 @@ func (s *AutoSquareOffScheduler) parseTime(timeStr string) (hour int, minute int
 func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) error {
 	log.Println("[auto-square-off] Fetching today's open INTRADAY algo positions...")
 
+	// Position-book driven path: uses broker position book as source of truth.
+	// Bypasses the NOT EXISTS DB bug and handles partial/manual positions safely.
+	// squareQty = min(brokerNetQty, ourFilledQty) so we never unwind the user's manual qty.
+	if s.positionChecker != nil {
+		return s.squareOffViaPositionBook(ctx)
+	}
+
+	// FALLBACK: DB-only path (legacy — GetOpenOrders has a NOT EXISTS bug with cancelled bracket legs).
 	// GetOpenOrders returns FILLED/PARTIALLY_FILLED INTRADAY live orders
 	// placed today through strategies (is_square_off_order=false, is_paper_trade=false,
 	// strategy_id != '', created_at >= today).
@@ -350,25 +372,9 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 	now := time.Now().In(timezone.IST)
 	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
 
-	// One position-book fetch per user — used to skip orders whose underlying
-	// position is already flat (NetQty == 0) at the broker. Fail-open: if the
-	// fetch errors we leave the user's snapshot nil and the check is bypassed.
+	// positionChecker is nil here (we returned early above if it was set),
+	// so openByUser stays empty and IsExited will always return false (fail-open).
 	openByUser := make(map[string]*OpenPositions)
-	if s.positionChecker != nil {
-		seen := make(map[string]struct{})
-		for _, o := range openOrders {
-			if _, ok := seen[o.UserID]; ok {
-				continue
-			}
-			seen[o.UserID] = struct{}{}
-			snapshot, fetchErr := s.positionChecker.FetchOpenPositions(ctx, o.UserID)
-			if fetchErr != nil {
-				log.Printf("[auto-square-off] Position-book check unavailable for user=%s; proceeding without skip: %v", o.UserID, fetchErr)
-				continue
-			}
-			openByUser[o.UserID] = snapshot
-		}
-	}
 
 	successCount := 0
 	failCount := 0
@@ -503,6 +509,102 @@ func (s *AutoSquareOffScheduler) squareOffUserPositions(ctx context.Context, use
 	return nil
 }
 
+// squareOffViaPositionBook is the position-book-driven replacement for the DB-only
+// squareOffAllPositions loop. It fetches the broker position book per user (in parallel)
+// and uses GetExitableLiveOrdersByUser (no NOT EXISTS bug) to determine what to close.
+//
+// squareQty = min(brokerNetQty, ourFilledQty) — ensures we only unwind algo-placed
+// quantity even when the user holds additional manual positions in the same symbol.
+func (s *AutoSquareOffScheduler) squareOffViaPositionBook(ctx context.Context) error {
+	users, err := s.orderRepo.GetDistinctActiveUsersToday(ctx)
+	if err != nil {
+		return fmt.Errorf("position-book sq-off: failed to get active users: %w", err)
+	}
+	if len(users) == 0 {
+		log.Println("[auto-square-off] Position-book sq-off: no active users today")
+		return nil
+	}
+
+	log.Printf("[auto-square-off] Position-book sq-off: %d active user(s)", len(users))
+
+	now := time.Now().In(timezone.IST)
+	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
+
+	var wg sync.WaitGroup
+	for _, userID := range users {
+		wg.Add(1)
+		go func(uid string) {
+			defer wg.Done()
+			s.squareOffUserViaPositionBook(ctx, uid, currentTime)
+		}(userID)
+	}
+	wg.Wait()
+	return nil
+}
+
+// squareOffUserViaPositionBook fetches the broker position book for userID and
+// closes each open algo entry order using squareQty = min(brokerNetQty, filledQty).
+// On any position-book failure it falls back to squareOffUserPositions (DB-only).
+func (s *AutoSquareOffScheduler) squareOffUserViaPositionBook(ctx context.Context, userID string, currentTime string) {
+	snapshot, err := s.positionChecker.FetchOpenPositions(ctx, userID)
+	if err != nil {
+		log.Printf("[auto-square-off] Position book unavailable for user=%s, falling back to DB sq-off: %v", userID, err)
+		if sqErr := s.squareOffUserPositions(ctx, userID); sqErr != nil {
+			log.Printf("[auto-square-off] Fallback DB sq-off also failed for user=%s: %v", userID, sqErr)
+		}
+		return
+	}
+
+	orders, err := s.orderRepo.GetExitableLiveOrdersByUser(ctx, userID)
+	if err != nil {
+		log.Printf("[auto-square-off] Failed to get exitable orders for user=%s: %v", userID, err)
+		return
+	}
+	if len(orders) == 0 {
+		return
+	}
+
+	log.Printf("[auto-square-off] Position-book sq-off: user=%s has %d exitable order(s)", userID, len(orders))
+
+	for _, order := range orders {
+		if order.FilledQuantity <= 0 {
+			continue
+		}
+		// Skip orders whose user-level custom sq-off time is later than now.
+		if order.AutoSquareOffTime != nil && *order.AutoSquareOffTime > currentTime {
+			log.Printf("[auto-square-off] Skipping order=%s user=%s sym=%s: custom sq-off at %s (now %s)",
+				order.OrderID, userID, order.Symbol, *order.AutoSquareOffTime, currentTime)
+			continue
+		}
+
+		brokerQty := snapshot.GetNetQty(order)
+		if brokerQty == 0 {
+			log.Printf("[auto-square-off] Skipping order=%s user=%s sym=%s: broker NetQty=0 (already flat)",
+				order.OrderID, userID, order.Symbol)
+			continue
+		}
+
+		// brokerQty is signed (negative for a short / SELL-entry position). Use its
+		// magnitude so the square-off quantity is positive — a negative qty would be
+		// rejected by the broker, leaving shorts un-squared-off. The reverse side is
+		// derived from the entry's OrderSide inside createAndExecuteSquareOffOrder.
+		if brokerQty < 0 {
+			brokerQty = -brokerQty
+		}
+
+		squareQty := min(brokerQty, int(order.FilledQuantity))
+		orderCopy := *order
+		orderCopy.FilledQuantity = int32(squareQty)
+
+		log.Printf("[auto-square-off] Position-book sq-off: user=%s sym=%s brokerQty=%d ourQty=%d squareQty=%d",
+			userID, order.Symbol, brokerQty, order.FilledQuantity, squareQty)
+
+		if err := s.createAndExecuteSquareOffOrder(ctx, &orderCopy); err != nil {
+			log.Printf("[auto-square-off] FAILED user=%s sym=%s: %v", userID, order.Symbol, err)
+		}
+	}
+}
+
 // createAndExecuteSquareOffOrder creates a reverse order to close a position
 // and executes it via the broker.
 func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Context, originalOrder *models.Order) error {
@@ -511,6 +613,16 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 	now := time.Now().In(timezone.IST)
 	if now.Hour()*60+now.Minute() >= marketCloseMinutes {
 		return fmt.Errorf("market closed (%02d:%02d IST ≥ 15:30) — refusing to place order to avoid AMO", now.Hour(), now.Minute())
+	}
+
+	// Cancel this symbol's resting SL/TP (OCO) and multi-level exit legs BEFORE
+	// placing the reverse order. Otherwise a stop could trigger in the window
+	// between our reverse fill and the broker's own EOD cancellation, executing
+	// into a now-flat book and opening a fresh (short) position. Per-symbol, so a
+	// position whose custom square-off time hasn't arrived keeps its protection.
+	// Nil-safe: when unwired, behaviour is unchanged (reverse order only).
+	if s.cancelProtectiveLegs != nil {
+		s.cancelProtectiveLegs(ctx, originalOrder.UserID, originalOrder.Symbol)
 	}
 
 	// Determine reverse side
@@ -540,12 +652,15 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 		// Link back to the entry order so statusservice can record the exact
 		// exit price / P&L on the parent when this reverse order fills.
 		ParentOrderID: &originalOrder.OrderID,
-		RiskApproved:     true, // auto square-off bypasses risk checks
-		BearerToken:      originalOrder.BearerToken,
-		AppId:            originalOrder.AppId,
-		Source:           originalOrder.Source,
-		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
+		RiskApproved: true, // auto square-off bypasses risk checks
+		// BearerToken / AppId / Source intentionally omitted (left nil).
+		// The token stored on the original order was captured at entry time and is
+		// likely expired by square-off time. Leaving them nil forces executor.go to
+		// fetch fresh credentials from the DB via CredentialsCache (credSource="cache"),
+		// so the most recently stored token is used and the 401-retry path can
+		// pick up any token refresh that happened since the original order was placed.
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 	}
 
 	// Persist to DB first
