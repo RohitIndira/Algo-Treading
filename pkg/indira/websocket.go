@@ -266,6 +266,16 @@ func (w *WSClient) readPump(conn *websocket.Conn) {
 		}
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 
+		// TEMP DIAGNOSTIC (remove after broker ticket is resolved): log the literal
+		// bytes of trade/fill messages before unmarshaling. The broker's TRD_MSG /
+		// EXECUTED push omits TradedQTY and all timestamps in the fields we model;
+		// this captures the exact payload Indira sends so we can prove whether the
+		// data is missing entirely or arrives under keys our struct doesn't parse.
+		if msgStr := string(message); strings.Contains(msgStr, "TRD_MSG") ||
+			strings.Contains(msgStr, "EXECUTED") || strings.Contains(msgStr, "TRADED") {
+			log.Printf("[ws-raw] user %s fill payload: %s", w.auth.UserId, msgStr)
+		}
+
 		var orderStatus WSOrderStatus
 		// Ignore unmarshal errors from type mismatches — the broker sends
 		// some fields as int in one message and string in another (e.g.

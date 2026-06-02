@@ -662,7 +662,16 @@ func main() {
 	autoSquareOff.SetPaperForceExitUser(paperMonitor.ForceExitAll)
 	// Wire broker position-book check so flat positions (NetQty == 0) aren't squared off again.
 	autoSquareOff.SetPositionChecker(positionChecker)
-	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-user: enabled, broker netQty check: enabled)", cfg.AutoSquareOffTime)
+	// Wire SL/TP teardown so each position's resting OCO and multi-level exit legs are
+	// cancelled at the broker BEFORE its reverse square-off order is placed — preventing a
+	// stop from firing into a now-flat book and opening a fresh position. Per-symbol so
+	// positions with a later custom square-off time keep their protection. Mirrors the
+	// teardown the manual force-exit and external-exit paths already perform.
+	autoSquareOff.SetProtectiveLegCanceller(func(ctx context.Context, userID, symbol string) {
+		ocoManager.CancelGroupsBySymbol(ctx, userID, symbol)
+		mlManager.CancelGroupsBySymbol(ctx, userID, symbol)
+	})
+	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-user: enabled, broker netQty check: enabled, SL/TP teardown: enabled)", cfg.AutoSquareOffTime)
 
 	// Backfill user_square_off_config from today's orders on every startup.
 	// Covers orders placed before the per-user custom square-off fix was deployed,

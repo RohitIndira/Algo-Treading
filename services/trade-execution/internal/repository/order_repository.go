@@ -965,6 +965,19 @@ func (r *orderRepository) CancelAllOrdersByStrategy(ctx context.Context, strateg
 			AND filled_quantity > 0
 			AND live_exit_price IS NULL
 		)
+		-- Never cancel a live square-off order: closeStrategyPositions places these
+		-- in step 1.5 and then calls this bulk-cancel in step 3. The reverse order
+		-- is SUBMITTED at the broker but its fill arrives asynchronously over the
+		-- broker WS, so at this point it is still non-terminal in our DB. Cancelling
+		-- it here would flip it to CANCELLED before its fill is recorded — the broker
+		-- still executes the IOC, but recordSquareOffExit never stamps live_exit_price/
+		-- live_exit_time/live_pnl on the entry, so the closed-positions view shows a
+		-- blank exit time and the still-attributed entry can leak into "USER Direct".
+		-- Square-off orders manage their own terminal state via the broker WS.
+		AND NOT (
+			is_paper_trade = false
+			AND is_square_off_order = true
+		)
 	`
 	if _, err := r.db.ExecContext(ctx, ordersQuery, now, strategyID, userID); err != nil {
 		return fmt.Errorf("failed to cancel orders for strategy %s user %s: %w", strategyID, userID, err)

@@ -51,6 +51,12 @@ type AutoSquareOffScheduler struct {
 	// positionChecker, if set, queries the broker position book before placing a
 	// square-off order and skips symbols whose NetQty is already 0. Nil-safe.
 	positionChecker *PositionChecker
+
+	// cancelProtectiveLegs, if set, cancels the broker SL/TP (OCO) and multi-level
+	// exit legs for one (user, symbol) right before its reverse square-off order is
+	// placed — so a resting stop can't fire into a now-flat book and open a fresh
+	// position. Nil-safe. Wired in main.go to OCO + ML CancelGroupsBySymbol.
+	cancelProtectiveLegs func(ctx context.Context, userID, symbol string)
 }
 
 // NewAutoSquareOffScheduler creates a new auto square-off scheduler.
@@ -93,6 +99,14 @@ func (s *AutoSquareOffScheduler) SetPaperForceExitUser(fn func(ctx context.Conte
 // square-off proceeds based on local DB state alone (legacy behaviour).
 func (s *AutoSquareOffScheduler) SetPositionChecker(pc *PositionChecker) {
 	s.positionChecker = pc
+}
+
+// SetProtectiveLegCanceller wires the OCO/ML SL-TP canceller invoked for each
+// symbol immediately before its reverse square-off order is placed, so protective
+// legs are removed from the exchange before the position goes flat. Nil-safe;
+// call before Start().
+func (s *AutoSquareOffScheduler) SetProtectiveLegCanceller(fn func(ctx context.Context, userID, symbol string)) {
+	s.cancelProtectiveLegs = fn
 }
 
 // Start begins the auto square-off check loop (every 1 minute).
@@ -570,6 +584,14 @@ func (s *AutoSquareOffScheduler) squareOffUserViaPositionBook(ctx context.Contex
 			continue
 		}
 
+		// brokerQty is signed (negative for a short / SELL-entry position). Use its
+		// magnitude so the square-off quantity is positive — a negative qty would be
+		// rejected by the broker, leaving shorts un-squared-off. The reverse side is
+		// derived from the entry's OrderSide inside createAndExecuteSquareOffOrder.
+		if brokerQty < 0 {
+			brokerQty = -brokerQty
+		}
+
 		squareQty := min(brokerQty, int(order.FilledQuantity))
 		orderCopy := *order
 		orderCopy.FilledQuantity = int32(squareQty)
@@ -591,6 +613,16 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 	now := time.Now().In(timezone.IST)
 	if now.Hour()*60+now.Minute() >= marketCloseMinutes {
 		return fmt.Errorf("market closed (%02d:%02d IST ≥ 15:30) — refusing to place order to avoid AMO", now.Hour(), now.Minute())
+	}
+
+	// Cancel this symbol's resting SL/TP (OCO) and multi-level exit legs BEFORE
+	// placing the reverse order. Otherwise a stop could trigger in the window
+	// between our reverse fill and the broker's own EOD cancellation, executing
+	// into a now-flat book and opening a fresh (short) position. Per-symbol, so a
+	// position whose custom square-off time hasn't arrived keeps its protection.
+	// Nil-safe: when unwired, behaviour is unchanged (reverse order only).
+	if s.cancelProtectiveLegs != nil {
+		s.cancelProtectiveLegs(ctx, originalOrder.UserID, originalOrder.Symbol)
 	}
 
 	// Determine reverse side
