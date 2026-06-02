@@ -349,38 +349,35 @@ func parseIndicesGrade(rows [][]string) ([]*IndicesGradeRow, error) {
 	return out, nil
 }
 
-// parseIndustry parses the Industry tab (live sheet only — not in xlsx export).
-// Header: Name, BSE Code, NSE Code, ISIN, Industry, Current Price, Market Cap,
-// PE, ROCE, ROE, FII, DII, EVEBITDA, PAT, OPM q-1, OPM latest, Down ATH, Down 52W, Sales
+// parseIndustry parses the Industry tab from the live Google Sheet.
+//
+// Schema in production today (3 columns):
+//
+//	col 0: NSE Code
+//	col 1: ISIN Code
+//	col 2: Industry
+//
+// Earlier versions of this sheet had 19 columns including BSE Code, market cap,
+// PE/ROCE/ROE, FII/DII, EVEBITDA, PAT, OPM, drawdowns, sales — but the live
+// pipeline only consumes (NSECode, ISIN, Industry) from this tab (see
+// pipeline.go:industryBySym / industryByISIN lookup). The extra fields were
+// effectively dead weight, so this parser now matches the trimmed schema and
+// leaves the rest of IndustryRow at zero values. The struct itself stays
+// intact so any downstream consumer that references the other fields still
+// compiles — they just won't be populated from this source.
 func parseIndustry(rows [][]string) ([]*IndustryRow, error) {
 	if len(rows) < 2 {
 		return nil, nil
 	}
 	out := make([]*IndustryRow, 0, len(rows)-1)
 	for _, row := range rows[1:] {
-		if len(row) < 5 {
+		if len(row) < 3 {
 			continue
 		}
 		rec := &IndustryRow{
-			Name:            strings.TrimSpace(col(row, 0)),
-			BSECode:         strings.TrimSpace(col(row, 1)),
-			NSECode:         strings.TrimSpace(col(row, 2)),
-			ISIN:            strings.TrimSpace(col(row, 3)),
-			Industry:        strings.TrimSpace(col(row, 4)),
-			CurrentPrice:    parseFloat(col(row, 5)),
-			MarketCap:       parseFloat(col(row, 6)),
-			PE:              parseFloat(col(row, 7)),
-			ROCE:            parseFloat(col(row, 8)),
-			ROE:             parseFloat(col(row, 9)),
-			FIIHolding:      parseFloat(col(row, 10)),
-			DIIHolding:      parseFloat(col(row, 11)),
-			EVEBITDA:        parseFloat(col(row, 12)),
-			PAT:             parseFloat(col(row, 13)),
-			OPMPrecedingQtr: parseFloat(col(row, 14)),
-			OPMLatestQtr:    parseFloat(col(row, 15)),
-			DownFromATH:     parseFloat(col(row, 16)),
-			DownFrom52WHigh: parseFloat(col(row, 17)),
-			Sales:           parseFloat(col(row, 18)),
+			NSECode:  strings.TrimSpace(col(row, 0)),
+			ISIN:     strings.TrimSpace(col(row, 1)),
+			Industry: strings.TrimSpace(col(row, 2)),
 		}
 		if rec.NSECode == "" && rec.ISIN == "" {
 			continue
@@ -548,7 +545,7 @@ func parseDate(s string) time.Time {
 	formats := []string{
 		"2006-01-02 15:04:05",
 		"2006-01-02",
-		"02/01/2006",       // DD/MM/YYYY
+		"02/01/2006", // DD/MM/YYYY
 		"2-Jan-2006",
 		"02-Jan-2006",
 		time.RFC3339,
