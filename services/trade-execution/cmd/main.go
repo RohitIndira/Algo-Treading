@@ -536,6 +536,12 @@ func main() {
 				JWTExpiryNotifier: manthanModule.JWTNotifier,
 				worker:            manthanModule.InboxWorker,
 			})
+			// Layer 4: wake the EOD-arm retry worker on JWT refresh so any
+			// PENDING rows for this user drain in ~1 second instead of
+			// waiting up to 5 minutes for the worker's poll tick.
+			if manthanModule.ArmRetryWorker != nil {
+				strategyEventsConsumer.SetCredentialsObserver(manthanModule.ArmRetryWorker)
+			}
 		}
 		manthanModule.Start(ctx)
 		log.Println("✓ Manthan order execution module started")
@@ -574,6 +580,41 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+
+	// Layer 5 — manual protective-replay trigger for a single user.
+	//
+	// POST /manthan/replay/runOnceForUser?user_id=ND03920
+	//
+	// Used by the operator when the 09:14 cron skipped a user (JWT was
+	// expired then but is fresh now), or to manually nudge an SL after a
+	// trail update. Runs the same buildPlans → fireAll → reconcile flow
+	// as the morning cron, filtered to one user. Returns 200 OK if at
+	// least one position was processed (placed OR skipped with a known
+	// reason); 4xx only on bad input; 5xx only on infra failure.
+	if manthanModule != nil && manthanModule.ProtectiveReplay != nil {
+		pr := manthanModule.ProtectiveReplay
+		metricsMux.HandleFunc("/manthan/replay/runOnceForUser", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST required", http.StatusMethodNotAllowed)
+				return
+			}
+			userID := r.URL.Query().Get("user_id")
+			if userID == "" {
+				http.Error(w, "user_id query parameter required", http.StatusBadRequest)
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+			defer cancel()
+			if err := pr.RunOnceForUser(ctx, userID); err != nil {
+				log.Printf("[manthan-replay] RunOnceForUser(%q) failed: %v", userID, err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"ok":true,"user_id":%q}`, userID)
+		})
+	}
 	metricsServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
 		Handler: metricsMux,

@@ -472,6 +472,7 @@ type PositionNeedingProtection struct {
 	NetQty          int     // sum(filled BUY) − sum(filled SELL); always > 0 here
 	LatestTrigger   float64 // most recent trail trigger from any prior SL row (0 if no prior SL)
 	LatestLimit     float64
+	EntryFillPrice  float64 // avg_fill_price of the entry BUY order — used as SL fallback when LatestTrigger==0 (e.g. EOD Phase A on entry-same-day positions with no tick-handler trail yet)
 }
 
 // ListPositionsNeedingProtection enumerates every position that has a filled
@@ -484,7 +485,8 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		WITH live_buys AS (
 		    SELECT DISTINCT ON (e.strategy_id, e.symbol)
 		           e.id AS entry_order_id, e.signal_id, e.strategy_id, e.user_id,
-		           e.symbol, e.isin, e.indira_symbol, e.exchange_token, e.exchange
+		           e.symbol, e.isin, e.indira_symbol, e.exchange_token, e.exchange,
+		           COALESCE(e.avg_fill_price, 0) AS entry_fill_price
 		    FROM manthan_orders e
 		    WHERE e.order_side = 'BUY'
 		      AND e.status = 'FILLED'
@@ -520,7 +522,8 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		       b.symbol, COALESCE(b.isin,''), COALESCE(b.indira_symbol,''),
 		       COALESCE(b.exchange_token,''), COALESCE(b.exchange,'NSE'),
 		       n.net,
-		       COALESCE(l.trigger_price, 0), COALESCE(l.limit_price, 0)
+		       COALESCE(l.trigger_price, 0), COALESCE(l.limit_price, 0),
+		       b.entry_fill_price
 		FROM   live_buys b
 		JOIN   net_qty   n ON n.strategy_id = b.strategy_id AND n.symbol = b.symbol
 		LEFT JOIN latest_sl l ON l.parent_order_id = b.entry_order_id
@@ -535,12 +538,139 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		var p PositionNeedingProtection
 		if err := rows.Scan(&p.EntryOrderID, &p.EntrySignalID, &p.StrategyID, &p.UserID,
 			&p.Symbol, &p.ISIN, &p.IndiraSymbol, &p.ExchangeToken, &p.Exchange,
-			&p.NetQty, &p.LatestTrigger, &p.LatestLimit); err != nil {
+			&p.NetQty, &p.LatestTrigger, &p.LatestLimit, &p.EntryFillPrice); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// ArmRetryRow is one entry in the manthan_arm_retries queue (Layer 4).
+type ArmRetryRow struct {
+	ID           int64
+	UserID       string
+	EntryOrderID int64
+	TradeDate    time.Time
+	Reason       string
+	Attempts     int
+	LastError    string
+}
+
+// EnqueueArmRetry inserts a PENDING retry row, or no-ops if a PENDING row
+// already exists for the same (entry_order_id, trade_date). Idempotent under
+// the partial unique index from migration 013.
+//
+// Called by EOD Phase A's skip-block whenever a position can't be armed for
+// a recoverable reason (no broker auth, JWT expired during PlaceAMOSLSell).
+func (r *Repository) EnqueueArmRetry(
+	ctx context.Context,
+	userID string,
+	entryOrderID int64,
+	tradeDate time.Time,
+	reason string,
+) error {
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO manthan_arm_retries
+		    (user_id, entry_order_id, trade_date, reason)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT DO NOTHING`,
+		userID, entryOrderID, tradeDate, reason)
+	return err
+}
+
+// ListPendingArmRetries returns every PENDING retry row. When userID is
+// non-empty, filter to that user (the on-login wake path); otherwise scan
+// the full queue (the 5-minute ticker path).
+func (r *Repository) ListPendingArmRetries(ctx context.Context, userID string) ([]ArmRetryRow, error) {
+	q := `
+		SELECT id, user_id, entry_order_id, trade_date, reason, attempts, COALESCE(last_error, '')
+		FROM   manthan_arm_retries
+		WHERE  status = 'PENDING'`
+	args := []any{}
+	if userID != "" {
+		q += " AND user_id = $1"
+		args = append(args, userID)
+	}
+	q += " ORDER BY created_at ASC LIMIT 500"
+
+	rows, err := r.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ArmRetryRow
+	for rows.Next() {
+		var rec ArmRetryRow
+		if err := rows.Scan(&rec.ID, &rec.UserID, &rec.EntryOrderID, &rec.TradeDate, &rec.Reason, &rec.Attempts, &rec.LastError); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// MarkArmRetryAttempted bumps attempts + records the last error from a failed
+// re-attempt. Row stays PENDING for the next tick.
+func (r *Repository) MarkArmRetryAttempted(ctx context.Context, id int64, errMsg string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_arm_retries
+		SET    attempts = attempts + 1,
+		       last_attempt_at = NOW(),
+		       last_error = $2,
+		       updated_at = NOW()
+		WHERE  id = $1 AND status = 'PENDING'`,
+		id, errMsg)
+	return err
+}
+
+// MarkArmRetryDone marks the retry row terminal-success: the position was
+// armed by the latest re-attempt. Verified separately via
+// HasActiveProtectionForToday before this is called.
+func (r *Repository) MarkArmRetryDone(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_arm_retries
+		SET    status = 'DONE', updated_at = NOW()
+		WHERE  id = $1 AND status = 'PENDING'`,
+		id)
+	return err
+}
+
+// MarkArmRetriesGivenUpBefore marks every PENDING row whose trade_date is
+// strictly before cutoff as GIVEN_UP. Called by the worker's tick to bound
+// the queue: once a row's intended trading day has opened (09:30+ IST), the
+// AMO ship has sailed and the morning hot-SL cron is the only remaining path.
+func (r *Repository) MarkArmRetriesGivenUpBefore(ctx context.Context, cutoffTradeDate time.Time) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_arm_retries
+		SET    status = 'GIVEN_UP', updated_at = NOW()
+		WHERE  status = 'PENDING' AND trade_date < $1`,
+		cutoffTradeDate)
+	return err
+}
+
+// HasActiveProtectionForToday returns true if the given entry order already
+// has an SL row (either a live SL_SELL or an AMO_PENDING SL_SELL_AMO) that
+// covers today's session. Used by the 09:14 morning cron to skip positions
+// already protected by the prior EOD Phase A submission — avoids placing
+// a duplicate SL on top of an AMO that converted at 09:00.
+//
+// "Active" here means: not cancelled, not rejected, not expired, not filled
+// (a filled SL means the position is already exited; nothing to re-arm).
+// Trade_date must match today's IST date so an AMO row stamped for an
+// earlier session doesn't cause a false positive.
+func (r *Repository) HasActiveProtectionForToday(ctx context.Context, entryOrderID int64, tradeDate time.Time) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+		    SELECT 1 FROM manthan_orders
+		    WHERE  parent_order_id = $1
+		      AND  trade_date = $2
+		      AND  order_type IN ('SL_SELL','SL_SELL_AMO')
+		      AND  status NOT IN ('CANCELLED','REJECTED','EXPIRED','FILLED','SL_FILLED','SL_SELL_AMO_REJECTED','AMO_REJECTED')
+		)`, entryOrderID, tradeDate,
+	).Scan(&exists)
+	return exists, err
 }
 
 // InsertAMOOrder writes a new SL_SELL_AMO row for the given position+trade_date

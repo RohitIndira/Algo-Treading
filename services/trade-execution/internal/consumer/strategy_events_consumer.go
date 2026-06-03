@@ -46,6 +46,15 @@ type AuthGateClearer interface {
 	ClearSessionExpired(userID string)
 }
 
+// CredentialsObserver lets the consumer fan out USER_CREDENTIALS_UPDATED events
+// to interested components. Implemented by *manthan.ArmRetryWorker so the Layer 4
+// EOD-arm retry queue drains the moment a user re-logs in — without this hook the
+// queue would wait up to 5 minutes for the next ticker even though fresh creds
+// are now in memory.
+type CredentialsObserver interface {
+	OnCredentialsUpdated(userID string)
+}
+
 // OrderUnwatcher removes orders from the price monitor watch list.
 // Implemented by *scheduler.PriceMonitor.
 type OrderUnwatcher interface {
@@ -59,14 +68,23 @@ type StrategyEventsConsumer struct {
 	orderRepo    repository.OrderRepository
 	executor     *executor.OrderExecutor
 	priceMonitor OrderUnwatcher // nil-safe: may be unset if PriceMonitor is disabled
-	credsCache   CredentialsCacheInvalidator // nil-safe: invalidates JWT cache on USER_CREDENTIALS_UPDATED
-	authGate     AuthGateClearer             // nil-safe: clears manthan session-expired gate on USER_CREDENTIALS_UPDATED
-	logger       *zap.Logger
+	credsCache    CredentialsCacheInvalidator // nil-safe: invalidates JWT cache on USER_CREDENTIALS_UPDATED
+	authGate      AuthGateClearer             // nil-safe: clears manthan session-expired gate on USER_CREDENTIALS_UPDATED
+	credsObserver CredentialsObserver         // nil-safe: wakes Layer-4 retry queue on USER_CREDENTIALS_UPDATED
+	logger        *zap.Logger
 }
 
 // SetAuthGate wires the manthan SESSION_EXPIRED gate so it clears on JWT refresh.
 func (c *StrategyEventsConsumer) SetAuthGate(g AuthGateClearer) {
 	c.authGate = g
+}
+
+// SetCredentialsObserver wires a side-effect observer that fires on every
+// USER_CREDENTIALS_UPDATED event after the cache/gate are reset. Used by the
+// Layer-4 ArmRetryWorker to wake immediately on user re-login instead of
+// waiting for its 5-minute poll.
+func (c *StrategyEventsConsumer) SetCredentialsObserver(o CredentialsObserver) {
+	c.credsObserver = o
 }
 
 // NewStrategyEventsConsumer creates a consumer for the user-config-events topic.
@@ -175,6 +193,13 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 		// to 5 min for the dedup window to expire.
 		if c.authGate != nil {
 			c.authGate.ClearSessionExpired(ev.UserID)
+		}
+		// Layer 4: wake the EOD-arm retry queue. If the user logged in
+		// because they got the 14:30 IST pre-flight alert (Layer 3) or the
+		// 15:35 IST EOD-skip notification, this drains their PENDING rows
+		// in seconds rather than waiting for the 5-min ticker.
+		if c.credsObserver != nil {
+			c.credsObserver.OnCredentialsUpdated(ev.UserID)
 		}
 		return nil
 	case configPaused, configDeleted:

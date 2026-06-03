@@ -30,6 +30,7 @@ type ManthanModule struct {
 	ProtectiveReplay  *manthan.ProtectiveReplay         // custom-GTC AMO replayer
 	JWTNotifier       *manthan.JWTExpiryNotifier        // pre-open JWT-expiry alerts
 	InboxWorker       *manthan.InboxWorker              // drains signal_inbox (transactional inbox)
+	ArmRetryWorker    *manthan.ArmRetryWorker           // Layer 4: drains manthan_arm_retries on re-login
 }
 
 // InitManthan initializes all Manthan order execution components.
@@ -278,6 +279,16 @@ func InitManthan(
 		}
 	}
 
+	// Layer 4 retry worker — drains manthan_arm_retries on USER_CREDENTIALS_UPDATED
+	// + every 5 minutes. Only meaningful when ProtectiveReplay is enabled (it owns
+	// the EOD Phase A logic the worker re-invokes). The actual Kafka-side wake hook
+	// is wired in main.go via strategyEventsConsumer.SetCredentialsObserver.
+	var armRetryWorker *manthan.ArmRetryWorker
+	if protectiveReplay != nil {
+		armRetryWorker = manthan.NewArmRetryWorker(protectiveReplay, repo, logger)
+		log.Println("[manthan] ArmRetryWorker ENABLED (Layer 4: 5-min poll + on-login wake on manthan_arm_retries)")
+	}
+
 	log.Println("[manthan] ✓ All components initialized")
 
 	return &ManthanModule{
@@ -293,6 +304,7 @@ func InitManthan(
 		ProtectiveReplay: protectiveReplay,
 		InboxWorker:      inboxWorker,
 		JWTNotifier:      jwtNotifier,
+		ArmRetryWorker:   armRetryWorker,
 	}
 }
 
@@ -352,6 +364,13 @@ func (m *ManthanModule) Start(ctx context.Context) {
 			log.Println("[manthan] Starting protective replayer (Phase A/B/C cron)...")
 			m.ProtectiveReplay.Start(ctx)
 		}()
+	}
+
+	// Start Layer-4 arm-retry worker. Constructor-gated on ProtectiveReplay
+	// presence so this is a no-op when the replayer is disabled.
+	if m.ArmRetryWorker != nil {
+		log.Println("[manthan] Starting arm-retry worker (Layer 4: drains manthan_arm_retries)...")
+		m.ArmRetryWorker.Start(ctx)
 	}
 
 	// Start JWT expiry POLL loop only when explicitly enabled. The reactive

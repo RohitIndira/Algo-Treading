@@ -129,14 +129,24 @@ func (p *ProtectiveReplay) SetEventPublisher(ep *ManthanEventPublisher) {
 	p.eventPub = ep
 }
 
-// Start runs the daily 09:14 IST cron until ctx is cancelled. If the service
-// boots between 09:14 and 10:00 IST on a trading day, runs the cycle
-// immediately once (catch-up for crashes / deploys mid-window).
+// Start runs the daily protective-replay scheduling. Two crons fire:
+//
+//   1. 15:35 IST — EOD Phase A (this file: eod_phase_a.go). For every open
+//      position, place an AMO+SL on Indira's overnight queue so the
+//      position is protected the moment the market reopens.
+//
+//   2. 09:14 IST — Hot SL placement (this method's runOnce). Builds plans
+//      for any positions still unprotected (EOD failed, AMO didn't
+//      convert, etc.) and places live SL orders before the 09:15 open.
+//
+// Both honor IsTradingDay so we never wake up on holidays/weekends to
+// place orders the broker would reject. Each cron has an independent
+// startup-catch-up window so a deploy mid-window doesn't skip a day.
 func (p *ProtectiveReplay) Start(ctx context.Context) {
 	p.logger.Info("Protective replayer started (server-side trigger engine)",
-		zap.String("schedule", "09:14 IST · pre-open plan + 09:15:00.1 fire + 09:15:30 reconcile"))
+		zap.String("schedule", "14:30 IST · JWT pre-flight  +  15:35 IST · EOD AMO pre-stage  +  09:14 IST · morning hot-SL fallback"))
 
-	// Startup catch-up — only on actual trading days.
+	// 09:14 morning hot-SL fallback.
 	now := p.now()
 	if indiraClient.IsTradingDay(now) {
 		minute := now.Hour()*60 + now.Minute()
@@ -145,8 +155,13 @@ func (p *ProtectiveReplay) Start(ctx context.Context) {
 			go p.runOnce(ctx)
 		}
 	}
-
 	go p.scheduleDaily(ctx, 9, 14, p.runOnce)
+
+	// 14:30 EOD pre-flight — Layer 3 (defined in eod_phase_pre.go).
+	p.StartEODPreFlight(ctx)
+
+	// 15:35 EOD Phase A — Layer 1/2 (defined in eod_phase_a.go).
+	p.StartEODPhaseA(ctx)
 }
 
 // scheduleDaily blocks until next IST occurrence of (hour, minute) on a
@@ -270,8 +285,32 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 	}
 	cache := map[string]*userCache{}
 
+	// Today's IST date — used for the AMO already-armed skip check. Snapped
+	// to midnight so the SQL date-equality comparison hits the date-only
+	// trade_date column cleanly.
+	istToday := func() time.Time {
+		n := p.now()
+		return time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, p.ist)
+	}()
+
 	plans := make([]FirePlan, 0, len(positions))
 	for _, pos := range positions {
+		// Skip-if-already-protected. If EOD Phase A pre-staged an AMO last
+		// evening AND it converted to a live SL at 09:00 (or sits in
+		// AMO_PENDING awaiting conversion), we have nothing to do.
+		// Placing a second SL would either double the protection (broker
+		// margin error) or race against the live one.
+		if protected, perr := p.repo.HasActiveProtectionForToday(ctx, pos.EntryOrderID, istToday); perr == nil && protected {
+			p.logger.Info("Pre-open cycle: position already protected by EOD AMO — skipping",
+				zap.String("symbol", pos.Symbol),
+				zap.String("user_id", pos.UserID),
+				zap.Int64("entry_order_id", pos.EntryOrderID))
+			continue
+		} else if perr != nil {
+			p.logger.Warn("Pre-open cycle: protection-check failed, proceeding with placement (safe default)",
+				zap.String("symbol", pos.Symbol), zap.Error(perr))
+		}
+
 		uc := cache[pos.UserID]
 		if uc == nil {
 			uc = &userCache{auth: p.getAuth(pos.UserID)}
