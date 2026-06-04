@@ -153,14 +153,18 @@ func isSessionNotReadyError(err error) bool {
 //
 // Returns the auth to use (never nil — falls back to group.Auth on any error).
 func (m *OCOManager) resolveAuth(ctx context.Context, group *OCOGroup) *indiraClient.AuthContext {
-	if group.Auth == nil || m.credsCache == nil || group.UserID == "" {
+	// NOTE: group.Auth can be nil for a group reconstructed from DB on restart
+	// (the bearer token is never persisted). We must still build a fresh auth from
+	// the credentials cache here — otherwise leg cancellation runs with a nil auth,
+	// which both panics CancelOrder and leaves the SL/TP legs resting at the broker.
+	if m.credsCache == nil || group.UserID == "" {
 		return group.Auth
 	}
 	userId, appId, source, bearerToken, err := m.credsCache.Get(ctx, group.UserID)
 	if err != nil || bearerToken == "" {
 		return group.Auth
 	}
-	if bearerToken == group.Auth.BearerToken {
+	if group.Auth != nil && bearerToken == group.Auth.BearerToken {
 		return group.Auth
 	}
 	fresh := &indiraClient.AuthContext{
@@ -1422,6 +1426,13 @@ func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
 
 // cancelLeg cancels a single leg order at the broker with retry and timeout.
 func (m *OCOManager) cancelLeg(group *OCOGroup, brokerID string, legName string, reason string) {
+	// Always invoked as a goroutine — recover so a panic here (e.g. a nil auth or
+	// broker client) can never crash the whole process and abandon everything else.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[oco] PANIC in cancelLeg (group=%s leg=%s broker=%s): %v", group.GroupID, legName, brokerID, r)
+		}
+	}()
 	if brokerID == "" {
 		return
 	}
@@ -2057,10 +2068,18 @@ func (m *OCOManager) AdoptOrder(
 	if trailingSLPct > 0 {
 		order.TrailingSLPct = &trailingSLPct
 	}
+	// Store SL/TP as PERCENT on the entry order (mirrors PlaceEntryWithOCO). These
+	// are set only AFTER the broker placement, so the entry was never sent with a
+	// triggerPrice, and they let reconstructGroup restore SLPercent/TPPercent after
+	// a service restart. NOTE: these are percentages, not prices.
+	slPct := slPercent
+	tpPct := tpPercent
+	order.StopLoss = &slPct
+	order.TakeProfit = &tpPct
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := m.repo.UpdateOCOTag(ctx, order.OrderID, groupID, role); err != nil {
+		if err := m.repo.UpdateOCOTag(ctx, order.OrderID, groupID, role, slPercent, tpPercent); err != nil {
 			log.Printf("[oco] AdoptOrder: failed to tag order %s with OCO group: %v", order.OrderID, err)
 		}
 	}()

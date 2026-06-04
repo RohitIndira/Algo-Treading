@@ -660,20 +660,33 @@ func (pm *PriceMonitor) triggerOrder(ctx context.Context, entry *watchEntry, ltp
 	roundedLimit := indiraClient.RoundToTickSize(adjustedLimit, tickSize)
 	order.Price = &roundedLimit
 
-	// Recompute SL/TP from the actual fill price (roundedLimit) rather than
-	// targetMonitorPrice. SL/TP were set as targetMonitorPrice*(1±slPct/100),
-	// so the ratio order.StopLoss/targetPrice preserves (1-slPct/100) exactly.
-	targetPrice := entry.targetPrice
-	if targetPrice > 0 {
-		if order.StopLoss != nil && *order.StopLoss > 0 {
-			ratio := *order.StopLoss / targetPrice
-			newSL := indiraClient.RoundToTickSize(roundedLimit*ratio, tickSize)
-			order.StopLoss = &newSL
-		}
-		if order.TakeProfit != nil && *order.TakeProfit > 0 {
-			ratio := *order.TakeProfit / targetPrice
-			newTP := indiraClient.RoundToTickSize(roundedLimit*ratio, tickSize)
-			order.TakeProfit = &newTP
+	if !order.IsPaperTrade && entry.onAfterFill != nil {
+		// LIVE only: an OCO/ML manager will place the SL/TP legs after this entry
+		// fills, from the actual fill price. The entry itself must be a clean
+		// marketable LIMIT — leaving order.StopLoss set would make
+		// convertToIndiraRequest emit triggerPrice = StopLoss and turn the entry
+		// into a broker SL/stop order, which the broker rejects when the SL sits
+		// far from LTP (wide fixed SL%). Paper never reaches the broker, so its
+		// SL/TP are preserved via the recompute below (paper executor reads them).
+		order.StopLoss = nil
+		order.TakeProfit = nil
+	} else {
+		// Paper trades, or a live entry that carries its own broker bracket legs:
+		// recompute SL/TP from the actual fill price (roundedLimit) rather than
+		// targetMonitorPrice. SL/TP were set as targetMonitorPrice*(1±slPct/100),
+		// so the ratio order.StopLoss/targetPrice preserves (1-slPct/100) exactly.
+		targetPrice := entry.targetPrice
+		if targetPrice > 0 {
+			if order.StopLoss != nil && *order.StopLoss > 0 {
+				ratio := *order.StopLoss / targetPrice
+				newSL := indiraClient.RoundToTickSize(roundedLimit*ratio, tickSize)
+				order.StopLoss = &newSL
+			}
+			if order.TakeProfit != nil && *order.TakeProfit > 0 {
+				ratio := *order.TakeProfit / targetPrice
+				newTP := indiraClient.RoundToTickSize(roundedLimit*ratio, tickSize)
+				order.TakeProfit = &newTP
+			}
 		}
 	}
 

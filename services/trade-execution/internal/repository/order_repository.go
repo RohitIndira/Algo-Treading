@@ -176,10 +176,13 @@ type OrderRepository interface {
 	// original_exit_qty is written only on the first rebalance (subsequent calls preserve it).
 	// rebalance_reason example: "SL_L1_TRIGGERED", "TP_L2_TRIGGERED".
 	UpdateMLLevelRebalancedQty(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, originalQty, newQty int32, reason string) error
-	// UpdateOCOTag sets the oco_group_id and oco_role columns on an already-existing order.
-	// Used by AdoptOrder to tag an entry order that was placed before OCO adoption.
-	// The generic Update() method omits these columns, so a targeted query is required.
-	UpdateOCOTag(ctx context.Context, orderID uuid.UUID, groupID uuid.UUID, role string) error
+	// UpdateOCOTag sets the oco_group_id / oco_role columns and the SL/TP percent
+	// (stored in stop_loss / take_profit) on an already-existing order. Used by
+	// AdoptOrder to tag an entry order that was placed before OCO adoption. The
+	// percent values let reconstructGroup restore SLPercent/TPPercent after a
+	// restart. The generic Update() method omits these columns, so a targeted
+	// query is required.
+	UpdateOCOTag(ctx context.Context, orderID uuid.UUID, groupID uuid.UUID, role string, slPercent, tpPercent float64) error
 }
 
 type orderRepository struct {
@@ -334,10 +337,10 @@ func (r *orderRepository) Update(ctx context.Context, order *models.Order) error
 
 // UpdateOCOTag sets oco_group_id and oco_role on an already-existing order.
 // Used by AdoptOrder to tag an entry order placed before OCO adoption.
-func (r *orderRepository) UpdateOCOTag(ctx context.Context, orderID uuid.UUID, groupID uuid.UUID, role string) error {
+func (r *orderRepository) UpdateOCOTag(ctx context.Context, orderID uuid.UUID, groupID uuid.UUID, role string, slPercent, tpPercent float64) error {
 	result, err := r.db.ExecContext(ctx,
-		`UPDATE orders SET oco_group_id = $1, oco_role = $2, updated_at = $3 WHERE order_id = $4`,
-		groupID, role, time.Now(), orderID,
+		`UPDATE orders SET oco_group_id = $1, oco_role = $2, stop_loss = $3, take_profit = $4, updated_at = $5 WHERE order_id = $6`,
+		groupID, role, slPercent, tpPercent, time.Now(), orderID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to tag order with OCO group: %w", err)

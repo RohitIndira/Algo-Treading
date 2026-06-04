@@ -47,8 +47,19 @@ type posKey struct {
 	prodType string
 }
 
+// normalizePrd maps a product type to the broker's canonical position-book form
+// for posKey matching. A filled BRACKET/BO order is held by the broker as a plain
+// INTRADAY (MIS) position — the position book reports prdType "INTRADAY", never
+// "BRACKET_ORDER" — so bracket types MUST collapse to INTRADAY here, otherwise the
+// order key never matches the broker row and the still-open position is wrongly
+// skipped as "already flat" (GetNetQty/IsExited return 0). Used only to build the
+// square-off match key on both sides, so it never affects order placement.
 func normalizePrd(s string) string {
-	return strings.ToUpper(indiraClient.MapProductType(s))
+	p := strings.ToUpper(indiraClient.MapProductType(s))
+	if p == "BRACKET_ORDER" {
+		return "INTRADAY"
+	}
+	return p
 }
 
 func orderKey(o *models.Order) posKey {
