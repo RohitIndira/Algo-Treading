@@ -535,6 +535,13 @@ func (s *AutoSquareOffScheduler) squareOffViaPositionBook(ctx context.Context) e
 		wg.Add(1)
 		go func(uid string) {
 			defer wg.Done()
+			// Recover per user so one user's panic can't crash the whole EOD
+			// square-off (and the process) and abandon every other user.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[auto-square-off] PANIC squaring off user=%s: %v", uid, r)
+				}
+			}()
 			s.squareOffUserViaPositionBook(ctx, uid, currentTime)
 		}(userID)
 	}

@@ -120,14 +120,26 @@ func (c *ExecutionClient) resolveLTP(exchange string, stockCode int64) (float64,
 
 // clampDPR clamps a price to within the Daily Price Range [lower, upper].
 // If lower and upper are both 0 (unavailable), the price is returned unchanged.
-func clampDPR(price, lower, upper float64) float64 {
+//
+// When a price falls outside the band it is placed one tick INSIDE the boundary
+// (lower+tick / upper-tick) rather than exactly on it: brokers commonly reject an
+// order sitting on the DPR edge, so a leg whose SL/TP would land beyond the band
+// (e.g. a wide fixed SL/TP%) is placed just inside instead of being rejected. A
+// non-positive tick falls back to clamping exactly to the boundary.
+func clampDPR(price, lower, upper, tick float64) float64 {
 	if lower <= 0 && upper <= 0 {
 		return price
 	}
 	if lower > 0 && price < lower {
+		if tick > 0 {
+			return lower + tick
+		}
 		return lower
 	}
 	if upper > 0 && price > upper {
+		if tick > 0 {
+			return upper - tick
+		}
 		return upper
 	}
 	return price
@@ -220,6 +232,9 @@ func (c *ExecutionClient) SubscribeOrderStatus(ctx context.Context, auth *indira
 
 // CancelOrder cancels an order
 func (c *ExecutionClient) CancelOrder(ctx context.Context, exchange, orderID, symbol string, auth *indiraClient.AuthContext) error {
+	if auth == nil {
+		return fmt.Errorf("cancel order %s: nil auth context (no credentials resolved)", orderID)
+	}
 	cancelReq := &indiraClient.CancelOrderRequest{
 		Exc:    exchange,
 		OrdId:  orderID,
@@ -341,7 +356,7 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		return c.roundPrice(price, tickSize)
 	}
 	clamp := func(price float64) float64 {
-		return clampDPR(price, dprLower, dprUpper)
+		return clampDPR(price, dprLower, dprUpper, tickSize)
 	}
 	// Convenience: round then clamp to DPR range.
 	roundClamp := func(price float64) float64 {
@@ -352,6 +367,16 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		log.Printf("[dpr] %s:%d DPR range [%.2f, %.2f]", symbolBuilder.Exchange, order.StockCode, dprLower, dprUpper)
 	}
 
+	// A square-off / exit order must NEVER be sent as a fresh bracket order. A filled
+	// BRACKET/BO entry is held by the broker as a plain INTRADAY (MIS) position, so the
+	// exit must close it as INTRADAY. Sending prdType "BRACKET_ORDER" makes the broker
+	// expect SL/TP trigger prices and reject the exit with EG003
+	// ("trigger_price could not be zero or negative").
+	effectivePrd := order.ProductType
+	if order.IsSquareOffOrder && (effectivePrd == "BRACKET" || effectivePrd == "BRACKET_ORDER" || effectivePrd == "BO") {
+		effectivePrd = "INTRADAY"
+	}
+
 	// Build order request
 	req := &indiraClient.PlaceOrderRequest{
 		Symbol:       indiraSymbol,
@@ -360,7 +385,7 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		OrdAction:    indiraClient.MapOrderSide(string(order.OrderSide)),
 		OrdValidity:  indiraClient.MapValidity(order.Validity),
 		OrdType:      indiraClient.MapOrderType(string(order.OrderType)),
-		PrdType:      indiraClient.MapProductType(order.ProductType),
+		PrdType:      indiraClient.MapProductType(effectivePrd),
 		Qty:          int(order.Quantity),
 		DisQty:       0,
 		LotSize:      1,
@@ -370,7 +395,7 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 		TriggerPrice: 0,
 	}
 
-	isBracket := order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO"
+	isBracket := effectivePrd == "BRACKET" || effectivePrd == "BRACKET_ORDER" || effectivePrd == "BO"
 
 	if isBracket {
 		// ── Immediate Bracket Order (Case 1: within_range / MARKET) ─────────
@@ -499,7 +524,7 @@ func (c *ExecutionClient) convertToIndiraModifyRequest(order *models.Order) (*in
 		return c.roundPrice(price, tickSize)
 	}
 	roundClamp := func(price float64) float64 {
-		return clampDPR(round(price), dprLower, dprUpper)
+		return clampDPR(round(price), dprLower, dprUpper, tickSize)
 	}
 
 	// Set price for limit orders

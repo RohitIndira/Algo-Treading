@@ -94,6 +94,19 @@ func NewDefaultClient() *Client {
 
 // ============ Helper Methods ============
 
+// indiaIST is UTC+5:30. Used to gate verbose position-book body logging to the
+// EOD square-off window so full books aren't logged all day.
+var indiaIST = time.FixedZone("IST", 5*3600+30*60)
+
+// eodPositionBookDumpWindow reports whether now is inside the window during
+// which the FULL position-book API response is logged per user (for diagnosing
+// auto-square-off skips). Window: 15:00–15:30 IST.
+func eodPositionBookDumpWindow() bool {
+	now := time.Now().In(indiaIST)
+	mins := now.Hour()*60 + now.Minute()
+	return mins >= 15*60 && mins <= 15*60+30
+}
+
 // doRequest performs an HTTP request with per-request authentication headers
 func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path string, body interface{}) (*StandardResponse, error) {
 	if auth == nil {
@@ -154,9 +167,16 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Check HTTP status code — skip body for noisy position-book responses
+	// Position-book responses are normally too noisy to log in full, so only the
+	// status is logged. EXCEPTION: during the EOD square-off window (15:00–15:30
+	// IST) log the COMPLETE body per user, so the exact broker book each user's
+	// square-off saw is captured for diagnosis.
 	if path == "/portfolio-services/api/portfolio/v1/position-book" {
-		log.Printf("[indira] ← %s %s  status=%d", method, path, resp.StatusCode)
+		if eodPositionBookDumpWindow() {
+			log.Printf("[indira] ← %s %s  status=%d  user=%s  body=%s", method, path, resp.StatusCode, auth.UserId, string(responseBody))
+		} else {
+			log.Printf("[indira] ← %s %s  status=%d", method, path, resp.StatusCode)
+		}
 	} else {
 		log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
 	}

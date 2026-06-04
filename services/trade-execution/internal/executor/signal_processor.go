@@ -333,6 +333,10 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 	// NOTE: Trailing SL + Multi-level TP is handled by Route 4 (multi-level),
 	// NOT by Route 1 (OCO), because multi-level TP requires N separate LIMIT orders.
 	// Route 4 intercepts: Trailing SL with multi-level TP skips OCO.
+	// Fixed SL/TP is NOT routed here: it uses Route 3 (ExecuteOrder + AdoptOrder),
+	// which reuses this order's ID (CreateOCOEntry would mint a new one) and, after
+	// the entry's protective SL/TP are cleared below, places the same clean
+	// marketable entry then manages SL/TP legs post-fill.
 	if isTrailingSL && p.ocoManager != nil && hasAuth && !order.IsPaperTrade && !isMultiLevel {
 		err := p.routeToOCO(ctx, order, signal)
 		p.logOrderTiming(signal, "oco", kafkaTime, processStart, idempotencyMs, dbMs, err)
@@ -355,6 +359,14 @@ func (p *SignalProcessor) ProcessTradeSignal(ctx context.Context, signal *models
 	if order.ProductType == "BRACKET" || order.ProductType == "BRACKET_ORDER" || order.ProductType == "BO" {
 		order.ProductType = "INTRADAY"
 	}
+
+	// The protective SL/TP are placed post-fill by the OCO manager (AdoptOrder
+	// below), never as part of the entry. Clearing them here ensures the executor
+	// sends a clean marketable order — otherwise convertToIndiraRequest would emit
+	// triggerPrice = StopLoss and turn the entry into a broker SL/stop order, which
+	// the broker rejects when the SL sits far from LTP (e.g. a wide fixed SL%).
+	order.StopLoss = nil
+	order.TakeProfit = nil
 
 	err = p.executor.ExecuteOrder(ctx, order)
 	p.logOrderTiming(signal, "executor", kafkaTime, processStart, idempotencyMs, dbMs, err)
