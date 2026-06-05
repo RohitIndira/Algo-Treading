@@ -14,24 +14,23 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
 
 	"sync"
 
-	"github.com/google/uuid"
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/lifecycle"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/oco"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/multilevel"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/oco"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/paper"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -39,6 +38,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/tickstore"
+	"github.com/google/uuid"
 )
 
 func main() {
@@ -65,6 +65,18 @@ func main() {
 	// Initialize repositories
 	orderRepo := repository.NewOrderRepository(db)
 	credsRepo := repository.NewCredentialsRepository(db, cfg.EncryptionKey)
+
+	// Connect to trading_db (same Postgres instance, different DB) for startup
+	// hydration of the broker-WS protection set. This is a secondary, read-only
+	// connection used only during startup; all runtime updates come via Kafka events.
+	log.Println("Connecting to trading_db for strategy hydration...")
+	tradingDB, tradingDBErr := sqlx.Connect("postgres", buildTradingDBURL())
+	if tradingDBErr != nil {
+		log.Printf("WARNING: could not connect to trading_db — broker-WS protection set will be empty until first Kafka event: %v", tradingDBErr)
+	} else {
+		log.Println("✓ Connected to trading_db")
+	}
+
 	log.Println("✓ Repository layer initialized")
 
 	// Initialize Indira client (stateless, supports multiple users)
@@ -123,7 +135,6 @@ func main() {
 	signalProcessor := executor.NewSignalProcessor(orderExecutor, orderRepo, kafkaPub, statusService, logger)
 	kafkaConsumer := consumer.NewKafkaConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, signalProcessor, logger, cfg.WorkerCount)
 	log.Println("✓ Kafka consumer initialized")
-
 
 	// Initialize strategy events consumer (user-config-events → close positions on deactivate/delete)
 	log.Println("Initializing Kafka consumer for user-config-events...")
@@ -379,7 +390,7 @@ func main() {
 	orderExecutor.SetPaperExecutor(paperExec)
 
 	var paperMonitorRef *paper.PaperTradeMonitor
-	
+
 	paperExec.OnPaperFilled = func(order *models.Order) {
 		if paperMonitorRef != nil {
 			paperMonitorRef.AddOrder(order)
@@ -434,10 +445,10 @@ func main() {
 		routingExec := executor.NewRoutingExecutor(orderExecutor, paperExec)
 
 		priceMonitorRef = scheduler.NewPriceMonitor(
-			redisPrices,   // Redis fallback (nil-safe)
+			redisPrices, // Redis fallback (nil-safe)
 			orderRepo,
 			kafkaPub,
-			routingExec, // routes paper/live based on IsPaperTrade
+			routingExec,          // routes paper/live based on IsPaperTrade
 			100*time.Millisecond, // check interval for evaluating WSS-cached prices
 		)
 
@@ -454,7 +465,7 @@ func main() {
 		if tw, err := tickstore.NewTickWriter("localhost:6379", ""); err != nil {
 			log.Printf("[tickstore] unavailable, tick history disabled (non-fatal): %v", err)
 		} else {
-			paperMarketClient.SetTickWriter(tw.InCh())   // paper SL/TP orders
+			paperMarketClient.SetTickWriter(tw.InCh())    // paper SL/TP orders
 			priceMonitorWSClient.SetTickWriter(tw.InCh()) // below_min price monitor orders
 			tickStoreWriter = tw
 			log.Println("✓ Tick writer connected — all socket ticks will be stored to localhost Redis DB=1")
@@ -497,6 +508,18 @@ func main() {
 	// Wire OCO handler into StatusService — every broker WS event is checked
 	// for OCO group membership (entry fill → place legs, leg fill → cancel other)
 	statusService.SetOCOHandler(ocoManager)
+
+	// Wire OCO manager → broker order-WS (re)subscription. AdoptOrder (the
+	// price-monitor entry path) calls this so the EXECUTED fill that places SL/TP
+	// legs is consumed even if the user's connection was idle-swept after signal
+	// time. Runs async so it never blocks the price-monitor tick on a broker connect.
+	ocoManager.SetWSEnsurer(func(userID string, auth *indiraPkg.AuthContext) {
+		go func() {
+			if err := statusService.StartSubscription(context.Background(), userID, auth); err != nil {
+				log.Printf("[oco] wsEnsure: StartSubscription failed user=%s: %v", userID, err)
+			}
+		}()
+	})
 
 	// Wire OCO canceller into WS server — force-exit-all cancels OCO legs too
 	paperWSServer.SetOCOCanceller(ocoManager)
@@ -616,6 +639,28 @@ func main() {
 	// recorded for remaining ML qty when a strategy is paused or deleted.
 	strategyEventsConsumer.SetMLManager(mlManager)
 
+	// Wire the strategy user tracker so the idle sweep never closes the broker WS
+	// for a user with an active LIVE strategy.
+	strategyEventsConsumer.SetStrategyUserTracker(statusService)
+
+	// Startup hydration: pre-populate the protection set from trading_db so users
+	// who activated before this process started are protected immediately — before
+	// their first CONFIG_CREATED Kafka event re-arrives on the consumer.
+	if tradingDB != nil {
+		strategyRepo := repository.NewStrategyRepository(tradingDB)
+		hydrateCtx, hydrateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if activeUserIDs, err := strategyRepo.GetActiveLiveStrategyUserIDs(hydrateCtx); err != nil {
+			log.Printf("WARNING: strategy hydration failed — protection set may be incomplete: %v", err)
+		} else {
+			for _, uid := range activeUserIDs {
+				statusService.MarkUserActiveStrategy(uid)
+			}
+			log.Printf("✓ Broker-WS protection set hydrated from trading_db (%d active LIVE user(s))", len(activeUserIDs))
+		}
+		hydrateCancel()
+		_ = tradingDB.Close()
+	}
+
 	// Wire the broker WS starter: a CONFIG_CREATED / CONFIG_UPDATED event opens
 	// the user's per-user order-status socket immediately — loading their broker
 	// credentials and calling StartSubscription — so order updates stream from
@@ -671,6 +716,9 @@ func main() {
 		ocoManager.CancelGroupsBySymbol(ctx, userID, symbol)
 		mlManager.CancelGroupsBySymbol(ctx, userID, symbol)
 	})
+	// After live square-off fires, clear the broker-WS protection set so post-market
+	// idle sweeps can close connections for users with no remaining exposure.
+	autoSquareOff.SetOnMarketClose(statusService.UnmarkAllActiveStrategyUsers)
 	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-user: enabled, broker netQty check: enabled, SL/TP teardown: enabled)", cfg.AutoSquareOffTime)
 
 	// Backfill user_square_off_config from today's orders on every startup.
@@ -955,6 +1003,16 @@ func main() {
 	statusService.StartIdleSweep(ctx, 15*time.Minute)
 	log.Println("✓ Broker WS idle-connection sweep started (15m interval)")
 
+	// Trade-book fill reconciler: WS-independent safety net that places protective
+	// SL/TP for any entry whose broker EXECUTED event the order WebSocket missed
+	// (idle-swept/dropped connection, dead processor). It polls the broker trade-book
+	// API for non-terminal orders and drives confirmed fills through the OCO/ML path.
+	// FILL_RECONCILE_INTERVAL_SEC=0 disables it.
+	if d := time.Duration(cfg.FillReconcileIntervalSec) * time.Second; d > 0 {
+		statusService.StartFillReconcile(ctx, d)
+		log.Printf("✓ Trade-book fill reconciler started (%s interval)", d)
+	}
+
 	// ── Lifecycle: ordered graceful shutdown ──────────────────────────────────
 	lc := lifecycle.New(cancel, 15*time.Second)
 
@@ -1170,15 +1228,15 @@ func main() {
 
 // Config holds service configuration
 type Config struct {
-	GRPCPort         int
-	WorkerCount      int
-	KafkaBrokers     []string
-	KafkaGroupID     string
-	KafkaTopic       string
-	MaxRetries       int
-	RetryDelay       time.Duration
-	PostgresURL      string
-	EncryptionKey    string
+	GRPCPort      int
+	WorkerCount   int
+	KafkaBrokers  []string
+	KafkaGroupID  string
+	KafkaTopic    string
+	MaxRetries    int
+	RetryDelay    time.Duration
+	PostgresURL   string
+	EncryptionKey string
 	// Paper Trading
 	PaperWSPort      int
 	PaperMarketWSURL string
@@ -1195,6 +1253,9 @@ type Config struct {
 	// back without redeploy.
 	EnableStartupReconcile bool // poll broker for in-flight orders on startup
 	EnableMLReload         bool // rebuild multi-level exit groups on startup
+	// FillReconcileIntervalSec controls the trade-book fill safety net cadence in
+	// seconds (places SL/TP when the order WS misses an EXECUTED fill). 0 disables.
+	FillReconcileIntervalSec int
 }
 
 func loadConfig() Config {
@@ -1207,24 +1268,25 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		GRPCPort:         getEnvInt("SERVICE_PORT", 9004),
-		WorkerCount:      getEnvInt("WORKER_COUNT", 100),
-		KafkaBrokers:     kafkaBrokers,
-		KafkaGroupID:     getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
-		KafkaTopic:       getEnv("KAFKA_TOPIC", "trade-signals"),
-		MaxRetries:       getEnvInt("MAX_RETRIES", 3),
-		RetryDelay:       time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
-		PostgresURL:      buildPostgresURL(),
-		EncryptionKey:    getEnv("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef"),
-		PaperWSPort:      getEnvInt("PAPER_WS_PORT", 8081),
-		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", ""),
-		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
-		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
-		RedisDB:          getEnvInt("REDIS_DB", 0),
-		MetricsPort:      getEnvInt("METRICS_PORT", 9090),
-		AutoSquareOffTime: getEnv("AUTO_SQUARE_OFF_TIME", "15:05"),
-		EnableStartupReconcile: getEnvBool("ENABLE_STARTUP_RECONCILE", false),
-		EnableMLReload:         getEnvBool("ENABLE_ML_RELOAD", false),
+		GRPCPort:                 getEnvInt("SERVICE_PORT", 9004),
+		WorkerCount:              getEnvInt("WORKER_COUNT", 100),
+		KafkaBrokers:             kafkaBrokers,
+		KafkaGroupID:             getEnv("KAFKA_GROUP_ID", "trade-execution-service"),
+		KafkaTopic:               getEnv("KAFKA_TOPIC", "trade-signals"),
+		MaxRetries:               getEnvInt("MAX_RETRIES", 3),
+		RetryDelay:               time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
+		PostgresURL:              buildPostgresURL(),
+		EncryptionKey:            getEnv("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef"),
+		PaperWSPort:              getEnvInt("PAPER_WS_PORT", 8081),
+		PaperMarketWSURL:         getEnv("PAPER_MARKET_WS_URL", ""),
+		RedisAddr:                getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
+		RedisPassword:            getEnv("REDIS_PASSWORD", ""),
+		RedisDB:                  getEnvInt("REDIS_DB", 0),
+		MetricsPort:              getEnvInt("METRICS_PORT", 9090),
+		AutoSquareOffTime:        getEnv("AUTO_SQUARE_OFF_TIME", "15:05"),
+		EnableStartupReconcile:   getEnvBool("ENABLE_STARTUP_RECONCILE", false),
+		EnableMLReload:           getEnvBool("ENABLE_ML_RELOAD", false),
+		FillReconcileIntervalSec: getEnvInt("FILL_RECONCILE_INTERVAL_SEC", 30),
 	}
 }
 
@@ -1261,6 +1323,20 @@ func buildPostgresURL() string {
 		getEnv("POSTGRES_USER", "postgres"),
 		getEnv("POSTGRES_PASSWORD", "postgres"),
 		getEnv("POSTGRES_DB", "trading_execution"),
+		getEnv("POSTGRES_SSL_MODE", "disable"),
+	)
+}
+
+// buildTradingDBURL connects to the strategies DB (trading_db) on the same
+// Postgres host. All auth env vars are shared with trading_execution; only
+// the database name is hardcoded. Used only for startup hydration (read-only).
+func buildTradingDBURL() string {
+	return fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=trading_db sslmode=%s",
+		getEnv("POSTGRES_HOST", "localhost"),
+		getEnv("POSTGRES_PORT", "5432"),
+		getEnv("POSTGRES_USER", "postgres"),
+		getEnv("POSTGRES_PASSWORD", "postgres"),
 		getEnv("POSTGRES_SSL_MODE", "disable"),
 	)
 }

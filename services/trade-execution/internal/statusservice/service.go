@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
@@ -78,8 +79,9 @@ type OrderStatusService struct {
 	// connection per subscribed user.
 	wsClients sync.Map
 
-	// processors: userID → context.CancelFunc. Cancels that user's
-	// processUpdates goroutine on StopSubscription.
+	// processors: userID → *processorHandle. Cancels that user's processUpdates
+	// goroutine on StopSubscription and tracks whether it is still alive so
+	// StartSubscription can restart a dead processor on a lingering client.
 	processors sync.Map
 
 	// subscriberAuths: userID → *indiraClient.AuthContext
@@ -97,6 +99,16 @@ type OrderStatusService struct {
 	// qty=100), leaving filled_quantity/filled_price stuck at the older snapshot
 	// and surfacing as wrong values on /ws/live-orders.
 	orderMutexes sync.Map
+
+	// activeStrategyUsers: userID → struct{}. Users with at least one active LIVE
+	// strategy are excluded from the idle-sweep for the full trading day — their
+	// broker WS must stay alive until market close regardless of position state.
+	// Populated on startup from trading_db and kept current via Kafka strategy
+	// events (CONFIG_CREATED/UPDATED → mark; CONFIG_DELETED/PAUSED → unmark).
+	// Unmark does NOT close the WS — the connection stays open; only CloseAll
+	// (service shutdown) or UnmarkAllActiveStrategyUsers (market close) leads to
+	// a sweep closing it.
+	activeStrategyUsers sync.Map
 }
 
 // lockOrder returns the mutex guarding all WS updates for one broker order ID.
@@ -161,6 +173,33 @@ func (s *OrderStatusService) SetMLHandler(handler MLHandler) {
 	s.mlHandler = handler
 }
 
+// MarkUserActiveStrategy marks userID as having an active LIVE strategy, protecting
+// their broker WS from the idle sweep for the remainder of the trading day.
+// Called on CONFIG_CREATED / CONFIG_UPDATED Kafka events.
+func (s *OrderStatusService) MarkUserActiveStrategy(userID string) {
+	s.activeStrategyUsers.Store(userID, struct{}{})
+}
+
+// UnmarkUserActiveStrategy removes the idle-sweep protection for userID.
+// Does NOT close the broker WS — the connection stays open so any in-flight
+// orders / SL/TP legs can still receive fill events. Only the next idle sweep
+// (if the user has no live exposure) or service shutdown will close it.
+// Called on CONFIG_DELETED / CONFIG_PAUSED Kafka events.
+func (s *OrderStatusService) UnmarkUserActiveStrategy(userID string) {
+	s.activeStrategyUsers.Delete(userID)
+}
+
+// UnmarkAllActiveStrategyUsers clears the full protection set at market close
+// so the next idle-sweep pass can clean up connections for users with no
+// remaining exposure. Called by AutoSquareOffScheduler after the live
+// square-off fires.
+func (s *OrderStatusService) UnmarkAllActiveStrategyUsers() {
+	s.activeStrategyUsers.Range(func(key, _ any) bool {
+		s.activeStrategyUsers.Delete(key)
+		return true
+	})
+}
+
 // NewOrderStatusService creates a new order status service.
 // credsRepo may be nil — if set, enables auto-refresh of expired broker
 // credentials on the shared WebSocket connection (avoids persistent 401 loops).
@@ -196,7 +235,23 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 	// but the WSClient has its own internal w.auth that never gets updated otherwise.
 	// ResumeWithNewAuth resets the retry backoff and retries createWsToken immediately.
 	if v, ok := s.wsClients.Load(userID); ok {
-		v.(*indiraClient.WSClient).ResumeWithNewAuth(&authCopy)
+		client := v.(*indiraClient.WSClient)
+		client.ResumeWithNewAuth(&authCopy)
+		// Self-heal: a prior StopSubscription (or a teardown/re-subscribe race) can
+		// leave the client in the map while its processUpdates goroutine has already
+		// exited. With no live processor nothing drains client.Updates, so broker
+		// fills — including the EXECUTED that places OCO SL/TP legs — are silently
+		// dropped. If the processor is dead, restart it on the existing client.
+		if h, ok := s.processors.Load(userID); ok && h.(*processorHandle).alive.Load() {
+			return nil
+		}
+		s.logger.Warn("WS client present but processor not running — restarting processor",
+			zap.String("user_id", userID))
+		procCtx, cancel := context.WithCancel(context.Background())
+		handle := &processorHandle{cancel: cancel}
+		handle.alive.Store(true)
+		s.processors.Store(userID, handle)
+		go s.processUpdates(procCtx, userID, client, handle)
 		return nil
 	}
 
@@ -236,11 +291,13 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 	// Dedicated processor goroutine for this user's Updates channel.
 	// Background context for the loop's own lifetime — cancelled by StopSubscription.
 	procCtx, cancel := context.WithCancel(context.Background())
-	s.processors.Store(userID, cancel)
+	handle := &processorHandle{cancel: cancel}
+	handle.alive.Store(true)
+	s.processors.Store(userID, handle)
 	s.wsClients.Store(userID, client)
 	metrics.BrokerWSActiveConnections.Inc()
 
-	go s.processUpdates(procCtx, userID, client)
+	go s.processUpdates(procCtx, userID, client, handle)
 	s.logger.Info("Per-user broker WS established", zap.String("user_id", userID))
 	return nil
 }
@@ -253,8 +310,8 @@ func (s *OrderStatusService) StopSubscription(userID string) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if cancel, ok := s.processors.LoadAndDelete(userID); ok {
-		cancel.(context.CancelFunc)()
+	if h, ok := s.processors.LoadAndDelete(userID); ok {
+		h.(*processorHandle).cancel()
 	}
 	if v, ok := s.wsClients.LoadAndDelete(userID); ok {
 		v.(*indiraClient.WSClient).Close()
@@ -311,6 +368,12 @@ func (s *OrderStatusService) sweepIdleConnections(ctx context.Context) {
 	s.wsClients.Range(func(key, _ any) bool {
 		userID := key.(string)
 		if _, ok := keep[userID]; !ok {
+			// Never sweep a user who has an active LIVE strategy: their broker WS
+			// must stay alive for the full trading day so entry fills, SL/TP events,
+			// and any order placed after a quiet period are always received.
+			if _, protected := s.activeStrategyUsers.Load(userID); protected {
+				return true
+			}
 			idle = append(idle, userID)
 		}
 		return true
@@ -347,14 +410,159 @@ func (s *OrderStatusService) refreshAuthFromDB(userID string) (*indiraClient.Aut
 	return newAuth, nil
 }
 
+// processorHandle tracks one user's processUpdates goroutine: cancel stops it,
+// alive reports whether it is still draining the broker WS Updates channel. Used
+// by StartSubscription to detect (and restart) a client whose processor died.
+type processorHandle struct {
+	cancel context.CancelFunc
+	alive  atomic.Bool
+}
+
+// StartFillReconcile launches the WS-independent fill safety net. On each tick it
+// asks the broker trade-book API whether any still-open order has executed and,
+// if so, drives an EXECUTED snapshot through the same handleStatusUpdate → OCO
+// path the live WS uses — so protective SL/TP legs are placed even when the
+// per-user order WebSocket is dead (idle-swept, dropped, or its processor exited).
+// interval <= 0 disables the loop. Stops when ctx is cancelled.
+func (s *OrderStatusService) StartFillReconcile(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.reconcileFillsViaTradeBook(ctx)
+			}
+		}
+	}()
+}
+
+// reconcileFillsViaTradeBook is one pass of the trade-book safety net: for every
+// non-terminal live order it aggregates the broker trade book and, when the order
+// has (partially) filled, applies an EXECUTED / PARTIALLY-EXECUTED snapshot via
+// ReconcileOrderFromBrokerBook (which reuses handleStatusUpdate, so the OCO/ML
+// hooks fire and place SL/TP). Idempotent: ReconcileOrderFromBrokerBook no-ops
+// when the broker status already matches the DB, and the OCO state machine ignores
+// a fill it has already acted on — so repeated passes never double-place legs.
+func (s *OrderStatusService) reconcileFillsViaTradeBook(ctx context.Context) {
+	rcCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// minAge=10s gives the normal placement → broker-WS path a head start so this
+	// safety net does not race freshly placed orders.
+	candidates, err := s.repo.GetReconciliationCandidates(rcCtx, 24, 10)
+	if err != nil {
+		s.logger.Warn("fill-reconcile: list candidates failed", zap.Error(err))
+		return
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	byUser := make(map[string][]*models.Order, 8)
+	for _, o := range candidates {
+		// Only ENTRY orders need fill-reconciliation: the reconciler's job is to
+		// catch a missed entry fill so OCO/ML can PLACE the SL/TP legs. Resting
+		// SL/TP legs (and reverse square-off orders) are already placed at the
+		// broker and only need the live WS to report when they trigger — polling
+		// the trade book for them returns empty until they fill and would hammer
+		// the broker for every protective order on every tick. Skip them.
+		if o.IsSquareOffOrder || o.ParentOrderID != nil {
+			continue
+		}
+		if o.OCORole != nil && *o.OCORole != "ENTRY" {
+			continue
+		}
+		byUser[o.UserID] = append(byUser[o.UserID], o)
+	}
+	if len(byUser) == 0 {
+		return
+	}
+
+	for userID, orders := range byUser {
+		auth := s.ensureAuthLoaded(userID)
+		if auth == nil {
+			continue
+		}
+		for _, o := range orders {
+			if o.IndiraOrderID == nil || *o.IndiraOrderID == "" {
+				continue
+			}
+			// Single attempt: no EXECUTED event to race here, so an empty result
+			// just means "not filled yet" — the next tick re-checks.
+			qty, price, _, ok := s.fillFromTradeBookN(rcCtx, userID, *o.IndiraOrderID, 1)
+			if !ok || qty <= 0 {
+				continue // not filled at the broker yet — leave for the next pass
+			}
+			status := "EXECUTED"
+			if qty < int(o.Quantity) {
+				status = "PARTIALLY EXECUTED"
+			}
+			snapshot := &indiraClient.WSOrderStatus{
+				UniqueCode:  *o.IndiraOrderID,
+				OrderStatus: status,
+				Symbol:      o.Symbol,
+				UCC:         userID,
+				BuySell:     string(o.OrderSide),
+				TradedQTY:   indiraClient.FlexInt(strconv.Itoa(qty)),
+				TradedPrice: strconv.FormatFloat(price, 'f', -1, 64),
+			}
+			changed, rerr := s.ReconcileOrderFromBrokerBook(rcCtx, o, snapshot)
+			if rerr != nil {
+				s.logger.Warn("fill-reconcile: apply snapshot failed",
+					zap.String("user_id", userID),
+					zap.String("indira_order_id", *o.IndiraOrderID),
+					zap.Error(rerr))
+				continue
+			}
+			if changed {
+				s.logger.Info("fill-reconcile: applied trade-book fill (WS fallback) — OCO/ML will place SL/TP",
+					zap.String("user_id", userID),
+					zap.String("symbol", o.Symbol),
+					zap.String("indira_order_id", *o.IndiraOrderID),
+					zap.String("status", status),
+					zap.Int("filled_qty", qty),
+					zap.Float64("fill_price", price))
+			}
+		}
+	}
+}
+
+// ensureAuthLoaded returns the cached auth for a user, loading it from the DB
+// (and caching it) when absent. The idle sweep deletes subscriberAuths on
+// teardown, but the trade-book reconciler still needs credentials to call the
+// broker. Returns nil when no credentials are available.
+func (s *OrderStatusService) ensureAuthLoaded(userID string) *indiraClient.AuthContext {
+	if v, ok := s.subscriberAuths.Load(userID); ok {
+		return v.(*indiraClient.AuthContext)
+	}
+	auth, err := s.refreshAuthFromDB(userID)
+	if err != nil {
+		s.logger.Warn("fill-reconcile: load credentials failed",
+			zap.String("user_id", userID), zap.Error(err))
+		return nil
+	}
+	return auth
+}
+
 // processUpdates drains one user's WSClient.Updates channel and dispatches
 // each update to its own goroutine so DB operations never block the read loop.
 // One processor runs per subscribed user; it exits when ctx is cancelled by
 // StopSubscription. Each update is handled with a background context so a
 // StopSubscription mid-update never aborts an in-flight DB write.
-func (s *OrderStatusService) processUpdates(ctx context.Context, userID string, client *indiraClient.WSClient) {
+func (s *OrderStatusService) processUpdates(ctx context.Context, userID string, client *indiraClient.WSClient, handle *processorHandle) {
 	s.logger.Info("Broker WS update processor started", zap.String("user_id", userID))
-	defer s.logger.Info("Broker WS update processor stopped", zap.String("user_id", userID))
+	defer func() {
+		if handle != nil {
+			handle.alive.Store(false)
+		}
+		s.logger.Info("Broker WS update processor stopped", zap.String("user_id", userID))
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -959,8 +1167,23 @@ func resolveFilledQty(ws *indiraClient.WSOrderStatus, placedQty int) int {
 // fill quantity and — critically — fill/exit TIME. Returns ok=false on any error,
 // missing auth, or no matching trade, so the caller keeps its WS-derived fallback.
 func (s *OrderStatusService) fillFromTradeBook(ctx context.Context, userID, indiraOrderID string) (qty int, price float64, ts time.Time, ok bool) {
+	// Two attempts: the socket EXECUTED event can momentarily lead the broker's
+	// trade book, so an empty first result is retried once after a short delay
+	// before giving up (caller then keeps the WS-derived fallback).
+	return s.fillFromTradeBookN(ctx, userID, indiraOrderID, 2)
+}
+
+// fillFromTradeBookN is fillFromTradeBook with a configurable attempt count.
+// The real-time WS path uses 2 (the trade book can briefly lag the EXECUTED
+// push). The periodic fill reconciler uses 1: there is no event to race, so an
+// empty result simply means "not filled yet" and the next tick re-checks —
+// retrying with a 500ms sleep there would only double broker API load.
+func (s *OrderStatusService) fillFromTradeBookN(ctx context.Context, userID, indiraOrderID string, attempts int) (qty int, price float64, ts time.Time, ok bool) {
 	if s.execClient == nil || indiraOrderID == "" {
 		return 0, 0, time.Time{}, false
+	}
+	if attempts < 1 {
+		attempts = 1
 	}
 	authVal, has := s.subscriberAuths.Load(userID)
 	if !has {
@@ -968,10 +1191,7 @@ func (s *OrderStatusService) fillFromTradeBook(ctx context.Context, userID, indi
 	}
 	auth := authVal.(*indiraClient.AuthContext)
 
-	// Two attempts: the socket EXECUTED event can momentarily lead the broker's
-	// trade book, so an empty first result is retried once after a short delay
-	// before giving up (caller then keeps the WS-derived fallback).
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -1211,4 +1431,3 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		)
 	}
 }
-

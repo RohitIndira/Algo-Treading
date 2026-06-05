@@ -57,6 +57,11 @@ type AutoSquareOffScheduler struct {
 	// placed — so a resting stop can't fire into a now-flat book and open a fresh
 	// position. Nil-safe. Wired in main.go to OCO + ML CancelGroupsBySymbol.
 	cancelProtectiveLegs func(ctx context.Context, userID, symbol string)
+
+	// onMarketClose, if set, is called once after the global live square-off
+	// completes. Used to clear the broker-WS idle-sweep protection set so
+	// post-market idle sweeps can close connections with no remaining exposure.
+	onMarketClose func()
 }
 
 // NewAutoSquareOffScheduler creates a new auto square-off scheduler.
@@ -109,6 +114,13 @@ func (s *AutoSquareOffScheduler) SetProtectiveLegCanceller(fn func(ctx context.C
 	s.cancelProtectiveLegs = fn
 }
 
+// SetOnMarketClose wires a callback invoked once after the global live square-off
+// fires at market close. Wired in main.go to statusService.UnmarkAllActiveStrategyUsers
+// so subsequent idle sweeps can close connections with no remaining exposure.
+func (s *AutoSquareOffScheduler) SetOnMarketClose(fn func()) {
+	s.onMarketClose = fn
+}
+
 // Start begins the auto square-off check loop (every 1 minute).
 // Paper positions close at paperSquareOffTime (15:00); live positions close at squareOffTime (15:05).
 func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
@@ -147,6 +159,11 @@ func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
 				log.Println("[auto-square-off] ========== LIVE TRIGGER — squaring off all open algo positions ==========")
 				if err := s.squareOffAllPositions(ctx); err != nil {
 					log.Printf("[auto-square-off] Error during live square-off: %v", err)
+				}
+				// Clear the broker-WS protection set so post-market idle sweeps
+				// can close connections for users with no remaining exposure.
+				if s.onMarketClose != nil {
+					s.onMarketClose()
 				}
 			}
 		}

@@ -2,16 +2,16 @@
 //
 // Architecture overview:
 //
-//	                   ┌─────────────────────┐
-//	 TradeSignal ──→   │    OCO Manager       │
-//	                   │  (in-memory registry │
-//	                   │   + broker ID index) │
-//	                   └──────────┬──────────┘
-//	                              │
-//	    ┌──────────┬──────────────┼───────────────────┐
-//	    ▼          ▼              ▼                    ▼
-//	 PlaceEntry  OnFill →     HandleBrokerUpdate   TrailingMonitor
-//	 (SL order)  PlaceLegs   (cancel counterpart)  (ModifyOrder)
+//	                  ┌─────────────────────┐
+//	TradeSignal ──→   │    OCO Manager       │
+//	                  │  (in-memory registry │
+//	                  │   + broker ID index) │
+//	                  └──────────┬──────────┘
+//	                             │
+//	   ┌──────────┬──────────────┼───────────────────┐
+//	   ▼          ▼              ▼                    ▼
+//	PlaceEntry  OnFill →     HandleBrokerUpdate   TrailingMonitor
+//	(SL order)  PlaceLegs   (cancel counterpart)  (ModifyOrder)
 //
 // All state is in-memory (sync.Map) for O(1) lookups from broker WS events.
 // State changes are persisted to PostgreSQL asynchronously.
@@ -69,6 +69,11 @@ type OCOManager struct {
 	// wsBroadcaster pushes real-time updates to the frontend WS.
 	wsBroadcaster func(userID string, eventType string, order *models.Order)
 
+	// wsEnsure (re)establishes the user's broker order-WS subscription so the
+	// EXECUTED event that triggers SL/TP leg placement is actually consumed.
+	// Wired in main.go to OrderStatusService.StartSubscription; nil-safe.
+	wsEnsure func(userID string, auth *indiraClient.AuthContext)
+
 	// partialFillTimeout is how long to wait for remaining entry qty after a
 	// partial fill before cancelling the unfilled portion. Configurable via
 	// OCO_PARTIAL_FILL_TIMEOUT env var (default 50s).
@@ -111,6 +116,13 @@ func (m *OCOManager) SetPartialFillTimeout(d time.Duration) {
 }
 
 // SetWSBroadcaster wires the frontend WS push callback.
+// SetWSEnsurer wires a callback that (re)establishes the user's broker order-WS
+// subscription. AdoptOrder calls it so a price-monitor entry placed after the
+// connection was idle-swept still receives its EXECUTED fill and gets SL/TP legs.
+func (m *OCOManager) SetWSEnsurer(fn func(userID string, auth *indiraClient.AuthContext)) {
+	m.wsEnsure = fn
+}
+
 func (m *OCOManager) SetWSBroadcaster(fn func(userID string, eventType string, order *models.Order)) {
 	m.wsBroadcaster = fn
 }
@@ -2090,6 +2102,15 @@ func (m *OCOManager) AdoptOrder(
 
 	log.Printf("[oco] Adopted order %s (broker=%s) into OCO group %s: symbol=%s SL=%.1f%% TP=%.1f%% trailing=%v",
 		order.OrderID, brokerID, groupID, order.Symbol, slPercent, tpPercent, trailingSL)
+
+	// Ensure the broker order-WS subscription is live so the EXECUTED event that
+	// places these SL/TP legs is consumed. The price-monitor → AdoptOrder path does
+	// not otherwise (re)subscribe, so a user whose connection was idle-swept between
+	// signal time and entry placement would never get protective legs. The
+	// trade-book fill reconciler is the backstop if this subscription still misses.
+	if m.wsEnsure != nil && auth != nil {
+		m.wsEnsure(order.UserID, auth)
+	}
 }
 
 // ════════════════════════════════════════════════════════════════════════════
