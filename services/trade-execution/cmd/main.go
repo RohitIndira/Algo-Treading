@@ -614,6 +614,28 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, `{"ok":true,"user_id":%q}`, userID)
 		})
+
+		// POST /manthan/replay/runEODNow — manually trigger Layer 1
+		// EOD Phase A AMO+SL submission outside the 15:35 IST cron window.
+		//
+		// Used for ops re-runs: e.g. when the 15:35 cycle skipped due to a
+		// transient bug (over-strict freeQty gate on T+0 buys) and an
+		// operator wants to re-arm after a hot fix. Idempotent — runs the
+		// same body the cron runs, InsertAMOOrder dedups already-armed
+		// positions via the partial-UNIQUE index. Not user-scoped: walks
+		// every position needing protection across all users.
+		metricsMux.HandleFunc("/manthan/replay/runEODNow", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST required", http.StatusMethodNotAllowed)
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+			defer cancel()
+			pr.RunEODPhaseANow(ctx)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"ok":true,"path":"EOD_PHASE_A"}`)
+		})
 	}
 	metricsServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),

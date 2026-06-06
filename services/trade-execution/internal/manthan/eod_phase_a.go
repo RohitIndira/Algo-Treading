@@ -144,9 +144,12 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 			continue
 		}
 
-		// Lazy-load freeQty once per user.
+		// Lazy-load EOD-sellable qty once per user. NOT freeQty — Indian T+1
+		// settlement means today's CNC buys have freeQty=0 at 15:35 even
+		// though the AMO will execute fine tomorrow morning post-settle.
+		// See fetchEODSellableQtyMap docstring for the full rationale.
 		if !uc.fetched {
-			uc.freeQty = p.fetchFreeQtyMap(cycleCtx, *uc.auth, pos.UserID)
+			uc.freeQty = p.fetchEODSellableQtyMap(cycleCtx, *uc.auth, pos.UserID)
 			uc.fetched = true
 		}
 
@@ -253,12 +256,15 @@ func (p *ProtectiveReplay) planEODTrigger(
 		return 0, 0, nil, "could not resolve symbol info (no indira_symbol / exchange_token)"
 	}
 
-	freeQty, hasHolding := freeQtyByUserSym[strings.ToUpper(pos.Symbol)]
+	sellableTomorrow, hasHolding := freeQtyByUserSym[strings.ToUpper(pos.Symbol)]
 	if !hasHolding {
 		return 0, 0, info, "position not in broker holdings — likely manually exited, reconcile via detector"
 	}
-	if freeQty < pos.NetQty {
-		return 0, 0, info, fmt.Sprintf("freeQty=%d < required=%d — CDSL/TPIN auth pending or auto-pledged for margin", freeQty, pos.NetQty)
+	if sellableTomorrow < pos.NetQty {
+		// Subtraction is holdingQty - usedQty - pledgeQty, so a shortfall
+		// here means shares are pledged or locked against margin — those
+		// won't free up overnight either and the AMO would correctly fail.
+		return 0, 0, info, fmt.Sprintf("sellable_after_settle=%d < required=%d — shares pledged or used as margin", sellableTomorrow, pos.NetQty)
 	}
 
 	// Trigger preference, in order:

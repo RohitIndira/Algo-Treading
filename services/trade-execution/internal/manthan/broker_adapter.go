@@ -23,6 +23,71 @@ type BrokerAdapter struct {
 	logger   *zap.Logger
 }
 
+// BrokerRejection is the structured form of a broker/exchange rejection,
+// returned by every BrokerAdapter order method so callers can decide retry
+// vs terminal-fail based on Category without parsing free text.
+//
+// Built from indiraClient.ParseCodifiResponse over the response's infoID,
+// infoMsg, RejReason fields. See pkg/indira/error_codes.go for the full
+// pattern catalog (built from 2026-06-06 NSE Contingency Drill captures).
+type BrokerRejection struct {
+	indiraClient.ExchangeRejection
+	Operation string // "place_limit_buy", "place_market_buy", "place_sl_sell", "place_amo_sl", "modify_sl"
+	OrderID   string // broker_order_id if the rejection arrives post-acceptance (Order Book), else ""
+}
+
+// Error implements error so callers can do `errors.Is/As` and existing
+// log.Error(err) sites keep working.
+func (e *BrokerRejection) Error() string {
+	if e.OrderID != "" {
+		return fmt.Sprintf("%s rejected (%s): %s [order %s]",
+			e.Operation, e.ExchangeRejection.String(), e.Raw, e.OrderID)
+	}
+	return fmt.Sprintf("%s rejected (%s): %s",
+		e.Operation, e.ExchangeRejection.String(), e.Raw)
+}
+
+// IsRetryable reports whether the rejection category permits an automatic
+// retry after recovering inputs (tick-round, DPR-clamp, etc.).
+func (e *BrokerRejection) IsRetryable() bool { return e.Retryable }
+
+// parseRejection builds a *BrokerRejection from a Codifi PlaceOrder response.
+// Returns nil if the response indicates the order was NOT rejected.
+//
+// The op parameter identifies the call site so logs / audit can tell which
+// adapter method produced the rejection. Common values:
+//   "place_limit_buy", "place_market_buy", "place_sl_sell",
+//   "place_amo_sl",   "modify_sl_trigger", "cancel_sl".
+func parseRejection(op string, resp *indiraClient.PlaceOrderResponse) *BrokerRejection {
+	if resp == nil {
+		return nil
+	}
+	// Codifi's data.ordStatus + data.rejReason. Also accept the legacy
+	// top-level Status="error" / Message variant a few endpoints use.
+	rejected := resp.OrdStatus == "Rejected" || resp.Status == "Rejected" || resp.Status == "error"
+	if !rejected {
+		return nil
+	}
+	// We don't have the API-envelope infoID/infoMsg here (the indira client
+	// already promoted those to BrokerBusinessError before returning).
+	// Parse against rejReason / Message.
+	parsed := indiraClient.ParseExchangeRejection(firstNonEmpty(resp.RejReason, resp.Message))
+	return &BrokerRejection{
+		ExchangeRejection: parsed,
+		Operation:         op,
+		OrderID:           firstNonEmpty(resp.OrdId, resp.OrderId),
+	}
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 // AMODprBuffer is the safety multiplier applied to DPR_lower when we're
 // preparing an AMO+SL trigger that has to survive overnight conversion.
 //
@@ -129,13 +194,11 @@ func (b *BrokerAdapter) PlaceLimitBuy(ctx context.Context, auth BrokerAuth, info
 		return "", fmt.Errorf("broker returned empty order ID")
 	}
 
-	// Check immediate rejection from response (per API docs: data.ordStatus + data.rejReason)
-	if resp.OrdStatus == "Rejected" || resp.Status == "Rejected" {
-		reason := resp.RejReason
-		if reason == "" {
-			reason = resp.Message
-		}
-		return "", fmt.Errorf("broker rejected: %s", reason)
+	// Check immediate rejection from response (per API docs: data.ordStatus + data.rejReason).
+	// Parsed into a structured BrokerRejection so callers can inspect Code/Tag/Category
+	// (see pkg/indira/error_codes.go for the catalog).
+	if rej := parseRejection("place_limit_buy", resp); rej != nil {
+		return "", rej
 	}
 
 	b.logger.Info("LIMIT BUY placed",
@@ -179,12 +242,8 @@ func (b *BrokerAdapter) PlaceMarketBuy(ctx context.Context, auth BrokerAuth, inf
 		return "", fmt.Errorf("broker returned empty market-buy order ID")
 	}
 
-	if resp.OrdStatus == "Rejected" || resp.Status == "Rejected" {
-		reason := resp.RejReason
-		if reason == "" {
-			reason = resp.Message
-		}
-		return "", fmt.Errorf("market buy rejected: %s", reason)
+	if rej := parseRejection("place_market_buy", resp); rej != nil {
+		return "", rej
 	}
 
 	b.logger.Info("MARKET BUY placed (LIMIT fallback)",
@@ -271,12 +330,8 @@ func (b *BrokerAdapter) PlaceSLMSell(ctx context.Context, auth BrokerAuth, info 
 		return "", fmt.Errorf("broker returned empty SL-M order ID")
 	}
 
-	if resp.OrdStatus == "Rejected" || resp.Status == "Rejected" {
-		reason := resp.RejReason
-		if reason == "" {
-			reason = resp.Message
-		}
-		return "", fmt.Errorf("SL-M order rejected: %s", reason)
+	if rej := parseRejection("place_slm_sell", resp); rej != nil {
+		return "", rej
 	}
 
 	b.logger.Info("SL-M SELL placed (fallback)",
@@ -327,12 +382,8 @@ func (b *BrokerAdapter) PlaceSLSell(ctx context.Context, auth BrokerAuth, info *
 		return "", fmt.Errorf("broker returned empty SL order ID")
 	}
 
-	if resp.OrdStatus == "Rejected" || resp.Status == "Rejected" {
-		reason := resp.RejReason
-		if reason == "" {
-			reason = resp.Message
-		}
-		return "", fmt.Errorf("SL order rejected: %s", reason)
+	if rej := parseRejection("place_sl_sell", resp); rej != nil {
+		return "", rej
 	}
 
 	b.logger.Info("SL-L SELL placed",
@@ -505,12 +556,8 @@ func (b *BrokerAdapter) PlaceAMOSLSell(ctx context.Context, auth BrokerAuth, inf
 		return "", fmt.Errorf("broker returned empty AMO+SL order ID")
 	}
 
-	if resp.OrdStatus == "Rejected" || resp.Status == "Rejected" {
-		reason := resp.RejReason
-		if reason == "" {
-			reason = resp.Message
-		}
-		return "", fmt.Errorf("AMO+SL submission rejected: %s", reason)
+	if rej := parseRejection("place_amo_sl_sell", resp); rej != nil {
+		return "", rej
 	}
 
 	b.logger.Info("AMO+SL SELL queued for next session",

@@ -57,6 +57,16 @@ type PlaceOrderRequest struct {
 	Amo          bool      `json:"amo"`          // After Market Order
 	BoStpLoss    *Price2DP `json:"boStpLoss,omitempty"`    // Bracket order stop loss
 	BoTgtPrice   *Price2DP `json:"boTgtPrice,omitempty"`   // Bracket order target price
+
+	// SEBI algo-tagging fields (2026 Algo Trading circular). Codifi's documented
+	// PlaceOrder spec doesn't list these, but the broker accepts and forwards
+	// them to NSE — confirmed by 2026-06-06 drill tests 49-54 (algoID variants
+	// all returned infoID="0" / status="Requested"). Set via the AlgoID and
+	// AlgoCategory env vars (MANTHAN_ALGO_ID, MANTHAN_ALGO_CATEGORY) before
+	// SEBI's enforcement deadline; orders without these will then fail with
+	// infoID/exchange code 17179 ERR_INVALID_ALGO_ID.
+	AlgoID       int    `json:"algoID,omitempty"`
+	AlgoCategory string `json:"algoCategory,omitempty"`
 }
 
 // PlaceOrderResponse represents the response from placing an order

@@ -458,6 +458,11 @@ func (p *ProtectiveReplay) resolveInfo(ctx context.Context, pos PositionNeedingP
 // fetchFreeQtyMap calls the holdings API and returns a dispSym → freeQty map.
 // On any error returns an empty map; callers treat empty as "skip everything"
 // (safer than firing blind).
+//
+// Used by the 09:14 IST morning hot-SL cron, where shares are already T+1
+// settled and freeQty is the right gate. For EOD Phase A (15:35 IST), use
+// fetchEODSellableQtyMap instead — freeQty is 0 for the day's own T+0 buys
+// even though the AMO will execute tomorrow morning post-settlement.
 func (p *ProtectiveReplay) fetchFreeQtyMap(ctx context.Context, auth BrokerAuth, userID string) map[string]int {
 	holdings, err := p.broker.client.GetHoldings(ctx, p.broker.toIndiraAuth(auth))
 	if err != nil {
@@ -482,6 +487,56 @@ func (p *ProtectiveReplay) fetchFreeQtyMap(ctx context.Context, auth BrokerAuth,
 		}
 	}
 	p.logger.Info("fetchFreeQtyMap: holdings snapshot",
+		zap.String("user", userID), zap.Int("symbols", len(out)))
+	return out
+}
+
+// fetchEODSellableQtyMap returns dispSym → sellableTomorrow map for the EOD
+// Phase A 15:35 IST path. Computed as holdingQty - usedQty - pledgeQty.
+//
+// Why not freeQty?
+//   freeQty is 0 for any position bought TODAY (T+0) because Indian markets
+//   are T+1 settle: today's CNC buy moves into the demat account overnight
+//   and isn't "free to sell" until the next morning. But EOD Phase A's AMO
+//   doesn't fire today — Indira queues it overnight and releases it at
+//   09:00 IST next session, after settlement completes. By that time the
+//   shares ARE free. Gating on freeQty here would mass-skip every position
+//   bought the same day Manthan signaled the entry — exactly the case
+//   Phase A is meant to protect.
+//
+// holdingQty - usedQty - pledgeQty is the "shares sellable once T+1
+// settlement clears". usedQty/pledgeQty subtractions cover shares pledged
+// to the broker or locked against margin obligations — those won't free
+// overnight and the AMO would correctly reject.
+func (p *ProtectiveReplay) fetchEODSellableQtyMap(ctx context.Context, auth BrokerAuth, userID string) map[string]int {
+	holdings, err := p.broker.client.GetHoldings(ctx, p.broker.toIndiraAuth(auth))
+	if err != nil {
+		p.logger.Warn("fetchEODSellableQtyMap: holdings API failed",
+			zap.String("user", userID), zap.Error(err))
+		return map[string]int{}
+	}
+	out := make(map[string]int, len(holdings))
+	for _, h := range holdings {
+		var key string
+		for _, s := range h.Symbol {
+			if s.Exc == "NSE" && s.DispSym != "" {
+				key = strings.ToUpper(s.DispSym)
+				break
+			}
+		}
+		if key == "" && len(h.Symbol) > 0 {
+			key = strings.ToUpper(h.Symbol[0].DispSym)
+		}
+		if key == "" {
+			continue
+		}
+		sellable := h.HoldingQty - h.UsedQty - h.PledgeQty
+		if sellable < 0 {
+			sellable = 0
+		}
+		out[key] = sellable
+	}
+	p.logger.Info("fetchEODSellableQtyMap: holdings snapshot (T+1 sellable)",
 		zap.String("user", userID), zap.Int("symbols", len(out)))
 	return out
 }
