@@ -242,6 +242,13 @@ var rejectPatterns = []rejPattern{
 	{contains: "Order Time has changed", code: 16346,
 		tag: "OE_ORD_CANNOT_MODIFY_STALE", category: CategoryStaleOrder},
 
+	// 2026-06-06 IDEA DPR re-cancel — cancel/modify against terminal order
+	// "Duplicate Modification.(CFIXBusinessServer:: ProcessCancelModifyOrderRequest)"
+	{contains: "Duplicate Modification", code: 16346,
+		tag: "OE_ORD_DUPLICATE_MOD_CANCEL", category: CategoryStaleOrder},
+	{contains: "ProcessCancelModifyOrderRequest", code: 16346,
+		tag: "OE_ORD_DUPLICATE_MOD_CANCEL", category: CategoryStaleOrder},
+
 	// #06 — exchange qty freeze
 	// " Quantity  is more than Maximum Quantity (101536) allowed by the exchange. ND03920"
 	{re: regexp.MustCompile(`(?i)Quantity\s+is more than Maximum Quantity\s*\((\d+)\)\s*allowed`),

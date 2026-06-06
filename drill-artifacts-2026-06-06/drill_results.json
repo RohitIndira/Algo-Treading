@@ -1,0 +1,303 @@
+[
+  {
+    "name": "01_clean_control_SBIN_buy_limit_1rupee",
+    "expected": "OK or session-closed feedback",
+    "request": {
+      "amo": false,
+      "disQty": 0,
+      "exc": "NSE",
+      "excToken": 3045,
+      "instrument": "STK",
+      "limitPrice": 1,
+      "lotSize": 0,
+      "ordAction": "BUY",
+      "ordType": "Limit",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 1,
+      "symbol": "STK_SBIN_EQ_NSE_3045",
+      "triggerPrice": 0
+    },
+    "http_status": 200,
+    "response": {
+      "data": {
+        "ordId": "NZWKE0000266",
+        "ordStatus": "Requested",
+        "rejReason": null
+      },
+      "infoID": "0",
+      "infoMsg": "success",
+      "timestamp": 1780731602751
+    },
+    "raw_response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780731602751,\"data\":{\"ordId\":\"NZWKE0000266\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "took": "169.556088ms"
+  },
+  {
+    "name": "02_tick_mismatch_SBIN_buy_limit_100.03",
+    "expected": "INVALID_PRICE / 16247 — SBIN tick=0.05, 100.03 not multiple",
+    "request": {
+      "amo": false,
+      "disQty": 0,
+      "exc": "NSE",
+      "excToken": 3045,
+      "instrument": "STK",
+      "limitPrice": 100.03,
+      "lotSize": 0,
+      "ordAction": "BUY",
+      "ordType": "Limit",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 1,
+      "symbol": "STK_SBIN_EQ_NSE_3045",
+      "triggerPrice": 0
+    },
+    "http_status": 200,
+    "response": {
+      "data": {},
+      "infoID": "EG003",
+      "infoMsg": "Price Not in multiple of PriceTick UserId[ND03920]",
+      "timestamp": 1780731603623
+    },
+    "raw_response": "{\"infoID\":\"EG003\",\"infoMsg\":\"Price Not in multiple of PriceTick UserId[ND03920]\",\"data\":{},\"timestamp\":1780731603623}",
+    "took": "69.831896ms"
+  },
+  {
+    "name": "03_dpr_breach_SBIN_buy_limit_1.00",
+    "expected": "ERR_PRICE_OUTSIDE_REVISED_PRICE_RANGE / 16521",
+    "request": {
+      "amo": false,
+      "disQty": 0,
+      "exc": "NSE",
+      "excToken": 3045,
+      "instrument": "STK",
+      "limitPrice": 1,
+      "lotSize": 0,
+      "ordAction": "BUY",
+      "ordType": "Limit",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 1,
+      "symbol": "STK_SBIN_EQ_NSE_3045",
+      "triggerPrice": 0
+    },
+    "http_status": 200,
+    "response": {
+      "data": {
+        "ordId": "NZWKE0000466",
+        "ordStatus": "Requested",
+        "rejReason": null
+      },
+      "infoID": "0",
+      "infoMsg": "success",
+      "timestamp": 1780731604529
+    },
+    "raw_response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780731604529,\"data\":{\"ordId\":\"NZWKE0000466\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "took": "104.93708ms"
+  },
+  {
+    "name": "04_sl_zero_trigger_SBIN_sell",
+    "expected": "ERR_INVALID_TRIGGER_PRICE / 16423",
+    "request": {
+      "amo": false,
+      "disQty": 0,
+      "exc": "NSE",
+      "excToken": 3045,
+      "instrument": "STK",
+      "limitPrice": 500,
+      "lotSize": 0,
+      "ordAction": "SELL",
+      "ordType": "SL",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 1,
+      "symbol": "STK_SBIN_EQ_NSE_3045",
+      "triggerPrice": 0
+    },
+    "http_status": 200,
+    "response": {
+      "data": {},
+      "infoID": "EG003",
+      "infoMsg": "Trigger price must be provided when order Type is SL",
+      "timestamp": 1780731605360
+    },
+    "raw_response": "{\"infoID\":\"EG003\",\"infoMsg\":\"Trigger price must be provided when order Type is SL\",\"data\":{},\"timestamp\":1780731605360}",
+    "took": "30.117715ms"
+  },
+  {
+    "name": "05_sl_limit_above_trigger_SBIN_sell",
+    "expected": "ERROR_SL_LMT_RSNBLTY_CHECK / 16448",
+    "request": {
+      "amo": false,
+      "disQty": 0,
+      "exc": "NSE",
+      "excToken": 3045,
+      "instrument": "STK",
+      "limitPrice": 600,
+      "lotSize": 0,
+      "ordAction": "SELL",
+      "ordType": "SL",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 1,
+      "symbol": "STK_SBIN_EQ_NSE_3045",
+      "triggerPrice": 500
+    },
+    "http_status": 200,
+    "response": {
+      "data": {},
+      "infoID": "EG003",
+      "infoMsg": "Trigger price should be greater than or equal to Limit price",
+      "timestamp": 1780731606193
+    },
+    "raw_response": "{\"infoID\":\"EG003\",\"infoMsg\":\"Trigger price should be greater than or equal to Limit price\",\"data\":{},\"timestamp\":1780731606193}",
+    "took": "31.919073ms"
+  },
+  {
+    "name": "06_qty_freeze_SBIN_buy_500000",
+    "expected": "ERR_QUANTITY_FREEZE_CANCELLED / 16307",
+    "request": {
+      "amo": false,
+      "disQty": 0,
+      "exc": "NSE",
+      "excToken": 3045,
+      "instrument": "STK",
+      "limitPrice": 500,
+      "lotSize": 0,
+      "ordAction": "BUY",
+      "ordType": "Limit",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 500000,
+      "symbol": "STK_SBIN_EQ_NSE_3045",
+      "triggerPrice": 0
+    },
+    "http_status": 200,
+    "response": {
+      "data": {
+        "ordId": "NZWKE0000566",
+        "ordStatus": "Requested",
+        "rejReason": null
+      },
+      "infoID": "0",
+      "infoMsg": "success",
+      "timestamp": 1780731607046
+    },
+    "raw_response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780731607046,\"data\":{\"ordId\":\"NZWKE0000566\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "took": "52.076416ms"
+  },
+  {
+    "name": "07_huge_value_RELIANCE_market_10000",
+    "expected": "ORDER_VALUE_EXCEEDS_ORDER_VALUE_LIMIT / 16442",
+    "request": {
+      "amo": false,
+      "disQty": 0,
+      "exc": "NSE",
+      "excToken": 2885,
+      "instrument": "STK",
+      "limitPrice": 0,
+      "lotSize": 0,
+      "ordAction": "BUY",
+      "ordType": "Market",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 10000,
+      "symbol": "STK_RELIANCE_EQ_NSE_2885",
+      "triggerPrice": 0
+    },
+    "http_status": 200,
+    "response": {
+      "data": {
+        "ordId": "NZWKE0000666",
+        "ordStatus": "Requested",
+        "rejReason": null
+      },
+      "infoID": "0",
+      "infoMsg": "success",
+      "timestamp": 1780731607900
+    },
+    "raw_response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780731607900,\"data\":{\"ordId\":\"NZWKE0000666\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "took": "53.991389ms"
+  },
+  {
+    "name": "08_modify_nonexistent_order",
+    "expected": "ERR_MOD_CAN_REJECT / 16115",
+    "request": {
+      "disQty": 0,
+      "exc": "NSE",
+      "exchangeToken": "3045",
+      "instrument": "STK",
+      "limitPrice": 500,
+      "lotSize": 0,
+      "offMktFlag": false,
+      "ordAction": "BUY",
+      "ordId": "NONEXISTENT_ORDER_99999",
+      "ordType": "Limit",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 1,
+      "symbol": "STK_SBIN_EQ_NSE_3045",
+      "tradedQty": 0,
+      "triggerPrice": 0
+    },
+    "http_status": 200,
+    "response": {
+      "data": {},
+      "infoID": "AU004",
+      "infoMsg": "Invalid Msg",
+      "timestamp": 1780731608746
+    },
+    "raw_response": "{\"infoID\":\"AU004\",\"infoMsg\":\"Invalid Msg\",\"data\":{},\"timestamp\":1780731608746}",
+    "took": "44.546036ms"
+  },
+  {
+    "name": "09_cancel_nonexistent_order",
+    "expected": "ERR_MOD_CAN_REJECT / 16115",
+    "request": {
+      "exc": "NSE",
+      "ordId": "NONEXISTENT_ORDER_99999",
+      "symbol": "STK_SBIN_EQ_NSE_3045"
+    },
+    "http_status": 200,
+    "response": {
+      "data": {},
+      "infoID": "EG003",
+      "infoMsg": "Invalid Msg",
+      "timestamp": 1780731609590
+    },
+    "raw_response": "{\"infoID\":\"EG003\",\"infoMsg\":\"Invalid Msg\",\"data\":{},\"timestamp\":1780731609590}",
+    "took": "41.460526ms"
+  },
+  {
+    "name": "10_clean_control_RELIANCE_buy_limit_1rupee",
+    "expected": "DPR breach or qty/value limit",
+    "request": {
+      "amo": false,
+      "disQty": 0,
+      "exc": "NSE",
+      "excToken": 2885,
+      "instrument": "STK",
+      "limitPrice": 1,
+      "lotSize": 0,
+      "ordAction": "BUY",
+      "ordType": "Limit",
+      "ordValidity": "DAY",
+      "prdType": "DELIVERY",
+      "qty": 1,
+      "symbol": "STK_RELIANCE_EQ_NSE_2885",
+      "triggerPrice": 0
+    },
+    "http_status": 200,
+    "response": {
+      "data": {
+        "ordId": "NZWKE0000766",
+        "ordStatus": "Requested",
+        "rejReason": null
+      },
+      "infoID": "0",
+      "infoMsg": "success",
+      "timestamp": 1780731610429
+    },
+    "raw_response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780731610429,\"data\":{\"ordId\":\"NZWKE0000766\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "took": "38.10846ms"
+  }
+]

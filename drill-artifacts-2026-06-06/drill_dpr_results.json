@@ -1,0 +1,52 @@
+[
+  {
+    "name": "DPR1_lower_breach_BUY_12.00",
+    "limit": "12",
+    "request": "{\"amo\":false,\"disQty\":0,\"exc\":\"NSE\",\"excToken\":14366,\"instrument\":\"STK\",\"limitPrice\":12,\"lotSize\":0,\"ordAction\":\"BUY\",\"ordType\":\"Limit\",\"ordValidity\":\"DAY\",\"prdType\":\"DELIVERY\",\"qty\":1,\"symbol\":\"STK_IDEA_EQ_NSE_14366\",\"triggerPrice\":0}",
+    "response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780736420051,\"data\":{\"ordId\":\"NZWKE0001A66\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "infoID": "0",
+    "infoMsg": "success",
+    "ordId": "NZWKE0001A66",
+    "ordStatus": "Requested"
+  },
+  {
+    "name": "DPR2_lower_boundary_BUY_13.43",
+    "limit": "13.43",
+    "request": "{\"amo\":false,\"disQty\":0,\"exc\":\"NSE\",\"excToken\":14366,\"instrument\":\"STK\",\"limitPrice\":13.43,\"lotSize\":0,\"ordAction\":\"BUY\",\"ordType\":\"Limit\",\"ordValidity\":\"DAY\",\"prdType\":\"DELIVERY\",\"qty\":1,\"symbol\":\"STK_IDEA_EQ_NSE_14366\",\"triggerPrice\":0}",
+    "response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780736420925,\"data\":{\"ordId\":\"NZWKE0001B66\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "infoID": "0",
+    "infoMsg": "success",
+    "ordId": "NZWKE0001B66",
+    "ordStatus": "Requested"
+  },
+  {
+    "name": "DPR3_inside_band_BUY_13.45",
+    "limit": "13.45",
+    "request": "{\"amo\":false,\"disQty\":0,\"exc\":\"NSE\",\"excToken\":14366,\"instrument\":\"STK\",\"limitPrice\":13.45,\"lotSize\":0,\"ordAction\":\"BUY\",\"ordType\":\"Limit\",\"ordValidity\":\"DAY\",\"prdType\":\"DELIVERY\",\"qty\":1,\"symbol\":\"STK_IDEA_EQ_NSE_14366\",\"triggerPrice\":0}",
+    "response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780736421677,\"data\":{\"ordId\":\"NZWKE0001C66\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "infoID": "0",
+    "infoMsg": "success",
+    "ordId": "NZWKE0001C66",
+    "ordStatus": "Requested"
+  },
+  {
+    "name": "DPR4_upper_boundary_BUY_16.43",
+    "limit": "16.43",
+    "request": "{\"amo\":false,\"disQty\":0,\"exc\":\"NSE\",\"excToken\":14366,\"instrument\":\"STK\",\"limitPrice\":16.43,\"lotSize\":0,\"ordAction\":\"BUY\",\"ordType\":\"Limit\",\"ordValidity\":\"DAY\",\"prdType\":\"DELIVERY\",\"qty\":1,\"symbol\":\"STK_IDEA_EQ_NSE_14366\",\"triggerPrice\":0}",
+    "response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780736422523,\"data\":{\"ordId\":\"NZWKE0001D66\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "infoID": "0",
+    "infoMsg": "success",
+    "ordId": "NZWKE0001D66",
+    "ordStatus": "Requested"
+  },
+  {
+    "name": "DPR5_upper_breach_BUY_17.50",
+    "limit": "17.5",
+    "request": "{\"amo\":false,\"disQty\":0,\"exc\":\"NSE\",\"excToken\":14366,\"instrument\":\"STK\",\"limitPrice\":17.5,\"lotSize\":0,\"ordAction\":\"BUY\",\"ordType\":\"Limit\",\"ordValidity\":\"DAY\",\"prdType\":\"DELIVERY\",\"qty\":1,\"symbol\":\"STK_IDEA_EQ_NSE_14366\",\"triggerPrice\":0}",
+    "response": "{\"infoID\":\"0\",\"infoMsg\":\"success\",\"timestamp\":1780736423270,\"data\":{\"ordId\":\"NZWKE0001E66\",\"ordStatus\":\"Requested\",\"rejReason\":null}}",
+    "infoID": "0",
+    "infoMsg": "success",
+    "ordId": "NZWKE0001E66",
+    "ordStatus": "Requested"
+  }
+]

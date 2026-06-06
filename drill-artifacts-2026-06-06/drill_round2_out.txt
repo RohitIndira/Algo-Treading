@@ -1,0 +1,40 @@
+
+===== T11_sl_buy_limit_below_trigger =====
+req:  {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":850,"lotSize":0,"ordAction":"BUY","ordType":"SL","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":900}
+http: 200  resp: {"infoID":"EG003","infoMsg":"Trigger price should be less than or equal to Limit price","data":{},"timestamp":1780731809965}
+
+===== T12_with_algoID_field =====
+req:  {"algoCategory":"ALGO","algoID":12345,"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http: 200  resp: {"infoID":"0","infoMsg":"success","timestamp":1780731810626,"data":{"ordId":"NZWKE0000866","ordStatus":"Requested","rejReason":null}}
+
+===== T13_negative_price =====
+req:  {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":-10,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http: 200  resp: {"infoID":"0","infoMsg":"success","timestamp":1780731811280,"data":{"ordId":"NZWKE0000966","ordStatus":"Requested","rejReason":null}}
+
+===== T14_zero_qty =====
+req:  {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":500,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":0,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http: 200  resp: {"infoID":"EG003","infoMsg":"Incorrect Quantity , Quantity could not be zero or negative","data":{},"timestamp":1780731811907}
+
+===== T15_invalid_exchange =====
+req:  {"amo":false,"disQty":0,"exc":"ZZZ","excToken":3045,"instrument":"STK","limitPrice":500,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http: 200  resp: {"infoID":"EG001","infoMsg":"Invalid request","data":{},"timestamp":1780731812512}
+
+===== T16_order_trail_rejected_amo =====
+req:  {"instrument":"STK","ordId":"NYMZX0028546"}
+http: 200  resp: {"infoID":"AU004","infoMsg":"No data found for Order History","data":{},"timestamp":1780731813184}
+
+===== T17_order_trail_today_margin =====
+req:  {"instrument":"STK","ordId":"NZWKE0000666"}
+http: 200  resp: {"infoID":"0","infoMsg":"success","timestamp":1780731814307,"data":{"symbol":{"exchange":"NSE","symbol":"STK_RELIANCE_EQ_NSE_2885","cmotsCode":"476","additionalInfo":"Reliance Industries","baseSym":"RELIANCE","instrumentType":"STK","isin":"INE002A01018","description":"Reliance Industries Ltd","optionType":null,"strikePrice":null,"expiryDate":null,"lotSize":1,"series":"EQ","tickSize":"0.1","createdAt":"2026-06-06T07:20:21","tradingSymbol":"RELIANCE-EQ","sector":"Refineries","capType":"Large Cap","noOfShares":null,"exchangeToken":2885,"openInterest":null,"multiplier":"1","streamSym":"2885_NSE","undExcToken":null,"dispSym":"RELIANCE","instrumentType1":null,"instrumentType2":null,"optionType2":null,"tickSize2":null,"expiryBuy":null,"expirySell":null,"strikePrice1":null,"strikePrice2":null,"exchangeToken1":null,"exchangeToken2":null,"tradingUnit":"RELIANCE INDUSTRIES LTD","priceQuoteQty":null,"category":"Company","freezeQty":"0","freeFloatShares":null,"pdc":"1291","imgUrl":"https://admin.stocksemoji.com/media/company_logo/476.png","weekTag":null,"fno":true,"mtf":false,"otherExch":[],"isWeeklyExpiry":null},"trails":[{"lupdateDateTime":"2026-06-06 13:10:07","ordDesc":"10000 Qty Rejected at Rs.1424.90","rejReason":"Margin Limit exceeded.Set/OptCFS/=13215.55,0.00,Used=2849927.29(M)(Prev=127.29,EM=0.00),ShortFall=2836711.74 across all securities of All Exchange Combined (Expiry/Settlement)  of  ND03920","qty":10000,"pendingQty":10000,"disQty":0,"price":1424.9,"triggerPrice":0.0,"tradedQty":0,"orderUpdatedAt":"2026-06-06 13:10:07","ordType":"Market","ordValidity":"DAY","status":"Rejected","exc":"NSE"},{"lupdateDateTime":"2026-06-06 13:10:07","ordDesc":"10000 Qty Requested at Rs.1424.90","rejReason":"Margin Limit exceeded.Set/OptCFS/=13215.55,0.00,Used=2849927.29(M)(Prev=127.29,EM=0.00),ShortFall=2836711.74 across all securities of All Exchange Combined (Expiry/Settlement)  of  ND03920","qty":10000,"pendingQty":10000,"disQty":0,"price":1424.9,"triggerPrice":0.0,"tradedQty":0,"orderUpdatedAt":"2026-06-06 13:10:07","ordType":"Market","ordValidity":"DAY","status":"Requested","exc":"NSE"}]}}
+
+===== T18_order_trail_today_qty_freeze =====
+req:  {"instrument":"STK","ordId":"NZWKE0000566"}
+http: 200  resp: {"infoID":"0","infoMsg":"success","timestamp":1780731815455,"data":{"symbol":{"exchange":"NSE","symbol":"STK_SBIN_EQ_NSE_3045","cmotsCode":"1375","additionalInfo":"SBI","baseSym":"SBIN","instrumentType":"STK","isin":"INE062A01020","description":"State Bank of India","optionType":null,"strikePrice":null,"expiryDate":null,"lotSize":1,"series":"EQ","tickSize":"0.05","createdAt":"2026-06-06T07:20:21","tradingSymbol":"SBIN-EQ","sector":"Banks","capType":"Large Cap","noOfShares":null,"exchangeToken":3045,"openInterest":null,"multiplier":"1","streamSym":"3045_NSE","undExcToken":null,"dispSym":"SBIN","instrumentType1":null,"instrumentType2":null,"optionType2":null,"tickSize2":null,"expiryBuy":null,"expirySell":null,"strikePrice1":null,"strikePrice2":null,"exchangeToken1":null,"exchangeToken2":null,"tradingUnit":"STATE BANK OF INDIA","priceQuoteQty":null,"category":"Company","freezeQty":"0","freeFloatShares":null,"pdc":"977.7","imgUrl":"https://admin.stocksemoji.com/media/company_logo/1375.png","weekTag":null,"fno":true,"mtf":false,"otherExch":[],"isWeeklyExpiry":null},"trails":[{"lupdateDateTime":"2026-06-06 13:10:06","ordDesc":"500000 Qty Rejected at Rs.500.00","rejReason":" Quantity  is more than Maximum Quantity (101536) allowed by the exchange. ND03920","qty":500000,"pendingQty":500000,"disQty":0,"price":500.0,"triggerPrice":0.0,"tradedQty":0,"orderUpdatedAt":"2026-06-06 13:10:06","ordType":"Limit","ordValidity":"DAY","status":"Rejected","exc":"NSE"},{"lupdateDateTime":"2026-06-06 13:10:06","ordDesc":"500000 Qty Requested at Rs.500.00","rejReason":" Quantity  is more than Maximum Quantity (101536) allowed by the exchange. ND03920","qty":500000,"pendingQty":500000,"disQty":0,"price":500.0,"triggerPrice":0.0,"tradedQty":0,"orderUpdatedAt":"2026-06-06 13:10:06","ordType":"Limit","ordValidity":"DAY","status":"Requested","exc":"NSE"}]}}
+
+===== T19_modify_cancelled_order =====
+req:  {"disQty":0,"exc":"NSE","exchangeToken":"3045","instrument":"STK","limitPrice":500,"lotSize":0,"offMktFlag":false,"ordAction":"BUY","ordId":"NZWKE0000266","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","tradedQty":0,"triggerPrice":0}
+http: 200  resp: {"infoID":"0","infoMsg":"success","timestamp":1780731816152,"data":{"ordId":"NZWKE0000266","ordStatus":"Requested","rejReason":null}}
+
+===== T20_cancel_cancelled_order =====
+req:  {"exc":"NSE","ordId":"NZWKE0000266","symbol":"STK_SBIN_EQ_NSE_3045"}
+http: 200  resp: {"infoID":"0","infoMsg":"success","timestamp":1780731816804,"data":{"ordId":"NZWKE0000266"}}

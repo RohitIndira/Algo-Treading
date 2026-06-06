@@ -139,6 +139,13 @@ func TestParseExchangeRejection_DrillCaptures(t *testing.T) {
 			wantRetry: false,
 		},
 		{
+			name:      "2026-06-06 DPR round: re-cancel terminal order",
+			input:     "Duplicate Modification.(CFIXBusinessServer:: ProcessCancelModifyOrderRequest)",
+			wantTag:   "OE_ORD_DUPLICATE_MOD_CANCEL",
+			wantCat:   CategoryStaleOrder,
+			wantRetry: false,
+		},
+		{
 			name:      "T06 qty above exchange freeze limit",
 			input:     " Quantity  is more than Maximum Quantity (101536) allowed by the exchange. ND03920",
 			wantTag:   "ERR_QUANTITY_FREEZE_CANCELLED",
@@ -278,6 +285,7 @@ func TestCatalogCoverage_DrillCaptures(t *testing.T) {
 		"Order Time has changed or is incorrect for modification/cancellation request",
 		" Quantity  is more than Maximum Quantity (101536) allowed by the exchange.",
 		"Order entered has invalid data.",
+		"Duplicate Modification.(CFIXBusinessServer:: ProcessCancelModifyOrderRequest)",
 	}
 	for _, raw := range drillFixtures {
 		got := ParseExchangeRejection(raw)

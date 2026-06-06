@@ -1,0 +1,45 @@
+
+===== DPR1_lower_breach_BUY_12.00 =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":14366,"instrument":"STK","limitPrice":12,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_IDEA_EQ_NSE_14366","triggerPrice":0}
+resp: {"infoID":"0","infoMsg":"success","timestamp":1780736420051,"data":{"ordId":"NZWKE0001A66","ordStatus":"Requested","rejReason":null}}
+
+===== DPR2_lower_boundary_BUY_13.43 =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":14366,"instrument":"STK","limitPrice":13.43,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_IDEA_EQ_NSE_14366","triggerPrice":0}
+resp: {"infoID":"0","infoMsg":"success","timestamp":1780736420925,"data":{"ordId":"NZWKE0001B66","ordStatus":"Requested","rejReason":null}}
+
+===== DPR3_inside_band_BUY_13.45 =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":14366,"instrument":"STK","limitPrice":13.45,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_IDEA_EQ_NSE_14366","triggerPrice":0}
+resp: {"infoID":"0","infoMsg":"success","timestamp":1780736421677,"data":{"ordId":"NZWKE0001C66","ordStatus":"Requested","rejReason":null}}
+
+===== DPR4_upper_boundary_BUY_16.43 =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":14366,"instrument":"STK","limitPrice":16.43,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_IDEA_EQ_NSE_14366","triggerPrice":0}
+resp: {"infoID":"0","infoMsg":"success","timestamp":1780736422523,"data":{"ordId":"NZWKE0001D66","ordStatus":"Requested","rejReason":null}}
+
+===== DPR5_upper_breach_BUY_17.50 =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":14366,"instrument":"STK","limitPrice":17.5,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_IDEA_EQ_NSE_14366","triggerPrice":0}
+resp: {"infoID":"0","infoMsg":"success","timestamp":1780736423270,"data":{"ordId":"NZWKE0001E66","ordStatus":"Requested","rejReason":null}}
+
+
+=== ORDER BOOK AFTER DPR TESTS ===
+ordId=NZWKE0001E66 sym=IDEA status=Pending price=17.5 qty=1 rejReason=""
+ordId=NZWKE0001D66 sym=IDEA status=Pending price=16.43 qty=1 rejReason=""
+ordId=NZWKE0001C66 sym=IDEA status=Pending price=13.45 qty=1 rejReason=""
+ordId=NZWKE0001B66 sym=IDEA status=Pending price=13.43 qty=1 rejReason=""
+ordId=NZWKE0001A66 sym=IDEA status=Pending price=12 qty=1 rejReason=""
+
+--- Trail for NZWKE0001E66 ---
+  ts=2026-06-06 14:30:22 status=Pending ordDesc=1 Qty Pending at Rs.17.50 rejReason=""
+
+--- Trail for NZWKE0001D66 ---
+  ts=2026-06-06 14:30:21 status=Pending ordDesc=1 Qty Pending at Rs.16.43 rejReason=""
+
+--- Trail for NZWKE0001C66 ---
+  ts=2026-06-06 14:30:21 status=Pending ordDesc=1 Qty Pending at Rs.13.45 rejReason=""
+
+--- Trail for NZWKE0001B66 ---
+  ts=2026-06-06 14:30:20 status=Pending ordDesc=1 Qty Pending at Rs.13.43 rejReason=""
+
+--- Trail for NZWKE0001A66 ---
+  ts=2026-06-06 14:30:19 status=Pending ordDesc=1 Qty Pending at Rs.12.00 rejReason=""
+
+=== saved /tmp/drill_dpr_results.json ===

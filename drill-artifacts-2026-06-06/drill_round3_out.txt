@@ -1,0 +1,157 @@
+# auth ready  jwt_len=298  appId=13ca3de309699e2ec3d1
+# now=2026-06-06 08:30:29
+
+===== [30] 30_missing_symbol =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734629968,"data":{"ordId":"NZWKE0000A66","ordStatus":"Requested","rejReason":null}}
+
+===== [31] 31_missing_excToken =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":0,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"AU004","infoMsg":"Scrip details not found.","data":{},"timestamp":1780734630743}
+
+===== [32] 32_invalid_instrument =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"XYZ","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG001","infoMsg":"Invalid request","data":{},"timestamp":1780734631449}
+
+===== [33] 33_invalid_ordType =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Invalid","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG001","infoMsg":"Invalid request","data":{},"timestamp":1780734632153}
+
+===== [34] 34_invalid_prdType =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"FOOBAR","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG001","infoMsg":"Invalid request","data":{},"timestamp":1780734632858}
+
+===== [35] 35_invalid_ordValidity =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"FOREVER","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG001","infoMsg":"Invalid request","data":{},"timestamp":1780734633564}
+
+===== [36] 36_invalid_ordAction =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"MAYBE","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG001","infoMsg":"Invalid request","data":{},"timestamp":1780734634269}
+
+===== [37] 37_invalid_exchange =====
+req: {"amo":false,"disQty":0,"exc":"BSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG003","infoMsg":"Scrip Information Not Found !!","data":{},"timestamp":1780734635035}
+
+===== [38] 38_excToken_mismatch_symbol =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":99999,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG003","infoMsg":"Scrip Information Not Found !!","data":{},"timestamp":1780734635814}
+
+===== [39] 39_limit_zero_on_Limit =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":0,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG003","infoMsg":"for RL order price should not be Zero","data":{},"timestamp":1780734636545}
+
+===== [40] 40_market_with_limit_set =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":500,"lotSize":0,"ordAction":"BUY","ordType":"Market","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734637283,"data":{"ordId":"NZWKE0000D66","ordStatus":"Requested","rejReason":null}}
+
+===== [41] 41_market_with_trigger_set =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":0,"lotSize":0,"ordAction":"BUY","ordType":"Market","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":500}
+http=200 resp={"infoID":"EG003","infoMsg":"Trigger price should not be allowed when order Type is RL-MKT","data":{},"timestamp":1780734638011}
+
+===== [42] 42_SLM_no_trigger =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":0,"lotSize":0,"ordAction":"BUY","ordType":"SL-M","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG003","infoMsg":"Trigger price must be provided when order Type is SL-MKT","data":{},"timestamp":1780734638744}
+
+===== [43] 43_SLM_with_trigger =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":0,"lotSize":0,"ordAction":"SELL","ordType":"SL-M","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":500}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734639516,"data":{"ordId":"NZWKE0000E66","ordStatus":"Requested","rejReason":null}}
+
+===== [44] 44_very_high_limit_99999 =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":99999,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734640252,"data":{"ordId":"NZWKE0000F66","ordStatus":"Requested","rejReason":null}}
+
+===== [45] 45_disQty_gt_qty =====
+req: {"amo":false,"disQty":100,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734640999,"data":{"ordId":"NZWKE0001066","ordStatus":"Requested","rejReason":null}}
+
+===== [46] 46_negative_qty =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":-1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"EG003","infoMsg":"Incorrect Quantity , Quantity could not be zero or negative","data":{},"timestamp":1780734641730}
+
+===== [47] 47_amo_true_explicit =====
+req: {"amo":true,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734642472,"data":{"ordId":"NZWKE0001166","ordStatus":"Requested","rejReason":null}}
+
+===== [48] 48_amo_with_SL_SELL =====
+req: {"amo":true,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":700,"lotSize":0,"ordAction":"SELL","ordType":"SL","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":750}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734643231,"data":{"ordId":"NZWKE0001266","ordStatus":"Requested","rejReason":null}}
+
+===== [49] 49_algoID_0 =====
+req: {"algoCategory":"ALGO","algoID":0,"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734643977,"data":{"ordId":"NZWKE0001366","ordStatus":"Requested","rejReason":null}}
+
+===== [50] 50_algoID_negative =====
+req: {"algoCategory":"ALGO","algoID":-1,"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734644718,"data":{"ordId":"NZWKE0001466","ordStatus":"Requested","rejReason":null}}
+
+===== [51] 51_algoID_huge =====
+req: {"algoCategory":"ALGO","algoID":999999999,"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734645458,"data":{"ordId":"NZWKE0001566","ordStatus":"Requested","rejReason":null}}
+
+===== [52] 52_algoID_string =====
+req: {"algoCategory":"ALGO","algoID":"INVALID_STRING","amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734646203,"data":{"ordId":"NZWKE0001666","ordStatus":"Requested","rejReason":null}}
+
+===== [53] 53_algoCategory_wrong =====
+req: {"algoCategory":"RETAIL","algoID":12345,"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734646950,"data":{"ordId":"NZWKE0001766","ordStatus":"Requested","rejReason":null}}
+
+===== [54] 54_only_algoCategory =====
+req: {"algoCategory":"ALGO","amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":1,"lotSize":0,"ordAction":"BUY","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734647692,"data":{"ordId":"NZWKE0001866","ordStatus":"Requested","rejReason":null}}
+
+===== [55] 55_sell_no_holdings_TPIN =====
+req: {"amo":false,"disQty":0,"exc":"NSE","excToken":3045,"instrument":"STK","limitPrice":800,"lotSize":0,"ordAction":"SELL","ordType":"Limit","ordValidity":"DAY","prdType":"DELIVERY","qty":1,"symbol":"STK_SBIN_EQ_NSE_3045","triggerPrice":0}
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734648475,"data":{"ordId":"NZWKE0001966","ordStatus":"Requested","rejReason":null}}
+
+===== [56] 56_holdings_fetch =====
+req: null
+http=200 resp={"infoID":"0","infoMsg":"success","timestamp":1780734649248,"data":{"invested":58.27,"unRealizedPnl":5.040000000000006,"marketValue":63.3099999999999996,"poa":true,"eAuthFlag":true,"holdings":[{"symbol":[{"symbol":"STK_LANDSMILL_EQ_NSE_17376","dispSym":"LANDSMILL","instrument":"STK","baseSym":"LANDSMILL","companyName":"Landsmill Green Limited","isin":"INE688J01023","exc":"NSE","excTkn":17376,"series":"EQ","lotSize":null,"tickSize":"0.01","holdingQty":null,"technicalScore":null,"fundamentalScore":null,"expiryDate":null,"optionType":null,"strikePrice":null,"streamSym":"17376_NSE","segment":null,"fno":false,"mtf":false,"multiplier":"1","freezeQty":null,"tradingSymbol":"LANDSMILL-EQ","otherExc":[],"isWeeklyExpiry":null,"expiryTag":null,"pdc":"0.88","prompt":null,"imgUrl":"https://admin.stocksemoji.com/media/company_logo/30141.png","alterTkn":0,"weekTag":null},{"symbol":"STK_LANDSMILL_EQ_BSE_533090","dispSym":"LANDSMILL","instrument":"STK","baseSym":"LANDSMILL","companyName":"Landsmill Green Limited","isin":"INE688J01023","exc":"BSE","excTkn":533090,"series":"EQ","lotSize":null,"tickSize":"0.01","holdingQty":null,"technicalScore":null,"fundamentalScore":null,"expiryDate":null,"optionType":null,"strikePrice":null,"streamSym":"533090_BSE","segment":null,"fno":false,"mtf":false,"multiplier":"1","freezeQty":null,"tradingSymbol":"LANDSMILL","otherExc":[],"isWeeklyExpiry":null,"expiryTag":null,"pdc":"0.88","prompt":null,"imgUrl":"https://admin.stocksemoji.com/media/company_logo/30141.png","alterTkn":0,"weekTag":null}],"ltp":0.88,"qty":5,"holdingQty":5,"usedQty":0,"btst":0,"pledgeQty":0,"avgPrice":1.64,"invested":8.2,"haircut":0.0,"pledgeable":false,"pledgeValue":0.0,"prdType":"DELIVERY","freeQty":0,"authFlag":true},{"symbol":[{"symbol":"STK_MAHACORP_EQ_BSE_505523","dispSym":"MAHACORP","instrument":"STK","baseSym":"MAHACORP","companyName":"Maharashtra Corporation Ltd","isin":"INE272E01027","exc":"BSE","excTkn":505523,"series":"EQ","lotSize":null,"tickSize":"0.01","holdingQty":null,"technicalScore":null,"fundamentalScore":null,"expiryDate":null,"optionType":null,"strikePrice":null,"streamSym":"505523_BSE","segment":null,"fno":false,"mtf":false,"multiplier":"1","freezeQty":null,"tradingSymbol":"MAHACORP","otherExc":[],"isWeeklyExpiry":null,"expiryTag":null,"pdc":"0.36","prompt":null,"imgUrl":"https://admin.stocksemoji.com/media/company_logo/2178.png","alterTkn":0,"weekTag":null}],"ltp":0.36,"qty":10,"holdingQty":10,"usedQty":0,"btst":0,"pledgeQty":0,"avgPrice":0.87,"invested":8.7,"haircut":0.0,"pledgeable":false,"pledgeValue":0.0,"prdType":"DELIVERY","freeQty":0,"authFlag":true},{"symbol":[{"symbol":"STK_SUZLON_EQ_NSE_12018","dispSym":"SUZLON","instrument":"STK","baseSym":"SUZLON","companyName":"Suzlon Energy Ltd","isin":"INE040H01021","exc":"NSE","excTkn":12018,"series":"EQ","lotSize":null,"tickSize":"0.01","holdingQty":null,"technicalScore":null,"fundamentalScore":null,"expiryDate":null,"optionType":null,"strikePrice":null,"streamSym":"12018_NSE","segment":null,"fno":true,"mtf":false,"multiplier":"1","freezeQty":null,"tradingSymbol":"SUZLON-EQ","otherExc":[],"isWeeklyExpiry":null,"expiryTag":null,"pdc":"55.31","prompt":null,"imgUrl":"https://admin.stocksemoji.com/media/company_logo/13872.png","alterTkn":0,"weekTag":null},{"symbol":"STK_SUZLON_EQ_BSE_532667","dispSym":"SUZLON","instrument":"STK","baseSym":"SUZLON","companyName":"Suzlon Energy Ltd","isin":"INE040H01021","exc":"BSE","excTkn":532667,"series":"EQ","lotSize":null,"tickSize":"0.01","holdingQty":null,"technicalScore":null,"fundamentalScore":null,"expiryDate":null,"optionType":null,"strikePrice":null,"streamSym":"532667_BSE","segment":null,"fno":false,"mtf":false,"multiplier":"1","freezeQty":null,"tradingSymbol":"SUZLON","otherExc":[],"isWeeklyExpiry":null,"expiryTag":null,"pdc":"55.36","prompt":null,"imgUrl":"https://admin.stocksemoji.com/media/company_logo/13872.png","alterTkn":0,"weekTag":null}],"ltp":55.31,"qty":1,"holdingQty":1,"usedQty":0,"btst":0,"pledgeQty":0,"avgPrice":41.37,"invested":41.37,"haircut":0.0,"pledgeable":true,"pledgeValue":46.54,"prdType":"DELIVERY","freeQty":0,"authFlag":true}]}}
+
+===== [57] 57_positions_fetch =====
+req: null
+http=404 resp={"type":"about:blank","title":"Not Found","status":404,"detail":"No static resource portfolio/v1/positions.","instance":"/portfolio-services/api/portfolio/v1/positions"}
+
+===== [58] 58_trail_empty_ordId =====
+req: {"instrument":"STK","ordId":""}
+http=200 resp={"infoID":"EG003","infoMsg":"limit must be provided","data":{},"timestamp":1780734650686}
+
+===== [59] 59_trail_wrong_instrument =====
+req: {"instrument":"OPT","ordId":"NZWKE0000666"}
+http=200 resp={"infoID":"EG001","infoMsg":"Invalid request","data":{},"timestamp":1780734651393}
+====================================================================================================
+#   | name                             | infoID | ordStatus    | infoMsg
+----------------------------------------------------------------------------------------------------
+30  | 30_missing_symbol                | 0      | Requested    | success
+31  | 31_missing_excToken              | AU004  |              | Scrip details not found.
+32  | 32_invalid_instrument            | EG001  |              | Invalid request
+33  | 33_invalid_ordType               | EG001  |              | Invalid request
+34  | 34_invalid_prdType               | EG001  |              | Invalid request
+35  | 35_invalid_ordValidity           | EG001  |              | Invalid request
+36  | 36_invalid_ordAction             | EG001  |              | Invalid request
+37  | 37_invalid_exchange              | EG003  |              | Scrip Information Not Found !!
+38  | 38_excToken_mismatch_symbol      | EG003  |              | Scrip Information Not Found !!
+39  | 39_limit_zero_on_Limit           | EG003  |              | for RL order price should not be Zero
+40  | 40_market_with_limit_set         | 0      | Requested    | success
+41  | 41_market_with_trigger_set       | EG003  |              | Trigger price should not be allowed when order Type is RL-MK
+42  | 42_SLM_no_trigger                | EG003  |              | Trigger price must be provided when order Type is SL-MKT
+43  | 43_SLM_with_trigger              | 0      | Requested    | success
+44  | 44_very_high_limit_99999         | 0      | Requested    | success
+45  | 45_disQty_gt_qty                 | 0      | Requested    | success
+46  | 46_negative_qty                  | EG003  |              | Incorrect Quantity , Quantity could not be zero or negative
+47  | 47_amo_true_explicit             | 0      | Requested    | success
+48  | 48_amo_with_SL_SELL              | 0      | Requested    | success
+49  | 49_algoID_0                      | 0      | Requested    | success
+50  | 50_algoID_negative               | 0      | Requested    | success
+51  | 51_algoID_huge                   | 0      | Requested    | success
+52  | 52_algoID_string                 | 0      | Requested    | success
+53  | 53_algoCategory_wrong            | 0      | Requested    | success
+54  | 54_only_algoCategory             | 0      | Requested    | success
+55  | 55_sell_no_holdings_TPIN         | 0      | Requested    | success
+56  | 56_holdings_fetch                | 0      |              | success
+57  | 57_positions_fetch               |        |              | 
+58  | 58_trail_empty_ordId             | EG003  |              | limit must be provided
+59  | 59_trail_wrong_instrument        | EG001  |              | Invalid request
+
+=== 30 results saved to /tmp/drill_round3_results.json ===
