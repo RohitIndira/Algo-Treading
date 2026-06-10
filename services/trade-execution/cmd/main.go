@@ -24,6 +24,7 @@ import (
 	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/fillprice"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/lifecycle"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
@@ -493,6 +494,18 @@ func main() {
 	if pfTimeout := getEnvInt("OCO_PARTIAL_FILL_TIMEOUT", 50); pfTimeout > 0 {
 		ocoManager.SetPartialFillTimeout(time.Duration(pfTimeout) * time.Second)
 	}
+
+	// Execution-price resolver: when the order WS carries no TradedPrice on an
+	// entry fill, the OCO fill-price retry worker resolves the real fill from the
+	// broker trade book (batched + cached per user) so SL/TP are computed from the
+	// actual execution price — not the inflated entry-limit price. Past a deadline
+	// it falls back to the buffer-stripped limit so a position is never unprotected.
+	fillPriceCache := fillprice.NewCache(indiraClient, time.Duration(getEnvInt("TRADEBOOK_CACHE_TTL_MS", 1500))*time.Millisecond)
+	ocoManager.SetFillPriceCache(
+		fillPriceCache,
+		time.Duration(getEnvInt("OCO_FILLPRICE_DEADLINE_SEC", 30))*time.Second,
+		time.Duration(getEnvInt("OCO_FILLPRICE_RETRY_INTERVAL_SEC", 3))*time.Second,
+	)
 
 	// Wire OCO manager → frontend WS so OCO events appear in real-time.
 	// Some OCO events (oco_legs_confirmed, oco_completed) have no order attached —
@@ -1012,6 +1025,12 @@ func main() {
 		statusService.StartFillReconcile(ctx, d)
 		log.Printf("✓ Trade-book fill reconciler started (%s interval)", d)
 	}
+
+	// OCO fill-price retry worker: resolves the execution price (trade book →
+	// deadline limit-fallback) for entries that filled without a WS TradedPrice,
+	// then places their deferred SL/TP legs. Cheap when idle (no awaiting groups).
+	ocoManager.StartFillPriceRetry(ctx)
+	log.Println("✓ OCO fill-price retry worker started")
 
 	// ── Lifecycle: ordered graceful shutdown ──────────────────────────────────
 	lc := lifecycle.New(cancel, 15*time.Second)
