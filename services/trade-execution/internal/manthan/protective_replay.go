@@ -328,9 +328,21 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 			continue
 		}
 
-		// Lazy-load freeQty for this user.
+		// Lazy-load sellable qty for this user.
+		//
+		// 2026-06-10 incident: Indira's holdings API returns freeQty=0 for
+		// all positions even when shares are owned, unpledged, and POA is
+		// active. The broker actually ACCEPTS sell orders regardless of
+		// the freeQty=0 display value — we proved this by placing 12
+		// successful SLs for S4450 while freeQty=0 across the board.
+		//
+		// Switch to the same formula EOD Phase A uses:
+		//   sellable = holdingQty - usedQty - pledgeQty
+		// This still correctly skips positions with shares pledged or
+		// locked against margin (where the broker would actually reject)
+		// but stops blocking on the misleading freeQty=0 cache state.
 		if !uc.fetched {
-			uc.freeQty = p.fetchFreeQtyMap(ctx, *auth, pos.UserID)
+			uc.freeQty = p.fetchEODSellableQtyMap(ctx, *auth, pos.UserID)
 			uc.fetched = true
 		}
 
@@ -358,12 +370,15 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 			continue
 		}
 		if freeQty < pos.NetQty {
+			// Reaching here now means shares are genuinely pledged or
+			// locked against margin (holdingQty - usedQty - pledgeQty <
+			// position size), not the old freeQty=0 false-positive.
 			plans = append(plans, FirePlan{
 				Pos:        pos,
 				Auth:       *auth,
 				Info:       info,
 				Action:     FireSkip,
-				SkipReason: fmt.Sprintf("freeQty=%d < required=%d — CDSL/TPIN auth pending or auto-pledged for margin", freeQty, pos.NetQty),
+				SkipReason: fmt.Sprintf("sellable_qty=%d < required=%d — shares pledged or used as margin", freeQty, pos.NetQty),
 			})
 			continue
 		}
