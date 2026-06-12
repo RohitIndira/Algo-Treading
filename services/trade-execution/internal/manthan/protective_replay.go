@@ -653,7 +653,9 @@ func (p *ProtectiveReplay) fireOne(ctx context.Context, plan FirePlan) FireResul
 	var brokerID string
 	switch plan.Action {
 	case FireSLLimit:
-		brokerID, err = p.broker.PlaceSLSell(ctx, plan.Auth, plan.Info, plan.IntendedQty, plan.SafeTrigger, plan.SafeLimit)
+		// broker-real trigger/limit are reconciled into broker_trigger_price by the
+		// Reconciler's periodic sync; the AMO row keeps the intended SafeTrigger.
+		brokerID, _, _, err = p.broker.PlaceSLSell(ctx, plan.Auth, plan.Info, plan.IntendedQty, plan.SafeTrigger, plan.SafeLimit)
 	case FireSLMarket:
 		brokerID, err = p.broker.PlaceSLMSell(ctx, plan.Auth, plan.Info, plan.IntendedQty, plan.SafeTrigger)
 	case FireMarketSell:

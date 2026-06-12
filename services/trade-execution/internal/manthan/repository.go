@@ -102,16 +102,55 @@ func (r *Repository) UpdateSLBrokerID(ctx context.Context, id int64, brokerOrder
 	return err
 }
 
+// UpdateSLBrokerExec is UpdateSLBrokerID plus the broker-real trigger/limit the
+// exchange actually accepted (post DPR/tick clamp). trigger_price is left as the
+// intended (un-clamped) stop set at InsertOrder; only broker_trigger_price /
+// broker_limit_price record the clamped reality. This is the SSOT split.
+func (r *Repository) UpdateSLBrokerExec(ctx context.Context, id int64, brokerOrderID string, parentID int64, brokerTrigger, brokerLimit float64) error {
+	now := time.Now()
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET broker_order_id=$1, status='SL_PLACED', parent_order_id=$2,
+		       broker_trigger_price=$3, broker_limit_price=$4, placed_at=$5, updated_at=$5
+		 WHERE id=$6`, brokerOrderID, parentID, brokerTrigger, brokerLimit, now, id)
+	return err
+}
+
+// UpdateSLAfterModify records a successful trail modify: trigger_price/limit_price
+// move to the new INTENDED stop (drives the next ratchet), while
+// broker_trigger_price/broker_limit_price record what the exchange accepted.
+// Fixes the latent bug where trail modifies updated the broker but never the DB row.
+func (r *Repository) UpdateSLAfterModify(ctx context.Context, id int64, intendedTrigger, intendedLimit, brokerTrigger, brokerLimit float64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET trigger_price=$1, limit_price=$2,
+		       broker_trigger_price=$3, broker_limit_price=$4, updated_at=NOW()
+		 WHERE id=$5`, intendedTrigger, intendedLimit, brokerTrigger, brokerLimit, id)
+	return err
+}
+
+// UpdateBrokerTrigger mirrors the broker's actual resting SL trigger/limit into
+// the DB without touching the intended trigger_price. Called by the Reconciler
+// each cycle so manthan_orders always reflects broker reality (SSOT).
+func (r *Repository) UpdateBrokerTrigger(ctx context.Context, id int64, brokerTrigger, brokerLimit float64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET broker_trigger_price=$1, broker_limit_price=$2, updated_at=NOW()
+		 WHERE id=$3`, brokerTrigger, brokerLimit, id)
+	return err
+}
+
 // UpdateSLAfterTopupMerge bumps an existing SL_SELL row's qty + trigger/limit
 // after a top-up fill merged into the parent SL via ModifyOrder. Without this
 // the next trail tick would call ModifySLOrder with the STALE pre-topup qty,
 // which Indira interprets as a request to shrink the SL back down — silently
 // dropping protection on the top-up shares.
-func (r *Repository) UpdateSLAfterTopupMerge(ctx context.Context, id int64, newQty int, newTrigger, newLimit float64) error {
+func (r *Repository) UpdateSLAfterTopupMerge(ctx context.Context, id int64, newQty int, intendedTrigger, intendedLimit, brokerTrigger, brokerLimit float64) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE manthan_orders
-		   SET qty=$1, trigger_price=$2, limit_price=$3, updated_at=NOW()
-		 WHERE id=$4`, newQty, newTrigger, newLimit, id)
+		   SET qty=$1, trigger_price=$2, limit_price=$3,
+		       broker_trigger_price=$4, broker_limit_price=$5, updated_at=NOW()
+		 WHERE id=$6`, newQty, intendedTrigger, intendedLimit, brokerTrigger, brokerLimit, id)
 	return err
 }
 

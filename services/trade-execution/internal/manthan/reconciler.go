@@ -192,6 +192,16 @@ func (r *Reconciler) reconcileUser(ctx context.Context, userID string, auth Brok
 func (r *Reconciler) applyDrift(ctx context.Context, db *ManthanOrder, bOrd *indiraClient.OrderBook) bool {
 	br := strings.ToUpper(strings.TrimSpace(bOrd.Status))
 
+	// SSOT sync: mirror the broker's actual resting SL trigger/limit into the DB
+	// (broker_trigger_price) so manthan_orders always reflects exchange reality,
+	// independent of the intended trigger_price. Idempotent UPDATE; not a "fix".
+	if db.Status == StatusSLPlaced && bOrd.TriggerPrice > 0 {
+		if err := r.repo.UpdateBrokerTrigger(ctx, db.ID, bOrd.TriggerPrice, bOrd.Price); err != nil {
+			r.logger.Warn("Reconciler: broker_trigger_price sync failed",
+				zap.Int64("order_id", db.ID), zap.Error(err))
+		}
+	}
+
 	// Drift A: broker says Executed but DB says still-placed
 	if isExecutedBrokerStatus(br) && db.Status == StatusPlaced && db.FilledQty < db.Qty {
 		tradedQty := bOrd.TradedQty

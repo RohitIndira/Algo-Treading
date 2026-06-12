@@ -343,8 +343,13 @@ func (b *BrokerAdapter) PlaceSLMSell(ctx context.Context, auth BrokerAuth, info 
 	return orderID, nil
 }
 
-// PlaceSLSell places an SL-L (stop-loss limit) SELL order.
-func (b *BrokerAdapter) PlaceSLSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) (string, error) {
+// PlaceSLSell places an SL-L (stop-loss limit) SELL order. Returns the broker
+// order id plus the ACTUAL trigger/limit it sent to the exchange (post DPR +
+// tick clamp) so the caller can record the broker-real value separately from
+// the intended (un-clamped) stop. The caller passes the intended trigger; the
+// DPR clamp lives here (placement-time only) — never store the clamped value as
+// the trail baseline.
+func (b *BrokerAdapter) PlaceSLSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) (brokerOrderID string, brokerTrigger float64, brokerLimit float64, err error) {
 	roundedTrigger := b.roundAndClamp(triggerPrice, info.TickSize, info.DPRLower, info.DPRUpper)
 	roundedLimit := b.roundAndClamp(limitPrice, info.TickSize, info.DPRLower, info.DPRUpper)
 
@@ -371,7 +376,7 @@ func (b *BrokerAdapter) PlaceSLSell(ctx context.Context, auth BrokerAuth, info *
 
 	resp, err := b.client.PlaceOrder(ctx, b.toIndiraAuth(auth), req)
 	if err != nil {
-		return "", err
+		return "", 0, 0, err
 	}
 
 	orderID := resp.OrderId
@@ -379,11 +384,11 @@ func (b *BrokerAdapter) PlaceSLSell(ctx context.Context, auth BrokerAuth, info *
 		orderID = resp.OrdId
 	}
 	if orderID == "" {
-		return "", fmt.Errorf("broker returned empty SL order ID")
+		return "", 0, 0, fmt.Errorf("broker returned empty SL order ID")
 	}
 
 	if rej := parseRejection("place_sl_sell", resp); rej != nil {
-		return "", rej
+		return "", 0, 0, rej
 	}
 
 	b.logger.Info("SL-L SELL placed",
@@ -393,20 +398,22 @@ func (b *BrokerAdapter) PlaceSLSell(ctx context.Context, auth BrokerAuth, info *
 		zap.Float64("limit", roundedLimit),
 		zap.String("broker_order_id", orderID))
 
-	return orderID, nil
+	return orderID, roundedTrigger, roundedLimit, nil
 }
 
-// ModifySLOrder modifies an existing SL order's trigger and limit prices (atomic).
+// ModifySLOrder modifies an existing SL order's trigger and limit (atomic).
 // Fetches real tradedQty from orderbook (API requires it for validation).
-func (b *BrokerAdapter) ModifySLOrder(ctx context.Context, auth BrokerAuth, info *SymbolInfo, brokerOrderID string, qty int, newTrigger, newLimit float64) error {
+// Returns the ACTUAL trigger/limit it sent to the exchange (post DPR + tick
+// clamp) so the caller records the broker-real value alongside the intended.
+func (b *BrokerAdapter) ModifySLOrder(ctx context.Context, auth BrokerAuth, info *SymbolInfo, brokerOrderID string, qty int, newTrigger, newLimit float64) (brokerTrigger float64, brokerLimit float64, err error) {
 	roundedTrigger := b.roundAndClamp(newTrigger, info.TickSize, info.DPRLower, info.DPRUpper)
 	roundedLimit := b.roundAndClamp(newLimit, info.TickSize, info.DPRLower, info.DPRUpper)
 
 	// Fetch real tradedQty from broker (API requires it — must be >= actual traded)
 	tradedQty := 0
 	if b.client != nil {
-		_, tq, _, err := b.GetOrderStatus(ctx, auth, brokerOrderID)
-		if err == nil {
+		_, tq, _, gerr := b.GetOrderStatus(ctx, auth, brokerOrderID)
+		if gerr == nil {
 			tradedQty = tq
 		}
 	}
@@ -432,8 +439,8 @@ func (b *BrokerAdapter) ModifySLOrder(ctx context.Context, auth BrokerAuth, info
 		DisQty:        0,
 	}
 
-	if err := b.client.ModifyOrder(ctx, b.toIndiraAuth(auth), req); err != nil {
-		return err
+	if merr := b.client.ModifyOrder(ctx, b.toIndiraAuth(auth), req); merr != nil {
+		return 0, 0, merr
 	}
 
 	b.logger.Info("SL order modified",
@@ -443,7 +450,7 @@ func (b *BrokerAdapter) ModifySLOrder(ctx context.Context, auth BrokerAuth, info
 		zap.Float64("new_limit", roundedLimit),
 		zap.Int("traded_qty", tradedQty))
 
-	return nil
+	return roundedTrigger, roundedLimit, nil
 }
 
 // CancelOrder cancels an order by broker order ID.

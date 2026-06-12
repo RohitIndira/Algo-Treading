@@ -168,7 +168,7 @@ func (r *Recovery) replaceSL(ctx context.Context, sl *ManthanOrder, auth *Broker
 		TickSize:      0.05,
 	}
 
-	newBrokerID, err := r.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, sl.LimitPrice)
+	newBrokerID, _, _, err := r.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, sl.LimitPrice)
 	if err != nil {
 		r.logger.Error("Recovery: SL re-place FAILED — MARKET SELL",
 			zap.String("symbol", sl.Symbol), zap.Error(err))

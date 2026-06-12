@@ -210,7 +210,7 @@ func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
 				Exchange:      "NSE",
 				TickSize:      0.05,
 			}
-			newBrokerID, placeErr := m.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, sl.LimitPrice)
+			newBrokerID, _, _, placeErr := m.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, sl.LimitPrice)
 			if placeErr != nil {
 				m.logger.Error("Safety monitor: SL re-place FAILED — MARKET SELL",
 					zap.String("symbol", sl.Symbol), zap.Error(placeErr))

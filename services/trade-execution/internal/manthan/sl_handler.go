@@ -77,20 +77,15 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 		}
 	}
 
-	// Clamp SL trigger to DPR lower (broker rejects orders below DPR)
-	if info.DPRLower > 0 && triggerPrice < info.DPRLower {
-		h.logger.Warn("SL trigger below DPR — clamping to DPR lower",
-			zap.String("symbol", signal.Symbol),
-			zap.Float64("original_trigger", triggerPrice),
-			zap.Float64("dpr_lower", info.DPRLower))
-		triggerPrice = info.DPRLower
-		limitPrice = triggerPrice - SLLimitGap(triggerPrice, info.TickSize)
-		if limitPrice < info.DPRLower {
-			limitPrice = info.DPRLower
-		}
-	}
+	// NOTE: the DPR clamp deliberately does NOT happen here. The incoming
+	// triggerPrice is the INTENDED stop (entry/high * 0.80) and is stored as-is
+	// in trigger_price so the trail ratchet can keep modifying on 2% moves and
+	// relax back to the true 20%. The broker adapter (PlaceSLSell) applies the
+	// DPR/tick clamp at placement time only and returns the broker-real value,
+	// which we record separately in broker_trigger_price. Clamping-then-storing
+	// here is what froze SANDHAR's SL too tight (see migration 015).
 
-	// Create SL order record
+	// Create SL order record (trigger_price = intended, un-clamped)
 	slOrder := &ManthanOrder{
 		SignalID:      fmt.Sprintf("sl-%s", signal.OrderID),
 		StrategyID:    signal.StrategyID,
@@ -135,17 +130,18 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 	// LIVE mode — place with broker, retry on failure (includes one auth-refresh
 	// retry on AU004/401 before falling back to exponential backoff).
 	var brokerID string
+	var brokerTrig, brokerLim float64
 	err = RetryWithBackoff(ctx, 3, func() error {
-		brokerID2, placeErr := h.broker.PlaceSLSell(ctx, auth, info, qty, triggerPrice, limitPrice)
+		brokerID2, bt, bl, placeErr := h.broker.PlaceSLSell(ctx, auth, info, qty, triggerPrice, limitPrice)
 		if IsAuthError(placeErr) && h.refreshAuth != nil {
 			h.logger.Warn("SL placement hit auth error — refreshing credentials",
 				zap.String("user", signal.UserID), zap.Error(placeErr))
 			if freshAuth := h.refreshAuth(signal.UserID); freshAuth != nil {
 				auth = *freshAuth
-				brokerID2, placeErr = h.broker.PlaceSLSell(ctx, auth, info, qty, triggerPrice, limitPrice)
+				brokerID2, bt, bl, placeErr = h.broker.PlaceSLSell(ctx, auth, info, qty, triggerPrice, limitPrice)
 			}
 		}
-		brokerID = brokerID2
+		brokerID, brokerTrig, brokerLim = brokerID2, bt, bl
 		return placeErr
 	})
 
@@ -170,15 +166,18 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 		return
 	}
 
-	_ = h.repo.UpdateSLBrokerID(ctx, slOrderID, brokerID, entryOrderID)
+	// Store intended trigger (trigger_price, set at InsertOrder) + broker-real
+	// trigger/limit the exchange accepted (broker_trigger_price). SSOT split.
+	_ = h.repo.UpdateSLBrokerExec(ctx, slOrderID, brokerID, entryOrderID, brokerTrig, brokerLim)
 	_ = h.repo.InsertEvent(ctx, slOrderID, "SL_PLACED", "PENDING", "SL_PLACED", "",
-		triggerPrice, qty, fmt.Sprintf("broker_id=%s trigger=%.2f limit=%.2f", brokerID, triggerPrice, limitPrice))
+		triggerPrice, qty, fmt.Sprintf("broker_id=%s intended=%.2f broker_trigger=%.2f broker_limit=%.2f", brokerID, triggerPrice, brokerTrig, brokerLim))
 
 	h.logger.Info("SL-L SELL placed",
 		zap.String("symbol", signal.Symbol),
 		zap.String("broker_id", brokerID),
-		zap.Float64("trigger", triggerPrice),
-		zap.Float64("limit", limitPrice))
+		zap.Float64("intended_trigger", triggerPrice),
+		zap.Float64("broker_trigger", brokerTrig),
+		zap.Float64("broker_limit", brokerLim))
 
 	// Publish SL_PLACED so rules-engine knows the SL is at broker. Used by
 	// FillConsumer to update manthan_positions.current_sl atomically.
@@ -240,19 +239,14 @@ func (h *SLHandler) MergeTopupSL(
 	}
 
 	combinedQty := parentSL.Qty + topupQty
-	// Ratchet: never lower the broker stop. parentSL.TriggerPrice already
-	// reflects any TSL trailing that ran while we held the original position.
+	// Ratchet on the INTENDED stop: never lower below parentSL.TriggerPrice
+	// (which is now the intended, un-clamped value). DPR clamping is left to the
+	// broker adapter at placement time; we store the intended here.
 	newTrigger := parentSL.TriggerPrice
 	if topupBased := topupAvgPrice * 0.80; topupBased > newTrigger {
 		newTrigger = topupBased
 	}
-	if info.DPRLower > 0 && newTrigger < info.DPRLower {
-		newTrigger = info.DPRLower
-	}
 	newLimit := newTrigger - SLLimitGap(newTrigger, info.TickSize)
-	if info.DPRLower > 0 && newLimit < info.DPRLower {
-		newLimit = info.DPRLower
-	}
 
 	h.logger.Info("Top-up SL merge: extending parent SL",
 		zap.String("symbol", signal.Symbol),
@@ -263,12 +257,12 @@ func (h *SLHandler) MergeTopupSL(
 		zap.Float64("old_trigger", parentSL.TriggerPrice),
 		zap.Float64("new_trigger", newTrigger))
 
-	modErr := h.broker.ModifySLOrder(ctx, auth, info, parentSL.BrokerOrderID,
+	brokerTrig, brokerLim, modErr := h.broker.ModifySLOrder(ctx, auth, info, parentSL.BrokerOrderID,
 		combinedQty, newTrigger, newLimit)
 	if IsAuthError(modErr) && h.refreshAuth != nil {
 		if fresh := h.refreshAuth(signal.UserID); fresh != nil {
 			auth = *fresh
-			modErr = h.broker.ModifySLOrder(ctx, auth, info, parentSL.BrokerOrderID,
+			brokerTrig, brokerLim, modErr = h.broker.ModifySLOrder(ctx, auth, info, parentSL.BrokerOrderID,
 				combinedQty, newTrigger, newLimit)
 		}
 	}
@@ -283,17 +277,17 @@ func (h *SLHandler) MergeTopupSL(
 		return
 	}
 
-	// Persist new qty + trigger onto the parent SL row. Without this the next
-	// TSL trail-modify reads the stale parent.qty=13 and would shrink the
-	// broker stop back down to cover only the original tranche.
-	if err := h.repo.UpdateSLAfterTopupMerge(ctx, parentSL.ID, combinedQty, newTrigger, newLimit); err != nil {
+	// Persist new qty + intended trigger onto the parent SL row, plus the
+	// broker-real trigger/limit. Without this the next TSL trail-modify reads
+	// the stale parent.qty and would shrink the broker stop back down.
+	if err := h.repo.UpdateSLAfterTopupMerge(ctx, parentSL.ID, combinedQty, newTrigger, newLimit, brokerTrig, brokerLim); err != nil {
 		h.logger.Error("Top-up SL merge: DB update failed — broker is correct but DB drifted",
 			zap.Int64("sl_order_id", parentSL.ID), zap.Error(err))
 	}
 	_ = h.repo.InsertEvent(ctx, parentSL.ID, "SL_MERGED_TOPUP", "SL_PLACED", "SL_PLACED", "",
 		newTrigger, combinedQty,
-		fmt.Sprintf("topup signal=%s: qty %d→%d, trigger %.2f→%.2f",
-			signal.OrderID, parentSL.Qty, combinedQty, parentSL.TriggerPrice, newTrigger))
+		fmt.Sprintf("topup signal=%s: qty %d→%d, intended %.2f→%.2f broker_trigger=%.2f",
+			signal.OrderID, parentSL.Qty, combinedQty, parentSL.TriggerPrice, newTrigger, brokerTrig))
 
 	// Publish SL_MODIFIED so the rules-engine projector syncs
 	// manthan_positions.current_sl with the new broker-side trigger.
@@ -435,13 +429,16 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 	}
 
 	// Atomic modify-in-place. On AU004/401, refresh credentials then retry.
-	err = h.broker.ModifySLOrder(ctx, auth, info, targetSL.BrokerOrderID, targetSL.Qty, signal.NewSL, newLimit)
+	// signal.NewSL is the INTENDED stop (high*0.80); the adapter clamps it to
+	// DPR for the broker and returns the broker-real trigger/limit we record.
+	var brokerTrig, brokerLim float64
+	brokerTrig, brokerLim, err = h.broker.ModifySLOrder(ctx, auth, info, targetSL.BrokerOrderID, targetSL.Qty, signal.NewSL, newLimit)
 	if IsAuthError(err) && h.refreshAuth != nil {
 		h.logger.Warn("SL modify hit auth error — refreshing credentials",
 			zap.String("user", signal.UserID), zap.Error(err))
 		if freshAuth := h.refreshAuth(signal.UserID); freshAuth != nil {
 			auth = *freshAuth
-			err = h.broker.ModifySLOrder(ctx, auth, info, targetSL.BrokerOrderID, targetSL.Qty, signal.NewSL, newLimit)
+			brokerTrig, brokerLim, err = h.broker.ModifySLOrder(ctx, auth, info, targetSL.BrokerOrderID, targetSL.Qty, signal.NewSL, newLimit)
 		}
 	}
 	if err != nil {
@@ -451,7 +448,7 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 
 		// Retry once more
 		time.Sleep(2 * time.Second)
-		err = h.broker.ModifySLOrder(ctx, auth, info, targetSL.BrokerOrderID, targetSL.Qty, signal.NewSL, newLimit)
+		brokerTrig, brokerLim, err = h.broker.ModifySLOrder(ctx, auth, info, targetSL.BrokerOrderID, targetSL.Qty, signal.NewSL, newLimit)
 		if err != nil {
 			h.logger.Error("SL modify retry FAILED — EMERGENCY MARKET SELL",
 				zap.String("symbol", signal.Symbol))
@@ -479,9 +476,15 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 		}
 	}
 
-	// Update DB
+	// Persist the new INTENDED stop (trigger_price) + the broker-real trigger/limit
+	// the exchange accepted. Previously the trail updated the broker but NEVER the
+	// DB row, so trigger_price went stale on every trail — fixed here.
+	if uerr := h.repo.UpdateSLAfterModify(ctx, targetSL.ID, signal.NewSL, newLimit, brokerTrig, brokerLim); uerr != nil {
+		h.logger.Error("SL trail: DB update failed — broker modified but DB drifted",
+			zap.Int64("sl_order_id", targetSL.ID), zap.Error(uerr))
+	}
 	_ = h.repo.InsertEvent(ctx, targetSL.ID, "MODIFIED", "SL_PLACED", "SL_PLACED", "",
-		signal.NewSL, 0, fmt.Sprintf("trail: old=%.2f new=%.2f high=%.2f", signal.OldSL, signal.NewSL, signal.NewHigh))
+		signal.NewSL, 0, fmt.Sprintf("trail: old=%.2f new=%.2f high=%.2f broker_trigger=%.2f", signal.OldSL, signal.NewSL, signal.NewHigh, brokerTrig))
 
 	// Publish SL_MODIFIED keyed on the entry signal_id (so rules-engine can
 	// project the new current_sl onto the right position row).

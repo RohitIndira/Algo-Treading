@@ -63,8 +63,13 @@ type ManthanOrder struct {
 	Qty             int         `db:"qty"`
 	FilledQty       int         `db:"filled_qty"`
 	LimitPrice      float64     `db:"limit_price"`
-	TriggerPrice    float64     `db:"trigger_price"`
+	TriggerPrice    float64     `db:"trigger_price"` // INTENDED stop (high*0.80, un-clamped) — drives trail/ratchet
 	AvgFillPrice    float64     `db:"avg_fill_price"`
+	// BrokerTriggerPrice/BrokerLimitPrice mirror the broker's actual resting SL
+	// (post DPR/tick clamp). Populated from the adapter's place/modify return
+	// value and re-synced by the reconciler. trigger_price stays the intended 20%.
+	BrokerTriggerPrice float64 `db:"broker_trigger_price"`
+	BrokerLimitPrice   float64 `db:"broker_limit_price"`
 	BrokerOrderID   string      `db:"broker_order_id"`
 	BrokerStatus    string      `db:"broker_status"`
 	IndiraSymbol    string      `db:"indira_symbol"`
