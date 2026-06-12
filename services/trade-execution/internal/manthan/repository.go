@@ -140,6 +140,59 @@ func (r *Repository) UpdateBrokerTrigger(ctx context.Context, id int64, brokerTr
 	return err
 }
 
+// MarkSLDeferredBand flags an SL row as deferred (intended 20% below the DPR
+// band — no broker order placed) and links it to the parent entry. trigger_price
+// already carries the intended stop from InsertOrder.
+func (r *Repository) MarkSLDeferredBand(ctx context.Context, id int64, parentID int64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET status='SL_DEFERRED_BAND', broker_status='DEFERRED_BAND',
+		       parent_order_id=$1, updated_at=NOW()
+		 WHERE id=$2`, parentID, id)
+	return err
+}
+
+// GetDeferredSLBySymbol returns the latest deferred SL row for a strategy+symbol
+// (status SL_DEFERRED_BAND), or (nil,nil) if none. Used by the trail to keep a
+// deferred SL's intended trigger current and to promote it once the band allows.
+func (r *Repository) GetDeferredSLBySymbol(ctx context.Context, strategyID, symbol string) (*ManthanOrder, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, signal_id, strategy_id, user_id, symbol, isin, exchange,
+		       order_type, order_side, product_type, qty, filled_qty,
+		       limit_price, trigger_price, avg_fill_price,
+		       broker_order_id, broker_status, indira_symbol, exchange_token,
+		       status, retry_count, max_retries, last_error, parent_order_id,
+		       created_at, placed_at, filled_at, cancelled_at, updated_at
+		FROM manthan_orders
+		WHERE order_type='SL_SELL' AND status='SL_DEFERRED_BAND'
+		  AND strategy_id=$1 AND symbol=$2
+		ORDER BY created_at DESC LIMIT 1`, strategyID, symbol)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	orders, err := scanOrders(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(orders) == 0 {
+		return nil, nil
+	}
+	return orders[0], nil
+}
+
+// UpdateDeferredIntended trails a deferred SL's intended trigger/limit upward as
+// the high rises. Status stays SL_DEFERRED_BAND (still no broker order). Ensures
+// the daily replay places at the correct trailed 20% once the band re-centers.
+func (r *Repository) UpdateDeferredIntended(ctx context.Context, id int64, intendedTrigger, intendedLimit float64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET trigger_price=$1, limit_price=$2, updated_at=NOW()
+		 WHERE id=$3 AND status='SL_DEFERRED_BAND'`, intendedTrigger, intendedLimit, id)
+	return err
+}
+
+
 // UpdateSLAfterTopupMerge bumps an existing SL_SELL row's qty + trigger/limit
 // after a top-up fill merged into the parent SL via ModifyOrder. Without this
 // the next trail tick would call ModifySLOrder with the STALE pre-topup qty,

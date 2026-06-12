@@ -136,8 +136,10 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 	// SL_DEFERRED_BAND (no broker order) and let the daily protective-replay
 	// place the real 20% SL once the band re-centers low enough.
 	if info.DPRLower > 0 && triggerPrice < info.DPRLower {
-		_ = h.repo.UpdateOrderStatus(ctx, slOrderID, StatusSLDeferredBand, "DEFERRED_BAND", 0,
-			fmt.Sprintf("intended %.2f < dpr_lower %.2f", triggerPrice, info.DPRLower))
+		// Park it: link to the parent entry, keep trigger_price = intended (set at
+		// InsertOrder). The trail keeps this intended current via the deferred
+		// branch in ModifyTrail; the daily replay places it once the band allows.
+		_ = h.repo.MarkSLDeferredBand(ctx, slOrderID, entryOrderID)
 		_ = h.repo.InsertEvent(ctx, slOrderID, "SL_DEFERRED_BAND", "PENDING", "SL_DEFERRED_BAND", "",
 			triggerPrice, qty, fmt.Sprintf("intended=%.2f < dpr_lower=%.2f — deferred (unreachable this session; replay places at 20%% when band allows)", triggerPrice, info.DPRLower))
 		h.logger.Info("SL deferred — intended 20% below DPR band; will place when band re-centers",
@@ -347,6 +349,14 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 	}
 
 	if targetSL == nil || targetSL.BrokerOrderID == "" {
+		// Option B: the position may be DEFERRED (intended 20% below the DPR band,
+		// no broker order). The trail must still advance the recorded intended so
+		// the eventual placement is at the trailed 20% — and place it the moment
+		// the intended rises into the band. Returns nil (handled) so the inbox
+		// doesn't retry this signal forever.
+		if deferred, derr := h.repo.GetDeferredSLBySymbol(ctx, signal.StrategyID, signal.Symbol); derr == nil && deferred != nil {
+			return h.trailDeferredSL(ctx, signal, deferred)
+		}
 		return fmt.Errorf("no active SL order found for %s", signal.Symbol)
 	}
 
@@ -527,6 +537,35 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 		zap.Float64("new_sl", signal.NewSL),
 		zap.Float64("new_high", signal.NewHigh))
 
+	return nil
+}
+
+// trailDeferredSL handles an SL_MODIFY for a DEFERRED position (intended 20%
+// below the DPR band, so no broker order exists yet). There is nothing to modify
+// at the broker — instead we advance the RECORDED intended (trigger_price) as the
+// high trails up, so the eventual placement is at the trailed 20% and not the
+// stale entry level. Placement itself stays the daily replay's job: it re-checks
+// the band every cycle and places the real SL the moment the intended fits inside
+// it (reading this trigger_price). Keeping a single placer avoids any trail↔replay
+// double-placement race. Returns nil so the inbox marks the signal done (no retry
+// spam) rather than failing forever on "no active SL order".
+func (h *SLHandler) trailDeferredSL(ctx context.Context, signal SLModifySignal, deferred *ManthanOrder) error {
+	// Approximate limit (~0.3% below trigger); the replay recomputes the precise,
+	// tick-aligned limit at placement time. Avoids a broker ResolveSymbol call on
+	// every trail tick.
+	newLimit := signal.NewSL - SLLimitGap(signal.NewSL, 0.05)
+	if err := h.repo.UpdateDeferredIntended(ctx, deferred.ID, signal.NewSL, newLimit); err != nil {
+		return fmt.Errorf("update deferred intended: %w", err)
+	}
+	_ = h.repo.InsertEvent(ctx, deferred.ID, "SL_DEFERRED_TRAIL", "SL_DEFERRED_BAND", "SL_DEFERRED_BAND", "",
+		signal.NewSL, deferred.Qty,
+		fmt.Sprintf("deferred trail: intended %.2f→%.2f (high=%.2f); placement awaits band via daily replay",
+			signal.OldSL, signal.NewSL, signal.NewHigh))
+	h.logger.Info("deferred SL trailed — recorded intended advanced; placement awaits band",
+		zap.String("symbol", signal.Symbol),
+		zap.Float64("new_intended", signal.NewSL),
+		zap.Float64("new_high", signal.NewHigh))
+	h.recordCooldown(signal.Symbol)
 	return nil
 }
 
