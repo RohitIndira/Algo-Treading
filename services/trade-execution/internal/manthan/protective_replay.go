@@ -402,15 +402,25 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 			}
 		}
 
-		safeTrigger := intended
-		if info.DPRLower > 0 {
-			floor := info.DPRLower * DPRSafetyBuffer
-			if safeTrigger < floor {
-				safeTrigger = floor
-			}
+		// Option B: DEFER if the intended 20% stop is below the DPR floor. We do
+		// NOT place a premature band-floor stop, and we do NOT take a band-floor
+		// circuit exit — the stock can't reach the intended level this session,
+		// and a later cycle re-attempts once the band re-centers low enough, so
+		// the SL walks to the true 20%. Gate runs before the action switch so it
+		// short-circuits every placement path (including lower-circuit AMO).
+		if info.DPRLower > 0 && intended < info.DPRLower*DPRSafetyBuffer {
+			plans = append(plans, FirePlan{
+				Pos:        pos,
+				Auth:       *auth,
+				Info:       info,
+				Action:     FireSkip,
+				SkipReason: fmt.Sprintf("intended SL %.2f below DPR floor %.2f — deferred (unreachable this session; places at 20%% when band re-centers)", intended, info.DPRLower*DPRSafetyBuffer),
+			})
+			continue
 		}
-		// Tick-align via broker_adapter's clamp (also caps at DPR upper).
-		safeTrigger = p.broker.roundAndClamp(safeTrigger, info.TickSize, info.DPRLower, info.DPRUpper)
+
+		// Tick-align via broker_adapter's clamp (intended is within band here).
+		safeTrigger := p.broker.roundAndClamp(intended, info.TickSize, info.DPRLower, info.DPRUpper)
 		safeLimit := p.broker.roundAndClamp(safeTrigger-SLLimitGap(safeTrigger, info.TickSize), info.TickSize, info.DPRLower, info.DPRUpper)
 
 		// LTP for action decision.

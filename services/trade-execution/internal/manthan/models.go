@@ -30,6 +30,14 @@ const (
 	StatusSLFilled         OrderStatus = "SL_FILLED"
 	StatusSLModifyPending  OrderStatus = "SL_MODIFY_PENDING"
 	StatusEmergencySell    OrderStatus = "EMERGENCY_SELL"
+	// SL_DEFERRED_BAND: the intended 20% stop is below the day's DPR band, so a
+	// resting SL there is unplaceable and a band-floor stop would exit prematurely.
+	// We hold (no broker order) — the stock can't reach the intended level in one
+	// session — and the daily protective-replay places the real 20% SL once the
+	// band re-centers. NON-terminal: the position is still live and re-evaluated.
+	// Deliberately NOT included in GetActiveSLOrders, so the safety monitor never
+	// treats a deferred position as "unprotected → re-place/market-sell".
+	StatusSLDeferredBand OrderStatus = "SL_DEFERRED_BAND"
 
 	// AMO replayer-specific lifecycle states.
 	// AMO_PENDING:        submitted to broker AMO queue at 15:35; awaits 08:50 conversion

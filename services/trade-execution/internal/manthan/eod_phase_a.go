@@ -285,15 +285,18 @@ func (p *ProtectiveReplay) planEODTrigger(
 		}
 	}
 
-	// DPR floor + tick alignment — identical to the 09:14 cron path.
-	safeTrigger := intended
+	// Option B: DEFER if the intended 20% stop is below the DPR floor. We do NOT
+	// place a premature band-floor stop (which could exit at ~band% on a circuit
+	// touch). The position can't reach the intended level in one session, and a
+	// later cycle re-attempts once the band re-centers low enough. The caller
+	// treats a non-empty reason as a clean skip + ProtectionSkipped event.
 	if info.DPRLower > 0 {
 		floor := info.DPRLower * DPRSafetyBuffer
-		if safeTrigger < floor {
-			safeTrigger = floor
+		if intended < floor {
+			return 0, 0, info, fmt.Sprintf("intended SL %.2f below DPR floor %.2f — deferred (unreachable next session; replay places at 20%% when band re-centers)", intended, floor)
 		}
 	}
-	safeTrigger = p.broker.roundAndClamp(safeTrigger, info.TickSize, info.DPRLower, info.DPRUpper)
+	safeTrigger := p.broker.roundAndClamp(intended, info.TickSize, info.DPRLower, info.DPRUpper)
 	safeLimit := p.broker.roundAndClamp(
 		safeTrigger-SLLimitGap(safeTrigger, info.TickSize),
 		info.TickSize, info.DPRLower, info.DPRUpper)

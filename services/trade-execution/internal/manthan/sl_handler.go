@@ -127,6 +127,26 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 		return
 	}
 
+	// Option B — DEFER instead of placing a premature band-floor stop. If the
+	// intended 20% trigger is below today's DPR lower band, the exchange would
+	// reject a resting SL there, and clamping up to the floor would create a
+	// ~band% stop that can exit on a single-day circuit touch (NOT the 20% the
+	// strategy intends). The stock physically cannot reach the intended level in
+	// one session (circuit caps the move), so we hold: mark the row
+	// SL_DEFERRED_BAND (no broker order) and let the daily protective-replay
+	// place the real 20% SL once the band re-centers low enough.
+	if info.DPRLower > 0 && triggerPrice < info.DPRLower {
+		_ = h.repo.UpdateOrderStatus(ctx, slOrderID, StatusSLDeferredBand, "DEFERRED_BAND", 0,
+			fmt.Sprintf("intended %.2f < dpr_lower %.2f", triggerPrice, info.DPRLower))
+		_ = h.repo.InsertEvent(ctx, slOrderID, "SL_DEFERRED_BAND", "PENDING", "SL_DEFERRED_BAND", "",
+			triggerPrice, qty, fmt.Sprintf("intended=%.2f < dpr_lower=%.2f — deferred (unreachable this session; replay places at 20%% when band allows)", triggerPrice, info.DPRLower))
+		h.logger.Info("SL deferred — intended 20% below DPR band; will place when band re-centers",
+			zap.String("symbol", signal.Symbol),
+			zap.Float64("intended_trigger", triggerPrice),
+			zap.Float64("dpr_lower", info.DPRLower))
+		return
+	}
+
 	// LIVE mode — place with broker, retry on failure (includes one auth-refresh
 	// retry on AU004/401 before falling back to exponential backoff).
 	var brokerID string
