@@ -58,6 +58,12 @@ const (
 	// Order Trail / Modify on missing order. Overloaded by Codifi.
 	// Drill samples in tests 08, 16, 31.
 	InfoIDAuthOrNotFound CodifiInfoID = "AU004"
+
+	// InfoIDNoDataFound — resource exists but returned empty. Seen 2026-06-10
+	// when calling Positions API for a user with only delivery holdings (no
+	// intraday positions). Differs from AU004 in that the request itself is
+	// valid and authorized; the response just has no rows. Treat as success-empty.
+	InfoIDNoDataFound CodifiInfoID = "EG004"
 )
 
 // IsSuccess reports whether the Codifi envelope indicates the API call

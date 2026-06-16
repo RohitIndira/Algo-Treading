@@ -226,6 +226,13 @@ func TestCodifiInfoID_Classification(t *testing.T) {
 	if CodifiInfoID("0").IsPreTradeReject() {
 		t.Fatal("0 should NOT be pre-trade reject")
 	}
+	// EG004 = no data found — must not be treated as auth error or pre-trade reject.
+	if CodifiInfoID("EG004").IsAuthError() {
+		t.Fatal("EG004 should NOT be auth error (it's empty-result, not auth)")
+	}
+	if CodifiInfoID("EG004").IsPreTradeReject() {
+		t.Fatal("EG004 should NOT be pre-trade reject")
+	}
 }
 
 func TestParseCodifiResponse_Combined(t *testing.T) {

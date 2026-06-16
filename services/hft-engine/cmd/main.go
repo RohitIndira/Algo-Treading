@@ -5,14 +5,16 @@
 // for shutdown signal. No trading.
 //
 // Run:
-//   go run ./services/hft-engine/cmd/
+//
+//	go run ./services/hft-engine/cmd/
 //
 // gRPC port:    :9090 (configurable via HFT_GRPC_PORT)
 // HTTP port:    :9091 (livez/readyz; configurable via HFT_HTTP_PORT)
 //
 // Smoke-test once running:
-//   grpcurl -plaintext localhost:9090 hft_engine.HFTService/Ping
-//   curl http://localhost:9091/livez
+//
+//	grpcurl -plaintext localhost:9090 hft_engine.HFTService/Ping
+//	curl http://localhost:9091/livez
 package main
 
 import (
@@ -41,7 +43,6 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/audit"
 	"github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/broker"
 	"github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/config"
-	"github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/eventbus"
 	"github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/grpcserver"
 	hftlog "github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/logger"
 	"github.com/RohitIndira/Algo-Treading/services/hft-engine/internal/manager"
@@ -95,27 +96,6 @@ func main() {
 	r := repo.New(tradingDB, tradingExecDB, cfg.EncryptionKey)
 	auditWriter := audit.New(r, logger, audit.Config{}) // defaults: 1000 buf, 200 batch, 1s flush
 	rootCtx, rootCancel := context.WithCancel(context.Background())
-
-	// Live-tape event bus — every audit event is also published to local
-	// Redis pub/sub (hft:events:{strategy_id}); the gateway WS streams it
-	// to the dashboard. Best-effort: a down Redis never blocks the engine.
-	localRedis := goredis.NewClient(&goredis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       cfg.RedisDB,
-	})
-	if perr := localRedis.Ping(rootCtx).Err(); perr != nil {
-		logger.Warn("local Redis ping failed — live event tape disabled",
-			zap.String("addr", cfg.RedisAddr), zap.Error(perr))
-	} else {
-		logger.Info("local Redis connected for live event tape", zap.String("addr", cfg.RedisAddr))
-		eventPub := eventbus.NewPublisher(localRedis, logger)
-		eventPub.Start(rootCtx)
-		auditWriter.SetEventSink(eventPub)
-		defer eventPub.Stop()
-	}
-	defer localRedis.Close()
-
 	auditWriter.Start(rootCtx)
 
 	// Broker selection. Phase 3: branch on cfg.DefaultMode.

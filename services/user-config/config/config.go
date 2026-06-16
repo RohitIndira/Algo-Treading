@@ -90,6 +90,7 @@ func getEnvAsBool(key string, defaultValue bool) bool {
 		return defaultValue
 	}
 	return valueStr == "true" || valueStr == "1" || valueStr == "yes"
+	
 }
 
 func getEnvAsSlice(key string, defaultValue []string) []string {

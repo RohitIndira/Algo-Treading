@@ -13,23 +13,24 @@
 //
 // Examples:
 //
-//   # Plain probe — uses defaults from .env or built-in fallbacks.
-//   go run ./services/hft-engine/cmd/odin-probe/
+//	# Plain probe — uses defaults from .env or built-in fallbacks.
+//	go run ./services/hft-engine/cmd/odin-probe/
 //
-//   # Probe a specific stock for 60 seconds.
-//   go run ./services/hft-engine/cmd/odin-probe/ \
-//       --symbol ARVIND --security-code 193 --duration 60s
+//	# Probe a specific stock for 60 seconds.
+//	go run ./services/hft-engine/cmd/odin-probe/ \
+//	    --symbol ARVIND --security-code 193 --duration 60s
 //
-//   # Override creds (instead of relying on .env).
-//   go run ./services/hft-engine/cmd/odin-probe/ \
-//       --user-id YOUR_ID --api-key YOUR_KEY
+//	# Override creds (instead of relying on .env).
+//	go run ./services/hft-engine/cmd/odin-probe/ \
+//	    --user-id YOUR_ID --api-key YOUR_KEY
 //
 // Common NSE Cash security codes for sanity-testing:
-//   ARVIND     193
-//   RELIANCE   2885
-//   IDEA       14366
-//   SBIN       3045
-//   TATAMOTORS 3456
+//
+//	ARVIND     193
+//	RELIANCE   2885
+//	IDEA       14366
+//	SBIN       3045
+//	TATAMOTORS 3456
 //
 // All are segment_id=1 (NSE Cash).
 package main
@@ -251,6 +252,7 @@ func summarize(m marketws.FixMessage) string {
 
 func waitForConnected(ctx context.Context, c *marketws.OdinClient, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	fmt.Println("waiting for connection...")
 	for time.Now().Before(deadline) {
 		if c.State() == marketws.StateConnected {
 			return nil
