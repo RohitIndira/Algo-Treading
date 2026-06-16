@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 	hftpb "github.com/RohitIndira/Algo-Treading/api/proto/hft_engine"
 	"github.com/gorilla/mux"
 )

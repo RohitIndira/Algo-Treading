@@ -1,4 +1,4 @@
-module github.com/RohitIndira/Algo-Treading/api/gateway
+module github.com/RohitIndira/Algo-Treading/services/api-gateway
 
 go 1.23.0
 
@@ -31,6 +31,6 @@ require (
 
 replace github.com/RohitIndira/Algo-Treading => ../..
 
-replace github.com/RohitIndira/Algo-Treading/api/proto/common => ../proto/common
+replace github.com/RohitIndira/Algo-Treading/api/proto/common => ../../api/proto/common
 
-replace github.com/RohitIndira/Algo-Treading/api/proto/user_config => ../proto/user_config
+replace github.com/RohitIndira/Algo-Treading/api/proto/user_config => ../../api/proto/user_config

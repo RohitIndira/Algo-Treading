@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/dto"
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/dto"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	hftpb "github.com/RohitIndira/Algo-Treading/api/proto/hft_engine"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"

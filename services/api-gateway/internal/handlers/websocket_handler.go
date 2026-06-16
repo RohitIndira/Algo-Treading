@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/notifications"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/notifications"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"

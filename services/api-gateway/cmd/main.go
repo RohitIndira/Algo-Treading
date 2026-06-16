@@ -16,12 +16,12 @@ import (
 	_ "github.com/lib/pq"
 	"go.uber.org/zap"
 
-	"github.com/RohitIndira/Algo-Treading/api/gateway/config"
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/handlers"
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/middleware"
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/notifications"
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/router"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/config"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/handlers"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/notifications"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/router"
 )
 
 func main() {

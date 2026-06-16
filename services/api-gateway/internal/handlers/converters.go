@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/dto"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/dto"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 )

@@ -3,8 +3,8 @@ package router
 import (
 	"net/http"
 
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/handlers"
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/middleware"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/handlers"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
 	"github.com/gorilla/mux"
 )
 

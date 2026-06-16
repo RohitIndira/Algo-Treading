@@ -12,7 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	commonpb "github.com/RohitIndira/Algo-Treading/api/proto/common"
-	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/grpc_clients"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 )
 
 // HealthHandler implements the standard three-tier health probe split used
