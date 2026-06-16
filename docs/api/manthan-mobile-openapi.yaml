@@ -1,0 +1,1451 @@
+# =============================================================================
+# Manthan Mobile + Web API — OpenAPI 3.0 specification
+# =============================================================================
+#
+# Auto-generated from Figma design review (2026-06-15) covering ~30 screens
+# across discovery, deployment, monitoring, and management flows.
+#
+# Editing notes:
+#   - Each endpoint carries an `x-screens` tag listing which Figma screens use
+#     it. Use this to find call sites when wiring the UI.
+#   - Each endpoint carries an `x-auth-tier` tag: public | session | sensitive.
+#     "sensitive" actions show a confirmation modal with a warning card before
+#     calling — no TPIN OTP at app layer (broker enforces TPIN/DDPI underneath).
+#   - WebSocket topics are documented in a separate section at the bottom
+#     (OpenAPI 3.0 doesn't natively spec WS — kept here for one-stop reference).
+#   - Bump `info.version` when you add/remove endpoints. Keep this file in
+#     git so backend, mobile, and web teams stay in sync.
+#
+# Tooling suggestions:
+#   - Render with Swagger UI:  npx @apidevtools/swagger-cli serve manthan-mobile-openapi.yaml
+#   - Generate TypeScript types: npx openapi-typescript manthan-mobile-openapi.yaml -o types.ts
+#   - Generate Go client/server stubs: oapi-codegen -package api manthan-mobile-openapi.yaml
+#   - Mock server: prism mock manthan-mobile-openapi.yaml
+# =============================================================================
+
+openapi: 3.0.3
+
+info:
+  title: Manthan Mobile/Web API
+  description: |
+    REST API for Indira Securities' Manthan algorithmic trading platform —
+    used by the mobile app and web app.
+
+    Covers: market data, algo catalog, deploy/pause/stop subscriptions,
+    holdings + trades, performance metrics, notifications, and audit timeline.
+
+    Companion WebSocket spec is documented at the bottom of this file under
+    `x-websocket`.
+  version: "0.1.0"
+  contact:
+    name: Indira Engineering
+    email: rohhit@indiratrade.com
+
+servers:
+  - url: https://api.stockk.trade
+    description: Production
+  - url: https://staging-api.stockk.trade
+    description: Staging
+  - url: http://localhost:8080
+    description: Local dev
+
+# =============================================================================
+# TAGS — used by Swagger UI to group endpoints
+# =============================================================================
+tags:
+  - name: Auth
+    description: SSO callback + session refresh
+  - name: User & Account
+    description: Profile, portfolio summary, margin
+  - name: Market Data
+    description: Indices, movers, FII/DII, calendar, news (cacheable)
+  - name: Algo Catalog
+    description: Browse pre-deploy strategies (Manthan / Flow / Value Edge)
+  - name: Algo Performance
+    description: Charts + return cards for a catalog entry
+  - name: Subscriptions
+    description: User's deployed algos — read
+  - name: Subscription Actions
+    description: Deploy / pause / resume / stop / capital change
+  - name: Holdings & Trades
+    description: Per-subscription position list + trade history
+  - name: Timeline
+    description: Per-subscription audit log
+  - name: Notifications
+    description: User notification feed
+
+  - name: Codifi (consumed internally)
+    description: |
+      **NOT exposed to mobile/web clients.** These are Codifi (Indira broker
+      middleware) endpoints that our backend services call server-to-server.
+      Documented here so any backend dev can see exactly which Codifi APIs
+      drive each piece of our public surface.
+
+      **Base URL:** `https://livemiddleware.indiratrade.com`
+
+      **Headers on every Codifi call:**
+      - `Authorization: Bearer <codifi_jwt>` — from `user_credentials` (AES-GCM encrypted, decrypt before use)
+      - `Content-Type: application/json`
+      - `accept: application/json`
+      - Token TTL: 24 h. AU004 response = token expired/invalid, refresh via SSO.
+
+      ---
+
+      ## 1. `POST /order-services/api/order/v1/place-order`
+      **Used by:** Manthan algo (SL_SELL_AMO submission at 15:35 IST), Trade-Execution Phase A.
+      **Notes:** Returns `ordId`; AMO orders get the ord-id REWRITTEN at 08:50 IST conversion (e.g. `NYMZX002CF96 → NYMZX002CF:6`). Must reconcile via orderTrail. Pass `algoID` + `algoCategory` per SEBI mandate.
+
+      ## 2. `PUT /order-services/api/order/v1/modify-order`
+      **Used by:** Manthan SL ratchet (every WS tick that moves the trail).
+      **Notes:** Modify is best-effort — if broker_order_id stale (post-AMO conversion), retry with the new ord-id. EG003 "Order not found" = need re-fetch from orderBook.
+
+      ## 3. `DELETE /order-services/api/order/v1/cancel-order/{ordId}`
+      **Used by:** Manthan position exit, retry queue cleanup.
+      **Notes:** **CRITICAL** — cancelling a Manthan SL triggers safety-monitor to MARKET-SELL the whole book. Always pair with a fresh SL placement OR mark `safety_paused` first. (See incident: liquidated S4450 2026-06-12.)
+
+      ## 4. `GET /order-services/api/order/v1/orderBook`
+      **Used by:** Reconciler (every 5 min), morning hot-SL boot, AMO conversion sync at 08:50 IST.
+      **Notes:** Returns live order rows incl. status (`open`, `complete`, `rejected`, `cancelled`). Source of truth for `broker_order_id` after AMO conversion.
+
+      ## 5. `GET /order-services/api/order/v1/orderTrail?orderId={id}`
+      **Used by:** Phase B/C verification — confirms whether an AMO actually got accepted by the exchange.
+      **Notes:** Returns the lifecycle journey for one order: AMO submitted → AMO accepted → converted → exchange accepted → filled. EG004 "No data found" = order not yet in trail.
+
+      ## 6. `GET /order-services/api/order/v1/tradeBook`
+      **Used by:** Trade reconciliation, P&L computation, fill detection.
+      **Notes:** Only filled orders appear here. Used to compute realized P&L per position.
+
+      ## 7. `GET /holding-services/api/holding/v1/holdings`
+      **Used by:** Reconciler, EOD Phase A (pre-flight check), morning hot-SL sellable-qty calc.
+      **Notes:**
+      - **`freeQty` is unreliable** — returns 0 even when shares are owned, unpledged, and POA is active (verified 2026-06-10 incident).
+      - Compute sellable from `eodQty + collateralQty - pledgeQty - cncSellQty` instead.
+      - Code fix lives in `protective_replay.fetchEODSellableQtyMap`.
+
+      ## 8. `GET /positions-services/api/position/v1/positions`
+      **Used by:** Live intraday P&L, Manthan position close detection.
+      **Notes:** Empty positions API returns EG004 "No data found" (not an error — just means no open positions).
+
+      ## 9. `GET /fund-services/api/fund/v1/fundLimit`
+      **Used by:** Pre-deploy margin check, capital-add validation.
+      **Notes:** 30 s cache. Returns available margin, blocked margin, withdrawable balance.
+
+      ## 10. `GET /user-services/api/user/v1/accountInfo`
+      **Used by:** First-load user profile (name, email, mobile, PAN, demat ID, bank details).
+      **Notes:** Cached for ~5 minutes per session. Returns email/mobile masked.
+
+      ## 11. `GET /charges-services/api/charges/v1/brokerageCharges`
+      **Used by:** Net P&L computation, trade cost display on Trade detail screen.
+      **Notes:** Returns STT + brokerage + exchange + GST + SEBI + stamp duty. Apply to gross P&L to get net.
+
+      ---
+
+      ## Ownership matrix — which service calls which Codifi endpoint
+
+      | Service          | Codifi endpoints called                                                                                                                  |
+      |------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+      | trade-execution  | placeOrder, modifyOrder, cancelOrder, orderBook, orderTrail, tradeBook, holdings, positions, fundLimit (margin pre-check), brokerageCharges |
+      | api-gateway      | accountInfo, fundLimit (user-facing margin pill), holdings (portfolio summary aggregation)                                                  |
+      | user-config      | accountInfo (on SSO callback — initial profile pull)                                                                                       |
+
+  - name: Architecture Notes
+    description: |
+      What the new backend OWNS vs what it COMPUTES from Codifi on each call.
+
+      ## Owned by new backend (Postgres-backed entities)
+      These have full lifecycle in our DB; the spec endpoints above describe them:
+
+      - **User** — local user record, links to Codifi `clientId`
+      - **Algo** — catalog entry (Manthan, Flow, Value Edge)
+      - **Subscription** — user's deployed algo instance
+      - **Holding** — per-subscription position snapshot (not the same as demat holdings — these are algo-attributed)
+      - **Trade** — per-subscription executed trade with algo-attribution
+      - **TimelineEvent** — per-subscription audit log
+      - **Notification** — user notification feed
+      - **PortfolioSummary** — aggregated invested/current/P&L, computed daily
+
+      ## Computed from Codifi on each request (NOT stored)
+      These are read-through with short TTLs:
+
+      | Field                | Source                           | Cache    |
+      |----------------------|----------------------------------|----------|
+      | Available margin     | Codifi `fundLimit`               | 30 sec   |
+      | Demat holdings       | Codifi `holdings`                | 5 min    |
+      | User profile basics  | Codifi `accountInfo`             | 1 hour   |
+      | Live LTP / positions | Codifi WS + `positions`          | realtime |
+
+      ## Auth flow (SSO via Codifi)
+      1. Mobile opens `GET /api/v1/auth/sso/start` → 302 to Codifi SSO URL
+      2. User signs in at Codifi (we don't see credentials)
+      3. Codifi redirects to `GET /api/v1/auth/sso/callback?code=...`
+      4. Backend exchanges code for Codifi JWT, encrypts with AES-GCM, stores in `user_credentials`
+      5. Backend issues opaque session ID → sets `stockk_session` HttpOnly cookie
+      6. Mobile never sees the broker JWT — server-side mapping only
+
+      ## Realtime (WebSocket)
+      - Path: `wss://api.stockk.trade/v1/ws`
+      - Auth: `?token=<bearer>` query string (mobile re-uses session-derived JWT)
+      - Pattern: subscribe-on-demand — client sends `{op: "sub", topics: ["ltp:RELIANCE", "portfolio:sub_xyz"]}`
+      - Driver: Kafka topics → WS fan-out (1 connection per device)
+      - Topics: see `x-websocket` section at the end of the spec
+
+# =============================================================================
+# SECURITY SCHEMES
+# =============================================================================
+components:
+  securitySchemes:
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: stockk_session
+      description: |
+        HttpOnly cookie set after SSO callback. The opaque session ID maps
+        server-side to the Codifi JWT — the broker token never reaches the
+        browser.
+
+    BearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        For B2B API key access (developers using their own server). Format:
+        `Authorization: Bearer mk_live_<random>`. Keys are IP-whitelisted at
+        the nginx layer.
+
+  # ===========================================================================
+  # COMMON HEADERS (referenced by every operation)
+  # ===========================================================================
+  parameters:
+    AcceptLanguage:
+      in: header
+      name: Accept-Language
+      schema: { type: string, default: en, enum: [en, hi] }
+      required: false
+      description: en or hi — falls back to en if missing
+
+    XClient:
+      in: header
+      name: X-Client
+      schema: { type: string }
+      required: true
+      description: |
+        Identifies the calling app. Format `<platform>-<version>`.
+        Examples: `stockk-android-2.3.1`, `stockk-ios-2.3.1`, `stockk-web-2.3.1`.
+
+    XRequestId:
+      in: header
+      name: X-Request-Id
+      schema: { type: string, format: uuid }
+      required: false
+      description: |
+        Optional client-generated UUID. Returned in response headers for
+        log correlation. If absent, server generates one.
+
+    SubscriptionIdPath:
+      in: path
+      name: subscriptionId
+      schema: { type: string }
+      required: true
+      description: User's algo subscription ID (e.g. sub_a8f3c7e9)
+
+    AlgoIdPath:
+      in: path
+      name: algoId
+      schema: { type: string }
+      required: true
+      description: Catalog algo ID (e.g. algo_manthan_v1)
+
+    SymbolPath:
+      in: path
+      name: symbol
+      schema: { type: string }
+      required: true
+      description: Stock display symbol (e.g. RELIANCE, SBIN)
+
+  # ===========================================================================
+  # SCHEMAS (response/request bodies)
+  # ===========================================================================
+  schemas:
+
+    # --- Common ----------------------------------------------------------------
+    Money:
+      type: object
+      properties:
+        value: { type: number, format: float, example: 24580.50 }
+        pct:   { type: number, format: float, example: 18.4, nullable: true }
+        currency: { type: string, default: INR }
+
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_REQUEST
+            - INVALID_AMOUNT
+            - INSUFFICIENT_MARGIN
+            - SUBSCRIPTION_NOT_LIVE
+            - SUBSCRIPTION_NOT_FOUND
+            - ALGO_NOT_FOUND
+            - ALGO_AT_CAPACITY
+            - ALGO_PAUSED_BY_SYSTEM
+            - SESSION_EXPIRED
+            - DDPI_REQUIRED
+            - BROKER_UNAVAILABLE
+            - INTERNAL_ERROR
+        message: { type: string, example: "You don't have enough Available Margin" }
+        details:
+          type: object
+          additionalProperties: true
+          description: Optional code-specific context (e.g. required/available for INSUFFICIENT_MARGIN)
+
+    # --- User & Account --------------------------------------------------------
+    User:
+      type: object
+      properties:
+        userId: { type: string, example: S4450 }
+        firstName: { type: string, example: Charlie }
+        email: { type: string, example: "c***@gmail.com" }
+        mobile: { type: string, example: "+91 98****1234" }
+        kycStatus: { type: string, enum: [VERIFIED, PENDING, REJECTED] }
+        ddpiActive: { type: boolean, description: "Required for sell automation" }
+
+    PortfolioSummary:
+      type: object
+      properties:
+        currentValue: { type: number, example: 51350899 }
+        investedAmount: { type: number, example: 15068000 }
+        totalPnL:
+          $ref: '#/components/schemas/Money'
+        todayPnL:
+          $ref: '#/components/schemas/Money'
+
+    AccountMargin:
+      type: object
+      properties:
+        availableMargin: { type: number, example: 80500 }
+        utilizedMargin: { type: number, example: 50000 }
+        deployedCapital: { type: number, example: 500000 }
+
+    # --- Market data -----------------------------------------------------------
+    Index:
+      type: object
+      properties:
+        name: { type: string, example: "NIFTY 50" }
+        value: { type: number, example: 25400.00 }
+        change: { type: number, example: 250.00 }
+        changePct: { type: number, example: 1.34 }
+
+    StockSymbol:
+      type: object
+      properties:
+        symbol: { type: string, example: RELIANCE }
+        companyName: { type: string, example: "Reliance Industries Ltd" }
+        logo: { type: string, format: uri, nullable: true }
+        exchange: { type: string, enum: [NSE, BSE], example: NSE }
+        excToken: { type: integer, example: 2885 }
+        isin: { type: string, example: INE002A01018 }
+        tickSize: { type: number, example: 0.05 }
+
+    MarketMover:
+      allOf:
+        - $ref: '#/components/schemas/StockSymbol'
+        - type: object
+          properties:
+            price: { type: number, example: 1150.00 }
+            change: { type: number, example: 1.30 }
+            changePct: { type: number, example: 1.34 }
+            badges: { type: array, items: { type: string }, example: ["NFO"] }
+
+    FiiDiiEntry:
+      type: object
+      properties:
+        date: { type: string, format: date, example: "2025-10-23" }
+        fii: { type: number, example: -4999.10 }
+        dii: { type: number, example: 6794.28 }
+        net: { type: number, example: 1795.18 }
+
+    CalendarEvent:
+      type: object
+      properties:
+        type: { type: string, enum: [RESULTS, DIVIDEND, BONUS, SPLIT] }
+        symbol: { $ref: '#/components/schemas/StockSymbol' }
+        label: { type: string, example: "Q1 Results" }
+        date: { type: string, format: date }
+
+    NewsItem:
+      type: object
+      properties:
+        id: { type: string }
+        category: { type: string, enum: [LIVE_NEWS, STOCK_ANALYSIS, TRADE_OPPORTUNITIES] }
+        title: { type: string }
+        summary: { type: string }
+        symbol: { type: string, nullable: true }
+        publishedAt: { type: string, format: date-time }
+        imageUrl: { type: string, format: uri, nullable: true }
+
+    # --- Algo catalog ----------------------------------------------------------
+    Algo:
+      type: object
+      properties:
+        id: { type: string, example: algo_manthan_v1 }
+        name: { type: string, example: Manthan }
+        type: { type: string, enum: [Equity, FNO, Currency], example: Equity }
+        style: { type: string, enum: [Positional, Intraday, Swing], example: Positional }
+        logo: { type: string, format: uri, nullable: true }
+        description: { type: string }
+        badges: { type: array, items: { type: string }, example: ["Most subscribed"] }
+        minInvestment: { type: number, example: 1500000 }
+        primaryReturn:
+          type: object
+          properties:
+            period: { type: string, enum: [6M, 1Y, 3Y, 5Y], example: 3Y }
+            valuePct: { type: number, example: 28.4 }
+        maxDrawdownPct: { type: number, example: -12.6 }
+
+    AlgoDetail:
+      allOf:
+        - $ref: '#/components/schemas/Algo'
+        - type: object
+          properties:
+            aboutAlgo: { type: string }
+            keyStats:
+              type: object
+              properties:
+                winRatePct: { type: number, example: 62 }
+                profitFactorPct: { type: number, example: 24.1 }
+                totalTradesPct: { type: number, example: 68 }
+                avgHoldingDays: { type: number, example: -7.4 }
+                sortino: { type: number, example: 1.84 }
+                volatilityDays: { type: number, example: 12 }
+            features:
+              type: array
+              items:
+                type: object
+                properties:
+                  icon: { type: string }
+                  title: { type: string }
+                  description: { type: string }
+            disclaimers:
+              type: array
+              items: { type: string }
+
+    PerformanceChartPoint:
+      type: object
+      properties:
+        ts: { type: string, format: date-time }
+        algoValuePct: { type: number, example: 8.26 }
+        benchmarkValuePct: { type: number, example: 1.37 }
+
+    PerformanceCalendarCell:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        pnlValue: { type: number, example: -3.2 }
+        pnlPct: { type: number, example: -0.05 }
+
+    PerformanceReturns:
+      type: object
+      properties:
+        chart:
+          type: array
+          items: { $ref: '#/components/schemas/PerformanceChartPoint' }
+        benchmark:
+          type: object
+          properties:
+            name: { type: string, example: "NIFTY 50" }
+            id: { type: string, example: index_nifty50 }
+        cards:
+          type: array
+          description: "1M / 6M / 1Y / SINCE DEPLOYMENT cards"
+          items:
+            type: object
+            properties:
+              label: { type: string, example: "1M RETURN" }
+              amount: { type: number, example: -105300 }
+              pct: { type: number, example: -3.2 }
+        basisCapital: { type: number, example: 5000000, description: "Footnote * Based on capital of X" }
+
+    # --- Subscriptions ---------------------------------------------------------
+    SubscriptionSummary:
+      type: object
+      description: Card in the Live Algos list
+      properties:
+        id: { type: string, example: sub_a8f3c7e9 }
+        algo: { $ref: '#/components/schemas/Algo' }
+        status: { type: string, enum: [LIVE, PAUSED, STOPPED] }
+        netPnL: { $ref: '#/components/schemas/Money' }
+        todayPnL: { $ref: '#/components/schemas/Money' }
+        winRatePct: { type: number, example: 68 }
+        openPositions: { type: integer, example: 3 }
+        deployedCapital: { type: number, example: 150000 }
+        deployedAt: { type: string, format: date-time }
+        alerts:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [ACTION_REQUIRED, INFO] }
+              code: { type: string, example: INSUFFICIENT_MARGIN }
+              message: { type: string }
+
+    SubscriptionDetail:
+      allOf:
+        - $ref: '#/components/schemas/SubscriptionSummary'
+        - type: object
+          properties:
+            performance:
+              type: object
+              properties:
+                totalReturnPct: { type: number, example: 18.2 }
+                cagrPct: { type: number, example: 24.1 }
+                winRatePct: { type: number, example: 68 }
+                maxDrawdownPct: { type: number, example: -7.4 }
+                avgHoldingDays: { type: number, example: 12 }
+                sharpeRatio: { type: number, example: 1.84 }
+            holdingsPreview:
+              type: array
+              maxItems: 4
+              items: { $ref: '#/components/schemas/Holding' }
+            tradesPreview:
+              type: array
+              maxItems: 4
+              items: { $ref: '#/components/schemas/TradeSummary' }
+            allocation:
+              type: array
+              description: "By sector OR by market cap depending on toggle"
+              items:
+                type: object
+                properties:
+                  groupName: { type: string, example: Automobile }
+                  pct: { type: number, example: 18.5 }
+                  children:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        symbol: { $ref: '#/components/schemas/StockSymbol' }
+                        pct: { type: number, example: 5.3 }
+            timelineUnreadCount: { type: integer, example: 3 }
+
+    Holding:
+      type: object
+      properties:
+        symbol: { $ref: '#/components/schemas/StockSymbol' }
+        qty: { type: integer, example: 1000 }
+        avgPrice: { type: number, example: 800 }
+        investedAmount: { type: number, example: 800000 }
+        unrealizedPnL: { type: number, example: 35500 }
+        unrealizedPnLPct: { type: number, example: 25.69 }
+        ltp: { type: number, example: 245.50 }
+        ltpChangePct: { type: number, example: -2.34 }
+        pctOfPortfolio: { type: number, example: 18.5 }
+
+    TradeSummary:
+      type: object
+      description: One row in Past Trades list
+      properties:
+        symbol: { $ref: '#/components/schemas/StockSymbol' }
+        product: { type: string, enum: [INTRADAY, DELIVERY] }
+        realisedPnL: { type: number, example: -358.80 }
+
+    StockPnLDetail:
+      type: object
+      description: Drill-down for one stock
+      properties:
+        symbol: { $ref: '#/components/schemas/StockSymbol' }
+        product: { type: string, enum: [INTRADAY, DELIVERY] }
+        realisedPnL: { type: number }
+        overview:
+          type: object
+          properties:
+            quantity: { type: integer }
+            avgBuyPrice: { type: number }
+            totalBuyValue: { type: number }
+            avgSellPrice: { type: number }
+            totalSellValue: { type: number }
+        trades:
+          type: array
+          items:
+            type: object
+            properties:
+              date: { type: string, format: date }
+              type: { type: string, enum: [BUY, SELL] }
+              quantity: { type: integer }
+              price: { type: number }
+
+    # --- Timeline --------------------------------------------------------------
+    TimelineEvent:
+      type: object
+      properties:
+        id: { type: string }
+        ts: { type: string, format: date-time }
+        type:
+          type: string
+          enum:
+            - DEPLOYED
+            - PAUSED
+            - RESUMED
+            - STOPPED
+            - AUTO_PAUSED
+            - CAPITAL_INCREASED
+            - CAPITAL_DECREASED
+            - TRADE_PLACED
+            - TRADE_REJECTED
+            - REBALANCED
+        severity: { type: string, enum: [INFO, WARNING, DANGER] }
+        title: { type: string }
+        description: { type: string }
+        relativeTime: { type: string, example: "2h ago" }
+        meta:
+          type: object
+          additionalProperties: true
+
+    # --- Notifications --------------------------------------------------------
+    Notification:
+      type: object
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum:
+            - ENTRY
+            - EXIT
+            - ALGO_PAUSED
+            - ALGO_RESUMED
+            - MARGIN_SHORTFALL
+            - SYSTEM_ALERT
+        title: { type: string }
+        body: { type: string }
+        subscriptionId: { type: string, nullable: true }
+        ts: { type: string, format: date-time }
+        read: { type: boolean }
+
+    # --- Action request bodies -------------------------------------------------
+    DeployRequest:
+      type: object
+      required: [investmentAmount, agreeTAndC]
+      properties:
+        investmentAmount: { type: number, example: 50000, description: "Must be >= algo.minInvestment" }
+        agreeTAndC: { type: boolean, example: true }
+
+    PausePositionsBody:
+      type: object
+      required: [positionsAction]
+      properties:
+        positionsAction:
+          type: string
+          enum: [KEEP_OPEN, SQUARE_OFF]
+          description: |
+            KEEP_OPEN  — leave open positions intact, algo just stops new entries
+            SQUARE_OFF — close all open positions at market before pausing/stopping
+
+    CapitalChangeRequest:
+      type: object
+      required: [newAmount]
+      properties:
+        newAmount: { type: number, example: 100000 }
+
+    AddFundsRequest:
+      type: object
+      required: [amount]
+      properties:
+        amount: { type: number, example: 30000 }
+
+# =============================================================================
+# SECURITY DEFAULT
+# =============================================================================
+security:
+  - SessionCookie: []
+  - BearerToken: []
+
+# =============================================================================
+# PATHS
+# =============================================================================
+paths:
+
+  # ===========================================================================
+  # AUTH
+  # ===========================================================================
+  /auth/sso/callback:
+    post:
+      tags: [Auth]
+      summary: SSO callback — exchanges Codifi JWT for our session cookie
+      x-screens: [login]
+      x-auth-tier: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [codifiJwt]
+              properties:
+                codifiJwt: { type: string }
+      responses:
+        '200':
+          description: Session cookie set
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: stockk_session=...; HttpOnly; Secure; SameSite=Strict
+        '401': { description: Invalid Codifi token }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Invalidate the session
+      x-screens: [profile_logout]
+      x-auth-tier: session
+      responses:
+        '200':
+          description: Logged out — session cookie cleared
+
+  # ===========================================================================
+  # USER & ACCOUNT
+  # ===========================================================================
+  /api/v1/me:
+    get:
+      tags: [User & Account]
+      summary: Authenticated user profile
+      x-screens: [home_dashboard, profile]
+      x-auth-tier: session
+      parameters:
+        - $ref: '#/components/parameters/XClient'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /api/v1/account/summary:
+    get:
+      tags: [User & Account]
+      summary: Portfolio totals shown at top of home dashboard
+      x-screens: [home_dashboard]
+      x-auth-tier: session
+      x-realtime: account.summary
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PortfolioSummary' }
+
+  /api/v1/account/margin:
+    get:
+      tags: [User & Account]
+      summary: Available + utilized margin
+      x-screens: [deploy_popup, add_fund_popup, change_allocation]
+      x-auth-tier: session
+      x-realtime: account.margin
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountMargin' }
+
+  # ===========================================================================
+  # MARKET DATA
+  # ===========================================================================
+  /api/v1/market/indices:
+    get:
+      tags: [Market Data]
+      summary: NIFTY 50, SENSEX, BANK NIFTY
+      x-screens: [home_dashboard]
+      x-auth-tier: public
+      x-realtime: market.indices
+      security: []
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Index' }
+
+  /api/v1/market/movers:
+    get:
+      tags: [Market Data]
+      summary: Top gainers / losers / 52W high/low
+      x-screens: [home_dashboard]
+      x-auth-tier: public
+      security: []
+      parameters:
+        - in: query
+          name: universe
+          schema: { type: string, default: NIFTY500, enum: [NIFTY50, NIFTY500, ALL] }
+        - in: query
+          name: type
+          required: true
+          schema: { type: string, enum: [gainers, losers, week52high, week52low] }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 10, maximum: 50 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MarketMover' }
+
+  /api/v1/market/fii-dii:
+    get:
+      tags: [Market Data]
+      summary: FII/DII activity series for the dashboard table
+      x-screens: [home_dashboard]
+      x-auth-tier: public
+      security: []
+      parameters:
+        - in: query
+          name: days
+          schema: { type: integer, default: 30, maximum: 90 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FiiDiiEntry' }
+
+  /api/v1/market/events:
+    get:
+      tags: [Market Data]
+      summary: Corporate events (results, dividends, bonuses, splits)
+      x-screens: [home_dashboard]
+      x-auth-tier: public
+      security: []
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string, default: today, description: "today | YYYY-MM-DD" }
+        - in: query
+          name: types
+          schema:
+            type: array
+            items: { type: string, enum: [RESULTS, DIVIDEND, BONUS, SPLIT] }
+            default: [RESULTS, DIVIDEND, BONUS, SPLIT]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CalendarEvent' }
+
+  /api/v1/market/news:
+    get:
+      tags: [Market Data]
+      summary: StockkAsk content feed
+      x-screens: [home_dashboard]
+      x-auth-tier: public
+      security: []
+      parameters:
+        - in: query
+          name: categories
+          schema:
+            type: array
+            items: { type: string, enum: [LIVE_NEWS, STOCK_ANALYSIS, TRADE_OPPORTUNITIES] }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/NewsItem' }
+
+  # ===========================================================================
+  # ALGO CATALOG (pre-deploy browsing)
+  # ===========================================================================
+  /api/v1/algos:
+    get:
+      tags: [Algo Catalog]
+      summary: List all algos available to deploy
+      x-screens: [readymade_algos_explore]
+      x-auth-tier: session
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Algo' }
+
+  /api/v1/algos/{algoId}:
+    get:
+      tags: [Algo Catalog]
+      summary: Strategy detail (About + Key Stats + What You Get + disclaimers)
+      x-screens: [strategy_overview]
+      x-auth-tier: session
+      parameters:
+        - $ref: '#/components/parameters/AlgoIdPath'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlgoDetail' }
+        '404':
+          description: not found
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } }
+
+  # ===========================================================================
+  # ALGO PERFORMANCE
+  # ===========================================================================
+  /api/v1/algos/{algoId}/performance:
+    get:
+      tags: [Algo Performance]
+      summary: Benchmark chart + return cards
+      x-screens: [strategy_performance]
+      x-auth-tier: session
+      parameters:
+        - $ref: '#/components/parameters/AlgoIdPath'
+        - in: query
+          name: period
+          schema: { type: string, default: 3Y, enum: [1M, 6M, 1Y, 3Y, 5Y, All] }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PerformanceReturns' }
+
+  /api/v1/algos/{algoId}/performance/calendar:
+    get:
+      tags: [Algo Performance]
+      summary: Day-wise or month-wise P&L grid
+      x-screens: [strategy_performance]
+      x-auth-tier: session
+      parameters:
+        - $ref: '#/components/parameters/AlgoIdPath'
+        - in: query
+          name: view
+          required: true
+          schema: { type: string, enum: [day, month] }
+        - in: query
+          name: year
+          required: true
+          schema: { type: integer, example: 2026 }
+        - in: query
+          name: month
+          schema: { type: integer, minimum: 1, maximum: 12, description: "Required when view=day" }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PerformanceCalendarCell' }
+
+  # ===========================================================================
+  # SUBSCRIPTIONS — read
+  # ===========================================================================
+  /api/v1/subscriptions:
+    get:
+      tags: [Subscriptions]
+      summary: List user's deployed algos (with top summary)
+      x-screens: [live_algos_live, live_algos_paused, live_algos_stopped]
+      x-auth-tier: session
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [LIVE, PAUSED, STOPPED] }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  summary:
+                    type: object
+                    properties:
+                      netPnL: { $ref: '#/components/schemas/Money' }
+                      todayPnL: { $ref: '#/components/schemas/Money' }
+                      totalDeployedCapital: { type: number }
+                  subscriptions:
+                    type: array
+                    items: { $ref: '#/components/schemas/SubscriptionSummary' }
+
+  /api/v1/subscriptions/{subscriptionId}:
+    get:
+      tags: [Subscriptions]
+      summary: Full subscription detail (header, metrics, allocation, previews)
+      x-screens: [algo_details_live, algo_details_paused]
+      x-auth-tier: session
+      x-realtime: "subscription.{id}.pnl, subscription.{id}.positions, subscription.{id}.timeline"
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SubscriptionDetail' }
+
+  /api/v1/subscriptions/{subscriptionId}/allocation:
+    get:
+      tags: [Subscriptions]
+      summary: Allocation breakdown — by sector or by market cap
+      x-screens: [algo_details_live]
+      x-auth-tier: session
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+        - in: query
+          name: by
+          required: true
+          schema: { type: string, enum: [sector, marketCap] }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    groupName: { type: string }
+                    pct: { type: number }
+                    children:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          symbol: { $ref: '#/components/schemas/StockSymbol' }
+                          pct: { type: number }
+
+  # ===========================================================================
+  # HOLDINGS & TRADES
+  # ===========================================================================
+  /api/v1/subscriptions/{subscriptionId}/holdings:
+    get:
+      tags: [Holdings & Trades]
+      summary: Open positions under a subscription
+      x-screens: [open_positions]
+      x-auth-tier: session
+      x-realtime: subscription.{id}.positions
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+        - in: query
+          name: sortBy
+          schema: { type: string, default: qty, enum: [qty, pnl, pnlPct, invested, current] }
+        - in: query
+          name: order
+          schema: { type: string, default: desc, enum: [asc, desc] }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Holding' }
+
+  /api/v1/subscriptions/{subscriptionId}/trades:
+    get:
+      tags: [Holdings & Trades]
+      summary: Past trades under a subscription
+      x-screens: [past_trades]
+      x-auth-tier: session
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+        - in: query
+          name: sortBy
+          schema: { type: string, default: realisedPnl }
+        - in: query
+          name: order
+          schema: { type: string, default: desc, enum: [asc, desc] }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TradeSummary' }
+
+  /api/v1/subscriptions/{subscriptionId}/trades/symbol/{symbol}:
+    get:
+      tags: [Holdings & Trades]
+      summary: Stock-level P&L drilldown (Overview + Trades table)
+      x-screens: [stock_pnl_drilldown]
+      x-auth-tier: session
+      x-realtime: market.quote.{symbol}
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+        - $ref: '#/components/parameters/SymbolPath'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StockPnLDetail' }
+
+  # ===========================================================================
+  # TIMELINE
+  # ===========================================================================
+  /api/v1/subscriptions/{subscriptionId}/timeline:
+    get:
+      tags: [Timeline]
+      summary: Audit log of events on a subscription
+      x-screens: [algo_timeline]
+      x-auth-tier: session
+      x-realtime: subscription.{id}.timeline
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 200 }
+        - in: query
+          name: before
+          schema: { type: string, format: date-time, description: "Pagination cursor" }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TimelineEvent' }
+
+  # ===========================================================================
+  # SUBSCRIPTION ACTIONS — sensitive (confirmation modal at app layer)
+  # ===========================================================================
+  /api/v1/algos/{algoId}/deploy:
+    post:
+      tags: [Subscription Actions]
+      summary: Deploy an algo (user confirms via T&C checkbox + warning card)
+      x-screens: [deploy_popup, add_fund_popup, strategy_live]
+      x-auth-tier: sensitive
+      parameters:
+        - $ref: '#/components/parameters/AlgoIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeployRequest' }
+      responses:
+        '200':
+          description: Deployed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptionId: { type: string }
+                  status: { type: string, enum: [LIVE] }
+                  deployedAt: { type: string, format: date-time }
+                  message: { type: string, example: "Strategy is live" }
+        '400':
+          description: |
+            - INSUFFICIENT_MARGIN → render Add fund popup
+            - INVALID_AMOUNT
+            - ALGO_AT_CAPACITY
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } }
+        '403':
+          description: |
+            - DDPI_REQUIRED → block deploy until user activates DDPI
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } }
+
+  /api/v1/subscriptions/{subscriptionId}/pause:
+    post:
+      tags: [Subscription Actions]
+      summary: Pause a live subscription
+      x-screens: [pause_confirmation, pause_success]
+      x-auth-tier: sensitive
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PausePositionsBody' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [PAUSED] }
+                  message: { type: string, example: "Algo Paused Successfully" }
+
+  /api/v1/subscriptions/{subscriptionId}/resume:
+    post:
+      tags: [Subscription Actions]
+      summary: Resume a paused subscription
+      x-screens: [resume_confirmation, resume_success]
+      x-auth-tier: sensitive
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PausePositionsBody' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [LIVE] }
+                  message: { type: string, example: "Algo Resumed Successfully" }
+        '409':
+          description: ALGO_PAUSED_BY_SYSTEM (margin shortfall — show Add fund first)
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } }
+
+  /api/v1/subscriptions/{subscriptionId}/stop:
+    post:
+      tags: [Subscription Actions]
+      summary: Stop a subscription permanently
+      x-screens: [stop_confirmation, stop_success]
+      x-auth-tier: sensitive
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PausePositionsBody' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [STOPPED] }
+                  message: { type: string, example: "Algo Stopped Successfully" }
+
+  /api/v1/subscriptions/{subscriptionId}/capital:
+    patch:
+      tags: [Subscription Actions]
+      summary: Increase or decrease deployed capital
+      x-screens: [change_allocation, change_allocation_success]
+      x-auth-tier: sensitive
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CapitalChangeRequest' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  newCapital: { type: number }
+                  message: { type: string, example: "Allocation Changed Successfully" }
+        '400':
+          description: INSUFFICIENT_MARGIN when increasing
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } }
+
+  /api/v1/subscriptions/{subscriptionId}/add-funds:
+    post:
+      tags: [Subscription Actions]
+      summary: Top up margin for a paused-by-system subscription
+      x-screens: [action_required_card, add_fund_popup]
+      x-auth-tier: sensitive
+      parameters:
+        - $ref: '#/components/parameters/SubscriptionIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddFundsRequest' }
+      responses:
+        '200': { description: ok }
+
+  # ===========================================================================
+  # NOTIFICATIONS
+  # ===========================================================================
+  /api/v1/notifications:
+    get:
+      tags: [Notifications]
+      summary: User notification feed
+      x-screens: [notifications_center]
+      x-auth-tier: session
+      x-realtime: notifications
+      parameters:
+        - in: query
+          name: since
+          schema: { type: string, format: date-time }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Notification' }
+
+  /api/v1/notifications/{notificationId}/read:
+    patch:
+      tags: [Notifications]
+      summary: Mark notification as read
+      x-screens: [notifications_center]
+      x-auth-tier: session
+      parameters:
+        - in: path
+          name: notificationId
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: ok }
+
+# =============================================================================
+# WEBSOCKET SPEC (not strictly OpenAPI — documented here for one-stop reference)
+# =============================================================================
+x-websocket:
+  url: wss://api.stockk.trade/ws
+  auth: |
+    Connect with the session cookie OR pass ?token={sessionToken} in query.
+    Server validates on upgrade and tracks per-user subscription set.
+
+  protocol:
+    subscribe:   '{ "op": "subscribe",   "topic": "<topic>" }'
+    unsubscribe: '{ "op": "unsubscribe", "topic": "<topic>" }'
+    push:        '{ "topic": "...", "ts": 1781509200000, "data": { ... } }'
+    heartbeat:   'Server sends { "op": "ping" } every 30s. Client must reply { "op": "pong" } within 10s.'
+
+  rateLimits:
+    quotePushPerSymbolMs: 500
+    maxSubscriptionsPerConnection: 200
+
+  topics:
+    account.summary:
+      payload:
+        currentValue: number
+        totalPnL: { value: number, pct: number }
+        todayPnL: { value: number, pct: number }
+      usedOnScreens: [home_dashboard]
+
+    account.margin:
+      payload:
+        availableMargin: number
+        utilizedMargin: number
+      usedOnScreens: [deploy_popup, change_allocation]
+
+    market.indices:
+      payload:
+        - { name: string, value: number, change: number, changePct: number }
+      usedOnScreens: [home_dashboard]
+
+    market.quote.{symbol}:
+      payload:
+        symbol: string
+        ltp: number
+        change: number
+        changePct: number
+      usedOnScreens: [home_dashboard, open_positions, stock_pnl_drilldown]
+
+    subscription.{id}.pnl:
+      payload:
+        netPnL: { value: number, pct: number }
+        todayPnL: { value: number, pct: number }
+      usedOnScreens: [live_algos_live, algo_details_live]
+
+    subscription.{id}.positions:
+      payload:
+        - { symbol: string, qty: number, unrealizedPnL: number, ltp: number }
+      usedOnScreens: [open_positions]
+
+    subscription.{id}.timeline:
+      payload: '<TimelineEvent>'
+      usedOnScreens: [algo_timeline, algo_details_live]
+
+    subscription.{id}.status:
+      payload:
+        status: 'LIVE | PAUSED | STOPPED'
+        alerts:
+          - { type: ACTION_REQUIRED, code: INSUFFICIENT_MARGIN, message: string }
+      usedOnScreens: [live_algos_live, algo_details_live]
+
+    notifications:
+      payload: '<Notification>'
+      usedOnScreens: [app-wide-bell-badge, notifications_center]
+
+# =============================================================================
+# SCREEN INDEX — quick lookup
+# =============================================================================
+x-screens:
+  home_dashboard:               "Home — portfolio summary, indices, movers, FII/DII, events, news"
+  readymade_algos_explore:      "Catalog list (Manthan / Flow / Value Edge)"
+  live_algos_live:              "User's running algos (Live filter)"
+  live_algos_paused:            "User's paused algos"
+  live_algos_stopped:           "User's stopped algos"
+  algo_details_live:            "Manthan Momentum detail (live state)"
+  algo_details_paused:          "Manthan Momentum detail (paused state)"
+  open_positions:               "All open positions list"
+  open_positions_sort:          "Sort filter bottom sheet"
+  past_trades:                  "Past trades list"
+  past_trades_sort:             "Past trades sort filter bottom sheet"
+  stock_pnl_drilldown:          "One stock's complete trade history + P&L"
+  strategy_overview:            "Pre-deploy: About Algo + Key Stats + features"
+  strategy_performance:         "Benchmark chart + return cards + day/month calendar"
+  deploy_popup:                 "Capital input modal"
+  add_fund_popup:               "Insufficient margin — add fund CTA"
+  strategy_live:                "Deploy success screen"
+  algo_timeline:                "Audit log of events"
+  pause_confirmation:           "Pause modal with KEEP_OPEN/SQUARE_OFF radio"
+  pause_success:                "Algo Paused Successfully"
+  resume_confirmation:          "Resume modal"
+  resume_success:               "Algo Resumed Successfully"
+  stop_confirmation:            "Stop modal with KEEP_OPEN/SQUARE_OFF radio"
+  stop_success:                 "Algo Stopped Successfully"
+  manage_bottom_sheet:          "Manage menu (Change Allocation / Stop)"
+  change_allocation:            "Increase or decrease deployed capital"
+  change_allocation_success:    "Allocation Changed Successfully"
+  action_required_card:         "Margin shortfall warning + Add funds CTA"
+  notifications_center:         "Notification feed"
+  profile:                      "User profile + settings"
+  profile_logout:               "Logout confirmation"
+  login:                        "SSO entry point (handled by Codifi — app just redirects)"
+
+# =============================================================================
+# SECTION B — Codifi/Indira broker endpoints consumed internally
+# =============================================================================
+# These are NOT exposed directly to mobile. The mobile app talks ONLY to OUR
+# backend (the endpoints under `paths:` above). OUR backend then talks to
+# Codifi server-to-server using the broker JWT it holds for each user.
+#
+# Documented here so the backend team knows:
+#   - which Codifi endpoints to call for which data
+#   - the existing API surface they integrate with
+#   - what's "already solved by Codifi" vs "we need to compute"
+#
+# Auth model:
+#   Mobile sends our session cookie → gateway validates → reads broker JWT
+#   from Redis → calls Codifi with Bearer token + appId/userId/source/sso
+#   headers (full pattern documented at /docs/architecture/codifi-auth.md).
+# =============================================================================
