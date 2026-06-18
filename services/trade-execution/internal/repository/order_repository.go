@@ -29,6 +29,15 @@ type DashboardStats struct {
 	ClosedCount      int     `json:"closed_count"`
 }
 
+// StrategySquareOffTarget is a (user, strategy) pair returned by strategy-level
+// square-off queries. The scheduler closes only that strategy's positions (both
+// paper and live) at the configured auto_square_off_time, leaving other strategies
+// untouched.
+type StrategySquareOffTarget struct {
+	UserID     string `db:"user_id"`
+	StrategyID string `db:"strategy_id"`
+}
+
 // OrderRepository defines database operations for orders
 type OrderRepository interface {
 	Create(ctx context.Context, order *models.Order) error
@@ -134,12 +143,21 @@ type OrderRepository interface {
 	GetStrategyNamesByIDs(ctx context.Context, strategyIDs []string) (map[string]string, error)
 	// GetUsersWithAutoSquareOffAtTime returns distinct user IDs whose square_off_time
 	// matches timeStr ("HH:MM" IST) in user_square_off_config. Used by the scheduler
-	// to trigger per-user square-offs at user-configured times.
+	// to trigger per-user square-offs at user-configured times (UI-level override).
 	GetUsersWithAutoSquareOffAtTime(ctx context.Context, timeStr string) ([]string, error)
 	// GetUsersWithExpiredAutoSquareOff returns user IDs whose enabled custom square_off_time
 	// is <= beforeTime ("HH:MM" IST). Used on startup to catch-up positions for users whose
 	// configured time already passed while the service was down.
 	GetUsersWithExpiredAutoSquareOff(ctx context.Context, beforeTime string) ([]string, error)
+	// GetStrategiesDueForSquareOff returns distinct (user_id, strategy_id) pairs whose
+	// today's orders carry auto_square_off_time = timeStr ("HH:MM" IST) and still have an
+	// open position (paper or live). Used by the scheduler to close only that strategy's
+	// positions, not all of the user's — preventing cross-strategy square-off pollution.
+	GetStrategiesDueForSquareOff(ctx context.Context, timeStr string) ([]StrategySquareOffTarget, error)
+	// GetStrategiesWithExpiredSquareOff returns (user_id, strategy_id) pairs whose today's
+	// orders carry auto_square_off_time <= beforeTime ("HH:MM" IST) and still have an open
+	// position. Used on startup to catch-up strategy square-offs missed while down.
+	GetStrategiesWithExpiredSquareOff(ctx context.Context, beforeTime string) ([]StrategySquareOffTarget, error)
 	// GetOpenOrdersByUser returns FILLED/PARTIALLY_FILLED INTRADAY live orders for a single
 	// user today that haven't been square-offed yet. Used for per-user live square-off.
 	GetOpenOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error)
@@ -1667,6 +1685,61 @@ func (r *orderRepository) GetDistinctActiveUsersToday(ctx context.Context) ([]st
 		return nil, fmt.Errorf("failed to get distinct active users today: %w", err)
 	}
 	return userIDs, nil
+}
+
+// GetStrategiesDueForSquareOff returns distinct (user_id, strategy_id) pairs from
+// today's orders whose auto_square_off_time column matches timeStr ("HH:MM" IST) and
+// still have an open position — paper (paper_exit_price IS NULL) or live
+// (live_exit_price IS NULL). The index on (auto_square_off_time, user_id) keeps this
+// O(matching rows), not a full table scan.
+func (r *orderRepository) GetStrategiesDueForSquareOff(ctx context.Context, timeStr string) ([]StrategySquareOffTarget, error) {
+	var targets []StrategySquareOffTarget
+	query := `
+		SELECT DISTINCT user_id, strategy_id
+		FROM orders
+		WHERE auto_square_off_time = $1
+		  AND is_square_off_order = false
+		  AND strategy_id != ''
+		  AND filled_quantity > 0
+		  AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		  AND (
+		        (is_paper_trade = false AND live_exit_price IS NULL)
+		     OR (is_paper_trade = true  AND paper_exit_price IS NULL)
+		  )
+		ORDER BY user_id, strategy_id
+	`
+	if err := r.db.SelectContext(ctx, &targets, query, timeStr); err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get strategies due for sq-off at %s: %w", timeStr, err)
+	}
+	return targets, nil
+}
+
+// GetStrategiesWithExpiredSquareOff returns (user_id, strategy_id) pairs from today's
+// orders whose auto_square_off_time <= beforeTime ("HH:MM" IST) and still have an open
+// position (paper or live). Used on startup to catch-up strategy square-offs that were
+// missed while the service was down.
+func (r *orderRepository) GetStrategiesWithExpiredSquareOff(ctx context.Context, beforeTime string) ([]StrategySquareOffTarget, error) {
+	var targets []StrategySquareOffTarget
+	query := `
+		SELECT DISTINCT user_id, strategy_id
+		FROM orders
+		WHERE auto_square_off_time IS NOT NULL
+		  AND auto_square_off_time != ''
+		  AND auto_square_off_time <= $1
+		  AND is_square_off_order = false
+		  AND strategy_id != ''
+		  AND filled_quantity > 0
+		  AND DATE(created_at AT TIME ZONE 'Asia/Kolkata') = DATE(NOW() AT TIME ZONE 'Asia/Kolkata')
+		  AND (
+		        (is_paper_trade = false AND live_exit_price IS NULL)
+		     OR (is_paper_trade = true  AND paper_exit_price IS NULL)
+		  )
+		ORDER BY user_id, strategy_id
+	`
+	if err := r.db.SelectContext(ctx, &targets, query, beforeTime); err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to get strategies with expired sq-off before %s: %w", beforeTime, err)
+	}
+	return targets, nil
 }
 
 // ════════════════════════════════════════════════════════════════════════════

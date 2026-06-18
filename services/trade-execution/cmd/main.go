@@ -716,8 +716,10 @@ func main() {
 	)
 	// Wire paper monitor so paper positions are closed at market close alongside live positions.
 	autoSquareOff.SetPaperSquareOff(paperMonitor.SquareOffAll)
-	// Wire per-user paper exit: closes a specific user's paper positions at their custom time.
+	// Wire per-user paper exit: closes a specific user's paper positions at their custom time (UI override).
 	autoSquareOff.SetPaperForceExitUser(paperMonitor.ForceExitAll)
+	// Wire per-strategy paper exit: closes only one strategy's paper positions at its configured time.
+	autoSquareOff.SetPaperForceExitStrategy(paperMonitor.ForceExitByStrategy)
 	// Wire broker position-book check so flat positions (NetQty == 0) aren't squared off again.
 	autoSquareOff.SetPositionChecker(positionChecker)
 	// Wire SL/TP teardown so each position's resting OCO and multi-level exit legs are
@@ -732,22 +734,13 @@ func main() {
 	// After live square-off fires, clear the broker-WS protection set so post-market
 	// idle sweeps can close connections for users with no remaining exposure.
 	autoSquareOff.SetOnMarketClose(statusService.UnmarkAllActiveStrategyUsers)
-	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-user: enabled, broker netQty check: enabled, SL/TP teardown: enabled)", cfg.AutoSquareOffTime)
+	log.Printf("✓ Auto Square-Off Scheduler initialized (time: %s, paper square-off: enabled, per-strategy: enabled, per-user: enabled, broker netQty check: enabled, SL/TP teardown: enabled)", cfg.AutoSquareOffTime)
 
-	// Backfill user_square_off_config from today's orders on every startup.
-	// Covers orders placed before the per-user custom square-off fix was deployed,
-	// so users who sent signals with auto_square_off_time earlier today still fire correctly.
-	go func() {
-		bfCtx, bfCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer bfCancel()
-		n, err := orderRepo.BackfillTodaySquareOffConfig(bfCtx)
-		if err != nil {
-			log.Printf("[auto-square-off] Backfill warning: %v", err)
-		} else if n > 0 {
-			log.Printf("[auto-square-off] Backfilled square-off config for %d user(s) from today's orders", n)
-		}
-	}()
-	// ──────────────────────────────────────────────────────────────────────
+	// NOTE: The user_square_off_config backfill was removed. The scheduler now reads
+	// the strategy-scoped auto_square_off_time directly off the orders table via
+	// GetStrategiesDueForSquareOff / runStartupStrategyCatchUp, so copying those times
+	// into the user-level config (which closed ALL of a user's strategies at once) is
+	// no longer needed and would reintroduce cross-strategy square-off pollution.
 
 	// ── Startup Recovery: broker WS pre-warm ─────────────────────────────
 	// Eagerly re-subscribe the Indira order-status WS for every user with

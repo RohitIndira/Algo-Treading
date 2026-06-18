@@ -839,14 +839,17 @@ func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, ord
 		go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg partially filled (OCO)")
 
 	case "CANCELLED":
-		// If we cancelled it ourselves (during OCO completion), this is expected.
-		// If cancelled externally, we should also cancel the TP leg.
+		// User cancelled the SL leg — leave TP running independently.
 		if group.State == StateActive || group.State == StateLegsSubmitted {
-			log.Printf("[oco] SL leg CANCELLED externally for group %s — cancelling TP", group.GroupID)
-			group.State = StateCancelled
+			log.Printf("[oco] SL leg CANCELLED externally for group %s — keeping TP active", group.GroupID)
+			m.brokerIndex.Delete(group.SLBrokerID)
+			group.SLBrokerID = ""
+			group.SLLegConfirmed = false
 			group.UpdatedAt = time.Now()
-			go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg cancelled externally (OCO)")
-			m.scheduleCleanup(group)
+			if group.TPBrokerID == "" {
+				group.State = StateCancelled
+				m.scheduleCleanup(group)
+			}
 		}
 	}
 }
@@ -922,12 +925,17 @@ func (m *OCOManager) handleTPLegUpdate(ctx context.Context, group *OCOGroup, ord
 		go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg partially filled (OCO)")
 
 	case "CANCELLED":
+		// User cancelled the TP leg — leave SL running independently.
 		if group.State == StateActive || group.State == StateLegsSubmitted {
-			log.Printf("[oco] TP leg CANCELLED externally for group %s — cancelling SL", group.GroupID)
-			group.State = StateCancelled
+			log.Printf("[oco] TP leg CANCELLED externally for group %s — keeping SL active", group.GroupID)
+			m.brokerIndex.Delete(group.TPBrokerID)
+			group.TPBrokerID = ""
+			group.TPLegConfirmed = false
 			group.UpdatedAt = time.Now()
-			go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg cancelled externally (OCO)")
-			m.scheduleCleanup(group)
+			if group.SLBrokerID == "" {
+				group.State = StateCancelled
+				m.scheduleCleanup(group)
+			}
 		}
 	}
 }
