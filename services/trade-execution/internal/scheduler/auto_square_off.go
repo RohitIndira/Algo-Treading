@@ -45,8 +45,12 @@ type AutoSquareOffScheduler struct {
 	paperSquareOff func(ctx context.Context) error
 
 	// paperForceExitUser, if set, is called with a specific userID to close that user's paper
-	// positions at their custom auto_square_off_time.
+	// positions at their custom auto_square_off_time (UI-level override — all strategies).
 	paperForceExitUser func(ctx context.Context, userID string) error
+
+	// paperForceExitStrategy, if set, closes paper positions for a single (user, strategy)
+	// pair at that strategy's auto_square_off_time. More targeted than paperForceExitUser.
+	paperForceExitStrategy func(ctx context.Context, userID, strategyID string) error
 
 	// positionChecker, if set, queries the broker position book before placing a
 	// square-off order and skips symbols whose NetQty is already 0. Nil-safe.
@@ -57,6 +61,11 @@ type AutoSquareOffScheduler struct {
 	// placed — so a resting stop can't fire into a now-flat book and open a fresh
 	// position. Nil-safe. Wired in main.go to OCO + ML CancelGroupsBySymbol.
 	cancelProtectiveLegs func(ctx context.Context, userID, symbol string)
+
+	// onMarketClose, if set, is called once after the global live square-off
+	// completes. Used to clear the broker-WS idle-sweep protection set so
+	// post-market idle sweeps can close connections with no remaining exposure.
+	onMarketClose func()
 }
 
 // NewAutoSquareOffScheduler creates a new auto square-off scheduler.
@@ -88,10 +97,17 @@ func (s *AutoSquareOffScheduler) SetPaperSquareOff(fn func(ctx context.Context) 
 }
 
 // SetPaperForceExitUser registers a callback used to close a single user's paper positions
-// when their custom auto_square_off_time is reached.
+// when their custom auto_square_off_time is reached (UI-level override — all strategies).
 // Pass paperMonitor.ForceExitAll to wire it up.
 func (s *AutoSquareOffScheduler) SetPaperForceExitUser(fn func(ctx context.Context, userID string) error) {
 	s.paperForceExitUser = fn
+}
+
+// SetPaperForceExitStrategy registers a callback used to close paper positions for a
+// single (user, strategy) pair at that strategy's auto_square_off_time.
+// Pass paperMonitor.ForceExitByStrategy to wire it up.
+func (s *AutoSquareOffScheduler) SetPaperForceExitStrategy(fn func(ctx context.Context, userID, strategyID string) error) {
+	s.paperForceExitStrategy = fn
 }
 
 // SetPositionChecker wires the broker position-book checker so square-off skips
@@ -107,6 +123,13 @@ func (s *AutoSquareOffScheduler) SetPositionChecker(pc *PositionChecker) {
 // call before Start().
 func (s *AutoSquareOffScheduler) SetProtectiveLegCanceller(fn func(ctx context.Context, userID, symbol string)) {
 	s.cancelProtectiveLegs = fn
+}
+
+// SetOnMarketClose wires a callback invoked once after the global live square-off
+// fires at market close. Wired in main.go to statusService.UnmarkAllActiveStrategyUsers
+// so subsequent idle sweeps can close connections with no remaining exposure.
+func (s *AutoSquareOffScheduler) SetOnMarketClose(fn func()) {
+	s.onMarketClose = fn
 }
 
 // Start begins the auto square-off check loop (every 1 minute).
@@ -132,7 +155,11 @@ func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
 			return nil
 
 		case <-ticker.C:
-			// Per-user custom auto square-off times (both paper + live).
+			// Strategy-level square-off: closes only the matching strategy's positions
+			// (paper + live) when orders.auto_square_off_time matches the current minute.
+			s.checkStrategySquareOffs(ctx)
+
+			// Per-user custom auto square-off times (UI-level override, all strategies).
 			s.checkUserSquareOffs(ctx)
 
 			// Global paper square-off fires independently at its own time (15:00).
@@ -147,6 +174,11 @@ func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
 				log.Println("[auto-square-off] ========== LIVE TRIGGER — squaring off all open algo positions ==========")
 				if err := s.squareOffAllPositions(ctx); err != nil {
 					log.Printf("[auto-square-off] Error during live square-off: %v", err)
+				}
+				// Clear the broker-WS protection set so post-market idle sweeps
+				// can close connections for users with no remaining exposure.
+				if s.onMarketClose != nil {
+					s.onMarketClose()
 				}
 			}
 		}
@@ -223,7 +255,10 @@ func (s *AutoSquareOffScheduler) runStartupCatchUp(ctx context.Context) {
 		}
 	}
 
-	// Per-user custom time catch-up
+	// Strategy-level custom time catch-up (orders.auto_square_off_time).
+	s.runStartupStrategyCatchUp(ctx, now, today, currentMinutes)
+
+	// Per-user custom time catch-up (user_square_off_config, UI-level override).
 	s.runStartupUserCatchUp(ctx, now, today, currentMinutes)
 }
 
@@ -685,4 +720,159 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 		originalOrder.UserID, squareOffOrder.OrderID, originalOrder.OrderID)
 
 	return nil
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Strategy-scoped square-off (auto_square_off_time set per strategy signal)
+// ════════════════════════════════════════════════════════════════════════════
+
+// checkStrategySquareOffs fires every minute tick on weekdays. It queries the orders
+// table for (user, strategy) pairs whose auto_square_off_time matches the current IST
+// minute, then closes ONLY those strategies' positions — both paper and live — leaving
+// every other strategy's open positions untouched.
+func (s *AutoSquareOffScheduler) checkStrategySquareOffs(ctx context.Context) {
+	now := time.Now().In(timezone.IST)
+	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+		return
+	}
+	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
+	today := now.Format("2006-01-02")
+
+	targets, err := s.orderRepo.GetStrategiesDueForSquareOff(ctx, currentTime)
+	if err != nil {
+		log.Printf("[auto-square-off] Strategy sq-off: failed to fetch targets at %s: %v", currentTime, err)
+		return
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	for _, t := range targets {
+		// Per-(user, strategy) dedup so we don't fire twice in the same minute/day.
+		guardKey := t.UserID + ":" + t.StrategyID + ":" + currentTime
+		s.mu.Lock()
+		if s.lastUserExecuteDates[guardKey] == today {
+			s.mu.Unlock()
+			continue
+		}
+		s.lastUserExecuteDates[guardKey] = today
+		s.mu.Unlock()
+
+		log.Printf("[auto-square-off] ===== STRATEGY SQUARE-OFF: user=%s strategy=%s time=%s =====",
+			t.UserID, t.StrategyID, currentTime)
+
+		// Close paper positions for this strategy.
+		if s.paperForceExitStrategy != nil {
+			if err := s.paperForceExitStrategy(ctx, t.UserID, t.StrategyID); err != nil {
+				log.Printf("[auto-square-off] Paper strategy exit failed user=%s strategy=%s: %v",
+					t.UserID, t.StrategyID, err)
+			}
+		}
+
+		// Close live positions for this strategy.
+		if err := s.squareOffStrategyLivePositions(ctx, t.UserID, t.StrategyID); err != nil {
+			log.Printf("[auto-square-off] Live strategy sq-off failed user=%s strategy=%s: %v",
+				t.UserID, t.StrategyID, err)
+		}
+	}
+}
+
+// squareOffStrategyLivePositions closes all open live positions for one (user, strategy)
+// pair. It uses the broker position-book check when available so symbols already flat
+// (NetQty == 0) are skipped, and otherwise falls open (closes based on DB state).
+func (s *AutoSquareOffScheduler) squareOffStrategyLivePositions(ctx context.Context, userID, strategyID string) error {
+	orders, err := s.orderRepo.GetExitableLiveOrdersByStrategy(ctx, strategyID, userID)
+	if err != nil {
+		return fmt.Errorf("get exitable orders user=%s strategy=%s: %w", userID, strategyID, err)
+	}
+	if len(orders) == 0 {
+		log.Printf("[auto-square-off] Strategy sq-off: no open live positions user=%s strategy=%s", userID, strategyID)
+		return nil
+	}
+
+	log.Printf("[auto-square-off] Strategy sq-off: user=%s strategy=%s has %d live order(s)",
+		userID, strategyID, len(orders))
+
+	// Fetch the broker position book once for this user. Fail-open: a nil snapshot
+	// makes IsExited return false so the square-off proceeds on DB state alone.
+	var snapshot *OpenPositions
+	if s.positionChecker != nil {
+		var fetchErr error
+		snapshot, fetchErr = s.positionChecker.FetchOpenPositions(ctx, userID)
+		if fetchErr != nil {
+			log.Printf("[auto-square-off] Position-book unavailable user=%s; proceeding without skip: %v", userID, fetchErr)
+			snapshot = nil
+		}
+	}
+
+	for _, order := range orders {
+		if order.FilledQuantity <= 0 {
+			continue
+		}
+		if snapshot.IsExited(order) {
+			log.Printf("[auto-square-off] Skipping order=%s user=%s sym=%s: broker NetQty=0 (already flat)",
+				order.OrderID, userID, order.Symbol)
+			continue
+		}
+		if err := s.createAndExecuteSquareOffOrder(ctx, order); err != nil {
+			log.Printf("[auto-square-off] FAILED strategy sq-off order=%s user=%s strategy=%s: %v",
+				order.OrderID, userID, strategyID, err)
+		}
+	}
+	return nil
+}
+
+// runStartupStrategyCatchUp closes positions for (user, strategy) pairs whose
+// auto_square_off_time has already passed today (e.g. the service was down at that
+// time). Live orders are only placed if we are still before market close (15:30 IST)
+// to avoid creating AMOs; paper exits are always safe.
+func (s *AutoSquareOffScheduler) runStartupStrategyCatchUp(ctx context.Context, now time.Time, today string, currentMinutes int) {
+	currentTimeStr := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
+
+	targets, err := s.orderRepo.GetStrategiesWithExpiredSquareOff(ctx, currentTimeStr)
+	if err != nil {
+		log.Printf("[auto-square-off] Startup strategy catch-up: failed to fetch targets: %v", err)
+		return
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	log.Printf("[auto-square-off] Startup strategy catch-up: %d (user, strategy) pair(s) with sq-off time already passed", len(targets))
+
+	pastClose := currentMinutes >= marketCloseMinutes
+	if pastClose {
+		log.Printf("[auto-square-off] Startup strategy catch-up: market closed (now %02d:%02d IST) — closing paper only, marking live done without orders to prevent AMOs",
+			now.Hour(), now.Minute())
+	}
+
+	for _, t := range targets {
+		guardKey := t.UserID + ":" + t.StrategyID + ":startup-catchup"
+		s.mu.Lock()
+		if s.lastUserExecuteDates[guardKey] == today {
+			s.mu.Unlock()
+			continue
+		}
+		s.lastUserExecuteDates[guardKey] = today
+		s.mu.Unlock()
+
+		log.Printf("[auto-square-off] Startup strategy catch-up: closing user=%s strategy=%s", t.UserID, t.StrategyID)
+
+		// Paper is simulated — no AMO risk, always safe to close.
+		if s.paperForceExitStrategy != nil {
+			if err := s.paperForceExitStrategy(ctx, t.UserID, t.StrategyID); err != nil {
+				log.Printf("[auto-square-off] Startup paper strategy exit failed user=%s strategy=%s: %v",
+					t.UserID, t.StrategyID, err)
+			}
+		}
+
+		// Live exits only before market close — otherwise an exit order becomes an AMO.
+		if pastClose {
+			continue
+		}
+		if err := s.squareOffStrategyLivePositions(ctx, t.UserID, t.StrategyID); err != nil {
+			log.Printf("[auto-square-off] Startup live strategy sq-off failed user=%s strategy=%s: %v",
+				t.UserID, t.StrategyID, err)
+		}
+	}
 }

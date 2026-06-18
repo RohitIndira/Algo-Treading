@@ -60,6 +60,24 @@ var (
 		Name:      "rejections_total",
 		Help:      "Total orders rejected or cancelled by broker.",
 	}, []string{"reason"})
+
+	// OCOFillPriceSource counts how the OCO entry fill price (used to compute
+	// SL/TP) was resolved: order_ws, trade_book, or limit_fallback.
+	OCOFillPriceSource = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "trade_execution",
+		Subsystem: "oco",
+		Name:      "fillprice_source_total",
+		Help:      "OCO entry fill-price resolutions by source (order_ws, trade_book, limit_fallback).",
+	}, []string{"source"})
+
+	// OCOAwaitingFillPrice is the current number of OCO groups parked awaiting a
+	// resolvable execution price before SL/TP legs can be placed.
+	OCOAwaitingFillPrice = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "trade_execution",
+		Subsystem: "oco",
+		Name:      "awaiting_fillprice",
+		Help:      "OCO groups currently awaiting execution-price resolution (entry filled, SL/TP deferred).",
+	})
 )
 
 // ── Kafka consumer ──────────────────────────────────────────────────────────

@@ -307,22 +307,32 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 	appId := r.Header.Get("appId")
 	source := r.Header.Get("source")
 	userIdHeader := r.Header.Get("userId")
-	if bearerToken != "" && appId != "" && source != "" && userIdHeader != "" {
-		credsReq := &pb.UpdateUserCredentialsRequest{
-			UserId: reqBody.UserID,
-			IndiraAuth: &common.IndiraAuthContext{
-				UserId:      userIdHeader,
-				AppId:       appId,
-				Source:      source,
-				BearerToken: bearerToken,
-			},
-		}
-		if _, credsErr := h.client.UpdateUserCredentials(r.Context(), credsReq); credsErr != nil {
-			log.Printf("WARN ActivateStrategy: credential refresh failed for user %s: %v", reqBody.UserID, credsErr)
-		}
-	} else {
-		log.Printf("WARN ActivateStrategy: missing auth headers for user %s — credentials NOT refreshed (bearer=%v appId=%v source=%v userId=%v)",
+	if bearerToken == "" || appId == "" || source == "" || userIdHeader == "" {
+		log.Printf("ERROR ActivateStrategy: missing auth headers for user %s — activation blocked (bearer=%v appId=%v source=%v userId=%v)",
 			reqBody.UserID, bearerToken != "", appId != "", source != "", userIdHeader != "")
+		respondWithError(w, http.StatusUnauthorized, "Broker session token is required to activate a strategy — please re-login and try again")
+		return
+	}
+
+	credsReq := &pb.UpdateUserCredentialsRequest{
+		UserId: reqBody.UserID,
+		IndiraAuth: &common.IndiraAuthContext{
+			UserId:      userIdHeader,
+			AppId:       appId,
+			Source:      source,
+			BearerToken: bearerToken,
+		},
+	}
+	credsResp, credsErr := h.client.UpdateUserCredentials(r.Context(), credsReq)
+	if credsErr != nil {
+		log.Printf("ERROR ActivateStrategy: credential save failed (transport) for user %s: %v", reqBody.UserID, credsErr)
+		respondWithError(w, http.StatusInternalServerError, "Failed to save broker credentials — please try again")
+		return
+	}
+	if !credsResp.Success {
+		log.Printf("ERROR ActivateStrategy: credential save rejected for user %s: %v", reqBody.UserID, credsResp.Error)
+		respondWithError(w, http.StatusBadRequest, "Broker session token could not be saved — please re-login and try again")
+		return
 	}
 
 	req := &pb.ActivateStrategyRequest{

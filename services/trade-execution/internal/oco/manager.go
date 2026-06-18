@@ -2,16 +2,16 @@
 //
 // Architecture overview:
 //
-//	                   ┌─────────────────────┐
-//	 TradeSignal ──→   │    OCO Manager       │
-//	                   │  (in-memory registry │
-//	                   │   + broker ID index) │
-//	                   └──────────┬──────────┘
-//	                              │
-//	    ┌──────────┬──────────────┼───────────────────┐
-//	    ▼          ▼              ▼                    ▼
-//	 PlaceEntry  OnFill →     HandleBrokerUpdate   TrailingMonitor
-//	 (SL order)  PlaceLegs   (cancel counterpart)  (ModifyOrder)
+//	                  ┌─────────────────────┐
+//	TradeSignal ──→   │    OCO Manager       │
+//	                  │  (in-memory registry │
+//	                  │   + broker ID index) │
+//	                  └──────────┬──────────┘
+//	                             │
+//	   ┌──────────┬──────────────┼───────────────────┐
+//	   ▼          ▼              ▼                    ▼
+//	PlaceEntry  OnFill →     HandleBrokerUpdate   TrailingMonitor
+//	(SL order)  PlaceLegs   (cancel counterpart)  (ModifyOrder)
 //
 // All state is in-memory (sync.Map) for O(1) lookups from broker WS events.
 // State changes are persisted to PostgreSQL asynchronously.
@@ -26,11 +26,22 @@ import (
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/fillprice"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/metrics"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/google/uuid"
 )
+
+// defaultFillPriceDeadline bounds how long an entry-filled group waits for a real
+// execution price (WS or trade book) before SL/TP legs are placed off the
+// buffer-stripped entry limit. Keeps the unprotected window small but lets the
+// trade book win in the common case.
+const defaultFillPriceDeadline = 30 * time.Second
+
+// defaultFillPriceRetryInterval is the tick of the fill-price retry worker.
+const defaultFillPriceRetryInterval = 3 * time.Second
 
 // maxEntryRetries is how many times we retry placing the OCO entry order on transient errors (e.g. 401).
 const maxEntryRetries = 2
@@ -69,10 +80,23 @@ type OCOManager struct {
 	// wsBroadcaster pushes real-time updates to the frontend WS.
 	wsBroadcaster func(userID string, eventType string, order *models.Order)
 
+	// wsEnsure (re)establishes the user's broker order-WS subscription so the
+	// EXECUTED event that triggers SL/TP leg placement is actually consumed.
+	// Wired in main.go to OrderStatusService.StartSubscription; nil-safe.
+	wsEnsure func(userID string, auth *indiraClient.AuthContext)
+
 	// partialFillTimeout is how long to wait for remaining entry qty after a
 	// partial fill before cancelling the unfilled portion. Configurable via
 	// OCO_PARTIAL_FILL_TIMEOUT env var (default 50s).
 	partialFillTimeout time.Duration
+
+	// fillCache resolves the execution price from the broker trade book (batched
+	// per user) when the order WS carried no TradedPrice. nil-safe.
+	fillCache *fillprice.Cache
+	// fillPriceDeadline bounds the AWAITING_FILL_PRICE wait before the limit
+	// fallback. fillRetryInterval is the retry worker's tick.
+	fillPriceDeadline time.Duration
+	fillRetryInterval time.Duration
 
 	// ── In-memory state (O(1) lookup) ───────────────────────────────────────
 	// groups: groupID (uuid.UUID) → *OCOGroup
@@ -99,6 +123,21 @@ func NewOCOManager(
 		repo:               repo,
 		indiraClient:       indiraClient,
 		partialFillTimeout: defaultPartialFillTimeout,
+		fillPriceDeadline:  defaultFillPriceDeadline,
+		fillRetryInterval:  defaultFillPriceRetryInterval,
+	}
+}
+
+// SetFillPriceCache wires the trade-book execution-price resolver used by the
+// fill-price retry worker, along with its deadline and retry interval. Values
+// <= 0 keep the existing defaults. nil-safe.
+func (m *OCOManager) SetFillPriceCache(c *fillprice.Cache, deadline, retryInterval time.Duration) {
+	m.fillCache = c
+	if deadline > 0 {
+		m.fillPriceDeadline = deadline
+	}
+	if retryInterval > 0 {
+		m.fillRetryInterval = retryInterval
 	}
 }
 
@@ -111,6 +150,13 @@ func (m *OCOManager) SetPartialFillTimeout(d time.Duration) {
 }
 
 // SetWSBroadcaster wires the frontend WS push callback.
+// SetWSEnsurer wires a callback that (re)establishes the user's broker order-WS
+// subscription. AdoptOrder calls it so a price-monitor entry placed after the
+// connection was idle-swept still receives its EXECUTED fill and gets SL/TP legs.
+func (m *OCOManager) SetWSEnsurer(fn func(userID string, auth *indiraClient.AuthContext)) {
+	m.wsEnsure = fn
+}
+
 func (m *OCOManager) SetWSBroadcaster(fn func(userID string, eventType string, order *models.Order)) {
 	m.wsBroadcaster = fn
 }
@@ -320,26 +366,27 @@ func (m *OCOManager) CreateOCOEntry(
 
 	// Create the OCO group
 	group := &OCOGroup{
-		GroupID:       groupID,
-		UserID:        userID,
-		EntryOrderID:  entryOrderID,
-		SLPercent:     slPercent,
-		TPPercent:     tpPercent,
-		TrailingSL:    trailingSL,
-		TrailingSLPct: trailingSLPct,
-		State:         StatePendingEntry,
-		Symbol:        symbol,
-		Exchange:      exchange,
-		StockCode:     stockCode,
-		Quantity:      quantity,
-		OrderSide:     orderSide,
-		Auth:          auth,
-		ProductType:   productType,
-		Validity:      "DAY",
-		StrategyID:    strategyID,
-		EventID:       eventID,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
+		GroupID:         groupID,
+		UserID:          userID,
+		EntryOrderID:    entryOrderID,
+		EntryLimitPrice: entryLimitPrice,
+		SLPercent:       slPercent,
+		TPPercent:       tpPercent,
+		TrailingSL:      trailingSL,
+		TrailingSLPct:   trailingSLPct,
+		State:           StatePendingEntry,
+		Symbol:          symbol,
+		Exchange:        exchange,
+		StockCode:       stockCode,
+		Quantity:        quantity,
+		OrderSide:       orderSide,
+		Auth:            auth,
+		ProductType:     productType,
+		Validity:        "DAY",
+		StrategyID:      strategyID,
+		EventID:         eventID,
+		CreatedAt:       time.Now(),
+		UpdatedAt:       time.Now(),
 	}
 
 	// Build the entry order model
@@ -594,27 +641,32 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 		}
 
 		// ── Case B: Normal full fill (no prior partial) ──
-		if group.State != StatePendingEntry {
+		// Accept the fill from the initial PENDING_ENTRY state or from a group
+		// already parked in AWAITING_FILL_PRICE — a later WS event may carry the
+		// TradedPrice the first one lacked.
+		if group.State != StatePendingEntry && group.State != StateAwaitingFillPrice {
 			return // Already handled
 		}
 
-		// Capture fill price from the WS event.
-		// FilledPrice (TradedPrice from broker WS) is the actual execution price.
-		// order.Price is the LIMIT price used to place the entry — for OCO LIMIT entries
-		// it is signal_price * 1.005, which is higher than the actual fill. Using it as
-		// HighestPrice would prevent trailing SL from ever firing (stock never exceeds
-		// the limit price that was already above market at entry time).
-		fillPrice := 0.0
-		if order.FilledPrice != nil && *order.FilledPrice > 0 {
-			fillPrice = *order.FilledPrice
-		} else if order.Price != nil && *order.Price > 0 {
-			fillPrice = *order.Price
-		}
-		if fillPrice <= 0 {
-			log.Printf("[oco] WARNING: Entry fill price is 0 for group %s — cannot place legs", group.GroupID)
-			group.State = StateFailed
+		// Execution-price resolution — STEP 1 (order WS): FilledPrice is the broker
+		// WS TradedPrice (VWAP'd by the status service) — the actual execution price.
+		// This is the only step on the WS hot path; it never makes a network call.
+		// When it is absent (e.g. a MARKET order whose EXECUTED event omits a price)
+		// we DEFER: park in AWAITING_FILL_PRICE so the fill-price retry worker
+		// resolves via the trade book (STEP 2) and, past a deadline, the
+		// buffer-stripped entry limit (STEP 3). This guarantees SL/TP come from the
+		// real execution price, never the inflated entry-limit price.
+		if order.FilledPrice == nil || *order.FilledPrice <= 0 {
+			if group.State != StateAwaitingFillPrice {
+				group.State = StateAwaitingFillPrice
+				group.EntryFilledAt = time.Now()
+				group.UpdatedAt = time.Now()
+				log.Printf("[oco] Entry FILLED for group %s but WS carried no fill price — deferring SL/TP to retry worker (trade-book resolve)", group.GroupID)
+			}
 			return
 		}
+
+		fillPrice := *order.FilledPrice
 
 		group.FilledQty = group.Quantity
 		group.EntryFillPrice = fillPrice
@@ -622,7 +674,8 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 		group.State = StatePlacingLegs
 		group.UpdatedAt = time.Now()
 
-		log.Printf("[oco] Entry FILLED for group %s at %.2f — placing SL+TP legs", group.GroupID, fillPrice)
+		metrics.OCOFillPriceSource.WithLabelValues("order_ws").Inc()
+		log.Printf("[oco] Entry FILLED for group %s at %.2f (source=order_ws) — placing SL+TP legs", group.GroupID, fillPrice)
 
 		// Place SL and TP legs (in background goroutine so we don't block the WS handler)
 		legCtx, legCancel := context.WithTimeout(context.Background(), brokerOpTimeout)
@@ -642,13 +695,11 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 			log.Printf("[oco] Entry PARTIALLY FILLED for group %s: %d/%d — placing SL+TP legs for filled qty",
 				group.GroupID, filledQty, group.Quantity)
 
-			// Capture fill price from the WS event (FilledPrice = TradedPrice, actual execution price)
-			fillPrice := 0.0
-			if order.FilledPrice != nil && *order.FilledPrice > 0 {
-				fillPrice = *order.FilledPrice
-			} else if order.Price != nil && *order.Price > 0 {
-				fillPrice = *order.Price
-			}
+			// Resolve fill price: prefer the real broker fill (FilledPrice =
+			// TradedPrice); fall back to the buffer-stripped entry limit only when
+			// no real price is available. Partial fills place legs immediately
+			// rather than deferring (the partial-fill timer logic depends on it).
+			fillPrice, source := wsFillOrStrippedLimit(order, group.OrderSide)
 			if fillPrice <= 0 {
 				log.Printf("[oco] WARNING: Partial fill price is 0 for group %s — cannot place legs", group.GroupID)
 				return // Don't fail the group — wait for full fill or next partial with price
@@ -660,6 +711,7 @@ func (m *OCOManager) handleEntryUpdate(ctx context.Context, group *OCOGroup, ord
 			group.HighestPrice = fillPrice
 			group.State = StatePlacingLegs
 			group.UpdatedAt = time.Now()
+			metrics.OCOFillPriceSource.WithLabelValues(source).Inc()
 
 			// Place SL+TP legs with partial qty, then start timeout timer
 			legCtx, legCancel := context.WithTimeout(context.Background(), brokerOpTimeout)
@@ -787,14 +839,17 @@ func (m *OCOManager) handleSLLegUpdate(ctx context.Context, group *OCOGroup, ord
 		go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg partially filled (OCO)")
 
 	case "CANCELLED":
-		// If we cancelled it ourselves (during OCO completion), this is expected.
-		// If cancelled externally, we should also cancel the TP leg.
+		// User cancelled the SL leg — leave TP running independently.
 		if group.State == StateActive || group.State == StateLegsSubmitted {
-			log.Printf("[oco] SL leg CANCELLED externally for group %s — cancelling TP", group.GroupID)
-			group.State = StateCancelled
+			log.Printf("[oco] SL leg CANCELLED externally for group %s — keeping TP active", group.GroupID)
+			m.brokerIndex.Delete(group.SLBrokerID)
+			group.SLBrokerID = ""
+			group.SLLegConfirmed = false
 			group.UpdatedAt = time.Now()
-			go m.cancelLeg(group, group.TPBrokerID, "TP", "SL leg cancelled externally (OCO)")
-			m.scheduleCleanup(group)
+			if group.TPBrokerID == "" {
+				group.State = StateCancelled
+				m.scheduleCleanup(group)
+			}
 		}
 	}
 }
@@ -870,12 +925,17 @@ func (m *OCOManager) handleTPLegUpdate(ctx context.Context, group *OCOGroup, ord
 		go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg partially filled (OCO)")
 
 	case "CANCELLED":
+		// User cancelled the TP leg — leave SL running independently.
 		if group.State == StateActive || group.State == StateLegsSubmitted {
-			log.Printf("[oco] TP leg CANCELLED externally for group %s — cancelling SL", group.GroupID)
-			group.State = StateCancelled
+			log.Printf("[oco] TP leg CANCELLED externally for group %s — keeping SL active", group.GroupID)
+			m.brokerIndex.Delete(group.TPBrokerID)
+			group.TPBrokerID = ""
+			group.TPLegConfirmed = false
 			group.UpdatedAt = time.Now()
-			go m.cancelLeg(group, group.SLBrokerID, "SL", "TP leg cancelled externally (OCO)")
-			m.scheduleCleanup(group)
+			if group.SLBrokerID == "" {
+				group.State = StateCancelled
+				m.scheduleCleanup(group)
+			}
 		}
 	}
 }
@@ -901,6 +961,156 @@ func (m *OCOManager) checkLegsConfirmed(group *OCOGroup) {
 			m.wsBroadcaster(group.UserID, "oco_legs_confirmed", nil)
 		}
 	}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// STEP 2b: Execution-price resolution (fill-price retry worker)
+// ════════════════════════════════════════════════════════════════════════════
+
+// wsFillOrStrippedLimit returns the execution-price reference for SL/TP from an
+// order whose entry has filled: the real broker fill price (preferred) or, only
+// when no real price is available, the buffer-stripped entry limit. The ÷1.005
+// strip is applied ONLY on the limit fallback — when an actual fill price exists
+// it is used as-is so SL/TP are relative to the true execution price.
+func wsFillOrStrippedLimit(order *models.Order, side string) (price float64, source string) {
+	if order.FilledPrice != nil && *order.FilledPrice > 0 {
+		return *order.FilledPrice, "order_ws"
+	}
+	if order.Price != nil && *order.Price > 0 {
+		return stripEntryBuffer(*order.Price, side), "limit_fallback"
+	}
+	return 0, ""
+}
+
+// StartFillPriceRetry runs the background worker that resolves the execution
+// price for groups parked in AWAITING_FILL_PRICE (entry filled, but the order WS
+// carried no TradedPrice). Each tick it tries the trade book (STEP 2) for every
+// awaiting group, and once a group passes the deadline with still no price it
+// falls back to the buffer-stripped entry limit (STEP 3) so the position is never
+// left without protective legs. Safe to call once at startup; returns immediately.
+func (m *OCOManager) StartFillPriceRetry(ctx context.Context) {
+	if m.fillRetryInterval <= 0 {
+		m.fillRetryInterval = defaultFillPriceRetryInterval
+	}
+	if m.fillPriceDeadline <= 0 {
+		m.fillPriceDeadline = defaultFillPriceDeadline
+	}
+	log.Printf("[oco] Fill-price retry worker started (interval=%v deadline=%v)", m.fillRetryInterval, m.fillPriceDeadline)
+	go func() {
+		ticker := time.NewTicker(m.fillRetryInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("[oco] Fill-price retry worker stopped")
+				return
+			case <-ticker.C:
+				m.resolveAwaitingGroups(ctx)
+			}
+		}
+	}()
+}
+
+// resolveAwaitingGroups processes one pass over all AWAITING_FILL_PRICE groups,
+// bounding concurrent broker calls. Trade-book lookups are batched and cached
+// per user by the fill cache, so many awaiting groups for the same user share a
+// single broker round-trip.
+func (m *OCOManager) resolveAwaitingGroups(ctx context.Context) {
+	var awaiting []*OCOGroup
+	m.groups.Range(func(_, v any) bool {
+		g := v.(*OCOGroup)
+		if g.State == StateAwaitingFillPrice {
+			awaiting = append(awaiting, g)
+		}
+		return true
+	})
+	metrics.OCOAwaitingFillPrice.Set(float64(len(awaiting)))
+	if len(awaiting) == 0 {
+		return
+	}
+
+	const maxConcurrent = 16
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	for _, g := range awaiting {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(group *OCOGroup) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			m.resolveAwaitingGroup(ctx, group)
+		}(g)
+	}
+	wg.Wait()
+}
+
+// resolveAwaitingGroup resolves a single awaiting group's execution price and,
+// when found (or once the deadline passes), transitions it to PLACING_LEGS and
+// places the SL/TP legs. The trade-book call runs OUTSIDE the group mutex; the
+// state transition is done under the mutex and re-checks the state in case a WS
+// event resolved the group concurrently.
+func (m *OCOManager) resolveAwaitingGroup(ctx context.Context, group *OCOGroup) {
+	auth := m.resolveAuth(ctx, group)
+	if auth == nil {
+		return
+	}
+
+	// STEP 2 (trade book) — off the hot path, batched/cached per user.
+	var tbPrice float64
+	if m.fillCache != nil && group.EntryBrokerID != "" {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		f, ok, err := m.fillCache.FillForOrder(cctx, auth, group.UserID, group.EntryBrokerID)
+		cancel()
+		if err != nil {
+			log.Printf("[oco] fill-retry: trade-book fetch failed for group %s: %v", group.GroupID, err)
+		} else if ok && f.Price > 0 {
+			tbPrice = f.Price
+		}
+	}
+
+	mu := m.GetGroupMu(group.GroupID)
+	mu.Lock()
+	if group.State != StateAwaitingFillPrice {
+		mu.Unlock()
+		return // resolved concurrently (e.g. a later WS event carried the price)
+	}
+
+	var fillPrice float64
+	var source string
+	switch {
+	case tbPrice > 0:
+		fillPrice, source = tbPrice, "trade_book"
+	case !group.EntryFilledAt.IsZero() && time.Since(group.EntryFilledAt) >= m.fillPriceDeadline:
+		// STEP 3 (deadline) — no real price after the deadline; place legs off the
+		// buffer-stripped entry limit so the position is never left unprotected.
+		if group.EntryLimitPrice <= 0 {
+			log.Printf("[oco] fill-retry: CRITICAL group %s past deadline but no entry limit price known — cannot place legs (position UNPROTECTED)", group.GroupID)
+			mu.Unlock()
+			return
+		}
+		fillPrice = stripEntryBuffer(group.EntryLimitPrice, group.OrderSide)
+		source = "limit_fallback"
+		log.Printf("[oco] fill-retry: DEADLINE exceeded for group %s — placing SL/TP off stripped entry limit %.2f (UNVERIFIED fill price)", group.GroupID, fillPrice)
+	default:
+		mu.Unlock()
+		return // still within deadline — try again next tick
+	}
+
+	group.FilledQty = group.Quantity
+	group.EntryFillPrice = fillPrice
+	group.HighestPrice = fillPrice
+	group.State = StatePlacingLegs
+	group.UpdatedAt = time.Now()
+	mu.Unlock()
+
+	metrics.OCOFillPriceSource.WithLabelValues(source).Inc()
+	log.Printf("[oco] fill-retry: resolved group %s fill=%.2f (source=%s) — placing SL+TP legs", group.GroupID, fillPrice, source)
+
+	legCtx, legCancel := context.WithTimeout(context.Background(), brokerOpTimeout)
+	go func() {
+		defer legCancel()
+		m.placeOCOLegs(legCtx, group)
+	}()
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1703,15 +1913,20 @@ func (m *OCOManager) reconstructGroup(groupID uuid.UUID, orders []*models.Order)
 			}
 			// Prefer the actual execution price (FilledPrice from broker WS TradedPrice)
 			// over the LIMIT price the order was placed at. order.Price for BUY OCO entries
-			// is signal_price × 1.005 — using it as HighestPrice silently desensitizes the
-			// trailing SL after every restart (any tick below the inflated baseline is
-			// ignored). Fall back to order.Price only if FilledPrice is missing.
+			// is signal_price × 1.005 — using it raw as the SL/TP reference or HighestPrice
+			// silently desensitizes the trailing SL after every restart. Record the raw
+			// limit as EntryLimitPrice, and fall back to its buffer-stripped value only when
+			// FilledPrice is missing.
+			if o.Price != nil && *o.Price > 0 {
+				group.EntryLimitPrice = *o.Price
+			}
 			if o.FilledPrice != nil && *o.FilledPrice > 0 {
 				group.EntryFillPrice = *o.FilledPrice
 				group.HighestPrice = *o.FilledPrice
 			} else if o.Price != nil && *o.Price > 0 {
-				group.EntryFillPrice = *o.Price
-				group.HighestPrice = *o.Price
+				stripped := stripEntryBuffer(*o.Price, string(o.OrderSide))
+				group.EntryFillPrice = stripped
+				group.HighestPrice = stripped
 			}
 			if o.StopLoss != nil {
 				group.SLPercent = *o.StopLoss // stored as percentage in entry
@@ -2053,6 +2268,11 @@ func (m *OCOManager) AdoptOrder(
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
 	}
+	// Record the entry limit price as the last-resort SL/TP reference (used
+	// buffer-stripped only if the real fill price can't be resolved from WS/TB).
+	if order.Price != nil && *order.Price > 0 {
+		group.EntryLimitPrice = *order.Price
+	}
 
 	// Tag the order in DB so HandleBrokerUpdate can find it and reconstructGroup
 	// can restore TrailingSL after a service restart.
@@ -2090,6 +2310,15 @@ func (m *OCOManager) AdoptOrder(
 
 	log.Printf("[oco] Adopted order %s (broker=%s) into OCO group %s: symbol=%s SL=%.1f%% TP=%.1f%% trailing=%v",
 		order.OrderID, brokerID, groupID, order.Symbol, slPercent, tpPercent, trailingSL)
+
+	// Ensure the broker order-WS subscription is live so the EXECUTED event that
+	// places these SL/TP legs is consumed. The price-monitor → AdoptOrder path does
+	// not otherwise (re)subscribe, so a user whose connection was idle-swept between
+	// signal time and entry placement would never get protective legs. The
+	// trade-book fill reconciler is the backstop if this subscription still misses.
+	if m.wsEnsure != nil && auth != nil {
+		m.wsEnsure(order.UserID, auth)
+	}
 }
 
 // ════════════════════════════════════════════════════════════════════════════

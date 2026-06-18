@@ -14,6 +14,12 @@ type OCOState string
 const (
 	// StatePendingEntry — entry SL order placed, waiting for broker fill.
 	StatePendingEntry OCOState = "PENDING_ENTRY"
+	// StateAwaitingFillPrice — entry filled but the execution price is not yet
+	// known (the broker WS carried no TradedPrice, e.g. a MARKET order). SL/TP
+	// legs are deferred until the fill-price retry worker resolves the real price
+	// from the trade book — or, past a deadline, from the buffer-stripped entry
+	// limit. NOT terminal: the position exists and must still get protective legs.
+	StateAwaitingFillPrice OCOState = "AWAITING_FILL_PRICE"
 	// StatePlacingLegs — entry filled, SL+TP legs being placed.
 	StatePlacingLegs OCOState = "PLACING_LEGS"
 	// StateLegsSubmitted — SL+TP legs submitted to broker API (got ordId),
@@ -46,9 +52,9 @@ func (s OCOState) IsTerminal() bool {
 type OCORole string
 
 const (
-	RoleEntry  OCORole = "ENTRY"
-	RoleSLLeg  OCORole = "SL_LEG"
-	RoleTPLeg  OCORole = "TP_LEG"
+	RoleEntry OCORole = "ENTRY"
+	RoleSLLeg OCORole = "SL_LEG"
+	RoleTPLeg OCORole = "TP_LEG"
 )
 
 // OCOGroup tracks the full state of one OCO trade (entry + SL leg + TP leg).
@@ -64,6 +70,13 @@ type OCOGroup struct {
 	EntryOrderID   uuid.UUID `json:"entry_order_id"`
 	EntryBrokerID  string    `json:"entry_broker_id,omitempty"` // Indira order ID
 	EntryFillPrice float64   `json:"entry_fill_price,omitempty"`
+	// EntryLimitPrice is the LIMIT price the entry was placed at (LTP×1.005 for
+	// BUY). Used only as the last-resort SL/TP reference (buffer-stripped) when
+	// the real fill price cannot be resolved from WS or trade book.
+	EntryLimitPrice float64 `json:"entry_limit_price,omitempty"`
+	// EntryFilledAt is when the broker reported the entry EXECUTED. Starts the
+	// deadline clock for the AWAITING_FILL_PRICE → limit-fallback transition.
+	EntryFilledAt time.Time `json:"entry_filled_at,omitempty"`
 
 	// ── Stop-Loss Leg ───────────────────────────────────────────────────────
 	SLOrderID      uuid.UUID `json:"sl_order_id,omitempty"`
@@ -130,42 +143,43 @@ func (g *OCOGroup) ExitSide() string {
 	return "BUY"
 }
 
-// entryRef strips the BUY entry limit buffer (LTP×1.005) so that SL/TP
-// percentages are relative to LTP rather than the inflated fill price.
-// SELL entries carry no buffer, so fill≈LTP and no adjustment is needed.
-func entryRef(fillPrice float64, side string) float64 {
+// stripEntryBuffer removes the BUY entry limit buffer (price×1.005) so that SL/TP
+// percentages applied to the *entry limit* land relative to the intended entry
+// (≈ signal LTP) instead of the inflated limit. It is applied ONLY when falling
+// back to the entry limit because the real execution price is unknown — when the
+// actual broker fill price is available it is used directly (no strip), so SL/TP
+// are relative to the true execution price. SELL entries carry no buffer.
+func stripEntryBuffer(limitPrice float64, side string) float64 {
 	if side == "BUY" {
-		return fillPrice / 1.005
+		return limitPrice / 1.005
 	}
-	return fillPrice
+	return limitPrice
 }
 
-// CalculateSLFromFill computes the SL trigger price from the actual fill.
-// Uses entryRef so the percentage is applied against LTP, not the fill price
-// (which is LTP×1.005 for BUY entries). Returns trigger only — SL legs are
-// placed as SL-M (stop market) so no limit price is needed.
+// CalculateSLFromFill computes the SL trigger price from the execution price.
+// The caller passes the resolved fill price (real broker fill preferred; the
+// buffer-stripped entry limit only as a last resort), so the percentage is always
+// relative to the true execution price. Returns trigger only — SL legs are placed
+// as SL-M (stop market) so no limit price is needed.
 //
-//	BUY entry → trigger = entryRef(fill) * (1 - slPct/100)
-//	SELL entry → trigger = entryRef(fill) * (1 + slPct/100)
+//	BUY entry  → trigger = fill * (1 - slPct/100)
+//	SELL entry → trigger = fill * (1 + slPct/100)
 func (g *OCOGroup) CalculateSLFromFill(fillPrice float64) float64 {
-	ref := entryRef(fillPrice, g.OrderSide)
 	if g.OrderSide == "BUY" {
-		return roundNSE(ref * (1 - g.SLPercent/100))
+		return roundNSE(fillPrice * (1 - g.SLPercent/100))
 	}
-	return roundNSE(ref * (1 + g.SLPercent/100))
+	return roundNSE(fillPrice * (1 + g.SLPercent/100))
 }
 
-// CalculateTPFromFill computes the TP limit price from the actual fill.
-// Uses entryRef so the percentage is applied against LTP, not the fill price.
+// CalculateTPFromFill computes the TP limit price from the execution price.
 //
-//	BUY entry → TP limit = entryRef(fill) * (1 + tpPct/100)
-//	SELL entry → TP limit = entryRef(fill) * (1 - tpPct/100)
+//	BUY entry  → TP limit = fill * (1 + tpPct/100)
+//	SELL entry → TP limit = fill * (1 - tpPct/100)
 func (g *OCOGroup) CalculateTPFromFill(fillPrice float64) float64 {
-	ref := entryRef(fillPrice, g.OrderSide)
 	if g.OrderSide == "BUY" {
-		return roundNSE(ref * (1 + g.TPPercent/100))
+		return roundNSE(fillPrice * (1 + g.TPPercent/100))
 	}
-	return roundNSE(ref * (1 - g.TPPercent/100))
+	return roundNSE(fillPrice * (1 - g.TPPercent/100))
 }
 
 // CalculateTrailingSL computes a new SL trigger given the current highest price.

@@ -150,6 +150,50 @@ func (m *mockRepo) CreatePaperPartialExit(ctx context.Context, order *models.Ord
 	return nil
 }
 
+// ── Stubs to satisfy the OrderRepository interface (unused in these tests) ──
+func (m *mockRepo) UpdateTrailingSL(ctx context.Context, orderID uuid.UUID, newSL float64) error {
+	return nil
+}
+func (m *mockRepo) UpdatePaperExitPrice(ctx context.Context, orderID uuid.UUID, exitPrice, pnl float64) error {
+	return nil
+}
+func (m *mockRepo) UpdateOCOTag(ctx context.Context, orderID uuid.UUID, groupID uuid.UUID, role string, slPercent, tpPercent float64) error {
+	return nil
+}
+func (m *mockRepo) UpdateMLLevelRebalancedQty(ctx context.Context, entryOrderID uuid.UUID, exitType string, levelNum int, originalQty, newQty int32, reason string) error {
+	return nil
+}
+func (m *mockRepo) GetExitableLiveOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetOpenOrdersByUser(ctx context.Context, userID string) ([]*models.Order, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetDistinctActiveUsersToday(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetUsersWithAutoSquareOffAtTime(ctx context.Context, timeStr string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetUsersWithExpiredAutoSquareOff(ctx context.Context, beforeTime string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetStrategiesDueForSquareOff(ctx context.Context, timeStr string) ([]repository.StrategySquareOffTarget, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetStrategiesWithExpiredSquareOff(ctx context.Context, beforeTime string) ([]repository.StrategySquareOffTarget, error) {
+	return nil, nil
+}
+func (m *mockRepo) UpsertUserSquareOffConfig(ctx context.Context, userID, squareOffTime string, enabled bool) error {
+	return nil
+}
+func (m *mockRepo) GetUserSquareOffConfig(ctx context.Context, userID string) (string, bool, error) {
+	return "", false, nil
+}
+func (m *mockRepo) BackfillTodaySquareOffConfig(ctx context.Context) (int, error) {
+	return 0, nil
+}
+
 // credentials repo mock (not used in these tests)
 type mockCredsRepo struct{}
 

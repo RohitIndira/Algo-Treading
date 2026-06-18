@@ -80,6 +80,18 @@ type BrokerWSStarter func(ctx context.Context, userID string) error
 type StrategyHalter interface {
 	HaltStrategy(strategyID string)
 }
+
+// StrategyUserTracker keeps the broker-WS idle-sweep protection set in sync with
+// live strategy activations. Implemented by *statusservice.OrderStatusService.
+type StrategyUserTracker interface {
+	// MarkUserActiveStrategy protects userID's broker WS from the idle sweep.
+	// Called on CONFIG_CREATED / CONFIG_UPDATED.
+	MarkUserActiveStrategy(userID string)
+	// UnmarkUserActiveStrategy removes idle-sweep protection. Does NOT close the
+	// WS — the connection stays alive until service shutdown or market close.
+	// Called on CONFIG_DELETED / CONFIG_PAUSED.
+	UnmarkUserActiveStrategy(userID string)
+}
 // MLGroupCanceller cancels active multi-level groups for a strategy, recording
 // paper partial exits for remaining qty. Implemented by *multilevel.Manager.
 type MLGroupCanceller interface {
@@ -114,9 +126,10 @@ type StrategyEventsConsumer struct {
 	priceMonitor   OrderUnwatcher          // nil-safe: may be unset if PriceMonitor is disabled
 	priceClient    PaperPriceLookup        // nil-safe: used to get LTP for paper exit PnL
 	mlManager      MLGroupCanceller        // nil-safe: creates paper partial exits for remaining ML qty
-	strategyHalter StrategyHalter          // nil-safe: halts new signals for deactivated strategies
-	positions      OpenPositionsLookup     // nil-safe: skips square-off for already-flat broker positions
-	logger         *zap.Logger
+	strategyHalter  StrategyHalter         // nil-safe: halts new signals for deactivated strategies
+	strategyTracker StrategyUserTracker    // nil-safe: keeps broker-WS protection set in sync
+	positions       OpenPositionsLookup    // nil-safe: skips square-off for already-flat broker positions
+	logger          *zap.Logger
 }
 
 // NewStrategyEventsConsumer creates a consumer for the user-config-events topic.
@@ -191,6 +204,12 @@ func (c *StrategyEventsConsumer) SetStrategyHalter(h StrategyHalter) {
 	c.strategyHalter = h
 }
 
+// SetStrategyUserTracker wires the WS protection tracker so the idle sweep never
+// closes the broker connection for a user with an active LIVE strategy.
+func (c *StrategyEventsConsumer) SetStrategyUserTracker(t StrategyUserTracker) {
+	c.strategyTracker = t
+}
+
 // SetPositionsLookup wires the broker position-book checker. With it, strategy
 // deactivation skips reverse orders for symbols already flat (NetQty == 0) at
 // the broker — preventing a redundant square-off from opening a fresh short.
@@ -247,6 +266,12 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 
 	switch ev.Type {
 	case configPaused, configDeleted:
+		// Remove idle-sweep protection. The broker WS stays open — in-flight
+		// SL/TP legs and any pending order fills must still be received. The next
+		// idle sweep will close it only if the user has no remaining live exposure.
+		if c.strategyTracker != nil && ev.UserID != "" {
+			c.strategyTracker.UnmarkUserActiveStrategy(ev.UserID)
+		}
 		// Immediately block new Kafka signals for this strategy so no new orders
 		// are placed after deactivation, even if the rules-engine has in-flight messages.
 		if c.strategyHalter != nil {
@@ -254,6 +279,12 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 		}
 		return c.closeStrategyPositions(ctx, ev)
 	case configCreated, configUpdated:
+		// Protect this user's broker WS from the idle sweep for the rest of the
+		// trading day. Must happen before StartSubscription so the connection
+		// opened below is immediately protected even if a sweep fires concurrently.
+		if c.strategyTracker != nil && ev.UserID != "" {
+			c.strategyTracker.MarkUserActiveStrategy(ev.UserID)
+		}
 		// Invalidate cached credentials so the next live order re-reads the fresh
 		// bearer token that user-config just wrote to broker_accounts.
 		if c.credsCache != nil && ev.UserID != "" {
