@@ -166,3 +166,82 @@ func roundToTickSize(price float64, tickSize float64) float64 {
 	rounded := ((priceSc + tickSc/2) / tickSc) * tickSc
 	return float64(rounded) / scale
 }
+
+// GetMarketDataFromRedis is the exported entry point for the backfill package.
+func GetMarketDataFromRedis(ctx context.Context, redisCache *cache.RedisCache, stockData models.StockData, logger *zap.Logger) (*MarketDataResult, error) {
+	return getMarketDataFromRedis(ctx, redisCache, stockData, logger)
+}
+
+// GetMarketDataBatchNSE fetches market data for many NSE tokens in a single
+// Redis MGET round-trip (key form market:nse:<token>). Returns a map keyed by
+// token; tokens with no data, invalid LTP, or invalid tick size are omitted.
+// This replaces N serial GetMarketDataFromRedis calls on the AMN preview path.
+func GetMarketDataBatchNSE(ctx context.Context, redisCache *cache.RedisCache, tokens []int64, logger *zap.Logger) map[int64]*MarketDataResult {
+	out := make(map[int64]*MarketDataResult, len(tokens))
+	if redisCache == nil || len(tokens) == 0 {
+		return out
+	}
+
+	// Deduplicate tokens and build aligned key list.
+	uniq := make([]int64, 0, len(tokens))
+	seen := make(map[int64]struct{}, len(tokens))
+	for _, t := range tokens {
+		if t <= 0 {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		uniq = append(uniq, t)
+	}
+	if len(uniq) == 0 {
+		return out
+	}
+
+	keys := make([]string, len(uniq))
+	for i, t := range uniq {
+		keys[i] = fmt.Sprintf("market:nse:%d", t)
+	}
+
+	vals, err := redisCache.MGet(ctx, keys...)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("market data batch MGET failed", zap.Error(err))
+		}
+		return out
+	}
+
+	for i, v := range vals {
+		s, ok := v.(string)
+		if !ok || s == "" {
+			continue
+		}
+		var raw struct {
+			LTP           float64 `json:"ltp"`
+			PrevClose     float64 `json:"prev_close"`
+			TickSize      float64 `json:"tick_size"`
+			PercentChange float64 `json:"percent_change"`
+		}
+		if err := json.Unmarshal([]byte(s), &raw); err != nil {
+			continue
+		}
+		if raw.LTP <= 0 || raw.TickSize <= 0 {
+			continue
+		}
+		out[uniq[i]] = &MarketDataResult{
+			LTP:           raw.LTP,
+			PrevClose:     raw.PrevClose,
+			TickSize:      raw.TickSize,
+			PercentChange: raw.PercentChange,
+			Exchange:      "nse",
+			Token:         uniq[i],
+		}
+	}
+	return out
+}
+
+// RoundToTickSize is the exported entry point for the backfill package.
+func RoundToTickSize(price, tickSize float64) float64 {
+	return roundToTickSize(price, tickSize)
+}

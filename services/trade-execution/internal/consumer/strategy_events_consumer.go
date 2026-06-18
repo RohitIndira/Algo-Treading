@@ -395,14 +395,11 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 		c.logger.Info("Skipping live square-off on deactivation — EOD window active; AutoSquareOffScheduler owns this",
 			zap.String("strategy_id", ev.StrategyID),
 			zap.String("user_id", ev.UserID))
-	} else if filledOrders, fetchErr := c.orderRepo.GetExitableLiveOrdersByStrategy(ctx, ev.StrategyID, ev.UserID); fetchErr != nil {
-		c.logger.Error("Failed to fetch filled live orders for square-off on deactivation",
-			zap.String("strategy_id", ev.StrategyID),
-			zap.Error(fetchErr))
-	} else if len(filledOrders) > 0 {
-		// Fetch broker positions once for this user — skip orders whose
-		// underlying position is already flat at the broker (NetQty == 0).
-		// Fail-open: a nil snapshot bypasses the check.
+	} else {
+		// Fetch broker positions once — used both to skip already-flat orders and to
+		// catch the fill/deactivation race: an order that filled at the broker but whose
+		// WS fill notification hasn't been processed into our DB yet (filled_price still
+		// NULL → GetExitableLiveOrdersByStrategy misses it → position stranded open).
 		var snapshot OpenPositionsSnapshot
 		if c.positions != nil {
 			snap, posErr := c.positions.FetchOpenPositions(ctx, ev.UserID)
@@ -416,7 +413,19 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 			}
 		}
 
+		filledOrders, fetchErr := c.orderRepo.GetExitableLiveOrdersByStrategy(ctx, ev.StrategyID, ev.UserID)
+		if fetchErr != nil {
+			c.logger.Error("Failed to fetch filled live orders for square-off on deactivation",
+				zap.String("strategy_id", ev.StrategyID),
+				zap.Error(fetchErr))
+			filledOrders = nil
+		}
+
+		// Track which orders we've queued so the race-condition check below doesn't
+		// double-square the same position.
+		squaredOffIDs := make(map[uuid.UUID]struct{}, len(filledOrders))
 		var sqWg sync.WaitGroup
+
 		for _, o := range filledOrders {
 			if o.FilledQuantity <= 0 {
 				continue
@@ -445,6 +454,7 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 					squareQty = brokerQty
 				}
 			}
+			squaredOffIDs[o.OrderID] = struct{}{}
 			ordCopy := *o
 			ordCopy.FilledQuantity = int32(squareQty)
 			sqWg.Add(1)
@@ -458,6 +468,55 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 				}
 			}(&ordCopy)
 		}
+
+		// Race-condition check: also square off any position that is open at the broker
+		// but whose order's filled_price is not yet in our DB (broker WS fill notification
+		// arrived after deactivation was triggered). This catches the pattern where a
+		// broker cancel returns "FULLY_EXECUTED order not allowed to CANCEL" but our DB
+		// still shows the order as SUBMITTED/PENDING with filled_quantity=0.
+		// Only possible when we have a live positions snapshot.
+		if snapshot != nil {
+			for _, o := range orders {
+				if o.IsPaperTrade || o.IndiraOrderID == nil {
+					continue
+				}
+				if _, done := squaredOffIDs[o.OrderID]; done {
+					continue
+				}
+				// OCO SL/TP legs are pending exit orders at the broker, not open
+				// entry positions. GetNetQty returns the symbol's open position qty
+				// for these orders too, which would cause squareOffLivePosition to
+				// reverse a SELL exit leg into a BUY entry order — wrong direction.
+				if o.OCORole != nil && *o.OCORole != "ENTRY" {
+					continue
+				}
+				brokerQty := snapshot.GetNetQty(o)
+				if brokerQty < 0 {
+					brokerQty = -brokerQty
+				}
+				if brokerQty == 0 {
+					continue
+				}
+				c.logger.Warn("Squaring off broker position not yet recorded in DB (fill/deactivation race)",
+					zap.String("order_id", o.OrderID.String()),
+					zap.String("symbol", o.Symbol),
+					zap.String("user_id", o.UserID),
+					zap.Int("broker_qty", brokerQty))
+				ordCopy := *o
+				ordCopy.FilledQuantity = int32(brokerQty)
+				sqWg.Add(1)
+				go func(ord *models.Order) {
+					defer sqWg.Done()
+					if sqErr := c.squareOffLivePosition(ctx, ord); sqErr != nil {
+						c.logger.Error("Square-off failed for untracked broker position on deactivation",
+							zap.String("order_id", ord.OrderID.String()),
+							zap.String("symbol", ord.Symbol),
+							zap.Error(sqErr))
+					}
+				}(&ordCopy)
+			}
+		}
+
 		sqWg.Wait()
 	}
 

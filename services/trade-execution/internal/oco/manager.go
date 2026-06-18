@@ -597,9 +597,21 @@ func (m *OCOManager) HandleBrokerUpdate(ctx context.Context, order *models.Order
 		if order.OCORole == nil || group.State.IsTerminal() {
 			return
 		}
+		isTerminalBrokerStatus := brokerStatusUpper == "CANCELLED" ||
+			brokerStatusUpper == "REJECTED" ||
+			brokerStatusUpper == "A.REJECTED" ||
+			brokerStatusUpper == "EXECUTED" ||
+			brokerStatusUpper == "TRADED"
+
 		switch *order.OCORole {
 		case string(RoleSLLeg):
 			if group.SLBrokerID == "" {
+				// SLBrokerID was cleared by a prior handler for this terminal event.
+				// Duplicate WS deliveries must not re-register and re-invoke the handler,
+				// or each duplicate triggers another clear→backfill→clear log storm.
+				if isTerminalBrokerStatus {
+					return
+				}
 				group.SLBrokerID = brokerID
 				m.brokerIndex.Store(brokerID, group.GroupID)
 				log.Printf("[oco] Race-recovery: backfilled SL broker ID %s for group %s", brokerID, group.GroupID)
@@ -607,6 +619,10 @@ func (m *OCOManager) HandleBrokerUpdate(ctx context.Context, order *models.Order
 			m.handleSLLegUpdate(ctx, group, order, brokerStatusUpper)
 		case string(RoleTPLeg):
 			if group.TPBrokerID == "" {
+				// Same guard as SL leg above.
+				if isTerminalBrokerStatus {
+					return
+				}
 				group.TPBrokerID = brokerID
 				m.brokerIndex.Store(brokerID, group.GroupID)
 				log.Printf("[oco] Race-recovery: backfilled TP broker ID %s for group %s", brokerID, group.GroupID)

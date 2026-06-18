@@ -37,6 +37,14 @@ type StrategyPayload struct {
 	Version      uint64             `json:"version"`
 	CreatedAt    int64              `json:"created_at"` // UnixNano
 	UpdatedAt    int64              `json:"updated_at"` // UnixNano
+
+	// ProcessAfterMarketNews instructs the rules-engine to run an AMN backfill
+	// exactly once when this strategy is first created.
+	ProcessAfterMarketNews bool `json:"process_after_market_news,omitempty"`
+
+	// AMNSelectedStocks restricts the AMN backfill to these ISINs. Empty → all
+	// affordable matches up to the trade cap.
+	AMNSelectedStocks []string `json:"amn_selected_stocks,omitempty"`
 }
 
 type ConditionsPayload struct {

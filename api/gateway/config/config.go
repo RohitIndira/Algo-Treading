@@ -25,6 +25,7 @@ type ServerConfig struct {
 type ServicesConfig struct {
 	UserConfigAddr         string
 	TradeExecutionPaperURL string
+	RulesEngineURL         string
 }
 
 type CORSConfig struct {
@@ -59,6 +60,7 @@ func Load() (*Config, error) {
 		Services: ServicesConfig{
 			UserConfigAddr:         getEnv("USER_CONFIG_GRPC_ADDR", "localhost:50051"),
 			TradeExecutionPaperURL: getEnv("TRADE_EXECUTION_PAPER_URL", "http://localhost:8081"),
+			RulesEngineURL:         getEnv("RULES_ENGINE_URL", "http://localhost:8082"),
 		},
 		CORS: CORSConfig{
 			AllowedOrigins: strings.Split(getEnv("CORS_ALLOWED_ORIGINS", "*"), ","),

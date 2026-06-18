@@ -12,6 +12,7 @@ func NewRouter(
 	userConfigHandler *handlers.UserConfigHandler,
 	websocketHandler *handlers.WebSocketHandler,
 	paperHandler *handlers.PaperTradingHandler,
+	amnPreviewHandler *handlers.AMNPreviewHandler,
 	corsConfig middleware.CORSConfig,
 	authConfig middleware.AuthConfig,
 ) http.Handler {
@@ -77,6 +78,11 @@ func NewRouter(
 		api.HandleFunc("/auto-square-off/config", paperHandler.GetAutoSquareOffConfig).Methods("GET")
 		// Dashboard
 		api.HandleFunc("/dashboard-stats", paperHandler.GetDashboardStats).Methods("GET")
+	}
+
+	// AMN backfill preview — returns news items matching strategy conditions
+	if amnPreviewHandler != nil {
+		api.HandleFunc("/amn-preview", amnPreviewHandler.Preview).Methods("POST")
 	}
 
 	// WebSocket routes for live match feed

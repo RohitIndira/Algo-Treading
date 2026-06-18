@@ -30,14 +30,16 @@ func NewUserConfigServer(service *service.StrategyService) *UserConfigServer {
 func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStrategyRequest) (*pb.CreateStrategyResponse, error) {
 	// Convert proto request to domain model
 	modelReq := &models.CreateStrategyRequest{
-		UserID:              req.UserId,
-		StrategyName:        req.StrategyName,
-		Description:         req.Description,
-		Conditions:          protoConditionsToModel(req.Conditions),
-		TradeConfig:         protoTradeConfigToModel(req.TradeConfig),
-		RiskLimits:          protoRiskLimitsToModel(req.RiskLimits),
-		ActivateImmediately: req.ActivateImmediately,
-		TradingMode:         protoTradingModeToModel(req.TradingMode),
+		UserID:                 req.UserId,
+		StrategyName:           req.StrategyName,
+		Description:            req.Description,
+		Conditions:             protoConditionsToModel(req.Conditions),
+		TradeConfig:            protoTradeConfigToModel(req.TradeConfig),
+		RiskLimits:             protoRiskLimitsToModel(req.RiskLimits),
+		ActivateImmediately:    req.ActivateImmediately,
+		TradingMode:            protoTradingModeToModel(req.TradingMode),
+		ProcessAfterMarketNews: req.ProcessAfterMarketNews,
+		AMNSelectedStocks:      req.AmnSelectedStocks,
 	}
 
 	// Extract Indira auth context if provided

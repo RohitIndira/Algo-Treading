@@ -72,6 +72,19 @@ func (c *RedisCache) Get(ctx context.Context, key string) (string, error) {
 	return c.client.Get(ctx, key).Result()
 }
 
+// MGet fetches many keys in a single round-trip. The returned slice is aligned
+// 1:1 with keys; a missing key yields a nil element. Used by the AMN snapshot /
+// preview to price hundreds of stocks without N serial GETs.
+func (c *RedisCache) MGet(ctx context.Context, keys ...string) ([]interface{}, error) {
+	if c == nil || c.client == nil {
+		return nil, fmt.Errorf("redis cache not initialized")
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	return c.client.MGet(ctx, keys...).Result()
+}
+
 func (c *RedisCache) Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
 	if c == nil || c.client == nil {
 		return fmt.Errorf("redis cache not initialized")

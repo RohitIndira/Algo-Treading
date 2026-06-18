@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,18 +13,23 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/config"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/backfill"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/holiday"
 	intkafka "github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/kafka"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/startup"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/utils"
+
+	"go.mongodb.org/mongo-driver/mongo"
+	mongoopts "go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -184,6 +190,89 @@ func main() {
 	eng.Start(ctx)
 	handler := consumer.NewHandler(eng, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours, holidayChecker)
 
+	// Initialize AMN backfill runner.
+	// Uses the same MongoDB URI as the holiday checker (accesses CAG_CHATBOT and
+	// OdinMasterData databases). Connection failures are non-fatal: if Mongo is
+	// unavailable the runner is nil and AMN backfill is silently disabled.
+	logger.Info("Initializing AMN backfill runner...")
+	var amnTrigger func(*models.Strategy)
+	backfillMongoClient, backfillMongoErr := func() (*mongo.Client, error) {
+		// Bounded pool + timeouts: the AMN snapshot/preview is the only consumer of
+		// this client. A small capped pool prevents connection blow-up under load
+		// while leaving headroom for the periodic snapshot refresh.
+		mopts := mongoopts.Client().ApplyURI(cfg.MongoDB.URI).
+			SetMaxPoolSize(20).
+			SetMinPoolSize(2).
+			SetMaxConnIdleTime(60 * time.Second).
+			SetServerSelectionTimeout(5 * time.Second).
+			SetSocketTimeout(10 * time.Second)
+		c, err := mongo.Connect(ctx, mopts)
+		if err != nil {
+			return nil, err
+		}
+		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := c.Ping(pingCtx, nil); err != nil {
+			_ = c.Disconnect(ctx)
+			return nil, err
+		}
+		return c, nil
+	}()
+	if backfillMongoErr != nil {
+		logger.Warn("AMN backfill runner disabled — could not connect to MongoDB for backfill",
+			zap.Error(backfillMongoErr))
+	} else {
+		amnRunner := backfill.NewAMNRunner(backfill.Config{
+			MongoClient:    backfillMongoClient,
+			Evaluator:      matcher.NewEvaluator(logger),
+			HolidayChecker: holidayChecker,
+			RedisCache:     redisCache,
+			KafkaPub:       kafkaPub,
+			SignalRepo:     signalRepo,
+			Logger:         logger,
+		})
+		amnTrigger = func(s *models.Strategy) { amnRunner.TriggerBackfill(ctx, s) }
+		logger.Info("AMN backfill runner initialized successfully")
+		defer func() { _ = backfillMongoClient.Disconnect(context.Background()) }()
+
+		// Start lightweight HTTP server for the AMN preview endpoint.
+		// The api-gateway proxies POST /api/v1/amn-preview → here.
+		previewRunner := backfill.NewPreviewRunner(
+			backfill.NewNewsReader(backfillMongoClient, logger),
+			backfill.NewCompanyLookup(backfillMongoClient, logger),
+			matcher.NewEvaluator(logger),
+			redisCache,
+			holidayChecker,
+			time.Duration(cfg.PreviewSnapshotRefreshSecs)*time.Second,
+			logger,
+		)
+		// Build the shared snapshot now and refresh it on an interval; requests
+		// filter the in-memory snapshot with zero DB/Redis calls on the hot path.
+		previewRunner.Start(ctx)
+		previewMux := http.NewServeMux()
+		// Cap concurrent previews and shed load past it (503) so a spike can't
+		// exhaust the Mongo/Redis pools.
+		previewMux.Handle("/internal/amn-preview", backfill.LimitConcurrency(previewRunner, 128))
+		previewSrv := &http.Server{
+			Addr:              fmt.Sprintf(":%d", cfg.PreviewHTTPPort),
+			Handler:           previewMux,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+		}
+		go func() {
+			logger.Info("AMN preview HTTP server listening", zap.Int("port", cfg.PreviewHTTPPort))
+			if err := previewSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Warn("AMN preview HTTP server error", zap.Error(err))
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = previewSrv.Shutdown(shutdownCtx)
+		}()
+	}
+
 	// Step 5: Start config consumer BEFORE news consumer
 	configReader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        cfg.Kafka.Brokers,
@@ -194,7 +283,7 @@ func main() {
 		CommitInterval: time.Second,
 		StartOffset:    startOffsetFor(cfg.Kafka.ConfigOffsetReset, kafka.FirstOffset),
 	})
-	configConsumer := intkafka.NewConfigConsumer(configReader, store)
+	configConsumer := intkafka.NewConfigConsumer(configReader, store, amnTrigger)
 
 	// Step 6: Start news consumer AFTER config consumer
 	newsReader := kafka.NewReader(kafka.ReaderConfig{

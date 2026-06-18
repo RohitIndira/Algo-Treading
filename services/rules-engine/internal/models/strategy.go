@@ -23,6 +23,18 @@ type Strategy struct {
 	BearerToken string `json:"bearer_token" bson:"bearer_token"` // JWT bearer token
 	AppId       string `json:"app_id" bson:"app_id"`             // Application ID
 	Source      string `json:"source" bson:"source"`             // Source platform
+
+	// ProcessAfterMarketNews triggers a historical news backfill (AMN) when the
+	// strategy is first created. The rules-engine scans CAG_CHATBOT.NewsImpactDashboard
+	// from the previous NSE_EQ trading day 15:31 IST until now, evaluates each
+	// news item against this strategy's conditions, and places orders tagged
+	// signal_source="BACKFILL_AMN" at the current live LTP.
+	ProcessAfterMarketNews bool `json:"process_after_market_news" bson:"process_after_market_news"`
+
+	// AMNSelectedStocks restricts the AMN backfill to these ISINs (the user's pick
+	// from the preview). Empty → backfill places all affordable matches up to the
+	// MaxTradesPerStrategy cap.
+	AMNSelectedStocks []string `json:"amn_selected_stocks,omitempty" bson:"amn_selected_stocks,omitempty"`
 }
 
 // StrategyConfig is the canonical in-memory configuration object used by the

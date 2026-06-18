@@ -117,13 +117,15 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 
 	// Insert strategy
 	strategy := &models.Strategy{
-		StrategyID:   uuid.New(),
-		UserID:       req.UserID,
-		StrategyName: req.StrategyName,
-		Description:  req.Description,
-		Active:       req.ActivateImmediately,
-		TradingMode:  req.TradingMode,
-		Version:      1,
+		StrategyID:             uuid.New(),
+		UserID:                 req.UserID,
+		StrategyName:           req.StrategyName,
+		Description:            req.Description,
+		Active:                 req.ActivateImmediately,
+		TradingMode:            req.TradingMode,
+		Version:                1,
+		ProcessAfterMarketNews: req.ProcessAfterMarketNews,
+		AMNSelectedStocks:      req.AMNSelectedStocks,
 	}
 
 	query := `

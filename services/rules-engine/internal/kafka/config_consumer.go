@@ -17,12 +17,14 @@ import (
 type ConfigConsumer struct {
 	reader      KafkaReader
 	configStore *configstore.ConfigStore
+	amnTrigger  func(strategy *models.Strategy) // optional; called on CONFIG_CREATED with ProcessAfterMarketNews=true
 	processed   atomic.Int64
 	errors      atomic.Int64
 }
 
-func NewConfigConsumer(reader KafkaReader, store *configstore.ConfigStore) *ConfigConsumer {
-	return &ConfigConsumer{reader: reader, configStore: store}
+// NewConfigConsumer creates a ConfigConsumer. amnTrigger may be nil to disable AMN backfill.
+func NewConfigConsumer(reader KafkaReader, store *configstore.ConfigStore, amnTrigger func(*models.Strategy)) *ConfigConsumer {
+	return &ConfigConsumer{reader: reader, configStore: store, amnTrigger: amnTrigger}
 }
 
 func (c *ConfigConsumer) Start(ctx context.Context) error {
@@ -80,6 +82,13 @@ func (c *ConfigConsumer) Start(ctx context.Context) error {
 			if err := c.configStore.Upsert((*models.StrategyConfig)(m)); err != nil {
 				c.errors.Add(1)
 				log.Printf("config consumer: upsert failed: %v", err)
+			}
+
+			// Trigger AMN backfill when a newly created strategy opts in.
+			// Only fires on CONFIG_CREATED (not CONFIG_UPDATED re-activations)
+			// so backfill runs exactly once per strategy lifecycle.
+			if ev.Type == configsync.ConfigCreated && m.ProcessAfterMarketNews && c.amnTrigger != nil {
+				c.amnTrigger(m)
 			}
 
 		case "CONFIG_PAUSED":

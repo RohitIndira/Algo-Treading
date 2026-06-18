@@ -71,6 +71,11 @@ func main() {
 	// Initialize Paper Trading handler
 	paperTradingHandler := handlers.NewPaperTradingHandler(cfg.Services.TradeExecutionPaperURL)
 
+	// AMN preview: stateless proxy to the rules-engine HTTP server.
+	// The rules-engine owns MongoDB — gateway stays DB-free.
+	amnPreviewHandler := handlers.NewAMNPreviewHandler(cfg.Services.RulesEngineURL)
+	log.Printf("AMN preview proxying to rules-engine at %s", cfg.Services.RulesEngineURL)
+
 	// CORS config
 	corsConfig := middleware.CORSConfig{
 		AllowedOrigins: cfg.CORS.AllowedOrigins,
@@ -87,7 +92,7 @@ func main() {
 	log.Printf("Auth middleware configured: verify URL=%s timeout=%s", authConfig.VerifyURL, authConfig.Timeout)
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, corsConfig, authConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, amnPreviewHandler, corsConfig, authConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

@@ -140,6 +140,19 @@ func (c *Checker) IsDateHoliday(date string) bool {
 	return ok
 }
 
+// NSEHolidays returns a snapshot copy of the loaded holiday set.
+// Keys are "YYYY-MM-DD" strings. Used by the AMN backfill to compute the
+// previous trading day without holding the checker's lock.
+func (c *Checker) NSEHolidays() map[string]struct{} {
+	c.mu.RLock()
+	snap := make(map[string]struct{}, len(c.holidays))
+	for k, v := range c.holidays {
+		snap[k] = v
+	}
+	c.mu.RUnlock()
+	return snap
+}
+
 // StartAutoRefresh spawns a goroutine that refreshes holidays once per day.
 // It stops when ctx is cancelled.
 func (c *Checker) StartAutoRefresh(ctx context.Context) {

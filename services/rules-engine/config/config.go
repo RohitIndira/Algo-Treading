@@ -14,8 +14,13 @@ type Config struct {
 	ServiceName    string
 	ServiceVersion string
 	Environment    string
-	GRPCPort       int
-	MetricsPort    int
+	GRPCPort        int
+	MetricsPort     int
+	PreviewHTTPPort int // lightweight HTTP server for AMN preview (default 8082)
+	// PreviewSnapshotRefreshSecs is how often the shared AMN preview snapshot
+	// (news + company + live market data) is rebuilt. Requests filter the
+	// in-memory snapshot, so this bounds the staleness of preview LTP/%change.
+	PreviewSnapshotRefreshSecs int
 
 	// Kafka Configuration
 	Kafka KafkaConfig
@@ -162,8 +167,10 @@ func LoadConfig() (*Config, error) {
 		ServiceName:    getEnv("SERVICE_NAME", "rules-engine"),
 		ServiceVersion: getEnv("SERVICE_VERSION", "1.0.0"),
 		Environment:    getEnv("ENVIRONMENT", "development"),
-		GRPCPort:       getEnvAsInt("GRPC_PORT", 9003),
-		MetricsPort:    getEnvAsInt("METRICS_PORT", 9103),
+		GRPCPort:        getEnvAsInt("GRPC_PORT", 9003),
+		MetricsPort:     getEnvAsInt("METRICS_PORT", 9103),
+		PreviewHTTPPort:            getEnvAsInt("PREVIEW_HTTP_PORT", 8082),
+		PreviewSnapshotRefreshSecs: getEnvAsInt("PREVIEW_SNAPSHOT_REFRESH_SECS", 30),
 
 		Kafka: KafkaConfig{
 			Brokers:           getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),

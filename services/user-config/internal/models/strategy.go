@@ -27,11 +27,22 @@ type Strategy struct {
 	CreatedAt    time.Time   `db:"created_at" json:"created_at"`
 	UpdatedAt    time.Time   `db:"updated_at" json:"updated_at"`
 	DeletedAt    *time.Time  `db:"deleted_at" json:"deleted_at,omitempty"`
-	
+
 	// These are now separate tables, so we use pointers and `db:"-"` or handle in repo
-	Conditions   *StrategyCondition `db:"-" json:"conditions,omitempty"`
-	TradeConfig  *TradeConfig       `db:"-" json:"trade_config,omitempty"`
-	RiskLimits   *RiskLimits        `db:"-" json:"risk_limits,omitempty"`
+	Conditions  *StrategyCondition `db:"-" json:"conditions,omitempty"`
+	TradeConfig *TradeConfig       `db:"-" json:"trade_config,omitempty"`
+	RiskLimits  *RiskLimits        `db:"-" json:"risk_limits,omitempty"`
+
+	// ProcessAfterMarketNews is a creation-time trigger flag. It is NOT stored in
+	// the strategies table (db:"-") — it is forwarded through the outbox JSON so
+	// the rules-engine Kafka consumer can initiate the AMN backfill exactly once.
+	ProcessAfterMarketNews bool `db:"-" json:"process_after_market_news,omitempty"`
+
+	// AMNSelectedStocks is the user's explicit AMN preview pick (ISINs). Like
+	// ProcessAfterMarketNews it is creation-time only and NOT persisted (db:"-");
+	// it is forwarded through the outbox JSON so the rules-engine backfill places
+	// orders only for these stocks. Empty → backfill places all affordable matches.
+	AMNSelectedStocks []string `db:"-" json:"amn_selected_stocks,omitempty"`
 }
 
 // StrategyCondition represents the conditions for triggering a strategy
@@ -158,6 +169,8 @@ type CreateStrategyRequest struct {
 	RiskLimits          *RiskLimits        `json:"risk_limits" validate:"required"`
 	ActivateImmediately bool               `json:"activate_immediately"`
 	TradingMode         TradingMode        `json:"trading_mode"`
+	ProcessAfterMarketNews bool            `json:"process_after_market_news"`
+	AMNSelectedStocks   []string           `json:"amn_selected_stocks,omitempty"`
 
 	// Frontend authentication data
 	IndiraAuth *IndiraAuthContext `json:"indira_auth,omitempty"`

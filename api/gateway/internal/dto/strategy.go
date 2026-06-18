@@ -10,6 +10,16 @@ type CreateStrategyRequest struct {
 	RiskLimits          *RiskLimits         `json:"risk_limits"`
 	ActivateImmediately bool                `json:"activate_immediately"`
 	TradingMode         string              `json:"trading_mode"` // "PAPER", "LIVE"
+	// ProcessAfterMarketNews triggers a one-shot historical news backfill when this
+	// strategy is first created. The rules-engine scans news from the previous
+	// NSE_EQ trading day's 15:31 IST close until now and places orders for matches,
+	// tagged signal_source="BACKFILL_AMN".
+	ProcessAfterMarketNews bool `json:"process_after_market_news"`
+
+	// AMNSelectedStocks is the user's explicit pick (ISINs) from the AMN preview.
+	// When non-empty, the backfill places orders ONLY for these stocks; when empty
+	// it falls back to all affordable matches up to the trade cap.
+	AMNSelectedStocks []string `json:"amn_selected_stocks,omitempty"`
 }
 
 // UpdateStrategyRequest represents the JSON body for updating a strategy

@@ -280,9 +280,20 @@ message CreateStrategyRequest {
     RiskLimits risk_limits = 6;
     bool activate_immediately = 7;
     TradingMode trading_mode = 8;
-    
+
     // Indira Securities authentication
     common.IndiraAuthContext indira_auth = 9;
+
+    // When true, triggers a one-shot AMN backfill on strategy creation:
+    // the rules-engine scans news from the previous NSE_EQ trading day's
+    // 15:31 IST close until now and places orders for matches, tagged
+    // signal_source="BACKFILL_AMN".
+    bool process_after_market_news = 10;
+
+    // amn_selected_stocks is the user's explicit pick (ISINs) from the AMN
+    // preview. When non-empty, the backfill places orders ONLY for these stocks.
+    // When empty, it falls back to all affordable matches up to the trade cap.
+    repeated string amn_selected_stocks = 11;
 }
 
 message CreateStrategyResponse {

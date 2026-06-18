@@ -73,6 +73,10 @@ type OrderRequest struct {
 	// open positions for this user should be automatically closed.
 	// Empty string = use the global default in trade-execution (15:05 IST live, 15:00 paper).
 	AutoSquareOffTime string `json:"auto_square_off_time,omitempty"`
+
+	// SignalSource identifies the pipeline that generated this order.
+	// "BACKFILL_AMN" for after-market news backfill orders; empty for live signals.
+	SignalSource string `json:"signal_source,omitempty"`
 }
 
 // RuleMatch represents a successful rule match

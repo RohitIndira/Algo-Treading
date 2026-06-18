@@ -47,7 +47,7 @@ func (f *fakeReader) Close() error {
 func TestConfigConsumer_UnknownType_SkipsGracefully(t *testing.T) {
 	store := configstore.New()
 	r := &fakeReader{msgs: []kafka.Message{{Value: []byte(`{"type":"WAT","user_id":"u","strategy_id":"s","version":1}`)}}}
-	c := NewConfigConsumer(r, store)
+	c := NewConfigConsumer(r, store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_ = c.Start(ctx)
@@ -56,7 +56,7 @@ func TestConfigConsumer_UnknownType_SkipsGracefully(t *testing.T) {
 func TestConfigConsumer_ParseError_ContinuesNotCrashes(t *testing.T) {
 	store := configstore.New()
 	r := &fakeReader{msgs: []kafka.Message{{Value: []byte(`not-json`)}}}
-	c := NewConfigConsumer(r, store)
+	c := NewConfigConsumer(r, store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(20 * time.Millisecond)
@@ -70,7 +70,7 @@ func TestConfigConsumer_Created_Upserts(t *testing.T) {
 	// create minimal config payload compatible with configsync mapper
 	msg := kafka.Message{Value: []byte(`{"type":"CONFIG_CREATED","user_id":"u1","strategy_id":"s1","version":1,"config":{"strategy_id":"s1","user_id":"u1","strategy_name":"n","active":true,"trading_mode":"PAPER","conditions":{"match_all_news":true,"impact_score_min":1,"impact_score_max":2,"sentiments":[],"categories":[],"stock_codes":[]},"trade_config":{"order_type":"MARKET","quantity":1,"exchange":"NSE","order_side":"BUY"},"risk_limits":{"max_daily_trades":1}}}`)}
 	r := &fakeReader{msgs: []kafka.Message{msg}}
-	c := NewConfigConsumer(r, store)
+	c := NewConfigConsumer(r, store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
 	_ = c.Start(ctx)
@@ -86,7 +86,7 @@ func TestConfigConsumer_StaleVersion_Skipped(t *testing.T) {
 
 	msg := kafka.Message{Value: []byte(`{"type":"CONFIG_UPDATED","user_id":"u1","strategy_id":"s1","version":4,"config":{"strategy_id":"s1","user_id":"u1","strategy_name":"n","active":true,"trading_mode":"PAPER","conditions":{"match_all_news":true,"impact_score_min":1,"impact_score_max":2,"sentiments":[],"categories":[],"stock_codes":[]},"trade_config":{"order_type":"MARKET","quantity":1,"exchange":"NSE","order_side":"BUY"},"risk_limits":{"max_daily_trades":1}}}`)}
 	r := &fakeReader{msgs: []kafka.Message{msg}}
-	c := NewConfigConsumer(r, store)
+	c := NewConfigConsumer(r, store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
 	_ = c.Start(ctx)
@@ -102,7 +102,7 @@ func TestConfigConsumer_Paused_RemovesFromActiveKeepsInByUser(t *testing.T) {
 
 	msg := kafka.Message{Value: []byte(`{"type":"CONFIG_PAUSED","user_id":"u1","strategy_id":"s1","version":2}`)}
 	r := &fakeReader{msgs: []kafka.Message{msg}}
-	c := NewConfigConsumer(r, store)
+	c := NewConfigConsumer(r, store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
 	_ = c.Start(ctx)
@@ -122,7 +122,7 @@ func TestConfigConsumer_Resumed_ReAddsToActive(t *testing.T) {
 
 	// pause then resume
 	r := &fakeReader{msgs: []kafka.Message{{Value: []byte(`{"type":"CONFIG_PAUSED","user_id":"u1","strategy_id":"s1","version":2}`)}, {Value: []byte(`{"type":"CONFIG_RESUMED","user_id":"u1","strategy_id":"s1","version":3}`)}}}
-	c := NewConfigConsumer(r, store)
+	c := NewConfigConsumer(r, store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 	_ = c.Start(ctx)
@@ -139,7 +139,7 @@ func TestConfigConsumer_Deleted_RemovesFromBoth(t *testing.T) {
 
 	msg := kafka.Message{Value: []byte(`{"type":"CONFIG_DELETED","user_id":"u1","strategy_id":"s1","version":2}`)}
 	r := &fakeReader{msgs: []kafka.Message{msg}}
-	c := NewConfigConsumer(r, store)
+	c := NewConfigConsumer(r, store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
 	_ = c.Start(ctx)
