@@ -2,7 +2,7 @@ go 1.25.4
 
 use (
 	.
-	./api/gateway
+	./services/api-gateway
 	./api/proto/common
 	./api/proto/hft_engine
 	./api/proto/risk_management
