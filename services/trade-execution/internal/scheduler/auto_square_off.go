@@ -699,28 +699,30 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 		reverseSide = models.OrderSideBuy
 	}
 
-	// Compute trigger and limit prices for SL-L compliance order.
-	// MARKET orders are prohibited in NSE algo trading; SL-L with trigger≈LTP and a
-	// wide limit replicates immediate-fill behaviour while satisfying SEBI requirements.
-	var triggerPrice, limitPrice float64
+	// Compute a marketable IOC LIMIT price for immediate square-off.
+	// MARKET orders are prohibited in NSE algo trading; a LIMIT priced sqOffSlippagePct
+	// through the LTP (SELL below / BUY above) crosses the spread and fills instantly
+	// against the resting book, while IOC cancels any unfilled remainder.
+	//
+	// NOTE: a prior version sent an SL-L order with the trigger on the far side of LTP
+	// ("trigger ≈ LTP"). A stop only fires after an adverse move, so the order could rest
+	// unfilled and leave the position OPEN past EOD if price didn't move against it.
+	// A marketable limit has no trigger and so no directional dependency.
+	var limitPrice float64
 	if s.ltpLookup != nil {
 		ltp, ltpErr := s.ltpLookup.GetLTP(ctx, string(originalOrder.Exchange), originalOrder.StockCode)
 		if ltpErr == nil && ltp > 0 {
 			if reverseSide == models.OrderSideSell {
-				// Closing a long: SELL SL-L — trigger just below LTP, wide limit below trigger.
-				triggerPrice = roundTwoDP(ltp * 0.999)
 				limitPrice = roundTwoDP(ltp * (1 - sqOffSlippagePct))
 			} else {
-				// Closing a short: BUY SL-L — trigger just above LTP, wide limit above trigger.
-				triggerPrice = roundTwoDP(ltp * 1.001)
 				limitPrice = roundTwoDP(ltp * (1 + sqOffSlippagePct))
 			}
 		} else {
-			log.Printf("[auto-square-off] LTP unavailable for %s:%d (%v) — SL-L prices left at 0, broker will reject",
+			log.Printf("[auto-square-off] LTP unavailable for %s:%d (%v) — limit price left at 0, broker will reject",
 				originalOrder.Exchange, originalOrder.StockCode, ltpErr)
 		}
 	} else {
-		log.Printf("[auto-square-off] No LTP lookup wired — SL-L prices left at 0 for order %s (configure SetLTPLookup)", originalOrder.OrderID)
+		log.Printf("[auto-square-off] No LTP lookup wired — limit price left at 0 for order %s (configure SetLTPLookup)", originalOrder.OrderID)
 	}
 
 	squareOffOrder := &models.Order{
@@ -732,12 +734,13 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 		StockCode:        originalOrder.StockCode,
 		Exchange:         originalOrder.Exchange,
 		Symbol:           originalOrder.Symbol,
-		OrderType:        models.OrderTypeStopLoss, // SL-L (algo compliance: no MARKET orders)
+		// Marketable IOC LIMIT (no trigger) → fills immediately; StopLoss left nil so the
+		// broker payload builder emits ordType "Limit", not "SL". MARKET barred for algo.
+		OrderType:        models.OrderTypeLimit,
 		OrderSide:        reverseSide,
 		Quantity:         originalOrder.FilledQuantity, // only exit the filled portion
-		StopLoss:         &triggerPrice,               // SL-L trigger price ≈ LTP
-		Price:            &limitPrice,                 // SL-L limit price = LTP ± sqOffSlippagePct
-		Validity:         "IOC",                       // Immediate or Cancel
+		Price:            &limitPrice,                  // marketable limit = LTP ∓ sqOffSlippagePct
+		Validity:         "IOC",                        // Immediate or Cancel
 		ProductType:      originalOrder.ProductType,
 		Status:           models.StatusReceived,
 		IsSquareOffOrder: true,  // mark so it won't be picked up again

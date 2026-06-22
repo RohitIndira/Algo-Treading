@@ -587,27 +587,36 @@ func (c *StrategyEventsConsumer) squareOffLivePosition(ctx context.Context, orig
 		reverseSide = models.OrderSideBuy
 	}
 
-	// Compute SL-L trigger and limit from LTP. Trigger ≈ LTP activates immediately;
-	// wide limit (1.5%) fills in all but extreme gap scenarios (IOC cancels remainder).
-	var triggerPrice, limitPrice float64
+	// Square-off must exit IMMEDIATELY regardless of which way the next tick moves.
+	// MARKET orders are barred for algo (SEBI), so we send a marketable IOC LIMIT: a
+	// SELL priced sqOffConsumerSlippagePct below LTP (or BUY above LTP) crosses the
+	// spread and fills against the resting book instantly; IOC cancels any unfilled
+	// remainder so nothing rests in the book.
+	//
+	// NOTE: a prior version sent an SL-L (stop-loss) order with the trigger 0.1% on the
+	// far side of LTP and called it "trigger ≈ LTP activates immediately". That is wrong:
+	// a SELL stop only fires when price FALLS to the trigger, so the order rested unfilled
+	// until an adverse move happened — squaring off late or, if price never moved against
+	// the position, not at all (e.g. LLOYDSENT sat PENDING 5 min on 2026-06-22 while
+	// CENTENKA's identical stop happened to trigger in ~2s). A marketable limit has no
+	// trigger and therefore no directional dependency.
+	var limitPrice float64
 	if c.priceClient != nil {
 		ltp, ltpErr := c.priceClient.GetLTP(ctx, string(original.Exchange), original.StockCode)
 		if ltpErr == nil && ltp > 0 {
 			if reverseSide == models.OrderSideSell {
-				triggerPrice = math.Round(ltp*0.999*100) / 100
 				limitPrice = math.Round(ltp*(1-sqOffConsumerSlippagePct)*100) / 100
 			} else {
-				triggerPrice = math.Round(ltp*1.001*100) / 100
 				limitPrice = math.Round(ltp*(1+sqOffConsumerSlippagePct)*100) / 100
 			}
 		} else {
-			c.logger.Warn("LTP unavailable for strategy deactivation sq-off — SL-L prices left at 0, broker will reject",
+			c.logger.Warn("LTP unavailable for strategy deactivation sq-off — limit price left at 0, broker will reject",
 				zap.String("exchange", string(original.Exchange)),
 				zap.Int64("stock_code", original.StockCode),
 				zap.Error(ltpErr))
 		}
 	} else {
-		c.logger.Warn("No priceClient wired — SL-L prices left at 0 for strategy deactivation sq-off",
+		c.logger.Warn("No priceClient wired — limit price left at 0 for strategy deactivation sq-off",
 			zap.String("order_id", original.OrderID.String()))
 	}
 
@@ -620,10 +629,11 @@ func (c *StrategyEventsConsumer) squareOffLivePosition(ctx context.Context, orig
 		StockCode:        original.StockCode,
 		Exchange:         original.Exchange,
 		Symbol:           original.Symbol,
-		OrderType:        models.OrderTypeStopLoss, // SL-L for algo compliance
+		// Marketable IOC LIMIT (no trigger) → fills immediately against the book.
+		// StopLoss left nil so the broker payload builder emits ordType "Limit", not "SL".
+		OrderType:        models.OrderTypeLimit,
 		OrderSide:        reverseSide,
 		Quantity:         original.FilledQuantity,
-		StopLoss:         &triggerPrice,
 		Price:            &limitPrice,
 		Validity:         "IOC",
 		ProductType:      original.ProductType,
