@@ -722,6 +722,10 @@ func main() {
 	autoSquareOff.SetPaperForceExitStrategy(paperMonitor.ForceExitByStrategy)
 	// Wire broker position-book check so flat positions (NetQty == 0) aren't squared off again.
 	autoSquareOff.SetPositionChecker(positionChecker)
+	// Wire Redis LTP so square-off orders are placed as SL-L at trigger≈LTP (algo compliance).
+	if redisPrices != nil {
+		autoSquareOff.SetLTPLookup(redisPrices)
+	}
 	// Wire SL/TP teardown so each position's resting OCO and multi-level exit legs are
 	// cancelled at the broker BEFORE its reverse square-off order is placed — preventing a
 	// stop from firing into a now-flat book and opening a fresh position. Per-symbol so

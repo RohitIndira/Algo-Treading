@@ -18,6 +18,21 @@ import (
 	"go.uber.org/zap"
 )
 
+// slLimitSlippagePct is the buffer added/subtracted from the SL trigger to form the
+// limit price of an SL-L order. 1% covers most intraday gap-down / gap-up scenarios
+// while limiting excess slippage on normal market conditions.
+const slLimitSlippagePct = 0.01
+
+// calcSLLimit computes the SL-L limit price from the trigger price and exit side.
+// SELL exit (closing a long): limit is below trigger — trigger > limit (NSE rule).
+// BUY  exit (closing a short): limit is above trigger — limit > trigger (NSE rule).
+func calcSLLimit(trigger float64, exitSide string) float64 {
+	if exitSide == "SELL" {
+		return math.Round(trigger*(1-slLimitSlippagePct)*100) / 100
+	}
+	return math.Round(trigger*(1+slLimitSlippagePct)*100) / 100
+}
+
 // BrokerOrderPlacer is the broker client subset used by the ML manager.
 // *indira.ExecutionClient satisfies this interface.
 type BrokerOrderPlacer interface {
@@ -920,9 +935,23 @@ func (m *Manager) evaluateTrailingSL(ctx context.Context, g *Group, ltp float64)
 // Broker order placement helpers (live only)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// placeExitOrderMarket places a MARKET IOC exit order for a triggered level.
+// placeExitOrderMarket places an SL-L IOC exit order for a triggered level.
+// exitPrice is the LTP at trigger time; trigger and limit are derived from it so the
+// order behaves like a market exit while satisfying NSE SEBI algo-compliance rules.
 func (m *Manager) placeExitOrderMarket(ctx context.Context, g *Group, level *ExitLevelState, qty int32, exitPrice float64, exitType string) {
-	order := m.buildExitOrder(g, qty, models.OrderTypeMarket, nil, nil)
+	// Compute SL-L prices. Trigger just inside current price activates immediately;
+	// limit = exitPrice ± 1% ensures fill in all but extreme gap scenarios.
+	var triggerPrice, limitPrice float64
+	if exitPrice > 0 {
+		if g.ExitSide() == "SELL" {
+			triggerPrice = math.Round(exitPrice*0.999*100) / 100
+			limitPrice = calcSLLimit(exitPrice, "SELL")
+		} else {
+			triggerPrice = math.Round(exitPrice*1.001*100) / 100
+			limitPrice = calcSLLimit(exitPrice, "BUY")
+		}
+	}
+	order := m.buildExitOrder(g, qty, models.OrderTypeStopLoss, &limitPrice, &triggerPrice)
 	brokerID, err := m.broker.PlaceOrder(ctx, order, g.Auth)
 	if err != nil {
 		m.logger.Error("ML exit order placement failed",
@@ -942,13 +971,14 @@ func (m *Manager) placeExitOrderMarket(ctx context.Context, g *Group, level *Exi
 		zap.String("broker", brokerID))
 }
 
-// placeFixedSLOrder places a single SL-M broker order covering the full position qty.
+// placeFixedSLOrder places a single SL-L broker order covering the full position qty.
 func (m *Manager) placeFixedSLOrder(ctx context.Context, g *Group, qty int32) {
 	g.mu.Lock()
 	triggerPrice := g.CalcSLTriggerPrice(g.FixedSLPct)
 	g.mu.Unlock()
 
-	order := m.buildExitOrder(g, qty, models.OrderTypeStopLossMarket, nil, &triggerPrice)
+	limitPrice := calcSLLimit(triggerPrice, g.ExitSide())
+	order := m.buildExitOrder(g, qty, models.OrderTypeStopLoss, &limitPrice, &triggerPrice)
 	brokerID, err := m.broker.PlaceOrder(ctx, order, g.Auth)
 	if err != nil {
 		m.logger.Error("fixed SL placement failed", zap.String("group", g.GroupID.String()), zap.Error(err))
@@ -968,7 +998,7 @@ func (m *Manager) placeFixedSLOrder(ctx context.Context, g *Group, qty int32) {
 		zap.String("broker", brokerID))
 }
 
-// placeLiveTrailingSL places the initial SL-M broker order at FixedSLPct% from fill.
+// placeLiveTrailingSL places the initial SL-L broker order at FixedSLPct% from fill.
 // FixedSLPct (e.g. 1%) is the initial SL distance; TrailingSLPct (e.g. 0.2%) is the
 // trailing increment used later by evaluateTrailingSL — they are separate concerns.
 func (m *Manager) placeLiveTrailingSL(ctx context.Context, g *Group) {
@@ -977,7 +1007,8 @@ func (m *Manager) placeLiveTrailingSL(ctx context.Context, g *Group) {
 	qty := g.RemainingQty
 	g.mu.Unlock()
 
-	order := m.buildExitOrder(g, qty, models.OrderTypeStopLossMarket, nil, &triggerPrice)
+	limitPrice := calcSLLimit(triggerPrice, g.ExitSide())
+	order := m.buildExitOrder(g, qty, models.OrderTypeStopLoss, &limitPrice, &triggerPrice)
 	brokerID, err := m.broker.PlaceOrder(ctx, order, g.Auth)
 	if err != nil {
 		m.logger.Error("trailing SL placement failed", zap.String("group", g.GroupID.String()), zap.Error(err))
@@ -1023,7 +1054,8 @@ func (m *Manager) replaceSLWithReducedQty(ctx context.Context, g *Group, remaini
 		m.logger.Warn("replaceSL: cancel failed (continuing)", zap.String("group", g.GroupID.String()), zap.Error(err))
 	}
 
-	order := m.buildExitOrder(g, remainingQty, models.OrderTypeStopLossMarket, nil, &triggerPrice)
+	limitPrice := calcSLLimit(triggerPrice, g.ExitSide())
+	order := m.buildExitOrder(g, remainingQty, models.OrderTypeStopLoss, &limitPrice, &triggerPrice)
 	newBrokerID, err := m.broker.PlaceOrder(ctx, order, auth)
 	if err != nil {
 		m.logger.Error("replaceSL: place failed", zap.String("group", g.GroupID.String()), zap.Error(err))
@@ -1076,7 +1108,8 @@ func (m *Manager) replaceSLTrailing(ctx context.Context, g *Group, remainingQty 
 			zap.Error(err))
 	}
 
-	order := m.buildExitOrder(g, remainingQty, models.OrderTypeStopLossMarket, nil, &triggerPrice)
+	limitPrice := calcSLLimit(triggerPrice, g.ExitSide())
+	order := m.buildExitOrder(g, remainingQty, models.OrderTypeStopLoss, &limitPrice, &triggerPrice)
 	newBrokerID, err := m.broker.PlaceOrder(ctx, order, auth)
 	if err != nil {
 		m.logger.Error("replaceSLTrailing: place new SL failed — position partially unprotected",
@@ -1570,7 +1603,8 @@ func (m *Manager) placeMultiSLOrders(ctx context.Context, g *Group) {
 			orderID := level.ExitOrderID
 			level.mu.Unlock()
 
-			order := m.buildMultiSLOrder(g, qty, trigger, orderID)
+			limit := calcSLLimit(trigger, g.ExitSide())
+			order := m.buildMultiSLOrder(g, qty, trigger, limit, orderID)
 			brokerID, err := m.broker.PlaceOrder(ctx, order, auth)
 			if err != nil {
 				m.logger.Error("multi SL level placement failed",
@@ -2033,7 +2067,7 @@ func (m *Manager) cancelRemainingMLOrders(ctx context.Context, g *Group, levels 
 }
 
 // buildMultiSLOrder builds a stop-loss-market order for one multi-level SL placement.
-func (m *Manager) buildMultiSLOrder(g *Group, qty int32, triggerPrice float64, orderID uuid.UUID) *models.Order {
+func (m *Manager) buildMultiSLOrder(g *Group, qty int32, triggerPrice, limitPrice float64, orderID uuid.UUID) *models.Order {
 	return &models.Order{
 		OrderID:      orderID,
 		UserID:       g.UserID,
@@ -2043,10 +2077,11 @@ func (m *Manager) buildMultiSLOrder(g *Group, qty int32, triggerPrice float64, o
 		StockCode:    g.StockCode,
 		Exchange:     models.Exchange(g.Exchange),
 		Symbol:       g.Symbol,
-		OrderType:    models.OrderTypeStopLossMarket,
+		OrderType:    models.OrderTypeStopLoss, // SL-L (algo compliance: no SL-M)
 		OrderSide:    models.OrderSide(g.ExitSide()),
 		Quantity:     qty,
-		StopLoss:     &triggerPrice,
+		Price:        &limitPrice,   // SL-L limit = trigger ± slLimitSlippagePct
+		StopLoss:     &triggerPrice, // SL-L trigger
 		Validity:     g.Validity,
 		ProductType:  g.ProductType,
 		Status:       models.StatusReceived,

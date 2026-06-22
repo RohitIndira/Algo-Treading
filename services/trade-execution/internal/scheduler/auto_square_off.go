@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -14,10 +15,24 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/timezone"
 )
 
+// roundTwoDP rounds a price to two decimal places (NSE tick-size rounding is handled
+// later by the Indira client; this just prevents floating-point noise in log output).
+func roundTwoDP(v float64) float64 { return math.Round(v*100) / 100 }
+
 // OrderExecutorFunc executes an order at the broker. Implemented by executor.OrderExecutor.
 type OrderExecutorFunc interface {
 	ExecuteOrder(ctx context.Context, order *models.Order) error
 }
+
+// LTPLookup fetches the last-traded price for an instrument from Redis market data.
+// Implemented by paper.RedisPriceClient (structurally typed — no import needed).
+type LTPLookup interface {
+	GetLTP(ctx context.Context, exchange string, token int64) (float64, error)
+}
+
+// sqOffSlippagePct is the limit-price buffer for auto square-off SL-L orders.
+// 1.5% gives a wide enough band to guarantee near-instant fill (IOC cancels any remainder).
+const sqOffSlippagePct = 0.015
 
 // AutoSquareOffScheduler manages automatic square-off of intraday positions
 // placed through our algo system at market close (default 15:05 IST).
@@ -51,6 +66,11 @@ type AutoSquareOffScheduler struct {
 	// paperForceExitStrategy, if set, closes paper positions for a single (user, strategy)
 	// pair at that strategy's auto_square_off_time. More targeted than paperForceExitUser.
 	paperForceExitStrategy func(ctx context.Context, userID, strategyID string) error
+
+	// ltpLookup, if set, fetches the current LTP from Redis to compute trigger and
+	// limit prices for SL-L square-off orders. Nil-safe: falls back to 0/0 prices
+	// (broker will reject, preventing an accidental plain-market order).
+	ltpLookup LTPLookup
 
 	// positionChecker, if set, queries the broker position book before placing a
 	// square-off order and skips symbols whose NetQty is already 0. Nil-safe.
@@ -108,6 +128,12 @@ func (s *AutoSquareOffScheduler) SetPaperForceExitUser(fn func(ctx context.Conte
 // Pass paperMonitor.ForceExitByStrategy to wire it up.
 func (s *AutoSquareOffScheduler) SetPaperForceExitStrategy(fn func(ctx context.Context, userID, strategyID string) error) {
 	s.paperForceExitStrategy = fn
+}
+
+// SetLTPLookup wires a Redis LTP source so square-off orders are placed as
+// SL-L at trigger=LTP±0.1%, limit=LTP±1.5% instead of plain MARKET orders.
+func (s *AutoSquareOffScheduler) SetLTPLookup(l LTPLookup) {
+	s.ltpLookup = l
 }
 
 // SetPositionChecker wires the broker position-book checker so square-off skips
@@ -673,6 +699,30 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 		reverseSide = models.OrderSideBuy
 	}
 
+	// Compute trigger and limit prices for SL-L compliance order.
+	// MARKET orders are prohibited in NSE algo trading; SL-L with trigger≈LTP and a
+	// wide limit replicates immediate-fill behaviour while satisfying SEBI requirements.
+	var triggerPrice, limitPrice float64
+	if s.ltpLookup != nil {
+		ltp, ltpErr := s.ltpLookup.GetLTP(ctx, string(originalOrder.Exchange), originalOrder.StockCode)
+		if ltpErr == nil && ltp > 0 {
+			if reverseSide == models.OrderSideSell {
+				// Closing a long: SELL SL-L — trigger just below LTP, wide limit below trigger.
+				triggerPrice = roundTwoDP(ltp * 0.999)
+				limitPrice = roundTwoDP(ltp * (1 - sqOffSlippagePct))
+			} else {
+				// Closing a short: BUY SL-L — trigger just above LTP, wide limit above trigger.
+				triggerPrice = roundTwoDP(ltp * 1.001)
+				limitPrice = roundTwoDP(ltp * (1 + sqOffSlippagePct))
+			}
+		} else {
+			log.Printf("[auto-square-off] LTP unavailable for %s:%d (%v) — SL-L prices left at 0, broker will reject",
+				originalOrder.Exchange, originalOrder.StockCode, ltpErr)
+		}
+	} else {
+		log.Printf("[auto-square-off] No LTP lookup wired — SL-L prices left at 0 for order %s (configure SetLTPLookup)", originalOrder.OrderID)
+	}
+
 	squareOffOrder := &models.Order{
 		OrderID:          uuid.New(),
 		EventID:          uuid.New(),
@@ -682,10 +732,12 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 		StockCode:        originalOrder.StockCode,
 		Exchange:         originalOrder.Exchange,
 		Symbol:           originalOrder.Symbol,
-		OrderType:        models.OrderTypeMarket, // MARKET for guaranteed execution
+		OrderType:        models.OrderTypeStopLoss, // SL-L (algo compliance: no MARKET orders)
 		OrderSide:        reverseSide,
 		Quantity:         originalOrder.FilledQuantity, // only exit the filled portion
-		Validity:         "IOC",                        // Immediate or Cancel
+		StopLoss:         &triggerPrice,               // SL-L trigger price ≈ LTP
+		Price:            &limitPrice,                 // SL-L limit price = LTP ± sqOffSlippagePct
+		Validity:         "IOC",                       // Immediate or Cancel
 		ProductType:      originalOrder.ProductType,
 		Status:           models.StatusReceived,
 		IsSquareOffOrder: true,  // mark so it won't be picked up again
@@ -694,7 +746,7 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 		// Link back to the entry order so statusservice can record the exact
 		// exit price / P&L on the parent when this reverse order fills.
 		ParentOrderID: &originalOrder.OrderID,
-		RiskApproved: true, // auto square-off bypasses risk checks
+		RiskApproved:  true, // auto square-off bypasses risk checks
 		// BearerToken / AppId / Source intentionally omitted (left nil).
 		// The token stored on the original order was captured at entry time and is
 		// likely expired by square-off time. Leaving them nil forces executor.go to

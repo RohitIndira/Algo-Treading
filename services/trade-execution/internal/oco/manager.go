@@ -1213,10 +1213,11 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 
 	if hasSL {
 		slOrderID := uuid.New()
+		slLimit := calcSLLimit(slTrigger, exitSide)
 		group.SLOrderID = slOrderID
 		group.SLTriggerPrice = slTrigger
-		group.SLLimitPrice = 0
-		slOrder = m.buildLegOrder(group, slOrderID, exitSide, models.OrderTypeStopLossMarket, nil, &slTrigger, RoleSLLeg)
+		group.SLLimitPrice = slLimit
+		slOrder = m.buildLegOrder(group, slOrderID, exitSide, models.OrderTypeStopLoss, &slLimit, &slTrigger, RoleSLLeg)
 	} else {
 		group.SLLegConfirmed = true // no SL leg — skip WS confirmation
 	}
@@ -1594,16 +1595,17 @@ func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
 
 	// Modify SL leg
 	if slBrokerID != "" {
+		slLimit := group.SLLimitPrice
 		slOrder := &models.Order{
 			OrderID:       group.SLOrderID,
 			IndiraOrderID: &slBrokerID,
 			StockCode:     group.StockCode,
 			Exchange:      models.Exchange(group.Exchange),
 			Symbol:        group.Symbol,
-			OrderType:     models.OrderTypeStopLossMarket,
+			OrderType:     models.OrderTypeStopLoss, // SL-L (algo compliance)
 			OrderSide:     models.OrderSide(group.ExitSide()),
 			Quantity:      newQty,
-			Price:         nil,
+			Price:         &slLimit,
 			StopLoss:      &slTrigger,
 			Validity:      group.Validity,
 			ProductType:   group.ProductType,
@@ -1760,10 +1762,10 @@ func (m *OCOManager) ModifySLLeg(ctx context.Context, group *OCOGroup, newTrigge
 		StockCode:     group.StockCode,
 		Exchange:      models.Exchange(group.Exchange),
 		Symbol:        group.Symbol,
-		OrderType:     models.OrderTypeStopLossMarket,
+		OrderType:     models.OrderTypeStopLoss, // SL-L (algo compliance)
 		OrderSide:     models.OrderSide(group.ExitSide()),
 		Quantity:      legQty,
-		Price:         nil,
+		Price:         &newLimit, // SL-L limit = newTrigger ± ocoSLSlippagePct
 		StopLoss:      &newTrigger,
 		Validity:      group.Validity,
 		ProductType:   group.ProductType,

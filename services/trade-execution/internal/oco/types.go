@@ -2,11 +2,26 @@ package oco
 
 import (
 	"context"
+	"math"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/google/uuid"
 )
+
+// ocoSLSlippagePct is the buffer for SL-L limit prices in OCO groups.
+// 1% covers most intraday gap scenarios while limiting excess slippage.
+const ocoSLSlippagePct = 0.01
+
+// calcSLLimit returns the SL-L limit price for an exit order.
+// exitSide is the side of the protective/exit order (SELL to close a long, BUY to close a short).
+// NSE rule: SELL SL-L requires limit < trigger; BUY SL-L requires limit > trigger.
+func calcSLLimit(trigger float64, exitSide string) float64 {
+	if exitSide == "SELL" {
+		return math.Round(trigger*(1-ocoSLSlippagePct)*100) / 100
+	}
+	return math.Round(trigger*(1+ocoSLSlippagePct)*100) / 100
+}
 
 // OCOState represents the lifecycle state of an OCO group.
 type OCOState string
@@ -159,8 +174,8 @@ func stripEntryBuffer(limitPrice float64, side string) float64 {
 // CalculateSLFromFill computes the SL trigger price from the execution price.
 // The caller passes the resolved fill price (real broker fill preferred; the
 // buffer-stripped entry limit only as a last resort), so the percentage is always
-// relative to the true execution price. Returns trigger only — SL legs are placed
-// as SL-M (stop market) so no limit price is needed.
+// relative to the true execution price. Returns trigger only; callers use
+// calcSLLimit(trigger, exitSide) to derive the SL-L limit price.
 //
 //	BUY entry  → trigger = fill * (1 - slPct/100)
 //	SELL entry → trigger = fill * (1 + slPct/100)
@@ -209,7 +224,8 @@ func (g *OCOGroup) CalculateTrailingSL(currentLTP float64) (trigger, limit float
 		}
 		// Proportional: SL moves up by the same ratio as the price
 		trigger = g.SLTriggerPrice * (currentLTP / g.HighestPrice)
-		limit = trigger // SL-M: no limit price needed; kept for signature compatibility
+		// BUY entry → SELL exit SL-L: limit must be below trigger (NSE rule)
+		limit = calcSLLimit(trigger, "SELL")
 		if trigger <= g.SLTriggerPrice {
 			return 0, 0, false
 		}
@@ -220,7 +236,8 @@ func (g *OCOGroup) CalculateTrailingSL(currentLTP float64) (trigger, limit float
 		}
 		// Proportional: SL moves down by the same ratio as the price
 		trigger = g.SLTriggerPrice * (currentLTP / g.HighestPrice)
-		limit = trigger // SL-M: no limit price needed; kept for signature compatibility
+		// SELL entry → BUY exit SL-L: limit must be above trigger (NSE rule)
+		limit = calcSLLimit(trigger, "BUY")
 		if trigger >= g.SLTriggerPrice {
 			return 0, 0, false
 		}

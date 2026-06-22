@@ -437,7 +437,12 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 			}
 		}
 
-		if order.OrderSide == models.OrderSideBuy {
+		// SL-L (hasTrigger + hasPrice): caller already set both trigger and limit relative
+		// to the SL price (e.g. trigger ± 1%). Use order.Price directly — do NOT override
+		// with LTP+0.5%, which can produce limit < trigger for BUY SL-L (invalid on NSE).
+		if hasTrigger && hasPrice {
+			req.LimitPrice = indiraClient.Price2DP(roundClamp(*order.Price))
+		} else if order.OrderSide == models.OrderSideBuy {
 			ltp, ltpErr := c.resolveLTP(symbolBuilder.Exchange, order.StockCode)
 			if ltpErr == nil && ltp > 0 {
 				limitPrice := roundClamp(ltp * 1.005)

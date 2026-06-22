@@ -17,34 +17,36 @@ import (
 	"go.uber.org/zap"
 )
 
-// previewMaxItems caps how many rows the preview returns (selection UI scrolls).
-const previewMaxItems = 200
-
-// Price-change buckets returned by classifyPctChange.
+// Price-change buckets returned by classifyPctChange. The comparison is on the
+// SIGNED current-day change %, so only upward moves place/monitor; a stock that's
+// up beyond Max% is excluded, and anything below Min% (including stocks that are
+// down) becomes a monitor that buys if it rises to +Min%.
 const (
-	bucketPlace   = "place"   // |%change| within [min,max] (or no filter) → order fires now
-	bucketMonitor = "monitor" // |%change| below min → price-watch at the Min% target
-	bucketExclude = "exclude" // |%change| at/above max → skipped
+	bucketPlace   = "place"   // %change within [min,max] (or no filter) → order fires now
+	bucketMonitor = "monitor" // %change below min → price-watch at the Min% target
+	bucketExclude = "exclude" // %change at/above max → skipped
 )
 
 // classifyPctChange mirrors matcher.evaluatePctChange's three-way logic against
-// the live current-day price change. Returns the bucket and, for "monitor", the
-// target trigger price = referencePrice*(1+min/100) (referencePrice = prevClose,
-// or ltp when prevClose is unavailable — same fallback as the live handler).
+// the live current-day price change. The comparison is on the SIGNED change %
+// (positive-only): up within [min,max] → place now; up beyond max → exclude;
+// below min (including stocks that are down) → monitor. Returns the bucket and,
+// for "monitor", the target trigger price = referencePrice*(1+min/100)
+// (referencePrice = prevClose, or ltp when prevClose is unavailable — same
+// fallback as the live handler).
 func classifyPctChange(min, max, pctChange, prevClose, ltp float64) (bucket string, target float64) {
 	// No filter → everything places now.
 	if min == 0 && max == 0 {
 		return bucketPlace, 0
 	}
-	abs := math.Abs(pctChange)
 	effectiveMax := max
 	if effectiveMax == 0 {
 		effectiveMax = math.MaxFloat64 // max unset → only a lower bound
 	}
-	if abs >= effectiveMax {
+	if pctChange >= effectiveMax {
 		return bucketExclude, 0
 	}
-	if abs >= min {
+	if pctChange >= min {
 		return bucketPlace, 0
 	}
 	// Below min → monitor candidate; compute the Min% target level.
@@ -392,9 +394,6 @@ func (pr *PreviewRunner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		items = append(items, item)
 		totalInvested += invested
-		if len(items) >= previewMaxItems {
-			break
-		}
 	}
 
 	pr.logger.Debug("amn-preview: filtered snapshot",

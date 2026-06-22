@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -572,13 +573,42 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 	return nil
 }
 
-// squareOffLivePosition places a reverse MARKET/IOC order to close a live position
+// sqOffConsumerSlippagePct is the SL-L limit price buffer for strategy-deactivation
+// square-off orders. 1.5% mirrors the auto-square-off scheduler, giving enough room
+// to fill immediately in all but extreme gap scenarios.
+const sqOffConsumerSlippagePct = 0.015
+
+// squareOffLivePosition places a reverse SL-L/IOC order to close a live position
 // already filled at the broker. Only the FilledQuantity is reversed so partial fills
-// don't over-exit.
+// don't over-exit. SL-L (not MARKET) satisfies NSE SEBI algo-compliance rules.
 func (c *StrategyEventsConsumer) squareOffLivePosition(ctx context.Context, original *models.Order) error {
 	reverseSide := models.OrderSideSell
 	if original.OrderSide == models.OrderSideSell {
 		reverseSide = models.OrderSideBuy
+	}
+
+	// Compute SL-L trigger and limit from LTP. Trigger ≈ LTP activates immediately;
+	// wide limit (1.5%) fills in all but extreme gap scenarios (IOC cancels remainder).
+	var triggerPrice, limitPrice float64
+	if c.priceClient != nil {
+		ltp, ltpErr := c.priceClient.GetLTP(ctx, string(original.Exchange), original.StockCode)
+		if ltpErr == nil && ltp > 0 {
+			if reverseSide == models.OrderSideSell {
+				triggerPrice = math.Round(ltp*0.999*100) / 100
+				limitPrice = math.Round(ltp*(1-sqOffConsumerSlippagePct)*100) / 100
+			} else {
+				triggerPrice = math.Round(ltp*1.001*100) / 100
+				limitPrice = math.Round(ltp*(1+sqOffConsumerSlippagePct)*100) / 100
+			}
+		} else {
+			c.logger.Warn("LTP unavailable for strategy deactivation sq-off — SL-L prices left at 0, broker will reject",
+				zap.String("exchange", string(original.Exchange)),
+				zap.Int64("stock_code", original.StockCode),
+				zap.Error(ltpErr))
+		}
+	} else {
+		c.logger.Warn("No priceClient wired — SL-L prices left at 0 for strategy deactivation sq-off",
+			zap.String("order_id", original.OrderID.String()))
 	}
 
 	sqOrder := &models.Order{
@@ -590,9 +620,11 @@ func (c *StrategyEventsConsumer) squareOffLivePosition(ctx context.Context, orig
 		StockCode:        original.StockCode,
 		Exchange:         original.Exchange,
 		Symbol:           original.Symbol,
-		OrderType:        models.OrderTypeMarket,
+		OrderType:        models.OrderTypeStopLoss, // SL-L for algo compliance
 		OrderSide:        reverseSide,
 		Quantity:         original.FilledQuantity,
+		StopLoss:         &triggerPrice,
+		Price:            &limitPrice,
 		Validity:         "IOC",
 		ProductType:      original.ProductType,
 		Status:           models.StatusReceived,
