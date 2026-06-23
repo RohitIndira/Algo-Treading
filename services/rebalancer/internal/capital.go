@@ -4,27 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 
-	"github.com/RohitIndira/Algo-Treading/pkg/crypto"
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
 )
 
-// encryptionKey returns the AES key used by the trade-execution credentials
-// repository when storing tokens. We MUST use the same key here since we
-// read the encrypted ciphertext directly from trading_execution.user_credentials.
-//
-// Default matches what trade-execution's main.go uses if ENCRYPTION_KEY is
-// not set in env. In production both services should share the same key
-// via .env or secrets manager.
-func encryptionKey() string {
-	if k := os.Getenv("ENCRYPTION_KEY"); k != "" {
-		return k
-	}
-	return "0123456789abcdef0123456789abcdef"
-}
+// encryptionKey() was removed 2026-06-23 in Phase 0.6a — rebalancer no
+// longer reads encrypted JWTs from trading_execution.user_credentials,
+// so it no longer needs the encryption key. user-config (the single
+// owner of user_credentials) now handles decryption server-side and
+// returns plaintext over the GetUserCredentials gRPC RPC.
 
 // FetchCurrentCapital pulls real-time capital from the broker for one user.
 //
@@ -158,39 +148,25 @@ func isDelivery(prdType string) bool {
 	return false
 }
 
-// ResolveBrokerAuth pulls the bearer token + appId + source for a user
-// from trading_execution.user_credentials. Returns nil if not found —
-// caller should skip the strategy with a clear log line (no auth = no
-// broker calls = no rebalance).
+// ResolveBrokerAuth fetches the bearer token + appId + source for a user
+// via user-config gRPC. Returns nil if user-config has no credentials on
+// file (NOT_FOUND) — caller should skip the strategy with a clear log
+// line (no auth = no broker calls = no rebalance).
 //
-// IMPORTANT: trade-execution's credentials_repository encrypts bearer
-// tokens with AES-256 before storing. We MUST decrypt here using the
-// same key (ENCRYPTION_KEY env, default matches trade-execution).
-// Without decryption the broker rejects every call with AU004 because
-// the ciphertext fails JWT signature verification.
-func ResolveBrokerAuth(ctx context.Context, execDB *sql.DB, userID string) (*indiraClient.AuthContext, error) {
-	if execDB == nil || userID == "" {
+// Phase 0.6a (2026-06-23) replaced the legacy direct SQL read of
+// trading_execution.user_credentials with this gRPC wrapper. user-config
+// is now the single owner of user_credentials per
+// docs/architecture/data-ownership.md. Decryption is server-side; this
+// function never touches encrypted ciphertext or the encryption key.
+//
+// The wrapper exists (rather than letting callers hit ucClient directly)
+// so that:
+//   - the call site signature in snapshot.go stays a one-liner
+//   - the function name remains greppable for code archaeologists
+//   - future enhancements (caching, retry, mTLS) land here, not in callers
+func ResolveBrokerAuth(ctx context.Context, ucClient *UserConfigClient, userID string) (*indiraClient.AuthContext, error) {
+	if ucClient == nil || userID == "" {
 		return nil, fmt.Errorf("ResolveBrokerAuth: missing inputs")
 	}
-	var encToken, appID, source string
-	err := execDB.QueryRowContext(ctx, `
-		SELECT indira_bearer_token, indira_app_id, indira_source
-		FROM user_credentials
-		WHERE user_id = $1`, userID).Scan(&encToken, &appID, &source)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("user_credentials lookup: %w", err)
-	}
-	plainToken, decErr := crypto.Decrypt(encToken, encryptionKey())
-	if decErr != nil {
-		return nil, fmt.Errorf("decrypt bearer token (check ENCRYPTION_KEY matches trade-execution): %w", decErr)
-	}
-	return &indiraClient.AuthContext{
-		UserId:      userID,
-		BearerToken: plainToken,
-		AppId:       appID,
-		Source:      source,
-	}, nil
+	return ucClient.FetchUserCredentials(ctx, userID)
 }

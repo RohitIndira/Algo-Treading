@@ -33,7 +33,7 @@ type StrategyConfig struct {
 	StopLossPct   float64 // e.g. 20 (percent, not fraction)
 	TrailingSLPct float64 // e.g. 2
 
-	// Broker auth — pulled from trading_execution.user_credentials so the
+	// Broker auth — fetched from user-config via gRPC (Phase 0.6a) so the
 	// rebalancer can call fund-limit / position-book / holdings.
 	BearerToken string
 	AppID       string

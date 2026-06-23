@@ -1,8 +1,7 @@
 // rebalancer is a manual CLI that drives one Manthan rebalance pass.
 //
 // Reads:
-//   - user-config gRPC (active MANTHAN strategies + trade_configs) — Phase 0.2
-//   - trading_execution.user_credentials (per-user broker auth; Phase 0.6 migrates to gRPC)
+//   - user-config gRPC (active MANTHAN strategies + trade_configs + broker auth) — Phase 0.2 + 0.6a
 //   - market_data.manthan_signals (today's eligible signals; Phase 0.5 migrates to gRPC)
 //   - Indira broker (fund-limit + position-book + holdings, real capital)
 //   - Redis manthan:ema:allocations (today's per-index EMA targets)
@@ -53,10 +52,12 @@ func main() {
 	defer cancel()
 
 	// --- DB connections ---
+	// Phase 0.6a (2026-06-23) removed the trading_execution connection —
+	// the only thing that used it was ResolveBrokerAuth, which now goes
+	// through user-config gRPC. rebalancer is no longer coupled to
+	// trade-execution's DB schema.
 	tradingDB := mustOpen(logger, "trading_db", buildDSN("trading_db"))
 	defer tradingDB.Close()
-	execDB := mustOpen(logger, "trading_execution", buildDSN("trading_execution"))
-	defer execDB.Close()
 	marketDB := mustOpen(logger, "market_data", buildDSN("market_data"))
 	defer marketDB.Close()
 
@@ -103,7 +104,7 @@ func main() {
 	defer ucClient.Close()
 
 	// --- Load active strategies ---
-	strategies, err := internal.LoadActiveStrategies(ctx, ucClient, execDB)
+	strategies, err := internal.LoadActiveStrategies(ctx, ucClient)
 	if err != nil {
 		logger.Fatal("load active strategies failed", zap.Error(err))
 	}

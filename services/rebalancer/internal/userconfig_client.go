@@ -26,6 +26,7 @@ import (
 	"time"
 
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -163,4 +164,59 @@ func tradingModeToString(m pb.TradingMode) string {
 	default:
 		return "PAPER" // safe default
 	}
+}
+
+// FetchUserCredentials fetches the broker auth bundle for a user via
+// user-config gRPC. Replaces the legacy direct read of
+//
+//	trading_execution.user_credentials
+//
+// plus the in-process AES-GCM decryption that lived in ResolveBrokerAuth.
+// After this method exists, rebalancer no longer needs to:
+//   - know about the trading_execution database
+//   - hold the encryption key
+//   - run any decryption code
+//
+// All three concerns now live behind user-config's GetUserCredentials
+// RPC (see services/user-config/internal/server/grpc_server.go), which
+// also writes a SEBI-grade audit log on every read.
+//
+// Returns:
+//   - (auth, nil)    user found, JWT decrypted server-side, ready for Indira
+//   - (nil,  nil)    user not found at user-config (NOT_FOUND) — caller
+//     should skip the strategy
+//   - (nil,  err)    network / unknown failure — caller decides whether
+//     to retry or fail the whole rebalance pass
+func (c *UserConfigClient) FetchUserCredentials(ctx context.Context, userID string) (*indiraClient.AuthContext, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("userID is required")
+	}
+
+	resp, err := c.client.GetUserCredentials(ctx, &pb.GetUserCredentialsRequest{UserId: userID})
+	if err != nil {
+		return nil, fmt.Errorf("GetUserCredentials RPC: %w", err)
+	}
+	if !resp.Success {
+		// Explicit NOT_FOUND maps to (nil, nil) so the caller can skip the
+		// strategy with a clean "no auth on file" log line. Any other
+		// structured failure propagates as an error.
+		if resp.Error != nil && resp.Error.Code == "NOT_FOUND" {
+			return nil, nil
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("GetUserCredentials unsuccessful: %s %s",
+				resp.Error.Code, resp.Error.Message)
+		}
+		return nil, fmt.Errorf("GetUserCredentials unsuccessful with no error detail")
+	}
+	if resp.IndiraAuth == nil {
+		return nil, fmt.Errorf("GetUserCredentials returned success but nil IndiraAuth")
+	}
+
+	return &indiraClient.AuthContext{
+		UserId:      userID,
+		BearerToken: resp.IndiraAuth.BearerToken,
+		AppId:       resp.IndiraAuth.AppId,
+		Source:      resp.IndiraAuth.Source,
+	}, nil
 }

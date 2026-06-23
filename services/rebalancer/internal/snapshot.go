@@ -14,17 +14,17 @@ import (
 // LoadActiveStrategies fetches every active MANTHAN strategy from user-config
 // via gRPC (single-owner principle for the strategies table — see
 // docs/architecture/data-ownership.md) and decorates each with its broker
-// auth from trading_execution.user_credentials.
+// auth, also fetched via user-config gRPC.
 //
-// Phase 0.2 migrated the strategies fetch from direct SQL to gRPC. The
-// broker-auth lookup (ResolveBrokerAuth) is intentionally still direct DB
-// — it migrates to gRPC in Phase 0.6 (the user_credentials completion),
-// at which point the execDB argument can be dropped entirely.
+// Phase 0.2 migrated the strategies fetch from direct SQL to gRPC.
+// Phase 0.6a migrated the broker-auth lookup the same way, eliminating
+// rebalancer's last cross-service direct read AND its dependency on the
+// trading_execution database connection entirely.
 //
 // Returns ONLY strategies that have all required pieces: active, has trade
 // config (already filtered server-side), has user credentials. Anything
 // missing → logged and skipped.
-func LoadActiveStrategies(ctx context.Context, ucClient *UserConfigClient, execDB *sql.DB) ([]StrategyConfig, error) {
+func LoadActiveStrategies(ctx context.Context, ucClient *UserConfigClient) ([]StrategyConfig, error) {
 	if ucClient == nil {
 		return nil, fmt.Errorf("user-config client is required")
 	}
@@ -43,8 +43,8 @@ func LoadActiveStrategies(ctx context.Context, ucClient *UserConfigClient, execD
 				c.MaxPositions = 50
 			}
 		}
-		// Pull broker auth from trading_execution (Phase 0.6: migrate this too)
-		auth, _ := ResolveBrokerAuth(ctx, execDB, c.UserID)
+		// Pull broker auth via the same user-config gRPC client.
+		auth, _ := ResolveBrokerAuth(ctx, ucClient, c.UserID)
 		if auth != nil {
 			c.BearerToken = auth.BearerToken
 			c.AppID = auth.AppId
