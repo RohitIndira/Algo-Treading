@@ -279,20 +279,40 @@ in the existing rules-engine. This is the work we were starting today.
       commit ALSO uncovered a second anti-pattern in the same function
       (`ResolveBrokerAuth` reads `user_credentials` directly) — deferred
       to Phase 0.6 to keep this commit focused.
+- [x] **Phase 0.6a** — rebalancer's broker auth → user-config gRPC
+      (commit `7d33090`, +94 / -61). The Phase 0.2 deferral closed out:
+      `ResolveBrokerAuth` rewired to call `user-config.GetUserCredentials`
+      (the RPC built in commit `a64265e`). Side-effect cleanup: rebalancer
+      no longer opens the `trading_execution` database connection at all
+      AND no longer holds the AES-GCM encryption key. Verified end-to-end
+      against the real Indira broker — single audit log line per strategy,
+      same broker numbers as the Phase 0.2 run.
 - [ ] Phase 0.3 — `strategies` LoadConfig in hft-engine → gRPC (~120 LOC).
        hft-engine needs a NEW gRPC client. Uses single-strategy `GetStrategy`
        RPC instead of bulk.
 - [ ] Phase 0.4 — Add gRPC server scaffold to data-ingestion + RPC for
                    `GetManthanSignals(date)`
 - [ ] Phase 0.5 — `manthan_signals` read in rules-engine → gRPC
-- [ ] Phase 0.6 — Finish `user_credentials` migration: rebalancer +
-       hft-engine + api-gateway all switch from direct DB read to
-       user-config gRPC (`GetUserCredentials`, already implemented in
-       Phase ‑1 / commit `a64265e`). Closes out the last cross-service
-       direct read.
+- [ ] Phase 0.6b — Finish `user_credentials` migration for the remaining
+       two services: hft-engine + api-gateway switch from direct DB read
+       to user-config gRPC. Same template as 0.6a. Closes out the last
+       cross-service `user_credentials` reads in the codebase.
 
 **Outcome**: rules-engine no longer reads from any foreign DB. We're
 still a 10k-LOC monolith, but the boundaries are clean.
+
+### Scorecard — what Phase 0 has unlocked so far
+
+| Service           | Cross-service direct DB reads remaining       |
+|-------------------|-----------------------------------------------|
+| **rebalancer**    | **0** ✅ (was 2: strategies + user_credentials) |
+| **rules-engine**  | 1 (manthan_signals — Phase 0.5)              |
+| hft-engine        | 2 (strategies + user_credentials — 0.3 / 0.6b) |
+| api-gateway       | 1 (user_credentials — 0.6b)                  |
+| trade-execution   | 0 ✅ (Phase -1, user_credentials via gRPC + DB fallback) |
+
+The rebalancer column already says ✅. That's the proof the pattern works.
+Three more services to finish off.
 
 ### Phase 1 — Add the gRPC server to rules-engine itself
 
