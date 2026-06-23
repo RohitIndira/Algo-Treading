@@ -1,9 +1,9 @@
 // rebalancer is a manual CLI that drives one Manthan rebalance pass.
 //
 // Reads:
-//   - trading_db.strategies (active MANTHAN strategies + trade_configs)
-//   - trading_execution.user_credentials (per-user broker auth)
-//   - market_data.manthan_signals (today's eligible signals)
+//   - user-config gRPC (active MANTHAN strategies + trade_configs) — Phase 0.2
+//   - trading_execution.user_credentials (per-user broker auth; Phase 0.6 migrates to gRPC)
+//   - market_data.manthan_signals (today's eligible signals; Phase 0.5 migrates to gRPC)
 //   - Indira broker (fund-limit + position-book + holdings, real capital)
 //   - Redis manthan:ema:allocations (today's per-index EMA targets)
 //   - trading_db.manthan_positions / manthan_cooldown / manthan_signal_decisions
@@ -89,8 +89,21 @@ func main() {
 		defer kafkaWriter.Close()
 	}
 
+	// --- Dial user-config gRPC ---
+	// Phase 0.2 migrated strategies fetch from direct SQL (cross-bounded-
+	// context anti-pattern) to gRPC. user-config is the single owner of the
+	// strategies table; rebalancer asks via the RPC. CLI semantics: fail
+	// fast if the address is unreachable, no retry.
+	ucAddr := getEnv("USER_CONFIG_GRPC_ADDR", "localhost:50051")
+	ucClient, err := internal.NewUserConfigClient(ctx, ucAddr)
+	if err != nil {
+		logger.Fatal("dial user-config gRPC failed",
+			zap.String("addr", ucAddr), zap.Error(err))
+	}
+	defer ucClient.Close()
+
 	// --- Load active strategies ---
-	strategies, err := internal.LoadActiveStrategies(ctx, tradingDB, execDB)
+	strategies, err := internal.LoadActiveStrategies(ctx, ucClient, execDB)
 	if err != nil {
 		logger.Fatal("load active strategies failed", zap.Error(err))
 	}

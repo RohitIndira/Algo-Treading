@@ -11,40 +11,31 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-// LoadActiveStrategies reads every active MANTHAN strategy from trading_db.
-// Joins strategies + trade_configs (for capital + max_positions + SL params)
-// and pulls the broker auth from trading_execution.user_credentials.
+// LoadActiveStrategies fetches every active MANTHAN strategy from user-config
+// via gRPC (single-owner principle for the strategies table — see
+// docs/architecture/data-ownership.md) and decorates each with its broker
+// auth from trading_execution.user_credentials.
+//
+// Phase 0.2 migrated the strategies fetch from direct SQL to gRPC. The
+// broker-auth lookup (ResolveBrokerAuth) is intentionally still direct DB
+// — it migrates to gRPC in Phase 0.6 (the user_credentials completion),
+// at which point the execDB argument can be dropped entirely.
 //
 // Returns ONLY strategies that have all required pieces: active, has trade
-// config, has user credentials. Anything missing → logged and skipped.
-func LoadActiveStrategies(ctx context.Context, tradingDB, execDB *sql.DB) ([]StrategyConfig, error) {
-	rows, err := tradingDB.QueryContext(ctx, `
-		SELECT s.strategy_id, s.user_id, s.strategy_name, s.trading_mode,
-		       COALESCE(t.total_capital, 0) AS total_capital,
-		       COALESCE(t.max_positions, 25) AS max_positions,
-		       COALESCE(t.stop_loss_pct, 20) AS stop_loss_pct,
-		       COALESCE(t.trailing_sl_pct, 2) AS trailing_sl_pct
-		FROM strategies s
-		LEFT JOIN trade_configs t ON t.strategy_id = s.strategy_id
-		WHERE s.strategy_type = 'MANTHAN'
-		  AND s.deleted_at IS NULL
-		  AND s.active = true
-		ORDER BY s.user_id, s.created_at`)
-	if err != nil {
-		return nil, fmt.Errorf("load strategies: %w", err)
+// config (already filtered server-side), has user credentials. Anything
+// missing → logged and skipped.
+func LoadActiveStrategies(ctx context.Context, ucClient *UserConfigClient, execDB *sql.DB) ([]StrategyConfig, error) {
+	if ucClient == nil {
+		return nil, fmt.Errorf("user-config client is required")
 	}
-	defer rows.Close()
 
-	out := make([]StrategyConfig, 0)
-	for rows.Next() {
-		var c StrategyConfig
-		var maxPos int
-		if err := rows.Scan(&c.StrategyID, &c.UserID, &c.StrategyName,
-			&c.TradingMode, &c.TotalCapital, &maxPos,
-			&c.StopLossPct, &c.TrailingSLPct); err != nil {
-			return nil, err
-		}
-		c.MaxPositions = maxPos
+	strategies, err := ucClient.FetchActiveMANTHANStrategies(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load strategies via user-config gRPC: %w", err)
+	}
+
+	out := make([]StrategyConfig, 0, len(strategies))
+	for _, c := range strategies {
 		// Apply Manthan rule: ≤25L → 25, >25L → 50 (only if config didn't set explicitly)
 		if c.MaxPositions <= 0 {
 			c.MaxPositions = 25
@@ -52,7 +43,7 @@ func LoadActiveStrategies(ctx context.Context, tradingDB, execDB *sql.DB) ([]Str
 				c.MaxPositions = 50
 			}
 		}
-		// Pull broker auth from trading_execution
+		// Pull broker auth from trading_execution (Phase 0.6: migrate this too)
 		auth, _ := ResolveBrokerAuth(ctx, execDB, c.UserID)
 		if auth != nil {
 			c.BearerToken = auth.BearerToken
@@ -61,7 +52,7 @@ func LoadActiveStrategies(ctx context.Context, tradingDB, execDB *sql.DB) ([]Str
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // LoadPortfolioSnapshot builds the per-strategy view used by the allocator.
