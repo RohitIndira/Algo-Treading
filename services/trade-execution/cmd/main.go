@@ -84,9 +84,33 @@ func main() {
 	}
 	log.Println("✓ Connected to PostgreSQL")
 
-	// Initialize repositories
+	// Initialize repositories.
+	//
+	// credsRepo: when USER_CONFIG_GRPC_ADDR is set we route reads through
+	// user-config's gRPC API (single-writer principle, see
+	// docs/architecture/data-ownership.md). The local DB-backed repo stays
+	// alive as a fallback so a brief user-config outage doesn't stall the
+	// 09:14 / 15:35 crons. When the env var is empty we fall back to direct
+	// DB reads, preserving the pre-refactor behaviour.
 	orderRepo := repository.NewOrderRepository(db)
-	credsRepo := repository.NewCredentialsRepository(db, cfg.EncryptionKey)
+	dbCredsRepo := repository.NewCredentialsRepository(db, cfg.EncryptionKey)
+
+	var credsRepo repository.CredentialsRepository = dbCredsRepo
+	if cfg.UserConfigGRPCAddr != "" {
+		grpcCreds, err := repository.NewGRPCCredentialsRepository(
+			cfg.UserConfigGRPCAddr,
+			cfg.UserConfigGRPCTimeout,
+			dbCredsRepo,
+		)
+		if err != nil {
+			log.Fatalf("Failed to initialize gRPC credentials repository: %v", err)
+		}
+		defer grpcCreds.Close()
+		credsRepo = grpcCreds
+		log.Printf("✓ Credentials repo: gRPC → %s (DB fallback ENABLED)", cfg.UserConfigGRPCAddr)
+	} else {
+		log.Println("✓ Credentials repo: DB only (set USER_CONFIG_GRPC_ADDR to enable gRPC)")
+	}
 	log.Println("✓ Repository layer initialized")
 
 	// Initialize Indira client (stateless, supports multiple users)
@@ -781,6 +805,10 @@ type Config struct {
 	RedisPassword string
 	// Observability
 	MetricsPort int
+	// user-config gRPC client. When UserConfigGRPCAddr is empty the
+	// credentials repo falls back to direct DB reads (legacy behaviour).
+	UserConfigGRPCAddr    string
+	UserConfigGRPCTimeout time.Duration
 }
 
 func loadConfig() Config {
@@ -812,6 +840,11 @@ func loadConfig() Config {
 		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
 		RedisPassword:    getEnv("REDIS_PASSWORD", ""),
 		MetricsPort:      getEnvInt("METRICS_PORT", 9090),
+		// USER_CONFIG_GRPC_ADDR — when set (e.g. "user-config:9003"), the
+		// credentials repo routes reads through user-config gRPC. When empty,
+		// reads come straight from the local DB (legacy path).
+		UserConfigGRPCAddr:    getEnv("USER_CONFIG_GRPC_ADDR", ""),
+		UserConfigGRPCTimeout: time.Duration(getEnvInt("USER_CONFIG_GRPC_TIMEOUT_MS", 3000)) * time.Millisecond,
 	}
 }
 

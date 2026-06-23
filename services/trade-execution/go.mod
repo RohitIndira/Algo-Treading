@@ -37,6 +37,7 @@ require (
 require (
 	github.com/RohitIndira/Algo-Treading/api/proto/common v0.0.0
 	github.com/RohitIndira/Algo-Treading/api/proto/trade_execution v0.0.0
+	github.com/RohitIndira/Algo-Treading/api/proto/user_config v0.0.0
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
@@ -51,6 +52,8 @@ require (
 replace github.com/RohitIndira/Algo-Treading/api/proto/common => ../../api/proto/common
 
 replace github.com/RohitIndira/Algo-Treading/api/proto/trade_execution => ../../api/proto/trade_execution
+
+replace github.com/RohitIndira/Algo-Treading/api/proto/user_config => ../../api/proto/user_config
 
 replace github.com/RohitIndira/Algo-Treading/pkg/indira => ../../pkg/indira
 
