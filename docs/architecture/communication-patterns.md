@@ -348,9 +348,71 @@ If your code looks like "I did X, others might care", that's Kafka.
 The producer doesn't know who consumes; consumers don't block the producer.
 
 ### Rule 4: Direct DB only for owned data + api-gateway list views
-You can read tables you OWN (single-writer principle).
-api-gateway gets an exception for list views via a read-only Postgres role.
-Everyone else: use gRPC.
+
+The matrix below is canonical. Memorise it before adding any read path.
+
+```
+                       OWNED DATA              CROSS-SERVICE DATA
+                       ──────────              ──────────────────
+api-gateway            (owns nothing)          Direct DB ✅
+(translation layer)                            (with SELECT-only role +
+                                                read replica when scaled)
+
+Backend services       Direct DB ✅            Default: gRPC ✅
+(rebalancer,           (your own tables)       Exceptions: see below
+ trade-execution,
+ rules-engine, …)
+
+Owner service          Direct DB ✅            Don't — you're crossing
+                       (its own tables)        a bounded context wrongly
+```
+
+**Why api-gateway gets the exception** (it's not laziness):
+
+- api-gateway has NO business logic of its own
+- Its job is to translate HTTPS/JSON ↔ gRPC ↔ DB rows
+- Forcing api-gateway → gRPC → owner-service → DB adds 30-50 ms per request for ZERO business value (no decryption, no derived values, no audit gain beyond what nginx already logs)
+- api-gateway is constrained by a SELECT-only Postgres role per Rule 5 — Postgres enforces the boundary even though the read is direct
+
+**Backend services use gRPC by default** when reading data they don't own. Direct DB is allowed only when **ALL FOUR** of these hold:
+
+```
+✅ Read is purely raw (no decryption, no derived computation)
+✅ Owner agrees in writing (data-ownership.md grants the read access)
+✅ Reader has SELECT-only Postgres role (enforced, not aspirational)
+✅ Latency truly matters (millisecond hot path) AND a read replica exists
+```
+
+In practice, almost no backend-to-backend read meets all four. **So gRPC wins by default.**
+
+**When gRPC is MANDATORY for a backend service read** (no direct DB allowed even with the four conditions above):
+
+```
+❌ Decryption required             → gRPC (only owner has key)
+❌ Computed/derived value          → gRPC (owner computes consistently)
+❌ Audit log required              → gRPC (owner logs every access)
+❌ Server-side filter/transform     → gRPC (owner enforces business rules)
+```
+
+**Concrete examples from this codebase:**
+
+| Reader → Owner table                  | Pattern   | Reason                            |
+|---------------------------------------|-----------|-----------------------------------|
+| api-gateway → manthan_orders          | Direct DB | api-gateway exception, raw list   |
+| api-gateway → user_credentials        | gRPC      | Decryption required (overrides)   |
+| rebalancer → strategies               | gRPC      | Business logic (filter MANTHAN)   |
+| rebalancer → user_credentials         | gRPC      | Decryption + audit                |
+| trade-execution → user_credentials    | gRPC      | Decryption + audit + dual-write   |
+| rules-engine → strategies (orphan ck) | gRPC      | NOT_FOUND semantic from owner     |
+| rules-engine → its own manthan_*      | Direct DB | Owns the tables                   |
+
+**Common mistake to avoid** (your author has fallen into this):
+Motivating a new gRPC RPC by saying *"api-gateway currently reads X directly from the DB."* That's NOT a motivation — Rule 4 says api-gateway can read direct. A new gRPC RPC is motivated by ONE of:
+1. A backend service (not api-gateway) needs the data
+2. Decryption / derived value / audit / filter required
+3. Future bounded-context extraction needs the surface to exist
+
+If none of those three apply, you're building infra without a customer. Don't.
 
 ### Rule 5: Never share DB credentials between services
 Each service gets its OWN Postgres role with minimal grants. Postgres enforces

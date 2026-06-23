@@ -9,9 +9,25 @@
 
 1. **One writer per table.** Exactly one service is listed as Owner.
 2. **Other services read via the owner's gRPC API** when business logic is required (decryption, computed values, audit logging).
-3. **Direct DB read is allowed** only for owned data + api-gateway public list views with a SELECT-only Postgres role.
+3. **Direct DB read is allowed** only for owned data + api-gateway public list views with a SELECT-only Postgres role. **Backend services default to gRPC** when reading cross-service data — see Rule 4 of [communication-patterns.md](communication-patterns.md) for the full decision matrix.
 4. **Every new table requires an entry here** in the SAME PR that creates the migration. CI enforces this.
 5. **Postgres roles enforce the boundary.** Code bugs cannot write to tables they shouldn't, because Postgres denies the GRANT.
+
+### Quick decision tree for "where should this read live?"
+
+```
+Is the read from api-gateway?
+├── YES → Direct DB ✅ (api-gateway is the translation layer)
+└── NO  → Is decryption / computed value / audit / filter needed?
+         ├── YES → gRPC (mandatory)
+         └── NO  → Does the read meet all four:
+                   (1) raw, (2) owner agrees, (3) SELECT-only role,
+                   (4) hot path with read replica?
+                   ├── YES → Direct DB acceptable (rare)
+                   └── NO  → gRPC (default)
+```
+
+The most common honest answer for backend services is **gRPC**. If you're tempted to justify a direct cross-service read, double-check against [communication-patterns.md#rule-4](communication-patterns.md) before merging.
 
 ---
 
