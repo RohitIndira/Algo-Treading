@@ -11,6 +11,23 @@ import (
 	"go.uber.org/zap"
 )
 
+// StrategyAliveChecker is the subset of user-config gRPC we need for
+// orphan detection. Kept as a tiny interface so:
+//   - manthan package doesn't import the startup package (avoids cycles)
+//   - tests can pass a fake without standing up a gRPC server
+//
+// The real implementation lives at
+// services/rules-engine/internal/startup/userconfig_client.go and is
+// satisfied by *startup.UserConfigClient.
+//
+// Contract — see UserConfigClient.IsStrategyAlive godoc:
+//   - (true,  nil)        strategy is alive  → keep position
+//   - (false, nil)        explicit NOT_FOUND → orphan, EXIT
+//   - (false, non-nil)    uncertain          → caller MUST skip
+type StrategyAliveChecker interface {
+	IsStrategyAlive(ctx context.Context, userID, strategyID string) (bool, error)
+}
+
 // RehydrateActivePositions restores in-memory portfolio state from the
 // authoritative source (Postgres `manthan_positions` WHERE status='ACTIVE')
 // after a rules-engine restart.
@@ -31,10 +48,16 @@ import (
 // orphan. Pass a closure bound to the rules-engine ConfigStore.
 //
 // Returns (restored, orphansCleaned, redisStaleEvicted, err).
+//
+// aliveChecker is consulted to confirm soft-deletion before EXITing a
+// position whose strategy is missing from the configstore. Pass a non-nil
+// *startup.UserConfigClient. If nil, the orphan path is disabled (rehydrate
+// still works for the "strategy is loaded" path).
 func (pm *PortfolioManager) RehydrateActivePositions(
 	ctx context.Context,
 	db *sql.DB,
 	rdb *redis.Client,
+	aliveChecker StrategyAliveChecker,
 	strategyByID func(string) *UserStrategy,
 ) (int, int, int, error) {
 	if db == nil {
@@ -93,18 +116,25 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 			//      because the configstore showed the strategy as
 			//      not-Active for ~500ms during the replay window.
 			//
-			// Resolution: consult `strategies.deleted_at` directly. The DB
-			// is the source of truth for "is this strategy alive?". Only
-			// orphan-cleanup when the DB confirms soft-deletion.
-			isDeleted, dbErr := isStrategySoftDeleted(ctx, db, strategyID)
-			if dbErr != nil {
-				pm.logger.Warn("Rehydrate: strategies DB lookup failed — skipping (no orphan cleanup, no restore)",
-					zap.String("strategy_id", strategyID),
-					zap.String("symbol", symbol),
-					zap.Error(dbErr))
+			// Resolution: ask user-config via gRPC — it's the single owner
+			// of the strategies table (see docs/architecture/data-ownership.md).
+			// Same defensive posture as the legacy SQL check: an uncertain
+			// answer (network failure, unknown error) skips silently — we
+			// NEVER EXIT a real position on a flaky lookup.
+			if aliveChecker == nil {
+				pm.logger.Warn("Rehydrate: no strategy alive-checker wired — skipping orphan path",
+					zap.String("strategy_id", strategyID), zap.String("symbol", symbol))
 				continue
 			}
-			if !isDeleted {
+			alive, rpcErr := aliveChecker.IsStrategyAlive(ctx, userID, strategyID)
+			if rpcErr != nil {
+				pm.logger.Warn("Rehydrate: strategies gRPC lookup failed — skipping (no orphan cleanup, no restore)",
+					zap.String("strategy_id", strategyID),
+					zap.String("symbol", symbol),
+					zap.Error(rpcErr))
+				continue
+			}
+			if alive {
 				// Strategy is alive in DB; configstore just hasn't caught up.
 				// Don't restore in-memory (the config consumer will populate
 				// the configstore shortly), don't touch DB. The orphan
@@ -244,28 +274,31 @@ func (pm *PortfolioManager) CleanupOrphans(
 	ctx context.Context,
 	db *sql.DB,
 	rdb *redis.Client,
+	aliveChecker StrategyAliveChecker,
 	strategyByID func(string) *UserStrategy,
 ) (int, error) {
 	if db == nil {
 		return 0, nil
 	}
 
+	// user_id is required by the gRPC alive-checker (user-scoped authz).
+	// Pulled here so we have it without a second per-row lookup.
 	rows, err := db.QueryContext(ctx, `
-		SELECT strategy_id, symbol
+		SELECT strategy_id, user_id, symbol
 		FROM manthan_positions
 		WHERE status = 'ACTIVE'`)
 	if err != nil {
 		return 0, fmt.Errorf("query active positions: %w", err)
 	}
-	type rowKey struct{ strategyID, symbol string }
+	type rowKey struct{ strategyID, userID, symbol string }
 	var actives []rowKey
 	for rows.Next() {
-		var sid, sym string
-		if err := rows.Scan(&sid, &sym); err != nil {
+		var sid, uid, sym string
+		if err := rows.Scan(&sid, &uid, &sym); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		actives = append(actives, rowKey{sid, sym})
+		actives = append(actives, rowKey{sid, uid, sym})
 	}
 	rows.Close()
 
@@ -275,17 +308,21 @@ func (pm *PortfolioManager) CleanupOrphans(
 			continue // strategy still loaded — not an orphan
 		}
 		// Configstore-miss alone isn't enough to destroy a position. Confirm
-		// against DB truth (`strategies.deleted_at`) before EXITing. Same
-		// reasoning as the boot-time rehydrate — see isStrategySoftDeleted
-		// doc for the contract.
-		isDeleted, dbErr := isStrategySoftDeleted(ctx, db, rk.strategyID)
-		if dbErr != nil {
-			pm.logger.Warn("Orphan scanner: DB lookup failed — skipping",
-				zap.String("strategy_id", rk.strategyID),
-				zap.String("symbol", rk.symbol), zap.Error(dbErr))
+		// with user-config via gRPC before EXITing. Same defensive posture
+		// as the boot-time rehydrate — uncertain answer skips silently.
+		if aliveChecker == nil {
+			pm.logger.Warn("Orphan scanner: no alive-checker wired — skipping",
+				zap.String("strategy_id", rk.strategyID), zap.String("symbol", rk.symbol))
 			continue
 		}
-		if !isDeleted {
+		alive, rpcErr := aliveChecker.IsStrategyAlive(ctx, rk.userID, rk.strategyID)
+		if rpcErr != nil {
+			pm.logger.Warn("Orphan scanner: gRPC lookup failed — skipping",
+				zap.String("strategy_id", rk.strategyID),
+				zap.String("symbol", rk.symbol), zap.Error(rpcErr))
+			continue
+		}
+		if alive {
 			// Configstore lag (e.g. operator-initiated pause that the
 			// scanner observed in a transient window). Skip silently.
 			continue
@@ -322,36 +359,10 @@ func (pm *PortfolioManager) CleanupOrphans(
 	return cleaned, nil
 }
 
-// isStrategySoftDeleted is the DB-truth check used by both the boot-time
-// rehydrate and the periodic orphan scanner before they EXIT a position
-// for "orphan" reasons. We can't rely on the configstore here — that view
-// is racy at startup (config consumer replay) and transient on pause.
-//
-// Contract:
-//   - row exists with deleted_at IS NULL  → returns (false, nil)  ← alive
-//   - row exists with deleted_at IS NOT NULL → returns (true,  nil)  ← genuine orphan
-//   - row missing entirely                → returns (true,  nil)  ← also orphan
-//   - query failed                        → returns (false, err)   ← caller skips, safer than wrong cleanup
-//
-// The "missing → orphan" case covers hard-delete (rare; the standard path
-// is soft-delete). Either way the position has no owner.
-func isStrategySoftDeleted(ctx context.Context, db *sql.DB, strategyID string) (bool, error) {
-	if db == nil {
-		return false, fmt.Errorf("nil DB handle")
-	}
-	var deletedAt sql.NullTime
-	err := db.QueryRowContext(ctx,
-		`SELECT deleted_at FROM strategies WHERE strategy_id = $1`,
-		strategyID).Scan(&deletedAt)
-	if err == sql.ErrNoRows {
-		// Strategy row gone — treat as orphan (very rare; soft-delete is the norm).
-		return true, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("strategies lookup: %w", err)
-	}
-	return deletedAt.Valid, nil
-}
+// isStrategySoftDeleted was removed 2026-06-23 — the orphan scanner now
+// asks user-config via gRPC (see StrategyAliveChecker at the top of this
+// file). user-config is the single owner of the strategies table per
+// docs/architecture/data-ownership.md.
 
 // StartOrphanScanner runs CleanupOrphans on a ticker. Blocks until ctx
 // cancelled. Intended to be launched once from main() in a goroutine.
@@ -359,6 +370,7 @@ func (pm *PortfolioManager) StartOrphanScanner(
 	ctx context.Context,
 	db *sql.DB,
 	rdb *redis.Client,
+	aliveChecker StrategyAliveChecker,
 	strategyByID func(string) *UserStrategy,
 	interval time.Duration,
 ) {
@@ -375,7 +387,7 @@ func (pm *PortfolioManager) StartOrphanScanner(
 			pm.logger.Info("Orphan scanner stopped")
 			return
 		case <-ticker.C:
-			if cleaned, err := pm.CleanupOrphans(ctx, db, rdb, strategyByID); err != nil {
+			if cleaned, err := pm.CleanupOrphans(ctx, db, rdb, aliveChecker, strategyByID); err != nil {
 				pm.logger.Warn("Orphan scanner: cleanup pass failed", zap.Error(err))
 			} else if cleaned > 0 {
 				pm.logger.Info("Orphan scanner pass", zap.Int("cleaned", cleaned))

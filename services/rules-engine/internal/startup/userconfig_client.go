@@ -281,3 +281,56 @@ func (c *UserConfigClient) Close() error {
 	}
 	return c.conn.Close()
 }
+
+// IsStrategyAlive returns true when user-config still has this strategy
+// (not soft-deleted, not hard-deleted, not unauthorized for the user).
+//
+// This is the gRPC replacement for the legacy
+//
+//	SELECT deleted_at FROM strategies WHERE strategy_id = $1
+//
+// the orphan scanner used to run directly against user-config's table.
+// Single-owner principle: only user-config touches the strategies table;
+// everyone else asks user-config — see docs/architecture/data-ownership.md.
+//
+// userID + strategyID are both required because GetStrategy enforces
+// user-scoped authorization. The orphan scanner has both at every call
+// site (they live on the same manthan_positions row).
+//
+// Return contract — designed so an ambiguous answer NEVER causes the
+// scanner to EXIT a real position:
+//
+//   - (true,  nil)        strategy is alive at user-config — keep position
+//   - (false, nil)        explicit NOT_FOUND from user-config — orphan,
+//     safe to EXIT the position
+//   - (false, non-nil)    network / transport / unknown failure — caller
+//     MUST skip (never EXIT on uncertainty)
+func (c *UserConfigClient) IsStrategyAlive(ctx context.Context, userID, strategyID string) (bool, error) {
+	if strategyID == "" {
+		return false, fmt.Errorf("strategyID is required")
+	}
+	if userID == "" {
+		return false, fmt.Errorf("userID is required")
+	}
+
+	resp, err := c.client.GetStrategy(ctx, &proto.GetStrategyRequest{
+		StrategyId: strategyID,
+		UserId:     userID,
+	})
+	if err != nil {
+		// Transport-level failure — uncertain, propagate.
+		return false, fmt.Errorf("GetStrategy RPC: %w", err)
+	}
+	if resp.Success {
+		return true, nil
+	}
+	// Structured failure. Only NOT_FOUND maps cleanly to "gone"; any other
+	// code (INVALID_STRATEGY_ID, INTERNAL, ...) is uncertain.
+	if resp.Error != nil && resp.Error.Code == "NOT_FOUND" {
+		return false, nil
+	}
+	if resp.Error != nil {
+		return false, fmt.Errorf("GetStrategy unsuccessful: %s %s", resp.Error.Code, resp.Error.Message)
+	}
+	return false, fmt.Errorf("GetStrategy unsuccessful with no error detail")
+}

@@ -427,8 +427,12 @@ func main() {
 		}
 		return nil
 	}
+	// ucClient (user-config gRPC) doubles as the StrategyAliveChecker —
+	// it implements IsStrategyAlive(ctx, userID, strategyID). Replaces the
+	// legacy direct read of strategies.deleted_at; user-config is now the
+	// single owner of that table (see docs/architecture/data-ownership.md).
 	if restored, orphans, stale, err := manthanPortfolioMgr.RehydrateActivePositions(
-		ctx, manthanDB, redisCache.Client(), strategyResolver,
+		ctx, manthanDB, redisCache.Client(), ucClient, strategyResolver,
 	); err != nil {
 		logger.Warn("Manthan rehydration failed", zap.Error(err))
 	} else {
@@ -443,7 +447,7 @@ func main() {
 	// cancel broker SL — data-integrity only. Complements the startup-time
 	// rehydrate cleanup by running continuously (every 60s).
 	go manthanPortfolioMgr.StartOrphanScanner(ctx, manthanDB, redisCache.Client(),
-		strategyResolver, 60*time.Second)
+		ucClient, strategyResolver, 60*time.Second)
 
 	// Wire MANTHAN catch-up callback
 	configConsumer.SetOnManthanCreated(func(ctx context.Context, strategy *models.Strategy) {
