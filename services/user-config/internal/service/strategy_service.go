@@ -221,6 +221,39 @@ func (s *StrategyService) UpdateUserCredentials(ctx context.Context, req UpdateU
 	return nil
 }
 
+// UserCredentials is the decrypted credential bundle returned by GetUserCredentials.
+// Mirrors the repository's IndiraCredentials struct but lives in the service layer
+// so callers (gRPC handler) don't import the repository package directly.
+type UserCredentials struct {
+	IndiraUserID string
+	AppID        string
+	Source       string
+	BearerToken  string // decrypted
+}
+
+// GetUserCredentials reads the broker credentials for userID, decrypts the
+// bearer token, and returns the bundle. Returns repository.ErrCredentialsNotFound
+// when no row exists for the user (gRPC handler maps that to NOT_FOUND).
+//
+// This is the READ side of the auth-domain ownership boundary: every other
+// service must call user-config via gRPC instead of reading the table directly.
+// See docs/architecture/data-ownership.md.
+func (s *StrategyService) GetUserCredentials(ctx context.Context, userID string) (*UserCredentials, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("user_id is required")
+	}
+	creds, err := s.credsRepo.GetIndiraCredentials(ctx, userID)
+	if err != nil {
+		return nil, err // includes ErrCredentialsNotFound
+	}
+	return &UserCredentials{
+		IndiraUserID: creds.IndiraUserID,
+		AppID:        creds.AppID,
+		Source:       creds.Source,
+		BearerToken:  creds.BearerToken,
+	}, nil
+}
+
 // Helper function to safely get float pointer value
 func valueOrZero(ptr *float64) float64 {
 	if ptr == nil {

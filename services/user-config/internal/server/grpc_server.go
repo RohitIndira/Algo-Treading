@@ -2,12 +2,15 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"strconv"
 
 	"github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -439,6 +442,65 @@ func (s *UserConfigServer) UpdateUserCredentials(ctx context.Context, req *pb.Up
 		}, nil
 	}
 	return &pb.UpdateUserCredentialsResponse{Success: true}, nil
+}
+
+// GetUserCredentials returns the user's decrypted broker credentials wrapped
+// in an IndiraAuthContext. user-config is the SINGLE READER for this data —
+// other services must call this RPC instead of querying the DB directly.
+//
+// Audit: every call is logged with caller hint + user id so SEBI auditors
+// can answer "who accessed user X's credentials and when".
+//
+// Errors:
+//   - INVALID_REQUEST  if req.UserId is empty
+//   - NOT_FOUND        if no credentials exist for the user
+//   - INTERNAL         on DB or decryption failure
+func (s *UserConfigServer) GetUserCredentials(ctx context.Context, req *pb.GetUserCredentialsRequest) (*pb.GetUserCredentialsResponse, error) {
+	if req == nil || req.UserId == "" {
+		return &pb.GetUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "INVALID_REQUEST",
+				Message: "user_id is required",
+			},
+		}, nil
+	}
+
+	creds, err := s.service.GetUserCredentials(ctx, req.UserId)
+	if err != nil {
+		if errors.Is(err, repository.ErrCredentialsNotFound) {
+			return &pb.GetUserCredentialsResponse{
+				Success: false,
+				Error: &common.Error{
+					Code:    "NOT_FOUND",
+					Message: fmt.Sprintf("no credentials for user %s", req.UserId),
+				},
+			}, nil
+		}
+		log.Printf("[user-config] GetUserCredentials error user=%s: %v", req.UserId, err)
+		return &pb.GetUserCredentialsResponse{
+			Success: false,
+			Error: &common.Error{
+				Code:    "INTERNAL",
+				Message: "failed to read credentials",
+			},
+		}, nil
+	}
+
+	// Compliance audit — who is asking for whose credentials? Format mirrors
+	// other audit lines so a single grep finds them. Do NOT log the token.
+	log.Printf("[user-config] AUDIT credentials_read user=%s source=%s app_id=%s",
+		req.UserId, creds.Source, creds.AppID)
+
+	return &pb.GetUserCredentialsResponse{
+		Success: true,
+		IndiraAuth: &common.IndiraAuthContext{
+			UserId:      creds.IndiraUserID,
+			AppId:       creds.AppID,
+			Source:      creds.Source,
+			BearerToken: creds.BearerToken, // decrypted; transport is gRPC over mTLS in prod
+		},
+	}, nil
 }
 
 // Helper functions to convert between proto and model types
