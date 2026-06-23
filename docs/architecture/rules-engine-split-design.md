@@ -1,6 +1,6 @@
 # rules-engine: split + bounded-context design
 
-> Status: **Proposal — not yet executed**
+> Status: **Phase 0 in progress** — see "Part 4: Migration path" for current state.
 > Author: dev team
 > Last updated: 2026-06-23
 > Related: [communication-patterns.md](communication-patterns.md), [data-ownership.md](data-ownership.md)
@@ -268,12 +268,28 @@ STRATEGY_DEACTIVATED    producer: user-config
 Goal: no behaviour change. Just clean up the cross-service direct reads
 in the existing rules-engine. This is the work we were starting today.
 
-- [ ] Phase 0.1 — `strategies` orphan check → gRPC (~80 LOC)
-- [ ] Phase 0.2 — `strategies` snapshot read in rebalancer → gRPC (~150 LOC)
-- [ ] Phase 0.3 — `strategies` LoadConfig in hft-engine → gRPC (~120 LOC)
+- [x] **Phase 0.1** — `strategies` orphan check → gRPC
+      (commit `4cdcc75`, +123 / -54). Added `IsStrategyAlive` RPC wrapper on
+      rules-engine's existing UserConfigClient; deleted legacy
+      `isStrategySoftDeleted` SQL. Defensive posture unchanged.
+- [x] **Phase 0.2** — `strategies` snapshot read in rebalancer → gRPC
+      (commit `fc88bee`, +205 / -35). NEW gRPC client in rebalancer
+      (`internal/userconfig_client.go`), `LoadActiveStrategies` now calls
+      `GetAllActiveStrategies` via paginated bulk fetch. NOTE: this
+      commit ALSO uncovered a second anti-pattern in the same function
+      (`ResolveBrokerAuth` reads `user_credentials` directly) — deferred
+      to Phase 0.6 to keep this commit focused.
+- [ ] Phase 0.3 — `strategies` LoadConfig in hft-engine → gRPC (~120 LOC).
+       hft-engine needs a NEW gRPC client. Uses single-strategy `GetStrategy`
+       RPC instead of bulk.
 - [ ] Phase 0.4 — Add gRPC server scaffold to data-ingestion + RPC for
                    `GetManthanSignals(date)`
 - [ ] Phase 0.5 — `manthan_signals` read in rules-engine → gRPC
+- [ ] Phase 0.6 — Finish `user_credentials` migration: rebalancer +
+       hft-engine + api-gateway all switch from direct DB read to
+       user-config gRPC (`GetUserCredentials`, already implemented in
+       Phase ‑1 / commit `a64265e`). Closes out the last cross-service
+       direct read.
 
 **Outcome**: rules-engine no longer reads from any foreign DB. We're
 still a 10k-LOC monolith, but the boundaries are clean.
