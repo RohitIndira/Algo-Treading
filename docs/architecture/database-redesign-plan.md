@@ -2,7 +2,41 @@
 
 > Status: **Proposal — not yet executed**
 > Author: dev team
-> Last updated: 2026-06-16
+> Last updated: 2026-06-24
+
+## Pre-Phase-2 audit findings (2026-06-24) — what's settled since the plan was drafted
+
+Between the original 2026-06-16 draft and the current state, three Phase 0
+gRPC migrations shipped (rules-engine + rebalancer + trade-execution
+credential / strategies refactors) and a pre-Phase-2 audit was completed.
+Resulting REQUIREMENTS for the role-grant design in Phase 5 below:
+
+  1. **`manthan_signal_decisions` has a documented co-INSERT pattern.**
+     rebalancer INSERTs PROPOSED rows, rules-engine UPDATEs them through
+     the lifecycle. The Postgres role for rebalancer must grant
+     **INSERT-only** on this specific table (no UPDATE / DELETE), to
+     enforce the lifecycle boundary at the DB layer even when code review
+     misses it. Detail in
+     [data-ownership.md § Co-INSERT pattern](data-ownership.md).
+
+  2. **hft-engine is FROZEN.** Its current direct reads of
+     `user_credentials` and `strategies` stay. The Postgres role for
+     hft-engine is created with **its current grants** (cross-DB SELECT
+     on those tables), not the target-state minimal grants. Tightening
+     happens after hft-engine is unfrozen (post-current-sweep).
+
+  3. **api-gateway exception is permanent.** api-gateway is the
+     translation layer; it gets a **SELECT-only** role across
+     `stockk_trading` (read replica preferred at scale). Direct DB
+     reads from api-gateway are NOT migration debt — they are policy.
+
+  4. **Backend → backend raw reads are policy-acceptable.** rebalancer
+     reading rules-engine's manthan_positions / _cooldown /
+     _portfolio_state / _signal_decisions remains direct DB with a
+     SELECT-only role on those tables. Same for rules-engine reading
+     data-ingestion's manthan_signals.
+
+These four findings are baked into Phase 5 (role grants) below.
 
 ## Why we're doing this
 
@@ -16,17 +50,21 @@ market              ← 1 table (tick_data), used by data-ingestion
 ```
 
 Specific problems we've hit or will hit:
+
 - `user_credentials` is touched by **4 services** (hft-engine, rebalancer,
   trade-execution, user-config). Each has its own struct, its own encryption
   key handling, its own schema assumptions. A schema change breaks the others
   silently.
+
 - `manthan_signals` is in `market_data` but `manthan_orders` is in
   `trading_execution`. You can't write a Postgres transaction across them.
   When a signal generates an order, you have to handle partial failures in
   application code.
+
 - `execution_outbox` lives in `trading_db` (owned by user-config) but the
   events being published are about `trade-execution`'s order flow. Wrong
   owner.
+  
 - Three different `health_probes` tables — one per DB. Symptom of "I can't
   see the other DB so I'll just make my own."
 
@@ -207,6 +245,144 @@ ALTER DATABASE market RENAME TO market_decom;
 -- ...
 ```
 
+### Phase 5 — Per-service Postgres roles with minimal grants (the boundary enforcement)
+
+Without this phase, the bounded contexts are only conceptual. Phase 5 is
+what makes the boundary REAL — Postgres physically denies a service the
+permission to touch data outside its lane, even if a future code bug
+tries to.
+
+Each service gets its own role with explicit GRANTs (no superuser). The
+grants are derived directly from the pre-Phase-2 audit findings.
+
+```sql
+-- ─────────────────────────────────────────────────────────────────
+-- Phase 5 role grants (executed after Phase 3 cutover is stable)
+-- ─────────────────────────────────────────────────────────────────
+
+-- user-config: owns stockk_auth completely
+CREATE ROLE user_config_svc LOGIN PASSWORD '__from_vault__';
+ALTER ROLE user_config_svc CONNECTION LIMIT 25 SET statement_timeout = '10s';
+GRANT CONNECT, TEMPORARY ON DATABASE stockk_auth TO user_config_svc;
+GRANT USAGE ON SCHEMA public TO user_config_svc;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO user_config_svc;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO user_config_svc;
+-- no grant on stockk_trading / stockk_market
+
+-- trade-execution: owns its orders + position events in stockk_trading
+CREATE ROLE trade_execution_svc LOGIN PASSWORD '__from_vault__';
+ALTER ROLE trade_execution_svc CONNECTION LIMIT 30 SET statement_timeout = '10s';
+GRANT CONNECT ON DATABASE stockk_trading TO trade_execution_svc;
+GRANT USAGE ON SCHEMA public TO trade_execution_svc;
+GRANT SELECT, INSERT, UPDATE ON
+    orders, manthan_orders, manthan_order_events, manthan_arm_retries,
+    signal_inbox, execution_events, execution_outbox
+TO trade_execution_svc;
+GRANT SELECT ON strategies, trade_configs, risk_limits, trade_signals
+TO trade_execution_svc;
+-- DOES NOT grant write on rules-engine's tables
+
+-- rules-engine: owns Manthan portfolio state machine
+CREATE ROLE rules_engine_svc LOGIN PASSWORD '__from_vault__';
+ALTER ROLE rules_engine_svc CONNECTION LIMIT 30 SET statement_timeout = '15s';
+GRANT CONNECT ON DATABASE stockk_trading TO rules_engine_svc;
+GRANT USAGE ON SCHEMA public TO rules_engine_svc;
+GRANT SELECT, INSERT, UPDATE ON
+    manthan_positions, manthan_position_events, manthan_portfolio_state,
+    manthan_signal_decisions, manthan_cooldown, trade_signals,
+    strategies, strategy_conditions, trade_configs, risk_limits
+TO rules_engine_svc;
+GRANT CONNECT ON DATABASE stockk_market TO rules_engine_svc;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO rules_engine_svc;  -- read-only on market
+
+-- rebalancer: stricter — INSERT-only on the co-write table
+CREATE ROLE rebalancer_svc LOGIN PASSWORD '__from_vault__';
+ALTER ROLE rebalancer_svc CONNECTION LIMIT 5 SET statement_timeout = '30s';  -- CLI, slower OK
+GRANT CONNECT ON DATABASE stockk_trading TO rebalancer_svc;
+GRANT USAGE ON SCHEMA public TO rebalancer_svc;
+-- Read-only on rules-engine's lifecycle tables (audit finding 4):
+GRANT SELECT ON
+    manthan_positions, manthan_cooldown, manthan_portfolio_state
+TO rebalancer_svc;
+-- INSERT-ONLY on the co-write table (audit finding 1) — lifecycle stays
+-- with rules-engine, but rebalancer is allowed to propose:
+GRANT SELECT, INSERT ON manthan_signal_decisions TO rebalancer_svc;
+-- (Note: NO UPDATE / DELETE grant — if rebalancer ever tries to flip
+-- a row's status, Postgres rejects the query. The lifecycle boundary
+-- is enforced at the DB layer.)
+GRANT CONNECT ON DATABASE stockk_market TO rebalancer_svc;
+GRANT SELECT ON manthan_signals TO rebalancer_svc;
+
+-- api-gateway: SELECT-only across stockk_trading (audit finding 3)
+CREATE ROLE api_gateway_reader LOGIN PASSWORD '__from_vault__';
+ALTER ROLE api_gateway_reader CONNECTION LIMIT 50 SET statement_timeout = '5s';
+GRANT CONNECT ON DATABASE stockk_trading TO api_gateway_reader;
+GRANT USAGE ON SCHEMA public TO api_gateway_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO api_gateway_reader;
+REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public FROM api_gateway_reader;
+-- Auto-grant SELECT on future tables:
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON TABLES TO api_gateway_reader;
+-- (api-gateway does NOT need write — it goes through user-config gRPC
+-- for the SSO write path.)
+
+-- data-ingestion: owns stockk_market
+CREATE ROLE data_ingestion_svc LOGIN PASSWORD '__from_vault__';
+ALTER ROLE data_ingestion_svc CONNECTION LIMIT 20 SET statement_timeout = '10s';
+GRANT CONNECT ON DATABASE stockk_market TO data_ingestion_svc;
+GRANT USAGE ON SCHEMA public TO data_ingestion_svc;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO data_ingestion_svc;
+
+-- hft-engine: FROZEN per 2026-06-24 audit (finding 2). Grants kept
+-- DELIBERATELY broader than target state — includes cross-DB reads of
+-- user_credentials + strategies that are pending migration. Tightening
+-- happens AFTER hft-engine is unfrozen.
+CREATE ROLE hft_engine_svc LOGIN PASSWORD '__from_vault__';
+ALTER ROLE hft_engine_svc CONNECTION LIMIT 30 SET statement_timeout = '5s';
+GRANT CONNECT ON DATABASE stockk_trading TO hft_engine_svc;
+GRANT USAGE ON SCHEMA public TO hft_engine_svc;
+GRANT SELECT, INSERT, UPDATE ON hft_audit_orders, hft_runtime_state
+    TO hft_engine_svc;
+-- Frozen reads (to be tightened post-unfreeze):
+GRANT SELECT ON strategies, trade_configs TO hft_engine_svc;
+GRANT CONNECT ON DATABASE stockk_auth TO hft_engine_svc;
+GRANT SELECT ON user_credentials TO hft_engine_svc;
+-- TODO(unfreeze hft-engine): REVOKE the stockk_auth grants and the
+-- direct strategies grant; replace with user-config gRPC client.
+
+-- risk-management: SELECT-only on what it audits
+CREATE ROLE risk_management_svc LOGIN PASSWORD '__from_vault__';
+ALTER ROLE risk_management_svc CONNECTION LIMIT 10 SET statement_timeout = '5s';
+GRANT CONNECT ON DATABASE stockk_trading TO risk_management_svc;
+GRANT USAGE ON SCHEMA public TO risk_management_svc;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO risk_management_svc;
+-- (risk-management is read-only by design; writes go through gRPC to
+-- whichever service owns the action.)
+```
+
+**Why this matters more than the table-move work itself**: the bounded
+contexts in Phase 1 + Phase 3 are conceptual until Phase 5 makes
+Postgres physically deny boundary violations. Phase 5 turns code
+review into an absolute guarantee.
+
+**Test before declaring Phase 5 done** — for each service role, verify
+the role CANNOT do what it shouldn't:
+
+```sql
+-- e.g. rebalancer must NOT be able to UPDATE manthan_signal_decisions:
+SET ROLE rebalancer_svc;
+UPDATE manthan_signal_decisions SET status='DISPATCHED' WHERE 1=0;
+-- Expected: ERROR: permission denied for table manthan_signal_decisions
+
+-- api-gateway must NOT be able to INSERT into manthan_orders:
+SET ROLE api_gateway_reader;
+INSERT INTO manthan_orders(symbol) VALUES ('TEST') ON CONFLICT DO NOTHING;
+-- Expected: ERROR: permission denied for table manthan_orders
+```
+
+These negative tests live in the deployment scripts so a future role
+config drift is caught at deploy time, not at incident time.
+
 ## What can go wrong (the veteran always asks this)
 
 | Risk | Likelihood | Mitigation |
@@ -260,3 +436,17 @@ Worst time: Tuesday morning before 09:14 IST cron fires. Don't be that team.
 - [ ] Pager/oncall coverage during cutover window
 - [ ] Communication sent to anyone using the API
 - [ ] Time slot reserved (outside trading hours)
+
+## Sign-off checklist (before Phase 5 starts)
+
+- [ ] All services running stably on new DBs for ≥ 1 week
+- [ ] Old DBs renamed `_decom` (Phase 4), still queryable for rollback
+- [ ] Each per-service `.env` has the role-specific password ready
+      (not the shared `postgres` superuser)
+- [ ] Negative test scripts written (verifying each role CANNOT do
+      what it shouldn't, per the table above)
+- [ ] Maintenance window scheduled — Phase 5 role swap takes a brief
+      reconnect per service
+- [ ] Rollback plan: keep a temporary `postgres` superuser env var ready
+      to swap back if any service unexpectedly fails with a permission
+      error in production
