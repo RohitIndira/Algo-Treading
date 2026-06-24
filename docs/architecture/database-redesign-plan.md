@@ -142,6 +142,92 @@ Specific problems we've hit or will hit:
 (Notice: user-config does NOT write to stockk_trading — only reads strategies
 to support its config UI. Strategies are owned by rules-engine.)
 
+> ⚠ **Discrepancy to resolve before Phase 3**: today's user-config service
+> exposes `CreateStrategy / UpdateStrategy / DeleteStrategy` gRPC RPCs and
+> writes `user_credentials` directly. The matrix above says it only reads
+> strategies. Either (a) the gRPC handlers are thin proxies that publish
+> Kafka events for rules-engine to apply, or (b) the matrix needs updating
+> to mark user-config as R/W on stockk_trading. **Verify in code before
+> Phase 3 cutover** — the answer affects the role grants in Phase 5.
+
+## Per-service `.env` mapping for Phase 3 cutover
+
+This table is what makes Phase 3 mechanical. For each service, here are
+the **exact** env var names that drive DB connection + the values they
+must hold before vs after cutover.
+
+### Env-only changes (most services)
+
+| Service          | Env var                  | Before                | After (Phase 3)    | Notes                          |
+|------------------|--------------------------|-----------------------|--------------------|--------------------------------|
+| api-gateway      | `MANTHAN_SIGNALS_DB`     | `market_data`         | `stockk_market`    |                                |
+| api-gateway      | `MANTHAN_POSITIONS_DB`   | `trading_db`          | `stockk_trading`   |                                |
+| api-gateway      | `MANTHAN_ORDERS_DB`      | `trading_execution`   | `stockk_trading`   | Same DB as positions now       |
+| data-ingestion   | `MARKET_DATA_DB_NAME`    | `market_data`         | `stockk_market`    |                                |
+| hft-engine       | `TRADING_DB`             | `trading_db`          | `stockk_trading`   |                                |
+| hft-engine       | `TRADING_EXEC_DB`        | `trading_execution`   | `stockk_trading`*  | * if user_credentials moved; see Phase 5 hft freeze note |
+| rules-engine     | `POSTGRES_DB`            | `trading_db`          | `stockk_trading`   |                                |
+| trade-execution  | `POSTGRES_DB`            | `trading_execution`   | `stockk_trading`   |                                |
+| user-config      | `DB_NAME`                | `trading_db`          | `stockk_trading`   | reads/writes strategies        |
+| user-config      | `EXECUTION_DB_NAME`      | `trading_execution`   | `stockk_auth`      | writes user_credentials        |
+| user-config      | `EXECUTION_DB_HOST`      | `localhost`           | `localhost`        | (no change in our setup)       |
+
+### Code changes required (NOT env-only)
+
+These services have **hardcoded** DB names in their code. They need a
+small refactor BEFORE the Phase 3 env swap will work.
+
+```
+─── rebalancer (services/rebalancer/cmd/main.go:59-61) ───
+  Current:
+      tradingDB := mustOpen(logger, "trading_db", buildDSN("trading_db"))
+      marketDB  := mustOpen(logger, "market_data", buildDSN("market_data"))
+  Change to (Phase 2.5 pre-flight refactor, ~5 LOC):
+      tradingDB := mustOpen(logger, "stockk_trading",
+                            buildDSN(getEnv("TRADING_DB", "stockk_trading")))
+      marketDB  := mustOpen(logger, "stockk_market",
+                            buildDSN(getEnv("MARKET_DB", "stockk_market")))
+```
+
+Until rebalancer is refactored, the new DBs created in Phase 1 need a
+temporary `CREATE DATABASE` ALIAS — but Postgres doesn't support DB
+aliases. So the rebalancer code change is a **hard prerequisite** for
+its Phase 3 cutover step. Schedule the code change in Phase 2.5 (between
+data-copy and cutover).
+
+### Notable consequence — service connection count changes
+
+Some services connect to FEWER databases after migration. Either by
+consolidation or because we removed a connection in Phase 0:
+
+| Service          | Connections before    | Connections after Phase 4   | Why                            |
+|------------------|-----------------------|------------------------------|--------------------------------|
+| api-gateway      | 3 (market_data, trading_db, trading_execution) | 2 (stockk_market, stockk_trading) | manthan_positions + manthan_orders both in stockk_trading |
+| user-config      | 2 (trading_db, trading_execution) | 2 (stockk_trading, stockk_auth) | rename, no consolidation       |
+| rebalancer       | 2 (trading_db, market_data) | 2 (stockk_trading, stockk_market) | rename + Phase 0.6a already dropped trading_execution |
+| trade-execution  | 1 (trading_execution) | 1 (stockk_trading)           | rename                         |
+| rules-engine     | 2 (trading_db, market_data) | 2 (stockk_trading, stockk_market) | rename                         |
+| data-ingestion   | 1 (market_data)       | 1 (stockk_market)            | rename                         |
+| hft-engine       | 2 (trading_db, trading_execution) | 2 (stockk_trading, stockk_auth) | rename until unfrozen          |
+| risk-management  | 1 (presumed trading_db) | 1 (stockk_trading)          | rename                         |
+
+### Verification command for each cutover step
+
+After flipping each service's `.env`, verify the connection landed on
+the new DB before declaring the cutover done:
+
+```bash
+# Run after each service restart in Phase 3:
+docker exec postgres_container psql -U postgres -c "
+  SELECT datname, count(*) AS conns
+  FROM pg_stat_activity
+  WHERE application_name LIKE '<service>%' OR usename = '<service>_svc'
+  GROUP BY datname"
+# Expected: rows show ONLY the new stockk_* databases. Any row with
+# trading_db / trading_execution / market_data means the cutover is
+# incomplete.
+```
+
 ## Migration phases — safe, reversible, no big-bang
 
 We do this in small steps. Each step is reversible if something breaks.
