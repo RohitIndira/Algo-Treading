@@ -296,6 +296,60 @@ pattern. It is NOT a bug.
 
 ---
 
+## Current migration state — what's in flight (2026-06-24)
+
+The Phase 0 / Phase 1 / Phase 2 plan in
+[rules-engine-split-design.md](rules-engine-split-design.md) is being executed
+incrementally. This section is the running snapshot of where things stand
+so a new reader does NOT assume the target-state matrix above is reality
+today.
+
+**Fully migrated to gRPC (target state achieved):**
+
+  - rules-engine → user-config strategies (Phase 0.1, commit 4cdcc75)
+  - rebalancer → user-config strategies (Phase 0.2, commit fc88bee)
+  - rebalancer → user-config user_credentials (Phase 0.6a, commit 7d33090)
+  - trade-execution → user-config user_credentials (Phase -1, commit 38631ee;
+    has a DB fallback documented as the hot-path safety net)
+
+**Acceptable as direct DB during migration (per CQRS policy, Rule 4 of
+[communication-patterns.md](communication-patterns.md))**:
+
+These are backend-to-backend reads of raw data with NO decryption / NO
+derived values / NO audit need. They satisfy the "four conditions" rule
+and may stay as direct reads provided the reader has a SELECT-only
+Postgres role (Phase 2 / 4 will enforce this at the DB layer):
+
+  - rebalancer → rules-engine.{manthan_positions, manthan_cooldown,
+    manthan_portfolio_state, manthan_signal_decisions}
+  - rules-engine → data-ingestion.manthan_signals
+  - All api-gateway cross-service reads (api-gateway exception)
+
+Default for any NEW backend-to-backend read going forward: **gRPC**.
+Direct DB requires explicit justification under Rule 4's four conditions
++ a row added to this file's ownership matrix.
+
+**❄ Frozen pending later decision — hft-engine**
+
+hft-engine currently reads `user_credentials` (with client-side decryption,
+violating the single-owner-of-secrets principle) and `strategies` (with
+business logic — strategy_type filter, JOIN with trade_configs). Both are
+KNOWN debt:
+
+  - `services/hft-engine/internal/repo/repo.go:74`   — strategies SQL JOIN
+  - `services/hft-engine/internal/repo/repo.go:143`  — user_credentials read
+
+Project decision (2026-06-24): hft-engine is FROZEN for the current
+migration sweep. These two direct reads remain as-is. They WILL be
+addressed in a later phase. Any code review that adds NEW direct reads
+in hft-engine should still reject — the freeze is "don't ship new fixes,"
+not "anything goes." The freeze unblocks Phase 2 (DB layout / Postgres
+roles) — hft-engine simply gets the same per-service Postgres role with
+its current grants, and the role's grants are tightened once the
+migration ships.
+
+---
+
 ## Anti-patterns we're fixing (the original sins)
 
 | Symptom seen today                         | Why it's wrong                     | Fix                                   |
