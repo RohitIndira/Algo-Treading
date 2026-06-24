@@ -242,7 +242,7 @@ db.Exec("DELETE FROM manthan_orders WHERE id = $1", orderID)
 | manthan_positions          | trade-execution  | No             | api-gateway, rebalancer, rules-engine (read-only) |
 | manthan_position_events    | trade-execution  | No             | rules-engine (read-only) |
 | manthan_portfolio_state    | rebalancer       | YES (computed P&L) | api-gateway (read-only) |
-| manthan_signal_decisions   | rules-engine     | No             | rebalancer (read-only) |
+| manthan_signal_decisions ⚠ | rules-engine *   | No             | rebalancer (co-INSERT), api-gateway (read-only) |
 | manthan_cooldown           | rules-engine     | No             | rebalancer (read-only) |
 
 ### `stockk_market`
@@ -255,6 +255,44 @@ db.Exec("DELETE FROM manthan_orders WHERE id = $1", orderID)
 | manthan_stocks     | data-ingestion | No             | rules-engine                    |
 | manthan_signals    | data-ingestion | No             | rebalancer                      |
 | breakout_events    | data-ingestion | No             | rules-engine                    |
+
+#### ⚠ Co-INSERT pattern — `manthan_signal_decisions`
+
+This is the one table in our codebase with a **documented multi-writer**
+pattern. It is NOT a bug.
+
+  - **Lifecycle owner**: rules-engine (writes UPDATEs for the state
+    machine: PROPOSED → DISPATCHED → CONFIRMED / FILLED / REJECTED).
+    All UPDATE paths live in
+    `services/rules-engine/internal/manthan/{publisher,position_projector,fill_consumer}.go`.
+
+  - **Co-inserter**: rebalancer (writes ONLY the initial INSERT with
+    `status='PROPOSED'`, never UPDATE). Code at
+    `services/rebalancer/internal/publisher.go:EnsureDecisionRow`.
+    Triggered by the batch CLI / top-up path.
+
+  - **Why it's safe**:
+      - Both INSERTs use `ON CONFLICT (signal_id) DO NOTHING` — signal_id
+        is unique, so a race produces exactly one row, not two.
+      - Both INSERTs write identical column set + the same `'PROPOSED'`
+        status. rebalancer additionally sets `rejection_reason` for
+        top-ups (a nullable string column rules-engine ignores).
+      - rules-engine guards all UPDATEs on the current state (e.g.,
+        `WHERE status='PROPOSED'`), so a late dispatch can't regress a
+        row that's already CONFIRMED.
+
+  - **Cleanup path** (future): when rules-engine has a gRPC server
+    (Phase 1.1), rebalancer can call a `RecordDecision` RPC instead of
+    INSERTing directly. Until then, the dual-writer pattern is the
+    pragmatic choice — the duplication is ~15 lines of identical SQL,
+    extracted to `pkg/manthan/decisions/insert.go` would be a low-value
+    refactor.
+
+  - **What this means for Phase 2 (DB redesign)**: this table moves with
+    rules-engine into `stockk_trading`. rebalancer needs a Postgres role
+    with INSERT-only grant on this specific table (not full write
+    access), enforcing the lifecycle boundary even if a future bug
+    tried to UPDATE from rebalancer.
 
 ---
 
