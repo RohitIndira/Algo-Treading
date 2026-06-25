@@ -5,6 +5,11 @@ bin/
 *.so
 *.dylib
 
+# Postgres dumps — taken during DB redesign migration. Local only,
+# never commit (contain real broker tokens + manthan_signals churn).
+backups/
+*.dump
+
 # Compiled service binaries (built into source dirs during dev)
 services/data-ingestion/historical-worker
 services/data-ingestion/ws-poc

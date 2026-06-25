@@ -4,6 +4,12 @@
 > Author: dev team
 > Last updated: 2026-06-24
 
+> **Executing the migration?** This document is the *design rationale*.
+> For copy-paste commands, validation gates, and rollback procedures,
+> see the companion [`db-migration-runbook.md`](./db-migration-runbook.md).
+> Phase 0 baseline backups completed locally on 2026-06-24
+> (`backups/*-baseline-20260624-165537.dump`); restore-test gate passed.
+
 ## Pre-Phase-2 audit findings (2026-06-24) — what's settled since the plan was drafted
 
 Between the original 2026-06-16 draft and the current state, three Phase 0
@@ -174,26 +180,46 @@ must hold before vs after cutover.
 
 ### Code changes required (NOT env-only)
 
-These services have **hardcoded** DB names in their code. They need a
-small refactor BEFORE the Phase 3 env swap will work.
+**Status (2026-06-24): RESOLVED.** Audit of every service for hardcoded
+DB literals found exactly one violation — rebalancer. Fixed in the same
+session it was discovered. Every service is now env-driven; Phase 3 is
+mechanical `.env` swaps with zero code edits.
 
 ```
-─── rebalancer (services/rebalancer/cmd/main.go:59-61) ───
-  Current:
+─── rebalancer (services/rebalancer/cmd/main.go) — FIXED ───
+  Was (hardcoded string literals):
       tradingDB := mustOpen(logger, "trading_db", buildDSN("trading_db"))
       marketDB  := mustOpen(logger, "market_data", buildDSN("market_data"))
-  Change to (Phase 2.5 pre-flight refactor, ~5 LOC):
-      tradingDB := mustOpen(logger, "stockk_trading",
-                            buildDSN(getEnv("TRADING_DB", "stockk_trading")))
-      marketDB  := mustOpen(logger, "stockk_market",
-                            buildDSN(getEnv("MARKET_DB", "stockk_market")))
+  Now (env-driven, defaults preserve current dev/staging behaviour):
+      tradingDBName := getEnv("TRADING_DB", "trading_db")
+      marketDBName  := getEnv("MARKET_DB",  "market_data")
+      tradingDB := mustOpen(logger, tradingDBName, buildDSN(tradingDBName))
+      marketDB  := mustOpen(logger, marketDBName,  buildDSN(marketDBName))
 ```
 
-Until rebalancer is refactored, the new DBs created in Phase 1 need a
-temporary `CREATE DATABASE` ALIAS — but Postgres doesn't support DB
-aliases. So the rebalancer code change is a **hard prerequisite** for
-its Phase 3 cutover step. Schedule the code change in Phase 2.5 (between
-data-copy and cutover).
+Phase 3 cutover for rebalancer now needs only:
+```bash
+# Add to services/rebalancer/.env (or shared .env)
+TRADING_DB=stockk_trading
+MARKET_DB=stockk_market
+```
+
+Full audit results (`grep -rn '"trading_db"|"market_data"|"trading_execution"' services/`):
+
+| Service          | Verdict     | How DB name is resolved                                      |
+|------------------|-------------|--------------------------------------------------------------|
+| api-gateway      | ✅ env       | `envOr("MANTHAN_SIGNALS_DB", ...)` etc. (cmd/main.go:143-145) |
+| data-ingestion   | ✅ env       | `getEnv("MARKET_DATA_DB_NAME", ...)` (config.go:135)         |
+| hft-engine       | ✅ env       | `env("TRADING_DB", ...)`, `env("TRADING_EXEC_DB", ...)`      |
+| rebalancer       | ✅ env (NEW) | `getEnv("TRADING_DB", ...)`, `getEnv("MARKET_DB", ...)`      |
+| risk-management  | ✅ env       | `getEnv("DB_NAME", ...)` (config.go:39)                      |
+| rules-engine     | ✅ env       | `getEnv("POSTGRES_DB", ...)` + `MANTHAN_SIGNALS_DB`          |
+| trade-execution  | ✅ env       | `getEnv("POSTGRES_DB", ...)` (cmd/main.go:883)               |
+| user-config      | ✅ env       | `getEnv("DB_NAME", ...)`, `getEnv("EXECUTION_DB_NAME", ...)` |
+
+Literal-string DB names *do* still appear in code, but only as the
+`default` argument to `getEnv` — the env var overrides them at runtime.
+That's the correct pattern (env wins, default is a dev convenience).
 
 ### Notable consequence — service connection count changes
 

@@ -56,9 +56,16 @@ func main() {
 	// the only thing that used it was ResolveBrokerAuth, which now goes
 	// through user-config gRPC. rebalancer is no longer coupled to
 	// trade-execution's DB schema.
-	tradingDB := mustOpen(logger, "trading_db", buildDSN("trading_db"))
+	//
+	// DB names are env-driven (TRADING_DB, MARKET_DB) so Phase 3 of the
+	// database redesign can flip `.env` without a code change. Defaults
+	// match the current dev/staging layout; post-cutover both .env files
+	// will set TRADING_DB=stockk_trading and MARKET_DB=stockk_market.
+	tradingDBName := getEnv("TRADING_DB", "trading_db")
+	marketDBName := getEnv("MARKET_DB", "market_data")
+	tradingDB := mustOpen(logger, tradingDBName, buildDSN(tradingDBName))
 	defer tradingDB.Close()
-	marketDB := mustOpen(logger, "market_data", buildDSN("market_data"))
+	marketDB := mustOpen(logger, marketDBName, buildDSN(marketDBName))
 	defer marketDB.Close()
 
 	// --- Indira broker client ---
@@ -66,8 +73,11 @@ func main() {
 	broker := indiraClient.NewClient(indiraClient.Config{BaseURL: brokerBase})
 
 	// --- Redis (for EMA targets) ---
+	// REDIS_ADDR wins; REDIS_URI is kept as a legacy alias for older .env
+	// files. Default is localhost — production redis IPs must come from .env,
+	// NEVER from a code default (one stale literal cost us an incident).
 	rdb := goredis.NewClient(&goredis.Options{
-		Addr:     getEnv("REDIS_ADDR", getEnv("REDIS_URI", "15.207.203.46:6379")),
+		Addr:     getEnv("REDIS_ADDR", getEnv("REDIS_URI", "localhost:6379")),
 		Password: getEnv("REDIS_PASSWORD", ""),
 		DB:       0,
 	})
@@ -251,11 +261,20 @@ func printSummary(results []internal.AllocResult, published int, dryRun bool) {
 
 // --- helpers ---
 
+// loadEnv loads environment from .env files. Order matters: godotenv.Overload
+// makes LATER files win, so we load shared/legacy files first and the
+// rebalancer's own .env LAST. The rebalancer .env is authoritative — every
+// var main.go reads is documented in services/rebalancer/.env.example.
+//
+// Files in load order (each one optional; missing files silently skipped):
+//   1. ./.env                              — repo-root shared (legacy)
+//   2. services/data-ingestion/.env        — shared Kafka/Redis (legacy)
+//   3. services/rebalancer/.env            — rebalancer-specific (WINS)
 func loadEnv() {
 	for _, p := range []string{
 		".env",
+		"services/data-ingestion/.env",
 		"services/rebalancer/.env",
-		"services/data-ingestion/.env", // share Mongo / Redis / Kafka with data-ingestion
 	} {
 		if abs, err := filepath.Abs(p); err == nil {
 			_ = godotenv.Overload(abs)
