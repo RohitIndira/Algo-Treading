@@ -169,9 +169,13 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 			continue
 		}
 
-		// Live position: restore in-memory portfolio + upsert Redis cache
+		// Live position: restore in-memory portfolio + upsert Redis cache.
+		// The previous implementation took pm.mu (outer) — wrong; that lock
+		// only protects the outer portfolios map. Inner Positions writes
+		// must take the per-Portfolio Mu so concurrent LTPFeed poll +
+		// allocator + fill consumer don't trip the concurrent-map panic.
 		p := pm.GetOrCreate(*strategy)
-		pm.mu.Lock()
+		p.Mu.Lock()
 		p.Positions[symbol] = &Position{
 			Symbol:         symbol,
 			ISIN:           isin,
@@ -188,7 +192,7 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 			State:          StateActive,
 			Active:         true,
 		}
-		pm.mu.Unlock()
+		p.Mu.Unlock()
 
 		if rdb != nil {
 			payload, _ := json.Marshal(map[string]any{

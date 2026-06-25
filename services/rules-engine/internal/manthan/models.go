@@ -1,6 +1,9 @@
 package manthan
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // ManthanSignal represents one eligible stock from the data-ingestion pipeline
 // (consumed from manthan.signals Kafka topic).
@@ -68,7 +71,20 @@ type Position struct {
 }
 
 // Portfolio tracks a user's full MANTHAN portfolio state.
+//
+// Concurrency: every read or write of Positions / Cooldown / the capital
+// fields must be done under Mu. PortfolioManager methods take this lock
+// internally when they mutate; external callers iterating portfolio.Positions
+// (LTPFeed poll, allocator cap-check, tick handler, publisher snapshot,
+// fill consumer position lookup) must take Mu.RLock around their read.
+//
+// PortfolioManager.mu (outer map lock) does NOT cover the inner maps once
+// a *Portfolio pointer has escaped via AllPortfolios / Get / GetOrCreate.
+// Without this per-Portfolio mutex, the LTP poll iterating Positions while
+// the fill consumer mutated the same map would eventually trip Go's
+// "concurrent map read and map write" panic.
 type Portfolio struct {
+	Mu             sync.RWMutex
 	UserID         string
 	StrategyID     string
 	InitialCapital float64

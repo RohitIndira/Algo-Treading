@@ -102,6 +102,13 @@ func (a *Allocator) Allocate(
 ) *AllocateResult {
 	result := &AllocateResult{}
 
+	// Allocate touches portfolio.Positions + portfolio.Cooldown (delete on
+	// re-entry) and is called rarely (once per signal batch — handful of
+	// times per day). Holding exclusive Mu for the duration is simpler than
+	// snapshotting + rechecking, and contention is negligible.
+	portfolio.Mu.Lock()
+	defer portfolio.Mu.Unlock()
+
 	openSlots := int(portfolio.MaxPositions) - countActive(portfolio.Positions)
 	if openSlots <= 0 {
 		a.logger.Info("Portfolio full, no open slots",

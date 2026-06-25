@@ -241,7 +241,7 @@ func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy UserStrategy
 				zap.String("symbol", order.Symbol), zap.Error(err))
 			continue
 		}
-		c.portfolioMgr.AddPosition(strategy.StrategyID, result.Allocations[i], c.slMgr, strategy.StopLossPct)
+		c.portfolioMgr.AddPosition(strategy.StrategyID, result.Allocations[i])
 		c.logger.Info("Catch-up entry order published",
 			zap.String("user", strategy.UserID),
 			zap.String("symbol", order.Symbol),
@@ -498,8 +498,6 @@ func (c *Consumer) processSignal(ctx context.Context, signal ManthanSignal) {
 			c.portfolioMgr.AddPosition(
 				strategy.StrategyID,
 				result.Allocations[i],
-				c.slMgr,
-				strategy.StopLossPct,
 			)
 			published++
 

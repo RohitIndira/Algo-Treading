@@ -124,11 +124,17 @@ func (f *LTPFeed) poll(ctx context.Context) {
 	}
 	var positions []posInfo
 	for _, portfolio := range f.portfolioMgr.AllPortfolios() {
+		// portfolio.Positions is a plain map mutated by the fill consumer
+		// goroutine. Take the per-Portfolio RLock so iteration doesn't race
+		// with a concurrent AddPosition/ProcessFillEvent (would panic
+		// otherwise). Released before the broker round-trip below.
+		portfolio.Mu.RLock()
 		for sym, pos := range portfolio.Positions {
 			if pos.Active && pos.ISIN != "" {
 				positions = append(positions, posInfo{symbol: sym, isin: pos.ISIN})
 			}
 		}
+		portfolio.Mu.RUnlock()
 	}
 	if len(positions) == 0 {
 		return

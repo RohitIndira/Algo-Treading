@@ -423,15 +423,23 @@ func (p *ManthanPublisher) UpdatePositionSL(ctx context.Context, strategyID, sym
 // UpdatePortfolioState syncs portfolio summary to DB + Redis.
 // Called after every entry/exit to keep state current.
 func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *Portfolio) {
+	// Snapshot all fields we need under a single RLock. Releasing before the
+	// DB + Redis round-trips below keeps the lock window short and avoids
+	// holding it across IO.
+	portfolio.Mu.RLock()
 	activeCount := 0
-	totalPnL := 0.0
 	for _, pos := range portfolio.Positions {
 		if pos.Active {
 			activeCount++
-		} else {
-			totalPnL += (0) // realized PnL tracked separately
 		}
 	}
+	strategyID := portfolio.StrategyID
+	userID := portfolio.UserID
+	initialCapital := portfolio.InitialCapital
+	currentCapital := portfolio.CurrentCapital
+	maxPositions := portfolio.MaxPositions
+	perStockBase := portfolio.PerStockBase
+	portfolio.Mu.RUnlock()
 
 	// DB
 	if p.db != nil {
@@ -444,21 +452,21 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 				per_stock_base  = EXCLUDED.per_stock_base,
 				active_count    = EXCLUDED.active_count,
 				updated_at      = NOW()`,
-			portfolio.StrategyID, portfolio.UserID,
-			portfolio.InitialCapital, portfolio.CurrentCapital,
-			portfolio.MaxPositions, portfolio.PerStockBase, activeCount)
+			strategyID, userID,
+			initialCapital, currentCapital,
+			maxPositions, perStockBase, activeCount)
 	}
 
 	// Redis
 	if p.rdb != nil {
-		key := fmt.Sprintf("manthan:portfolio:%s", portfolio.StrategyID)
+		key := fmt.Sprintf("manthan:portfolio:%s", strategyID)
 		data, _ := json.Marshal(map[string]any{
-			"user_id":         portfolio.UserID,
-			"strategy_id":     portfolio.StrategyID,
-			"initial_capital": portfolio.InitialCapital,
-			"current_capital": portfolio.CurrentCapital,
-			"max_positions":   portfolio.MaxPositions,
-			"per_stock_base":  portfolio.PerStockBase,
+			"user_id":         userID,
+			"strategy_id":     strategyID,
+			"initial_capital": initialCapital,
+			"current_capital": currentCapital,
+			"max_positions":   maxPositions,
+			"per_stock_base":  perStockBase,
 			"active_count":    activeCount,
 			"updated_at":      time.Now().UTC().Format(time.RFC3339),
 		})

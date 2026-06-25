@@ -45,17 +45,27 @@ func NewTickHandler(
 // Called for every tick from the websocket feed.
 func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float64) {
 	for _, portfolio := range h.portfolioMgr.AllPortfolios() {
+		// Tight critical section: read pos under Lock, let slMgr.ProcessTick
+		// mutate pos.CurrentSL / pos.HighSinceEntry in-place under the same
+		// lock, snapshot what we need for the post-release work, release.
+		// Releasing before pm.ExitPosition is essential — that method
+		// re-acquires Mu.Lock(), and sync.RWMutex is non-reentrant
+		// (nested lock would deadlock the goroutine).
+		portfolio.Mu.Lock()
 		pos, ok := portfolio.Positions[symbol]
 		if !ok || !pos.Active || pos.State != StateActive {
-			continue // skip PENDING_ENTRY and EXITED positions
-		}
-
-		strategy := h.strategyFn(portfolio.StrategyID)
-		if strategy == nil {
+			portfolio.Mu.Unlock()
 			continue
 		}
-
+		strategy := h.strategyFn(portfolio.StrategyID)
+		if strategy == nil {
+			portfolio.Mu.Unlock()
+			continue
+		}
 		update := h.slMgr.ProcessTick(pos, ltp, strategy.StopLossPct, strategy.TrailingSLPct)
+		strategyID := portfolio.StrategyID
+		posSnap := *pos // value copy for use after Unlock
+		portfolio.Mu.Unlock()
 
 		switch update.Action {
 		case SLModify:
@@ -68,8 +78,8 @@ func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float6
 			}
 
 		case SLTriggered:
-			pnl := h.portfolioMgr.ExitPosition(portfolio.StrategyID, symbol, update.ExitPrice)
-			order := h.orderGen.GenerateSLExit(*strategy, pos, update.ExitPrice, pnl)
+			pnl := h.portfolioMgr.ExitPosition(strategyID, symbol, update.ExitPrice)
+			order := h.orderGen.GenerateSLExit(*strategy, &posSnap, update.ExitPrice, pnl)
 			if err := h.publisher.PublishSLExit(ctx, order); err != nil {
 				h.logger.Error("Failed to publish SL exit",
 					zap.String("symbol", symbol),
@@ -77,13 +87,19 @@ func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float6
 				)
 			}
 
+			// Capital was just updated inside ExitPosition; re-read under
+			// RLock for the log so the printed value reflects the new state.
+			portfolio.Mu.RLock()
+			newCapital := portfolio.CurrentCapital
+			portfolio.Mu.RUnlock()
+
 			h.logger.Info("MANTHAN SL triggered — position exited",
 				zap.String("user", strategy.UserID),
 				zap.String("symbol", symbol),
-				zap.Float64("entry", pos.EntryPrice),
+				zap.Float64("entry", posSnap.EntryPrice),
 				zap.Float64("exit", update.ExitPrice),
 				zap.Float64("pnl", pnl),
-				zap.Float64("new_capital", portfolio.CurrentCapital),
+				zap.Float64("new_capital", newCapital),
 			)
 		}
 	}

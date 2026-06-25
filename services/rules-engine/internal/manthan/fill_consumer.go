@@ -228,15 +228,21 @@ func (c *FillConsumer) applyInMemory(ctx context.Context, event *projector.FillE
 		if mp, ok := c.publisher.(*ManthanPublisher); ok {
 			if p, pok := c.portfolioMgr.Get(event.StrategyID); pok {
 				if isFull && !c.decisionLogEnabled {
+					// Read pos.CurrentSL under the per-Portfolio RLock —
+					// LTPFeed poll + tick handler mutate this field
+					// concurrently.
 					var slPrice float64
+					p.Mu.RLock()
 					if pos, ok := p.Positions[event.Symbol]; ok {
 						slPrice = pos.CurrentSL
 					}
+					p.Mu.RUnlock()
 					mp.UpdatePositionFill(ctx, event.StrategyID, event.Symbol,
 						fillPrice, fillQty, slPrice)
 				}
 				// Portfolio summary refresh runs in both modes — active_count
-				// changes whenever a position flips Active.
+				// changes whenever a position flips Active. UpdatePortfolioState
+				// snapshots fields under p.Mu.RLock internally.
 				mp.UpdatePortfolioState(ctx, p)
 			}
 		}

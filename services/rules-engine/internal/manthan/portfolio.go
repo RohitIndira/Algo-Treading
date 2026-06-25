@@ -1,6 +1,7 @@
 package manthan
 
 import (
+	"math"
 	"sync"
 	"time"
 
@@ -73,11 +74,14 @@ func (pm *PortfolioManager) AllPortfolios() []*Portfolio {
 }
 
 // AddPosition adds a new position to a portfolio after an order is placed.
-func (pm *PortfolioManager) AddPosition(strategyID string, alloc AllocationResult, slMgr *TrailingSLManager, slPct float64) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
+//
+// slMgr / slPct removed 2026-06-25 (audit finding #3) — SL initialisation
+// happens in ProcessFillEvent once we have the real broker price, so passing
+// the SL machinery here was dead weight that lied about behaviour.
+func (pm *PortfolioManager) AddPosition(strategyID string, alloc AllocationResult) {
+	pm.mu.RLock()
 	p, ok := pm.portfolios[strategyID]
+	pm.mu.RUnlock()
 	if !ok {
 		return
 	}
@@ -95,21 +99,27 @@ func (pm *PortfolioManager) AddPosition(strategyID string, alloc AllocationResul
 		State:       StatePendingEntry, // NOT active until fill confirmed
 		Active:      false,             // trailing SL disabled until ACTIVE
 	}
-	// Don't init SL yet — wait for fill confirmation with real price
+	// Inner write — Mu guards Positions against concurrent external readers
+	// (LTPFeed poll, allocator cap-check, publisher snapshot).
+	p.Mu.Lock()
 	p.Positions[alloc.Symbol] = pos
+	p.Mu.Unlock()
 }
 
 // ProcessFillEvent handles both partial and full fill events.
 // Partial: updates price/qty, stays in PARTIALLY_FILLED
 // Full: transitions to ACTIVE, enables SL + trailing
 func (pm *PortfolioManager) ProcessFillEvent(strategyID, symbol string, avgFillPrice float64, filledQty, expectedQty int32, isFull bool, slMgr *TrailingSLManager, slPct float64) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
+	pm.mu.RLock()
 	p, ok := pm.portfolios[strategyID]
+	pm.mu.RUnlock()
 	if !ok {
 		return
 	}
+
+	// Inner mutation — Mu guards Positions/CurrentSL against external readers.
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
 
 	pos, ok := p.Positions[symbol]
 	if !ok {
@@ -180,18 +190,25 @@ func (pm *PortfolioManager) UpdateSLFromBroker(strategyID, symbol string, broker
 	if brokerTrigger <= 0 {
 		return
 	}
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
+	pm.mu.RLock()
 	p, ok := pm.portfolios[strategyID]
+	pm.mu.RUnlock()
 	if !ok {
 		return
 	}
+
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
+
 	pos, ok := p.Positions[symbol]
 	if !ok {
 		return
 	}
-	if pos.CurrentSL == brokerTrigger {
+	// Float equality is a lie at the bit level — broker may report 82.10
+	// while we hold 82.099999999. Use half-a-paise epsilon so legitimate
+	// re-broadcasts of the same trigger are idempotent.
+	const slEpsilon = 0.005
+	if math.Abs(pos.CurrentSL-brokerTrigger) < slEpsilon {
 		return
 	}
 	pm.logger.Info("In-memory SL synced from broker (closes rules-engine/broker divergence)",
@@ -205,13 +222,15 @@ func (pm *PortfolioManager) UpdateSLFromBroker(strategyID, symbol string, broker
 // ExitPosition marks a position as exited after SL triggered.
 // Adds to cooldown for re-entry logic. Returns realized P&L.
 func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice float64) float64 {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
+	pm.mu.RLock()
 	p, ok := pm.portfolios[strategyID]
+	pm.mu.RUnlock()
 	if !ok {
 		return 0
 	}
+
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
 
 	pos, ok := p.Positions[symbol]
 	if !ok || !pos.Active {
@@ -227,13 +246,22 @@ func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice fl
 	// Recalc per-stock base (real-time capital rebalancing)
 	p.PerStockBase = p.CurrentCapital / float64(p.MaxPositions)
 
+	// Reentry guard against ATH ≈ 0 — if HighSinceEntry never got updated
+	// (e.g. exit before any tick arrived for a fresh position), don't
+	// install a 0-threshold cooldown that's always satisfied. Fall back
+	// to exitPrice × 0.80 as a conservative floor.
+	ath := pos.HighSinceEntry
+	if ath <= 0 {
+		ath = exitPrice
+	}
+
 	// Add to cooldown — stock must correct 20% from ATH before re-entry
 	p.Cooldown[symbol] = &CooldownEntry{
 		Symbol:       symbol,
-		ATHAtExit:    pos.HighSinceEntry,
+		ATHAtExit:    ath,
 		ExitPrice:    exitPrice,
 		ExitTime:     time.Now(),
-		ReentryBelow: pos.HighSinceEntry * 0.80, // 20% below ATH
+		ReentryBelow: ath * 0.80, // 20% below ATH
 	}
 
 	pm.logger.Info("Position exited",
@@ -253,14 +281,23 @@ func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice fl
 // Used by websocket manager to know which ticks to process.
 func (pm *PortfolioManager) ActiveSymbols() map[string]bool {
 	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-	syms := make(map[string]bool)
+	portfolios := make([]*Portfolio, 0, len(pm.portfolios))
 	for _, p := range pm.portfolios {
+		portfolios = append(portfolios, p)
+	}
+	pm.mu.RUnlock()
+
+	// Inner maps must be read under each Portfolio's own RLock —
+	// pm.mu only protects the outer map, not Positions inside each.
+	syms := make(map[string]bool)
+	for _, p := range portfolios {
+		p.Mu.RLock()
 		for sym, pos := range p.Positions {
 			if pos.Active {
 				syms[sym] = true
 			}
 		}
+		p.Mu.RUnlock()
 	}
 	return syms
 }
