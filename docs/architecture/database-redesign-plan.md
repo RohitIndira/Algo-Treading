@@ -477,8 +477,57 @@ contexts in Phase 1 + Phase 3 are conceptual until Phase 5 makes
 Postgres physically deny boundary violations. Phase 5 turns code
 review into an absolute guarantee.
 
-**Test before declaring Phase 5 done** — for each service role, verify
-the role CANNOT do what it shouldn't:
+### Lessons from the 2026-06-25 local dry-run
+
+The Phase 5 SQL above was rehearsed on the local dev box. The runnable
+version lives at [`scripts/db/phase5_roles_local.sql`](../../scripts/db/phase5_roles_local.sql).
+Two findings the dry-run surfaced that this draft did NOT have:
+
+1. **`REVOKE CONNECT ... FROM PUBLIC` is mandatory.** By default every
+   role (including `data_ingestion_svc`) can CONNECT to every DB. The
+   per-role CONNECT GRANTs above don't matter if PUBLIC already has
+   CONNECT. Without revoking PUBLIC first, `data_ingestion_svc` could
+   open a session against `stockk_trading` (it would have zero table
+   grants, but the boundary leaks at the DB level). The script now
+   begins with three `REVOKE CONNECT ... FROM PUBLIC` statements.
+
+2. **`user_config_svc` needs RW on `strategies` + `strategy_conditions`
+   + `trade_configs` in `stockk_trading`.** The original draft only
+   granted it `stockk_auth`. The 2026-06-25 grep found 1 INSERT + 5
+   UPDATE sites in `services/user-config/internal/repository/strategy_repository.go`
+   — user-config IS a strategies writer. The local script grants
+   `SELECT, INSERT, UPDATE, DELETE` on those three tables. (rules-engine
+   is also a writer on `strategies` — confirmed co-write pattern.)
+
+3. **Idempotency.** First-draft `DROP ROLE IF EXISTS` errors out on
+   re-run because the role still owns objects. The local script
+   wraps a `REASSIGN OWNED ... TO postgres; DROP OWNED ...` block in
+   a `DO ... EXCEPTION WHEN undefined_object THEN NULL ... END` so
+   re-runs are silent no-ops.
+
+### 2026-06-25 boundary enforcement test results
+
+13 cases run after applying the local script. All passed:
+
+```
+✓ rebalancer INSERT manthan_signal_decisions         allowed
+✓ rebalancer UPDATE manthan_signal_decisions         denied   (lifecycle owned by rules-engine)
+✓ rebalancer UPDATE manthan_positions                denied
+✓ api-gateway INSERT manthan_orders                  denied
+✓ trade-exec UPDATE manthan_positions                denied
+✓ risk-mgmt UPDATE strategies                        denied
+✓ user-config UPDATE manthan_positions               denied   (out of its lane)
+✓ rules-engine UPDATE strategies (co-write)          allowed
+✓ user-config UPDATE strategies (audit fix)          allowed
+✓ data-ingestion CONNECT stockk_trading              denied at CONNECT (PUBLIC revoked)
+✓ user-config CONNECT stockk_market                  denied at CONNECT (PUBLIC revoked)
+✓ trade-exec SELECT user_credentials (cross-DB)      allowed
+✓ rules-engine INSERT manthan_signals                denied   (read-only on stockk_market)
+```
+
+### Test before declaring Phase 5 done
+
+For each service role, verify the role CANNOT do what it shouldn't:
 
 ```sql
 -- e.g. rebalancer must NOT be able to UPDATE manthan_signal_decisions:
