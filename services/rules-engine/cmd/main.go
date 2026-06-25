@@ -17,17 +17,10 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/consumer"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/holiday"
 	intkafka "github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/kafka"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/repository"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/risk"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/startup"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/utils"
 
 	_ "github.com/lib/pq"
 
@@ -76,30 +69,7 @@ func main() {
 		logger.Fatal("FATAL: bootstrap failed", zap.Error(err))
 	}
 
-	// Initialize matching statistics
-	stats := models.NewMatchingStats()
-
-	// Initialize PostgreSQL repository for trade signal tracking
-	logger.Info("Initializing PostgreSQL trade signal repository...")
-	signalRepo, err := repository.NewTradeSignalRepository(
-		cfg.PostgreSQL.Host,
-		cfg.PostgreSQL.Port,
-		cfg.PostgreSQL.User,
-		cfg.PostgreSQL.Password,
-		cfg.PostgreSQL.Database,
-		cfg.PostgreSQL.SSLMode,
-		logger,
-	)
-	if err != nil {
-		logger.Warn("Failed to initialize trade signal repository - orders won't be tracked in DB",
-			zap.Error(err))
-		signalRepo = nil // Continue without DB tracking
-	} else {
-		defer signalRepo.Close()
-		logger.Info("Trade signal repository initialized successfully")
-	}
-
-	// Initialize Redis cache (kept for LTP lookup + Pub/Sub)
+	// Initialize Redis cache (LTP lookup + manthan Pub/Sub).
 	logger.Info("Initializing Redis cache...")
 	redisCache, err := cache.NewRedisCache(
 		cfg.Redis.Addrs,
@@ -117,77 +87,13 @@ func main() {
 	defer redisCache.Close()
 	logger.Info("Redis cache initialized successfully")
 
-	// Initialize risk management client
-	logger.Info("Initializing risk management client...")
-	riskClient, err := risk.NewClient(risk.Config{
-		Address:          cfg.GRPCClients.RiskManagement.Address,
-		Timeout:          cfg.GRPCClients.RiskManagement.Timeout,
-		MaxRetries:       cfg.GRPCClients.RiskManagement.MaxRetries,
-		RetryBackoff:     cfg.GRPCClients.RiskManagement.RetryBackoff,
-		KeepAlive:        cfg.GRPCClients.RiskManagement.KeepAlive,
-		KeepAliveTimeout: cfg.GRPCClients.RiskManagement.KeepAliveTimeout,
-	}, logger)
-	if err != nil {
-		logger.Warn("Failed to initialize risk management client - orders will be auto-approved",
-			zap.Error(err))
-		riskClient = nil // Continue without risk checks
-	} else {
-		defer riskClient.Close()
-		logger.Info("Risk management client initialized successfully")
-	}
+	// Legacy news-event path removed 2026-06-25 (Cat B trim). The engine +
+	// matcher + news consumer + handler + RabbitMQ-shaped trade_signal
+	// publisher + repository are all gone; rules-engine now drives Manthan
+	// exclusively. signalRepo, riskClient, kafkaPub (trade-signals topic),
+	// marketHours, holidayChecker, stats were all news-path only.
 
-	// Initialize Kafka publisher for trade-signals topic
-	logger.Info("Initializing Kafka publisher for trade-signals...")
-	kafkaPub := publisher.NewKafkaPublisher(
-		cfg.Kafka.Brokers,
-		"trade-signals", // Topic for order signals
-		logger,
-	)
-	defer kafkaPub.Close()
-	logger.Info("Kafka trade-signals publisher initialized successfully")
-
-	// Initialize market hours from configuration
-	logger.Info("Initializing market hours configuration...",
-		zap.Int("open_hour", cfg.MarketHours.OpenHour),
-		zap.Int("open_minute", cfg.MarketHours.OpenMinute),
-		zap.Int("close_hour", cfg.MarketHours.CloseHour),
-		zap.Int("close_minute", cfg.MarketHours.CloseMinute),
-		zap.String("timezone", cfg.MarketHours.Timezone),
-		zap.Bool("enforce_hours", cfg.MarketHours.EnforceHours))
-
-	marketHours := utils.NewMarketHours(
-		cfg.MarketHours.OpenHour,
-		cfg.MarketHours.OpenMinute,
-		cfg.MarketHours.CloseHour,
-		cfg.MarketHours.CloseMinute,
-		cfg.MarketHours.Timezone,
-	)
-	logger.Info("Market hours initialized",
-		zap.String("status", marketHours.GetMarketStatus()))
-
-	// Initialize trading holiday checker (MongoDB)
-	logger.Info("Initializing trading holiday checker...")
-	var holidayChecker *holiday.Checker
-	holidayChecker, err = holiday.New(ctx, holiday.Config{
-		MongoURI: cfg.MongoDB.URI,
-		Timezone: cfg.MarketHours.Timezone,
-	}, logger)
-	if err != nil {
-		logger.Warn("Failed to initialize holiday checker - orders will be placed on holidays too",
-			zap.Error(err))
-		holidayChecker = nil
-	} else {
-		holidayChecker.StartAutoRefresh(ctx)
-		defer holidayChecker.Close(context.Background())
-		logger.Info("Trading holiday checker initialized successfully")
-	}
-
-	// Initialize event handler
-	eng := engine.New(store, engine.Config{Workers: cfg.Performance.WorkerCount}, logger)
-	eng.Start(ctx)
-	handler := consumer.NewHandler(eng, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours, holidayChecker)
-
-	// Step 5: Start config consumer BEFORE news consumer
+	// Step 5: Start config consumer — strategy events from user-config.
 	configReader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        cfg.Kafka.Brokers,
 		Topic:          cfg.Kafka.UserConfigTopic,
@@ -198,22 +104,6 @@ func main() {
 		StartOffset:    startOffsetFor(cfg.Kafka.ConfigOffsetReset, kafka.FirstOffset),
 	})
 	configConsumer := intkafka.NewConfigConsumer(configReader, store)
-
-	// Wire MANTHAN catch-up: when new strategy created, replay today's signals
-	// (set after manthanConsumer is created below)
-
-	// Step 6: Start news consumer AFTER config consumer
-	newsReader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:        cfg.Kafka.Brokers,
-		Topic:          cfg.Kafka.Topic,
-		GroupID:        cfg.Kafka.ConsumerGroup,
-		MinBytes:       1,
-		MaxBytes:       cfg.Kafka.MaxBytes,
-		CommitInterval: cfg.Kafka.CommitInterval,
-		StartOffset:    startOffsetFor(cfg.Kafka.StartOffset, kafka.LastOffset),
-		MaxWait:        time.Second,
-	})
-	newsConsumer := intkafka.NewNewsConsumer(newsReader, handler, logger)
 
 	// --- MANTHAN MODULE ---
 	// PostgreSQL connection for manthan portfolio tracking
@@ -399,11 +289,9 @@ func main() {
 		logger.Warn("EXT_REDIS_ADDR not set — live LTP feed disabled, using sheet prices")
 	}
 
-	lc := StartLive(ctx, eng, configConsumer, newsConsumer, configReader, logger)
+	lc := StartLive(ctx, configConsumer, configReader, logger)
 	<-lc.ConfigConsumerStarted
-	logger.Info("Config consumer started")
-	<-lc.NewsConsumerStarted
-	logger.Info("News consumer started — system is LIVE")
+	logger.Info("Config consumer started — system is LIVE")
 
 	// Warm Redis cache from the authoritative `manthan_signals` DB before any
 	// catch-up callback can fire — so new strategies always see today's signals
@@ -534,35 +422,17 @@ func main() {
 	}
 
 	// Log periodic statistics
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				logger.Info("Matching statistics",
-					zap.Int64("events_processed", stats.TotalEventsProcessed),
-					zap.Int64("matches_found", stats.TotalMatchesFound),
-					zap.Int64("orders_generated", stats.TotalOrdersGenerated),
-					zap.Int64("cache_hits", stats.CacheHits),
-					zap.Int64("cache_misses", stats.CacheMisses))
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	// Periodic matching-stats logger removed 2026-06-25 — its source (stats *MatchingStats)
+	// counted news-event matches/orders. Manthan's own counters live in manthan/* publishers.
 
 	logger.Info("Rules Engine Service started successfully",
 		zap.Int("worker_count", cfg.Performance.WorkerCount))
 
 	// Wait for shutdown signal
 	<-ctx.Done()
-	logger.Info("Shutdown received — stopping news consumer then draining worker pool")
+	logger.Info("Shutdown received — stopping config consumer")
 
-	// Stop news consumer first (stop submitting new jobs), drain engine, then stop config consumer.
-	lc.StopNewsFirstThenDrainEngineThenStopConfig()
-	logger.Info("Worker pool drained")
+	lc.StopConfigConsumer()
 	logger.Info("Config consumer stopped")
 
 	// Give some time for graceful shutdown
@@ -571,13 +441,6 @@ func main() {
 
 	// Wait for shutdown with timeout
 	<-shutdownCtx.Done()
-
-	// Log final statistics
-	logger.Info("Final statistics",
-		zap.Int64("total_events_processed", stats.TotalEventsProcessed),
-		zap.Int64("total_matches_found", stats.TotalMatchesFound),
-		zap.Int64("total_orders_generated", stats.TotalOrdersGenerated),
-		zap.Int64("total_errors", stats.EvaluationErrors+stats.KafkaErrors))
 
 	logger.Info("Rules Engine Service shutdown complete")
 }

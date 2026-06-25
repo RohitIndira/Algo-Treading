@@ -83,19 +83,26 @@ fi
 echo ""
 echo "${YELLOW}Step 5: Creating required topics for all services...${NC}"
 
-# Comprehensive array of all topics needed for the trading system
+# Comprehensive array of all topics needed for the trading system.
+#
+# Removed 2026-06-25 (zero code refs across entire repo):
+#   - "risk-approvals"   # never produced, never consumed
+#
+# Under review (2026-06-25 audit):
+#   - "news-events"        # only legacy news-event path uses it (Cat B target)
+#   - "trade-executions"   # only legacy signal_processor publishes; no consumer
+#   - "order-updates"      # 7 Go publishers, 0 Go consumers (presumed frontend WS)
 topics=(
-    "user-config-events"         # User Config Service - strategy updates
-    "news-events"           # Data Ingestion - incoming market news
-    "trade-signals"         # Rules Engine - matched trading signals
-    "trade-executions"      # Trade Execution - execution results
-    "risk-approvals"        # Risk Management - approved trades
-    "order-updates"         # Trade Execution - order status updates
-    "market.data.52w_breakouts" # Data Ingestion - 52W high/low breakout events (real-time)
-    "manthan.signals"       # Data Ingestion - Manthan strategy eligible stocks (daily)
-    "portfolio.allocations" # Rules Engine - Manthan portfolio state changes (real-time)
-    "manthan.execution.events" # Trade Execution - fill confirmations for rules-engine sync
-    "manthan.notifications" # Rules Engine - user-facing notifications (manual exit detected, etc)
+    "user-config-events"          # User Config Service - strategy updates
+    "news-events"                 # Data Ingestion - news (LEGACY — under review)
+    "trade-signals"               # Rules Engine - matched trading signals
+    "trade-executions"            # Trade Execution - exec results (LEGACY producer — under review)
+    "order-updates"               # Trade Execution - order status (PUBLISH-ONLY — under review)
+    "market.data.52w_breakouts"   # Data Ingestion - 52W high/low breakout events (real-time)
+    "manthan.signals"             # Data Ingestion - Manthan strategy eligible stocks (daily)
+    "portfolio.allocations"       # Rules Engine - Manthan portfolio state changes (real-time)
+    "manthan.execution.events"    # Trade Execution - fill confirmations for rules-engine sync
+    "manthan.notifications"       # Rules Engine - user-facing notifications
 )
 
 for topic in "${topics[@]}"; do

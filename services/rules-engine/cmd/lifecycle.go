@@ -2,32 +2,26 @@ package main
 
 import (
 	"context"
-	"time"
 
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
 
 // Lifecycle is a small wrapper returned by StartLive that allows tests to
 // assert shutdown ordering without depending on OS signals.
+//
+// Legacy news consumer + engine fields removed 2026-06-25 — the news-event
+// path (engine + matcher + news consumer) has been deleted entirely. Manthan
+// is the only signal path now; ConfigConsumer drives strategy events.
 type Lifecycle struct {
 	ConfigConsumerStarted chan struct{}
-	NewsConsumerStarted   chan struct{}
-
-	newsStop func()
-	eng      *engine.Engine
 
 	configReaderClose func() error
 }
 
-func (l *Lifecycle) StopNewsFirstThenDrainEngineThenStopConfig() {
-	if l.newsStop != nil {
-		l.newsStop()
-	}
-	if l.eng != nil {
-		l.eng.Shutdown()
-	}
+// StopConfigConsumer closes the config Kafka reader. Engine + news consumer
+// shutdown logic gone with the news-path removal.
+func (l *Lifecycle) StopConfigConsumer() {
 	if l.configReaderClose != nil {
 		_ = l.configReaderClose()
 	}
@@ -37,14 +31,10 @@ type configConsumerRunner interface {
 	Start(ctx context.Context) error
 }
 
-type newsConsumerRunner interface {
-	Start(ctx context.Context) error
-	Stop()
-}
-
-// StartLive starts the config consumer BEFORE the news consumer and signals
-// the order via channels.
-func StartLive(ctx context.Context, eng *engine.Engine, cfgConsumer configConsumerRunner, newsConsumer newsConsumerRunner, configReader *kafka.Reader, logger ...*zap.Logger) *Lifecycle {
+// StartLive starts the config consumer (strategy events from user-config).
+// Returns a Lifecycle whose channel signals readiness for the rest of main.go
+// (e.g. it can now warm the Redis cache and start the Manthan consumer).
+func StartLive(ctx context.Context, cfgConsumer configConsumerRunner, configReader *kafka.Reader, logger ...*zap.Logger) *Lifecycle {
 	var log *zap.Logger
 	if len(logger) > 0 && logger[0] != nil {
 		log = logger[0]
@@ -54,9 +44,6 @@ func StartLive(ctx context.Context, eng *engine.Engine, cfgConsumer configConsum
 
 	l := &Lifecycle{
 		ConfigConsumerStarted: make(chan struct{}),
-		NewsConsumerStarted:   make(chan struct{}),
-		newsStop:              newsConsumer.Stop,
-		eng:                   eng,
 		configReaderClose:     configReader.Close,
 	}
 
@@ -64,15 +51,6 @@ func StartLive(ctx context.Context, eng *engine.Engine, cfgConsumer configConsum
 		close(l.ConfigConsumerStarted)
 		if err := cfgConsumer.Start(ctx); err != nil {
 			log.Error("Config consumer exited with error", zap.Error(err))
-		}
-	}()
-
-	go func() {
-		// tiny yield so order is deterministic even if goroutines schedule oddly
-		time.Sleep(1 * time.Millisecond)
-		close(l.NewsConsumerStarted)
-		if err := newsConsumer.Start(ctx); err != nil {
-			log.Error("News consumer exited with error", zap.Error(err))
 		}
 	}()
 

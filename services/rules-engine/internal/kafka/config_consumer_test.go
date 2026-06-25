@@ -82,7 +82,7 @@ func TestConfigConsumer_Created_Upserts(t *testing.T) {
 
 func TestConfigConsumer_StaleVersion_Skipped(t *testing.T) {
 	store := configstore.New()
-	store.BulkLoad([]*models.StrategyConfig{{StrategyID: "s1", UserID: "u1", Version: 5, Active: true, TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1}, RiskLimits: models.RiskLimits{MaxDailyTrades: 1}}})
+	store.BulkLoad([]*models.StrategyConfig{{StrategyID: "s1", UserID: "u1", Version: 5, Active: true, StrategyType: "MANTHAN", TradeConfig: models.TradeConfig{OrderType: "MARKET", TotalCapital: 100000, MaxPositions: 10, PerStockAmount: 10000}}})
 
 	msg := kafka.Message{Value: []byte(`{"type":"CONFIG_UPDATED","user_id":"u1","strategy_id":"s1","version":4,"config":{"strategy_id":"s1","user_id":"u1","strategy_name":"n","active":true,"trading_mode":"PAPER","conditions":{"match_all_news":true,"impact_score_min":1,"impact_score_max":2,"sentiments":[],"categories":[],"stock_codes":[]},"trade_config":{"order_type":"MARKET","quantity":1,"exchange":"NSE","order_side":"BUY"},"risk_limits":{"max_daily_trades":1}}}`)}
 	r := &fakeReader{msgs: []kafka.Message{msg}}
@@ -98,7 +98,7 @@ func TestConfigConsumer_StaleVersion_Skipped(t *testing.T) {
 
 func TestConfigConsumer_Paused_RemovesFromActiveKeepsInByUser(t *testing.T) {
 	store := configstore.New()
-	store.BulkLoad([]*models.StrategyConfig{{StrategyID: "s1", UserID: "u1", Version: 1, Active: true, TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1}, RiskLimits: models.RiskLimits{MaxDailyTrades: 1}}})
+	store.BulkLoad([]*models.StrategyConfig{{StrategyID: "s1", UserID: "u1", Version: 1, Active: true, StrategyType: "MANTHAN", TradeConfig: models.TradeConfig{OrderType: "MARKET", TotalCapital: 100000, MaxPositions: 10, PerStockAmount: 10000}}})
 
 	msg := kafka.Message{Value: []byte(`{"type":"CONFIG_PAUSED","user_id":"u1","strategy_id":"s1","version":2}`)}
 	r := &fakeReader{msgs: []kafka.Message{msg}}
@@ -118,7 +118,7 @@ func TestConfigConsumer_Paused_RemovesFromActiveKeepsInByUser(t *testing.T) {
 
 func TestConfigConsumer_Resumed_ReAddsToActive(t *testing.T) {
 	store := configstore.New()
-	store.BulkLoad([]*models.StrategyConfig{{StrategyID: "s1", UserID: "u1", Version: 1, Active: true, TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1}, RiskLimits: models.RiskLimits{MaxDailyTrades: 1}}})
+	store.BulkLoad([]*models.StrategyConfig{{StrategyID: "s1", UserID: "u1", Version: 1, Active: true, StrategyType: "MANTHAN", TradeConfig: models.TradeConfig{OrderType: "MARKET", TotalCapital: 100000, MaxPositions: 10, PerStockAmount: 10000}}})
 
 	// pause then resume
 	r := &fakeReader{msgs: []kafka.Message{{Value: []byte(`{"type":"CONFIG_PAUSED","user_id":"u1","strategy_id":"s1","version":2}`)}, {Value: []byte(`{"type":"CONFIG_RESUMED","user_id":"u1","strategy_id":"s1","version":3}`)}}}
@@ -135,7 +135,7 @@ func TestConfigConsumer_Resumed_ReAddsToActive(t *testing.T) {
 
 func TestConfigConsumer_Deleted_RemovesFromBoth(t *testing.T) {
 	store := configstore.New()
-	store.BulkLoad([]*models.StrategyConfig{{StrategyID: "s1", UserID: "u1", Version: 1, Active: true, TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1}, RiskLimits: models.RiskLimits{MaxDailyTrades: 1}}})
+	store.BulkLoad([]*models.StrategyConfig{{StrategyID: "s1", UserID: "u1", Version: 1, Active: true, StrategyType: "MANTHAN", TradeConfig: models.TradeConfig{OrderType: "MARKET", TotalCapital: 100000, MaxPositions: 10, PerStockAmount: 10000}}})
 
 	msg := kafka.Message{Value: []byte(`{"type":"CONFIG_DELETED","user_id":"u1","strategy_id":"s1","version":2}`)}
 	r := &fakeReader{msgs: []kafka.Message{msg}}

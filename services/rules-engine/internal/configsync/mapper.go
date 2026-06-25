@@ -34,25 +34,10 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 		s.Active = true
 	}
 
-	// Conditions
-	s.Conditions = models.Conditions{
-		MatchAllNews:    p.Conditions.MatchAllNews,
-		ImpactScoreMin:  p.Conditions.ImpactScoreMin,
-		ImpactScoreMax:  p.Conditions.ImpactScoreMax,
-		Sentiments:      nilSafeStringSlice(p.Conditions.Sentiments),
-		Categories:      nilSafeStringSlice(p.Conditions.Categories),
-		Stocks:          nilSafeInt64Slice(p.Conditions.StockCodes),
-		VolumeThreshold: p.Conditions.MinVolume,
-		MinPctChange:    p.Conditions.MinPriceChangePct,
-		MaxPctChange:    p.Conditions.MaxPriceChangePct,
-		Exchanges:       normalizeExchanges(p.Conditions.Exchanges),
-	}
-	// Market cap range
-	// (rules-engine model currently stores range but doesn't evaluate it yet; keep for future.)
-	s.Conditions.MarketCapRange = models.MarketCapRange{
-		MinMcap: p.Conditions.MinMarketCap,
-		MaxMcap: p.Conditions.MaxMarketCap,
-	}
+	// Conditions + RiskLimits mapping removed 2026-06-25 — those Strategy
+	// fields are gone with the news-event path. Mapper now only fills the
+	// TradeConfig block that the Manthan allocator/order generator consume.
+	// Incoming p.Conditions / p.RiskLimits fields are silently ignored.
 
 	// Trade config
 	s.TradeConfig = models.TradeConfig{
@@ -71,16 +56,6 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 		MaxPositions:    p.TradeConfig.MaxPositions,
 		PerStockAmount:  p.TradeConfig.PerStockAmount,
 		MaxPositionSize: 0,
-	}
-
-	// Risk limits
-	s.RiskLimits = models.RiskLimits{
-		MaxDailyTrades:      p.RiskLimits.MaxDailyTrades,
-		MaxPerTradeRisk:     p.RiskLimits.MaxPerTradeRisk,
-		MaxLossPerDay:       p.RiskLimits.MaxLossPerDay,
-		EnableAutoSquareOff: p.RiskLimits.EnableAutoSquareOff,
-		AutoSquareOffTime:   p.RiskLimits.AutoSquareOffTime,
-		MaxPositionSize:     0,
 	}
 
 	return s, nil

@@ -79,30 +79,14 @@ func validateStrategyConfig(s *models.StrategyConfig) error {
 	if s.UserID == "" {
 		return fmt.Errorf("user_id empty")
 	}
-
-	// MANTHAN strategies have different validation — no news conditions, no quantity
-	if s.StrategyType == "MANTHAN" {
-		if s.TradeConfig.TotalCapital <= 0 {
-			return fmt.Errorf("total_capital <= 0")
-		}
-		s.Active = true // MANTHAN always active once created
-		return nil
+	// Only MANTHAN strategies are accepted now — NEWS / 52W_BREAKOUT
+	// validation paths removed 2026-06-25 along with the news-event engine.
+	if s.StrategyType != "MANTHAN" {
+		return fmt.Errorf("unsupported strategy_type %q (only MANTHAN is accepted)", s.StrategyType)
 	}
-
-	// NEWS / 52W_BREAKOUT validation
-	if s.Conditions.ImpactScoreMin > s.Conditions.ImpactScoreMax {
-		return fmt.Errorf("impact_score_min > impact_score_max")
+	if s.TradeConfig.TotalCapital <= 0 {
+		return fmt.Errorf("total_capital <= 0")
 	}
-	if s.Conditions.MinPctChange > 0 && s.Conditions.MaxPctChange > 0 {
-		if s.Conditions.MinPctChange > s.Conditions.MaxPctChange {
-			return fmt.Errorf("min_pct_change > max_pct_change")
-		}
-	}
-	if s.TradeConfig.Quantity <= 0 {
-		return fmt.Errorf("quantity <= 0")
-	}
-	if s.RiskLimits.MaxDailyTrades <= 0 {
-		return fmt.Errorf("max_daily_trades <= 0")
-	}
+	s.Active = true // MANTHAN always active once created
 	return nil
 }

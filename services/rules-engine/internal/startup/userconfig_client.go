@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	commonpb "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	proto "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"google.golang.org/grpc"
@@ -128,23 +127,10 @@ func protoToModel(ps *proto.Strategy) (*models.StrategyConfig, error) {
 		m.UpdatedAt = time.Unix(ps.UpdatedAt.Seconds, int64(ps.UpdatedAt.Nanos))
 	}
 
-	if ps.Conditions != nil {
-		m.Conditions.MatchAllNews = ps.Conditions.MatchAllNews
-		m.Conditions.ImpactScoreMin = ps.Conditions.ImpactScoreMin
-		m.Conditions.ImpactScoreMax = ps.Conditions.ImpactScoreMax
-		m.Conditions.Categories = ps.Conditions.Categories
-		m.Conditions.Stocks = ps.Conditions.StockCodes
-		m.Conditions.VolumeThreshold = ps.Conditions.VolumeThreshold
-		if ps.Conditions.PctChangeRange != nil {
-			m.Conditions.MinPctChange = ps.Conditions.PctChangeRange.MinPctChange
-			m.Conditions.MaxPctChange = ps.Conditions.PctChangeRange.MaxPctChange
-		}
-		m.Conditions.Sentiments = sentimentsToStrings(ps.Conditions.Sentiments)
-		m.Conditions.Exchanges = exchangesToStrings(ps.Conditions.Exchanges)
-		if ps.Conditions.MarketCapRange != nil {
-			m.Conditions.MarketCapRange = models.MarketCapRange{MinMcap: ps.Conditions.MarketCapRange.MinMcap, MaxMcap: ps.Conditions.MarketCapRange.MaxMcap}
-		}
-	}
+	// ps.Conditions mapping removed 2026-06-25 — Strategy no longer has a
+	// Conditions struct (news-event path gone). Incoming proto field is
+	// silently ignored; user-config will stop sending it once their schema
+	// catches up.
 
 	if ps.TradeConfig != nil {
 		m.TradeConfig.OrderType = normalizeOrderType(ps.TradeConfig.OrderType.String())
@@ -163,49 +149,15 @@ func protoToModel(ps *proto.Strategy) (*models.StrategyConfig, error) {
 		m.TradeConfig.PerStockAmount = ps.TradeConfig.PerStockAmount
 	}
 
-	if ps.RiskLimits != nil {
-		m.RiskLimits.MaxDailyTrades = ps.RiskLimits.MaxDailyTrades
-		m.RiskLimits.MaxLossPerDay = ps.RiskLimits.MaxLossPerDay
-		m.RiskLimits.MaxPerTradeRisk = ps.RiskLimits.MaxPerTradeRisk
-		m.RiskLimits.PositionSizing = ps.RiskLimits.PositionSizing.String()
-		m.RiskLimits.EnableAutoSquareOff = ps.RiskLimits.EnableAutoSquareOff
-		m.RiskLimits.AutoSquareOffTime = ps.RiskLimits.AutoSquareOffTime
-	}
+	// ps.RiskLimits mapping removed 2026-06-25 — Strategy.RiskLimits gone
+	// with the news path. Manthan enforces its own portfolio caps via
+	// the rebalancer + allocator.
 
 	return m, nil
 }
 
-func sentimentsToStrings(in []commonpb.Sentiment) []string {
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		switch s {
-		case commonpb.Sentiment_SENTIMENT_POSITIVE:
-			out = append(out, "positive")
-		case commonpb.Sentiment_SENTIMENT_NEGATIVE:
-			out = append(out, "negative")
-		case commonpb.Sentiment_SENTIMENT_NEUTRAL:
-			out = append(out, "neutral")
-		default:
-			out = append(out, "neutral")
-		}
-	}
-	return out
-}
-
-func exchangesToStrings(in []commonpb.Exchange) []string {
-	out := make([]string, 0, len(in))
-	for _, ex := range in {
-		switch ex {
-		case commonpb.Exchange_EXCHANGE_NSE:
-			out = append(out, "NSE")
-		case commonpb.Exchange_EXCHANGE_BSE:
-			out = append(out, "BSE")
-		default:
-			out = append(out, ex.String())
-		}
-	}
-	return out
-}
+// sentimentsToStrings/exchangesToStrings removed 2026-06-25 — they only
+// served the Conditions mapper that's gone with the news-event path.
 
 func normalizeOrderType(v string) string {
 	switch v {

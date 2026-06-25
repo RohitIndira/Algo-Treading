@@ -30,14 +30,16 @@ func TestBootstrapper_BulkLoadSuccess(t *testing.T) {
 		StrategyID:   "s1",
 		UserID:       "u1",
 		StrategyName: "n",
+		StrategyType: "MANTHAN",
 		Active:       true,
 		Version:      1,
-		Conditions: models.Conditions{
-			ImpactScoreMin: 1,
-			ImpactScoreMax: 2,
+		TradingMode:  "LIVE",
+		TradeConfig: models.TradeConfig{
+			OrderType:      "MARKET",
+			TotalCapital:   100000,
+			MaxPositions:   10,
+			PerStockAmount: 10000,
 		},
-		TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1, Exchange: "NSE"},
-		RiskLimits:  models.RiskLimits{MaxDailyTrades: 1},
 	}}}
 
 	bs := NewBootstrapper(client, store, logger)
@@ -73,29 +75,37 @@ func TestBootstrapper_ZeroStrategies_AcceptedOnFreshSystem(t *testing.T) {
 }
 
 func TestValidateStrategyConfig_InvalidCases(t *testing.T) {
-	base := &models.StrategyConfig{StrategyID: "s", UserID: "u", TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1}, RiskLimits: models.RiskLimits{MaxDailyTrades: 1}}
+	// Validation rules after the 2026-06-25 Cat B trim:
+	//   - StrategyID / UserID must be non-empty
+	//   - StrategyType must be "MANTHAN" (NEWS / 52W_BREAKOUT no longer accepted)
+	//   - TradeConfig.TotalCapital must be > 0
+	base := &models.StrategyConfig{
+		StrategyID:   "s",
+		UserID:       "u",
+		StrategyType: "MANTHAN",
+		TradeConfig:  models.TradeConfig{TotalCapital: 100000},
+	}
 
 	if err := validateStrategyConfig(&models.StrategyConfig{}); err == nil {
-		t.Fatalf("expected error")
+		t.Fatalf("expected error for empty strategy_id")
 	}
 
-	c := *base
-	c.Conditions.ImpactScoreMin = 5
-	c.Conditions.ImpactScoreMax = 1
-	if err := validateStrategyConfig(&c); err == nil {
-		t.Fatalf("expected error")
+	cNoUser := *base
+	cNoUser.UserID = ""
+	if err := validateStrategyConfig(&cNoUser); err == nil {
+		t.Fatalf("expected error for empty user_id")
 	}
 
-	c2 := *base
-	c2.TradeConfig.Quantity = 0
-	if err := validateStrategyConfig(&c2); err == nil {
-		t.Fatalf("expected error")
+	cWrongType := *base
+	cWrongType.StrategyType = "NEWS"
+	if err := validateStrategyConfig(&cWrongType); err == nil {
+		t.Fatalf("expected error for non-MANTHAN strategy_type")
 	}
 
-	c3 := *base
-	c3.RiskLimits.MaxDailyTrades = 0
-	if err := validateStrategyConfig(&c3); err == nil {
-		t.Fatalf("expected error")
+	cNoCapital := *base
+	cNoCapital.TradeConfig.TotalCapital = 0
+	if err := validateStrategyConfig(&cNoCapital); err == nil {
+		t.Fatalf("expected error for zero total_capital")
 	}
 }
 

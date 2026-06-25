@@ -16,13 +16,15 @@ func mkStrategy(userID, strategyID string, version uint64, active bool) *models.
 		Version:      version,
 		Active:       active,
 		StrategyName: "n",
-		Conditions: models.Conditions{
-			MatchAllNews:   true,
-			ImpactScoreMin: 1,
-			ImpactScoreMax: 2,
+		StrategyType: "MANTHAN",
+		TradingMode:  "LIVE",
+		TradeConfig: models.TradeConfig{
+			OrderType:      "MARKET",
+			TotalCapital:   100000,
+			MaxPositions:   10,
+			PerStockAmount: 10000,
+			Exchange:       "NSE",
 		},
-		TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1, Exchange: "NSE"},
-		RiskLimits:  models.RiskLimits{MaxDailyTrades: 1},
 	}
 }
 
@@ -216,8 +218,8 @@ func TestBulkLoad_LoadsAllActive_SkipsInactive(t *testing.T) {
 	cs := New()
 
 	cs.BulkLoad([]*models.StrategyConfig{
-		{UserID: "u1", StrategyID: "a", Active: true, Version: 1, TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1}, RiskLimits: models.RiskLimits{MaxDailyTrades: 1}},
-		{UserID: "u1", StrategyID: "b", Active: false, Version: 1, TradeConfig: models.TradeConfig{OrderType: "MARKET", Quantity: 1}, RiskLimits: models.RiskLimits{MaxDailyTrades: 1}},
+		{UserID: "u1", StrategyID: "a", Active: true, Version: 1, StrategyType: "MANTHAN", TradeConfig: models.TradeConfig{OrderType: "MARKET", TotalCapital: 100000, MaxPositions: 10, PerStockAmount: 10000}},
+		{UserID: "u1", StrategyID: "b", Active: false, Version: 1, StrategyType: "MANTHAN", TradeConfig: models.TradeConfig{OrderType: "MARKET", TotalCapital: 100000, MaxPositions: 10, PerStockAmount: 10000}},
 	})
 
 	snap := cs.GetSnapshot()
