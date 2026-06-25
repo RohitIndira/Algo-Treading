@@ -14,13 +14,15 @@ import (
 
 // ConfigConsumer consumes "user-config-events" and applies deltas to ConfigStore.
 // Single goroutine. Never crashes on bad messages.
-// OnManthanCreatedFn is called when a MANTHAN strategy is created.
-type OnManthanCreatedFn func(ctx context.Context, strategy *models.Strategy)
+//
+// The OnManthanCreatedFn named type was inlined 2026-06-25 — manthan.Wire
+// passes a closure through its own narrow interface (without importing
+// internal/kafka), so we no longer benefit from a named alias here.
 
 type ConfigConsumer struct {
 	reader           KafkaReader
 	configStore      *configstore.ConfigStore
-	onManthanCreated OnManthanCreatedFn
+	onManthanCreated func(ctx context.Context, strategy *models.Strategy)
 	processed        atomic.Int64
 	errors           atomic.Int64
 }
@@ -29,7 +31,7 @@ func NewConfigConsumer(reader KafkaReader, store *configstore.ConfigStore) *Conf
 	return &ConfigConsumer{reader: reader, configStore: store}
 }
 
-func (c *ConfigConsumer) SetOnManthanCreated(fn OnManthanCreatedFn) {
+func (c *ConfigConsumer) SetOnManthanCreated(fn func(ctx context.Context, strategy *models.Strategy)) {
 	c.onManthanCreated = fn
 }
 
