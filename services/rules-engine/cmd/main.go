@@ -313,9 +313,6 @@ func main() {
 					PerStockBase:  st.TradeConfig.PerStockAmount,
 					StopLossPct:   st.TradeConfig.StopLossPct,
 					TrailingSLPct: st.TradeConfig.TrailingSLPct,
-					BearerToken:   st.BearerToken,
-					AppId:         st.AppId,
-					Source:        st.Source,
 				})
 			}
 		}
@@ -461,9 +458,6 @@ func main() {
 			PerStockBase:  strategy.TradeConfig.PerStockAmount,
 			StopLossPct:   strategy.TradeConfig.StopLossPct,
 			TrailingSLPct: strategy.TradeConfig.TrailingSLPct,
-			BearerToken:   strategy.BearerToken,
-			AppId:         strategy.AppId,
-			Source:        strategy.Source,
 		}
 		manthanConsumer.CatchUpNewStrategy(ctx, us)
 	})

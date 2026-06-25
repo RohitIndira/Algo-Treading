@@ -22,6 +22,10 @@ type ManthanSignal struct {
 }
 
 // UserStrategy holds a user's MANTHAN strategy config (from user-config-events).
+//
+// Auth fields (BearerToken/AppId/Source) were removed 2026-06-25 — broker
+// credentials are now fetched at-edge by trade-execution via user-config gRPC
+// instead of flowing through this in-memory model and onto the Kafka wire.
 type UserStrategy struct {
 	StrategyID    string
 	UserID        string
@@ -32,9 +36,6 @@ type UserStrategy struct {
 	PerStockBase  float64 // TotalCapital / MaxPositions
 	StopLossPct   float64 // 20
 	TrailingSLPct float64 // 2
-	BearerToken   string
-	AppId         string
-	Source        string
 }
 
 // PositionState tracks the lifecycle of a position.

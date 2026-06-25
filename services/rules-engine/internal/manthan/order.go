@@ -45,10 +45,9 @@ type ManthanOrder struct {
 	IndexName  string  `json:"index_name"`
 	EMAAllocPct float64 `json:"ema_alloc_pct"`
 
-	// Auth (passed through for trade execution)
-	BearerToken string `json:"bearer_token,omitempty"`
-	AppId       string `json:"app_id,omitempty"`
-	Source      string `json:"source,omitempty"`
+	// Auth fields removed 2026-06-25: broker creds are fetched at-edge by
+	// trade-execution via user-config gRPC (see entry_handler.authProvider).
+	// Embedding the encrypted token on the Kafka wire was a security leak.
 
 	TradingMode string    `json:"trading_mode"` // PAPER or LIVE
 	Timestamp   time.Time `json:"timestamp"`
@@ -66,9 +65,7 @@ type SLModifyOrder struct {
 	OldSL      float64 `json:"old_sl"`
 	NewHigh    float64 `json:"new_high"`
 
-	BearerToken string    `json:"bearer_token,omitempty"`
-	AppId       string    `json:"app_id,omitempty"`
-	Source      string    `json:"source,omitempty"`
+	// Auth fields removed 2026-06-25 — fetched at-edge in trade-execution.
 	TradingMode string    `json:"trading_mode"`
 	Timestamp   time.Time `json:"timestamp"`
 }
@@ -88,9 +85,7 @@ type SLExitOrder struct {
 	SLPrice    float64 `json:"sl_price"`
 	PnL        float64 `json:"pnl"`
 
-	BearerToken string    `json:"bearer_token,omitempty"`
-	AppId       string    `json:"app_id,omitempty"`
-	Source      string    `json:"source,omitempty"`
+	// Auth fields removed 2026-06-25 — fetched at-edge in trade-execution.
 	TradingMode string    `json:"trading_mode"`
 	Timestamp   time.Time `json:"timestamp"`
 }
@@ -125,9 +120,6 @@ func (g *OrderGenerator) GenerateEntryOrders(
 			MCapBucket:    alloc.MCapBucket,
 			IndexName:     alloc.IndexName,
 			EMAAllocPct:   alloc.EMAAllocPct * 100,
-			BearerToken:   strategy.BearerToken,
-			AppId:         strategy.AppId,
-			Source:        strategy.Source,
 			TradingMode:   strategy.TradingMode,
 			Timestamp:     time.Now(),
 		}
@@ -159,9 +151,6 @@ func (g *OrderGenerator) GenerateSLModify(
 		NewSL:       update.NewSL,
 		OldSL:       update.OldSL,
 		NewHigh:     update.NewHigh,
-		BearerToken: strategy.BearerToken,
-		AppId:       strategy.AppId,
-		Source:      strategy.Source,
 		TradingMode: strategy.TradingMode,
 		Timestamp:   time.Now(),
 	}
@@ -186,9 +175,6 @@ func (g *OrderGenerator) GenerateSLExit(
 		ExitPrice:   exitPrice,
 		SLPrice:     pos.CurrentSL,
 		PnL:         pnl,
-		BearerToken: strategy.BearerToken,
-		AppId:       strategy.AppId,
-		Source:      strategy.Source,
 		TradingMode: strategy.TradingMode,
 		Timestamp:   time.Now(),
 	}
