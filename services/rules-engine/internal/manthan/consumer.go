@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -20,10 +21,20 @@ import (
 //   - Kafka `manthan.signals`                     — transport/notification.
 //   - Redis `manthan:signals:{date}`              — hot cache (rebuildable from DB).
 type Consumer struct {
-	reader       *kafka.Reader
-	rdb          *redis.Client
+	reader *kafka.Reader
+	rdb    *redis.Client
+
+	// ltpFeed is wired AFTER NewConsumer via SetLTPFeed because of a
+	// construction-order circular dependency (LTPFeed needs TickHandler,
+	// TickHandler is built after Consumer, Consumer wants LTPFeed). Stored
+	// in an atomic.Pointer so the post-construction Set is safely visible
+	// to the consumer goroutine without relying on the happens-before edge
+	// from the `go` statement that launches Start — without atomic, a
+	// future caller flipping the feed mid-flight (hot-reconfig, dynamic
+	// swap) would race with getLiveLTP reading c.ltpFeed.
+	ltpFeed atomic.Pointer[LTPFeed]
+
 	signalsDB    *sql.DB
-	ltpFeed      *LTPFeed
 	allocator    *Allocator
 	orderGen     *OrderGenerator
 	portfolioMgr *PortfolioManager
@@ -82,11 +93,10 @@ func NewConsumer(
 		MaxBytes: 10e6,
 	})
 
-	return &Consumer{
+	c := &Consumer{
 		reader:       reader,
 		rdb:          rdb,
 		signalsDB:    signalsDB,
-		ltpFeed:      ltpFeed,
 		allocator:    allocator,
 		orderGen:     orderGen,
 		portfolioMgr: portfolioMgr,
@@ -96,6 +106,10 @@ func NewConsumer(
 		emaFn:        emaFn,
 		logger:       logger,
 	}
+	if ltpFeed != nil {
+		c.ltpFeed.Store(ltpFeed)
+	}
+	return c
 }
 
 // Start begins consuming manthan signals. Blocks until ctx is cancelled.
@@ -262,19 +276,32 @@ func (c *Consumer) storeSignal(ctx context.Context, sig ManthanSignal) {
 	}
 	dateKey := "manthan:signals:" + date
 
-	// Remove old entry for same symbol (update with fresh data)
-	existing, _ := c.rdb.SMembers(ctx, dateKey).Result()
+	// Remove old entry for same symbol (update with fresh data).
+	existing, err := c.rdb.SMembers(ctx, dateKey).Result()
+	if err != nil {
+		c.logger.Warn("storeSignal: Redis SMembers failed",
+			zap.String("key", dateKey), zap.Error(err))
+	}
 	for _, raw := range existing {
 		var old ManthanSignal
 		if json.Unmarshal([]byte(raw), &old) == nil && old.Symbol == sig.Symbol {
-			c.rdb.SRem(ctx, dateKey, raw)
+			if err := c.rdb.SRem(ctx, dateKey, raw).Err(); err != nil {
+				c.logger.Warn("storeSignal: Redis SRem failed",
+					zap.String("key", dateKey), zap.String("symbol", sig.Symbol), zap.Error(err))
+			}
 			break
 		}
 	}
 
 	body, _ := json.Marshal(sig)
-	c.rdb.SAdd(ctx, dateKey, string(body))
-	c.rdb.SAdd(ctx, "manthan:signals:dates", date)
+	if err := c.rdb.SAdd(ctx, dateKey, string(body)).Err(); err != nil {
+		c.logger.Warn("storeSignal: Redis SAdd (date bucket) failed",
+			zap.String("key", dateKey), zap.String("symbol", sig.Symbol), zap.Error(err))
+	}
+	if err := c.rdb.SAdd(ctx, "manthan:signals:dates", date).Err(); err != nil {
+		c.logger.Warn("storeSignal: Redis SAdd (dates index) failed",
+			zap.String("date", date), zap.Error(err))
+	}
 }
 
 // loadSignalsForDate reads all signals cached for a specific date.
@@ -377,7 +404,9 @@ func todayIST() string {
 
 // SetLTPFeed sets the LTP feed after construction (needed because of init order).
 func (c *Consumer) SetLTPFeed(feed *LTPFeed) {
-	c.ltpFeed = feed
+	// Atomic Store: safe to call after Start. The next getLiveLTP from the
+	// consumer goroutine picks up the new feed without a torn-read.
+	c.ltpFeed.Store(feed)
 }
 
 // Stop closes the Kafka reader.
@@ -412,8 +441,8 @@ func (c *Consumer) fetchLiveLTP(ctx context.Context, symbol string) (float64, bo
 
 // getLiveLTP tries external Redis (production feed) first, falls back to local Redis.
 func (c *Consumer) getLiveLTP(ctx context.Context, isin, symbol string) (float64, bool) {
-	if c.ltpFeed != nil && isin != "" {
-		if ltp, ok := c.ltpFeed.FetchLiveLTP(ctx, isin); ok {
+	if feed := c.ltpFeed.Load(); feed != nil && isin != "" {
+		if ltp, ok := feed.FetchLiveLTP(ctx, isin); ok {
 			return ltp, true
 		}
 	}
