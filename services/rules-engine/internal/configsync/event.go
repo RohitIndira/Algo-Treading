@@ -31,29 +31,15 @@ type StrategyPayload struct {
 	StrategyType string             `json:"strategy_type"`
 	Active       bool               `json:"active"`
 	TradingMode  string             `json:"trading_mode"`
-	Conditions   ConditionsPayload  `json:"conditions"`
 	TradeConfig  TradeConfigPayload `json:"trade_config"`
-	RiskLimits   RiskLimitsPayload  `json:"risk_limits"`
 	Version      uint64             `json:"version"`
 	CreatedAt    int64              `json:"created_at"` // UnixNano
 	UpdatedAt    int64              `json:"updated_at"` // UnixNano
-}
 
-type ConditionsPayload struct {
-	MatchAllNews      bool     `json:"match_all_news"`
-	ImpactScoreMin    int32    `json:"impact_score_min"`
-	ImpactScoreMax    int32    `json:"impact_score_max"`
-	Sentiments        []string `json:"sentiments"`
-	Categories        []string `json:"categories"`
-	StockCodes        []int64  `json:"stock_codes"`
-	MarketCapTypes    []string `json:"market_cap_types"`
-	MinMarketCap      float64  `json:"min_market_cap"`
-	MaxMarketCap      float64  `json:"max_market_cap"`
-	MinPriceChangePct float64  `json:"min_price_change_pct"`
-	MaxPriceChangePct float64  `json:"max_price_change_pct"`
-	MinVolume         int64    `json:"min_volume"`
-	Exchanges         []string `json:"exchanges"`
-	CreatedAt         int64    `json:"created_at"`
+	// Conditions + RiskLimits fields removed 2026-06-25 (Cat B trim).
+	// They came from the news-event-driven strategy schema; the user-config
+	// Kafka message still includes them but json.Unmarshal silently ignores
+	// unknown fields, so receiving older messages is harmless.
 }
 
 type TradeConfigPayload struct {
@@ -74,13 +60,5 @@ type TradeConfigPayload struct {
 	CreatedAt      int64   `json:"created_at"`
 }
 
-type RiskLimitsPayload struct {
-	MaxDailyTrades          int32   `json:"max_daily_trades"`
-	MaxPerTradeRisk         float64 `json:"max_per_trade_risk"`
-	MaxPortfolioExposurePct float64 `json:"max_portfolio_exposure_pct"`
-	MaxLossPerDay           float64 `json:"max_loss_per_day"`
-	EnableRiskChecks        bool    `json:"enable_risk_checks"`
-	EnableAutoSquareOff     bool    `json:"enable_auto_square_off"`
-	AutoSquareOffTime       string  `json:"auto_square_off_time"`
-	CreatedAt               int64   `json:"created_at"`
-}
+// RiskLimitsPayload removed 2026-06-25 (Cat B trim) — news-event path's risk
+// schema. Manthan enforces its own caps via rebalancer + allocator.

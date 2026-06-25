@@ -68,19 +68,8 @@ func unixNanosToTime(n int64) time.Time {
 	return time.Unix(0, n)
 }
 
-func nilSafeStringSlice(in []string) []string {
-	if in == nil {
-		return []string{}
-	}
-	return in
-}
-
-func nilSafeInt64Slice(in []int64) []int64 {
-	if in == nil {
-		return []int64{}
-	}
-	return in
-}
+// nilSafeStringSlice / nilSafeInt64Slice removed 2026-06-25 (Cat B trim) —
+// they only protected the Conditions mapping that's gone with the news path.
 
 func normalizeOrderType(v string) string {
 	switch v {
@@ -107,16 +96,8 @@ func normalizeExchange(v string) string {
 	}
 }
 
-func normalizeExchanges(in []string) []string {
-	if in == nil {
-		return []string{}
-	}
-	out := make([]string, 0, len(in))
-	for _, v := range in {
-		out = append(out, normalizeExchange(v))
-	}
-	return out
-}
+// normalizeExchanges removed 2026-06-25 (Cat B trim) — served the Conditions
+// mapping. normalizeExchange (singular) is still used for TradeConfig.Exchange.
 
 func normalizeOrderSide(v string) string {
 	switch v {
