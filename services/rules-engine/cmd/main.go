@@ -425,8 +425,7 @@ func main() {
 	// Periodic matching-stats logger removed 2026-06-25 — its source (stats *MatchingStats)
 	// counted news-event matches/orders. Manthan's own counters live in manthan/* publishers.
 
-	logger.Info("Rules Engine Service started successfully",
-		zap.Int("worker_count", cfg.Performance.WorkerCount))
+	logger.Info("Rules Engine Service started successfully")
 
 	// Wait for shutdown signal
 	<-ctx.Done()
