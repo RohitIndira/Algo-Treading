@@ -26,7 +26,7 @@ type MatchingStats struct {
 	// Error statistics
 	EvaluationErrors int64
 	KafkaErrors      int64
-	RabbitMQErrors   int64
+	// RabbitMQErrors removed 2026-06-25 — RabbitMQ publisher gone.
 
 	// Start time
 	StartTime time.Time
@@ -102,10 +102,7 @@ func (s *MatchingStats) IncrementKafkaErrors() {
 	atomic.AddInt64(&s.KafkaErrors, 1)
 }
 
-// IncrementRabbitMQErrors atomically increments rabbitmq errors
-func (s *MatchingStats) IncrementRabbitMQErrors() {
-	atomic.AddInt64(&s.RabbitMQErrors, 1)
-}
+// IncrementRabbitMQErrors removed 2026-06-25 — RabbitMQ publisher gone.
 
 // RecordStrategyMatch records a strategy match
 func (s *MatchingStats) RecordStrategyMatch(strategyID, strategyName string) {
@@ -231,7 +228,6 @@ func (s *MatchingStats) Reset() {
 	atomic.StoreInt64(&s.CacheMisses, 0)
 	atomic.StoreInt64(&s.EvaluationErrors, 0)
 	atomic.StoreInt64(&s.KafkaErrors, 0)
-	atomic.StoreInt64(&s.RabbitMQErrors, 0)
 
 	s.mu.Lock()
 	s.StartTime = time.Now()

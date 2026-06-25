@@ -29,8 +29,7 @@ type Config struct {
 	// Redis Configuration
 	Redis RedisConfig
 
-	// RabbitMQ Configuration
-	RabbitMQ RabbitMQConfig
+	// RabbitMQ config removed 2026-06-25 — Kafka-only publishing.
 
 	// gRPC Client Configuration
 	GRPCClients GRPCClientsConfig
@@ -95,21 +94,7 @@ type RedisConfig struct {
 	ClusterMode  bool
 }
 
-// RabbitMQConfig holds RabbitMQ-specific configuration
-type RabbitMQConfig struct {
-	URL                  string
-	Exchange             string
-	ExchangeType         string
-	Queue                string
-	RoutingKey           string
-	Durable              bool
-	AutoDelete           bool
-	Exclusive            bool
-	NoWait               bool
-	PrefetchCount        int
-	ReconnectDelay       time.Duration
-	MaxReconnectAttempts int
-}
+// RabbitMQConfig removed 2026-06-25 — Kafka-only publishing.
 
 // GRPCClientsConfig holds gRPC client configuration
 type GRPCClientsConfig struct {
@@ -210,21 +195,6 @@ func LoadConfig() (*Config, error) {
 			PoolTimeout:  getEnvAsDuration("REDIS_POOL_TIMEOUT", 4*time.Second),
 			CacheTTL:     getEnvAsDuration("REDIS_CACHE_TTL", 5*time.Minute),
 			ClusterMode:  getEnvAsBool("REDIS_CLUSTER_MODE", false),
-		},
-
-		RabbitMQ: RabbitMQConfig{
-			URL:                  getEnv("RABBITMQ_URL", "amqp://admin:admin123@localhost:5672/"),
-			Exchange:             getEnv("RABBITMQ_EXCHANGE", "orders"),
-			ExchangeType:         getEnv("RABBITMQ_EXCHANGE_TYPE", "direct"),
-			Queue:                getEnv("RABBITMQ_QUEUE", "trade_signals"),
-			RoutingKey:           getEnv("RABBITMQ_ROUTING_KEY", "order.new"),
-			Durable:              getEnvAsBool("RABBITMQ_DURABLE", true),
-			AutoDelete:           getEnvAsBool("RABBITMQ_AUTO_DELETE", false),
-			Exclusive:            getEnvAsBool("RABBITMQ_EXCLUSIVE", false),
-			NoWait:               getEnvAsBool("RABBITMQ_NO_WAIT", false),
-			PrefetchCount:        getEnvAsInt("RABBITMQ_PREFETCH_COUNT", 10),
-			ReconnectDelay:       getEnvAsDuration("RABBITMQ_RECONNECT_DELAY", 5*time.Second),
-			MaxReconnectAttempts: getEnvAsInt("RABBITMQ_MAX_RECONNECT_ATTEMPTS", 10),
 		},
 
 		GRPCClients: GRPCClientsConfig{

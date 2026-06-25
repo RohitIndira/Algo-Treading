@@ -6,7 +6,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// OrderRequest represents an order request to be published to RabbitMQ
+// OrderRequest is the legacy news-event-driven trade signal. Published to
+// the Kafka `trade-signals` topic by publisher.KafkaPublisher and persisted
+// via TradeSignalRepository. The RabbitMQ publisher that originally drove
+// this struct was removed 2026-06-25; the Manthan path uses manthan.ManthanOrder.
 type OrderRequest struct {
 	OrderID      string    `json:"order_id"`
 	UserID       string    `json:"user_id"`

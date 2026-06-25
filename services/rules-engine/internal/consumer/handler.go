@@ -18,9 +18,12 @@ import (
 )
 
 // Handler handles market events
+//
+// RabbitMQ publisher removed 2026-06-25 — Kafka-only publishing has been the
+// only configured path for a long time (main.go passed nil for rabbitPubl).
+// Both the parameter and the if-nil-check branch in HandleEvent are gone.
 type Handler struct {
 	engine         *engine.Engine
-	rabbitPubl     *publisher.Publisher
 	kafkaPubl      *publisher.KafkaPublisher
 	signalRepo     *repository.TradeSignalRepository
 	riskClient     *risk.Client
@@ -36,7 +39,6 @@ type Handler struct {
 // NewHandler creates a new event handler
 func NewHandler(
 	eng *engine.Engine,
-	rabbitPubl *publisher.Publisher,
 	kafkaPubl *publisher.KafkaPublisher,
 	signalRepo *repository.TradeSignalRepository,
 	riskClient *risk.Client,
@@ -49,7 +51,6 @@ func NewHandler(
 ) *Handler {
 	return &Handler{
 		engine:         eng,
-		rabbitPubl:     rabbitPubl,
 		kafkaPubl:      kafkaPubl,
 		signalRepo:     signalRepo,
 		riskClient:     riskClient,
@@ -515,13 +516,9 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 	pubWg.Wait()
 
-	// RabbitMQ publish is critical — failure stops the order.
-	if h.rabbitPubl != nil {
-		if err := h.rabbitPubl.PublishOrder(ctx, orderReq); err != nil {
-			h.stats.IncrementRabbitMQErrors()
-			return fmt.Errorf("failed to publish order: %w", err)
-		}
-	}
+	// RabbitMQ publish path removed 2026-06-25 (Kafka-only publishing has
+	// been the only configured path for a long time — main.go was passing
+	// nil for the RabbitMQ publisher).
 
 	h.stats.IncrementOrdersGenerated()
 
