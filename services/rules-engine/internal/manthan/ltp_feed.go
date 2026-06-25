@@ -3,6 +3,8 @@ package manthan
 import (
 	"context"
 	"encoding/json"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -27,9 +29,25 @@ type LTPFeed struct {
 	pollInterval time.Duration
 	logger       *zap.Logger
 
-	// ISIN → NSE token cache (doesn't change during market hours)
+	// ISIN → NSE token cache (doesn't change during market hours).
+	// Accessed concurrently: poll() runs in the LTP Start goroutine,
+	// FetchLiveLTP is called from Consumer's allocation goroutine. The
+	// mutex guards both reads and writes — a plain map here would
+	// eventually trip Go's concurrent-map panic.
+	tokenMu    sync.RWMutex
 	tokenCache map[string]string
+
+	// lastRedisErrLog is the unix-nano timestamp of the last rate-limited
+	// log for "external Redis Get failed". Loaded/stored atomically; only
+	// one Warn per redisErrLogInterval keeps the log readable during a
+	// sustained outage instead of one Warn per (poll × symbol).
+	lastRedisErrLog int64
 }
+
+// redisErrLogInterval rate-limits the "external Redis Get failed" warning.
+// Picked to be loud enough to notice but quiet enough that a 1-second poll
+// across 50 symbols during a 5-minute Redis outage doesn't drown the log.
+const redisErrLogInterval = 30 * time.Second
 
 // LTPFeedConfig configures the external Redis connection.
 type LTPFeedConfig struct {
@@ -97,12 +115,9 @@ func (f *LTPFeed) Start(ctx context.Context) {
 }
 
 func (f *LTPFeed) poll(ctx context.Context) {
-	activeSymbols := f.portfolioMgr.ActiveSymbols()
-	if len(activeSymbols) == 0 {
-		return
-	}
-
-	// Collect ISINs from active positions
+	// Collect ISINs from active positions in a single pass — the previous
+	// implementation called ActiveSymbols() just to test for empty and
+	// then re-walked AllPortfolios, wasting the first call's result.
 	type posInfo struct {
 		symbol string
 		isin   string
@@ -115,6 +130,9 @@ func (f *LTPFeed) poll(ctx context.Context) {
 			}
 		}
 	}
+	if len(positions) == 0 {
+		return
+	}
 
 	for _, p := range positions {
 		ltp, ok := f.fetchLTP(ctx, p.isin, p.symbol)
@@ -125,7 +143,11 @@ func (f *LTPFeed) poll(ctx context.Context) {
 	}
 }
 
-// fetchLTP resolves ISIN → token → market data → LTP
+// fetchLTP resolves ISIN → token → market data → LTP.
+//
+// symbol is used purely for log context — kept even when blank
+// (FetchLiveLTP allocation path) so the rate-limited error message
+// stays readable.
 func (f *LTPFeed) fetchLTP(ctx context.Context, isin, symbol string) (float64, bool) {
 	token, ok := f.resolveToken(ctx, isin)
 	if !ok {
@@ -135,6 +157,7 @@ func (f *LTPFeed) fetchLTP(ctx context.Context, isin, symbol string) (float64, b
 	key := "market:nse:" + token
 	raw, err := f.extRedis.Get(ctx, key).Result()
 	if err != nil {
+		f.warnRedisErr("market Get failed", key, symbol, err)
 		return 0, false
 	}
 
@@ -149,13 +172,18 @@ func (f *LTPFeed) fetchLTP(ctx context.Context, isin, symbol string) (float64, b
 }
 
 func (f *LTPFeed) resolveToken(ctx context.Context, isin string) (string, bool) {
-	// Check cache first
+	// Cache check under a read lock — vast majority of calls take this
+	// path during a normal trading day.
+	f.tokenMu.RLock()
 	if token, ok := f.tokenCache[isin]; ok {
+		f.tokenMu.RUnlock()
 		return token, true
 	}
+	f.tokenMu.RUnlock()
 
 	raw, err := f.extRedis.Get(ctx, "isin:"+isin).Result()
 	if err != nil {
+		f.warnRedisErr("isin Get failed", "isin:"+isin, "", err)
 		return "", false
 	}
 
@@ -166,8 +194,30 @@ func (f *LTPFeed) resolveToken(ctx context.Context, isin string) (string, bool) 
 		return "", false
 	}
 
+	f.tokenMu.Lock()
 	f.tokenCache[isin] = data.NSECode
+	f.tokenMu.Unlock()
 	return data.NSECode, true
+}
+
+// warnRedisErr emits a Warn for an external-Redis failure, but only once
+// per redisErrLogInterval. During a sustained outage the operator gets
+// one line every 30 seconds instead of one per (symbol × poll cycle),
+// which can be hundreds per second on a busy book.
+func (f *LTPFeed) warnRedisErr(msg, key, symbol string, err error) {
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&f.lastRedisErrLog)
+	if now-last < int64(redisErrLogInterval) {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&f.lastRedisErrLog, last, now) {
+		// Another goroutine just logged; let it win.
+		return
+	}
+	f.logger.Warn("LTP feed: external Redis "+msg,
+		zap.String("key", key),
+		zap.String("symbol", symbol),
+		zap.Error(err))
 }
 
 // FetchLiveLTP is a convenience method for the consumer to get live LTP
