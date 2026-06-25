@@ -159,8 +159,12 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 					zap.Error(err))
 			}
 			if rdb != nil {
-				rdb.Del(ctx, posKey)
-				rdb.SRem(ctx, "manthan:positions:active", setMember)
+				if err := rdb.Del(ctx, posKey).Err(); err != nil {
+					pm.logger.Warn("Rehydrate: Redis Del failed", zap.String("key", posKey), zap.Error(err))
+				}
+				if err := rdb.SRem(ctx, "manthan:positions:active", setMember).Err(); err != nil {
+					pm.logger.Warn("Rehydrate: Redis SRem failed", zap.String("member", setMember), zap.Error(err))
+				}
 			}
 			orphans++
 			pm.logger.Warn("Rehydrate: orphan position cleaned up (strategy soft-deleted in DB)",
@@ -209,8 +213,12 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 				"ema_pct":      emaPct * 100,
 				"trading_mode": strategy.TradingMode,
 			})
-			rdb.Set(ctx, posKey, payload, 30*24*time.Hour)
-			rdb.SAdd(ctx, "manthan:positions:active", setMember)
+			if err := rdb.Set(ctx, posKey, payload, 30*24*time.Hour).Err(); err != nil {
+				pm.logger.Warn("Rehydrate: Redis Set failed", zap.String("key", posKey), zap.Error(err))
+			}
+			if err := rdb.SAdd(ctx, "manthan:positions:active", setMember).Err(); err != nil {
+				pm.logger.Warn("Rehydrate: Redis SAdd failed", zap.String("member", setMember), zap.Error(err))
+			}
 			seenRedisKeys[posKey] = struct{}{}
 		}
 
@@ -242,7 +250,10 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 				if _, ok := seenRedisKeys[k]; ok {
 					continue
 				}
-				rdb.Del(ctx, k)
+				if err := rdb.Del(ctx, k).Err(); err != nil {
+					pm.logger.Warn("Rehydrate: stale Redis Del failed", zap.String("key", k), zap.Error(err))
+					continue
+				}
 				staleEvicted++
 			}
 			if next == 0 {
@@ -333,12 +344,19 @@ func (pm *PortfolioManager) CleanupOrphans(
 		}
 
 		// Genuine orphan — also drop from in-memory portfolio if it was
-		// rehydrated earlier.
-		pm.mu.Lock()
-		if p, ok := pm.portfolios[rk.strategyID]; ok {
+		// rehydrated earlier. pm.mu (outer) only protects the portfolios
+		// map; the inner Positions delete must take per-Portfolio Mu, same
+		// pattern as the rest of PortfolioManager since 2026-06-25
+		// (commit 73d418d). Race window had been open while the orphan
+		// scanner overlapped the LTP poll on the same map.
+		pm.mu.RLock()
+		p, ok := pm.portfolios[rk.strategyID]
+		pm.mu.RUnlock()
+		if ok {
+			p.Mu.Lock()
 			delete(p.Positions, rk.symbol)
+			p.Mu.Unlock()
 		}
-		pm.mu.Unlock()
 
 		if _, err := db.ExecContext(ctx, `
 			UPDATE manthan_positions
@@ -352,8 +370,14 @@ func (pm *PortfolioManager) CleanupOrphans(
 			continue
 		}
 		if rdb != nil {
-			rdb.Del(ctx, fmt.Sprintf("manthan:position:%s:%s", rk.strategyID, rk.symbol))
-			rdb.SRem(ctx, "manthan:positions:active", fmt.Sprintf("%s:%s", rk.strategyID, rk.symbol))
+			posKey := fmt.Sprintf("manthan:position:%s:%s", rk.strategyID, rk.symbol)
+			setMember := fmt.Sprintf("%s:%s", rk.strategyID, rk.symbol)
+			if err := rdb.Del(ctx, posKey).Err(); err != nil {
+				pm.logger.Warn("Orphan cleanup: Redis Del failed", zap.String("key", posKey), zap.Error(err))
+			}
+			if err := rdb.SRem(ctx, "manthan:positions:active", setMember).Err(); err != nil {
+				pm.logger.Warn("Orphan cleanup: Redis SRem failed", zap.String("member", setMember), zap.Error(err))
+			}
 		}
 		cleaned++
 		pm.logger.Warn("Orphan position cleaned up (strategy soft-deleted in DB)",
