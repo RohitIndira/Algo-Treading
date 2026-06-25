@@ -41,9 +41,10 @@ type manthanEntryMessage struct {
 	MCapBucket    string    `json:"mcap_bucket"`
 	IndexName     string    `json:"index_name"`
 	EMAAllocPct   float64   `json:"ema_alloc_pct"`
-	BearerToken   string    `json:"bearer_token,omitempty"`
-	AppId         string    `json:"app_id,omitempty"`
-	Source        string    `json:"source,omitempty"`
+	// Auth fields removed 2026-06-25 — trade-execution fetches creds at-edge
+	// via user-config gRPC. rebalancer still holds them internally on
+	// StrategyConfig for its own direct broker calls (fund-limit/holdings),
+	// but they no longer ride the Kafka wire.
 	TradingMode   string    `json:"trading_mode"`
 	Timestamp     time.Time `json:"timestamp"`
 
@@ -291,9 +292,6 @@ func buildEntryMessage(cfg StrategyConfig, e PlannedEntry) manthanEntryMessage {
 		MCapBucket:    e.MCapBucket,
 		IndexName:     e.IndexName,
 		EMAAllocPct:   e.EMAFraction * 100,
-		BearerToken:      cfg.BearerToken,
-		AppId:            cfg.AppID,
-		Source:           cfg.Source,
 		TradingMode:      cfg.TradingMode,
 		Timestamp:        time.Now(),
 		TopUpForSignalID: e.TopUpForSignalID,
