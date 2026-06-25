@@ -116,9 +116,10 @@ type ManthanSignal struct {
 	MCapBucket    string  `json:"mcap_bucket"`
 	IndexName     string  `json:"index_name"`
 	EMAAllocPct   float64 `json:"ema_alloc_pct"`
-	BearerToken   string  `json:"bearer_token"`
-	AppId         string  `json:"app_id"`
-	Source        string  `json:"source"`
+	// BearerToken/AppId/Source fields removed 2026-06-25 — handlers now
+	// always fetch creds at-edge via authProvider (user-config gRPC + DB
+	// fallback). The token no longer rides the Kafka wire. See
+	// internal/repository/grpc_credentials_repository.go.
 	TradingMode   string  `json:"trading_mode"`
 
 	// TopUpForSignalID — when set, this signal tops up an existing position
@@ -143,9 +144,7 @@ type SLModifySignal struct {
 	NewSL      float64 `json:"new_sl"`
 	OldSL      float64 `json:"old_sl"`
 	NewHigh    float64 `json:"new_high"`
-	BearerToken string `json:"bearer_token"`
-	AppId       string `json:"app_id"`
-	Source      string `json:"source"`
+	// Auth fields removed 2026-06-25 — fetched at-edge via authProvider.
 	TradingMode string `json:"trading_mode"`
 }
 
@@ -164,9 +163,7 @@ type SLExitSignal struct {
 	ExitPrice   float64 `json:"exit_price"`
 	SLPrice     float64 `json:"sl_price"`
 	PnL         float64 `json:"pnl"`
-	BearerToken string  `json:"bearer_token"`
-	AppId       string  `json:"app_id"`
-	Source      string  `json:"source"`
+	// Auth fields removed 2026-06-25 — fetched at-edge via authProvider.
 	TradingMode string  `json:"trading_mode"`
 }
 

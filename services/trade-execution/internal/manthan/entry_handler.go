@@ -228,21 +228,25 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 		return 0, fmt.Errorf("insert order: %w", err)
 	}
 
-	// Resolve auth — prefer fresh credentials from cache over signal's (possibly stale) token
-	var auth BrokerAuth
-	if h.authProvider != nil {
-		if freshAuth := h.authProvider(signal.UserID); freshAuth != nil {
-			auth = *freshAuth
-		}
+	// Resolve auth at-edge via authProvider (user-config gRPC + DB fallback).
+	// Auth no longer rides the Kafka signal — see internal/manthan/models.go
+	// and internal/repository/grpc_credentials_repository.go. If authProvider
+	// can't resolve creds (no SSO yet, both gRPC + DB unreachable), we fail
+	// the entry — placing a broker order without creds would 401 anyway.
+	if h.authProvider == nil {
+		h.logger.Error("Entry rejected — authProvider not wired",
+			zap.String("user_id", signal.UserID),
+			zap.String("symbol", signal.Symbol))
+		return 0, fmt.Errorf("authProvider not configured")
 	}
-	if auth.BearerToken == "" {
-		auth = BrokerAuth{
-			UserID:      signal.UserID,
-			BearerToken: signal.BearerToken,
-			AppID:       signal.AppId,
-			Source:      signal.Source,
-		}
+	freshAuth := h.authProvider(signal.UserID)
+	if freshAuth == nil || freshAuth.BearerToken == "" {
+		h.logger.Error("Entry rejected — no broker credentials available",
+			zap.String("user_id", signal.UserID),
+			zap.String("symbol", signal.Symbol))
+		return 0, fmt.Errorf("no broker credentials for user %s", signal.UserID)
 	}
+	auth := *freshAuth
 
 	// Margin pre-check (LIVE only) — skip the broker call if we're short on
 	// margin. Saves a round-trip + avoids noisy "Margin Limit exceeded"

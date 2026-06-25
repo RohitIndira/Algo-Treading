@@ -63,18 +63,37 @@ func (h *SLHandler) SetEventPublisher(p *ManthanEventPublisher) {
 	h.eventPub = p
 }
 
-func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, signal ManthanSignal, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) {
-	// Use fresh credentials from cache (signal token may be stale)
-	auth := BrokerAuth{
-		UserID:      signal.UserID,
-		BearerToken: signal.BearerToken,
-		AppID:       signal.AppId,
-		Source:      signal.Source,
+// resolveAuth fetches broker creds at-edge via authProvider (user-config gRPC
+// with DB fallback). Returns ok=false and logs if creds can't be obtained;
+// callers should return early in that case rather than attempting the broker
+// call (which would just 401). Replaces the legacy "build from signal then
+// override" pattern from before 2026-06-25 — see internal/manthan/models.go.
+func (h *SLHandler) resolveAuth(userID, symbol, op string) (BrokerAuth, bool) {
+	if h.authProvider == nil {
+		h.logger.Error("SL: authProvider not wired",
+			zap.String("user_id", userID),
+			zap.String("symbol", symbol),
+			zap.String("op", op))
+		return BrokerAuth{}, false
 	}
-	if h.authProvider != nil {
-		if freshAuth := h.authProvider(signal.UserID); freshAuth != nil {
-			auth = *freshAuth
-		}
+	a := h.authProvider(userID)
+	if a == nil || a.BearerToken == "" {
+		h.logger.Error("SL: no broker credentials available",
+			zap.String("user_id", userID),
+			zap.String("symbol", symbol),
+			zap.String("op", op))
+		return BrokerAuth{}, false
+	}
+	return *a, true
+}
+
+func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, signal ManthanSignal, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) {
+	// Resolve auth at-edge via authProvider — token no longer rides the Kafka
+	// signal. If creds are unavailable we'd 401 against the broker anyway, so
+	// fail fast with a clear log instead.
+	auth, ok := h.resolveAuth(signal.UserID, signal.Symbol, "PlaceInitialSL")
+	if !ok {
+		return
 	}
 
 	// NOTE: the DPR clamp deliberately does NOT happen here. The incoming
@@ -248,16 +267,9 @@ func (h *SLHandler) MergeTopupSL(
 		return
 	}
 
-	auth := BrokerAuth{
-		UserID:      signal.UserID,
-		BearerToken: signal.BearerToken,
-		AppID:       signal.AppId,
-		Source:      signal.Source,
-	}
-	if h.authProvider != nil {
-		if fresh := h.authProvider(signal.UserID); fresh != nil {
-			auth = *fresh
-		}
+	auth, ok := h.resolveAuth(signal.UserID, signal.Symbol, "TopUpSL")
+	if !ok {
+		return
 	}
 
 	combinedQty := parentSL.Qty + topupQty
@@ -451,11 +463,9 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 		return nil
 	}
 
-	auth := BrokerAuth{
-		UserID:      signal.UserID,
-		BearerToken: signal.BearerToken,
-		AppID:       signal.AppId,
-		Source:      signal.Source,
+	auth, ok := h.resolveAuth(signal.UserID, signal.Symbol, "ModifyTrail")
+	if !ok {
+		return fmt.Errorf("no broker creds for SL modify")
 	}
 
 	// Atomic modify-in-place. On AU004/401, refresh credentials then retry.
@@ -498,8 +508,7 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 			h.emergencySell(ctx, ManthanSignal{
 				OrderID: entrySignalID, // carry entry signal_id into emergency-sell publishing
 				UserID:  signal.UserID, StrategyID: signal.StrategyID,
-				Symbol: signal.Symbol, BearerToken: signal.BearerToken,
-				AppId: signal.AppId, Source: signal.Source,
+				Symbol:   signal.Symbol,
 				Quantity: int32(targetSL.Qty), TradingMode: signal.TradingMode,
 			}, info, auth, targetSL.Qty, "SL modify failed after retry")
 			return err
@@ -576,11 +585,9 @@ func (h *SLHandler) EmergencySell(ctx context.Context, signal SLExitSignal) erro
 		return fmt.Errorf("resolve symbol: %w", err)
 	}
 
-	auth := BrokerAuth{
-		UserID:      signal.UserID,
-		BearerToken: signal.BearerToken,
-		AppID:       signal.AppId,
-		Source:      signal.Source,
+	auth, ok := h.resolveAuth(signal.UserID, signal.Symbol, "EmergencySell")
+	if !ok {
+		return fmt.Errorf("no broker creds for emergency sell")
 	}
 
 	// PAPER mode
