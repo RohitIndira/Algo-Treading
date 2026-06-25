@@ -240,3 +240,230 @@ func TestApply_RejectsMissingEventSeq(t *testing.T) {
 		t.Fatalf("Apply with zero EventSeq returned applied=true; want false")
 	}
 }
+
+// ─── SL_FILLED / EXIT_FILLED ───────────────────────────────────────────
+
+// TestApply_SL_FILLED_RealizedPnL covers the SL trigger path: an ACTIVE
+// position with a known entry price exits at a lower fill price. The
+// projector must:
+//   - INSERT into position_events (idempotency log)
+//   - UPDATE manthan_positions: status=EXITED, exit_price, realized_pnl
+//     computed as (exit_price - entry_price) × qty, exit_reason='SL_TRIGGERED',
+//     exit_time non-null, event_seq advanced
+//   - UPDATE manthan_signal_decisions: status → CLOSED
+//
+// Uses a realistic Manthan scenario: bought 100 @ 102.50, SL trips at
+// 82.10 (a hair above the 20% intended trigger at 82.00 — DPR clamp
+// shifted it). Realized P&L = (82.10 - 102.50) × 100 = -2,040.00.
+func TestApply_SL_FILLED_RealizedPnL(t *testing.T) {
+	resetTables(t)
+	signalID := newTestUUID(t, "signal")
+	strategyID := newTestUUID(t, "strategy")
+
+	insertProposedDecision(t, proposedDecision{
+		SignalID:         signalID,
+		UserID:           "S4450",
+		StrategyID:       strategyID,
+		Symbol:           "SANDHAR",
+		LTP:              100.00,
+		IntendedQty:      100,
+		IntendedInvested: 10000.00,
+		InitialSLTarget:  80.00,
+		Industry:         "Auto Components",
+		MCapBucket:       "MID",
+		IndexName:        "NFTYMCP150",
+	})
+
+	proj := newProjector(t)
+	ctx := context.Background()
+
+	// Drive the position to ACTIVE first.
+	entryEv := &FillEvent{
+		Type:          "ENTRY_FILLED",
+		SignalID:      signalID,
+		EventSeq:      1,
+		StrategyID:    strategyID,
+		UserID:        "S4450",
+		Symbol:        "SANDHAR",
+		FillPrice:     102.50,
+		FillQty:       100,
+		BrokerOrderID: "BO-Entry",
+		Source:        "WSS",
+		TradingMode:   "LIVE",
+	}
+	if _, err := proj.Apply(ctx, entryEv); err != nil {
+		t.Fatalf("ENTRY_FILLED setup failed: %v", err)
+	}
+
+	// Now the SL trips. event_seq must be > entry's (monotonicity guard).
+	slEv := &FillEvent{
+		Type:          "SL_FILLED",
+		SignalID:      signalID,
+		EventSeq:      2,
+		StrategyID:    strategyID,
+		UserID:        "S4450",
+		Symbol:        "SANDHAR",
+		FillPrice:     82.10, // broker actually filled here
+		FillQty:       100,
+		BrokerOrderID: "BO-SL",
+		Source:        "WSS",
+		TradingMode:   "LIVE",
+	}
+	applied, err := proj.Apply(ctx, slEv)
+	if err != nil {
+		t.Fatalf("Apply SL_FILLED err: %v", err)
+	}
+	if !applied {
+		t.Fatalf("Apply SL_FILLED applied=false; want true")
+	}
+
+	// 2 events in the idempotency log now (entry + sl).
+	if got := countPositionEvents(t, signalID); got != 2 {
+		t.Errorf("manthan_position_events count = %d, want 2 (ENTRY + SL)", got)
+	}
+
+	pos, ok := fetchPosition(t, signalID)
+	if !ok {
+		t.Fatalf("position row missing after SL_FILLED")
+	}
+	if pos.Status != "EXITED" {
+		t.Errorf("position.Status = %q, want EXITED", pos.Status)
+	}
+	if !pos.ExitPrice.Valid || pos.ExitPrice.Float64 != 82.10 {
+		t.Errorf("position.ExitPrice = %+v, want valid=true value=82.10", pos.ExitPrice)
+	}
+	// (82.10 - 102.50) * 100 = -2040.00
+	wantPnL := -2040.00
+	if !pos.RealizedPnL.Valid || pos.RealizedPnL.Float64 != wantPnL {
+		t.Errorf("position.RealizedPnL = %+v, want valid=true value=%v", pos.RealizedPnL, wantPnL)
+	}
+	if !pos.ExitReason.Valid || pos.ExitReason.String != "SL_TRIGGERED" {
+		t.Errorf("position.ExitReason = %+v, want valid=true value=SL_TRIGGERED", pos.ExitReason)
+	}
+	if !pos.ExitTime.Valid {
+		t.Errorf("position.ExitTime = invalid; want non-null timestamp")
+	}
+	if !pos.EventSeq.Valid || pos.EventSeq.Int64 != 2 {
+		t.Errorf("position.EventSeq = %+v, want valid=true value=2 (advanced past entry)", pos.EventSeq)
+	}
+
+	dec := fetchDecision(t, signalID)
+	if dec.Status != "CLOSED" {
+		t.Errorf("decision.Status after SL_FILLED = %q, want CLOSED", dec.Status)
+	}
+}
+
+// ─── MANUAL_EXIT_DETECTED ──────────────────────────────────────────────
+
+// TestApply_MANUAL_EXIT_DETECTED covers the path that liquidated S4450 on
+// 2026-06-12 (see project_manthan_safety_monitor_liquidation_hazard memory):
+// the user closed an ACTIVE position outside our system (broker mobile
+// app, manual phone call to broker, etc.). The projector must:
+//   - mark the position EXITED with exit_reason='MANUAL_EXIT',
+//     exit_price LEFT NULL (we have no fill price for a manual exit),
+//     exit_time non-null
+//   - flip decision.status → MANUALLY_EXITED
+//   - set decision.user_override_until = NOW() + 3 days so the allocator
+//     skips this signal until the cooldown clears
+//   - fire NotifyManualExit on the notifier (best-effort, post-commit)
+func TestApply_MANUAL_EXIT_DETECTED(t *testing.T) {
+	resetTables(t)
+	signalID := newTestUUID(t, "signal")
+	strategyID := newTestUUID(t, "strategy")
+
+	insertProposedDecision(t, proposedDecision{
+		SignalID:         signalID,
+		UserID:           "S4450",
+		StrategyID:       strategyID,
+		Symbol:           "GALLANTT",
+		LTP:              100.00,
+		IntendedQty:      100,
+		IntendedInvested: 10000.00,
+		InitialSLTarget:  80.00,
+		Industry:         "Steel",
+		MCapBucket:       "MID",
+		IndexName:        "NIFTY50",
+	})
+
+	proj := newProjector(t)
+	notif := &fakeNotifier{}
+	proj.SetNotifier(notif)
+	ctx := context.Background()
+
+	// Drive position to ACTIVE.
+	entryEv := &FillEvent{
+		Type:          "ENTRY_FILLED",
+		SignalID:      signalID,
+		EventSeq:      1,
+		StrategyID:    strategyID,
+		UserID:        "S4450",
+		Symbol:        "GALLANTT",
+		FillPrice:     102.50,
+		FillQty:       100,
+		BrokerOrderID: "BO-Entry",
+		Source:        "WSS",
+		TradingMode:   "LIVE",
+	}
+	if _, err := proj.Apply(ctx, entryEv); err != nil {
+		t.Fatalf("ENTRY_FILLED setup failed: %v", err)
+	}
+
+	// Reconciler detects the position is no longer held at the broker.
+	manualEv := &FillEvent{
+		Type:            "MANUAL_EXIT_DETECTED",
+		SignalID:        signalID,
+		EventSeq:        2,
+		StrategyID:      strategyID,
+		UserID:          "S4450",
+		Symbol:          "GALLANTT",
+		ExpectedQty:     100, // qty we WANTED to hold (the notification reports this)
+		RejectionReason: "broker reports 0 shares; expected 100",
+		Source:          "RECONCILER",
+		TradingMode:     "LIVE",
+	}
+	applied, err := proj.Apply(ctx, manualEv)
+	if err != nil {
+		t.Fatalf("Apply MANUAL_EXIT_DETECTED err: %v", err)
+	}
+	if !applied {
+		t.Fatalf("Apply MANUAL_EXIT_DETECTED applied=false; want true")
+	}
+
+	pos, ok := fetchPosition(t, signalID)
+	if !ok {
+		t.Fatalf("position row missing")
+	}
+	if pos.Status != "EXITED" {
+		t.Errorf("position.Status = %q, want EXITED", pos.Status)
+	}
+	if !pos.ExitReason.Valid || pos.ExitReason.String != "MANUAL_EXIT" {
+		t.Errorf("position.ExitReason = %+v, want valid=true value=MANUAL_EXIT", pos.ExitReason)
+	}
+	// CRITICAL: exit_price stays NULL on manual exit — we don't have a
+	// real broker fill price for it. Setting a fake value here would
+	// pollute realized P&L reporting.
+	if pos.ExitPrice.Valid {
+		t.Errorf("position.ExitPrice = %+v; want NULL (manual exit has no broker fill price)", pos.ExitPrice)
+	}
+	if pos.RealizedPnL.Valid {
+		t.Errorf("position.RealizedPnL = %+v; want NULL (cannot compute without exit_price)", pos.RealizedPnL)
+	}
+	if !pos.ExitTime.Valid {
+		t.Errorf("position.ExitTime = invalid; want non-null")
+	}
+
+	dec := fetchDecision(t, signalID)
+	if dec.Status != "MANUALLY_EXITED" {
+		t.Errorf("decision.Status = %q, want MANUALLY_EXITED", dec.Status)
+	}
+	// user_override_until ≈ NOW() + 3 days. We just assert it's > NOW().
+	uo := fetchDecisionUserOverride(t, signalID)
+	if !uo.Valid {
+		t.Errorf("decision.user_override_until = NULL; want NOW() + 3 days")
+	}
+
+	// Notifier fired exactly once for this signal.
+	if len(notif.manualExits) != 1 || notif.manualExits[0] != signalID {
+		t.Errorf("notifier.manualExits = %+v, want [%s]", notif.manualExits, signalID)
+	}
+}

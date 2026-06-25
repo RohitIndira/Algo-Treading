@@ -237,6 +237,10 @@ type positionRow struct {
 	Status         string
 	EventSeq       sql.NullInt64
 	BrokerOrderID  sql.NullString
+	ExitPrice      sql.NullFloat64
+	RealizedPnL    sql.NullFloat64
+	ExitReason     sql.NullString
+	ExitTime       sql.NullTime
 }
 
 func fetchPosition(t *testing.T, signalID string) (positionRow, bool) {
@@ -244,10 +248,12 @@ func fetchPosition(t *testing.T, signalID string) (positionRow, bool) {
 	var r positionRow
 	err := testDB.QueryRow(`
 		SELECT signal_id::text, symbol, quantity, entry_price, invested_amt,
-		       current_sl, high_since_entry, status, event_seq, broker_order_id
+		       current_sl, high_since_entry, status, event_seq, broker_order_id,
+		       exit_price, realized_pnl, exit_reason, exit_time
 		FROM manthan_positions WHERE signal_id = $1`, signalID).
 		Scan(&r.SignalID, &r.Symbol, &r.Quantity, &r.EntryPrice, &r.InvestedAmt,
-			&r.CurrentSL, &r.HighSinceEntry, &r.Status, &r.EventSeq, &r.BrokerOrderID)
+			&r.CurrentSL, &r.HighSinceEntry, &r.Status, &r.EventSeq, &r.BrokerOrderID,
+			&r.ExitPrice, &r.RealizedPnL, &r.ExitReason, &r.ExitTime)
 	if err == sql.ErrNoRows {
 		return positionRow{}, false
 	}
@@ -255,6 +261,19 @@ func fetchPosition(t *testing.T, signalID string) (positionRow, bool) {
 		t.Fatalf("fetchPosition: %v", err)
 	}
 	return r, true
+}
+
+// fetchDecisionUserOverride returns the user_override_until column so
+// MANUAL_EXIT tests can assert the 3-day allocator cooldown is set.
+func fetchDecisionUserOverride(t *testing.T, signalID string) sql.NullTime {
+	t.Helper()
+	var v sql.NullTime
+	err := testDB.QueryRow(`
+		SELECT user_override_until FROM manthan_signal_decisions WHERE signal_id = $1`, signalID).Scan(&v)
+	if err != nil {
+		t.Fatalf("fetchDecisionUserOverride: %v", err)
+	}
+	return v
 }
 
 func countPositionEvents(t *testing.T, signalID string) int {
