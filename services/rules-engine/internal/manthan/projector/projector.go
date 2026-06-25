@@ -1,4 +1,10 @@
-package manthan
+package projector
+
+// Moved from internal/manthan/position_projector.go on 2026-06-25 (Finding #3).
+// Single-file extraction with no behaviour change. Notifier is now a narrow
+// 3-method interface defined in this file that manthan.NotificationPublisher
+// satisfies — projector therefore does not import the wider manthan package
+// and can be tested standalone.
 
 import (
 	"context"
@@ -9,6 +15,16 @@ import (
 
 	"go.uber.org/zap"
 )
+
+// Notifier is the slice of internal/manthan.NotificationPublisher that
+// PositionProjector calls. Defined here so the projector subpackage is
+// independent of the manthan package. NotificationPublisher already has
+// matching methods so the import-site assignment is structurally typed.
+type Notifier interface {
+	NotifyManualExit(ctx context.Context, userID, strategyID, signalID, symbol string, dbQty int)
+	NotifyManualPartialExit(ctx context.Context, userID, strategyID, signalID, symbol string, oldQty, newQty int)
+	NotifyManualSLCancelled(ctx context.Context, userID, strategyID, signalID, symbol string)
+}
 
 // PositionProjector applies broker events to the position tables in a single
 // atomic Postgres transaction:
@@ -29,7 +45,7 @@ import (
 // flag that switches the entry-write path to manthan_signal_decisions).
 type PositionProjector struct {
 	db       *sql.DB
-	notifier *NotificationPublisher // optional — nil-safe; emits user-facing events
+	notifier Notifier // optional — nil-safe; emits user-facing events
 	logger   *zap.Logger
 }
 
@@ -37,10 +53,10 @@ func NewPositionProjector(db *sql.DB, logger *zap.Logger) *PositionProjector {
 	return &PositionProjector{db: db, logger: logger}
 }
 
-// SetNotifier attaches a NotificationPublisher so MANUAL_* projections emit
-// user-facing notifications to manthan.notifications. Called once during
-// startup wiring; nil-safe to leave unset (no notifications fire).
-func (p *PositionProjector) SetNotifier(n *NotificationPublisher) {
+// SetNotifier attaches a Notifier (manthan.NotificationPublisher satisfies it)
+// so MANUAL_* projections emit user-facing notifications. Nil-safe — if
+// unset the projector simply skips the notifications.
+func (p *PositionProjector) SetNotifier(n Notifier) {
 	if p == nil {
 		return
 	}

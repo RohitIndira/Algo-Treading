@@ -20,6 +20,7 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/projector"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"go.uber.org/zap"
 )
@@ -88,7 +89,7 @@ type Manthan struct {
 	portfolioMgr  *PortfolioManager
 	consumer      *Consumer
 	fillConsumer  *FillConsumer
-	projector     *PositionProjector
+	proj          *projector.PositionProjector
 	ltpFeed       *LTPFeed // may be nil — external Redis was not configured
 	signalsDB     *sql.DB  // opened by Wire; closed by Close
 	manthanDB     *sql.DB  // borrowed — main.go owns the lifecycle
@@ -281,9 +282,9 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 	}
 
 	// Projector + notifier (CQRS write path).
-	m.projector = NewPositionProjector(deps.ManthanDB, logger)
+	m.proj = projector.NewPositionProjector(deps.ManthanDB, logger)
 	m.notifier = NewNotificationPublisher(deps.KafkaBrokers, deps.NotificationsEnabled, logger)
-	m.projector.SetNotifier(m.notifier)
+	m.proj.SetNotifier(m.notifier)
 	if deps.NotificationsEnabled {
 		logger.Info("Manthan notifications ENABLED — publishing to manthan.notifications topic")
 	}
@@ -295,7 +296,7 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			Topic:              "manthan.execution.events",
 			DecisionLogEnabled: deps.DecisionLogEnabled,
 		},
-		m.portfolioMgr, slMgr, m.publisher, m.projector, 20.0, logger,
+		m.portfolioMgr, slMgr, m.publisher, m.proj, 20.0, logger,
 	)
 
 	// Sync warm-up — fill Redis cache from Postgres so newly-bootstrapped
@@ -370,7 +371,7 @@ func (m *Manthan) Start(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					n, err := m.projector.MarkStaleDecisionsTimedOut(ctx, 120)
+					n, err := m.proj.MarkStaleDecisionsTimedOut(ctx, 120)
 					if err != nil {
 						m.logger.Warn("Reaper: stale decision sweep failed", zap.Error(err))
 						continue

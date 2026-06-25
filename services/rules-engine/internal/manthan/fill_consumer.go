@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/projector"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
@@ -44,7 +45,7 @@ type FillConsumer struct {
 	portfolioMgr *PortfolioManager
 	slMgr        *TrailingSLManager
 	publisher    OrderPublisher
-	projector    *PositionProjector
+	proj         *projector.PositionProjector
 	slPct        float64 // 20
 	logger       *zap.Logger
 
@@ -63,7 +64,7 @@ func NewFillConsumer(
 	portfolioMgr *PortfolioManager,
 	slMgr *TrailingSLManager,
 	publisher OrderPublisher,
-	projector *PositionProjector,
+	proj *projector.PositionProjector,
 	slPct float64,
 	logger *zap.Logger,
 ) *FillConsumer {
@@ -89,7 +90,7 @@ func NewFillConsumer(
 		portfolioMgr:       portfolioMgr,
 		slMgr:              slMgr,
 		publisher:          publisher,
-		projector:          projector,
+		proj:               proj,
 		slPct:              slPct,
 		logger:             logger,
 		decisionLogEnabled: cfg.DecisionLogEnabled,
@@ -145,7 +146,7 @@ func (c *FillConsumer) Start(ctx context.Context) {
 // (success, parse failure, idempotent duplicate) return false so the offset
 // advances.
 func (c *FillConsumer) processOne(ctx context.Context, msg kafka.Message, processed map[string]bool) (retryable bool) {
-	var event FillEvent
+	var event projector.FillEvent
 	if err := json.Unmarshal(msg.Value, &event); err != nil {
 		// Poison message — can never be processed. Commit and move on.
 		c.logger.Warn("Fill event unmarshal failed — dropping",
@@ -165,8 +166,8 @@ func (c *FillConsumer) processOne(ctx context.Context, msg kafka.Message, proces
 	// overwrite the correct in-memory CurrentSL while the DB stays correct
 	// (the projector's `event_seq < $2` guard protects DB but applyInMemory
 	// has no such guard). So we skip in-memory on duplicate.
-	if c.decisionLogEnabled && c.projector != nil {
-		applied, err := c.projector.Apply(context.Background(), &event)
+	if c.decisionLogEnabled && c.proj != nil {
+		applied, err := c.proj.Apply(context.Background(), &event)
 		if err != nil {
 			c.logger.Error("Projector.Apply failed (retryable)",
 				zap.String("type", event.Type),
@@ -193,7 +194,7 @@ func (c *FillConsumer) processOne(ctx context.Context, msg kafka.Message, proces
 // trailing-SL math, allocator decisions, or cooldown state. In LEGACY mode
 // it also persists the DB side-effects (UpdatePositionFill / UpdatePositionSL
 // / UpdatePortfolioState) since the projector is bypassed.
-func (c *FillConsumer) applyInMemory(ctx context.Context, event *FillEvent, processed map[string]bool) {
+func (c *FillConsumer) applyInMemory(ctx context.Context, event *projector.FillEvent, processed map[string]bool) {
 	switch event.Type {
 
 	// ── Entry fills ────────────────────────────────────────────────────
