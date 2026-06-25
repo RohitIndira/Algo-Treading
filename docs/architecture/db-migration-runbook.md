@@ -36,6 +36,8 @@ This file holds the *how*.
       with identical table count + row counts.
 - [x] Every service is env-driven for DB names (no hardcoded literals).
       See `database-redesign-plan.md` "Code changes required" section.
+- [x] **Phase 1 + Phase 2 executed locally on 2026-06-25** — see execution
+      log at the bottom of this file. All row-count gates passed.
 - [ ] **For staging/prod**: confirm out-of-market-hours window (>15:30 IST).
 - [ ] **For staging/prod**: take a fresh backup right before Phase 1
       (the one in `backups/` is from `date +%Y%m%d-%H%M%S` — see file).
@@ -131,6 +133,56 @@ PGPASSWORD=$PGPASSWORD pg_dump \
 | PGPASSWORD=$PGPASSWORD psql -h $POSTGRES_HOST -U $POSTGRES_USER \
   -d stockk_auth
 ```
+
+**⚠ Gotcha — trigger function dependency (hit on 2026-06-25 dry-run):**
+`pg_dump -t TBL` dumps the table + its triggers but does NOT follow the
+trigger's function dependencies. The `update_updated_at_column()` trigger
+function lives at schema level, not table level, so it gets skipped.
+You'll see this error during the load:
+
+```
+ERROR: function public.update_updated_at_column() does not exist
+```
+
+The table + data still loads (`COPY` runs before triggers attach). The
+trigger is dropped silently. Fix: create the function in `stockk_auth`
+first, then re-apply the trigger.
+
+```bash
+# Step 1: create the trigger function in stockk_auth
+PGPASSWORD=$PGPASSWORD psql -h $POSTGRES_HOST -U $POSTGRES_USER \
+  -d stockk_auth -c "
+CREATE OR REPLACE FUNCTION public.update_updated_at_column() RETURNS trigger
+    LANGUAGE plpgsql
+    AS \$\$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+\$\$;
+"
+
+# Step 2: re-apply the trigger DDL (extracted from the source dump)
+PGPASSWORD=$PGPASSWORD pg_dump \
+  -h $POSTGRES_HOST -U $POSTGRES_USER \
+  -t user_credentials --no-owner --no-acl --schema-only \
+  trading_execution 2>/dev/null \
+| grep "CREATE TRIGGER" \
+| PGPASSWORD=$PGPASSWORD psql -h $POSTGRES_HOST -U $POSTGRES_USER \
+  -d stockk_auth
+```
+
+Smoke-test with a no-op UPDATE inside a transaction (then rollback so we
+don't change real data):
+
+```sql
+BEGIN;
+UPDATE user_credentials SET updated_at = updated_at WHERE TRUE
+  RETURNING user_id, updated_at;
+ROLLBACK;
+```
+
+If the rollback succeeded without errors, the trigger is wired.
 
 **Validation gate** — row count parity:
 
@@ -435,17 +487,24 @@ The plan references a 4th source DB called `market` containing
 `\l` on those Postgres instances. If yes, the runbook above already
 includes the `tick_data` migration step. If no, remove that step.
 
-### 2. user-config `strategies` writes
+### 2. user-config `strategies` writes — RESOLVED 2026-06-25
 
-`data-ownership.md` says user-config doesn't write to `stockk_trading`,
-but user-config exposes `CreateStrategy / UpdateStrategy / DeleteStrategy`
-gRPC RPCs. Either those RPCs are Kafka-proxy stubs (and rules-engine
-applies the writes) or the ownership matrix is wrong.
+**Verdict: matrix was wrong. user-config is a DIRECT writer of `strategies`.**
 
-**Resolve:** grep `services/user-config/internal/` for direct INSERT/
-UPDATE on `strategies`. If found → matrix is wrong, user-config needs
-INSERT/UPDATE grant on `stockk_trading.strategies` in Phase 5. If not
-found → matrix is correct, user-config gets SELECT-only.
+Evidence: `services/user-config/internal/repository/strategy_repository.go`
+contains 1 `INSERT INTO strategies` (line 100) and 5 `UPDATE strategies`
+sites (lines 381, 532, 577, 610, 655) for create/update/soft-delete/
+activate/deactivate.
+
+Phase 5 grants must give `user_config_svc` INSERT + UPDATE + DELETE on
+`stockk_trading.strategies` (NOT SELECT-only). rules-engine likely
+co-writes too (per earlier audit found 6 UPDATE sites) — same
+co-write pattern as `manthan_signal_decisions`. Both writers will need
+the same grant.
+
+Action item: update [`data-ownership.md`](./data-ownership.md) to mark
+user-config as a writer of `strategies`, and update Phase 5 role-grant
+SQL in `database-redesign-plan.md` to include the INSERT/UPDATE/DELETE.
 
 ---
 
@@ -462,3 +521,30 @@ typing the first `CREATE DATABASE`:
 - [ ] On-call has been told a migration is starting.
 - [ ] You have a terminal in `~/Algo-Treading` with the right
       Postgres credentials exported.
+
+---
+
+## Execution log
+
+### Local dry-run — 2026-06-25
+
+| Phase | Result | Notes |
+|-------|--------|-------|
+| 0 — backup | ✅ | 3 dumps in `backups/*-baseline-20260624-165537.dump` (trading_execution 42K, trading_db 55K, market_data 40M). 4th DB `market` does NOT exist on local dev. |
+| 0 — restore test | ✅ | `trading_db` round-tripped to throwaway. 13 tables in source = 13 tables restored. Per-table row counts identical. |
+| 1 — CREATE DATABASE | ✅ | All 3 created (each ~8 MB empty). |
+| 2A — stockk_auth | ✅ | `user_credentials`: 1 row src = 1 row dst. **Hit the trigger-function gotcha** (documented above) — patched manually, smoke test passed. |
+| 2B — stockk_market | ✅ | 27/27 tables match. Sample row counts: manthan_signals 5, instruments 7810, daily_ohlcv 1.24M, daily_ohlcv_2025 923K, daily_ohlcv_2026 320K. Size drop 419 MB → 273 MB = pure bloat (every row matches). |
+| 2C — stockk_trading | ✅ | Collision check: 0 conflicts between 6 trading_execution tables + 12 trading_db tables. All 18 row-count gates passed. Final DB size 10 MB (mostly empty dev fixtures). |
+
+**Open items before this can run on staging/prod:**
+
+1. Confirm whether `market` DB exists on staging/prod (with `tick_data`).
+   If yes, add the `tick_data` migration step (already in the runbook).
+   If no, remove that step.
+2. Patch `data-ownership.md` + `database-redesign-plan.md` Phase 5
+   role grants — user-config writes to `strategies` directly (1 INSERT
+   + 5 UPDATE sites in `repository/strategy_repository.go`), needs
+   INSERT/UPDATE/DELETE grant on `stockk_trading.strategies`.
+3. Test the Phase 2A trigger-function fix on staging (the source DBs
+   there will have more triggers than the dev fixtures).
