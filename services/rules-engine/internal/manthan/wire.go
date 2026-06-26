@@ -310,7 +310,14 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 	if restored, orphans, stale, err := m.portfolioMgr.RehydrateActivePositions(
 		ctx, deps.ManthanDB, deps.Redis.Client(), deps.AliveChecker, m.strategyByID,
 	); err != nil {
-		logger.Warn("Manthan rehydration failed", zap.Error(err))
+		// Error-level (not Warn): a failed rehydrate means live broker
+		// positions exist with no in-memory TSL state. The trail handler
+		// will never tick them and the orphan scanner won't see them,
+		// leaving them effectively unmanaged until the next clean boot.
+		// We continue boot rather than fail-fast because the positions
+		// at the broker remain regardless — but operators MUST see this.
+		logger.Error("Manthan rehydration failed — live positions are unmanaged until next clean boot",
+			zap.Error(err))
 	} else {
 		logger.Info("Manthan positions rehydrated from DB",
 			zap.Int("restored", restored),
