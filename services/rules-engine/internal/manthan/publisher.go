@@ -150,14 +150,17 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 		}
 	}
 
-	// 3. Kafka — portfolio.allocations
+	// 3. Kafka — portfolio.allocations (best-effort notification topic for
+	// the frontend WS; failure should NOT bubble up to the caller, but
+	// silent drops during a Kafka outage mean the frontend stops updating
+	// with no log signal).
 	if p.portfolioWriter != nil {
 		event := map[string]any{
 			"type":        "POSITION_OPENED",
 			"user_id":     order.UserID,
 			"strategy_id": order.StrategyID,
 			"symbol":      order.Symbol,
-			"quantity":     order.Quantity,
+			"quantity":    order.Quantity,
 			"entry_price": order.EntryPrice,
 			"stop_loss":   order.StopLoss,
 			"invested":    order.InvestedAmt,
@@ -168,15 +171,19 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 			"timestamp":   time.Now().UTC().Format(time.RFC3339),
 		}
 		body, _ := json.Marshal(event)
-		_ = p.portfolioWriter.WriteMessages(ctx, kafka.Message{
+		if err := p.portfolioWriter.WriteMessages(ctx, kafka.Message{
 			Key:   []byte(fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)),
 			Value: body,
-		})
+		}); err != nil {
+			p.logger.Warn("portfolio.allocations publish failed (POSITION_OPENED)",
+				zap.String("symbol", order.Symbol), zap.Error(err))
+		}
 	}
 
 	// 4. Redis — position state + active set
 	if p.rdb != nil {
 		posKey := fmt.Sprintf("manthan:position:%s:%s", order.StrategyID, order.Symbol)
+		setMember := fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)
 		posData, _ := json.Marshal(map[string]any{
 			"symbol":       order.Symbol,
 			"entry_price":  order.EntryPrice,
@@ -191,27 +198,42 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 			"ema_pct":      order.EMAAllocPct,
 			"trading_mode": order.TradingMode,
 		})
-		p.rdb.Set(ctx, posKey, posData, 30*24*time.Hour)
-		p.rdb.SAdd(ctx, "manthan:positions:active", fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol))
+		if err := p.rdb.Set(ctx, posKey, posData, 30*24*time.Hour).Err(); err != nil {
+			p.logger.Warn("PublishEntryOrder: Redis Set failed",
+				zap.String("key", posKey), zap.Error(err))
+		}
+		if err := p.rdb.SAdd(ctx, "manthan:positions:active", setMember).Err(); err != nil {
+			p.logger.Warn("PublishEntryOrder: Redis SAdd (active set) failed",
+				zap.String("member", setMember), zap.Error(err))
+		}
 	}
 
 	return nil
 }
 
 func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOrder) error {
-	// 1. DB — update position SL
+	// 1. DB — update position SL (LEGACY path; the CQRS projector owns this
+	// when DecisionLogEnabled=true). Silent failure here meant DB.current_sl
+	// drifted from the broker truth and the next trail recomputation could
+	// LOWER the stop.
 	if p.db != nil {
-		_, _ = p.db.ExecContext(ctx, `
+		if _, err := p.db.ExecContext(ctx, `
 			UPDATE manthan_positions
 			SET current_sl = $1, high_since_entry = $2, last_trail_level = $2, updated_at = NOW()
 			WHERE strategy_id = $3 AND symbol = $4 AND status = 'ACTIVE'`,
-			order.NewSL, order.NewHigh, order.StrategyID, order.Symbol)
+			order.NewSL, order.NewHigh, order.StrategyID, order.Symbol); err != nil {
+			p.logger.Warn("PublishSLModify: DB update failed",
+				zap.String("symbol", order.Symbol),
+				zap.Float64("new_sl", order.NewSL), zap.Error(err))
+		}
 	}
 
-	// 2. Kafka — trade-signals (SL modify)
+	// 2. Kafka — trade-signals (SL modify). CRITICAL outbound: this is what
+	// drives trade-execution to update the broker SL. Silent failure here
+	// was the worst class — rules-engine THINKS it told the broker, but didn't.
 	if p.tradeWriter != nil {
 		body, _ := json.Marshal(order)
-		_ = p.tradeWriter.WriteMessages(ctx, kafka.Message{
+		if err := p.tradeWriter.WriteMessages(ctx, kafka.Message{
 			Key:   []byte(order.OrderID),
 			Value: body,
 			Headers: []kafka.Header{
@@ -219,10 +241,15 @@ func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOr
 				{Key: "user_id", Value: []byte(order.UserID)},
 				{Key: "symbol", Value: []byte(order.Symbol)},
 			},
-		})
+		}); err != nil {
+			p.logger.Error("PublishSLModify: Kafka trade-signals publish failed (broker SL NOT updated)",
+				zap.String("symbol", order.Symbol),
+				zap.String("order_id", order.OrderID),
+				zap.Float64("new_sl", order.NewSL), zap.Error(err))
+		}
 	}
 
-	// 3. Kafka — portfolio.allocations
+	// 3. Kafka — portfolio.allocations (best-effort notification)
 	if p.portfolioWriter != nil {
 		event := map[string]any{
 			"type":        "SL_MODIFIED",
@@ -235,10 +262,13 @@ func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOr
 			"timestamp":   time.Now().UTC().Format(time.RFC3339),
 		}
 		body, _ := json.Marshal(event)
-		_ = p.portfolioWriter.WriteMessages(ctx, kafka.Message{
+		if err := p.portfolioWriter.WriteMessages(ctx, kafka.Message{
 			Key:   []byte(fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)),
 			Value: body,
-		})
+		}); err != nil {
+			p.logger.Warn("portfolio.allocations publish failed (SL_MODIFIED)",
+				zap.String("symbol", order.Symbol), zap.Error(err))
+		}
 	}
 
 	// 4. Redis — update position
@@ -251,7 +281,10 @@ func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOr
 				pos["stop_loss"] = order.NewSL
 				pos["high"] = order.NewHigh
 				updated, _ := json.Marshal(pos)
-				p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour)
+				if err := p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour).Err(); err != nil {
+					p.logger.Warn("PublishSLModify: Redis Set failed",
+						zap.String("key", posKey), zap.Error(err))
+				}
 			}
 		}
 	}
@@ -260,20 +293,29 @@ func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOr
 }
 
 func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder) error {
-	// 1. DB — mark position exited + insert cooldown
+	// 1. DB — mark position exited (LEGACY path). Silent failure here meant
+	// the row stayed ACTIVE in DB → next restart, rehydrate brings the
+	// position back to memory as ACTIVE → ghost position the broker has
+	// already closed.
 	if p.db != nil {
-		_, _ = p.db.ExecContext(ctx, `
+		if _, err := p.db.ExecContext(ctx, `
 			UPDATE manthan_positions
 			SET status = 'EXITED', exit_price = $1, realized_pnl = $2,
 			    exit_reason = 'SL_TRIGGERED', exit_time = NOW(), updated_at = NOW()
 			WHERE strategy_id = $3 AND symbol = $4 AND status = 'ACTIVE'`,
-			order.ExitPrice, order.PnL, order.StrategyID, order.Symbol)
+			order.ExitPrice, order.PnL, order.StrategyID, order.Symbol); err != nil {
+			p.logger.Warn("PublishSLExit: DB update failed",
+				zap.String("symbol", order.Symbol),
+				zap.Float64("exit_price", order.ExitPrice), zap.Error(err))
+		}
 	}
 
-	// 2. Kafka — trade-signals (sell order)
+	// 2. Kafka — trade-signals (sell order). CRITICAL outbound: this is what
+	// drives trade-execution to actually exit at the broker. Silent failure
+	// would leave the position open with rules-engine thinking it's closed.
 	if p.tradeWriter != nil {
 		body, _ := json.Marshal(order)
-		_ = p.tradeWriter.WriteMessages(ctx, kafka.Message{
+		if err := p.tradeWriter.WriteMessages(ctx, kafka.Message{
 			Key:   []byte(order.OrderID),
 			Value: body,
 			Headers: []kafka.Header{
@@ -281,10 +323,14 @@ func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder)
 				{Key: "user_id", Value: []byte(order.UserID)},
 				{Key: "symbol", Value: []byte(order.Symbol)},
 			},
-		})
+		}); err != nil {
+			p.logger.Error("PublishSLExit: Kafka trade-signals publish failed (broker NOT notified to exit)",
+				zap.String("symbol", order.Symbol),
+				zap.String("order_id", order.OrderID), zap.Error(err))
+		}
 	}
 
-	// 3. Kafka — portfolio.allocations
+	// 3. Kafka — portfolio.allocations (best-effort notification)
 	if p.portfolioWriter != nil {
 		event := map[string]any{
 			"type":        "POSITION_EXITED",
@@ -294,20 +340,26 @@ func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder)
 			"exit_price":  order.ExitPrice,
 			"sl_price":    order.SLPrice,
 			"pnl":         order.PnL,
-			"quantity":     order.Quantity,
+			"quantity":    order.Quantity,
 			"timestamp":   time.Now().UTC().Format(time.RFC3339),
 		}
 		body, _ := json.Marshal(event)
-		_ = p.portfolioWriter.WriteMessages(ctx, kafka.Message{
+		if err := p.portfolioWriter.WriteMessages(ctx, kafka.Message{
 			Key:   []byte(fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)),
 			Value: body,
-		})
+		}); err != nil {
+			p.logger.Warn("portfolio.allocations publish failed (POSITION_EXITED)",
+				zap.String("symbol", order.Symbol), zap.Error(err))
+		}
 	}
 
 	// 4. Redis — remove from active, update position
 	if p.rdb != nil {
 		member := fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)
-		p.rdb.SRem(ctx, "manthan:positions:active", member)
+		if err := p.rdb.SRem(ctx, "manthan:positions:active", member).Err(); err != nil {
+			p.logger.Warn("PublishSLExit: Redis SRem failed",
+				zap.String("member", member), zap.Error(err))
+		}
 
 		posKey := fmt.Sprintf("manthan:position:%s:%s", order.StrategyID, order.Symbol)
 		posData, _ := json.Marshal(map[string]any{
@@ -318,7 +370,10 @@ func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder)
 			"sl_price":   order.SLPrice,
 			"exit_time":  time.Now().UTC().Format(time.RFC3339),
 		})
-		p.rdb.Set(ctx, posKey, posData, 7*24*time.Hour)
+		if err := p.rdb.Set(ctx, posKey, posData, 7*24*time.Hour).Err(); err != nil {
+			p.logger.Warn("PublishSLExit: Redis Set failed",
+				zap.String("key", posKey), zap.Error(err))
+		}
 	}
 
 	return nil
@@ -367,7 +422,10 @@ func (p *ManthanPublisher) UpdatePositionFill(ctx context.Context, strategyID, s
 				pos["high"] = fillPrice
 				pos["quantity"] = filledQty
 				updated, _ := json.Marshal(pos)
-				p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour)
+				if err := p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour).Err(); err != nil {
+					p.logger.Warn("UpdatePositionFill: Redis Set failed",
+						zap.String("key", posKey), zap.Error(err))
+				}
 			}
 		}
 	}
@@ -413,7 +471,10 @@ func (p *ManthanPublisher) UpdatePositionSL(ctx context.Context, strategyID, sym
 			if json.Unmarshal(existing, &pos) == nil {
 				pos["stop_loss"] = brokerTrigger
 				if updated, mErr := json.Marshal(pos); mErr == nil {
-					p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour)
+					if err := p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour).Err(); err != nil {
+						p.logger.Warn("UpdatePositionSL: Redis Set failed",
+							zap.String("key", posKey), zap.Error(err))
+					}
 				}
 			}
 		}
@@ -443,7 +504,7 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 
 	// DB
 	if p.db != nil {
-		_, _ = p.db.ExecContext(ctx, `
+		if _, err := p.db.ExecContext(ctx, `
 			INSERT INTO manthan_portfolio_state
 				(strategy_id, user_id, initial_capital, current_capital, max_positions, per_stock_base, active_count, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
@@ -454,7 +515,10 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 				updated_at      = NOW()`,
 			strategyID, userID,
 			initialCapital, currentCapital,
-			maxPositions, perStockBase, activeCount)
+			maxPositions, perStockBase, activeCount); err != nil {
+			p.logger.Warn("UpdatePortfolioState: DB upsert failed",
+				zap.String("strategy_id", strategyID), zap.Error(err))
+		}
 	}
 
 	// Redis
@@ -470,7 +534,10 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 			"active_count":    activeCount,
 			"updated_at":      time.Now().UTC().Format(time.RFC3339),
 		})
-		p.rdb.Set(ctx, key, data, 30*24*time.Hour)
+		if err := p.rdb.Set(ctx, key, data, 30*24*time.Hour).Err(); err != nil {
+			p.logger.Warn("UpdatePortfolioState: Redis Set failed",
+				zap.String("key", key), zap.Error(err))
+		}
 	}
 }
 
