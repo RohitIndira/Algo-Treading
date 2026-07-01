@@ -89,6 +89,10 @@ type RedisConfig struct {
 	Addrs        []string
 	Password     string
 	DB           int
+	// TickstoreDB is the Redis DB where trade-execution's tickstore writes the
+	// recent tick stream (ticks:{exch}:{token}). Read by the market-price-
+	// protection (velocity) check. Default 1.
+	TickstoreDB  int
 	PoolSize     int
 	MinIdleConns int
 	MaxRetries   int
@@ -208,6 +212,7 @@ func LoadConfig() (*Config, error) {
 			}(),
 			Password:     getEnv("REDIS_PASSWORD", ""),
 			DB:           getEnvAsInt("REDIS_DB", 0),
+			TickstoreDB:  getEnvAsInt("TICKSTORE_REDIS_DB", 1),
 			PoolSize:     getEnvAsInt("REDIS_POOL_SIZE", 100),
 			MinIdleConns: getEnvAsInt("REDIS_MIN_IDLE_CONNS", 10),
 			MaxRetries:   getEnvAsInt("REDIS_MAX_RETRIES", 3),

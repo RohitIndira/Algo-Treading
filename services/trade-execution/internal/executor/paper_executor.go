@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -178,6 +179,14 @@ func (e *PaperOrderExecutor) ExitPaperPosition(ctx context.Context, order *model
 // createReverseExitOrder persists a square-off paper order in DB so the trade history
 // shows both entry and exit legs — mirroring live force-exit behaviour.
 func (e *PaperOrderExecutor) createReverseExitOrder(ctx context.Context, original *models.Order, exitPrice float64, at time.Time) {
+	// Always invoked as `go e.createReverseExitOrder(...)` — recover so a panic
+	// here can't crash the process. The position is already exited; this only
+	// mirrors the exit as a reverse paper order, so a failure is non-fatal.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[paper] PANIC RECOVERED in createReverseExitOrder: %v\n%s", r, debug.Stack())
+		}
+	}()
 	reverseSide := models.OrderSideSell
 	if original.OrderSide == models.OrderSideSell {
 		reverseSide = models.OrderSideBuy

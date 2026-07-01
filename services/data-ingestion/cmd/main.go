@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -19,6 +21,10 @@ import (
 )
 
 func main() {
+	// Route the standard library logger to stdout so stdlib log.* output shares
+	// the single stream PM2 captures alongside the zap logger.
+	log.SetOutput(os.Stdout)
+
 	cfg := config.Load()
 
 	lgr, err := logger.NewWithDefaults("data-ingestion")
@@ -84,17 +90,38 @@ func main() {
 		lgr.Fatal("failed to create watcher", zap.Error(err))
 	}
 
+	// watcherDone closes when the run loop exits for ANY reason — error,
+	// normal return, or recovered panic — so we can tell the difference
+	// between "we were asked to stop" and "the watcher silently died" below.
+	// Without this, a watcher crash leaves main() blocked on <-sig forever:
+	// the process stays "online" in PM2 while doing nothing.
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
+		defer func() {
+			if rec := recover(); rec != nil {
+				lgr.Error("PANIC in watcher run loop — ingestion has stopped",
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())))
+			}
+		}()
 		if err := w.Run(ctxRun); err != nil {
-			lgr.Error("watcher stopped with error", zap.Error(err))
-			cancelRun()
+			lgr.Error("watcher stopped with error — ingestion has stopped", zap.Error(err))
 		}
 	}()
 
 	// Wait for termination
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+
+	crashed := false
+	select {
+	case <-sig:
+		lgr.Info("received shutdown signal")
+	case <-watcherDone:
+		crashed = true
+		lgr.Error("watcher exited unexpectedly — shutting down so the process supervisor can restart it")
+	}
 
 	lgr.Info("shutting down data-ingestion service")
 	// allow graceful shutdown
@@ -103,4 +130,11 @@ func main() {
 	cancelRun()
 	// give components time to cleanup
 	<-tctx.Done()
+
+	if crashed {
+		// os.Exit skips deferred calls, so flush the logger explicitly —
+		// otherwise the crash log above may never reach the file/pm2 capture.
+		lgr.Sync()
+		os.Exit(1)
+	}
 }

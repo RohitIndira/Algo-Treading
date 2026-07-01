@@ -5,6 +5,8 @@
 package workerpool
 
 import (
+	"log"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 )
@@ -43,10 +45,24 @@ func New(workers, queueSize int) *Pool {
 func (p *Pool) worker() {
 	defer p.wg.Done()
 	for task := range p.tasks {
-		atomic.AddInt64(&p.active, 1)
-		task()
-		atomic.AddInt64(&p.active, -1)
+		p.runTask(task)
 	}
+}
+
+// runTask executes one task with panic recovery. This pool runs the order-
+// execution hot path, so a panic in a single task must not crash the worker
+// (which would shrink the pool and, unrecovered, take down the whole process
+// and every other in-flight order). The active-count decrement is deferred so
+// it runs even on panic — previously a panicking task leaked the counter.
+func (p *Pool) runTask(task func()) {
+	atomic.AddInt64(&p.active, 1)
+	defer atomic.AddInt64(&p.active, -1)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[workerpool] PANIC RECOVERED in task: %v\n%s", r, debug.Stack())
+		}
+	}()
+	task()
 }
 
 // Submit enqueues a task. It blocks if the queue is full.

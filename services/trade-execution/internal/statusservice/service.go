@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,21 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
+
+// recoverGo recovers a panic in a detached goroutine (or a per-update handler
+// dispatched as one) and logs it with a stack trace. The broker-WS update path
+// fans every order update out into its own goroutine, so an unrecovered panic in
+// one update would crash the whole trade-execution process and drop every other
+// user's order stream. This only logs and returns — it never changes order logic.
+func (s *OrderStatusService) recoverGo(where string) {
+	if r := recover(); r != nil {
+		s.logger.Error("PANIC RECOVERED in statusservice goroutine",
+			zap.String("where", where),
+			zap.Any("panic", r),
+			zap.String("stacktrace", string(debug.Stack())),
+		)
+	}
+}
 
 // OCOHandler is called on every broker WS status update to check if the order
 // belongs to an OCO group and act accordingly (place legs, cancel counterpart).
@@ -274,7 +290,10 @@ func (s *OrderStatusService) StartSubscription(ctx context.Context, userID strin
 	// affects anyone else.
 	client.OnTokenExpired = func(_ string) {
 		if s.tokenExpiredNotifier != nil {
-			go s.tokenExpiredNotifier(userID)
+			go func() {
+				defer s.recoverGo("tokenExpiredNotifier")
+				s.tokenExpiredNotifier(userID)
+			}()
 		}
 	}
 
@@ -351,6 +370,7 @@ func (s *OrderStatusService) StartIdleSweep(ctx context.Context, interval time.D
 
 // sweepIdleConnections closes connections for users absent from the live-exposure set.
 func (s *OrderStatusService) sweepIdleConnections(ctx context.Context) {
+	defer s.recoverGo("sweepIdleConnections")
 	sweepCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -450,6 +470,7 @@ func (s *OrderStatusService) StartFillReconcile(ctx context.Context, interval ti
 // when the broker status already matches the DB, and the OCO state machine ignores
 // a fill it has already acted on — so repeated passes never double-place legs.
 func (s *OrderStatusService) reconcileFillsViaTradeBook(ctx context.Context) {
+	defer s.recoverGo("reconcileFillsViaTradeBook")
 	rcCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -556,6 +577,7 @@ func (s *OrderStatusService) ensureAuthLoaded(userID string) *indiraClient.AuthC
 // StopSubscription. Each update is handled with a background context so a
 // StopSubscription mid-update never aborts an in-flight DB write.
 func (s *OrderStatusService) processUpdates(ctx context.Context, userID string, client *indiraClient.WSClient, handle *processorHandle) {
+	defer s.recoverGo("processUpdates")
 	s.logger.Info("Broker WS update processor started", zap.String("user_id", userID))
 	defer func() {
 		if handle != nil {
@@ -580,6 +602,7 @@ func (s *OrderStatusService) processUpdates(ctx context.Context, userID string, 
 }
 
 func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *indiraClient.WSOrderStatus) {
+	defer s.recoverGo("handleStatusUpdate")
 	updateStart := time.Now()
 	defer func() {
 		metrics.StatusUpdateProcessDuration.Observe(time.Since(updateStart).Seconds())
@@ -849,7 +872,10 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	if (brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED") && s.onOrderFilled != nil {
 		if authVal, ok := s.subscriberAuths.Load(order.UserID); ok {
 			auth := authVal.(*indiraClient.AuthContext)
-			go s.onOrderFilled(order.UserID, auth)
+			go func() {
+				defer s.recoverGo("onOrderFilled")
+				s.onOrderFilled(order.UserID, auth)
+			}()
 		}
 	}
 
@@ -1087,6 +1113,7 @@ func (s *OrderStatusService) handleExternalExit(ctx context.Context, wsStatus *i
 // what executed at the exchange. Idempotent — UpdateLiveTradeExit guards on
 // live_exit_price IS NULL, so a race with an OCO/ML exit resolves cleanly.
 func (s *OrderStatusService) recordSquareOffExit(ctx context.Context, sqOrder *models.Order) {
+	defer s.recoverGo("recordSquareOffExit")
 	if sqOrder.ParentOrderID == nil || sqOrder.FilledPrice == nil {
 		return
 	}

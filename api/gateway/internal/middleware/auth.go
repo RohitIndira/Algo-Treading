@@ -25,6 +25,7 @@ type AuthClaims struct {
 type AuthConfig struct {
 	VerifyURL string
 	Timeout   time.Duration
+	Bypass    bool // skip external verify call (UAT / dev)
 }
 
 // authVerifyResponse mirrors the auth service response schema.
@@ -69,16 +70,23 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Call the external auth service.
-			claims, httpStatus, err := callAuthService(client, cfg.VerifyURL, token, userID, appID)
-			if err != nil {
-				// Auth service itself could not be reached.
-				writeAuthJSON(w, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "Authentication service unavailable, try again shortly")
-				return
-			}
-			if httpStatus != "200" {
-				writeAuthJSON(w, http.StatusUnauthorized, "UNAUTHORIZED", "Invalid or expired token")
-				return
+			var claims *AuthClaims
+			if cfg.Bypass {
+				// UAT / dev: skip the external verify call; trust headers.
+				claims = &AuthClaims{UCC: userID}
+			} else {
+				// Call the external auth service.
+				var httpStatus string
+				var err error
+				claims, httpStatus, err = callAuthService(client, cfg.VerifyURL, token, userID, appID)
+				if err != nil {
+					writeAuthJSON(w, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "Authentication service unavailable, try again shortly")
+					return
+				}
+				if httpStatus != "200" {
+					writeAuthJSON(w, http.StatusUnauthorized, "UNAUTHORIZED", "Invalid or expired token")
+					return
+				}
 			}
 
 			// Token is valid — propagate claims into context.

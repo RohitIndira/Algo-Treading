@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +22,136 @@ import (
 	"go.uber.org/zap"
 )
 
+// ── Pre-trade compliance caps (firm-wide SEBI algo safety ceilings) ──────────
+// Hard limits applied to EVERY order before it is published, regardless of the
+// per-strategy config. Overridable via env for ops tuning without a redeploy.
+var (
+	// maxOrderQuantity is the absolute share-count ceiling per order.
+	maxOrderQuantity = envInt32("MAX_ORDER_QUANTITY", 50000)
+	// maxOrderValueINR is the absolute order-value (quantity × price) ceiling,
+	// in rupees. Default ₹2,00,00,000 (2 crore).
+	maxOrderValueINR = envFloat("MAX_ORDER_VALUE", 20000000)
 
+	// velocityPct is the market-price-protection threshold: if a stock's
+	// peak-to-trough move within velocityWindow ≥ this %, the order is rejected.
+	velocityPct = envFloat("VELOCITY_PCT", 1.0)
+	// velocityWindowMs is the look-back window (milliseconds) for the move above.
+	velocityWindowMs = envInt32("VELOCITY_WINDOW_MS", 1000)
+
+	// maxExposureLimitINR is the per-user total submitted-order value ceiling.
+	// 0 = disabled. Set MAX_EXPOSURE_LIMIT env var (e.g. 10000000 = ₹1 crore).
+	maxExposureLimitINR = envFloat("MAX_EXPOSURE_LIMIT", 0)
+
+	// bannedTokens is the set of NSE token codes that must never be traded.
+	// Populated once at startup from BANNED_TOKENS env var (comma-separated).
+	bannedTokens = loadBannedTokens()
+)
+
+func envInt32(key string, def int32) int32 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 32); err == nil && n > 0 {
+			return int32(n)
+		}
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			return f
+		}
+	}
+	return def
+}
+
+func loadBannedTokens() map[int64]struct{} {
+	m := make(map[int64]struct{})
+	for _, s := range strings.Split(os.Getenv("BANNED_TOKENS"), ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if t, err := strconv.ParseInt(s, 10, 64); err == nil {
+			m[t] = struct{}{}
+		}
+	}
+	return m
+}
+
+// auditOrderReceived emits one structured audit record for every order request
+// the engine builds — the complete order detail required by the compliance
+// trail: timestamp, user, security, quantity, price, order type, product type.
+func (h *Handler) auditOrderReceived(o *models.OrderRequest, ltp float64) {
+	h.logger.Info("ORDER_AUDIT",
+		zap.String("event", "ORDER_AUDIT"),
+		zap.String("order_id", o.OrderID),
+		zap.Time("ts", time.Now()),
+		zap.String("user_id", o.UserID),
+		zap.String("strategy_id", o.StrategyID),
+		zap.String("symbol", o.Symbol),
+		zap.Int64("stock_code", o.StockCode),
+		zap.String("exchange", o.Exchange),
+		zap.String("side", o.OrderSide),
+		zap.Int32("quantity", o.Quantity),
+		zap.Float64("price", o.Price),
+		zap.String("order_type", o.OrderType),
+		zap.String("product_type", o.ProductType),
+		zap.String("trading_mode", o.TradingMode),
+		zap.Float64("ltp", ltp),
+	)
+}
+
+// rejectForCompliance logs a structured ORDER_REJECTED audit record. The caller
+// must `return nil` immediately after so the order is dropped (not published).
+func (h *Handler) rejectForCompliance(o *models.OrderRequest, ltp float64, reason string, limit, actual float64) {
+	h.logger.Warn("ORDER_REJECTED",
+		zap.String("event", "ORDER_REJECTED"),
+		zap.String("reason", reason),
+		zap.Float64("limit_value", limit),
+		zap.Float64("actual_value", actual),
+		zap.String("order_id", o.OrderID),
+		zap.Time("ts", time.Now()),
+		zap.String("user_id", o.UserID),
+		zap.String("strategy_id", o.StrategyID),
+		zap.String("symbol", o.Symbol),
+		zap.Int64("stock_code", o.StockCode),
+		zap.String("exchange", o.Exchange),
+		zap.String("side", o.OrderSide),
+		zap.Int32("quantity", o.Quantity),
+		zap.Float64("price", o.Price),
+		zap.String("order_type", o.OrderType),
+		zap.String("product_type", o.ProductType),
+		zap.Float64("ltp", ltp),
+	)
+}
+
+// rejectForDPR logs ORDER_REJECTED for DPR band breaches and includes both the
+// lower and upper DPR bounds so the audit trail shows the full band at the time
+// of rejection, not just the breached limit.
+func (h *Handler) rejectForDPR(o *models.OrderRequest, ltp float64, reason string, limit, actual, dprLower, dprUpper float64) {
+	h.logger.Warn("ORDER_REJECTED",
+		zap.String("event", "ORDER_REJECTED"),
+		zap.String("reason", reason),
+		zap.Float64("limit_value", limit),
+		zap.Float64("actual_value", actual),
+		zap.Float64("dpr_lower", dprLower),
+		zap.Float64("dpr_upper", dprUpper),
+		zap.String("order_id", o.OrderID),
+		zap.Time("ts", time.Now()),
+		zap.String("user_id", o.UserID),
+		zap.String("strategy_id", o.StrategyID),
+		zap.String("symbol", o.Symbol),
+		zap.Int64("stock_code", o.StockCode),
+		zap.String("exchange", o.Exchange),
+		zap.String("side", o.OrderSide),
+		zap.Int32("quantity", o.Quantity),
+		zap.Float64("price", o.Price),
+		zap.String("order_type", o.OrderType),
+		zap.String("product_type", o.ProductType),
+		zap.Float64("ltp", ltp),
+	)
+}
 
 // Handler handles market events
 type Handler struct {
@@ -33,10 +166,19 @@ type Handler struct {
 	marketHours    *utils.MarketHours
 	enforceHours   bool
 	holidayChecker *holiday.Checker
+	// tickHistory powers the market-price-protection (velocity) check. nil-safe:
+	// when unset the velocity check is skipped (fail-open).
+	tickHistory *TickHistory
 	// strategyLocks serializes the per-strategy "count → cap check → insert"
 	// window so concurrent worker goroutines cannot both pass a near-limit
 	// check and over-issue trade signals. Keyed by strategy_id.
 	strategyLocks sync.Map
+}
+
+// SetTickHistory wires the tick-store reader used by the market-price-protection
+// (velocity) check. Pass nil to leave the check disabled. Call before Start().
+func (h *Handler) SetTickHistory(th *TickHistory) {
+	h.tickHistory = th
 }
 
 // lockStrategy returns a function that releases a per-strategy mutex. Callers
@@ -140,6 +282,19 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// recover() only catches panics in THIS goroutine — EvaluateEvent's own
+		// code (dedup, snapshot, wg.Wait aggregation) runs here directly, outside
+		// the worker pool's own recovery. Without this, a panic here kills the
+		// whole rules-engine over a single event instead of just failing it.
+		defer func() {
+			if rec := recover(); rec != nil {
+				h.logger.Error("PANIC RECOVERED evaluating event",
+					zap.String("event_id", event.EventID),
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())))
+				evalRes.err = fmt.Errorf("panic recovered during evaluation: %v", rec)
+			}
+		}()
 		evalRes.matches, evalRes.err = h.engine.EvaluateEvent(ctx, event)
 	}()
 
@@ -149,6 +304,15 @@ func (h *Handler) HandleEvent(ctx context.Context, event *models.MarketEvent) er
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer func() {
+			if rec := recover(); rec != nil {
+				h.logger.Error("PANIC RECOVERED prefetching market data",
+					zap.String("event_id", event.EventID),
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())))
+				mdRes.err = fmt.Errorf("panic recovered during market data prefetch: %v", rec)
+			}
+		}()
 		// Always fetch full market data: we need LTP (if event lacks it),
 		// prev_close (for below_min case), and tick_size.
 		// If tick_size is already cached, we still need LTP/prev_close.
@@ -630,6 +794,82 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		return fmt.Errorf("invalid order request: %w", err)
 	}
 
+	// ── Pre-trade compliance audit + hard-cap checks ─────────────────────
+	// Capture the complete order detail for the audit trail, then enforce the
+	// firm-wide safety ceilings and the exchange DPR band. Any breach is logged
+	// as ORDER_REJECTED and the order is dropped (not published) — mirroring the
+	// other skip paths above.
+	h.auditOrderReceived(orderReq, ltp)
+
+	// (1) Ban list — reject tokens that are prohibited from trading.
+	if _, banned := bannedTokens[orderReq.StockCode]; banned {
+		h.rejectForCompliance(orderReq, ltp, "BANNED_TOKEN",
+			float64(orderReq.StockCode), float64(orderReq.StockCode))
+		return nil
+	}
+
+	// (2) Quantity ceiling — never place an order above the share-count cap.
+	if orderReq.Quantity > maxOrderQuantity {
+		h.rejectForCompliance(orderReq, ltp, "QTY_LIMIT_EXCEEDED",
+			float64(maxOrderQuantity), float64(orderReq.Quantity))
+		return nil
+	}
+
+	// (3) Order-value ceiling — quantity × price must not exceed the cap.
+	// Use the limit price when set; fall back to LTP for MARKET orders (price 0).
+	// effPrice and orderValue are declared here (not inside the if-block) so they
+	// remain accessible for the exposure check (4) and post-publish update below.
+	effPrice := orderReq.Price
+	if effPrice <= 0 {
+		effPrice = ltp
+	}
+	orderValue := float64(orderReq.Quantity) * effPrice
+	if orderValue > maxOrderValueINR {
+		h.rejectForCompliance(orderReq, ltp, "ORDER_VALUE_LIMIT_EXCEEDED",
+			maxOrderValueINR, orderValue)
+		return nil
+	}
+
+	// (4) Exposure wallet — cumulative submitted-order value per user must not
+	// exceed the configured ceiling. Exposure is tracked in Redis key
+	// "exposure:{user_id}" and incremented after a successful order publish.
+	if maxExposureLimitINR > 0 {
+		exposureKey := fmt.Sprintf("exposure:%s", orderReq.UserID)
+		currentExposure, _ := h.redisCache.GetFloat(ctx, exposureKey) // 0 if key absent
+		if currentExposure+orderValue > maxExposureLimitINR {
+			h.rejectForCompliance(orderReq, ltp, "EXPOSURE_LIMIT_EXCEEDED",
+				maxExposureLimitINR, currentExposure+orderValue)
+			return nil
+		}
+	}
+
+	// (5) DPR band — never place a priced (LIMIT/SL) order outside the exchange
+	// daily price range. Both bounds are logged for full audit context.
+	if orderReq.Price > 0 {
+		if md.DPRLower > 0 && orderReq.Price < md.DPRLower {
+			h.rejectForDPR(orderReq, ltp, "DPR_LOWER_BREACH",
+				md.DPRLower, orderReq.Price, md.DPRLower, md.DPRUpper)
+			return nil
+		}
+		if md.DPRUpper > 0 && orderReq.Price > md.DPRUpper {
+			h.rejectForDPR(orderReq, ltp, "DPR_UPPER_BREACH",
+				md.DPRUpper, orderReq.Price, md.DPRLower, md.DPRUpper)
+			return nil
+		}
+	}
+
+	// (6) Market price protection — reject if the stock moved ≥ velocityPct
+	// within the last velocityWindow (a fast spike we should not chase).
+	// Best-effort & fail-open: when tick history is unavailable the check is
+	// skipped so missing data never blocks an order.
+	if h.tickHistory != nil {
+		window := time.Duration(velocityWindowMs) * time.Millisecond
+		if movePct, ok := h.tickHistory.MaxMovePct(ctx, md.Exchange, md.Token, window); ok && movePct >= velocityPct {
+			h.rejectForCompliance(orderReq, ltp, "VELOCITY_BREACH", velocityPct, movePct)
+			return nil
+		}
+	}
+
 	// ── Risk management check ───────────────────────────────────────────
 	// TODO: TEMPORARILY BYPASSED FOR TESTING - REMOVE THIS BEFORE PRODUCTION
 	if false && h.riskClient != nil {
@@ -703,6 +943,19 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	}
 
 	pubWg.Wait()
+
+	// Record exposure consumed by this order so the next order for this user
+	// sees the updated running total. Best-effort: a Redis error here is logged
+	// but does NOT roll back the already-published order.
+	if maxExposureLimitINR > 0 {
+		exposureKey := fmt.Sprintf("exposure:%s", orderReq.UserID)
+		if _, err := h.redisCache.IncrByFloat(ctx, exposureKey, orderValue); err != nil {
+			h.logger.Warn("Failed to update exposure tracker in Redis",
+				zap.String("user_id", orderReq.UserID),
+				zap.Float64("order_value", orderValue),
+				zap.Error(err))
+		}
+	}
 
 	h.stats.IncrementOrdersGenerated()
 

@@ -56,7 +56,7 @@ func New(store *configstore.ConfigStore, cfg Config, logger *zap.Logger) *Engine
 		workers:    cfg.Workers,
 		logger:     logger,
 		dedup:      NewDeduper(cfg.DedupWindow, cfg.DedupMaxEntries),
-		pool:       NewWorkerPool(cfg.Workers, cfg.Workers*16),
+		pool:       NewWorkerPool(cfg.Workers, cfg.Workers*16, logger),
 		closedChan: make(chan struct{}),
 	}
 	return e

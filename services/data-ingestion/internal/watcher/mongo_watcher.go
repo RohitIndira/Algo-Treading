@@ -152,6 +152,7 @@ func (w *MongoWatcher) Run(ctx context.Context) error {
 	cleanupTicker := time.NewTicker(10 * time.Minute)
 	defer cleanupTicker.Stop()
 	go func() {
+		defer w.lgr.RecoverAndLog("mongo-watcher-cleanup-ticker")
 		for {
 			select {
 			case <-ctx.Done():
@@ -232,6 +233,7 @@ func (w *MongoWatcher) Run(ctx context.Context) error {
 			// Process in a new goroutine
 			wg.Add(1)
 			go func(d models.NewsDocument, id string, t time.Time) {
+				defer w.lgr.RecoverAndLog("mongo-watcher-enrich-and-publish")
 				defer wg.Done()
 				defer func() { <-sem }() // Release semaphore
 				w.enrichAndPublish(ctx, d, id, t)

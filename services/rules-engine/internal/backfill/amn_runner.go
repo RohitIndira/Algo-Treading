@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -105,6 +106,15 @@ func (r *AMNRunner) TriggerBackfill(svcCtx context.Context, strategy *models.Str
 
 	go func() {
 		defer r.running.Delete(strategy.StrategyID)
+		defer func() {
+			if rec := recover(); rec != nil {
+				r.logger.Error("PANIC RECOVERED in AMN backfill — this run is non-functional, the rest of the service is unaffected",
+					zap.String("strategy_id", strategy.StrategyID),
+					zap.String("user_id", strategy.UserID),
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())))
+			}
+		}()
 
 		ctx, cancel := context.WithTimeout(svcCtx, backfillTimeout)
 		defer cancel()
@@ -481,6 +491,14 @@ func (r *AMNRunner) publishOrder(ctx context.Context, orderReq *models.OrderRequ
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					r.logger.Error("PANIC RECOVERED saving AMN backfill signal to DB",
+						zap.String("order_id", orderReq.OrderID),
+						zap.Any("panic", rec),
+						zap.String("stacktrace", string(debug.Stack())))
+				}
+			}()
 			if err := r.signalRepo.SaveTradeSignal(ctx, orderReq); err != nil {
 				r.logger.Error("AMN backfill: failed to save signal to DB",
 					zap.String("order_id", orderReq.OrderID),
@@ -493,6 +511,14 @@ func (r *AMNRunner) publishOrder(ctx context.Context, orderReq *models.OrderRequ
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					r.logger.Error("PANIC RECOVERED publishing AMN backfill signal to Kafka",
+						zap.String("order_id", orderReq.OrderID),
+						zap.Any("panic", rec),
+						zap.String("stacktrace", string(debug.Stack())))
+				}
+			}()
 			if err := r.kafkaPub.PublishTradeSignal(ctx, orderReq); err != nil {
 				r.logger.Error("AMN backfill: failed to publish to Kafka",
 					zap.String("order_id", orderReq.OrderID),

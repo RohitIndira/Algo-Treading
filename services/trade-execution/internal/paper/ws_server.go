@@ -932,6 +932,7 @@ func (s *PaperWSServer) handleWSConnection(w http.ResponseWriter, r *http.Reques
 
 	// Server-side ping loop: keeps the connection alive through proxies/load balancers.
 	go func() {
+		defer paperRecover("ws_server.pingLoop")
 		ticker := time.NewTicker(pingPeriod)
 		defer ticker.Stop()
 		for range ticker.C {
@@ -1225,6 +1226,7 @@ func (s *PaperWSServer) handleLiveOrdersWS(w http.ResponseWriter, r *http.Reques
 
 	// Server-side ping loop: keeps the connection alive through proxies/load balancers.
 	go func() {
+		defer paperRecover("ws_server.pingLoop")
 		ticker := time.NewTicker(pingPeriod)
 		defer ticker.Stop()
 		for range ticker.C {
@@ -1368,6 +1370,7 @@ func (s *PaperWSServer) handleForceExitAllLive(w http.ResponseWriter, r *http.Re
 				}
 				cancelWg.Add(1)
 				go func(o *models.Order) {
+					defer paperRecover("ws_server.liveBrokerCancel")
 					defer cancelWg.Done()
 					if err := s.liveBrokerCanceller(r.Context(), o, "Force exit by user"); err != nil {
 						log.Printf("[live-ws] Broker cancel failed for order %s: %v", o.OrderID, err)

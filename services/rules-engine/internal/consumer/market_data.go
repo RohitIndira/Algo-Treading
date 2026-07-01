@@ -21,8 +21,10 @@ type MarketDataResult struct {
 	PrevClose     float64
 	TickSize      float64
 	PercentChange float64
-	Exchange      string // which exchange the data came from ("nse" or "bse")
-	Token         int64  // the token used for the Redis key
+	DPRLower      float64 // exchange daily price range lower band (0 = unavailable)
+	DPRUpper      float64 // exchange daily price range upper band (0 = unavailable)
+	Exchange      string  // which exchange the data came from ("nse" or "bse")
+	Token         int64   // the token used for the Redis key
 }
 
 // TickSizeCache is a concurrency-safe in-memory cache for per-stock tick sizes.
@@ -104,6 +106,8 @@ func getMarketDataFromRedis(
 			PrevClose     float64 `json:"prev_close"`
 			TickSize      float64 `json:"tick_size"`
 			PercentChange float64 `json:"percent_change"`
+			DPRLower      float64 `json:"dpr_lower"`
+			DPRUpper      float64 `json:"dpr_upper"`
 		}
 		if err := json.Unmarshal([]byte(jsonData), &raw); err != nil {
 			lastErr = fmt.Errorf("failed to parse market data JSON for key %s: %w", key, err)
@@ -131,6 +135,8 @@ func getMarketDataFromRedis(
 			PrevClose:     raw.PrevClose,
 			TickSize:      raw.TickSize,
 			PercentChange: raw.PercentChange,
+			DPRLower:      raw.DPRLower,
+			DPRUpper:      raw.DPRUpper,
 			Exchange:      exch,
 			Token:         token,
 		}, nil

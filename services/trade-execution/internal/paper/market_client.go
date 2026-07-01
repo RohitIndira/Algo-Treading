@@ -171,6 +171,9 @@ func NewPaperMarketClient(wsURL string, callback PriceCallback) *PaperMarketClie
 // It auto-reconnects on disconnect. Call Stop() to shut down.
 func (c *PaperMarketClient) Start(ctx context.Context) {
 	go func() {
+		defer paperRecover("PaperMarketClient.Start")
+		const maxRetries = 5
+		failures := 0
 		for {
 			select {
 			case <-c.stopCh:
@@ -179,15 +182,28 @@ func (c *PaperMarketClient) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				if err := c.connect(ctx); err != nil {
-					log.Printf("[paper-market] Connection error: %v — retrying in 5s", err)
-					select {
-					case <-time.After(5 * time.Second):
-					case <-c.stopCh:
-						return
-					case <-ctx.Done():
-						return
-					}
+				start := time.Now()
+				err := c.connect(ctx)
+				if err == nil {
+					return // clean shutdown
+				}
+				// A connection that stayed up for a while then dropped is a
+				// fresh incident, not a flapping failure — reset the budget.
+				if time.Since(start) > time.Minute {
+					failures = 0
+				}
+				failures++
+				if failures >= maxRetries {
+					log.Printf("[paper-market] Giving up after %d consecutive connection failures: %v", failures, err)
+					return
+				}
+				log.Printf("[paper-market] Connection error (attempt %d/%d): %v — retrying in 5s", failures, maxRetries, err)
+				select {
+				case <-time.After(5 * time.Second):
+				case <-c.stopCh:
+					return
+				case <-ctx.Done():
+					return
 				}
 			}
 		}
@@ -286,6 +302,7 @@ func (c *PaperMarketClient) connect(ctx context.Context) error {
 	msgCh := make(chan []byte, 16)
 	errCh := make(chan error, 1)
 	go func() {
+		defer paperRecover("PaperMarketClient.readLoop")
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {

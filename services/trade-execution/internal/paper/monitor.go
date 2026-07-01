@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -14,6 +15,16 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/timezone"
 	"github.com/google/uuid"
 )
+
+// paperRecover recovers a panic in a detached goroutine within the paper
+// package and logs it with a stack trace. Paper trading shares the process with
+// live trading, so an unrecovered paper panic would crash live order management
+// too. Logs and returns only — it never changes exit/square-off logic.
+func paperRecover(where string) {
+	if r := recover(); r != nil {
+		log.Printf("[paper] PANIC RECOVERED in %s: %v\n%s", where, r, debug.Stack())
+	}
+}
 
 const (
 	// wssGracePeriod: time without a WSS price before Redis fallback kicks in.
@@ -486,6 +497,7 @@ func (m *PaperTradeMonitor) advanceTrailingSL(order *models.Order, ltp float64) 
 		// Update the in-memory order so REST fetches return the current TSL immediately.
 		m.UpdateCachedOrderSL(orderID, newSL)
 		go func() {
+			defer paperRecover("PaperTradeMonitor.updateTrailingSL")
 			m.repo.UpdateTrailingSL(context.Background(), orderID, newSL)
 			m.repo.RecordExecutionEvent(context.Background(), orderID, "PAPER_TRAILING_SL_UPDATED", map[string]interface{}{
 				"new_sl": newSL,
@@ -604,6 +616,7 @@ func (m *PaperTradeMonitor) OnPriceUpdate(symbol string, ltp float64) {
 // For symbols where WSS has been silent longer than wssGracePeriod, it fetches the
 // LTP from Redis and broadcasts a PnL update — it does NOT trigger SL/TP exits.
 func (m *PaperTradeMonitor) runRedisPnLTicker(ctx context.Context) {
+	defer paperRecover("PaperTradeMonitor.runRedisPnLTicker")
 	ticker := time.NewTicker(redisPollInterval)
 	defer ticker.Stop()
 	for {
@@ -689,6 +702,7 @@ func (m *PaperTradeMonitor) tickRedisPnL(ctx context.Context) {
 // exits that WSS may have skipped over (e.g. when the WSS connection is down or a tick
 // is missed). Both SL and TP are checked; exiting.LoadOrStore prevents double-exits.
 func (m *PaperTradeMonitor) runRedisTPSafetyNet(ctx context.Context) {
+	defer paperRecover("PaperTradeMonitor.runRedisTPSafetyNet")
 	if m.redisPrices == nil {
 		return
 	}
@@ -986,6 +1000,7 @@ func (m *PaperTradeMonitor) resolveExitPrice(ctx context.Context, order *models.
 
 // exitPosition performs the actual DB update and WebSocket broadcast for an exit.
 func (m *PaperTradeMonitor) exitPosition(ctx context.Context, order *models.Order, exitPrice float64, reason string) {
+	defer paperRecover("PaperTradeMonitor.exitPosition")
 	defer m.exiting.Delete(order.OrderID)
 
 	// Close any active ML group for this order BEFORE writing to DB so the ML

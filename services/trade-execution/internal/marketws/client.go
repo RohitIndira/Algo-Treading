@@ -7,12 +7,23 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// marketwsRecover recovers a panic in a detached market-data goroutine and logs
+// it with a stack trace. The market-data feed shares the process with order
+// management, so an unrecovered panic here would crash live trading. Logs and
+// returns only — it never changes feed/parse logic.
+func marketwsRecover(where string) {
+	if r := recover(); r != nil {
+		log.Printf("[market-ws] PANIC RECOVERED in %s: %v\n%s", where, r, debug.Stack())
+	}
+}
 
 // Binary message type bytes (matches enhanced-stream binary encoding)
 const (
@@ -104,6 +115,9 @@ func (c *Client) SetTickWriter(ch chan<- TickData) {
 // Start connects and begins consuming market data. Auto-reconnects on failure.
 func (c *Client) Start(ctx context.Context) {
 	go func() {
+		defer marketwsRecover("Client.Start")
+		const maxRetries = 5
+		failures := 0
 		for {
 			select {
 			case <-c.stopCh:
@@ -111,16 +125,29 @@ func (c *Client) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				if err := c.connectAndConsume(ctx); err != nil {
-					c.setHealthy(false)
-					log.Printf("[marketws] Connection error: %v — retrying in 3s", err)
-					select {
-					case <-time.After(3 * time.Second):
-					case <-c.stopCh:
-						return
-					case <-ctx.Done():
-						return
-					}
+				start := time.Now()
+				err := c.connectAndConsume(ctx)
+				if err == nil {
+					return // clean shutdown
+				}
+				c.setHealthy(false)
+				// A connection that stayed up for a while then dropped is a
+				// fresh incident, not a flapping failure — reset the budget.
+				if time.Since(start) > time.Minute {
+					failures = 0
+				}
+				failures++
+				if failures >= maxRetries {
+					log.Printf("[marketws] Giving up after %d consecutive connection failures: %v", failures, err)
+					return
+				}
+				log.Printf("[marketws] Connection error (attempt %d/%d): %v — retrying in 3s", failures, maxRetries, err)
+				select {
+				case <-time.After(3 * time.Second):
+				case <-c.stopCh:
+					return
+				case <-ctx.Done():
+					return
 				}
 			}
 		}
@@ -313,6 +340,7 @@ func (c *Client) connectAndConsume(ctx context.Context) error {
 	msgCh := make(chan []byte, 64)
 	errCh := make(chan error, 1)
 	go func() {
+		defer marketwsRecover("Client.readLoop")
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {

@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"log"
+	"runtime/debug"
 	"sync"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -63,6 +65,11 @@ func (c *CredentialsCache) Warm(ctx context.Context, userIDs []string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[credentials] PANIC RECOVERED warming user %s: %v\n%s", uid, r, debug.Stack())
+				}
+			}()
 			c.Get(ctx, uid) //nolint:errcheck — miss is non-fatal, will retry per-order
 		}()
 	}

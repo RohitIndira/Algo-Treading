@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +18,21 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
+
+// recoverGo recovers a panic in a fire-and-forget goroutine and logs it with a
+// stack trace. Every method below that is launched with `go m.<method>(…)` is a
+// detached goroutine, so an unrecovered panic in any one of them would crash the
+// whole trade-execution process and abandon every other live position. This only
+// logs and returns — it does not alter the non-panic path or any order logic.
+func (m *Manager) recoverGo(where string) {
+	if r := recover(); r != nil {
+		m.logger.Error("PANIC RECOVERED in multilevel goroutine",
+			zap.String("where", where),
+			zap.Any("panic", r),
+			zap.String("stacktrace", string(debug.Stack())),
+		)
+	}
+}
 
 // slLimitSlippagePct is the buffer added/subtracted from the SL trigger to form the
 // limit price of an SL-L order. 1% covers most intraday gap-down / gap-up scenarios
@@ -146,7 +162,13 @@ func (m *Manager) worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case job := <-m.evalCh:
-			m.runEvalJob(ctx, job)
+			// Per-job recovery: a panic evaluating one group must not kill this
+			// worker (which would silently stop multi-level exits for every group
+			// it would later handle).
+			func() {
+				defer m.recoverGo("worker.runEvalJob")
+				m.runEvalJob(ctx, job)
+			}()
 		}
 	}
 }
@@ -263,6 +285,7 @@ func (m *Manager) OnEntryFill(
 	filledQty int32,
 	slLevels, tpLevels []models.MultiLevelExitLevel,
 ) {
+	defer m.recoverGo("OnEntryFill")
 	val, ok := m.groupsByEntry.Load(entryOrderID)
 	if !ok {
 		m.logger.Warn("OnEntryFill: no group registered for entry order",
@@ -363,6 +386,7 @@ func (m *Manager) OnEntryFill(
 // HandleBrokerUpdate processes a broker WS order status event.
 // Detects live entry fills and single SL fills.
 func (m *Manager) HandleBrokerUpdate(ctx context.Context, order *models.Order, brokerStatus string) {
+	defer m.recoverGo("HandleBrokerUpdate")
 	if order == nil {
 		return
 	}
@@ -403,6 +427,7 @@ func (m *Manager) HandleBrokerUpdate(ctx context.Context, order *models.Order, b
 // CancelGroupsBySymbol cancels all active groups for the given user and symbol.
 // Used during force-exit (auto square-off or user-initiated close).
 func (m *Manager) CancelGroupsBySymbol(ctx context.Context, userID string, symbol string) {
+	defer m.recoverGo("CancelGroupsBySymbol")
 	symUpper := strings.ToUpper(symbol)
 	m.groupsByEntry.Range(func(key, val interface{}) bool {
 		g := val.(*Group)
@@ -488,6 +513,7 @@ func (m *Manager) cancelGroupInternal(ctx context.Context, g *Group) {
 	// Cancel single SL broker order (FIXED/TRAILING live only).
 	if g.TradingMode == "LIVE" && oldSLBrokerID != "" && auth != nil {
 		go func() {
+			defer m.recoverGo("CancelGroup.cancelOldSL")
 			if err := m.broker.CancelOrder(ctx, exchange, oldSLBrokerID, symbol, auth); err != nil {
 				m.logger.Warn("CancelGroup: broker SL cancel failed",
 					zap.String("group", g.GroupID.String()),
@@ -666,6 +692,7 @@ func (m *Manager) CancelGroupForExit(ctx context.Context, entryOrderID uuid.UUID
 // LTP so the closed-positions tab shows a row for the deactivation exit.
 // Called by StrategyEventsConsumer when a strategy is paused or deleted.
 func (m *Manager) CancelGroupsByStrategy(ctx context.Context, userID, strategyID string) {
+	defer m.recoverGo("CancelGroupsByStrategy")
 	m.groupsByEntry.Range(func(k, v interface{}) bool {
 		g := v.(*Group)
 		if g.UserID != userID || g.StrategyID != strategyID {
@@ -891,6 +918,7 @@ func (m *Manager) evaluateTrailingSL(ctx context.Context, g *Group, ltp float64)
 	g.mu.Unlock()
 
 	go func() {
+		defer m.recoverGo("modifySLAfterPartialTP")
 		modOrder := &models.Order{
 			OrderID:       orderID,
 			IndiraOrderID: &brokerOrderID,
@@ -939,6 +967,7 @@ func (m *Manager) evaluateTrailingSL(ctx context.Context, g *Group, ltp float64)
 // exitPrice is the LTP at trigger time; trigger and limit are derived from it so the
 // order behaves like a market exit while satisfying NSE SEBI algo-compliance rules.
 func (m *Manager) placeExitOrderMarket(ctx context.Context, g *Group, level *ExitLevelState, qty int32, exitPrice float64, exitType string) {
+	defer m.recoverGo("placeExitOrderMarket")
 	// Compute SL-L prices. Trigger just inside current price activates immediately;
 	// limit = exitPrice ± 1% ensures fill in all but extreme gap scenarios.
 	var triggerPrice, limitPrice float64
@@ -973,6 +1002,7 @@ func (m *Manager) placeExitOrderMarket(ctx context.Context, g *Group, level *Exi
 
 // placeFixedSLOrder places a single SL-L broker order covering the full position qty.
 func (m *Manager) placeFixedSLOrder(ctx context.Context, g *Group, qty int32) {
+	defer m.recoverGo("placeFixedSLOrder")
 	g.mu.Lock()
 	triggerPrice := g.CalcSLTriggerPrice(g.FixedSLPct)
 	g.mu.Unlock()
@@ -1002,6 +1032,7 @@ func (m *Manager) placeFixedSLOrder(ctx context.Context, g *Group, qty int32) {
 // FixedSLPct (e.g. 1%) is the initial SL distance; TrailingSLPct (e.g. 0.2%) is the
 // trailing increment used later by evaluateTrailingSL — they are separate concerns.
 func (m *Manager) placeLiveTrailingSL(ctx context.Context, g *Group) {
+	defer m.recoverGo("placeLiveTrailingSL")
 	g.mu.Lock()
 	triggerPrice := g.CalcSLTriggerPrice(g.FixedSLPct) // initial SL = 1% from fill
 	qty := g.RemainingQty
@@ -1033,6 +1064,7 @@ func (m *Manager) placeLiveTrailingSL(ctx context.Context, g *Group) {
 // replaceSLWithReducedQty cancels the current single SL order and places a new
 // smaller one after a TP level fires, so the broker SL covers only remaining qty.
 func (m *Manager) replaceSLWithReducedQty(ctx context.Context, g *Group, remainingQty int32) {
+	defer m.recoverGo("replaceSLWithReducedQty")
 	if remainingQty <= 0 {
 		return
 	}
@@ -1081,6 +1113,7 @@ func (m *Manager) replaceSLWithReducedQty(ctx context.Context, g *Group, remaini
 // Called when a TP level fills and the trailing SL must be re-sized to match the
 // reduced position. Falls back to FixedSLPct if CurrentSLTrigger is not yet set.
 func (m *Manager) replaceSLTrailing(ctx context.Context, g *Group, remainingQty int32) {
+	defer m.recoverGo("replaceSLTrailing")
 	if remainingQty <= 0 {
 		return
 	}
@@ -1137,6 +1170,7 @@ func (m *Manager) replaceSLTrailing(ctx context.Context, g *Group, remainingQty 
 
 // onSingleSLFilled handles a broker EXECUTED event for the fixed/trailing SL order.
 func (m *Manager) onSingleSLFilled(ctx context.Context, g *Group, fillPrice *float64, filledQty int32, exitTime *time.Time) {
+	defer m.recoverGo("onSingleSLFilled")
 	price := 0.0
 	if fillPrice != nil {
 		price = *fillPrice
@@ -1168,6 +1202,7 @@ func (m *Manager) onSingleSLFilled(ctx context.Context, g *Group, fillPrice *flo
 		m.mlLevelIndex.Delete(bid)
 		bid := bid
 		go func() {
+			defer m.recoverGo("onSingleSLFilled.cancelTP")
 			if err := m.broker.CancelOrder(context.Background(), g.Exchange, bid, g.Symbol, g.Auth); err != nil {
 				m.logger.Warn("onSingleSLFilled: cancel TP broker order failed",
 					zap.String("group", g.GroupID.String()),
@@ -1401,6 +1436,7 @@ func (m *Manager) recordLiveGroupExit(ctx context.Context, g *Group, lastExitPri
 // ══════════════════════════════════════════════════════════════════════════════
 
 func (m *Manager) persistExitLevels(ctx context.Context, g *Group) {
+	defer m.recoverGo("persistExitLevels")
 	for _, lvl := range g.SLLevels {
 		lvl.mu.Lock()
 		triggerPrice := lvl.TriggerPrice
@@ -1585,6 +1621,7 @@ func isFilledStatus(s string) bool {
 // placeMultiSLOrders places one broker SL-M order per SL level for live groups.
 // All placements run concurrently; broker IDs are stored in mlLevelIndex for WS routing.
 func (m *Manager) placeMultiSLOrders(ctx context.Context, g *Group) {
+	defer m.recoverGo("placeMultiSLOrders")
 	g.mu.Lock()
 	levels := make([]*ExitLevelState, len(g.SLLevels))
 	copy(levels, g.SLLevels)
@@ -1595,6 +1632,7 @@ func (m *Manager) placeMultiSLOrders(ctx context.Context, g *Group) {
 	for _, lvl := range levels {
 		wg.Add(1)
 		go func(level *ExitLevelState) {
+			defer m.recoverGo("placeMultiSLOrders.level")
 			defer wg.Done()
 			level.mu.Lock()
 			trigger := level.TriggerPrice
@@ -1635,6 +1673,7 @@ func (m *Manager) placeMultiSLOrders(ctx context.Context, g *Group) {
 // placeMultiTPOrders places one broker LIMIT order per TP level for live groups.
 // TriggerPrice on each ExitLevelState holds the absolute limit price (set by CalcTPLimitPrice).
 func (m *Manager) placeMultiTPOrders(ctx context.Context, g *Group) {
+	defer m.recoverGo("placeMultiTPOrders")
 	g.mu.Lock()
 	levels := make([]*ExitLevelState, len(g.TPLevels))
 	copy(levels, g.TPLevels)
@@ -1645,6 +1684,7 @@ func (m *Manager) placeMultiTPOrders(ctx context.Context, g *Group) {
 	for _, lvl := range levels {
 		wg.Add(1)
 		go func(level *ExitLevelState) {
+			defer m.recoverGo("placeMultiTPOrders.level")
 			defer wg.Done()
 			level.mu.Lock()
 			limitPrice := level.TriggerPrice // CalcTPLimitPrice stored here
@@ -1685,6 +1725,7 @@ func (m *Manager) placeMultiTPOrders(ctx context.Context, g *Group) {
 // Marks the level triggered, decrements RemainingQty, then proportionally rebalances
 // all remaining active levels on BOTH sides and issues ModifyOrder for each.
 func (m *Manager) onMultiLevelFilled(ctx context.Context, g *Group, exitType string, levelNum int, fillPrice *float64, filledQty int32, exitTime *time.Time) {
+	defer m.recoverGo("onMultiLevelFilled")
 	price := 0.0
 	if fillPrice != nil {
 		price = *fillPrice
@@ -1778,6 +1819,7 @@ func (m *Manager) onMultiLevelFilled(ctx context.Context, g *Group, exitType str
 		if slBrokerID != "" {
 			m.singleSLIndex.Delete(slBrokerID)
 			go func() {
+				defer m.recoverGo("onMultiLevelFilled.cancelSingleSL")
 				if err := m.broker.CancelOrder(ctx, g.Exchange, slBrokerID, g.Symbol, g.Auth); err != nil {
 					m.logger.Warn("onMultiLevelFilled: cancel single SL failed",
 						zap.String("group", g.GroupID.String()),
@@ -1985,6 +2027,7 @@ func computeInitialExitQtys(configs []SLTPLevelConfig, filledQty int32, logger *
 // modifyLevelOrder issues a broker ModifyOrder for a single exit level with updated qty.
 // SL levels use SL-M (trigger only); TP levels use LIMIT (price only).
 func (m *Manager) modifyLevelOrder(ctx context.Context, g *Group, orderID uuid.UUID, brokerID string, qty int32, triggerPrice float64, auth *indiraClient.AuthContext, exitType string, levelNum int) {
+	defer m.recoverGo("modifyLevelOrder")
 	var orderType models.OrderType
 	var limitPrice *float64
 	var stopLoss *float64
@@ -2056,6 +2099,7 @@ func (m *Manager) cancelRemainingMLOrders(ctx context.Context, g *Group, levels 
 		m.mlLevelIndex.Delete(brokerID)
 
 		go func(bid string, ln int) {
+			defer m.recoverGo("cancelMLLevelOrder")
 			if err := m.broker.CancelOrder(ctx, g.Exchange, bid, g.Symbol, auth); err != nil {
 				m.logger.Warn("cancel ML level order failed",
 					zap.String("group", g.GroupID.String()),

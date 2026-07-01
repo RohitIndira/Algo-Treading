@@ -6,6 +6,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/handlers"
 	"github.com/RohitIndira/Algo-Treading/api/gateway/internal/middleware"
 	"github.com/gorilla/mux"
+	"go.uber.org/zap"
 )
 
 func NewRouter(
@@ -15,10 +16,14 @@ func NewRouter(
 	amnPreviewHandler *handlers.AMNPreviewHandler,
 	corsConfig middleware.CORSConfig,
 	authConfig middleware.AuthConfig,
+	logger *zap.Logger,
 ) http.Handler {
 
 	r := mux.NewRouter()
 
+	// Outermost: catches a panic from every middleware/handler below so a
+	// crash is logged with full context instead of just resetting the conn.
+	r.Use(middleware.Recovery(logger))
 	// Assign/propagate X-Correlation-ID before anything else touches the context
 	r.Use(middleware.CorrelationID())
 	// Security headers on every response
@@ -27,8 +32,8 @@ func NewRouter(
 	r.Use(middleware.RequestSizeLimit(1 << 20))
 	// Rate limit: 100 req/s per IP, burst of 200
 	r.Use(middleware.NewRateLimiter(100, 200).Middleware())
-	// Audit log for mutating operations
-	r.Use(middleware.AuditLog())
+	// Access log for every request (status, latency, user, mutating tag)
+	r.Use(middleware.AccessLog(logger))
 	// CORS middleware
 	r.Use(middleware.CORS(corsConfig))
 

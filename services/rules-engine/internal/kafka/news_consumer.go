@@ -3,6 +3,8 @@ package kafka
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -98,7 +100,8 @@ func (n *NewsConsumer) Start(ctx context.Context) error {
 
 		var handleErr error
 		for attempt := 1; attempt <= maxHandlerRetries; attempt++ {
-			if handleErr = n.handler.HandleEvent(msgCtx, event); handleErr == nil {
+			handleErr = n.callHandlerRecovered(msgCtx, event)
+			if handleErr == nil {
 				break
 			}
 			n.logger.Warn("Handler error, retrying",
@@ -119,6 +122,25 @@ func (n *NewsConsumer) Start(ctx context.Context) error {
 
 		_ = n.reader.CommitMessages(ctx, msg)
 	}
+}
+
+// callHandlerRecovered invokes the handler with panic recovery. This is the
+// backstop for the sequential parts of HandleEvent that run outside the
+// engine's worker pool (e.g. processMatch, order construction, Kafka/DB
+// writes) — without it, a panic there kills the whole consumer loop instead
+// of just failing this one event, which the retry loop above then handles
+// like any other transient error.
+func (n *NewsConsumer) callHandlerRecovered(ctx context.Context, event *models.MarketEvent) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			n.logger.Error("PANIC RECOVERED in news handler",
+				zap.String("event_id", event.EventID),
+				zap.Any("panic", rec),
+				zap.String("stacktrace", string(debug.Stack())))
+			err = fmt.Errorf("panic recovered in handler: %v", rec)
+		}
+	}()
+	return n.handler.HandleEvent(ctx, event)
 }
 
 // extractCorrelationID reads the correlation ID from a Kafka message's headers.

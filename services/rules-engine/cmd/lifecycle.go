@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"runtime/debug"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
@@ -62,6 +63,17 @@ func StartLive(ctx context.Context, eng *engine.Engine, cfgConsumer configConsum
 
 	go func() {
 		close(l.ConfigConsumerStarted)
+		// Backstop only: both consumer implementations already recover their
+		// own per-message panics internally and keep looping. This catches
+		// anything unexpected that slips past that, instead of silently
+		// killing config sync for the rest of the process's life.
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Error("PANIC RECOVERED in config consumer — config sync is now non-functional",
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())))
+			}
+		}()
 		if err := cfgConsumer.Start(ctx); err != nil {
 			log.Error("Config consumer exited with error", zap.Error(err))
 		}
@@ -71,6 +83,13 @@ func StartLive(ctx context.Context, eng *engine.Engine, cfgConsumer configConsum
 		// tiny yield so order is deterministic even if goroutines schedule oddly
 		time.Sleep(1 * time.Millisecond)
 		close(l.NewsConsumerStarted)
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Error("PANIC RECOVERED in news consumer — news processing is now non-functional",
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())))
+			}
+		}()
 		if err := newsConsumer.Start(ctx); err != nil {
 			log.Error("News consumer exited with error", zap.Error(err))
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,16 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/google/uuid"
 )
+
+// schedRecover recovers a panic in a detached scheduler goroutine and logs it
+// with a stack trace, matching the package's existing stdlib-log style. Shared
+// by the price monitor and auto-square-off scheduler. Logs and returns only —
+// it never changes order/square-off logic.
+func schedRecover(where string) {
+	if r := recover(); r != nil {
+		log.Printf("[scheduler] PANIC RECOVERED in %s: %v\n%s", where, r, debug.Stack())
+	}
+}
 
 // OCOAdopter adopts a freshly-filled entry order into an OCO group, placing
 // SL and TP legs based on the percentages derived from the persisted order.
@@ -375,7 +386,13 @@ func (pm *PriceMonitor) Start(ctx context.Context) error {
 					if !ok {
 						return
 					}
-					pm.evaluateEntry(ctx, job.entry, job.ltp)
+					// Per-job recovery: a panic evaluating one watched order must
+					// not kill this worker (which would reduce monitoring capacity
+					// for every other order routed to it).
+					func() {
+						defer schedRecover("priceMonitor.evaluateEntry")
+						pm.evaluateEntry(ctx, job.entry, job.ltp)
+					}()
 				}
 			}
 		}()
@@ -452,6 +469,7 @@ func stockKey(exchange string, token int64) string {
 // checkPricesFallback runs the Redis polling path for stocks not covered by WSS.
 // This is the fallback — WSS-driven evaluation via OnPriceUpdate is the primary path.
 func (pm *PriceMonitor) checkPricesFallback(ctx context.Context) {
+	defer schedRecover("priceMonitor.checkPricesFallback")
 	// Collect all unique stock keys across all shards
 	allStockKeys := make(map[string]struct{}, 128)
 	for _, shard := range pm.shards {
@@ -581,6 +599,7 @@ func (pm *PriceMonitor) evaluateEntry(ctx context.Context, entry *watchEntry, lt
 			// Mark as triggered to prevent re-evaluation, then unwatch
 			atomic.StoreInt32(&entry.triggered, 1)
 			go func() {
+				defer schedRecover("priceMonitor.unwatchMaxExceeded")
 				pm.Unwatch(entry.order.OrderID)
 				// Mark as CANCELLED in DB
 				if pm.orderRepo != nil {
@@ -615,6 +634,7 @@ func isTerminalStatus(s models.OrderStatus) bool {
 
 // triggerOrder updates the order with the current LTP and calls the executor.
 func (pm *PriceMonitor) triggerOrder(ctx context.Context, entry *watchEntry, ltp float64) {
+	defer schedRecover("priceMonitor.triggerOrder")
 	order := entry.order
 
 	// Before executing, verify the order hasn't been cancelled/failed in the DB

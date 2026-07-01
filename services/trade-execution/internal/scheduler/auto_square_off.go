@@ -181,32 +181,39 @@ func (s *AutoSquareOffScheduler) Start(ctx context.Context) error {
 			return nil
 
 		case <-ticker.C:
-			// Strategy-level square-off: closes only the matching strategy's positions
-			// (paper + live) when orders.auto_square_off_time matches the current minute.
-			s.checkStrategySquareOffs(ctx)
+			// Wrap the whole tick in recovery: a panic in any handler must not
+			// kill the ticker loop, or every FUTURE square-off (including the
+			// 15:05 EOD live close) would silently never fire, stranding positions.
+			func() {
+				defer schedRecover("autoSquareOff.tick")
 
-			// Per-user custom auto square-off times (UI-level override, all strategies).
-			s.checkUserSquareOffs(ctx)
+				// Strategy-level square-off: closes only the matching strategy's positions
+				// (paper + live) when orders.auto_square_off_time matches the current minute.
+				s.checkStrategySquareOffs(ctx)
 
-			// Global paper square-off fires independently at its own time (15:00).
-			if s.shouldPaperSquareOff() && s.paperSquareOff != nil {
-				log.Println("[auto-square-off] ========== PAPER TRIGGER — closing all paper positions at 15:00 ==========")
-				if err := s.paperSquareOff(ctx); err != nil {
-					log.Printf("[auto-square-off] Paper square-off error: %v", err)
+				// Per-user custom auto square-off times (UI-level override, all strategies).
+				s.checkUserSquareOffs(ctx)
+
+				// Global paper square-off fires independently at its own time (15:00).
+				if s.shouldPaperSquareOff() && s.paperSquareOff != nil {
+					log.Println("[auto-square-off] ========== PAPER TRIGGER — closing all paper positions at 15:00 ==========")
+					if err := s.paperSquareOff(ctx); err != nil {
+						log.Printf("[auto-square-off] Paper square-off error: %v", err)
+					}
 				}
-			}
-			// Global live square-off fires at its own time (15:05).
-			if s.shouldSquareOff() {
-				log.Println("[auto-square-off] ========== LIVE TRIGGER — squaring off all open algo positions ==========")
-				if err := s.squareOffAllPositions(ctx); err != nil {
-					log.Printf("[auto-square-off] Error during live square-off: %v", err)
+				// Global live square-off fires at its own time (15:05).
+				if s.shouldSquareOff() {
+					log.Println("[auto-square-off] ========== LIVE TRIGGER — squaring off all open algo positions ==========")
+					if err := s.squareOffAllPositions(ctx); err != nil {
+						log.Printf("[auto-square-off] Error during live square-off: %v", err)
+					}
+					// Clear the broker-WS protection set so post-market idle sweeps
+					// can close connections for users with no remaining exposure.
+					if s.onMarketClose != nil {
+						s.onMarketClose()
+					}
 				}
-				// Clear the broker-WS protection set so post-market idle sweeps
-				// can close connections for users with no remaining exposure.
-				if s.onMarketClose != nil {
-					s.onMarketClose()
-				}
-			}
+			}()
 		}
 	}
 }

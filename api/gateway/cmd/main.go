@@ -21,6 +21,11 @@ import (
 )
 
 func main() {
+	// Route the standard library logger to stdout. The gateway logs almost
+	// everything (CORS, proxy errors, gRPC, routes) via the stdlib log package;
+	// sending it to stdout puts it in the same single stream PM2 captures.
+	log.SetOutput(os.Stdout)
+
 	// Load config
 	cfg, err := config.Load()
 	if err != nil {
@@ -60,8 +65,13 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	// Initialize logger for WebSocket handler
-	pkgLgr, _ := pkglogger.NewWithDefaults("api-gateway")
+	// Shared structured logger — used by WebSocket handler, Recovery, and
+	// AccessLog middleware. Fail fast rather than handing a nil logger to
+	// every request handler.
+	pkgLgr, err := pkglogger.NewWithDefaults("api-gateway")
+	if err != nil {
+		log.Fatalf("Failed to initialize logger: %v", err)
+	}
 	defer pkgLgr.Close()
 	logger := pkgLgr.Logger
 
@@ -87,12 +97,13 @@ func main() {
 	authConfig := middleware.AuthConfig{
 		VerifyURL: cfg.Auth.VerifyURL,
 		Timeout:   cfg.Auth.Timeout,
+		Bypass:    cfg.Auth.Bypass,
 	}
 
 	log.Printf("Auth middleware configured: verify URL=%s timeout=%s", authConfig.VerifyURL, authConfig.Timeout)
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, amnPreviewHandler, corsConfig, authConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, amnPreviewHandler, corsConfig, authConfig, logger)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

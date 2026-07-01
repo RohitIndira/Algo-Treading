@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -16,6 +17,36 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
+
+// recoverGo recovers a panic in a detached goroutine and logs it with a stack
+// trace so one bad square-off/cancel can't crash the whole process. Logs and
+// returns only — does not change order logic.
+func (c *StrategyEventsConsumer) recoverGo(where string) {
+	if r := recover(); r != nil {
+		c.logger.Error("PANIC RECOVERED in strategy-events goroutine",
+			zap.String("where", where),
+			zap.Any("panic", r),
+			zap.String("stacktrace", string(debug.Stack())),
+		)
+	}
+}
+
+// processMessageRecovered wraps processMessage with panic recovery, surfacing a
+// panic as an error so the Start loop's existing "don't commit, retry on
+// restart" path runs instead of the whole consumer goroutine crashing.
+func (c *StrategyEventsConsumer) processMessageRecovered(ctx context.Context, msg kafka.Message) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("PANIC RECOVERED processing strategy event",
+				zap.Int64("offset", msg.Offset),
+				zap.Any("panic", r),
+				zap.String("stacktrace", string(debug.Stack())),
+			)
+			err = fmt.Errorf("panic processing strategy event: %v", r)
+		}
+	}()
+	return c.processMessage(ctx, msg)
+}
 
 // isEODSquareOffWindow returns true during the EOD square-off window (15:00–15:10 IST,
 // weekdays). During this window, AutoSquareOffScheduler is the sole owner of live
@@ -244,7 +275,7 @@ func (c *StrategyEventsConsumer) Start(ctx context.Context) error {
 				continue
 			}
 
-			if err := c.processMessage(ctx, msg); err != nil {
+			if err := c.processMessageRecovered(ctx, msg); err != nil {
 				c.logger.Error("Failed to process strategy event",
 					zap.Error(err),
 					zap.Int64("offset", msg.Offset))
@@ -308,6 +339,7 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 		if c.startBrokerWS != nil && ev.UserID != "" {
 			userID := ev.UserID
 			go func() {
+				defer c.recoverGo("startBrokerWS")
 				bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				if err := c.startBrokerWS(bgCtx, userID); err != nil {
@@ -373,6 +405,7 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 		wg.Add(1)
 		go func(o *models.Order) {
 			defer wg.Done()
+			defer c.recoverGo("cancelBrokerOrder")
 			reason := "Strategy deactivated or deleted"
 			if cancelErr := c.executor.CancelOrder(ctx, o, reason); cancelErr != nil {
 				c.logger.Error("Broker cancellation failed for order",
@@ -475,6 +508,7 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 			sqWg.Add(1)
 			go func(ord *models.Order) {
 				defer sqWg.Done()
+				defer c.recoverGo("squareOffLivePosition")
 				if sqErr := c.squareOffLivePosition(ctx, ord); sqErr != nil {
 					c.logger.Error("Square-off failed on strategy deactivation",
 						zap.String("order_id", ord.OrderID.String()),
@@ -522,6 +556,7 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 				sqWg.Add(1)
 				go func(ord *models.Order) {
 					defer sqWg.Done()
+					defer c.recoverGo("squareOffLivePosition.untracked")
 					if sqErr := c.squareOffLivePosition(ctx, ord); sqErr != nil {
 						c.logger.Error("Square-off failed for untracked broker position on deactivation",
 							zap.String("order_id", ord.OrderID.String()),

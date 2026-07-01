@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"time"
 )
 
@@ -68,29 +69,40 @@ func (s *EODDeactivationScheduler) Start(ctx context.Context) {
 			log.Printf("[eod-scheduler] Stopped via stop channel")
 			return
 		case t := <-ticker.C:
-			now := t.In(loc)
-			if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
-				continue
-			}
+			// Recover guards this single tick, so a panic at 15:00 doesn't
+			// cancel every future minute's check — including 15:05 LIVE
+			// deactivation and tomorrow's market close.
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Printf("[eod-scheduler] PANIC recovered: %v\n%s", rec, debug.Stack())
+					}
+				}()
 
-			currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
-			today := now.Format("2006-01-02")
+				now := t.In(loc)
+				if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+					return
+				}
 
-			// Per-user custom auto-square-off: deactivate strategies whose
-			// auto_square_off_time matches the current minute.
-			s.deactivateAtCustomSquareOffTime(ctx, currentTime)
+				currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
+				today := now.Format("2006-01-02")
 
-			// Global paper deactivation at 15:00 IST.
-			if now.Hour() == paperDeactivationHour && now.Minute() == paperDeactivationMinute && lastPaperFiredDate != today {
-				lastPaperFiredDate = today
-				s.deactivateByMode(ctx, "PAPER")
-			}
+				// Per-user custom auto-square-off: deactivate strategies whose
+				// auto_square_off_time matches the current minute.
+				s.deactivateAtCustomSquareOffTime(ctx, currentTime)
 
-			// Global live deactivation at 15:05 IST.
-			if now.Hour() == liveDeactivationHour && now.Minute() == liveDeactivationMinute && lastLiveFiredDate != today {
-				lastLiveFiredDate = today
-				s.deactivateByMode(ctx, "LIVE")
-			}
+				// Global paper deactivation at 15:00 IST.
+				if now.Hour() == paperDeactivationHour && now.Minute() == paperDeactivationMinute && lastPaperFiredDate != today {
+					lastPaperFiredDate = today
+					s.deactivateByMode(ctx, "PAPER")
+				}
+
+				// Global live deactivation at 15:05 IST.
+				if now.Hour() == liveDeactivationHour && now.Minute() == liveDeactivationMinute && lastLiveFiredDate != today {
+					lastLiveFiredDate = today
+					s.deactivateByMode(ctx, "LIVE")
+				}
+			}()
 		}
 	}
 }

@@ -41,7 +41,10 @@ func (h *PaperTradingHandler) GetPaperPositions(w http.ResponseWriter, r *http.R
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -69,7 +72,10 @@ func (h *PaperTradingHandler) ForceExitAll(w http.ResponseWriter, r *http.Reques
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -113,7 +119,10 @@ func (h *PaperTradingHandler) ForceExitAllLive(w http.ResponseWriter, r *http.Re
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -153,7 +162,10 @@ func (h *PaperTradingHandler) ForceExitStrategy(w http.ResponseWriter, r *http.R
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -206,7 +218,10 @@ func (h *PaperTradingHandler) ForceExitStrategyLive(w http.ResponseWriter, r *ht
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -232,7 +247,10 @@ func (h *PaperTradingHandler) GetLiveOrders(w http.ResponseWriter, r *http.Reque
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -258,7 +276,10 @@ func (h *PaperTradingHandler) GetClosedPaperOrders(w http.ResponseWriter, r *htt
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -284,7 +305,10 @@ func (h *PaperTradingHandler) GetClosedLiveOrders(w http.ResponseWriter, r *http
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -315,7 +339,10 @@ func (h *PaperTradingHandler) GetDashboardStats(w http.ResponseWriter, r *http.R
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -360,7 +387,10 @@ func (h *PaperTradingHandler) GetIndiraPositions(w http.ResponseWriter, r *http.
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -401,7 +431,10 @@ func (h *PaperTradingHandler) SubscribeBrokerWS(w http.ResponseWriter, r *http.R
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -438,7 +471,10 @@ func (h *PaperTradingHandler) CancelPriceWatch(w http.ResponseWriter, r *http.Re
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -465,7 +501,10 @@ func (h *PaperTradingHandler) GetPriceWatches(w http.ResponseWriter, r *http.Req
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -501,7 +540,10 @@ func (h *PaperTradingHandler) SetAutoSquareOffConfig(w http.ResponseWriter, r *h
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
@@ -528,7 +570,10 @@ func (h *PaperTradingHandler) GetAutoSquareOffConfig(w http.ResponseWriter, r *h
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("ERROR proxy %s %s: failed reading upstream response body: %v", r.Method, r.URL.Path, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)

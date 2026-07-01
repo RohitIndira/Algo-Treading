@@ -9,10 +9,16 @@
 #   5. api-gateway  (last)
 #
 # Usage:
-#   ./deploy-pm2.sh            # deploy all
-#   ./deploy-pm2.sh restart    # restart all running instances
-#   ./deploy-pm2.sh stop       # stop all instances
-#   ./deploy-pm2.sh status     # show pm2 status
+#   ./deploy-pm2.sh                  # deploy all
+#   ./deploy-pm2.sh restart          # restart all running instances
+#   ./deploy-pm2.sh stop             # stop all instances
+#   ./deploy-pm2.sh status           # show pm2 status
+#   ./deploy-pm2.sh setup-logrotate  # install/configure pm2-logrotate (run once)
+#
+# Logging model: each service logs ONLY to stdout; PM2's --log captures stdout
+# and stderr into a single combined file per instance under <service>/logs/.
+# That PM2 file is the single source of truth — `pm2 logs <name>` shows exactly
+# its contents. Run `setup-logrotate` once so these files rotate daily.
 
 set -e
 
@@ -102,15 +108,20 @@ deploy_service() {
             local instance_name="${pm2_name}"
         fi
 
+        # Single source of truth: --log writes BOTH stdout and stderr into one
+        # combined file per instance. The app no longer writes its own file
+        # (LOG_DIR is unset), so this PM2 file is the only on-disk log and
+        # `pm2 logs ${instance_name}` shows exactly its contents.
+        # --cwd pins the working directory so any relative paths resolve here.
         pm2 start "${binary_path}" \
             --name "${instance_name}" \
+            --cwd  "${service_dir}" \
             --log  "${log_dir}/${instance_name}.log" \
-            --error "${log_dir}/${instance_name}-error.log" \
             --restart-delay 3000 \
             --max-restarts 10 \
             --no-autorestart
 
-        info "${instance_name} started."
+        info "${instance_name} started → ${log_dir}/${instance_name}.log"
     done
 }
 
@@ -157,12 +168,26 @@ case "$ACTION" in
         exit 0
         ;;
 
+    setup-logrotate)
+        # Since the app no longer writes dated sub-folders, PM2's pm2-logrotate
+        # module handles daily rotation + retention of the combined log files.
+        info "Installing and configuring pm2-logrotate..."
+        pm2 install pm2-logrotate
+        pm2 set pm2-logrotate:max_size 50M
+        pm2 set pm2-logrotate:retain 30
+        pm2 set pm2-logrotate:compress true
+        pm2 set pm2-logrotate:rotateInterval '0 0 * * *'   # daily at midnight
+        pm2 set pm2-logrotate:dateFormat 'YYYY-MM-DD_HH-mm-ss'
+        info "pm2-logrotate configured: rotate daily, keep 30, compress, max 50M."
+        exit 0
+        ;;
+
     deploy)
         ;;  # fall through to deploy logic below
 
     *)
         error "Unknown action: $ACTION"
-        echo "Usage: $0 [deploy|restart|stop|status]"
+        echo "Usage: $0 [deploy|restart|stop|status|setup-logrotate]"
         exit 1
         ;;
 esac
@@ -209,8 +234,9 @@ fi
 echo ""
 info "Useful commands:"
 echo "  pm2 list                  — show all processes"
-echo "  pm2 logs <name>           — tail logs"
+echo "  pm2 logs <name>           — tail logs (same content as the file)"
 echo "  pm2 monit                 — live monitor"
 echo "  $0 restart                — restart all"
 echo "  $0 stop                   — stop all"
+echo "  $0 setup-logrotate        — install/configure daily log rotation"
 echo "=========================================="

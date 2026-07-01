@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/marketws"
@@ -70,6 +71,11 @@ func (tw *TickWriter) InCh() chan<- marketws.TickData {
 // Start runs the drain loop. Call this in a goroutine: go tw.Start(ctx).
 // It exits cleanly when ctx is cancelled or the channel is closed.
 func (tw *TickWriter) Start(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[tickstore] PANIC RECOVERED in drain loop: %v\n%s", r, debug.Stack())
+		}
+	}()
 	log.Println("[tickstore] drain loop started — writing to localhost Redis DB=1")
 
 	batch := make([]marketws.TickData, 0, batchMax)

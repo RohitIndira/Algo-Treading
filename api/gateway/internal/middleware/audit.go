@@ -1,6 +1,9 @@
 package middleware
 
 import (
+	"bufio"
+	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -19,18 +22,35 @@ func (rw *auditResponseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-// AuditLog records every mutating request (POST, PUT, DELETE) with the user ID,
-// client IP, path, method, response status, and latency. Read-only requests are
-// not logged to keep audit output focused on state-changing operations.
-func AuditLog() func(http.Handler) http.Handler {
-	logger, _ := zap.NewProduction()
+// Hijack delegates to the underlying ResponseWriter so WebSocket upgrades keep
+// working through this wrapper (gorilla/websocket requires http.Hijacker).
+// The old AuditLog skipped GET requests entirely, so the WS handshake was never
+// wrapped; AccessLog wraps every method, so this passthrough is required.
+func (rw *auditResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("audit: underlying ResponseWriter does not implement http.Hijacker")
+	}
+	return hj.Hijack()
+}
+
+// Flush delegates to the underlying ResponseWriter so streaming/SSE responses
+// keep flushing through this wrapper.
+func (rw *auditResponseWriter) Flush() {
+	if fl, ok := rw.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+// AccessLog records every request (method, path, user ID, client IP, response
+// status, latency) so any crash or error has surrounding context to trace
+// what was in flight. Mutating requests (POST/PUT/DELETE) are additionally
+// tagged "mutating" for audit filtering. Severity escalates with status: 5xx
+// logs as Error, 4xx as Warn, everything else as Info, so failures are easy
+// to grep/alert on without drowning in successful GETs.
+func AccessLog(logger *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodDelete {
-				next.ServeHTTP(w, r)
-				return
-			}
-
 			rw := &auditResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 			start := time.Now()
 
@@ -39,18 +59,29 @@ func AuditLog() func(http.Handler) http.Handler {
 			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 				ip = xff
 			}
+			mutating := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete
 
 			next.ServeHTTP(rw, r)
 
-			logger.Info("AUDIT",
+			fields := []zap.Field{
 				zap.String("correlation_id", correlation.FromContext(r.Context())),
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.String("user_id", userID),
 				zap.String("ip", ip),
 				zap.Int("status", rw.statusCode),
+				zap.Bool("mutating", mutating),
 				zap.Duration("duration", time.Since(start).Round(time.Millisecond)),
-			)
+			}
+
+			switch {
+			case rw.statusCode >= 500:
+				logger.Error("REQUEST", fields...)
+			case rw.statusCode >= 400:
+				logger.Warn("REQUEST", fields...)
+			default:
+				logger.Info("REQUEST", fields...)
+			}
 		})
 	}
 }

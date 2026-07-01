@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,17 @@ import (
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 )
+
+// indiraRecover recovers a panic in a detached goroutine and logs it with a
+// stack trace. Used for the bounded tick-size / DPR resolver goroutines: on
+// panic their target value is left at its zero, which is the same safe fallback
+// these resolvers already return on a missing lookup (0 = no tick rounding /
+// no DPR clamp). Logs and returns only.
+func indiraRecover(where string) {
+	if r := recover(); r != nil {
+		log.Printf("[indira] PANIC RECOVERED in %s: %v\n%s", where, r, debug.Stack())
+	}
+}
 
 // TickSizeLookup retrieves the tick size for an instrument from Redis market data.
 type TickSizeLookup interface {
@@ -344,10 +356,12 @@ func (c *ExecutionClient) convertToIndiraRequest(order *models.Order) (*indiraCl
 	lookupWg.Add(2)
 	go func() {
 		defer lookupWg.Done()
+		defer indiraRecover("resolveTickSize")
 		tickSize = c.resolveTickSize(symbolBuilder.Exchange, order.StockCode)
 	}()
 	go func() {
 		defer lookupWg.Done()
+		defer indiraRecover("resolveDPR")
 		dprLower, dprUpper = c.resolveDPR(symbolBuilder.Exchange, order.StockCode)
 	}()
 	lookupWg.Wait()
@@ -517,10 +531,12 @@ func (c *ExecutionClient) convertToIndiraModifyRequest(order *models.Order) (*in
 	modLookupWg.Add(2)
 	go func() {
 		defer modLookupWg.Done()
+		defer indiraRecover("resolveTickSize.modify")
 		tickSize = c.resolveTickSize(symbolBuilder.Exchange, order.StockCode)
 	}()
 	go func() {
 		defer modLookupWg.Done()
+		defer indiraRecover("resolveDPR.modify")
 		dprLower, dprUpper = c.resolveDPR(symbolBuilder.Exchange, order.StockCode)
 	}()
 	modLookupWg.Wait()

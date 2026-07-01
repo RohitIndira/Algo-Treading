@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -208,9 +209,11 @@ func New(config Config) (*Logger, error) {
 //
 //	ENVIRONMENT  – development (default) | staging | production
 //	LOG_LEVEL    – debug | info (default) | warn | error | fatal
-//	LOG_DIR      – base log directory (default: "logs")
+//	LOG_DIR      – base log directory (unset by default → stdout only)
 //
-// Log files land at  <LOG_DIR>/<YYYY-MM-DD>/<serviceName>.log
+// When LOG_DIR is set, files land at  <LOG_DIR>/<YYYY-MM-DD>/<serviceName>.log.
+// When it is unset the logger writes only to stdout and the supervisor (PM2)
+// owns the on-disk log — see the note in NewWithDefaults' body.
 func NewWithDefaults(serviceName string) (*Logger, error) {
 	env := os.Getenv("ENVIRONMENT")
 	if env == "" {
@@ -222,10 +225,12 @@ func NewWithDefaults(serviceName string) (*Logger, error) {
 		logLevel = "info"
 	}
 
+	// LOG_DIR is intentionally NOT defaulted. When it is unset the service logs
+	// only to stdout and the process supervisor (PM2) owns the single on-disk
+	// file — this keeps `pm2 logs` and the file byte-identical and avoids a
+	// second, divergent app-written log. Set LOG_DIR to additionally write an
+	// app-side dated file (escape hatch for non-PM2 / local runs).
 	logDir := os.Getenv("LOG_DIR")
-	if logDir == "" {
-		logDir = "logs"
-	}
 
 	return New(Config{
 		Environment: env,
@@ -290,6 +295,56 @@ func (l *Logger) Close() error {
 		return l.writer.Close()
 	}
 	return nil
+}
+
+// RecoverAndLog recovers a panic in the calling goroutine and logs it with a
+// full stack trace instead of letting it crash the process — an unhandled
+// panic in any goroutine (unlike an HTTP handler) takes the whole service
+// down with it. Call as the first `defer` in any manually-spawned goroutine:
+//
+//	go func() {
+//	    defer lgr.RecoverAndLog("mongo-watcher-cleanup-ticker")
+//	    ...
+//	}()
+//
+// This recovers-and-continues; it does not re-panic or exit. Use it for
+// goroutines whose death shouldn't take the rest of the service down. For a
+// goroutine whose death means the service is no longer doing useful work
+// (e.g. the main processing loop), recover explicitly at that call site and
+// trigger a deliberate shutdown instead, so the failure stays observable.
+func (l *Logger) RecoverAndLog(goroutineName string) {
+	if rec := recover(); rec != nil {
+		l.Error("PANIC RECOVERED in goroutine",
+			zap.String("goroutine", goroutineName),
+			zap.Any("panic", rec),
+			zap.String("stacktrace", string(debug.Stack())),
+		)
+	}
+}
+
+// RecoverGoroutine is the free-function form of RecoverAndLog for packages that
+// hold a raw *zap.Logger rather than the *Logger wrapper. It recovers a panic in
+// the calling goroutine and logs it with a full stack trace so one bad
+// goroutine cannot crash the whole process. It recovers-and-continues; it does
+// NOT alter control flow, re-panic, or exit — safe to add to any fire-and-forget
+// goroutine without changing its behaviour on the non-panic path.
+//
+//	go func() {
+//	    defer logger.RecoverGoroutine(lgr, "oco-cancel-leg")
+//	    ...
+//	}()
+//
+// A nil logger is tolerated (the panic is still recovered, just not logged).
+func RecoverGoroutine(lgr *zap.Logger, goroutineName string) {
+	if rec := recover(); rec != nil {
+		if lgr != nil {
+			lgr.Error("PANIC RECOVERED in goroutine",
+				zap.String("goroutine", goroutineName),
+				zap.Any("panic", rec),
+				zap.String("stacktrace", string(debug.Stack())),
+			)
+		}
+	}
 }
 
 // CurrentLogPath returns the absolute path of the active log file, or an

@@ -16,6 +16,7 @@ package lifecycle
 import (
 	"context"
 	"log"
+	"runtime/debug"
 	"time"
 )
 
@@ -99,6 +100,11 @@ func (l *Lifecycle) Shutdown() {
 
 		go func(comp Component) {
 			defer close(done)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[lifecycle] PANIC RECOVERED stopping %s: %v\n%s", comp.Name, r, debug.Stack())
+				}
+			}()
 			if comp.StopFn != nil {
 				comp.StopFn()
 			}

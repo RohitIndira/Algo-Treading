@@ -101,3 +101,25 @@ func (c *RedisCache) Publish(ctx context.Context, channel string, message interf
 	}
 	return c.client.Publish(ctx, channel, message).Err()
 }
+
+// GetFloat returns a float64 stored at key. Returns 0 (no error) when the key
+// does not exist so callers can treat a missing exposure counter as zero.
+func (c *RedisCache) GetFloat(ctx context.Context, key string) (float64, error) {
+	if c == nil || c.client == nil {
+		return 0, fmt.Errorf("redis cache not initialized")
+	}
+	val, err := c.client.Get(ctx, key).Float64()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	return val, err
+}
+
+// IncrByFloat atomically increments a float64 counter at key and returns the
+// new value. Creates the key with value `incr` if it does not yet exist.
+func (c *RedisCache) IncrByFloat(ctx context.Context, key string, incr float64) (float64, error) {
+	if c == nil || c.client == nil {
+		return 0, fmt.Errorf("redis cache not initialized")
+	}
+	return c.client.IncrByFloat(ctx, key, incr).Result()
+}

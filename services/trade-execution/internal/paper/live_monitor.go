@@ -199,6 +199,7 @@ func (m *LiveOrderMonitor) broadcastPnL(order *models.Order, symbol string, ltp 
 // runReconcileLoop periodically diffs the open-live-positions DB view against
 // the in-memory cache: new positions → new_order, vanished positions → exit.
 func (m *LiveOrderMonitor) runReconcileLoop(ctx context.Context) {
+	defer paperRecover("LiveOrderMonitor.runReconcileLoop")
 	ticker := time.NewTicker(liveReconcileInterval)
 	defer ticker.Stop()
 	for {
@@ -372,6 +373,7 @@ func (m *LiveOrderMonitor) removeFromCache(orderID uuid.UUID) {
 // (beyond wssGracePeriod) and broadcasts P&L so positions on quiet instruments
 // still get live updates. It never triggers exits.
 func (m *LiveOrderMonitor) runRedisPnLTicker(ctx context.Context) {
+	defer paperRecover("LiveOrderMonitor.runRedisPnLTicker")
 	ticker := time.NewTicker(liveRedisPollInterval)
 	defer ticker.Stop()
 	for {

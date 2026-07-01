@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -52,9 +53,18 @@ func (w *OutboxWorker) Start(ctx context.Context) {
 			fmt.Println("[OutboxWorker] Stopping outbox worker...")
 			return
 		case <-ticker.C:
-			if err := w.processOutbox(ctx); err != nil {
-				fmt.Printf("[OutboxWorker] Error processing outbox: %v\n", err)
-			}
+			// Recover guards this tick only, so a panic in one batch doesn't
+			// cancel every future tick — Kafka publishing must keep running.
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						fmt.Printf("[OutboxWorker] PANIC recovered: %v\n%s\n", rec, debug.Stack())
+					}
+				}()
+				if err := w.processOutbox(ctx); err != nil {
+					fmt.Printf("[OutboxWorker] Error processing outbox: %v\n", err)
+				}
+			}()
 		}
 	}
 }

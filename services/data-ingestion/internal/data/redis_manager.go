@@ -273,12 +273,16 @@ func (rm *RedisManager) StartScheduler(ctx context.Context, mongoClient *mongodb
 	// So let's run once on startup, then schedule.
 	
 	go func() {
+		defer rm.lgr.RecoverAndLog("redis-initial-company-master-load")
 		if err := rm.LoadCompanyMasterData(ctx, mongoClient); err != nil {
 			rm.lgr.Error("initial company master load failed", zap.Error(err))
 		}
 	}()
 
 	go func() {
+		// Recover guards each day's run individually (inner closure) rather
+		// than the whole loop, so a panic during one day's sync doesn't
+		// cancel every future scheduled run — tomorrow's 8am sync still fires.
 		for {
 			now := time.Now()
 			// Calculate next 8:00 AM
@@ -286,15 +290,18 @@ func (rm *RedisManager) StartScheduler(ctx context.Context, mongoClient *mongodb
 			if now.After(nextRun) {
 				nextRun = nextRun.Add(24 * time.Hour)
 			}
-			
+
 			duration := nextRun.Sub(now)
 			rm.lgr.Info("scheduling next company master sync", zap.Duration("wait", duration))
-			
+
 			select {
 			case <-time.After(duration):
-				if err := rm.LoadCompanyMasterData(ctx, mongoClient); err != nil {
-					rm.lgr.Error("scheduled company master load failed", zap.Error(err))
-				}
+				func() {
+					defer rm.lgr.RecoverAndLog("redis-scheduled-company-master-load")
+					if err := rm.LoadCompanyMasterData(ctx, mongoClient); err != nil {
+						rm.lgr.Error("scheduled company master load failed", zap.Error(err))
+					}
+				}()
 			case <-ctx.Done():
 				return
 			}

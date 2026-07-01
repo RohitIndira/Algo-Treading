@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -38,6 +40,10 @@ import (
 )
 
 func main() {
+	// Route the standard library logger to stdout so stdlib log.* output shares
+	// the single stream PM2 captures alongside the zap logger.
+	log.SetOutput(os.Stdout)
+
 	loadEnv()
 
 	// Create context bound to OS signals
@@ -190,6 +196,24 @@ func main() {
 	eng.Start(ctx)
 	handler := consumer.NewHandler(eng, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours, holidayChecker)
 
+	// Market-price-protection (velocity) check reads the recent tick stream that
+	// trade-execution's tickstore writes to Redis DB=TickstoreDB. Non-fatal: if
+	// the tick store is unreachable the velocity check is simply disabled
+	// (fail-open) — it must never block order generation.
+	if len(cfg.Redis.Addrs) > 0 {
+		tickHistory, thErr := consumer.NewTickHistory(cfg.Redis.Addrs[0], cfg.Redis.Password, cfg.Redis.TickstoreDB, logger)
+		if thErr != nil {
+			logger.Warn("Market-price-protection disabled — tick store unavailable",
+				zap.Int("tickstore_db", cfg.Redis.TickstoreDB),
+				zap.Error(thErr))
+		} else {
+			handler.SetTickHistory(tickHistory)
+			defer tickHistory.Close()
+			logger.Info("Market-price-protection enabled",
+				zap.Int("tickstore_db", cfg.Redis.TickstoreDB))
+		}
+	}
+
 	// Initialize AMN backfill runner.
 	// Uses the same MongoDB URI as the holiday checker (accesses CAG_CHATBOT and
 	// OdinMasterData databases). Connection failures are non-fatal: if Mongo is
@@ -309,6 +333,13 @@ func main() {
 
 	// Log periodic statistics
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("PANIC RECOVERED in stats logger",
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())))
+			}
+		}()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 

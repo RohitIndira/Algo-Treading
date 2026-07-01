@@ -572,6 +572,7 @@ func (p *SignalProcessor) routeToMultiLevel(ctx context.Context, order *models.O
 	// Ensure broker WS subscription is active.
 	if !order.IsPaperTrade && p.executor.statusSvc != nil && auth != nil {
 		go func() {
+			defer p.executor.recoverGo("ml_ws_sub")
 			if err := p.executor.statusSvc.StartSubscription(context.Background(), order.UserID, auth); err != nil {
 				p.logger.Warn("ml_ws_sub_failed",
 					zap.String("uid", order.UserID),

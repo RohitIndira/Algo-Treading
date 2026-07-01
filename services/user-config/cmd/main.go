@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -25,10 +26,39 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 )
+
+// recoveryInterceptor recovers a panic in any unary RPC handler and logs it
+// with full context (method, correlation id, stack trace) instead of letting
+// it crash the whole process. Unlike net/http, grpc-go has NO built-in
+// per-RPC panic recovery — without this, one bad request takes down strategy
+// CRUD, the outbox worker, and the EOD scheduler together.
+func recoveryInterceptor(lgr *logger.Logger) grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (resp interface{}, err error) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				lgr.Error("PANIC RECOVERED in gRPC handler",
+					zap.String("correlation_id", correlation.FromContext(ctx)),
+					zap.String("method", info.FullMethod),
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())),
+				)
+				err = status.Error(codes.Internal, "internal server error")
+			}
+		}()
+		return handler(ctx, req)
+	}
+}
 
 // correlationServerInterceptor extracts the correlation ID from incoming gRPC
 // metadata and stores it in the handler context. A new ID is generated when
@@ -51,6 +81,10 @@ func correlationServerInterceptor(
 }
 
 func main() {
+	// Route the standard library logger to stdout so stdlib log.* output shares
+	// the single stream PM2 captures alongside the zap logger.
+	log.SetOutput(os.Stdout)
+
 	// Load .env file if it exists
 	if err := godotenv.Load(); err != nil {
 		fmt.Printf("Note: .env file not found, using system environment variables\n")
@@ -148,7 +182,9 @@ func main() {
 	serverOpts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(10 * 1024 * 1024),
 		grpc.MaxSendMsgSize(10 * 1024 * 1024),
-		grpc.UnaryInterceptor(correlationServerInterceptor),
+		// recoveryInterceptor must run outermost so it catches panics from
+		// correlationServerInterceptor and every handler beneath it.
+		grpc.ChainUnaryInterceptor(recoveryInterceptor(lgr), correlationServerInterceptor),
 	}
 	certFile := os.Getenv("GRPC_TLS_CERT")
 	keyFile := os.Getenv("GRPC_TLS_KEY")
@@ -178,8 +214,19 @@ func main() {
 
 	lgr.Info("Starting gRPC server", zap.Int("port", cfg.Server.Port))
 
-	// Start server in goroutine
+	// Start server in goroutine. lgr.Fatal already exits on a returned error;
+	// the recover here only guards against an actual panic in Serve, which
+	// would otherwise crash the process with an unstructured stack trace.
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				lgr.Error("PANIC in gRPC server — service is non-functional",
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())))
+				lgr.Sync()
+				os.Exit(1)
+			}
+		}()
 		if err := grpcServer.Serve(lis); err != nil {
 			lgr.Fatal("Failed to serve", zap.Error(err))
 		}

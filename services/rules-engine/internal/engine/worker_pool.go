@@ -2,8 +2,11 @@ package engine
 
 import (
 	"errors"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
+
+	"go.uber.org/zap"
 )
 
 // WorkerPool executes submitted jobs using a fixed number of workers.
@@ -12,21 +15,22 @@ import (
 // This provides the hard invariant required for graceful shutdown: no queued
 // evaluations are dropped.
 type WorkerPool struct {
-	jobs chan func()
-	wg   sync.WaitGroup
+	jobs   chan func()
+	wg     sync.WaitGroup
+	logger *zap.Logger
 
 	closeOnce sync.Once
 	closed    atomic.Bool
 }
 
-func NewWorkerPool(workers int, buffer int) *WorkerPool {
+func NewWorkerPool(workers int, buffer int, logger *zap.Logger) *WorkerPool {
 	if workers <= 0 {
 		workers = 1
 	}
 	if buffer <= 0 {
 		buffer = workers * 4
 	}
-	wp := &WorkerPool{jobs: make(chan func(), buffer)}
+	wp := &WorkerPool{jobs: make(chan func(), buffer), logger: logger}
 	for i := 0; i < workers; i++ {
 		go func() {
 			for job := range wp.jobs {
@@ -34,12 +38,29 @@ func NewWorkerPool(workers int, buffer int) *WorkerPool {
 					wp.wg.Done()
 					continue
 				}
-				job()
+				wp.runJob(job)
 				wp.wg.Done()
 			}
 		}()
 	}
 	return wp
+}
+
+// runJob executes a single job with panic recovery. One strategy's bad data
+// (or an evaluator edge case) must not crash the worker and take every other
+// in-flight evaluation — across all strategies and all workers — down with it.
+func (wp *WorkerPool) runJob(job func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			if wp.logger != nil {
+				wp.logger.Error("PANIC RECOVERED in worker pool job",
+					zap.Any("panic", rec),
+					zap.String("stacktrace", string(debug.Stack())),
+				)
+			}
+		}
+	}()
+	job()
 }
 
 var ErrWorkerPoolClosed = errors.New("worker pool closed")

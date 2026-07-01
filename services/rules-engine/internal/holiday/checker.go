@@ -3,6 +3,7 @@ package holiday
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -162,9 +163,21 @@ func (c *Checker) StartAutoRefresh(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
-				if err := c.Refresh(ctx); err != nil {
-					c.logger.Error("holiday checker: auto-refresh failed", zap.Error(err))
-				}
+				// Recover guards this refresh only, so a panic doesn't cancel
+				// every future day's refresh — the holiday set would otherwise
+				// silently go stale and a holiday could be traded as a normal day.
+				func() {
+					defer func() {
+						if rec := recover(); rec != nil {
+							c.logger.Error("holiday checker: PANIC recovered during auto-refresh",
+								zap.Any("panic", rec),
+								zap.String("stacktrace", string(debug.Stack())))
+						}
+					}()
+					if err := c.Refresh(ctx); err != nil {
+						c.logger.Error("holiday checker: auto-refresh failed", zap.Error(err))
+					}
+				}()
 			case <-ctx.Done():
 				return
 			}

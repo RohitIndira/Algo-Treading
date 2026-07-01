@@ -316,8 +316,14 @@ func (e *Evaluator) evaluateExchange(event *models.MarketEvent, strategy *models
 		return
 	}
 
+	// Strategy conditions store proto-prefixed names (e.g. "EXCHANGE_NSE") while
+	// Kafka news events carry plain names ("NSE"). Normalize both before comparing.
+	normExch := func(s string) string {
+		return strings.ToUpper(strings.TrimPrefix(strings.ToUpper(s), "EXCHANGE_"))
+	}
+	eventExch := normExch(event.StockData.Exchange)
 	for _, ex := range strategy.Conditions.Exchanges {
-		if strings.EqualFold(ex, event.StockData.Exchange) {
+		if normExch(ex) == eventExch {
 			result.MatchedConditions = append(result.MatchedConditions, condition)
 			result.ConditionScores[condition] = 100.0
 			return

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,19 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
+
+// recoverGo recovers a panic in a detached goroutine and logs it with a stack
+// trace so a panic in a background DB/publish/WS task can't crash the whole
+// order-execution process. Logs and returns only — never changes order logic.
+func (e *OrderExecutor) recoverGo(where string) {
+	if r := recover(); r != nil {
+		e.logger.Error("PANIC RECOVERED in executor goroutine",
+			zap.String("where", where),
+			zap.Any("panic", r),
+			zap.String("stacktrace", string(debug.Stack())),
+		)
+	}
+}
 
 // OrderExecutor handles order execution logic
 type OrderExecutor struct {
@@ -262,6 +276,7 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 			e.logger.Error("sync_db_update_failed", zap.String("oid", orderCopy.OrderID.String()), zap.Error(err))
 		}
 		go func() {
+			defer e.recoverGo("squareOffSubmittedEvent")
 			bgCtx := context.Background()
 			oc := orderCopy
 			e.repo.RecordExecutionEvent(bgCtx, oc.OrderID, "SUBMITTED", map[string]interface{}{
@@ -275,6 +290,7 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 	} else {
 		// Normal orders: background DB updates + publish concurrently for speed.
 		go func() {
+			defer e.recoverGo("submittedEvent.parent")
 			bgCtx := context.Background()
 			orderCopy := *order
 
@@ -283,6 +299,7 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 
 			go func() {
 				defer wg.Done()
+				defer e.recoverGo("submittedEvent.dbUpdate")
 				if err := e.repo.Update(bgCtx, &orderCopy); err != nil {
 					e.logger.Error("bg_db_update_failed", zap.String("oid", orderCopy.OrderID.String()), zap.Error(err))
 				}
@@ -290,6 +307,7 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 
 			go func() {
 				defer wg.Done()
+				defer e.recoverGo("submittedEvent.recordEvent")
 				e.repo.RecordExecutionEvent(bgCtx, orderCopy.OrderID, "SUBMITTED", map[string]interface{}{
 					"indira_order_id": indiraOrderID,
 					"timestamp":       now,
@@ -298,6 +316,7 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 
 			go func() {
 				defer wg.Done()
+				defer e.recoverGo("submittedEvent.publish")
 				e.publishOrderUpdate(bgCtx, &orderCopy, "ORDER_SUBMITTED", "MEDIUM",
 					"Order Submitted",
 					fmt.Sprintf("Order for %s submitted to broker (ref: %s)", orderCopy.Symbol, indiraOrderID))
@@ -310,6 +329,7 @@ func (e *OrderExecutor) handleSuccessfulPlacement(ctx context.Context, order *mo
 	// Start broker WS subscription (idempotent).
 	if e.statusSvc != nil && auth != nil {
 		go func() {
+			defer e.recoverGo("startSubscription")
 			if err := e.statusSvc.StartSubscription(context.Background(), order.UserID, auth); err != nil {
 				e.logger.Warn("ws_sub_failed", zap.String("uid", order.UserID), zap.Error(err))
 			}

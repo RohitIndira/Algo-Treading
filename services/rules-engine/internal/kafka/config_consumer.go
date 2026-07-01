@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configsync"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
+	"github.com/segmentio/kafka-go"
 )
 
 // ConfigConsumer consumes "user-config-events" and applies deltas to ConfigStore.
@@ -46,83 +48,107 @@ func (c *ConfigConsumer) Start(ctx context.Context) error {
 			continue
 		}
 
-		var ev configsync.ConfigEvent
-		if err := json.Unmarshal(msg.Value, &ev); err != nil {
-			c.errors.Add(1)
-			log.Printf("config consumer: parse error: %v", err)
-			_ = c.reader.CommitMessages(ctx, msg)
-			continue
-		}
-
-		switch string(ev.Type) {
-		case "CONFIG_CREATED", "CONFIG_UPDATED":
-			if ev.Config == nil {
-				log.Printf("config consumer: missing config payload for %s", ev.Type)
-				_ = c.reader.CommitMessages(ctx, msg)
-				continue
-			}
-
-			if existing, ok := c.configStore.GetStrategy(ev.UserID, ev.StrategyID); ok {
-				if existing.Version >= ev.Version {
-					log.Printf("config consumer: skipping stale event existing=%d incoming=%d", existing.Version, ev.Version)
-					_ = c.reader.CommitMessages(ctx, msg)
-					continue
-				}
-			}
-
-			m, err := configsync.ToModelStrategy(ev.Config)
-			if err != nil {
-				c.errors.Add(1)
-				log.Printf("config consumer: map payload error: %v", err)
-				_ = c.reader.CommitMessages(ctx, msg)
-				continue
-			}
-			m.Version = ev.Version
-			// m.Active already reflects ev.Config.Active (set by ToModelStrategy) — do NOT
-			// force it true here. CONFIG_UPDATED is also used for STRATEGY_ACTIVATED replay
-			// (outbox_worker re-fetches the strategy's current DB row to build the full
-			// payload), so if the strategy was deactivated again before that backlogged
-			// event got published, this event legitimately carries active=false. Forcing
-			// it true would silently reactivate an already-paused strategy and, via
-			// ApplyUpsert's version bump, make the real CONFIG_PAUSED event that follows
-			// look stale and get dropped.
-			if err := c.configStore.Upsert((*models.StrategyConfig)(m)); err != nil {
-				c.errors.Add(1)
-				log.Printf("config consumer: upsert failed: %v", err)
-			}
-
-			// Trigger AMN backfill when a newly created strategy opts in.
-			// Only fires on CONFIG_CREATED (not CONFIG_UPDATED re-activations)
-			// so backfill runs exactly once per strategy lifecycle.
-			if ev.Type == configsync.ConfigCreated && m.ProcessAfterMarketNews && c.amnTrigger != nil {
-				c.amnTrigger(m)
-			}
-
-		case "CONFIG_PAUSED":
-			if err := c.configStore.Pause(ev.UserID, ev.StrategyID, ev.Version); err != nil {
-				c.errors.Add(1)
-				log.Printf("config consumer: pause failed: %v", err)
-			}
-
-		case "CONFIG_RESUMED":
-			if err := c.configStore.Resume(ev.UserID, ev.StrategyID, ev.Version); err != nil {
-				c.errors.Add(1)
-				log.Printf("config consumer: resume failed: %v", err)
-			}
-
-		case "CONFIG_DELETED":
-			if err := c.configStore.Remove(ev.UserID, ev.StrategyID, ev.Version); err != nil {
-				c.errors.Add(1)
-				log.Printf("config consumer: remove failed: %v", err)
-			}
-
-		default:
-			log.Printf("config consumer: WARN unknown event type %q — skipping", ev.Type)
-		}
-
-		c.processed.Add(1)
-		_ = c.reader.CommitMessages(ctx, msg)
+		c.processMessageRecovered(ctx, msg)
 	}
+}
+
+// processMessageRecovered processes one message with panic recovery, fulfilling
+// the "Single goroutine. Never crashes on bad messages." contract above for the
+// panic case too — a payload that panics deep in ToModelStrategy/Upsert/amnTrigger
+// must not kill the only goroutine applying config changes. The message is still
+// committed on panic (same as any other unprocessable event) so a poison-pill
+// message can't get stuck retrying forever instead of just being skipped.
+func (c *ConfigConsumer) processMessageRecovered(ctx context.Context, msg kafka.Message) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			c.errors.Add(1)
+			log.Printf("config consumer: PANIC recovered (message skipped): %v\n%s", rec, debug.Stack())
+			_ = c.reader.CommitMessages(ctx, msg)
+		}
+	}()
+	c.processMessage(ctx, msg)
+}
+
+func (c *ConfigConsumer) processMessage(ctx context.Context, msg kafka.Message) {
+	var ev configsync.ConfigEvent
+	if err := json.Unmarshal(msg.Value, &ev); err != nil {
+		c.errors.Add(1)
+		log.Printf("config consumer: parse error: %v", err)
+		_ = c.reader.CommitMessages(ctx, msg)
+		return
+	}
+
+	switch string(ev.Type) {
+	case "CONFIG_CREATED", "CONFIG_UPDATED":
+		if ev.Config == nil {
+			log.Printf("config consumer: missing config payload for %s", ev.Type)
+			_ = c.reader.CommitMessages(ctx, msg)
+			return
+		}
+
+		if existing, ok := c.configStore.GetStrategy(ev.UserID, ev.StrategyID); ok {
+			if existing.Version >= ev.Version {
+				log.Printf("config consumer: skipping stale event existing=%d incoming=%d", existing.Version, ev.Version)
+				_ = c.reader.CommitMessages(ctx, msg)
+				return
+			}
+		}
+
+		m, err := configsync.ToModelStrategy(ev.Config)
+		if err != nil {
+			c.errors.Add(1)
+			log.Printf("config consumer: map payload error: %v", err)
+			_ = c.reader.CommitMessages(ctx, msg)
+			return
+		}
+		m.Version = ev.Version
+		m.Active = true
+		if err := c.configStore.Upsert((*models.StrategyConfig)(m)); err != nil {
+			c.errors.Add(1)
+			log.Printf("config consumer: upsert failed: %v", err)
+		}
+
+		// Audit: capture strategy initialization (CONFIG_CREATED only) with its
+		// full parameter set, so the compliance trail records every strategy as
+		// it comes online.
+		if ev.Type == configsync.ConfigCreated {
+			log.Printf("STRATEGY_INITIALIZED event=STRATEGY_INITIALIZED strategy_id=%s user_id=%s strategy_name=%q version=%d trading_mode=%s quantity=%d order_type=%s exchange=%s max_amount_per_stock=%.2f max_trades_per_strategy=%d process_after_market_news=%t",
+				m.StrategyID, m.UserID, m.StrategyName, m.Version, m.TradingMode,
+				m.TradeConfig.Quantity, m.TradeConfig.OrderType, m.TradeConfig.Exchange,
+				m.RiskLimits.MaxAmountPerStock, m.RiskLimits.MaxTradesPerStrategy, m.ProcessAfterMarketNews)
+		}
+
+		// Trigger AMN backfill when a newly created strategy opts in.
+		// Only fires on CONFIG_CREATED (not CONFIG_UPDATED re-activations)
+		// so backfill runs exactly once per strategy lifecycle.
+		if ev.Type == configsync.ConfigCreated && m.ProcessAfterMarketNews && c.amnTrigger != nil {
+			c.amnTrigger(m)
+		}
+
+	case "CONFIG_PAUSED":
+		if err := c.configStore.Pause(ev.UserID, ev.StrategyID, ev.Version); err != nil {
+			c.errors.Add(1)
+			log.Printf("config consumer: pause failed: %v", err)
+		}
+
+	case "CONFIG_RESUMED":
+		if err := c.configStore.Resume(ev.UserID, ev.StrategyID, ev.Version); err != nil {
+			c.errors.Add(1)
+			log.Printf("config consumer: resume failed: %v", err)
+		}
+
+	case "CONFIG_DELETED":
+		if err := c.configStore.Remove(ev.UserID, ev.StrategyID, ev.Version); err != nil {
+			c.errors.Add(1)
+			log.Printf("config consumer: remove failed: %v", err)
+		}
+
+	default:
+		log.Printf("config consumer: WARN unknown event type %q — skipping", ev.Type)
+	}
+
+	c.processed.Add(1)
+	_ = c.reader.CommitMessages(ctx, msg)
 }
 
 func (c *ConfigConsumer) Stats() (processed int64, errors int64) {

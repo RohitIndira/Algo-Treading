@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -42,11 +43,22 @@ import (
 	"github.com/google/uuid"
 )
 
+// mainRecover recovers a panic in a detached startup/background goroutine and
+// logs it with a stack trace, so one subsystem's panic can't crash the whole
+// trade-execution process. Logs and returns only — it never changes startup or
+// order logic. (The gRPC server goroutine is intentionally NOT wrapped: it uses
+// log.Fatalf, i.e. a failure there is meant to terminate the process.)
+func mainRecover(where string) {
+	if r := recover(); r != nil {
+		log.Printf("[main] PANIC RECOVERED in %s: %v\n%s", where, r, debug.Stack())
+	}
+}
+
 func main() {
-	// Microsecond-precision timestamps on every log.Printf line ([ws-raw],
-	// [oco], [indira]) — needed to measure cancel/fill race latency, which
-	// is otherwise invisible at the default second-level resolution.
+	// Microsecond-precision timestamps — needed to measure cancel/fill race latency.
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	// Route stdlib logger to stdout so PM2 captures all log.* and zap lines together.
+	log.SetOutput(os.Stdout)
 
 	// Load .env file
 	if err := godotenv.Load(); err != nil {
@@ -123,6 +135,7 @@ func main() {
 	// Pre-warm credentials cache with active live-trading users so the first
 	// order per user hits memory instead of DB + decrypt.
 	go func() {
+		defer mainRecover("credentialsCacheWarmup")
 		warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer warmCancel()
 		userIDs, err := orderRepo.GetDistinctActiveUserIDs(warmCtx)
@@ -537,6 +550,7 @@ func main() {
 	// time. Runs async so it never blocks the price-monitor tick on a broker connect.
 	ocoManager.SetWSEnsurer(func(userID string, auth *indiraPkg.AuthContext) {
 		go func() {
+			defer mainRecover("ocoWSEnsure")
 			if err := statusService.StartSubscription(context.Background(), userID, auth); err != nil {
 				log.Printf("[oco] wsEnsure: StartSubscription failed user=%s: %v", userID, err)
 			}
@@ -762,6 +776,7 @@ func main() {
 	// until the user takes a new action — leaving the DB out of sync with the
 	// broker. Idempotent: StartSubscription tolerates already-subscribed users.
 	go func() {
+		defer mainRecover("startup.broker_ws")
 		subsystem := "broker_ws"
 		metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(0)
 		start := time.Now()
@@ -826,6 +841,7 @@ func main() {
 	// real-time WS events.
 	if cfg.EnableStartupReconcile {
 		go func() {
+			defer mainRecover("startup.reconcile")
 			subsystem := "reconcile"
 			metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(0)
 			start := time.Now()
@@ -937,6 +953,7 @@ func main() {
 	// no broker orders during reload. Gated by ENABLE_ML_RELOAD until validated.
 	if cfg.EnableMLReload {
 		go func() {
+			defer mainRecover("startup.ml_reload")
 			subsystem := "ml_reload"
 			metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(0)
 			start := time.Now()
@@ -977,6 +994,7 @@ func main() {
 	// For now we log readiness with a nil loader so the extension point is
 	// visible and the metric/log surface exists for future wiring.
 	go func() {
+		defer mainRecover("startup.halted_strategies")
 		subsystem := "halted_strategies"
 		metrics.StartupRecoveryReady.WithLabelValues(subsystem).Set(0)
 		start := time.Now()
@@ -1108,6 +1126,7 @@ func main() {
 		Handler: metricsMux,
 	}
 	go func() {
+		defer mainRecover("metricsServer")
 		log.Printf("Starting Prometheus metrics server on :%d/metrics", cfg.MetricsPort)
 		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Metrics server error: %v", err)
@@ -1124,6 +1143,7 @@ func main() {
 
 	// Start Auto Square-Off Scheduler
 	go func() {
+		defer mainRecover("autoSquareOff.Start")
 		log.Println("Starting Auto Square-Off Scheduler...")
 		if err := autoSquareOff.Start(ctx); err != nil {
 			log.Printf("Auto Square-Off Scheduler error: %v", err)
@@ -1132,12 +1152,14 @@ func main() {
 
 	// Start market data WSS client (paper trading price feed)
 	go func() {
+		defer mainRecover("paperMarketClient.Start")
 		log.Println("Starting paper market WSS client...")
 		paperMarketClient.Start(ctx)
 	}()
 
 	// Load active paper orders and subscribe symbols
 	go func() {
+		defer mainRecover("paperMonitor.Initialize")
 		time.Sleep(2 * time.Second) // wait for WSS to connect
 		if err := paperMonitor.Initialize(ctx); err != nil {
 			log.Printf("[paper] Monitor init error (non-fatal): %v", err)
@@ -1146,12 +1168,14 @@ func main() {
 
 	// Start live market WSS client (dedicated feed for the live order monitor)
 	go func() {
+		defer mainRecover("liveMarketClient.Start")
 		log.Println("Starting live market WSS client...")
 		liveMarketClient.Start(ctx)
 	}()
 
 	// Load open live positions and subscribe symbols for live P&L broadcasting
 	go func() {
+		defer mainRecover("liveMonitor.Initialize")
 		time.Sleep(2 * time.Second) // wait for WSS to connect
 		if err := liveMonitor.Initialize(ctx); err != nil {
 			log.Printf("[live] Monitor init error (non-fatal): %v", err)
@@ -1160,6 +1184,7 @@ func main() {
 
 	// Start paper trading WebSocket server for frontend
 	go func() {
+		defer mainRecover("paperWSServer.StartHTTPServer")
 		paperWSAddr := fmt.Sprintf(":%d", cfg.PaperWSPort)
 		log.Printf("Starting paper trading WS server on %s", paperWSAddr)
 		if err := paperWSServer.StartHTTPServer(ctx, paperWSAddr); err != nil {
@@ -1170,12 +1195,14 @@ func main() {
 	// Start PriceMonitor WSS client + price monitor for below_min orders
 	if priceMonitorWSClient != nil {
 		go func() {
+			defer mainRecover("priceMonitorWSClient.Start")
 			log.Println("Starting Price Monitor WSS client...")
 			priceMonitorWSClient.Start(ctx)
 		}()
 	}
 	if priceMonitorRef != nil {
 		go func() {
+			defer mainRecover("priceMonitorRef.Start")
 			log.Println("Starting Price Monitor...")
 			if err := priceMonitorRef.Start(ctx); err != nil {
 				log.Printf("Price Monitor error: %v", err)
@@ -1185,12 +1212,14 @@ func main() {
 
 	// Start OCO market data WSS client (price feed for trailing SL)
 	go func() {
+		defer mainRecover("ocoMarketClient.Start")
 		log.Println("Starting OCO market WSS client...")
 		ocoMarketClient.Start(ctx)
 	}()
 
 	// Start OCO trailing SL monitor
 	go func() {
+		defer mainRecover("ocoTrailingMonitor.Start")
 		log.Println("Starting OCO trailing SL monitor...")
 		ocoTrailingMonitor.Start(ctx)
 	}()
@@ -1203,6 +1232,7 @@ func main() {
 
 	// Start Kafka consumer — primary intake path (rules-engine trade-signals)
 	go func() {
+		defer mainRecover("kafkaConsumer.Start")
 		log.Println("Starting Kafka consumer (trade-signals)...")
 		if err := kafkaConsumer.Start(ctx); err != nil {
 			log.Printf("Kafka consumer error: %v", err)
@@ -1211,6 +1241,7 @@ func main() {
 
 	// Start strategy events consumer — closes positions on strategy deactivate/delete
 	go func() {
+		defer mainRecover("strategyEventsConsumer.Start")
 		log.Println("Starting Kafka consumer (user-config-events)...")
 		if err := strategyEventsConsumer.Start(ctx); err != nil {
 			log.Printf("Strategy events consumer error: %v", err)
@@ -1444,10 +1475,9 @@ func initLogger() (*zap.Logger, error) {
 	if logLevel == "" {
 		logLevel = "info"
 	}
+	// LOG_DIR unset → stdout only; PM2 owns the single on-disk file. Set LOG_DIR
+	// to also write an app-side dated file (non-PM2 / local runs).
 	logDir := os.Getenv("LOG_DIR")
-	if logDir == "" {
-		logDir = "logs"
-	}
 	lgr, err := pkglogger.New(pkglogger.Config{
 		Environment: env,
 		Level:       logLevel,

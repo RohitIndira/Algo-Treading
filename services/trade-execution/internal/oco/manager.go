@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,17 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/google/uuid"
 )
+
+// ocoRecover recovers a panic in a detached OCO goroutine and logs it with a
+// stack trace, matching the existing [oco] log style. Every method launched with
+// `go m.<method>(…)` is a fire-and-forget goroutine, so an unrecovered panic in
+// one would crash the whole process and abandon every other OCO group. This only
+// logs and returns — it never alters order logic or the non-panic path.
+func ocoRecover(where string) {
+	if r := recover(); r != nil {
+		log.Printf("[oco] PANIC RECOVERED in %s: %v\n%s", where, r, debug.Stack())
+	}
+}
 
 // defaultFillPriceDeadline bounds how long an entry-filled group waits for a real
 // execution price (WS or trade book) before SL/TP legs are placed off the
@@ -258,6 +270,7 @@ func (m *OCOManager) GetGroupMu(groupID uuid.UUID) *sync.Mutex {
 // dbUpdateAsync persists an order update to DB asynchronously with retry.
 func (m *OCOManager) dbUpdateAsync(order *models.Order, label string) {
 	go func() {
+		defer ocoRecover("dbUpdateAsync")
 		ctx, cancel := context.WithTimeout(context.Background(), brokerOpTimeout)
 		defer cancel()
 		var lastErr error
@@ -294,6 +307,7 @@ func (m *OCOManager) recordEntryExit(group *OCOGroup, exitPrice float64, reason 
 	entryID := group.EntryOrderID
 	groupID := group.GroupID
 	go func() {
+		defer ocoRecover("recordEntryExitAsync")
 		ctx, cancel := context.WithTimeout(context.Background(), brokerOpTimeout)
 		defer cancel()
 		if err := m.repo.UpdateLiveTradeExit(ctx, entryID, exitPrice, pnl, t, reason); err != nil {
@@ -544,6 +558,7 @@ func (m *OCOManager) CreateOCOEntry(
 //
 // This is the HOT PATH — must be fast. Two sync.Map lookups (O(1)) to find the group.
 func (m *OCOManager) HandleBrokerUpdate(ctx context.Context, order *models.Order, brokerStatus string) {
+	defer ocoRecover("HandleBrokerUpdate")
 	if order == nil || order.IndiraOrderID == nil {
 		return
 	}
@@ -1013,6 +1028,7 @@ func (m *OCOManager) StartFillPriceRetry(ctx context.Context) {
 	}
 	log.Printf("[oco] Fill-price retry worker started (interval=%v deadline=%v)", m.fillRetryInterval, m.fillPriceDeadline)
 	go func() {
+		defer ocoRecover("fillPriceRetryWorker")
 		ticker := time.NewTicker(m.fillRetryInterval)
 		defer ticker.Stop()
 		for {
@@ -1032,6 +1048,7 @@ func (m *OCOManager) StartFillPriceRetry(ctx context.Context) {
 // per user by the fill cache, so many awaiting groups for the same user share a
 // single broker round-trip.
 func (m *OCOManager) resolveAwaitingGroups(ctx context.Context) {
+	defer ocoRecover("resolveAwaitingGroups")
 	var awaiting []*OCOGroup
 	m.groups.Range(func(_, v any) bool {
 		g := v.(*OCOGroup)
@@ -1066,6 +1083,7 @@ func (m *OCOManager) resolveAwaitingGroups(ctx context.Context) {
 // state transition is done under the mutex and re-checks the state in case a WS
 // event resolved the group concurrently.
 func (m *OCOManager) resolveAwaitingGroup(ctx context.Context, group *OCOGroup) {
+	defer ocoRecover("resolveAwaitingGroup")
 	auth := m.resolveAuth(ctx, group)
 	if auth == nil {
 		return
@@ -1137,6 +1155,7 @@ func (m *OCOManager) resolveAwaitingGroup(ctx context.Context, group *OCOGroup) 
 // Either leg is skipped when its percentage is 0 (user disabled it).
 // Both are placed in parallel when both are enabled.
 func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
+	defer ocoRecover("placeOCOLegs")
 	fillPrice := group.EntryFillPrice
 	exitSide := group.ExitSide()
 
@@ -1237,6 +1256,7 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		dbWg.Add(1)
 		go func() {
 			defer dbWg.Done()
+			defer ocoRecover("persistSLLegOrder")
 			if err := m.repo.Create(ctx, slOrder); err != nil {
 				log.Printf("[oco] Failed to persist SL leg order: %v", err)
 			}
@@ -1246,6 +1266,7 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		dbWg.Add(1)
 		go func() {
 			defer dbWg.Done()
+			defer ocoRecover("persistTPLegOrder")
 			if err := m.repo.Create(ctx, tpOrder); err != nil {
 				log.Printf("[oco] Failed to persist TP leg order: %v", err)
 			}
@@ -1262,6 +1283,14 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// On panic, surface it as slErr so the caller's existing
+			// leg-failure handling runs (rather than treating the leg as placed).
+			defer func() {
+				if r := recover(); r != nil {
+					slErr = fmt.Errorf("panic placing SL leg: %v", r)
+					log.Printf("[oco] PANIC RECOVERED placing SL leg for group %s: %v\n%s", group.GroupID, r, debug.Stack())
+				}
+			}()
 			slBrokerID, slErr = m.placeLegWithRetry(ctx, slOrder, group.Auth, "SL", group.GroupID)
 		}()
 	}
@@ -1269,6 +1298,12 @@ func (m *OCOManager) placeOCOLegs(ctx context.Context, group *OCOGroup) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					tpErr = fmt.Errorf("panic placing TP leg: %v", r)
+					log.Printf("[oco] PANIC RECOVERED placing TP leg for group %s: %v\n%s", group.GroupID, r, debug.Stack())
+				}
+			}()
 			tpBrokerID, tpErr = m.placeLegWithRetry(ctx, tpOrder, group.Auth, "TP", group.GroupID)
 		}()
 	}
@@ -1484,6 +1519,7 @@ func (m *OCOManager) startPartialFillTimer(group *OCOGroup) {
 	mu.Unlock()
 
 	go func() {
+		defer ocoRecover("partialFillTimeout")
 		select {
 		case <-time.After(m.partialFillTimeout):
 			// Timer expired — cancel remaining entry qty at broker
@@ -1564,6 +1600,7 @@ func (m *OCOManager) cancelEntryRemaining(group *OCOGroup) {
 // modifyLegsQty modifies the quantity on both SL and TP legs at the broker.
 // Called when additional partial fills arrive or when the entry fully fills.
 func (m *OCOManager) modifyLegsQty(group *OCOGroup, newQty int32) {
+	defer ocoRecover("modifyLegsQty")
 	ctx, cancel := context.WithTimeout(context.Background(), brokerOpTimeout)
 	defer cancel()
 
@@ -2172,6 +2209,7 @@ func (m *OCOManager) CancelAllGroupsByUser(ctx context.Context, userID string) {
 // CancelGroupsByStrategy cancels all non-terminal OCO groups for a user+strategy.
 // Called when the user force-exits all positions for a specific strategy.
 func (m *OCOManager) CancelGroupsByStrategy(ctx context.Context, userID, strategyID string) {
+	defer ocoRecover("CancelGroupsByStrategy")
 	var toCancel []uuid.UUID
 	m.groups.Range(func(key, value any) bool {
 		group := value.(*OCOGroup)
@@ -2201,6 +2239,7 @@ func (m *OCOManager) CancelGroupsByStrategy(ctx context.Context, userID, strateg
 // Per-strategy cancellation (e.g. strategy delete/deactivate) goes through
 // CancelGroupsByStrategy and does NOT call this function.
 func (m *OCOManager) CancelGroupsBySymbol(ctx context.Context, userID string, symbol string) {
+	defer ocoRecover("CancelGroupsBySymbol")
 	var toCancel []uuid.UUID
 	m.groups.Range(func(key, value any) bool {
 		group := value.(*OCOGroup)
@@ -2315,6 +2354,7 @@ func (m *OCOManager) AdoptOrder(
 	order.StopLoss = &slPct
 	order.TakeProfit = &tpPct
 	go func() {
+		defer ocoRecover("adoptOrderTag")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := m.repo.UpdateOCOTag(ctx, order.OrderID, groupID, role, slPercent, tpPercent); err != nil {
