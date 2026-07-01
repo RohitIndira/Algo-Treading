@@ -563,8 +563,34 @@ func (s *AutoSquareOffScheduler) squareOffUserPositions(ctx context.Context, use
 				order.OrderID, userID, order.Symbol)
 			continue
 		}
-		if err := s.createAndExecuteSquareOffOrder(ctx, order); err != nil {
+
+		// Clamp to the broker's actual remaining qty when a snapshot is available.
+		// Multiple order rows (e.g. an OCO's SL leg and TP leg, both EXECUTED after
+		// a double-fill) can share one broker position; without this, each row
+		// would reverse the full FilledQuantity independently and a second reverse
+		// order would flip the already-flattened position open again. Nil snapshot
+		// keeps the old fail-open behaviour (full FilledQuantity, no clamp).
+		squareQty := int(order.FilledQuantity)
+		if snapshot != nil {
+			brokerQty := snapshot.GetNetQty(order)
+			if brokerQty < 0 {
+				brokerQty = -brokerQty
+			}
+			squareQty = min(brokerQty, int(order.FilledQuantity))
+			if squareQty <= 0 {
+				continue
+			}
+		}
+		orderCopy := *order
+		orderCopy.FilledQuantity = int32(squareQty)
+
+		if err := s.createAndExecuteSquareOffOrder(ctx, &orderCopy); err != nil {
 			log.Printf("[auto-square-off] FAILED live sq-off order=%s user=%s: %v", order.OrderID, userID, err)
+			continue
+		}
+
+		if snapshot != nil {
+			snapshot.Consume(order, squareQty)
 		}
 	}
 	return nil
@@ -669,7 +695,16 @@ func (s *AutoSquareOffScheduler) squareOffUserViaPositionBook(ctx context.Contex
 
 		if err := s.createAndExecuteSquareOffOrder(ctx, &orderCopy); err != nil {
 			log.Printf("[auto-square-off] FAILED user=%s sym=%s: %v", userID, order.Symbol, err)
+			continue
 		}
+
+		// Multiple order rows (e.g. an OCO's SL leg and TP leg after a double-fill)
+		// can share the same broker position. Decrement the snapshot so a later
+		// row for the same symbol/exchange/product-type sees the reduced — likely
+		// zero — remaining qty instead of re-reading the stale pre-loop NetQty and
+		// placing a second reverse order that flips the now-flat position open
+		// again in the other direction.
+		snapshot.Consume(order, squareQty)
 	}
 }
 
@@ -869,9 +904,36 @@ func (s *AutoSquareOffScheduler) squareOffStrategyLivePositions(ctx context.Cont
 				order.OrderID, userID, order.Symbol)
 			continue
 		}
-		if err := s.createAndExecuteSquareOffOrder(ctx, order); err != nil {
+
+		// Clamp to the broker's actual remaining qty when a snapshot is available,
+		// and decrement it after a successful close. Multiple order rows (e.g. an
+		// OCO's SL leg and TP leg, both EXECUTED after a double-fill) can share one
+		// broker position; without this, each row would reverse its full
+		// FilledQuantity independently against the same stale pre-loop NetQty,
+		// flipping the already-flattened position open again in the other
+		// direction. Nil snapshot keeps the old fail-open behaviour.
+		squareQty := int(order.FilledQuantity)
+		if snapshot != nil {
+			brokerQty := snapshot.GetNetQty(order)
+			if brokerQty < 0 {
+				brokerQty = -brokerQty
+			}
+			squareQty = min(brokerQty, int(order.FilledQuantity))
+			if squareQty <= 0 {
+				continue
+			}
+		}
+		orderCopy := *order
+		orderCopy.FilledQuantity = int32(squareQty)
+
+		if err := s.createAndExecuteSquareOffOrder(ctx, &orderCopy); err != nil {
 			log.Printf("[auto-square-off] FAILED strategy sq-off order=%s user=%s strategy=%s: %v",
 				order.OrderID, userID, strategyID, err)
+			continue
+		}
+
+		if snapshot != nil {
+			snapshot.Consume(order, squareQty)
 		}
 	}
 	return nil

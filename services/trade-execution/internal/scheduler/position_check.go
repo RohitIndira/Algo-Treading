@@ -111,6 +111,41 @@ func (o *OpenPositions) GetNetQty(order *models.Order) int {
 	return o.m[orderKey(order)]
 }
 
+// Consume records that qty units of order's underlying broker position have
+// just been squared off, moving the snapshot's remembered NetQty toward zero.
+// Multiple DB order rows (e.g. an OCO's SL leg and TP leg, both EXECUTED after
+// a double-fill) can map to the same posKey; without this, a single square-off
+// pass would read the same pre-fetch NetQty for every row and place a reverse
+// order per row instead of per underlying position — flattening it once and
+// then opening a fresh position in the other direction on the next row.
+// No-op on a nil snapshot or a key the snapshot doesn't have.
+func (o *OpenPositions) Consume(order *models.Order, qty int) {
+	if o == nil || order == nil || qty <= 0 {
+		return
+	}
+	key := orderKey(order)
+	cur, ok := o.m[key]
+	if !ok {
+		return
+	}
+	if cur < 0 {
+		cur += qty
+		if cur > 0 {
+			cur = 0
+		}
+	} else {
+		cur -= qty
+		if cur < 0 {
+			cur = 0
+		}
+	}
+	if cur == 0 {
+		delete(o.m, key)
+	} else {
+		o.m[key] = cur
+	}
+}
+
 // FetchOpenPositions returns the broker's open positions (NetQty != 0) for
 // userID. EXPIRY rows are dropped; only DAILY (intraday) positions are kept.
 //

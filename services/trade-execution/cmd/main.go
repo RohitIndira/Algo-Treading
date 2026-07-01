@@ -43,6 +43,11 @@ import (
 )
 
 func main() {
+	// Microsecond-precision timestamps on every log.Printf line ([ws-raw],
+	// [oco], [indira]) — needed to measure cancel/fill race latency, which
+	// is otherwise invisible at the default second-level resolution.
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	// Load .env file
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using environment variables")
@@ -314,6 +319,9 @@ func main() {
 
 	// When the frontend sends a resume_token message on /ws/live-orders after re-login,
 	// forward the new credentials to statusService so the Indira WS can reconnect.
+	// Also refresh paperWSServer's cached auth — GetAuth/PushPositions reads from
+	// that cache on every new WS connect, so without this the REST positions call
+	// keeps using the stale pre-re-login token until the next fill event or restart.
 	paperWSServer.SetResumeService(func(ctx context.Context, userID, bearerToken, appID, source string) error {
 		statusService.ResumeUserSubscription(userID, &indiraPkg.AuthContext{
 			UserId:      userID,
@@ -321,6 +329,7 @@ func main() {
 			Source:      source,
 			BearerToken: bearerToken,
 		})
+		paperWSServer.StoreAuth(userID, bearerToken, appID, source)
 		return nil
 	})
 

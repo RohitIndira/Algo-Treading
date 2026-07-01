@@ -17,6 +17,16 @@ type StrategyRepository struct {
 	db *sqlx.DB
 }
 
+// riskLimitsColumns lists risk_limits columns explicitly (instead of SELECT *) so
+// auto_square_off_time can be COALESCEd to "" — the column is nullable but
+// models.RiskLimits.AutoSquareOffTime is a plain string, so scanning a NULL row
+// fails with "converting NULL to string is unsupported" and (via the outbox
+// worker's STRATEGY_ACTIVATED path) can wedge the entire outbox queue.
+const riskLimitsColumns = `risk_limit_id, strategy_id, max_daily_trades, max_per_trade_risk,
+	max_portfolio_exposure_pct, max_loss_per_day, enable_risk_checks, enable_auto_square_off,
+	COALESCE(auto_square_off_time, '') AS auto_square_off_time,
+	max_amount_per_stock, max_trades_per_strategy, created_at`
+
 // ListAllActive returns a page of active, non-deleted strategies.
 // Ordered by updated_at DESC for stable pagination.
 // Uses batch queries (ANY($1)) instead of per-row queries to avoid N+3 DB roundtrips.
@@ -90,7 +100,7 @@ func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offse
 
 	// Batch fetch risk limits — 1 query.
 	riskLimits := []*models.RiskLimits{}
-	riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = ANY($1)`
+	riskQuery := `SELECT ` + riskLimitsColumns + ` FROM risk_limits WHERE strategy_id = ANY($1)`
 	if err := r.db.SelectContext(ctx, &riskLimits, riskQuery, pq.Array(ids)); err == nil {
 		for _, rl := range riskLimits {
 			if s, ok := byID[rl.StrategyID]; ok {
@@ -298,7 +308,7 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 
 	// Get risk limits
 	riskLimits := &models.RiskLimits{}
-	riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = $1`
+	riskQuery := `SELECT ` + riskLimitsColumns + ` FROM risk_limits WHERE strategy_id = $1`
 	err = r.db.GetContext(ctx, riskLimits, riskQuery, strategyID)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to get risk limits: %w", err)
@@ -369,7 +379,7 @@ func (r *StrategyRepository) ListByUserID(ctx context.Context, userID string, ac
 
 		// Load risk limits
 		riskLimits := &models.RiskLimits{}
-		riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = $1`
+		riskQuery := `SELECT ` + riskLimitsColumns + ` FROM risk_limits WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, riskLimits, riskQuery, strategy.StrategyID)
 		if err == nil {
 			strategy.RiskLimits = riskLimits
@@ -521,7 +531,7 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		}
 
 		rl := &models.RiskLimits{}
-		if err2 := tx.GetContext(ctx, rl, `SELECT * FROM risk_limits WHERE strategy_id = $1`, strategy.StrategyID); err2 == nil {
+		if err2 := tx.GetContext(ctx, rl, `SELECT ` + riskLimitsColumns + ` FROM risk_limits WHERE strategy_id = $1`, strategy.StrategyID); err2 == nil {
 			outboxStrategy.RiskLimits = rl
 		}
 	}
@@ -847,7 +857,7 @@ func (r *StrategyRepository) GetByIDs(ctx context.Context, strategyIDs []uuid.UU
 
 		// Load risk limits
 		riskLimits := &models.RiskLimits{}
-		riskQuery := `SELECT * FROM risk_limits WHERE strategy_id = $1`
+		riskQuery := `SELECT ` + riskLimitsColumns + ` FROM risk_limits WHERE strategy_id = $1`
 		err = r.db.GetContext(ctx, riskLimits, riskQuery, strategy.StrategyID)
 		if err == nil {
 			strategy.RiskLimits = riskLimits

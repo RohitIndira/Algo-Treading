@@ -105,6 +105,12 @@ type MLGroupCanceller interface {
 type OpenPositionsSnapshot interface {
 	IsExited(order *models.Order) bool
 	GetNetQty(order *models.Order) int
+	// Consume records that qty units of order's underlying broker position have
+	// just been queued for square-off, moving the remembered NetQty toward zero.
+	// Must be called synchronously (before any concurrent placement) so a second
+	// order row mapping to the same broker position sees the reduced/zeroed qty
+	// instead of the same stale pre-loop NetQty.
+	Consume(order *models.Order, qty int)
 }
 
 // OpenPositionsLookup queries the broker position book for a user.
@@ -454,6 +460,14 @@ func (c *StrategyEventsConsumer) closeStrategyPositions(ctx context.Context, ev 
 				if brokerQty < squareQty {
 					squareQty = brokerQty
 				}
+				// Decrement now, synchronously, before the concurrent placement
+				// below. Multiple order rows (e.g. an OCO's SL leg and TP leg,
+				// both EXECUTED after a double-fill) can map to the same broker
+				// position; without this, the next row's GetNetQty above would
+				// read the same stale pre-loop value and queue its own redundant
+				// reverse order, flipping the now-flat position open again in
+				// the other direction.
+				snapshot.Consume(o, squareQty)
 			}
 			squaredOffIDs[o.OrderID] = struct{}{}
 			ordCopy := *o

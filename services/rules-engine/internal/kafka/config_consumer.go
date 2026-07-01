@@ -78,7 +78,14 @@ func (c *ConfigConsumer) Start(ctx context.Context) error {
 				continue
 			}
 			m.Version = ev.Version
-			m.Active = true
+			// m.Active already reflects ev.Config.Active (set by ToModelStrategy) — do NOT
+			// force it true here. CONFIG_UPDATED is also used for STRATEGY_ACTIVATED replay
+			// (outbox_worker re-fetches the strategy's current DB row to build the full
+			// payload), so if the strategy was deactivated again before that backlogged
+			// event got published, this event legitimately carries active=false. Forcing
+			// it true would silently reactivate an already-paused strategy and, via
+			// ApplyUpsert's version bump, make the real CONFIG_PAUSED event that follows
+			// look stale and get dropped.
 			if err := c.configStore.Upsert((*models.StrategyConfig)(m)); err != nil {
 				c.errors.Add(1)
 				log.Printf("config consumer: upsert failed: %v", err)
