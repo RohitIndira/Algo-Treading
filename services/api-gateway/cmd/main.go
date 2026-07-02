@@ -270,10 +270,13 @@ func main() {
 		// SSO tokens (web login via SSO gateway):
 		VerifyURL: envOr("CODIFI_VERIFY_URL",
 			"https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token"),
-		// APP tokens (mobile mPin / biometric login) — different endpoint,
-		// different signing secret, different response shape on Codifi's side:
+		// APP tokens (mobile mPin / biometric login) — piggybacks on the
+		// /AccountInfo data endpoint because Codifi's dedicated
+		// /auth/v1/verify/token is over-strict (rejects tokens the
+		// mobile app itself uses successfully). See introspection_verifier.go
+		// for the full write-up.
 		AppVerifyURL: envOr("CODIFI_APP_VERIFY_URL",
-			"https://livemiddleware.indiratrade.com/auth-services/api/auth/v1/verify/token"),
+			"https://livemiddleware.indiratrade.com/user-services/api/user/v1/AccountInfo"),
 		// HTTPTimeout, CacheTTL, NegativeTTL, CleanupPeriod all use
 		// defaults defined in NewIntrospectionVerifier — 3s / 5m / 30s / 1m.
 	})
