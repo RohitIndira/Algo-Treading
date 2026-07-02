@@ -55,4 +55,16 @@ type Catalog interface {
 	// there genuinely are no algos to show. Callers should treat the
 	// empty list as "show an empty state," not as an error.
 	All(ctx context.Context) ([]Algo, error)
+
+	// ByID returns the full detail view of a single algo — the
+	// response payload for GET /api/v1/algos/{id}. AlgoDetail embeds
+	// the same fields as the list entry AND adds the detail-page-only
+	// fields (keyStats, whatYouGet, alsoWorthKnowing, disclaimer).
+	//
+	// Returns (nil, ErrAlgoNotFound) when id doesn't match any known
+	// algo — the handler maps this to a 404 response. Returns any
+	// other error only when a real IO failure happens (DB down,
+	// network blip) — static catalog will never return one, but a
+	// future DB catalog might.
+	ByID(ctx context.Context, id string) (*AlgoDetail, error)
 }

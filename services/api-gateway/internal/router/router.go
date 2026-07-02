@@ -190,8 +190,12 @@ func NewRouter(
 	// per user directive that unauthenticated visitors should not see
 	// product-strategy details. Frontend team must send Authorization
 	// header on this call now — same shape as any other protected route.
+	//
+	// /algos      — list of algo cards (Explore screen)
+	// /algos/{id} — detail view of a single algo (tap on a card)
 	if algosHandler != nil {
 		protected.HandleFunc("/algos", algosHandler.ListAlgos).Methods("GET")
+		protected.HandleFunc("/algos/{id}", algosHandler.GetAlgo).Methods("GET")
 	}
 
 	// Money-moving paper/live routes — moved from the public `api.`

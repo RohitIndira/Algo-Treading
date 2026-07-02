@@ -12,6 +12,13 @@
 //   parts of the codebase that may need to read or write algo data later.
 package algos
 
+import "errors"
+
+// ErrAlgoNotFound is returned by Catalog.ByID when the requested id
+// does not exist in the catalog. Handlers use errors.Is to map this
+// to a 404 response with a stable infoID the frontend can key off.
+var ErrAlgoNotFound = errors.New("algos: algo not found")
+
 // Algo is one row in the Explore screen — everything shown on a single card.
 //
 // Field-by-field map back to the screen:
@@ -77,4 +84,81 @@ type Algo struct {
 // "algo" actually IS, not on HTTP delivery details.
 type ListResponse struct {
 	Algos []Algo `json:"algos"`
+}
+
+// KeyStats is the "Key Stats" grid on the algo detail page — six
+// performance metrics shown as a 2×3 tile grid.
+//
+// Field notes:
+//   WinRatePct     — 62 means "62%". Frontend adds the % sign.
+//   ProfitFactor   — 24.1. Dimensionless ratio, no % suffix in the UI.
+//   TotalTradesPct — 68 means "68%". Confusingly named on the mockup
+//                    ("Total Trades") but it IS shown with a % sign,
+//                    so it's a percentage. Kept the "Pct" suffix so
+//                    future readers of this file don't wonder.
+//   AvgHoldingDays — a signed number (screen shows -7.4). Frontend
+//                    prefixes appropriately.
+//   Sortino        — the Sortino ratio. Dimensionless.
+//   VolatilityDays — displayed as "12 days" on the mockup. Integer.
+//
+// Every field defaults to zero-value when omitted; the frontend
+// should treat all-zeros as "no data yet" (helpful when we add a
+// new algo before we've computed its metrics).
+type KeyStats struct {
+	WinRatePct     float64 `json:"winRatePct"`
+	ProfitFactor   float64 `json:"profitFactor"`
+	TotalTradesPct float64 `json:"totalTradesPct"`
+	AvgHoldingDays float64 `json:"avgHoldingDays"`
+	Sortino        float64 `json:"sortino"`
+	VolatilityDays int     `json:"volatilityDays"`
+}
+
+// WhatYouGetItem is one row of the "What you get" bullet list on the
+// detail page. Each row is an icon + a title + a short description.
+//
+// Icon is a semantic name (e.g. "automation", "shield", "bell", "chart")
+// that the Flutter app maps to a local SVG asset — NOT a URL. Keeping
+// icons app-local means: smaller responses, no image-fetch race with
+// the rest of the screen, offline-safe. When we add a new icon type,
+// the mobile release is what enables it.
+type WhatYouGetItem struct {
+	Icon        string `json:"icon"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+// AlsoWorthKnowingItem is one row of the "Also Worth Knowing" list on
+// the detail page. Same icon convention as WhatYouGetItem but only a
+// single line of text (no separate title/description split, matching
+// the mockup).
+type AlsoWorthKnowingItem struct {
+	Icon string `json:"icon"`
+	Text string `json:"text"`
+}
+
+// AlgoDetail is the full response payload for GET /api/v1/algos/{id}.
+//
+// Design decision — we EMBED Algo (rather than duplicating its fields)
+// so the base Explore-card data (name, badge, minInvestment, etc.)
+// stays in ONE place. Go's JSON encoder "promotes" embedded struct
+// fields to the parent level automatically, so the output JSON is flat:
+//
+//   { "id": "...", "name": "...", ..., "keyStats": {...}, ... }
+//
+// not:
+//
+//   { "algo": { "id": "...", "name": "..." }, "keyStats": {...} }
+//
+// which is what the frontend expects.
+//
+// The extra detail-page fields (description length differs from list,
+// keyStats, whatYouGet, alsoWorthKnowing, disclaimer) live only here.
+// The list endpoint keeps returning the smaller Algo — no extra bytes
+// on the Explore screen just because we added detail fields.
+type AlgoDetail struct {
+	Algo
+	KeyStats         KeyStats               `json:"keyStats"`
+	WhatYouGet       []WhatYouGetItem       `json:"whatYouGet"`
+	AlsoWorthKnowing []AlsoWorthKnowingItem `json:"alsoWorthKnowing"`
+	Disclaimer       string                 `json:"disclaimer"`
 }
