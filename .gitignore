@@ -98,3 +98,4 @@ test.js
 *.credentials.json
 *-sheet.json
 service-account*.json
+StockK-Mobile/

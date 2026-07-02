@@ -18,6 +18,8 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/config"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/auth"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/handlers"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/notifications"
@@ -239,8 +241,45 @@ func main() {
 		marketHandler = handlers.NewMarketHandler(extRedis)
 	}
 
+	// Algos — Explore screen catalog. Today: static in-memory list (just
+	// Manthan). When the catalog grows or moves to a DB, only the NewStaticCatalog
+	// call below changes; the handler + router wiring stay identical.
+	algosCatalog := algos.NewStaticCatalog()
+	algosHandler := handlers.NewAlgosHandler(algosCatalog)
+
+	// JWT verifier for the protected subrouter.
+	//
+	// PATTERN 4 (cached introspection) — bridge until Codifi shares the
+	// HS512 signing secret. Every JWT is validated against Codifi's
+	// verify endpoint on first-see, then cached for 5 min so subsequent
+	// requests with the same JWT cost ~1 ms instead of ~200 ms.
+	//
+	// The blacklist (populated by /auth/logout) closes the revocation
+	// gap — logout takes effect INSTANTLY on our gateway, even though
+	// Codifi keeps trusting the JWT until its natural exp.
+	//
+	// When Codifi finally shares the HS512 signing secret, swap this
+	// ONE line to:
+	//     verifier := auth.NewLocalKeyVerifier(os.Getenv("CODIFI_JWT_SECRET"))
+	// Every protected route instantly moves from network-hop verification
+	// to local HMAC math — no handler, middleware, or router changes.
+	//
+	// CODIFI_VERIFY_URL env var lets ops point at a staging Codifi
+	// without a code change. Default is production Codifi.
+	verifier := auth.NewIntrospectionVerifier(auth.IntrospectionConfig{
+		// SSO tokens (web login via SSO gateway):
+		VerifyURL: envOr("CODIFI_VERIFY_URL",
+			"https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token"),
+		// APP tokens (mobile mPin / biometric login) — different endpoint,
+		// different signing secret, different response shape on Codifi's side:
+		AppVerifyURL: envOr("CODIFI_APP_VERIFY_URL",
+			"https://livemiddleware.indiratrade.com/auth-services/api/auth/v1/verify/token"),
+		// HTTPTimeout, CacheTTL, NegativeTTL, CleanupPeriod all use
+		// defaults defined in NewIntrospectionVerifier — 3s / 5m / 30s / 1m.
+	})
+
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, verifier, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
