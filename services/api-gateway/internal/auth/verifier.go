@@ -155,4 +155,15 @@ var (
 	// is calling. Rejecting here is safer than silently defaulting to
 	// some sentinel user ID, which would be a critical security bug.
 	ErrNoUserID = errors.New("auth: token has no userId claim")
+
+	// ErrTokenSessionExpired is returned when Codifi's server-side
+	// session store has revoked the JWT even though its `exp` claim is
+	// still in the future — e.g., user logged out via mobile app, user
+	// re-logged-in from another device forcing this session out,
+	// admin invalidated the session. Empirically observed as Codifi's
+	// v1 verify endpoint returning `infoID:"AU004", infoMsg:"Session
+	// expired"`. Distinct from ErrTokenExpired (pure time-based expiry)
+	// so ops logs can distinguish "user's device slept past exp" from
+	// "session actively revoked".
+	ErrTokenSessionExpired = errors.New("auth: session expired on issuer side")
 )

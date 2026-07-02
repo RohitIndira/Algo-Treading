@@ -141,7 +141,11 @@ func AuthRequired(v auth.Verifier) func(next http.Handler) http.Handler {
 // will match even if a Verifier wrapped the sentinel with %w.
 func mapVerifyError(err error) (infoID, message string) {
 	switch {
-	case errors.Is(err, auth.ErrTokenExpired):
+	case errors.Is(err, auth.ErrTokenExpired),
+		errors.Is(err, auth.ErrTokenSessionExpired):
+		// Both "exp timestamp passed" and "server-side session
+		// revoked" surface as the same frontend action: log in again.
+		// Distinct sentinels for log clarity; same UX response.
 		return "E_AUTH_EXPIRED", "token has expired — please log in again"
 	case errors.Is(err, auth.ErrTokenInvalid):
 		return "E_AUTH_INVALID_SIGNATURE", "token signature is invalid"

@@ -267,8 +267,13 @@ func main() {
 	// CODIFI_VERIFY_URL env var lets ops point at a staging Codifi
 	// without a code change. Default is production Codifi.
 	verifier := auth.NewIntrospectionVerifier(auth.IntrospectionConfig{
+		// SSO tokens (web login via SSO gateway):
 		VerifyURL: envOr("CODIFI_VERIFY_URL",
 			"https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token"),
+		// APP tokens (mobile mPin / biometric login) — different endpoint,
+		// different signing secret, different response shape on Codifi's side:
+		AppVerifyURL: envOr("CODIFI_APP_VERIFY_URL",
+			"https://livemiddleware.indiratrade.com/auth-services/api/auth/v1/verify/token"),
 		// HTTPTimeout, CacheTTL, NegativeTTL, CleanupPeriod all use
 		// defaults defined in NewIntrospectionVerifier — 3s / 5m / 30s / 1m.
 	})

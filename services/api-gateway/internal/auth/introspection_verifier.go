@@ -41,10 +41,23 @@ import (
 // have sensible zero-value defaults except VerifyURL, which MUST be
 // set (there's no sane default that isn't environment-specific).
 type IntrospectionConfig struct {
-	// VerifyURL is the base URL of Codifi's verify endpoint. Query
-	// string is added at Verify time. Example:
+	// VerifyURL is the base URL of Codifi's SSO verify endpoint. Query
+	// string is added at Verify time. Called for tokens whose
+	// `loginSource` claim is "SSO" (web login via SSO gateway). Example:
 	//   https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token
 	VerifyURL string
+
+	// AppVerifyURL is the base URL of Codifi's MOBILE-APP verify
+	// endpoint. Called for tokens whose `loginSource` claim is "APP"
+	// (mPin, biometric, or other mobile app login flows). SSO and
+	// APP flows use DIFFERENT signing secrets on Codifi's side and
+	// DIFFERENT response shapes, so we route each to its correct
+	// endpoint. Example:
+	//   https://livemiddleware.indiratrade.com/auth-services/api/auth/v1/verify/token
+	//
+	// Empirically discovered response shape for APP endpoint (Indira
+	// envelope): {"infoID":"0"|"AU004"|..., "infoMsg":"...", "data":{}, "timestamp":...}
+	AppVerifyURL string
 
 	// HTTPTimeout is the per-request timeout when calling Codifi.
 	// Default 3s. If set to 0, defaults are applied.
@@ -94,12 +107,15 @@ type IntrospectionVerifier struct {
 
 // NewIntrospectionVerifier builds an IntrospectionVerifier from cfg
 // and starts a background sweep goroutine. Zero-value cfg fields
-// receive sane defaults. VerifyURL is REQUIRED and panics if empty
-// (a missing verify URL is a startup misconfiguration, not a runtime
-// condition worth returning an error for).
+// receive sane defaults. VerifyURL + AppVerifyURL are BOTH required
+// and panic if empty (a missing verify URL is a startup mis-
+// configuration, not a runtime condition worth returning an error for).
 func NewIntrospectionVerifier(cfg IntrospectionConfig) *IntrospectionVerifier {
 	if cfg.VerifyURL == "" {
 		panic("auth.NewIntrospectionVerifier: cfg.VerifyURL is required")
+	}
+	if cfg.AppVerifyURL == "" {
+		panic("auth.NewIntrospectionVerifier: cfg.AppVerifyURL is required")
 	}
 	if cfg.HTTPTimeout == 0 {
 		cfg.HTTPTimeout = 3 * time.Second
@@ -147,13 +163,16 @@ func (iv *IntrospectionVerifier) Verify(ctx context.Context, jwt string) (*Claim
 	// Codifi's verify endpoint requires userId + appId as HTTP
 	// headers (they cross-check them against the JWT's own claims).
 	// So we MUST extract them from the payload ourselves BEFORE
-	// calling Codifi.
+	// calling Codifi. We also read loginSource here to decide WHICH
+	// Codifi verify endpoint to route to (SSO vs APP use different
+	// endpoints with different signing secrets on Codifi's side).
 	raw, err := ParsePayload(jwt)
 	if err != nil {
 		return nil, err // already wrapped with ErrTokenMalformed
 	}
 	userID, _ := raw["userId"].(string)
 	appID, _ := raw["appId"].(string)
+	loginSource, _ := raw["loginSource"].(string)
 	if userID == "" || appID == "" {
 		return nil, fmt.Errorf("%w: payload missing userId or appId", ErrNoUserID)
 	}
@@ -171,11 +190,88 @@ func (iv *IntrospectionVerifier) Verify(ctx context.Context, jwt string) (*Claim
 		// Cache expired — fall through to Codifi. Sweep will evict.
 	}
 
-	// ── Step 4 ── Call Codifi verify endpoint ────────────────────
-	reqURL, err := url.Parse(iv.cfg.VerifyURL)
+	// ── Step 4 ── Pick the correct Codifi endpoint by loginSource ─
+	// SSO tokens (web login) verify against /auth/verify/token,
+	// APP tokens (mobile mPin/biometric) verify against
+	// /auth/v1/verify/token. They use DIFFERENT signing secrets
+	// AND DIFFERENT response shapes on Codifi's side. Fail-closed
+	// on any unknown loginSource — if Codifi ever adds a new flow
+	// (PARTNER, API_KEY, etc), tokens from that flow return 401
+	// until we teach our verifier about it. Safer than silently
+	// picking a default endpoint that would reject anyway.
+	var verifyURL string
+	var parseVerdict func(body []byte) error
+	switch loginSource {
+	case "SSO":
+		verifyURL = iv.cfg.VerifyURL
+		parseVerdict = parseSSOVerifyResponse
+	case "APP":
+		verifyURL = iv.cfg.AppVerifyURL
+		parseVerdict = parseAPPVerifyResponse
+	default:
+		return nil, fmt.Errorf("%w: unknown loginSource %q",
+			ErrTokenInvalid, loginSource)
+	}
+
+	// ── Step 5 ── Call the picked endpoint ───────────────────────
+	body, err := iv.callCodifi(ctx, verifyURL, jwt, userID, appID)
+	if err != nil {
+		return nil, err // already wrapped with ErrTokenInvalid
+	}
+
+	// ── Step 6 ── Interpret response with the shape-appropriate parser
+	if verdictErr := parseVerdict(body); verdictErr != nil {
+		// Negative-cache the rejection so brute-force garbage tokens
+		// don't hammer Codifi on every attempt.
+		iv.cache.Store(jwt, cacheEntry{
+			valid:     false,
+			expiresAt: time.Now().Add(iv.cfg.NegativeTTL),
+		})
+		return nil, verdictErr
+	}
+
+	// ── Step 7 ── Success — build Claims ─────────────────────────
+	// SECURITY: use the userId we extracted from the JWT payload,
+	// NOT any field the verify response may echo back. Codifi's
+	// verify response `ucc` field is a MIRROR of the header we
+	// sent, not a verified value — trusting it would let a wrong
+	// header override the token's actual identity.
+	var expiresAt int64
+	if expF, ok := raw["exp"].(float64); ok {
+		expiresAt = int64(expF)
+	}
+
+	claims := &Claims{
+		UserID:    userID,
+		ExpiresAt: expiresAt,
+		Raw:       raw,
+	}
+
+	// Cache the success for CacheTTL. Subsequent requests with this
+	// same JWT (within TTL) hit cache and skip Codifi entirely.
+	iv.cache.Store(jwt, cacheEntry{
+		claims:    claims,
+		valid:     true,
+		expiresAt: time.Now().Add(iv.cfg.CacheTTL),
+	})
+
+	return claims, nil
+}
+
+// callCodifi builds an HTTP GET to verifyURL with ?token=<jwt> query
+// param and userId/appId headers, returns the raw response body.
+// Extracted from Verify so both the SSO and APP branches share the
+// same HTTP-plumbing code — response INTERPRETATION differs, but the
+// request shape is identical.
+//
+// Returns errors wrapped with ErrTokenInvalid so middleware maps them
+// to a generic 401. Network errors are logged for ops so a Codifi
+// outage surfaces in our own log stream.
+func (iv *IntrospectionVerifier) callCodifi(ctx context.Context, verifyURL, jwt, userID, appID string) ([]byte, error) {
+	reqURL, err := url.Parse(verifyURL)
 	if err != nil {
 		// Config-time bug, not a runtime auth problem.
-		log.Printf("auth: bad VerifyURL config: %v", err)
+		log.Printf("auth: bad verify URL config %q: %v", verifyURL, err)
 		return nil, fmt.Errorf("%w: verify URL misconfigured", ErrTokenInvalid)
 	}
 	q := reqURL.Query()
@@ -197,68 +293,73 @@ func (iv *IntrospectionVerifier) Verify(ctx context.Context, jwt string) (*Claim
 		// Network error — Codifi unreachable, DNS failure, timeout,
 		// TLS error, etc. Log for ops (this is how we'd notice a
 		// Codifi outage), fail closed (don't authorize).
-		log.Printf("auth: Codifi verify network error: %v", err)
+		log.Printf("auth: Codifi verify network error (%s): %v", verifyURL, err)
 		return nil, fmt.Errorf("%w: verify network error", ErrTokenInvalid)
 	}
 	defer resp.Body.Close() // MANDATORY — leaks the TCP connection otherwise.
 
-	// ── Step 5 ── Parse Codifi's response ────────────────────────
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("%w: verify body read: %v", ErrTokenInvalid, err)
 	}
+	return body, nil
+}
 
-	var vresp struct {
-		Code         string `json:"code"`
-		Message      string `json:"message"`
-		PlainMessage struct {
-			UCC         string `json:"ucc"`
-			Timestamp   int64  `json:"timestamp"`
-			CallbackURL string `json:"callback-url"`
-		} `json:"plain-message"`
+// parseSSOVerifyResponse decodes the SSO-endpoint response shape:
+//
+//	{"code":"200","message":"Valid Token","plain-message":{"ucc":"...","timestamp":...,"callback-url":""}}
+//
+// Returns nil on success (code == "200") or a wrapped ErrTokenInvalid
+// with the human-readable Codifi message on any rejection. Note that
+// the HTTP status is ALWAYS 200 for this endpoint even on rejection;
+// only the body `code` field distinguishes valid from invalid.
+func parseSSOVerifyResponse(body []byte) error {
+	var r struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
 	}
-	if err := json.Unmarshal(body, &vresp); err != nil {
-		return nil, fmt.Errorf("%w: verify response parse: %v", ErrTokenInvalid, err)
+	if err := json.Unmarshal(body, &r); err != nil {
+		return fmt.Errorf("%w: SSO verify response parse: %v",
+			ErrTokenInvalid, err)
 	}
-
-	// Codifi's convention: HTTP is always 200, real status is in body.code.
-	// "200" (STRING, not int) = valid; anything else = rejected.
-	if vresp.Code != "200" {
-		// Negative-cache the rejection so brute-force garbage tokens
-		// don't hammer Codifi on every attempt.
-		iv.cache.Store(jwt, cacheEntry{
-			valid:     false,
-			expiresAt: time.Now().Add(iv.cfg.NegativeTTL),
-		})
-		return nil, fmt.Errorf("%w: Codifi rejected: %s (code=%s)",
-			ErrTokenInvalid, vresp.Message, vresp.Code)
+	if r.Code == "200" {
+		return nil
 	}
+	return fmt.Errorf("%w: Codifi SSO rejected: %s (code=%s)",
+		ErrTokenInvalid, r.Message, r.Code)
+}
 
-	// ── Success — build Claims ───────────────────────────────────
-	// SECURITY: use the userId we extracted from the JWT payload,
-	// NOT vresp.PlainMessage.UCC. The UCC field is Codifi's echo of
-	// the header we sent, not a verified value — trusting it would
-	// let a wrong header override the token's actual identity.
-	var expiresAt int64
-	if expF, ok := raw["exp"].(float64); ok {
-		expiresAt = int64(expF)
+// parseAPPVerifyResponse decodes the APP-endpoint response shape
+// (Indira-envelope style):
+//
+//	{"infoID":"0"|"AU004"|..., "infoMsg":"...", "data":{}, "timestamp":...}
+//
+// Returns:
+//   - nil                          when infoID == "0" (valid token)
+//   - ErrTokenSessionExpired-wrap  when infoID == "AU004" (server-side logout)
+//   - ErrTokenInvalid-wrap         for any other non-"0" infoID
+//
+// The AU004 distinction lets middleware surface E_AUTH_EXPIRED to the
+// frontend (which typically prompts silent re-login) vs the generic
+// E_AUTH_INVALID_SIGNATURE (which typically prompts full logout).
+func parseAPPVerifyResponse(body []byte) error {
+	var r struct {
+		InfoID  string `json:"infoID"`
+		InfoMsg string `json:"infoMsg"`
 	}
-
-	claims := &Claims{
-		UserID:    userID,
-		ExpiresAt: expiresAt,
-		Raw:       raw,
+	if err := json.Unmarshal(body, &r); err != nil {
+		return fmt.Errorf("%w: APP verify response parse: %v",
+			ErrTokenInvalid, err)
 	}
-
-	// Cache the success for CacheTTL. Subsequent requests with this
-	// same JWT (within TTL) hit cache and skip Codifi entirely.
-	iv.cache.Store(jwt, cacheEntry{
-		claims:    claims,
-		valid:     true,
-		expiresAt: time.Now().Add(iv.cfg.CacheTTL),
-	})
-
-	return claims, nil
+	switch r.InfoID {
+	case "0":
+		return nil
+	case "AU004":
+		return fmt.Errorf("%w: %s", ErrTokenSessionExpired, r.InfoMsg)
+	default:
+		return fmt.Errorf("%w: Codifi APP rejected: %s (infoID=%s)",
+			ErrTokenInvalid, r.InfoMsg, r.InfoID)
+	}
 }
 
 // Revoke removes the given JWT from the cache and adds it to the
