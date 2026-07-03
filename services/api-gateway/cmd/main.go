@@ -23,6 +23,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/handlers"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/notifications"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/performance"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/router"
 )
 
@@ -135,6 +136,7 @@ func main() {
 	// to enrich positions + signals with live LTP. Env: EXT_REDIS_ADDR / EXT_REDIS_PASSWORD.
 	var manthanHandler *handlers.ManthanHandler
 	var healthHandler *handlers.HealthHandler
+	var perfHandler *handlers.PerformanceHandler
 	var extRedis *redis.Client // hoisted: reused by the market-quote handler
 	{
 		pgHost := envOr("POSTGRES_HOST", "localhost")
@@ -145,6 +147,7 @@ func main() {
 		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "market_data")
 		positionsDBName := envOr("MANTHAN_POSITIONS_DB", "trading_db")
 		ordersDBName := envOr("MANTHAN_ORDERS_DB", "trading_execution")
+		perfDBName := envOr("MANTHAN_PERF_DB", "stockk_market")
 
 		openPG := func(dbName string) (*sql.DB, error) {
 			connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
@@ -186,6 +189,24 @@ func main() {
 		} else {
 			log.Printf("Manthan orders DB connected (%s)", ordersDBName)
 			defer ordersDB.Close()
+		}
+
+		// Performance data DB — algo_performance_daily + benchmark_daily.
+		// Populated by the perf-etl service (currently the one-off Python
+		// script /tmp/perf_etl.py). If unreachable, the /performance
+		// endpoint returns 500 but the rest of the gateway keeps working.
+		perfDB, err := openPG(perfDBName)
+		if err != nil {
+			log.Printf("Warning: Manthan performance DB (%s) open/ping failed: %v (performance route disabled)", perfDBName, err)
+		} else {
+			log.Printf("Manthan performance DB connected (%s)", perfDBName)
+			defer perfDB.Close()
+			perfStore := performance.NewPostgresStore(perfDB)
+			// Maps algo id → reference client id in the sheet. Grows as
+			// we add more algos; for launch there's exactly one entry.
+			perfHandler = handlers.NewPerformanceHandler(perfStore, map[string]string{
+				"algo_manthan_v1": "A844",
+			})
 		}
 
 		// Optional external Redis for live LTP (assigns the hoisted var)
@@ -282,7 +303,7 @@ func main() {
 	})
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, verifier, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, verifier, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

@@ -20,6 +20,7 @@ func NewRouter(
 	healthHandler *handlers.HealthHandler,
 	marketHandler *handlers.MarketHandler,
 	algosHandler *handlers.AlgosHandler,
+	perfHandler *handlers.PerformanceHandler,
 	verifier auth.Verifier,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
@@ -196,6 +197,14 @@ func NewRouter(
 	if algosHandler != nil {
 		protected.HandleFunc("/algos", algosHandler.ListAlgos).Methods("GET")
 		protected.HandleFunc("/algos/{id}", algosHandler.GetAlgo).Methods("GET")
+	}
+
+	// Algo Performance tab — served out of stockk_market DB (nil-safe:
+	// if the DB was unreachable at boot, perfHandler is nil and this
+	// route is simply not registered, matching the pattern used by
+	// other DB-backed handlers above.)
+	if perfHandler != nil {
+		protected.HandleFunc("/algos/{id}/performance", perfHandler.GetPerformance).Methods("GET")
 	}
 
 	// Money-moving paper/live routes — moved from the public `api.`
