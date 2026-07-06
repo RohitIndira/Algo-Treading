@@ -47,16 +47,32 @@ type IntrospectionConfig struct {
 	//   https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token
 	VerifyURL string
 
-	// AppVerifyURL is the base URL of Codifi's MOBILE-APP verify
-	// endpoint. Called for tokens whose `loginSource` claim is "APP"
-	// (mPin, biometric, or other mobile app login flows). SSO and
-	// APP flows use DIFFERENT signing secrets on Codifi's side and
-	// DIFFERENT response shapes, so we route each to its correct
-	// endpoint. Example:
-	//   https://livemiddleware.indiratrade.com/auth-services/api/auth/v1/verify/token
+	// AppVerifyURL is the endpoint we probe for MOBILE-APP token
+	// verification (tokens whose `loginSource` claim is "APP").
 	//
-	// Empirically discovered response shape for APP endpoint (Indira
-	// envelope): {"infoID":"0"|"AU004"|..., "infoMsg":"...", "data":{}, "timestamp":...}
+	// PIGGYBACK APPROACH (2026-07-02): we empirically discovered that
+	// Codifi's dedicated /auth-services/api/auth/v1/verify/token
+	// endpoint is over-strict — it rejects tokens (with AU004
+	// "Session expired") that Codifi's own DATA endpoints accept as
+	// valid. This means /verify/token cannot be used to validate the
+	// same JWTs the mobile app uses successfully in production.
+	//
+	// Workaround: we call a lightweight authenticated data endpoint
+	// (/user-services/api/user/v1/AccountInfo) as our validity probe.
+	// If the response is infoID:"0" → JWT is valid. Otherwise rejected.
+	// This matches the exact auth check the mobile app itself relies
+	// on for every real API call.
+	//
+	// This endpoint requires the JWT as `Authorization: Bearer` header
+	// (NOT as ?token= query param — unlike the SSO verify endpoint).
+	// See the callAPPVerify helper below for the request shape.
+	//
+	// Long-term fix: obtain the HS512 signing secret from Codifi and
+	// switch to LocalKeyVerifier (Pattern 2). Then we verify signature
+	// locally in ~1ms and stop depending on any Codifi endpoint's
+	// auth semantics.
+	//
+	// Example: https://livemiddleware.indiratrade.com/user-services/api/user/v1/AccountInfo
 	AppVerifyURL string
 
 	// HTTPTimeout is the per-request timeout when calling Codifi.
@@ -214,9 +230,18 @@ func (iv *IntrospectionVerifier) Verify(ctx context.Context, jwt string) (*Claim
 	}
 
 	// ── Step 5 ── Call the picked endpoint ───────────────────────
-	body, err := iv.callCodifi(ctx, verifyURL, jwt, userID, appID)
-	if err != nil {
-		return nil, err // already wrapped with ErrTokenInvalid
+	// SSO uses ?token= query param; APP uses Authorization: Bearer
+	// header (because we piggyback on the /AccountInfo data endpoint
+	// which follows the mobile app's usual header contract).
+	var body []byte
+	var err2 error
+	if loginSource == "SSO" {
+		body, err2 = iv.callSSOVerify(ctx, verifyURL, jwt, userID, appID)
+	} else { // APP (default branch guarded by the switch above)
+		body, err2 = iv.callAPPVerify(ctx, verifyURL, jwt, userID, appID)
+	}
+	if err2 != nil {
+		return nil, err2 // already wrapped with ErrTokenInvalid
 	}
 
 	// ── Step 6 ── Interpret response with the shape-appropriate parser
@@ -258,36 +283,72 @@ func (iv *IntrospectionVerifier) Verify(ctx context.Context, jwt string) (*Claim
 	return claims, nil
 }
 
-// callCodifi builds an HTTP GET to verifyURL with ?token=<jwt> query
-// param and userId/appId headers, returns the raw response body.
-// Extracted from Verify so both the SSO and APP branches share the
-// same HTTP-plumbing code — response INTERPRETATION differs, but the
-// request shape is identical.
-//
-// Returns errors wrapped with ErrTokenInvalid so middleware maps them
-// to a generic 401. Network errors are logged for ops so a Codifi
-// outage surfaces in our own log stream.
-func (iv *IntrospectionVerifier) callCodifi(ctx context.Context, verifyURL, jwt, userID, appID string) ([]byte, error) {
+// callSSOVerify makes the HTTP GET to Codifi's SSO verify endpoint
+// (/auth-services/api/auth/verify/token). The SSO endpoint takes the
+// JWT as the `?token=` QUERY PARAMETER — NOT an Authorization header.
+// That's a Codifi choice; passing the JWT the other way returns 404.
+func (iv *IntrospectionVerifier) callSSOVerify(ctx context.Context, verifyURL, jwt, userID, appID string) ([]byte, error) {
 	reqURL, err := url.Parse(verifyURL)
 	if err != nil {
-		// Config-time bug, not a runtime auth problem.
-		log.Printf("auth: bad verify URL config %q: %v", verifyURL, err)
+		log.Printf("auth: bad SSO verify URL config %q: %v", verifyURL, err)
 		return nil, fmt.Errorf("%w: verify URL misconfigured", ErrTokenInvalid)
 	}
 	q := reqURL.Query()
 	q.Set("token", jwt)
 	reqURL.RawQuery = q.Encode()
 
-	// http.NewRequestWithContext ties the outbound call to the caller's
-	// ctx — if the client disconnects mid-flight, the Codifi call is
-	// cancelled too, freeing the goroutine.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("%w: request build: %v", ErrTokenInvalid, err)
+		return nil, fmt.Errorf("%w: SSO request build: %v", ErrTokenInvalid, err)
 	}
 	req.Header.Set("userId", userID)
 	req.Header.Set("appId", appID)
+	return iv.doAndReadBody(req, verifyURL)
+}
 
+// callAPPVerify makes the HTTP GET to Codifi's mobile-app probe endpoint.
+//
+// PIGGYBACK: Codifi's dedicated /auth/v1/verify/token endpoint is
+// over-strict for mobile tokens (rejects with AU004 even when the JWT
+// is valid on real data endpoints). So we instead probe an authenticated
+// DATA endpoint (default: /user-services/api/user/v1/AccountInfo). If
+// Codifi accepts the JWT there, it accepts it everywhere.
+//
+// The probe endpoint follows the MOBILE APP contract: JWT goes in
+// `Authorization: Bearer ...` header (NOT a query param). We also send
+// userId, appId, and source headers to match what the mobile app itself
+// sends — matches the exact request shape that Codifi validates.
+//
+// Response shape is the Indira envelope ({infoID, infoMsg, ...}) — the
+// SAME shape as /auth/v1/verify/token — so parseAPPVerifyResponse works
+// unchanged.
+//
+// Side-effect note: the /AccountInfo response body contains user PII
+// (name, PAN, email, mobile, bank details). We parse ONLY infoID/
+// infoMsg via a narrow struct in parseAPPVerifyResponse — the PII fields
+// are discarded during JSON unmarshal. Never log the response body.
+func (iv *IntrospectionVerifier) callAPPVerify(ctx context.Context, verifyURL, jwt, userID, appID string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, verifyURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: APP request build: %v", ErrTokenInvalid, err)
+	}
+	// Mobile app contract: JWT in Authorization header, userId + appId
+	// echoed as headers, source identifying the caller platform. We
+	// pick "AND" (Android) as the source since Codifi's endpoints accept
+	// it regardless of what the real caller is — the value primarily
+	// gates certain platform-specific response paths we don't invoke.
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("userId", userID)
+	req.Header.Set("appId", appID)
+	req.Header.Set("source", "AND")
+	return iv.doAndReadBody(req, verifyURL)
+}
+
+// doAndReadBody executes the request through iv.httpClient, ensures
+// the response body is closed, and returns the raw bytes. Shared by
+// callSSOVerify and callAPPVerify — the only differences between the
+// two are URL + header shape, both handled by the caller.
+func (iv *IntrospectionVerifier) doAndReadBody(req *http.Request, verifyURL string) ([]byte, error) {
 	resp, err := iv.httpClient.Do(req)
 	if err != nil {
 		// Network error — Codifi unreachable, DNS failure, timeout,
