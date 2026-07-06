@@ -21,6 +21,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/auth"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/handlers"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/livealgos"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/notifications"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/performance"
@@ -268,11 +269,71 @@ func main() {
 	algosCatalog := algos.NewStaticCatalog()
 	algosHandler := handlers.NewAlgosHandler(algosCatalog)
 
-	// Live Algos — user's deployed strategies dashboard. Depends on
-	// user-config gRPC (for the strategy list) + the static algo
-	// catalog (for name/logo/style). Both are required; nil check in
-	// NewLiveAlgosHandler panics fast if wiring is wrong.
-	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog)
+	// Live Algos — user's deployed strategies dashboard AND the Details
+	// page endpoints (strategy detail / holdings / trades / stock P&L).
+	//
+	// The LIST endpoint (GET /users/me/live-algos) needs only user-config
+	// gRPC + the static catalog. The DETAILS endpoints additionally need:
+	//
+	//   store: *sql.DB pool against stockk_trading (positions + orders)
+	//   ltp:   go-redis client pointed at the staging LTP feed. In dev
+	//          this is the SSH tunnel at localhost:6380 (managed by the
+	//          systemd --user staging-redis-tunnel.service). In prod,
+	//          it will be the local redis_live directly.
+	//
+	// Both are nil-safe — if the DB pool or Redis client fail to init,
+	// the router skips registering the details routes and the LIST
+	// endpoint keeps working normally.
+	var liveAlgosStore livealgos.Store
+	tradingDBName := envOr("STOCKK_TRADING_DB", "stockk_trading")
+	if tradingDB, err := sql.Open("postgres", fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		envOr("POSTGRES_HOST", "localhost"),
+		envOr("POSTGRES_PORT", "5432"),
+		envOr("POSTGRES_USER", "postgres"),
+		envOr("POSTGRES_PASSWORD", "postgres"),
+		tradingDBName,
+		envOr("POSTGRES_SSLMODE", "disable"),
+	)); err != nil {
+		log.Printf("Warning: %s DB open failed: %v (details endpoints disabled)", tradingDBName, err)
+	} else {
+		tradingDB.SetMaxOpenConns(5)
+		tradingDB.SetMaxIdleConns(2)
+		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := tradingDB.PingContext(pCtx); err != nil {
+			log.Printf("Warning: %s DB ping failed: %v (details endpoints disabled)", tradingDBName, err)
+			_ = tradingDB.Close()
+		} else {
+			log.Printf("Live-algos trading DB connected (%s)", tradingDBName)
+			defer tradingDB.Close()
+			liveAlgosStore = livealgos.NewPostgresStore(tradingDB)
+		}
+		pCancel()
+	}
+
+	var liveAlgosLTP *livealgos.LTPStore
+	if ltpAddr := envOr("LIVEALGOS_LTP_REDIS_ADDR", "localhost:6380"); ltpAddr != "" {
+		ltpClient := redis.NewClient(&redis.Options{
+			Addr:         ltpAddr,
+			Password:     os.Getenv("LIVEALGOS_LTP_REDIS_PASSWORD"),
+			DB:           0,
+			PoolSize:     10,
+			MinIdleConns: 2,
+			ReadTimeout:  2 * time.Second,
+		})
+		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := ltpClient.Ping(pCtx).Err(); err != nil {
+			log.Printf("Warning: LTP redis ping (%s) failed: %v (details endpoints degrade to zero LTP)", ltpAddr, err)
+			_ = ltpClient.Close()
+		} else {
+			log.Printf("Live-algos LTP redis connected (%s)", ltpAddr)
+			defer ltpClient.Close()
+			liveAlgosLTP = livealgos.NewLTPStore(ltpClient)
+		}
+		pCancel()
+	}
+
+	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP)
 
 	// JWT verifier for the protected subrouter.
 	//

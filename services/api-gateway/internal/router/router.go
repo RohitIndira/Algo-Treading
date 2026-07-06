@@ -210,6 +210,18 @@ func NewRouter(
 	// to spoof. Same pattern as GitHub's /user, Twitter's /users/me.
 	if liveAlgosHandler != nil {
 		protected.HandleFunc("/users/me/live-algos", liveAlgosHandler.GetLiveAlgos).Methods("GET")
+
+		// Details-page endpoints — nil-safe on both the DB store AND
+		// LTP redis client (see LiveAlgosHandler.HasDetailsEndpoints).
+		// Skipping registration when either is unavailable turns
+		// misconfigurations into a clean 404 instead of runtime nil
+		// derefs, and lets the /live-algos list keep serving.
+		if liveAlgosHandler.HasDetailsEndpoints() {
+			protected.HandleFunc("/users/me/live-algos/{strategyId}", liveAlgosHandler.GetStrategyDetails).Methods("GET")
+			protected.HandleFunc("/users/me/live-algos/{strategyId}/holdings", liveAlgosHandler.GetHoldings).Methods("GET")
+			protected.HandleFunc("/users/me/live-algos/{strategyId}/trades", liveAlgosHandler.GetTrades).Methods("GET")
+			protected.HandleFunc("/users/me/live-algos/{strategyId}/holdings/{symbol}", liveAlgosHandler.GetStockPnL).Methods("GET")
+		}
 	}
 
 	// Strategy CRUD + user-strategy list — MOVED here from public on

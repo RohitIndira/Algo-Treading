@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/auth"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/livealgos"
+	"github.com/gorilla/mux"
 )
 
 // LiveAlgosHandler serves GET /api/v1/users/me/live-algos — the mobile
@@ -40,12 +43,27 @@ import (
 type LiveAlgosHandler struct {
 	userConfig *grpc_clients.UserConfigClient
 	catalog    algos.Catalog
+
+	// The following are used only by the Details-page endpoints
+	// (GetStrategyDetails, GetHoldings, GetTrades, GetStockPnL).
+	// nil-safe: if either is nil at boot (e.g. stockk_trading DB or
+	// staging LTP tunnel unreachable) the router simply doesn't
+	// register the routes that need them.
+	store livealgos.Store
+	ltp   *livealgos.LTPStore
 }
 
-// NewLiveAlgosHandler wires the handler to its dependencies. Both are
-// required — a nil userConfig or catalog would produce a runtime nil
-// deref on every request, which is a startup misconfiguration.
-func NewLiveAlgosHandler(userConfig *grpc_clients.UserConfigClient, catalog algos.Catalog) *LiveAlgosHandler {
+// NewLiveAlgosHandler wires the handler to its dependencies. Both
+// userConfig and catalog are required — a nil userConfig or catalog
+// would produce a runtime nil deref on the /live-algos list endpoint.
+// store + ltp are optional (see LiveAlgosHandler doc); pass nil when
+// unavailable and the Details-page routes stay unregistered upstream.
+func NewLiveAlgosHandler(
+	userConfig *grpc_clients.UserConfigClient,
+	catalog algos.Catalog,
+	store livealgos.Store,
+	ltp *livealgos.LTPStore,
+) *LiveAlgosHandler {
 	if userConfig == nil {
 		panic("handlers.NewLiveAlgosHandler: userConfig is required")
 	}
@@ -55,7 +73,17 @@ func NewLiveAlgosHandler(userConfig *grpc_clients.UserConfigClient, catalog algo
 	return &LiveAlgosHandler{
 		userConfig: userConfig,
 		catalog:    catalog,
+		store:      store,
+		ltp:        ltp,
 	}
+}
+
+// HasDetailsEndpoints reports whether the router should register the
+// 3 details-page routes on this handler. Wired to check both DB store
+// and LTP tunnel — either being unavailable disables the routes so
+// the frontend gets a clean 404 rather than a mysterious 500.
+func (h *LiveAlgosHandler) HasDetailsEndpoints() bool {
+	return h.store != nil && h.ltp != nil
 }
 
 // GetLiveAlgos handles GET /api/v1/users/me/live-algos.
@@ -118,4 +146,293 @@ func (h *LiveAlgosHandler) GetLiveAlgos(w http.ResponseWriter, r *http.Request) 
 	payload := livealgos.Build(resp.Strategies, h.catalog)
 
 	respondIndiraOK(w, payload)
+}
+
+// ─── Details page handlers ──────────────────────────────────────────
+//
+// These 3 handlers implement the Details page (Screens 1-7 of the
+// mockup). All read from stockk_trading directly (bypassing the
+// user-config gRPC that the list endpoint uses) because they need
+// position + order rows and the P&L math on top. LTP comes from the
+// staging Redis via SSH tunnel — same client shape as `redisClient`
+// elsewhere in the gateway.
+//
+// URL identity is enforced two ways:
+//
+//  1. `/users/me/...` — no user_id path param exists, identity always
+//     comes from the JWT via auth.UserIDFromContext.
+//  2. The store.StrategyMeta / store.Positions queries pass BOTH
+//     strategy_id AND user_id in the WHERE clause. Even if a
+//     malicious client fabricated a strategy_id belonging to another
+//     user, the DB returns zero rows and the handler returns 404.
+
+// GetStrategyDetails handles GET /users/me/live-algos/{strategyId}.
+// Powers Screen 1 & 2 of the Details page.
+func (h *LiveAlgosHandler) GetStrategyDetails(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respondIndiraError(w, http.StatusUnauthorized,
+			"E_AUTH", "authenticated user not found in context")
+		return
+	}
+	strategyID := mux.Vars(r)["strategyId"]
+	if strategyID == "" {
+		respondIndiraError(w, http.StatusBadRequest,
+			"E_BAD_REQUEST", "strategyId is required")
+		return
+	}
+
+	// Fetch header + positions + LTPs in that order — each depends on
+	// the previous only for the FROM/WHERE, not for the results, so
+	// the sequential call graph is fine at MVP scale.
+	meta, err := h.store.StrategyMeta(r.Context(), strategyID, userID)
+	if err != nil {
+		if errors.Is(err, livealgos.ErrStrategyNotFound) {
+			respondIndiraError(w, http.StatusNotFound,
+				"E_NOT_FOUND", "strategy not found")
+			return
+		}
+		log.Printf("livealgos: StrategyMeta %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError,
+			"E500", "failed to load strategy details")
+		return
+	}
+
+	positions, err := h.store.Positions(r.Context(), strategyID, userID)
+	if err != nil {
+		log.Printf("livealgos: Positions %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError,
+			"E500", "failed to load positions")
+		return
+	}
+
+	// LTP: only for ACTIVE positions with a resolved exchange_token.
+	// Degrade gracefully if the tunnel is temporarily down — response
+	// still renders positions, just with 0 LTP (frontend can show a
+	// stale-marker on those cards).
+	tokens := collectActiveTokens(positions)
+	var ltps map[string]livealgos.LTPQuote
+	if len(tokens) > 0 {
+		ltps, err = h.ltp.FetchByTokens(r.Context(), tokens)
+		if err != nil {
+			log.Printf("livealgos: LTP fetch failed (rendering without): %v", err)
+			ltps = nil
+		}
+	}
+
+	algoID, algoName := resolveAlgoMeta(h.catalog, meta.StrategyType)
+	payload := livealgos.BuildDetails(meta, positions, ltps, algoID, algoName)
+	respondIndiraOK(w, payload)
+}
+
+// GetHoldings handles GET /users/me/live-algos/{strategyId}/holdings.
+// Powers Screens 3 & 4 — full sortable list of active positions.
+func (h *LiveAlgosHandler) GetHoldings(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respondIndiraError(w, http.StatusUnauthorized, "E_AUTH", "authenticated user not found")
+		return
+	}
+	strategyID := mux.Vars(r)["strategyId"]
+	if strategyID == "" {
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "strategyId is required")
+		return
+	}
+	// Existence check — cheap and it turns "no such strategy" into a
+	// clean 404 rather than a suspicious 200-with-empty-list.
+	if _, err := h.store.StrategyMeta(r.Context(), strategyID, userID); err != nil {
+		if errors.Is(err, livealgos.ErrStrategyNotFound) {
+			respondIndiraError(w, http.StatusNotFound, "E_NOT_FOUND", "strategy not found")
+			return
+		}
+		log.Printf("livealgos: holdings meta check %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load holdings")
+		return
+	}
+
+	positions, err := h.store.Positions(r.Context(), strategyID, userID)
+	if err != nil {
+		log.Printf("livealgos: holdings positions %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load holdings")
+		return
+	}
+
+	active := filterByStatus(positions, "ACTIVE")
+	tokens := collectTokens(active)
+	ltps, err := h.ltp.FetchByTokens(r.Context(), tokens)
+	if err != nil {
+		log.Printf("livealgos: holdings LTP (rendering without): %v", err)
+		ltps = nil
+	}
+
+	respondIndiraOK(w, livealgos.BuildHoldings(active, ltps))
+}
+
+// GetTrades handles GET /users/me/live-algos/{strategyId}/trades.
+// Powers Screens 5 & 6 — full sortable list of closed trades.
+func (h *LiveAlgosHandler) GetTrades(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respondIndiraError(w, http.StatusUnauthorized, "E_AUTH", "authenticated user not found")
+		return
+	}
+	strategyID := mux.Vars(r)["strategyId"]
+	if strategyID == "" {
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "strategyId is required")
+		return
+	}
+	if _, err := h.store.StrategyMeta(r.Context(), strategyID, userID); err != nil {
+		if errors.Is(err, livealgos.ErrStrategyNotFound) {
+			respondIndiraError(w, http.StatusNotFound, "E_NOT_FOUND", "strategy not found")
+			return
+		}
+		log.Printf("livealgos: trades meta check %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load trades")
+		return
+	}
+
+	positions, err := h.store.Positions(r.Context(), strategyID, userID)
+	if err != nil {
+		log.Printf("livealgos: trades positions %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load trades")
+		return
+	}
+	exited := filterByStatus(positions, "EXITED")
+	respondIndiraOK(w, livealgos.BuildTrades(exited))
+}
+
+// GetStockPnL handles GET /users/me/live-algos/{strategyId}/holdings/{symbol}.
+// Powers Screen 7 — individual stock overview + per-fill trade history.
+func (h *LiveAlgosHandler) GetStockPnL(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respondIndiraError(w, http.StatusUnauthorized, "E_AUTH", "authenticated user not found")
+		return
+	}
+	strategyID := mux.Vars(r)["strategyId"]
+	symbol := mux.Vars(r)["symbol"]
+	if strategyID == "" || symbol == "" {
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "strategyId and symbol are required")
+		return
+	}
+	if _, err := h.store.StrategyMeta(r.Context(), strategyID, userID); err != nil {
+		if errors.Is(err, livealgos.ErrStrategyNotFound) {
+			respondIndiraError(w, http.StatusNotFound, "E_NOT_FOUND", "strategy not found")
+			return
+		}
+		log.Printf("livealgos: stockpnl meta check %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load stock detail")
+		return
+	}
+
+	positions, err := h.store.Positions(r.Context(), strategyID, userID)
+	if err != nil {
+		log.Printf("livealgos: stockpnl positions %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load stock detail")
+		return
+	}
+	// Positions for THIS symbol only.
+	perSymbol := filterBySymbol(positions, symbol)
+	if len(perSymbol) == 0 {
+		respondIndiraError(w, http.StatusNotFound, "E_NOT_FOUND", "no history for this symbol under this strategy")
+		return
+	}
+
+	orders, err := h.store.OrdersForSymbol(r.Context(), strategyID, userID, symbol)
+	if err != nil {
+		log.Printf("livealgos: stockpnl orders %s/%s/%s: %v", strategyID, userID, symbol, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load stock trades")
+		return
+	}
+
+	respondIndiraOK(w, livealgos.BuildStockPnL(symbol, perSymbol, orders))
+}
+
+// ─── Small helpers used only by the details endpoints ────────────────
+
+// resolveAlgoMeta looks up the algo id + display name for a given
+// user-config strategy_type string. Falls back to the raw type when
+// the catalog doesn't recognise it so a UI can still render something.
+func resolveAlgoMeta(catalog algos.Catalog, strategyType string) (string, string) {
+	// Static catalog today has exactly one entry (Manthan). context.TODO
+	// keeps the lint happy while making it obvious that the static impl
+	// truly ignores ctx — swap for a real ctx if we ever move to a
+	// DB-backed catalog with query cancellation.
+	all, _ := catalog.All(context.TODO())
+	for _, a := range all {
+		// Match by name; safer than comparing to the enum value that
+		// user-config returns since the catalog doesn't know that enum.
+		if a.Name == "Manthan" && (strategyType == "MANTHAN" || strategyType == "STRATEGY_TYPE_MANTHAN") {
+			return a.ID, a.Name
+		}
+	}
+	if len(all) > 0 {
+		return all[0].ID, all[0].Name
+	}
+	return "", ""
+}
+
+// collectActiveTokens returns exchange_tokens for ACTIVE positions only —
+// used by the main details endpoint (which values open positions but
+// doesn't need LTP for closed ones).
+func collectActiveTokens(positions []livealgos.PositionRow) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, p := range positions {
+		if p.Status != "ACTIVE" {
+			continue
+		}
+		if !p.ExchangeToken.Valid || p.ExchangeToken.String == "" {
+			continue
+		}
+		if _, ok := seen[p.ExchangeToken.String]; ok {
+			continue
+		}
+		seen[p.ExchangeToken.String] = struct{}{}
+		out = append(out, p.ExchangeToken.String)
+	}
+	return out
+}
+
+// collectTokens is like collectActiveTokens but takes a pre-filtered
+// slice (caller decides which subset). Used by the Holdings endpoint
+// where we've already isolated active positions.
+func collectTokens(positions []livealgos.PositionRow) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, p := range positions {
+		if !p.ExchangeToken.Valid || p.ExchangeToken.String == "" {
+			continue
+		}
+		if _, ok := seen[p.ExchangeToken.String]; ok {
+			continue
+		}
+		seen[p.ExchangeToken.String] = struct{}{}
+		out = append(out, p.ExchangeToken.String)
+	}
+	return out
+}
+
+// filterByStatus is a tiny slice filter — kept here rather than in the
+// aggregator because the aggregator functions take pre-split slices.
+func filterByStatus(positions []livealgos.PositionRow, status string) []livealgos.PositionRow {
+	out := make([]livealgos.PositionRow, 0, len(positions))
+	for _, p := range positions {
+		if p.Status == status {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// filterBySymbol returns positions matching a symbol (case-sensitive
+// intentionally — DB values are always upper-case).
+func filterBySymbol(positions []livealgos.PositionRow, symbol string) []livealgos.PositionRow {
+	out := make([]livealgos.PositionRow, 0)
+	for _, p := range positions {
+		if p.Symbol == symbol {
+			out = append(out, p)
+		}
+	}
+	return out
 }
