@@ -268,6 +268,12 @@ func main() {
 	algosCatalog := algos.NewStaticCatalog()
 	algosHandler := handlers.NewAlgosHandler(algosCatalog)
 
+	// Live Algos — user's deployed strategies dashboard. Depends on
+	// user-config gRPC (for the strategy list) + the static algo
+	// catalog (for name/logo/style). Both are required; nil check in
+	// NewLiveAlgosHandler panics fast if wiring is wrong.
+	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog)
+
 	// JWT verifier for the protected subrouter.
 	//
 	// PATTERN 4 (cached introspection) — bridge until Codifi shares the
@@ -303,7 +309,7 @@ func main() {
 	})
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, verifier, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, verifier, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

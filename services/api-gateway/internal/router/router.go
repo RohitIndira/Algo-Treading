@@ -21,6 +21,7 @@ func NewRouter(
 	marketHandler *handlers.MarketHandler,
 	algosHandler *handlers.AlgosHandler,
 	perfHandler *handlers.PerformanceHandler,
+	liveAlgosHandler *handlers.LiveAlgosHandler,
 	verifier auth.Verifier,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
@@ -60,16 +61,11 @@ func NewRouter(
 	// replayer's 15:35 IST cron.
 	api.HandleFunc("/auth/credentials", userConfigHandler.UpdateCredentials).Methods("POST")
 
-	// Strategy CRUD
-	api.HandleFunc("/strategies", userConfigHandler.CreateStrategy).Methods("POST")
-	api.HandleFunc("/strategies/{strategy_id}", userConfigHandler.GetStrategy).Methods("GET")
-	api.HandleFunc("/strategies/{strategy_id}", userConfigHandler.UpdateStrategy).Methods("PUT")
-	api.HandleFunc("/strategies/{strategy_id}", userConfigHandler.DeleteStrategy).Methods("DELETE")
-	api.HandleFunc("/strategies/{strategy_id}/activate", userConfigHandler.ActivateStrategy).Methods("POST")
-	api.HandleFunc("/strategies/{strategy_id}/deactivate", userConfigHandler.DeactivateStrategy).Methods("POST")
-
-	// User strategies
-	api.HandleFunc("/users/{user_id}/strategies", userConfigHandler.ListUserStrategies).Methods("GET")
+	// Strategy CRUD + user's strategy list — MOVED to protected on 2026-07-03.
+	// These endpoints all touch user-specific data (strategy configs owned
+	// by a specific user, deployment/activation actions that spend real
+	// margin). Every one of them is now behind auth via the `protected`
+	// subrouter registration below.
 
 	// Paper trading REST endpoints
 	if paperHandler != nil {
@@ -206,6 +202,31 @@ func NewRouter(
 	if perfHandler != nil {
 		protected.HandleFunc("/algos/{id}/performance", perfHandler.GetPerformance).Methods("GET")
 	}
+
+	// Live Algos tab — user's deployed strategies dashboard. URL uses
+	// the literal keyword "me" (NOT a path parameter); identity comes
+	// from the JWT via auth.UserIDFromContext inside the handler. This
+	// makes IDOR impossible by design — the URL contains no user id
+	// to spoof. Same pattern as GitHub's /user, Twitter's /users/me.
+	if liveAlgosHandler != nil {
+		protected.HandleFunc("/users/me/live-algos", liveAlgosHandler.GetLiveAlgos).Methods("GET")
+	}
+
+	// Strategy CRUD + user-strategy list — MOVED here from public on
+	// 2026-07-03 because they all touch user-specific data OR trigger
+	// real-money actions (POST /strategies deploys with real capital
+	// via activate_immediately=true).
+	//
+	// The mobile "Deploy Now" popup on the Manthan detail screen calls
+	// POST /strategies with strategy_type="MANTHAN", trade_config.total_capital
+	// set to the amount entered, activate_immediately=true, trading_mode="LIVE".
+	protected.HandleFunc("/strategies", userConfigHandler.CreateStrategy).Methods("POST")
+	protected.HandleFunc("/strategies/{strategy_id}", userConfigHandler.GetStrategy).Methods("GET")
+	protected.HandleFunc("/strategies/{strategy_id}", userConfigHandler.UpdateStrategy).Methods("PUT")
+	protected.HandleFunc("/strategies/{strategy_id}", userConfigHandler.DeleteStrategy).Methods("DELETE")
+	protected.HandleFunc("/strategies/{strategy_id}/activate", userConfigHandler.ActivateStrategy).Methods("POST")
+	protected.HandleFunc("/strategies/{strategy_id}/deactivate", userConfigHandler.DeactivateStrategy).Methods("POST")
+	protected.HandleFunc("/users/{user_id}/strategies", userConfigHandler.ListUserStrategies).Methods("GET")
 
 	// Money-moving paper/live routes — moved from the public `api.`
 	// subrouter above. Same handlers, same paths, just gated now.

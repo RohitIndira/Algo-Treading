@@ -397,16 +397,26 @@ func slimPagination(p *common.PaginationResponse) map[string]interface{} {
 
 // build52WResponse / buildManthanResponse / buildHFTResponse all delegate
 // to slimStrategy so the create-response shape matches list/get/update.
+//
+// As of 2026-07-03 these return the slim strategy DIRECTLY (no wrapper).
+// respondIndiraOK in the handler wraps them inside the Indira envelope's
+// `data` field, so the final JSON becomes:
+//
+//   { "infoID":"0", "infoMsg":"success", "timestamp":..., "data": { <slim strategy> } }
+//
+// Previously they returned {"success": true, "strategy": {...}} which
+// double-wrapped once the envelope layer was added. Success is implicit
+// in infoID=="0".
 func build52WResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
-	return map[string]interface{}{"success": true, "strategy": slimStrategy(resp.Strategy)}
+	return slimStrategy(resp.Strategy)
 }
 
 func buildManthanResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
-	return map[string]interface{}{"success": true, "strategy": slimStrategy(resp.Strategy)}
+	return slimStrategy(resp.Strategy)
 }
 
 func buildHFTResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
-	return map[string]interface{}{"success": true, "strategy": slimStrategy(resp.Strategy)}
+	return slimStrategy(resp.Strategy)
 }
 
 // Keep fmt referenced — used elsewhere in this file if any helpers remain.
