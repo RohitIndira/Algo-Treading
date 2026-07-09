@@ -30,6 +30,14 @@ type StaticCatalog struct {
 	// internals, which is why this field is private — it's an implementation
 	// detail, not part of the contract.)
 	items []Algo
+
+	// detailsByID is the lookup table for GET /api/v1/algos/{id}. Built
+	// once at startup and never mutated, so it's safe to read from many
+	// goroutines without a mutex.
+	//
+	// Storing details in a map keyed by ID (not a slice + linear scan)
+	// keeps ByID O(1) regardless of how many algos we add later.
+	detailsByID map[string]AlgoDetail
 }
 
 // NewStaticCatalog returns a Catalog populated with the algos we ship by
@@ -40,9 +48,18 @@ type StaticCatalog struct {
 // abstraction, not on this specific implementation. Tomorrow we'll do
 // the same with NewDBCatalog — same return type, different innards.
 func NewStaticCatalog() Catalog {
+	// The list-card entries and detail-page entries are built by two
+	// separate factories (manthan / manthanDetail) so we can hold
+	// slightly different content in each — the detail page shows a
+	// longer description, extra stats, "what you get" bullets, etc.
+	// See each factory function for the exact payload.
+	manthanDetailData := manthanDetail()
 	return &StaticCatalog{
 		items: []Algo{
 			manthan(),
+		},
+		detailsByID: map[string]AlgoDetail{
+			manthanDetailData.ID: manthanDetailData,
 		},
 	}
 }
@@ -74,6 +91,87 @@ func (s *StaticCatalog) All(ctx context.Context) ([]Algo, error) {
 	_ = ctx
 	out := append([]Algo(nil), s.items...)
 	return out, nil
+}
+
+// ByID returns the detail view of a single algo, or ErrAlgoNotFound
+// if the id doesn't match anything we know about.
+//
+// We RETURN A COPY of the struct (not a pointer to the internal map
+// value). Same reasoning as All: prevents any caller from accidentally
+// mutating shared catalog state. `detail := s.detailsByID[id]` copies
+// the AlgoDetail struct by value; the copy owns its own slices too
+// because Go's copy is shallow for structs but the WhatYouGet /
+// AlsoWorthKnowing slices are read-only by convention and we build
+// them fresh in manthanDetail() — never appended to at runtime.
+//
+// ctx is currently unused (no IO in a map lookup). Kept on the
+// signature because the Catalog interface promises it.
+func (s *StaticCatalog) ByID(ctx context.Context, id string) (*AlgoDetail, error) {
+	_ = ctx
+	detail, ok := s.detailsByID[id]
+	if !ok {
+		return nil, ErrAlgoNotFound
+	}
+	return &detail, nil
+}
+
+// manthanDetail is the full detail-page data for the Manthan algo.
+// Kept separate from manthan() (the list-card factory) because:
+//   - The description is longer here (full paragraph vs one-liner)
+//   - Detail-only fields (keyStats, whatYouGet, alsoWorthKnowing,
+//     disclaimer) exist only on this side
+//   - When we eventually move to a DB, list and detail may be
+//     served by different queries — keeping factories separate
+//     makes the migration path natural
+//
+// The base Algo fields (ID, Name, Type, Style, Logo, Badge,
+// MinInvestment, MaxDrawdown, PrimaryReturn) MUST match the
+// corresponding manthan() list card — otherwise the detail page
+// would show inconsistent numbers vs the Explore screen. If you
+// need to update one, update both.
+func manthanDetail() AlgoDetail {
+	return AlgoDetail{
+		Algo: Algo{
+			ID:    "algo_manthan_v1",
+			Name:  "Manthan",
+			Type:  "Equity",
+			Style: "Positional",
+			Logo:  "https://stockk-assets.s3.ap-south-1.amazonaws.com/algos/manthan.png",
+			// Longer version of the description for the About Algo
+			// section on the detail page. The list card uses the
+			// shorter version from manthan() above.
+			Description: "Manthan screens the Nifty 500 every Monday using a weighted blend of momentum, quality, low-volatility and value signals. It builds a concentrated book of 10-15 stocks and rebalances when factor scores decay or stop-loss bands are breached.",
+			Badge:       "Most Subscribed",
+			// Values MUST match manthan() to stay consistent
+			// between the Explore card and the detail page.
+			MinInvestment: 500_000,
+			MaxDrawdown:   -12.6,
+			PrimaryReturn: map[string]float64{
+				"3Y Return": 28.4,
+				"2Y Return": 32.9,
+			},
+		},
+		KeyStats: KeyStats{
+			WinRatePct:     62,
+			ProfitFactor:   24.1,
+			TotalTradesPct: 68,
+			AvgHoldingDays: -7.4,
+			Sortino:        1.84,
+			VolatilityDays: 12,
+		},
+		WhatYouGet: []WhatYouGetItem{
+			{Icon: "automation", Title: "Automated execution", Description: "Trades placed by us — no manual orders"},
+			{Icon: "shield", Title: "Stop-loss baked in", Description: "8% trailing per position, 14% portfolio cap"},
+			{Icon: "bell", Title: "Signal alerts", Description: "Push notifications on entries"},
+			{Icon: "chart", Title: "Daily performance feed", Description: "Curve, P&L, drawdown updated live"},
+		},
+		AlsoWorthKnowing: []AlsoWorthKnowingItem{
+			{Icon: "trending", Text: "Returns shown are gross & historical"},
+			{Icon: "wallet", Text: "Funds must be ready at rebalance"},
+			{Icon: "receipt", Text: "Frequent trades affect your taxes"},
+		},
+		Disclaimer: "Past performance does not guarantee future returns. Manthan trades equities only; capital can be temporarily locked during rebalancing windows.",
+	}
 }
 
 // manthan is the canonical Manthan algo entry as shown on the Explore

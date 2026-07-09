@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
+	"github.com/gorilla/mux"
 )
 
 // AlgosHandler is the HTTP-layer entry point for the Explore screen.
@@ -125,4 +127,57 @@ func (h *AlgosHandler) ListAlgos(w http.ResponseWriter, r *http.Request) {
 	// Content-Type header, the full {infoID, infoMsg, timestamp, data}
 	// JSON, and we're done.
 	respondIndiraOK(w, resp)
+}
+
+// GetAlgo handles GET /api/v1/algos/{id}.
+//
+// This is the detail-page endpoint — powers the "Manthan Strategy"
+// screen the user sees after tapping an algo card on the Explore list.
+// Response is the full AlgoDetail struct wrapped in the Indira envelope.
+//
+// URL path parameter:
+//   {id} — the algo's stable ID (e.g., "algo_manthan_v1"). Extracted
+//          via gorilla/mux's Vars helper.
+//
+// Response codes:
+//   200 — algo found, returns AlgoDetail as the envelope's "data"
+//   400 — malformed request (path variable missing, extremely rare
+//         because the router only matches when {id} is present, but
+//         defensive check is cheap)
+//   404 — infoID "E_NOT_FOUND", infoMsg "algo not found"
+//         (when catalog.ByID returns ErrAlgoNotFound)
+//   500 — infoID "E500" (any other catalog error — future DB down,
+//         network blip, etc. StaticCatalog never returns one today.)
+func (h *AlgosHandler) GetAlgo(w http.ResponseWriter, r *http.Request) {
+	// Extract the {id} path variable via gorilla/mux.
+	// Vars returns a map[string]string of every path parameter
+	// captured in the route pattern (e.g. "/algos/{id}" captures "id").
+	// If the router matched us at all, "id" is guaranteed to be
+	// present — but a defensive check catches a silly mis-registered
+	// route earlier, and costs nothing.
+	id := mux.Vars(r)["id"]
+	if id == "" {
+		respondIndiraError(w, http.StatusBadRequest,
+			"E_BAD_REQUEST", "algo id is required")
+		return
+	}
+
+	// Delegate to the catalog. errors.Is walks any %w wrap chain so
+	// this keeps working even when a future implementation wraps
+	// ErrAlgoNotFound with extra context.
+	detail, err := h.catalog.ByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, algos.ErrAlgoNotFound) {
+			respondIndiraError(w, http.StatusNotFound,
+				"E_NOT_FOUND", "algo not found")
+			return
+		}
+		respondIndiraError(w, http.StatusInternalServerError,
+			"E500", "failed to load algo")
+		return
+	}
+
+	// AlgoDetail already has JSON tags for every field including the
+	// embedded Algo — the envelope helper marshals it directly.
+	respondIndiraOK(w, detail)
 }

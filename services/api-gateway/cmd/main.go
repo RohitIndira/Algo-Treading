@@ -21,8 +21,10 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/auth"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/handlers"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/livealgos"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/notifications"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/performance"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/router"
 )
 
@@ -135,6 +137,7 @@ func main() {
 	// to enrich positions + signals with live LTP. Env: EXT_REDIS_ADDR / EXT_REDIS_PASSWORD.
 	var manthanHandler *handlers.ManthanHandler
 	var healthHandler *handlers.HealthHandler
+	var perfHandler *handlers.PerformanceHandler
 	var extRedis *redis.Client // hoisted: reused by the market-quote handler
 	{
 		pgHost := envOr("POSTGRES_HOST", "localhost")
@@ -145,6 +148,7 @@ func main() {
 		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "market_data")
 		positionsDBName := envOr("MANTHAN_POSITIONS_DB", "trading_db")
 		ordersDBName := envOr("MANTHAN_ORDERS_DB", "trading_execution")
+		perfDBName := envOr("MANTHAN_PERF_DB", "stockk_market")
 
 		openPG := func(dbName string) (*sql.DB, error) {
 			connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
@@ -186,6 +190,24 @@ func main() {
 		} else {
 			log.Printf("Manthan orders DB connected (%s)", ordersDBName)
 			defer ordersDB.Close()
+		}
+
+		// Performance data DB — algo_performance_daily + benchmark_daily.
+		// Populated by the perf-etl service (currently the one-off Python
+		// script /tmp/perf_etl.py). If unreachable, the /performance
+		// endpoint returns 500 but the rest of the gateway keeps working.
+		perfDB, err := openPG(perfDBName)
+		if err != nil {
+			log.Printf("Warning: Manthan performance DB (%s) open/ping failed: %v (performance route disabled)", perfDBName, err)
+		} else {
+			log.Printf("Manthan performance DB connected (%s)", perfDBName)
+			defer perfDB.Close()
+			perfStore := performance.NewPostgresStore(perfDB)
+			// Maps algo id → reference client id in the sheet. Grows as
+			// we add more algos; for launch there's exactly one entry.
+			perfHandler = handlers.NewPerformanceHandler(perfStore, map[string]string{
+				"algo_manthan_v1": "A844",
+			})
 		}
 
 		// Optional external Redis for live LTP (assigns the hoisted var)
@@ -247,6 +269,72 @@ func main() {
 	algosCatalog := algos.NewStaticCatalog()
 	algosHandler := handlers.NewAlgosHandler(algosCatalog)
 
+	// Live Algos — user's deployed strategies dashboard AND the Details
+	// page endpoints (strategy detail / holdings / trades / stock P&L).
+	//
+	// The LIST endpoint (GET /users/me/live-algos) needs only user-config
+	// gRPC + the static catalog. The DETAILS endpoints additionally need:
+	//
+	//   store: *sql.DB pool against stockk_trading (positions + orders)
+	//   ltp:   go-redis client pointed at the staging LTP feed. In dev
+	//          this is the SSH tunnel at localhost:6380 (managed by the
+	//          systemd --user staging-redis-tunnel.service). In prod,
+	//          it will be the local redis_live directly.
+	//
+	// Both are nil-safe — if the DB pool or Redis client fail to init,
+	// the router skips registering the details routes and the LIST
+	// endpoint keeps working normally.
+	var liveAlgosStore livealgos.Store
+	tradingDBName := envOr("STOCKK_TRADING_DB", "stockk_trading")
+	if tradingDB, err := sql.Open("postgres", fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		envOr("POSTGRES_HOST", "localhost"),
+		envOr("POSTGRES_PORT", "5432"),
+		envOr("POSTGRES_USER", "postgres"),
+		envOr("POSTGRES_PASSWORD", "postgres"),
+		tradingDBName,
+		envOr("POSTGRES_SSLMODE", "disable"),
+	)); err != nil {
+		log.Printf("Warning: %s DB open failed: %v (details endpoints disabled)", tradingDBName, err)
+	} else {
+		tradingDB.SetMaxOpenConns(5)
+		tradingDB.SetMaxIdleConns(2)
+		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := tradingDB.PingContext(pCtx); err != nil {
+			log.Printf("Warning: %s DB ping failed: %v (details endpoints disabled)", tradingDBName, err)
+			_ = tradingDB.Close()
+		} else {
+			log.Printf("Live-algos trading DB connected (%s)", tradingDBName)
+			defer tradingDB.Close()
+			liveAlgosStore = livealgos.NewPostgresStore(tradingDB)
+		}
+		pCancel()
+	}
+
+	var liveAlgosLTP *livealgos.LTPStore
+	if ltpAddr := envOr("LIVEALGOS_LTP_REDIS_ADDR", "localhost:6380"); ltpAddr != "" {
+		ltpClient := redis.NewClient(&redis.Options{
+			Addr:         ltpAddr,
+			Password:     os.Getenv("LIVEALGOS_LTP_REDIS_PASSWORD"),
+			DB:           0,
+			PoolSize:     10,
+			MinIdleConns: 2,
+			ReadTimeout:  2 * time.Second,
+		})
+		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := ltpClient.Ping(pCtx).Err(); err != nil {
+			log.Printf("Warning: LTP redis ping (%s) failed: %v (details endpoints degrade to zero LTP)", ltpAddr, err)
+			_ = ltpClient.Close()
+		} else {
+			log.Printf("Live-algos LTP redis connected (%s)", ltpAddr)
+			defer ltpClient.Close()
+			liveAlgosLTP = livealgos.NewLTPStore(ltpClient)
+		}
+		pCancel()
+	}
+
+	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP)
+
 	// JWT verifier for the protected subrouter.
 	//
 	// PATTERN 4 (cached introspection) — bridge until Codifi shares the
@@ -282,7 +370,7 @@ func main() {
 	})
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, verifier, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, verifier, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

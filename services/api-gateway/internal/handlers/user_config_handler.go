@@ -34,10 +34,19 @@ func NewUserConfigHandler(client *grpc_clients.UserConfigClient, hftClient *grpc
 }
 
 // CreateStrategy handles POST /api/v1/strategies
+//
+// Response shape: Indira envelope
+//   Success: { "infoID":"0", "infoMsg":"success", "timestamp":..., "data": { <strategy> } }
+//   Error:   { "infoID":"E_XXX", "infoMsg":"<reason>", "timestamp":... }
+//
+// Standardized 2026-07-03 (previously returned {"success", "strategy"} at
+// http 201). Frontend keys off the envelope's infoID like every other
+// endpoint in the gateway now.
 func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Request) {
 	var reqDTO dto.CreateStrategyRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST",
+			"Invalid request body: "+err.Error())
 		return
 	}
 
@@ -55,13 +64,15 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 
 	// 1. Header Validation
 	if bearerToken == "" || appId == "" || source == "" || userIdHeader == "" {
-		respondWithError(w, http.StatusUnauthorized, "Missing authentication headers: Authorization, appId, source, and userId are required")
+		respondIndiraError(w, http.StatusUnauthorized, "E_AUTH_HEADERS_MISSING",
+			"Missing authentication headers: Authorization, appId, source, and userId are required")
 		return
 	}
 
 	// 2. IDOR Protection: Body UserID must match Header UserID
 	if reqDTO.UserID != "" && reqDTO.UserID != userIdHeader {
-		respondWithError(w, http.StatusForbidden, "User ID mismatch between header and body")
+		respondIndiraError(w, http.StatusForbidden, "E_FORBIDDEN",
+			"User ID mismatch between header and body")
 		return
 	}
 	// Force body UserID to match header if empty
@@ -73,12 +84,14 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 
 	// 4. Logic Validation
 	if reqDTO.StrategyName == "" {
-		respondWithError(w, http.StatusBadRequest, "Strategy name is required")
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST",
+			"Strategy name is required")
 		return
 	}
 	if reqDTO.Conditions != nil {
 		if reqDTO.Conditions.MinMarketCap > reqDTO.Conditions.MaxMarketCap && reqDTO.Conditions.MaxMarketCap > 0 {
-			respondWithError(w, http.StatusBadRequest, "Min Market Cap cannot be greater than Max Market Cap")
+			respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST",
+				"Min Market Cap cannot be greater than Max Market Cap")
 			return
 		}
 		// Add more range checks here
@@ -107,23 +120,27 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 	// Call Service
 	resp, err := h.client.CreateStrategy(r.Context(), pbReq)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to create strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500",
+			"Failed to create strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST",
+			resp.Error.Message)
 		return
 	}
 
-	// Clean response based on strategy type
+	// Clean response based on strategy type. Every branch responds with
+	// the Indira envelope, data = the slim strategy map (build*Response
+	// returns slimStrategy directly since 2026-07-03).
 	if resp.Strategy != nil {
 		switch resp.Strategy.StrategyType {
 		case pb.StrategyType_WEEK52_BREAKOUT:
-			respondWithJSON(w, http.StatusCreated, build52WResponse(resp))
+			respondIndiraOK(w, build52WResponse(resp))
 			return
 		case pb.StrategyType_MANTHAN:
-			respondWithJSON(w, http.StatusCreated, buildManthanResponse(resp))
+			respondIndiraOK(w, buildManthanResponse(resp))
 			return
 		case pb.StrategyType_HFT_BIDDING:
 			out := buildHFTResponse(resp)
@@ -163,11 +180,14 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 					}
 				}
 			}
-			respondWithJSON(w, http.StatusCreated, out)
+			respondIndiraOK(w, out)
 			return
 		}
 	}
-	respondWithJSON(w, http.StatusCreated, resp)
+	// Fallthrough for unknown strategy types — return the raw protobuf
+	// response as data. Should be rare (all known strategy types match a
+	// case above); kept as a safety net.
+	respondIndiraOK(w, resp)
 }
 
 // UpdateStrategy handles PUT /api/v1/strategies/{strategy_id}
