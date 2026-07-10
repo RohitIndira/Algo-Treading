@@ -29,6 +29,7 @@ import (
 	indira "github.com/RohitIndira/Algo-Treading/pkg/indira"
 
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/publisher"
+	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/reconciler"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/store"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/userconfig"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/wss"
@@ -170,9 +171,34 @@ func main() {
 		zap.Int("skipped_no_creds", skipped),
 		zap.Int("failed", failed))
 
+	// ── Reconciler (Chunk D — Layers 2 + 3 of the truth hierarchy) ─────
+	// Layer 2: REST orderbook poll every 15s per user — catches WSS misses
+	// Layer 3: full sweep every 5min + immediate startup catch-up
+	//
+	// Both paths INSERT into broker_events with source=REST_*; dedup with the
+	// WSS path on (broker_order_id, event_seq); publish only NEW rows to
+	// order.events.
+	rec := reconciler.New(
+		indiraClient,
+		brokerEvents,
+		orderEventsPub,
+		func(ctx context.Context, userID string) (*indira.AuthContext, error) {
+			return ucClient.FetchUserCredentials(ctx, userID)
+		},
+		ucClient.ListActiveUserIDs,
+		reconciler.Config{
+			FastPollInterval: 15 * time.Second,
+			SlowPollInterval: 5 * time.Minute,
+		},
+		logger,
+	)
+	recCtx, recCancel := context.WithCancel(context.Background())
+	defer recCancel()
+	rec.Start(recCtx)
+
 	logger.Info("orderstatus svc ready",
-		zap.String("chunk", "C"),
-		zap.String("next", "Chunk D — move reconciler + safety_monitor into this binary"))
+		zap.String("chunk", "D"),
+		zap.String("next", "Chunk E — trade-execution consumes order.events"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
