@@ -27,6 +27,7 @@ DB setup (new dev box, new staging cluster, etc.).
 | 006 | `006_active_position_classification_check.sql` | Data integrity | CHECK constraint preventing invalid `status` transitions on `manthan_positions` |
 | 007 | `007_manthan_protective_audit.sql` | Protective-attempt audit trail | adds 3 columns to `manthan_positions` for protective-order forensics |
 | 008 | `008_drop_trade_signals_table.sql` | Cleanup of dead news-path artefact | DROPs `trade_signals` (was created by the removed migration 001; the code that wrote to it was deleted in commit 671f970) |
+| 009 | `009_signal_types_and_outbox_columns.sql` | Extend signal_decisions for all 5 signal types (ENTRY_BUY / SL_MODIFY / EXIT_TSL / EXIT_MANUAL / SL_CANCEL) — additive: `signal_type`, `parent_signal_id`, `payload` columns + CHECK constraints. Per [`docs/rules_engine_refactor.md`](../../../docs/rules_engine_refactor.md) §4.5. | `manthan_signal_decisions` |
 
 **Migration 001 (`001_create_trade_signals_table.sql`) was removed on 2026-06-25**
 when the news-event path it supported was deleted. Production DBs that still
