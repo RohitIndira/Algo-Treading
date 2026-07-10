@@ -89,6 +89,137 @@ services/rules-engine/internal/
 
 positions/ code lifts out to `services/positions/` — that's a separate future refactor.
 
+## 4.5 What rules-engine WRITES after the refactor — ratified 2026-07-10
+
+Approved by rohitt after PM+senior-dev review. This is the final target the
+5-step extraction below is aiming at.
+
+### Kafka publishes (2 topics)
+
+| Topic | Payload | Consumer(s) |
+|---|---|---|
+| `trade-signals` | Trade action envelope (entry / SL modify / exit) | trade-execution |
+| `portfolio.allocations` | Portfolio allocation state change | frontend, monitoring |
+
+### Postgres writes (2 tables, `trading_db`)
+
+**Table 1: `manthan_signal_decisions`** — durable signal audit log.
+Every signal rules-engine fires gets ONE INSERT. One follow-up UPDATE
+sets `published_at` after Kafka ACK (transactional-outbox pattern —
+crash-safe publishing).
+
+```sql
+CREATE TABLE manthan_signal_decisions (
+  signal_id         UUID PRIMARY KEY,
+  parent_signal_id  UUID REFERENCES manthan_signal_decisions(signal_id) NULL,
+  signal_type       VARCHAR(32) NOT NULL,  -- ENTRY_BUY, SL_MODIFY, EXIT_TSL, EXIT_MANUAL, SL_CANCEL
+  strategy_id       VARCHAR(64) NOT NULL,
+  user_id           VARCHAR(64) NOT NULL,
+  symbol            VARCHAR(32) NOT NULL,
+  payload           JSONB NOT NULL,        -- type-specific fields
+  fired_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  published_at      TIMESTAMPTZ NULL       -- NULL = INSERT-ed but Kafka publish pending
+);
+
+CREATE INDEX idx_msd_type_user_symbol ON manthan_signal_decisions(signal_type, user_id, symbol);
+CREATE INDEX idx_msd_unpublished ON manthan_signal_decisions(fired_at) WHERE published_at IS NULL;
+```
+
+Write pattern (transactional outbox — industry standard):
+```
+BEGIN;
+  INSERT INTO manthan_signal_decisions (…, published_at=NULL);
+COMMIT;
+
+publish to Kafka trade-signals
+  → on ACK:
+UPDATE manthan_signal_decisions SET published_at=NOW() WHERE signal_id=?
+```
+
+**On startup**, republish any row where `published_at IS NULL` — recovers
+from crashes between INSERT and Kafka ACK. Zero signal loss, zero
+duplicate re-publishes (Kafka key = signal_id gives idempotency at consumer).
+
+**Table 2: `manthan_cooldown`** — re-entry cooldown state (Manthan spec:
+after SL exit, don't re-enter until price drops below `ATH × 0.80`).
+
+```sql
+CREATE TABLE manthan_cooldown (
+  user_id           VARCHAR(64) NOT NULL,
+  strategy_id       VARCHAR(64) NOT NULL,
+  symbol            VARCHAR(32) NOT NULL,
+  ath_at_exit       NUMERIC(14,4) NOT NULL,
+  exit_price        NUMERIC(14,4) NOT NULL,
+  exit_time         TIMESTAMPTZ NOT NULL,
+  reentry_below     NUMERIC(14,4) NOT NULL,  -- ATH × 0.80
+  PRIMARY KEY (user_id, strategy_id, symbol)
+);
+```
+
+Write pattern: INSERT on EXIT_TSL / EXIT_MANUAL signal. DELETE (or expire)
+when re-entry conditions are met. Allocator reads this on every entry
+decision.
+
+### Signal types rules-engine fires (enum for `signal_type` column)
+
+| `signal_type` | When fired | Payload fields |
+|---|---|---|
+| `ENTRY_BUY` | Allocator picks stock → entry order | qty, entry_price, initial_sl_trigger, initial_sl_limit |
+| `SL_MODIFY` | Trailing SL ratchet-up (LTP moved 2%+) | new_trigger, new_limit, old_trigger, ltp_when_fired |
+| `EXIT_TSL` | LTP crossed trailing SL — rules-engine emits sell | ltp_at_fire, sl_at_fire |
+| `EXIT_MANUAL` | User-triggered exit | reason |
+| `SL_CANCEL` | Cancel a stuck / misplaced SL | reason |
+
+Extending the enum later is one migration + one Go const.
+
+### What rules-engine will NOT write (moved out)
+
+| Was writing | New owner |
+|---|---|
+| `manthan_positions` (16 writes) | positions svc |
+| `manthan_position_events` (1 write) | positions svc |
+| `manthan_portfolio_state` (1 write) | portfolio svc |
+| `manthan_signal_decisions` outcome UPDATEs (10 writes) | positions svc updates via its own table; JOIN at read time. **rules-engine never UPDATEs outcome columns.** |
+| Kafka `manthan.notifications` | notification svc (subscribes to positions svc + rules-engine events; owns user messaging) |
+
+### Reads (input side)
+
+| Source | What |
+|---|---|
+| Postgres `MANTHAN_SIGNALS_DB.manthan_signals` (read-only) | Eligible 52W breakouts |
+| Kafka `manthan.signals` | Real-time breakout events |
+| Kafka `user-config-events` | User strategy configs |
+| Kafka `position.updates` (from positions svc) | Live portfolio snapshot for allocator cap checks + trail SL LTP context |
+
+### Numbers — before vs after
+
+| Metric | Today | After |
+|---|---|---|
+| Tables written to | 4 | 2 |
+| SQL statements per signal cycle | ~30 | 2 (INSERT + UPDATE published_at) |
+| Cross-service writes | Yes (writes tables that belong to positions/portfolio concerns) | No |
+| Recovery-safe publishing | No | Yes (outbox pattern) |
+| Signal audit horizon | Kafka only (30 days) | Postgres forever |
+| Kafka topics published | 3 (trade-signals, portfolio.allocations, manthan.notifications) | 2 (drops notifications) |
+
+### Read-time JOIN for "was signal profitable?"
+
+Signal outcomes live in positions svc — no cross-service writes needed.
+Reader combines via JOIN:
+
+```sql
+SELECT d.signal_id, d.symbol, d.fired_at,
+       p.state, p.realized_pnl, p.exit_price
+FROM manthan_signal_decisions d
+LEFT JOIN manthan_positions p ON p.signal_id = d.signal_id
+WHERE d.user_id = 'S4450'
+  AND d.signal_type = 'ENTRY_BUY';
+```
+
+Each service owns its columns. Zero write-side coupling.
+
+---
+
 ## 5. Extraction plan — 5 steps
 
 Each step is:
