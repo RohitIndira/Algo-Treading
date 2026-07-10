@@ -102,7 +102,8 @@ topics=(
     "manthan.signals"             # Data Ingestion - Manthan strategy eligible stocks (daily)
     "portfolio.allocations"       # Rules Engine - Manthan portfolio state changes (real-time)
     "manthan.execution.events"    # Trade Execution - fill confirmations for rules-engine sync
-    "manthan.notifications"       # Rules Engine - user-facing notifications
+    "manthan.notifications"       # Rules Engine - user-facing notifications (RETIRING — moves to notification svc)
+    "order.events"                # Orderstatus Svc - every observed broker event (2026-07-10, CQRS split target)
 )
 
 for topic in "${topics[@]}"; do
