@@ -29,6 +29,7 @@ import (
 	indira "github.com/RohitIndira/Algo-Treading/pkg/indira"
 
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/store"
+	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/userconfig"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/wss"
 )
 
@@ -106,9 +107,6 @@ func main() {
 	}()
 
 	// ── WSS listener (Chunk B) ─────────────────────────────────────────
-	// broker_events writer + listener orchestrator. Actual subscriptions
-	// require an *indira.AuthContext per user — hooked in during Chunk B.5
-	// (user-config gRPC lookup) or provided by external callers via test paths.
 	brokerEvents := store.NewWriter(db, logger)
 	indiraClient := indira.NewDefaultClient()
 	listener := wss.NewListener(indiraClient, brokerEvents, logger)
@@ -118,10 +116,64 @@ func main() {
 	// Chunk C when we publish order.events on every INSERT.
 	_ = kafkaWriter
 
+	// ── Auth wiring (Chunk B.5): user-config gRPC → subscriptions ──────
+	// Dial user-config with a 10s timeout. Fail fast — orderstatus svc
+	// can't do useful work without knowing which users to subscribe.
+	ucAddr := getEnv("USER_CONFIG_GRPC_ADDR", "localhost:50051")
+	ucCtx, ucCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ucClient, err := userconfig.NewClient(ucCtx, ucAddr)
+	ucCancel()
+	if err != nil {
+		logger.Fatal("user-config dial failed", zap.String("addr", ucAddr), zap.Error(err))
+	}
+	defer func() { _ = ucClient.Close() }()
+	logger.Info("user-config gRPC ready", zap.String("addr", ucAddr))
+
+	// Fetch active users and start a subscription per user. One user may
+	// own multiple strategies — user-config's dedup gives us unique IDs.
+	subCtx, subCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	activeUsers, err := ucClient.ListActiveUserIDs(subCtx)
+	if err != nil {
+		subCancel()
+		logger.Fatal("ListActiveUserIDs failed", zap.Error(err))
+	}
+	logger.Info("active users to subscribe", zap.Int("count", len(activeUsers)))
+
+	subscribed, skipped, failed := 0, 0, 0
+	for _, userID := range activeUsers {
+		auth, err := ucClient.FetchUserCredentials(subCtx, userID)
+		if err != nil {
+			logger.Warn("fetch credentials failed — skipping user",
+				zap.String("user_id", userID), zap.Error(err))
+			failed++
+			continue
+		}
+		if auth == nil {
+			// No broker creds on file (user never SSO'd, or credentials wiped).
+			// Silent skip — will retry on next boot.
+			logger.Debug("no credentials on file — skipping user",
+				zap.String("user_id", userID))
+			skipped++
+			continue
+		}
+		if err := listener.StartSubscription(subCtx, userID, auth); err != nil {
+			logger.Warn("subscribe failed — will not receive events for user",
+				zap.String("user_id", userID), zap.Error(err))
+			failed++
+			continue
+		}
+		subscribed++
+	}
+	subCancel()
+
+	logger.Info("wss subscription pass complete",
+		zap.Int("subscribed", subscribed),
+		zap.Int("skipped_no_creds", skipped),
+		zap.Int("failed", failed))
+
 	logger.Info("orderstatus svc ready",
-		zap.String("chunk", "B"),
-		zap.String("waiting_for", "auth wiring (Chunk B.5) then subscriptions via listener.StartSubscription"))
-	_ = listener // silence unused until auth wiring lands
+		zap.String("chunk", "B.5"),
+		zap.String("next", "Chunk C — publish order.events on every broker_events INSERT"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
