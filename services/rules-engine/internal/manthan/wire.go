@@ -20,7 +20,6 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/projector"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"go.uber.org/zap"
 
@@ -87,11 +86,8 @@ type Manthan struct {
 
 	// Components held for shutdown / debugging.
 	publisher     *ManthanPublisher
-	notifier      *NotificationPublisher
 	portfolioMgr  *PortfolioManager
 	consumer      *Consumer
-	fillConsumer  *FillConsumer
-	proj          *projector.PositionProjector
 	ltpFeed       *LTPFeed // may be nil — external Redis was not configured
 	signalsDB     *sql.DB  // opened by Wire; closed by Close
 	manthanDB     *sql.DB  // borrowed — main.go owns the lifecycle
@@ -283,23 +279,11 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 		logger.Warn("EXT_REDIS_ADDR not set — live LTP feed disabled, using sheet prices")
 	}
 
-	// Projector + notifier (CQRS write path).
-	m.proj = projector.NewPositionProjector(deps.ManthanDB, logger)
-	m.notifier = NewNotificationPublisher(deps.KafkaBrokers, deps.NotificationsEnabled, logger)
-	m.proj.SetNotifier(m.notifier)
-	if deps.NotificationsEnabled {
-		logger.Info("Manthan notifications ENABLED — publishing to manthan.notifications topic")
-	}
-
-	// Fill consumer (manthan.execution.events topic).
-	m.fillConsumer = NewFillConsumer(
-		FillConsumerConfig{
-			KafkaBrokers:       deps.KafkaBrokers,
-			Topic:              "manthan.execution.events",
-			DecisionLogEnabled: deps.DecisionLogEnabled,
-		},
-		m.portfolioMgr, slMgr, m.publisher, m.proj, 20.0, logger,
-	)
+	// Projector + fill_consumer + notifier removed 2026-07-10 as part of the
+	// signal-engine-only refactor. Rules-engine no longer writes to
+	// manthan_positions / manthan_position_events. Positions svc (to be built)
+	// will own those writes; until then, positions/PnL/frontend state degrades.
+	// See docs/rules_engine_refactor.md §4.5 for the ratified end state.
 
 	// Sync warm-up — fill Redis cache from Postgres so newly-bootstrapped
 	// strategies see today's signals without waiting for the next sheet
@@ -363,37 +347,10 @@ func (m *Manthan) Start(ctx context.Context) {
 	}()
 	m.logger.Info("Manthan signal consumer started")
 
-	// Fill consumer (drives the projector).
-	go func() {
-		m.fillConsumer.Start(ctx)
-	}()
-	m.logger.Info("Manthan fill consumer started — reality sync active")
-
-	// Stale-decision reaper — flips PROPOSED/DISPATCHED rows >2 minutes
-	// old to TIMED_OUT. Only active in CQRS mode.
-	if m.decisionLogEnabled {
-		go func() {
-			ticker := time.NewTicker(60 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					n, err := m.proj.MarkStaleDecisionsTimedOut(ctx, 120)
-					if err != nil {
-						m.logger.Warn("Reaper: stale decision sweep failed", zap.Error(err))
-						continue
-					}
-					if n > 0 {
-						m.logger.Info("Reaper: flipped stale decisions to TIMED_OUT",
-							zap.Int64("count", n))
-					}
-				}
-			}
-		}()
-		m.logger.Info("Stale-decision reaper started (60s tick, 2min cutoff)")
-	}
+	// Fill consumer + stale-decision reaper removed 2026-07-10. Both depended
+	// on the projector, which is gone. Signal decisions stay at PROPOSED /
+	// DISPATCHED forever until positions svc takes over the outcome updates.
+	// See docs/rules_engine_refactor.md §4.5.
 
 	// LTP feed poller — drives trailing SL.
 	if m.ltpFeed != nil {
@@ -412,9 +369,6 @@ func (m *Manthan) Close() {
 	}
 	if m.publisher != nil {
 		m.publisher.Close()
-	}
-	if m.notifier != nil {
-		_ = m.notifier.Close()
 	}
 	if m.signalsDB != nil {
 		_ = m.signalsDB.Close()
