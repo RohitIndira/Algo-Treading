@@ -10,6 +10,8 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
 // Consumer reads eligible stock signals from the manthan.signals Kafka topic.
@@ -40,7 +42,7 @@ type Consumer struct {
 	portfolioMgr *PortfolioManager
 	slMgr        *TrailingSLManager
 	publisher    OrderPublisher
-	strategyFn   func() []UserStrategy
+	strategyFn   func() []types.UserStrategy
 	emaFn        func() map[string]float64
 	logger       *zap.Logger
 }
@@ -74,7 +76,7 @@ func NewConsumer(
 	portfolioMgr *PortfolioManager,
 	slMgr *TrailingSLManager,
 	publisher OrderPublisher,
-	strategyFn func() []UserStrategy,
+	strategyFn func() []types.UserStrategy,
 	emaFn func() map[string]float64,
 	logger *zap.Logger,
 ) *Consumer {
@@ -138,7 +140,7 @@ func (c *Consumer) Start(ctx context.Context) {
 			continue
 		}
 
-		var signal ManthanSignal
+		var signal types.ManthanSignal
 		if err := json.Unmarshal(msg.Value, &signal); err != nil {
 			// Poison message — can never parse. Commit and skip so it doesn't
 			// block the partition.
@@ -179,7 +181,7 @@ func (c *Consumer) Start(ctx context.Context) {
 //
 // Reads Redis first (fast path); if cold, falls back to the authoritative
 // Postgres `manthan_signals` table and repopulates Redis for future lookups.
-func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy UserStrategy) {
+func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy types.UserStrategy) {
 	if c.rdb == nil {
 		return
 	}
@@ -265,7 +267,7 @@ func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy UserStrategy
 
 // storeSignal saves a signal to Redis keyed by date.
 // Deduplicates by symbol within each date bucket.
-func (c *Consumer) storeSignal(ctx context.Context, sig ManthanSignal) {
+func (c *Consumer) storeSignal(ctx context.Context, sig types.ManthanSignal) {
 	if c.rdb == nil {
 		return
 	}
@@ -283,7 +285,7 @@ func (c *Consumer) storeSignal(ctx context.Context, sig ManthanSignal) {
 			zap.String("key", dateKey), zap.Error(err))
 	}
 	for _, raw := range existing {
-		var old ManthanSignal
+		var old types.ManthanSignal
 		if json.Unmarshal([]byte(raw), &old) == nil && old.Symbol == sig.Symbol {
 			if err := c.rdb.SRem(ctx, dateKey, raw).Err(); err != nil {
 				c.logger.Warn("storeSignal: Redis SRem failed",
@@ -305,7 +307,7 @@ func (c *Consumer) storeSignal(ctx context.Context, sig ManthanSignal) {
 }
 
 // loadSignalsForDate reads all signals cached for a specific date.
-func (c *Consumer) loadSignalsForDate(ctx context.Context, date string) []ManthanSignal {
+func (c *Consumer) loadSignalsForDate(ctx context.Context, date string) []types.ManthanSignal {
 	if c.rdb == nil {
 		return nil
 	}
@@ -313,9 +315,9 @@ func (c *Consumer) loadSignalsForDate(ctx context.Context, date string) []Mantha
 	if err != nil {
 		return nil
 	}
-	var signals []ManthanSignal
+	var signals []types.ManthanSignal
 	for _, raw := range members {
-		var sig ManthanSignal
+		var sig types.ManthanSignal
 		if json.Unmarshal([]byte(raw), &sig) == nil {
 			signals = append(signals, sig)
 		}
@@ -326,7 +328,7 @@ func (c *Consumer) loadSignalsForDate(ctx context.Context, date string) []Mantha
 // loadSignalsFromDB reads signals for a given date from the authoritative
 // Postgres `manthan_signals` table (lives in market_data DB).
 // Used for startup warm-up and as a fallback when Redis cache is cold.
-func (c *Consumer) loadSignalsFromDB(ctx context.Context, date string) ([]ManthanSignal, error) {
+func (c *Consumer) loadSignalsFromDB(ctx context.Context, date string) ([]types.ManthanSignal, error) {
 	if c.signalsDB == nil {
 		return nil, nil
 	}
@@ -345,9 +347,9 @@ func (c *Consumer) loadSignalsFromDB(ctx context.Context, date string) ([]Mantha
 	}
 	defer rows.Close()
 
-	var signals []ManthanSignal
+	var signals []types.ManthanSignal
 	for rows.Next() {
-		var sig ManthanSignal
+		var sig types.ManthanSignal
 		var runDate, createdAt time.Time
 		if err := rows.Scan(
 			&runDate, &sig.Symbol, &sig.ISIN, &sig.Industry,
@@ -470,7 +472,7 @@ func parseJSONLTP(raw string) (float64, error) {
 	return 0, nil
 }
 
-func (c *Consumer) processSignal(ctx context.Context, signal ManthanSignal) {
+func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal) {
 	strategies := c.strategyFn()
 	if len(strategies) == 0 {
 		return
@@ -495,7 +497,7 @@ func (c *Consumer) processSignal(ctx context.Context, signal ManthanSignal) {
 		portfolio := c.portfolioMgr.GetOrCreate(strategy)
 
 		result := c.allocator.Allocate(
-			[]ManthanSignal{signal},
+			[]types.ManthanSignal{signal},
 			portfolio,
 			emaByIndex,
 		)

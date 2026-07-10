@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
 // TickHandler processes real-time LTP ticks for all active MANTHAN positions.
@@ -19,7 +21,7 @@ type TickHandler struct {
 	portfolioMgr *PortfolioManager
 	orderGen     *OrderGenerator
 	publisher    OrderPublisher
-	strategyFn   func(strategyID string) *UserStrategy // get strategy by ID
+	strategyFn   func(strategyID string) *types.UserStrategy // get strategy by ID
 	logger       *zap.Logger
 }
 
@@ -28,7 +30,7 @@ func NewTickHandler(
 	portfolioMgr *PortfolioManager,
 	orderGen *OrderGenerator,
 	publisher OrderPublisher,
-	strategyFn func(strategyID string) *UserStrategy,
+	strategyFn func(strategyID string) *types.UserStrategy,
 	logger *zap.Logger,
 ) *TickHandler {
 	return &TickHandler{
@@ -53,7 +55,7 @@ func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float6
 		// (nested lock would deadlock the goroutine).
 		portfolio.Mu.Lock()
 		pos, ok := portfolio.Positions[symbol]
-		if !ok || !pos.Active || pos.State != StateActive {
+		if !ok || !pos.Active || pos.State != types.StateActive {
 			portfolio.Mu.Unlock()
 			continue
 		}

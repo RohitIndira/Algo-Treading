@@ -8,7 +8,7 @@ import (
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/orderstatus"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -36,12 +36,12 @@ type BrokerExecutionResult struct {
 type SignalProcessor struct {
 	broker        BrokerExecutor
 	publisher     *publisher.KafkaPublisher
-	statusService *statusservice.OrderStatusService
+	statusService *orderstatus.OrderStatusService
 	logger        *zap.Logger
 }
 
 // NewSignalProcessor creates a new signal processor
-func NewSignalProcessor(broker BrokerExecutor, publisher *publisher.KafkaPublisher, statusService *statusservice.OrderStatusService, logger *zap.Logger) *SignalProcessor {
+func NewSignalProcessor(broker BrokerExecutor, publisher *publisher.KafkaPublisher, statusService *orderstatus.OrderStatusService, logger *zap.Logger) *SignalProcessor {
 	return &SignalProcessor{
 		broker:        broker,
 		publisher:     publisher,

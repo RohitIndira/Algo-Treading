@@ -1,6 +1,7 @@
 package manthan
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -123,12 +124,38 @@ func (b *WSSBridge) PendingCount() int {
 	return len(b.pending)
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Codify (Indira) WSS OrderStatus enum
+// ────────────────────────────────────────────────────────────────────
+// Values marked "verified" were observed emitted by the broker during
+// live capture 2026-07-09 (see scripts/codify_learn/03_wss_full_capture.py).
+//
+// Values marked "unverified" have never been observed but are retained
+// for defensive coverage in case broker vocabulary differs in edge cases
+// we haven't exercised (partial fills, SL fires, AMO acceptance, etc).
+// Do NOT remove without additional capture evidence — false negatives
+// here mean a fill event silently gets ignored.
+//
+// Verified terminal states:
+//   EXECUTED     — fill (comes on MessageType=TRD_MSG with TradedPrice)
+//   CANCELLED    — user-cancel success
+//   A.REJECTED   — exchange/broker rejection (OMSOrderStatus=15 fresh,
+//                                             =10 cancel-of-dead)
+//   ORDER ERROR  — instant reject (Reason contains "price freeze")
+//
+// Verified transitional state (expect follow-up within ~200ms):
+//   ADMIN PENDING — pre-reject state, becomes A.REJECTED
+//
+// Verified active state:
+//   PENDING      — sitting at exchange (Codify never emits "OPEN")
+
 // IsTerminalStatus returns true if the broker status means the order is done.
 func IsTerminalStatus(status string) bool {
 	switch status {
-	case "EXECUTED", "TRADED", "COMPLETE", "FILLED",
-		"REJECTED", "A.REJECTED",
-		"CANCELLED":
+	case "EXECUTED", "TRADED", "COMPLETE", "FILLED", // EXECUTED verified; others defensive
+		"REJECTED", "A.REJECTED", // A.REJECTED verified; REJECTED defensive
+		"ORDER ERROR", // verified — price freeze instant reject
+		"CANCELLED":   // verified
 		return true
 	}
 	return false
@@ -137,13 +164,16 @@ func IsTerminalStatus(status string) bool {
 // IsFilledWSStatus returns true if the broker status means order was filled.
 func IsFilledWSStatus(status string) bool {
 	switch status {
-	case "EXECUTED", "TRADED", "COMPLETE", "FILLED":
+	case "EXECUTED", // verified
+		"TRADED", "COMPLETE", "FILLED": // defensive — never observed
 		return true
 	}
 	return false
 }
 
 // IsPartialWSStatus returns true if broker reports partial fill.
+// NOTE: neither value has been observed in live capture; strings are
+// educated guesses from Codify docs. Update after we see a real partial.
 func IsPartialWSStatus(status string) bool {
 	switch status {
 	case "PARTIALLY TRADED", "PARTIALLY EXECUTED":
@@ -153,10 +183,27 @@ func IsPartialWSStatus(status string) bool {
 }
 
 // IsRejectedWSStatus returns true if broker rejected the order.
+// ORDER ERROR is the "price freeze" path — same terminal semantics as
+// A.REJECTED but arrives as a single event (no ADMIN PENDING lead-in).
 func IsRejectedWSStatus(status string) bool {
 	switch status {
-	case "REJECTED", "A.REJECTED":
+	case "A.REJECTED", // verified — codes 10 and 15
+		"REJECTED",     // defensive — never observed
+		"ORDER ERROR": // verified — price freeze instant reject
 		return true
 	}
 	return false
+}
+
+// IsPriceFreezeReject returns true iff the WSS event is specifically the
+// "price too far from LTP" rejection. Used to drive log-spam suppression:
+// production sees 100+ of these per minute during AMO retry storms and we
+// want to log-collapse them without hiding real rejections.
+// Detection: OrderStatus=ORDER ERROR AND Reason mentions "price freeze".
+func IsPriceFreezeReject(status, reason string) bool {
+	if status != "ORDER ERROR" {
+		return false
+	}
+	// Reason from live capture: " The order has been cancelled due to price freeze."
+	return strings.Contains(strings.ToLower(reason), "price freeze")
 }

@@ -33,7 +33,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/server"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/orderstatus"
 )
 
 func main() {
@@ -126,7 +126,7 @@ func main() {
 	// Initialize Order Status Service (WebSocket-based real-time order updates)
 	// The backend opens one WS connection per user to Indira after placing their first order.
 	log.Println("Initializing WebSocket Order Status Service...")
-	statusService := statusservice.NewOrderStatusService(indiraClient, orderRepo, credsRepo, kafkaPub, logger)
+	statusService := orderstatus.NewOrderStatusService(indiraClient, orderRepo, credsRepo, kafkaPub, logger)
 	log.Println("✓ Order Status Service initialized")
 
 	// Initialize executor with credentials repository, Kafka publisher, and status service.

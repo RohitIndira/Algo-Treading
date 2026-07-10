@@ -12,7 +12,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/scheduler"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/orderstatus"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -34,7 +34,7 @@ func NewSignalProcessor(
 	orderRepo repository.OrderRepository,
 	kafkaPub *publisher.KafkaPublisher,
 	// statusSvc is now wired inside OrderExecutor — no longer needed here
-	_ *statusservice.OrderStatusService,
+	_ *orderstatus.OrderStatusService,
 	logger *zap.Logger,
 ) *SignalProcessor {
 	return &SignalProcessor{

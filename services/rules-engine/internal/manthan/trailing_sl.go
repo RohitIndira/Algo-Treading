@@ -1,6 +1,10 @@
 package manthan
 
-import "go.uber.org/zap"
+import (
+	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
+)
 
 // TrailingSLManager manages trailing stop-losses for all positions.
 //
@@ -48,7 +52,7 @@ type SLUpdate struct {
 
 // ProcessTick evaluates a single LTP tick against a position's trailing SL.
 // Called on every tick from the websocket feed.
-func (m *TrailingSLManager) ProcessTick(pos *Position, ltp float64, slPct float64, trailStepPct float64) SLUpdate {
+func (m *TrailingSLManager) ProcessTick(pos *types.Position, ltp float64, slPct float64, trailStepPct float64) SLUpdate {
 	if !pos.Active || ltp <= 0 {
 		return SLUpdate{Action: SLNoAction}
 	}
@@ -106,7 +110,7 @@ func (m *TrailingSLManager) ProcessTick(pos *Position, ltp float64, slPct float6
 }
 
 // InitPosition sets up the initial SL state for a new entry.
-func (m *TrailingSLManager) InitPosition(pos *Position, slPct float64) {
+func (m *TrailingSLManager) InitPosition(pos *types.Position, slPct float64) {
 	pos.HighSinceEntry = pos.EntryPrice
 	pos.CurrentSL = pos.EntryPrice * (1 - slPct/100)
 	pos.LastTrailLevel = pos.EntryPrice

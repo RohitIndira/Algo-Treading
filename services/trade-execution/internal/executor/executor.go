@@ -15,7 +15,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/orderstatus"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -26,7 +26,7 @@ type OrderExecutor struct {
 	credsCache    *CredentialsCache // in-memory credential store; avoids per-order DB hit
 	indiraClient  *indira.ExecutionClient
 	kafkaPub      *publisher.KafkaPublisher
-	statusSvc     *statusservice.OrderStatusService
+	statusSvc     *orderstatus.OrderStatusService
 	paperExecutor *PaperOrderExecutor
 	wsBroadcaster func(userID string, eventType string, order *models.Order)
 	logger        *zap.Logger
@@ -58,7 +58,7 @@ func NewOrderExecutor(
 	credsRepo repository.CredentialsRepository,
 	indiraClient *indira.ExecutionClient,
 	kafkaPub *publisher.KafkaPublisher,
-	statusSvc *statusservice.OrderStatusService,
+	statusSvc *orderstatus.OrderStatusService,
 	logger *zap.Logger,
 	maxRetries int,
 	retryDelay time.Duration,
