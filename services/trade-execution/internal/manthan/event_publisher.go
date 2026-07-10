@@ -40,15 +40,21 @@ type ManthanEventPublisher struct {
 	logger *zap.Logger
 }
 
+// NewManthanEventPublisher returns a NO-OP publisher as of 2026-07-10.
+//
+// The manthan.execution.events topic was consumed only by rules-engine's
+// projector + fill_consumer, both deleted in the signal-engine-only refactor
+// (see docs/rules_engine_refactor.md §4.5). The event surface is preserved
+// here so callers (entry_handler / sl_handler / safety_monitor / reconciler)
+// keep compiling and can be wired to the new order.events topic once
+// orderstatus svc is built.
+//
+// Until then: publish() sees writer==nil and returns silently. All PublishXxx
+// methods no-op. The struct + call sites stay so the transition to
+// orderstatus svc is a wiring change, not a rewrite.
 func NewManthanEventPublisher(brokers []string, logger *zap.Logger) *ManthanEventPublisher {
-	w := &kafka.Writer{
-		Addr:         kafka.TCP(brokers...),
-		Topic:        "manthan.execution.events",
-		Balancer:     &kafka.LeastBytes{},
-		BatchTimeout: 1 * time.Millisecond,
-		RequiredAcks: kafka.RequireAll,
-	}
-	return &ManthanEventPublisher{writer: w, logger: logger}
+	logger.Info("ManthanEventPublisher: manthan.execution.events retired — publisher is a no-op until orderstatus svc lands")
+	return &ManthanEventPublisher{writer: nil, logger: logger}
 }
 
 func (p *ManthanEventPublisher) Close() error {
