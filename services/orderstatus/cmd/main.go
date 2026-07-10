@@ -25,6 +25,11 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+
+	indira "github.com/RohitIndira/Algo-Treading/pkg/indira"
+
+	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/store"
+	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/wss"
 )
 
 func main() {
@@ -100,8 +105,23 @@ func main() {
 		}
 	}()
 
-	// ── TODO Chunk B/C/D — WSS + reconciler + publisher wire up here ──
-	logger.Info("orderstatus svc ready — awaiting signal (Chunks B/C/D pending)")
+	// ── WSS listener (Chunk B) ─────────────────────────────────────────
+	// broker_events writer + listener orchestrator. Actual subscriptions
+	// require an *indira.AuthContext per user — hooked in during Chunk B.5
+	// (user-config gRPC lookup) or provided by external callers via test paths.
+	brokerEvents := store.NewWriter(db, logger)
+	indiraClient := indira.NewDefaultClient()
+	listener := wss.NewListener(indiraClient, brokerEvents, logger)
+	defer listener.Close()
+
+	// silence "declared and not used" during Chunk B — kafkaWriter is used in
+	// Chunk C when we publish order.events on every INSERT.
+	_ = kafkaWriter
+
+	logger.Info("orderstatus svc ready",
+		zap.String("chunk", "B"),
+		zap.String("waiting_for", "auth wiring (Chunk B.5) then subscriptions via listener.StartSubscription"))
+	_ = listener // silence unused until auth wiring lands
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)

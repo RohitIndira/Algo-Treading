@@ -17,4 +17,5 @@ use (
 	./services/rules-engine
 	./services/trade-execution
 	./services/user-config
+	./services/orderstatus
 )
