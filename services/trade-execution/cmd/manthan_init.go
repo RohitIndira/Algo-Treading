@@ -13,7 +13,7 @@ import (
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/manthan"
-	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/statusservice"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/orderstatus"
 )
 
 // ManthanModule holds all Manthan order execution components.
@@ -39,7 +39,7 @@ func InitManthan(
 	ctx context.Context,
 	db *sql.DB,
 	indiraClient *indiraPkg.Client,
-	statusSvc *statusservice.OrderStatusService,
+	statusSvc *orderstatus.OrderStatusService,
 	credsCache *executor.CredentialsCache,
 	kafkaBrokers []string,
 	logger *zap.Logger,

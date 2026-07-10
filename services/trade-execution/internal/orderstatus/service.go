@@ -1,7 +1,16 @@
-// Package statusservice provides real-time order status updates
-// using the Indira WebSocket stream. It subscribes per-user and
-// updates the order database and publishes Kafka notifications.
-package statusservice
+// Package orderstatus is the WSS-listener layer that observes broker order
+// state and updates our DB.
+//
+// Renamed from "statusservice" on 2026-07-10 as part of the CQRS boundary
+// prep. Lives in trade-execution today; when orderstatus svc is extracted
+// as its own binary (per docs/orderstatus_service_design.md), this package
+// moves to services/orderstatus/internal/wss/ unchanged.
+//
+// Sibling code that also belongs to the orderstatus concern but hasn't moved
+// yet (heavy `manthan` package coupling): safety_monitor.go, reconciler.go,
+// external_activity_detector.go — all in internal/manthan/. Each is marked
+// with a "// TODO(orderstatus): moves to orderstatus svc" comment.
+package orderstatus
 
 import (
 	"context"

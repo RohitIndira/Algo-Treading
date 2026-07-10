@@ -1,5 +1,9 @@
 package manthan
 
+// TODO(orderstatus): moves to orderstatus svc when extracted.
+// See docs/orderstatus_service_design.md — this file's WSS-driven / poll-driven
+// concern belongs to the status-observation layer, not the placement layer.
+
 import (
 	"context"
 	"errors"
