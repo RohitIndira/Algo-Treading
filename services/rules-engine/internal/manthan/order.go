@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
 // OrderGenerator creates trade orders from allocation results.
@@ -92,8 +94,8 @@ type SLExitOrder struct {
 
 // GenerateEntryOrders creates entry orders from allocation results.
 func (g *OrderGenerator) GenerateEntryOrders(
-	strategy UserStrategy,
-	allocations []AllocationResult,
+	strategy types.UserStrategy,
+	allocations []types.AllocationResult,
 ) []ManthanOrder {
 	orders := make([]ManthanOrder, 0, len(allocations))
 
@@ -115,7 +117,7 @@ func (g *OrderGenerator) GenerateEntryOrders(
 			StopLossPct:   strategy.StopLossPct,
 			TrailingSLPct: strategy.TrailingSLPct,
 			InvestedAmt:   float64(alloc.Quantity) * alloc.EntryPrice,
-			TxnCostPct:    TotalTxnCostPct() * 100,
+			TxnCostPct:    types.TotalTxnCostPct() * 100,
 			Industry:      alloc.Industry,
 			MCapBucket:    alloc.MCapBucket,
 			IndexName:     alloc.IndexName,
@@ -138,7 +140,7 @@ func (g *OrderGenerator) GenerateEntryOrders(
 
 // GenerateSLModify creates an SL modification order for trailing SL update.
 func (g *OrderGenerator) GenerateSLModify(
-	strategy UserStrategy,
+	strategy types.UserStrategy,
 	update SLUpdate,
 ) SLModifyOrder {
 	return SLModifyOrder{
@@ -158,8 +160,8 @@ func (g *OrderGenerator) GenerateSLModify(
 
 // GenerateSLExit creates a sell order when trailing SL is triggered.
 func (g *OrderGenerator) GenerateSLExit(
-	strategy UserStrategy,
-	pos *Position,
+	strategy types.UserStrategy,
+	pos *types.Position,
 	exitPrice, pnl float64,
 ) SLExitOrder {
 	return SLExitOrder{

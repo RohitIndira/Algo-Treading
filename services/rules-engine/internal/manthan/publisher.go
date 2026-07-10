@@ -10,6 +10,8 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
 // ManthanPublisher publishes to all 3 sinks: PostgreSQL, Kafka, Redis.
@@ -483,7 +485,7 @@ func (p *ManthanPublisher) UpdatePositionSL(ctx context.Context, strategyID, sym
 
 // UpdatePortfolioState syncs portfolio summary to DB + Redis.
 // Called after every entry/exit to keep state current.
-func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *Portfolio) {
+func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *types.Portfolio) {
 	// Snapshot all fields we need under a single RLock. Releasing before the
 	// DB + Redis round-trips below keeps the lock window short and avoids
 	// holding it across IO.

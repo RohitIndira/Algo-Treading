@@ -6,25 +6,27 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
 // PortfolioManager manages all users' MANTHAN portfolios.
 // Thread-safe — accessed from both signal consumer and tick handler goroutines.
 type PortfolioManager struct {
 	mu         sync.RWMutex
-	portfolios map[string]*Portfolio // strategyID → portfolio
+	portfolios map[string]*types.Portfolio // strategyID → portfolio
 	logger     *zap.Logger
 }
 
 func NewPortfolioManager(logger *zap.Logger) *PortfolioManager {
 	return &PortfolioManager{
-		portfolios: make(map[string]*Portfolio),
+		portfolios: make(map[string]*types.Portfolio),
 		logger:     logger,
 	}
 }
 
 // GetOrCreate returns the portfolio for a strategy, creating it if needed.
-func (pm *PortfolioManager) GetOrCreate(strategy UserStrategy) *Portfolio {
+func (pm *PortfolioManager) GetOrCreate(strategy types.UserStrategy) *types.Portfolio {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -33,22 +35,22 @@ func (pm *PortfolioManager) GetOrCreate(strategy UserStrategy) *Portfolio {
 		return p
 	}
 
-	p = &Portfolio{
+	p = &types.Portfolio{
 		UserID:         strategy.UserID,
 		StrategyID:     strategy.StrategyID,
 		InitialCapital: strategy.TotalCapital,
 		CurrentCapital: strategy.TotalCapital,
 		MaxPositions:   strategy.MaxPositions,
 		PerStockBase:   strategy.TotalCapital / float64(strategy.MaxPositions),
-		Positions:      make(map[string]*Position),
-		Cooldown:       make(map[string]*CooldownEntry),
+		Positions:      make(map[string]*types.Position),
+		Cooldown:       make(map[string]*types.CooldownEntry),
 	}
 	pm.portfolios[strategy.StrategyID] = p
 	return p
 }
 
 // Get returns a portfolio if it exists.
-func (pm *PortfolioManager) Get(strategyID string) (*Portfolio, bool) {
+func (pm *PortfolioManager) Get(strategyID string) (*types.Portfolio, bool) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	p, ok := pm.portfolios[strategyID]
@@ -63,10 +65,10 @@ func (pm *PortfolioManager) Remove(strategyID string) {
 }
 
 // AllPortfolios returns a snapshot of all portfolios (for tick processing).
-func (pm *PortfolioManager) AllPortfolios() []*Portfolio {
+func (pm *PortfolioManager) AllPortfolios() []*types.Portfolio {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	out := make([]*Portfolio, 0, len(pm.portfolios))
+	out := make([]*types.Portfolio, 0, len(pm.portfolios))
 	for _, p := range pm.portfolios {
 		out = append(out, p)
 	}
@@ -78,7 +80,7 @@ func (pm *PortfolioManager) AllPortfolios() []*Portfolio {
 // slMgr / slPct removed 2026-06-25 (audit finding #3) — SL initialisation
 // happens in ProcessFillEvent once we have the real broker price, so passing
 // the SL machinery here was dead weight that lied about behaviour.
-func (pm *PortfolioManager) AddPosition(strategyID string, alloc AllocationResult) {
+func (pm *PortfolioManager) AddPosition(strategyID string, alloc types.AllocationResult) {
 	pm.mu.RLock()
 	p, ok := pm.portfolios[strategyID]
 	pm.mu.RUnlock()
@@ -86,7 +88,7 @@ func (pm *PortfolioManager) AddPosition(strategyID string, alloc AllocationResul
 		return
 	}
 
-	pos := &Position{
+	pos := &types.Position{
 		Symbol:      alloc.Symbol,
 		ISIN:        alloc.ISIN,
 		Industry:    alloc.Industry,
@@ -96,7 +98,7 @@ func (pm *PortfolioManager) AddPosition(strategyID string, alloc AllocationResul
 		EntryTime:   time.Now(),
 		Quantity:    alloc.Quantity,
 		InvestedAmt: alloc.PerCallActual,
-		State:       StatePendingEntry, // NOT active until fill confirmed
+		State:       types.StatePendingEntry, // NOT active until fill confirmed
 		Active:      false,             // trailing SL disabled until ACTIVE
 	}
 	// Inner write — Mu guards Positions against concurrent external readers
@@ -127,7 +129,7 @@ func (pm *PortfolioManager) ProcessFillEvent(strategyID, symbol string, avgFillP
 	}
 
 	// Idempotency: if already ACTIVE with same or higher qty, skip
-	if pos.State == StateActive && pos.Quantity >= filledQty {
+	if pos.State == types.StateActive && pos.Quantity >= filledQty {
 		return
 	}
 
@@ -138,7 +140,7 @@ func (pm *PortfolioManager) ProcessFillEvent(strategyID, symbol string, avgFillP
 
 	if isFull || filledQty >= expectedQty {
 		// Full fill — activate position, enable SL + trailing
-		pos.State = StateActive
+		pos.State = types.StateActive
 		pos.Active = true
 		slMgr.InitPosition(pos, slPct)
 
@@ -149,7 +151,7 @@ func (pm *PortfolioManager) ProcessFillEvent(strategyID, symbol string, avgFillP
 			zap.Float64("sl", pos.CurrentSL))
 	} else {
 		// Partial fill — update price/qty but keep locked
-		pos.State = StatePartiallyFilled
+		pos.State = types.StatePartiallyFilled
 		pos.Active = false
 
 		pm.logger.Info("Position partially filled — waiting for rest",
@@ -256,7 +258,7 @@ func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice fl
 	}
 
 	// Add to cooldown — stock must correct 20% from ATH before re-entry
-	p.Cooldown[symbol] = &CooldownEntry{
+	p.Cooldown[symbol] = &types.CooldownEntry{
 		Symbol:       symbol,
 		ATHAtExit:    ath,
 		ExitPrice:    exitPrice,
@@ -281,13 +283,13 @@ func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice fl
 // Used by websocket manager to know which ticks to process.
 func (pm *PortfolioManager) ActiveSymbols() map[string]bool {
 	pm.mu.RLock()
-	portfolios := make([]*Portfolio, 0, len(pm.portfolios))
+	portfolios := make([]*types.Portfolio, 0, len(pm.portfolios))
 	for _, p := range pm.portfolios {
 		portfolios = append(portfolios, p)
 	}
 	pm.mu.RUnlock()
 
-	// Inner maps must be read under each Portfolio's own RLock —
+	// Inner maps must be read under each types.Portfolio's own RLock —
 	// pm.mu only protects the outer map, not Positions inside each.
 	syms := make(map[string]bool)
 	for _, p := range portfolios {

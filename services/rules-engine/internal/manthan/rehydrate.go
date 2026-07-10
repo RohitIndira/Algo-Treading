@@ -9,6 +9,8 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
 // StrategyAliveChecker is the subset of user-config gRPC we need for
@@ -44,7 +46,7 @@ type StrategyAliveChecker interface {
 //  3. Evict any `manthan:position:*` Redis key that was NOT seen in step 1
 //     (stale cache from a previous run).
 //
-// strategyByID resolves a strategyID to its UserStrategy; nil return means
+// strategyByID resolves a strategyID to its types.UserStrategy; nil return means
 // orphan. Pass a closure bound to the rules-engine ConfigStore.
 //
 // Returns (restored, orphansCleaned, redisStaleEvicted, err).
@@ -58,7 +60,7 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 	db *sql.DB,
 	rdb *redis.Client,
 	aliveChecker StrategyAliveChecker,
-	strategyByID func(string) *UserStrategy,
+	strategyByID func(string) *types.UserStrategy,
 ) (int, int, int, error) {
 	if db == nil {
 		return 0, 0, 0, nil
@@ -106,7 +108,7 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 		if strategy == nil {
 			// Configstore doesn't show this strategy as Active. Two causes:
 			//   1. Genuine orphan — strategy was soft-deleted while the
-			//      position was ACTIVE. Position should be cleaned up.
+			//      position was ACTIVE. position should be cleaned up.
 			//   2. Startup race — the config consumer is still replaying
 			//      `user-config-events` from FirstOffset. The strategy is
 			//      transiently in Paused (after a DEACTIVATED event, before
@@ -176,11 +178,11 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 		// Live position: restore in-memory portfolio + upsert Redis cache.
 		// The previous implementation took pm.mu (outer) — wrong; that lock
 		// only protects the outer portfolios map. Inner Positions writes
-		// must take the per-Portfolio Mu so concurrent LTPFeed poll +
+		// must take the per-types.Portfolio Mu so concurrent LTPFeed poll +
 		// allocator + fill consumer don't trip the concurrent-map panic.
 		p := pm.GetOrCreate(*strategy)
 		p.Mu.Lock()
-		p.Positions[symbol] = &Position{
+		p.Positions[symbol] = &types.Position{
 			Symbol:         symbol,
 			ISIN:           isin,
 			Industry:       industry,
@@ -193,7 +195,7 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 			HighSinceEntry: high,
 			CurrentSL:      sl,
 			LastTrailLevel: lastTrail,
-			State:          StateActive,
+			State:          types.StateActive,
 			Active:         true,
 		}
 		p.Mu.Unlock()
@@ -290,7 +292,7 @@ func (pm *PortfolioManager) CleanupOrphans(
 	db *sql.DB,
 	rdb *redis.Client,
 	aliveChecker StrategyAliveChecker,
-	strategyByID func(string) *UserStrategy,
+	strategyByID func(string) *types.UserStrategy,
 ) (int, error) {
 	if db == nil {
 		return 0, nil
@@ -345,7 +347,7 @@ func (pm *PortfolioManager) CleanupOrphans(
 
 		// Genuine orphan — also drop from in-memory portfolio if it was
 		// rehydrated earlier. pm.mu (outer) only protects the portfolios
-		// map; the inner Positions delete must take per-Portfolio Mu, same
+		// map; the inner Positions delete must take per-types.Portfolio Mu, same
 		// pattern as the rest of PortfolioManager since 2026-06-25
 		// (commit 73d418d). Race window had been open while the orphan
 		// scanner overlapped the LTP poll on the same map.
@@ -399,7 +401,7 @@ func (pm *PortfolioManager) StartOrphanScanner(
 	db *sql.DB,
 	rdb *redis.Client,
 	aliveChecker StrategyAliveChecker,
-	strategyByID func(string) *UserStrategy,
+	strategyByID func(string) *types.UserStrategy,
 	interval time.Duration,
 ) {
 	if interval <= 0 {

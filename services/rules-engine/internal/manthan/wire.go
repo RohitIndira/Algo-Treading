@@ -23,6 +23,8 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/projector"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
 // Deps is everything Wire needs that lives outside the manthan package.
@@ -95,8 +97,8 @@ type Manthan struct {
 	manthanDB     *sql.DB  // borrowed — main.go owns the lifecycle
 	aliveChecker  StrategyAliveChecker
 	redis         *cache.RedisCache
-	strategyByID  func(strategyID string) *UserStrategy
-	getStrategies func() []UserStrategy
+	strategyByID  func(strategyID string) *types.UserStrategy
+	getStrategies func() []types.UserStrategy
 
 	decisionLogEnabled bool
 }
@@ -181,15 +183,15 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 	slMgr := NewTrailingSLManager(logger)
 
 	// Closures over Store / Redis that the consumer + tick handler need.
-	m.getStrategies = func() []UserStrategy {
+	m.getStrategies = func() []types.UserStrategy {
 		snap := deps.Store.GetSnapshot()
-		var out []UserStrategy
+		var out []types.UserStrategy
 		for _, uv := range snap.ByUser {
 			for _, st := range uv.Active {
 				if st.StrategyType != "MANTHAN" {
 					continue
 				}
-				out = append(out, UserStrategy{
+				out = append(out, types.UserStrategy{
 					StrategyID:    st.StrategyID,
 					UserID:        st.UserID,
 					StrategyName:  st.StrategyName,
@@ -204,7 +206,7 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 		}
 		return out
 	}
-	m.strategyByID = func(sid string) *UserStrategy {
+	m.strategyByID = func(sid string) *types.UserStrategy {
 		for _, s := range m.getStrategies() {
 			if s.StrategyID == sid {
 				s := s
@@ -329,7 +331,7 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 	// MANTHAN strategy is back-filled with today's eligible signals
 	// immediately via the consumer.
 	deps.ConfigConsumer.SetOnManthanCreated(func(ctx context.Context, strategy *models.Strategy) {
-		us := UserStrategy{
+		us := types.UserStrategy{
 			StrategyID:    strategy.StrategyID,
 			UserID:        strategy.UserID,
 			StrategyName:  strategy.StrategyName,

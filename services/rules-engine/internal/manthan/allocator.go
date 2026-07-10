@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
 // Allocator takes eligible ManthanSignals and a user's portfolio, then decides
@@ -81,7 +83,7 @@ func (a *Allocator) isUserOverrideActive(strategyID, symbol string) (bool, time.
 
 // AllocateResult holds the full output of one allocation run.
 type AllocateResult struct {
-	Allocations []AllocationResult
+	Allocations []types.AllocationResult
 	Skipped     []SkipReason
 }
 
@@ -96,8 +98,8 @@ type SkipReason struct {
 // Signals are processed in arrival order (FCFS). Alphabetical tie-break is used
 // only when a position exits and multiple stocks compete for the freed slot.
 func (a *Allocator) Allocate(
-	signals []ManthanSignal,
-	portfolio *Portfolio,
+	signals []types.ManthanSignal,
+	portfolio *types.Portfolio,
 	emaByIndex map[string]float64,
 ) *AllocateResult {
 	result := &AllocateResult{}
@@ -117,7 +119,7 @@ func (a *Allocator) Allocate(
 		return result
 	}
 
-	caps := NewCapCheck(portfolio.MaxPositions, portfolio.Positions)
+	caps := types.NewCapCheck(portfolio.MaxPositions, portfolio.Positions)
 	perCallBase := portfolio.CurrentCapital / float64(portfolio.MaxPositions)
 
 	for _, sig := range signals {
@@ -187,7 +189,7 @@ func (a *Allocator) Allocate(
 		}
 
 		// Adjust entry for transaction cost
-		effectiveEntry := entryPrice * (1 + TotalTxnCostPct())
+		effectiveEntry := entryPrice * (1 + types.TotalTxnCostPct())
 		qty := int32(perCallActual / effectiveEntry)
 		if qty <= 0 {
 			result.Skipped = append(result.Skipped, SkipReason{
@@ -201,7 +203,7 @@ func (a *Allocator) Allocate(
 		// Original (prod): initialSL := entryPrice * 0.80 // 20% below entry
 		initialSL := entryPrice * 0.98 // 2% below entry (TEST)
 
-		alloc := AllocationResult{
+		alloc := types.AllocationResult{
 			Symbol:        sig.Symbol,
 			Industry:      sig.Industry,
 			MCapBucket:    sig.MCapBucket,
@@ -237,13 +239,13 @@ func (a *Allocator) Allocate(
 // SortAlphabetical sorts signals alphabetically by symbol. Used when choosing
 // which stock fills a freed slot after an exit (spec: "consider stocks
 // alphabetically in case any stock exits").
-func SortAlphabetical(signals []ManthanSignal) {
+func SortAlphabetical(signals []types.ManthanSignal) {
 	sort.Slice(signals, func(i, j int) bool {
 		return signals[i].Symbol < signals[j].Symbol
 	})
 }
 
-func countActive(positions map[string]*Position) int {
+func countActive(positions map[string]*types.Position) int {
 	n := 0
 	for _, p := range positions {
 		if p.Active {
