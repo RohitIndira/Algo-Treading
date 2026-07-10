@@ -28,6 +28,7 @@ import (
 
 	indira "github.com/RohitIndira/Algo-Treading/pkg/indira"
 
+	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/store"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/userconfig"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/wss"
@@ -106,15 +107,13 @@ func main() {
 		}
 	}()
 
-	// ── WSS listener (Chunk B) ─────────────────────────────────────────
+	// ── WSS listener (Chunks B + C) ────────────────────────────────────
+	// Pipeline: WSS event → broker_events INSERT → order.events publish
 	brokerEvents := store.NewWriter(db, logger)
+	orderEventsPub := publisher.NewPublisher(kafkaWriter, logger)
 	indiraClient := indira.NewDefaultClient()
-	listener := wss.NewListener(indiraClient, brokerEvents, logger)
+	listener := wss.NewListener(indiraClient, brokerEvents, orderEventsPub, logger)
 	defer listener.Close()
-
-	// silence "declared and not used" during Chunk B — kafkaWriter is used in
-	// Chunk C when we publish order.events on every INSERT.
-	_ = kafkaWriter
 
 	// ── Auth wiring (Chunk B.5): user-config gRPC → subscriptions ──────
 	// Dial user-config with a 10s timeout. Fail fast — orderstatus svc
@@ -172,8 +171,8 @@ func main() {
 		zap.Int("failed", failed))
 
 	logger.Info("orderstatus svc ready",
-		zap.String("chunk", "B.5"),
-		zap.String("next", "Chunk C — publish order.events on every broker_events INSERT"))
+		zap.String("chunk", "C"),
+		zap.String("next", "Chunk D — move reconciler + safety_monitor into this binary"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)

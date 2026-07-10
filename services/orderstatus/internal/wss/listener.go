@@ -24,6 +24,7 @@ import (
 
 	indira "github.com/RohitIndira/Algo-Treading/pkg/indira"
 
+	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/store"
 )
 
@@ -34,6 +35,7 @@ import (
 type Listener struct {
 	httpClient *indira.Client
 	writer     *store.Writer
+	pub        *publisher.Publisher // nil = no Kafka fan-out (dev / test paths)
 	logger     *zap.Logger
 
 	mu       sync.Mutex
@@ -44,10 +46,17 @@ type Listener struct {
 	runningCancel context.CancelFunc
 }
 
-func NewListener(httpClient *indira.Client, writer *store.Writer, logger *zap.Logger) *Listener {
+// NewListener wires the WSS event pipeline:
+//
+//	WSS event → broker_events INSERT (writer) → order.events publish (pub)
+//
+// Passing a nil pub is legal — the listener still persists to broker_events,
+// just skips the Kafka fan-out. Useful for tests or a boot without Kafka.
+func NewListener(httpClient *indira.Client, writer *store.Writer, pub *publisher.Publisher, logger *zap.Logger) *Listener {
 	return &Listener{
 		httpClient: httpClient,
 		writer:     writer,
+		pub:        pub,
 		logger:     logger,
 		subs:       make(map[string]*indira.AuthContext),
 	}
@@ -205,7 +214,12 @@ func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) 
 		zap.String("event_type", string(ev.EventType)),
 		zap.Int64("event_seq", ev.EventSeq))
 
-	// TODO(chunk C): publish to Kafka order.events here.
+	// Fan out to Kafka order.events. Only new events (inserted=true) go here —
+	// dedup at the source means downstream consumers each see every event
+	// exactly once regardless of WSS/REST race conditions.
+	if l.pub != nil {
+		l.pub.Publish(ctx, ev)
+	}
 }
 
 // eventSeqFrom picks the best available deterministic sequence key for
