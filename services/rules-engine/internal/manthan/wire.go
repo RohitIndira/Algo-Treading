@@ -64,8 +64,8 @@ type Deps struct {
 	// this file independent of internal/kafka.
 	ConfigConsumer ConfigConsumerCallbackSetter
 
-	// Feature gates.
-	DecisionLogEnabled   bool
+	// Feature gates. NotificationsEnabled is retained for now but unused since
+	// NotificationPublisher was deleted 2026-07-10 (moves to notification svc).
 	NotificationsEnabled bool
 
 	// External Redis (Indira live LTP feed). Empty Addr disables the feed.
@@ -95,8 +95,6 @@ type Manthan struct {
 	redis         *cache.RedisCache
 	strategyByID  func(strategyID string) *types.UserStrategy
 	getStrategies func() []types.UserStrategy
-
-	decisionLogEnabled bool
 }
 
 // Wire builds the entire Manthan stack from Deps. Sync side-effects
@@ -127,20 +125,17 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 
 	logger := deps.Logger
 	m := &Manthan{
-		logger:             logger,
-		manthanDB:          deps.ManthanDB,
-		redis:              deps.Redis,
-		aliveChecker:       deps.AliveChecker,
-		decisionLogEnabled: deps.DecisionLogEnabled,
+		logger:       logger,
+		manthanDB:    deps.ManthanDB,
+		redis:        deps.Redis,
+		aliveChecker: deps.AliveChecker,
 	}
 
-	// Publisher — trade-signals + portfolio.allocations + Postgres writes
-	// for the CQRS decisions table when the flag is on.
+	// Publisher — trade-signals + portfolio.allocations + signal_decisions audit.
 	m.publisher = NewManthanPublisher(ManthanPublisherConfig{
-		DB:                 deps.ManthanDB,
-		Redis:              deps.Redis.Client(),
-		KafkaBrokers:       deps.KafkaBrokers,
-		DecisionLogEnabled: deps.DecisionLogEnabled,
+		DB:           deps.ManthanDB,
+		Redis:        deps.Redis.Client(),
+		KafkaBrokers: deps.KafkaBrokers,
 	}, logger)
 
 	// Signals DB — separate Postgres connection because manthan_signals

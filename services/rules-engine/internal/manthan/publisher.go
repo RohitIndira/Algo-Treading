@@ -14,57 +14,47 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
-// ManthanPublisher publishes to all 3 sinks: PostgreSQL, Kafka, Redis.
+// ManthanPublisher publishes rules-engine's signals to the world.
 //
-// Kafka topics:
-//   - trade-signals          → entry/exit orders (consumed by trade-execution)
+// Kafka topics (both stay in rules-engine, per docs/rules_engine_refactor.md §4.5):
+//   - trade-signals          → entry/SL-modify/exit orders (consumed by trade-execution)
 //   - portfolio.allocations  → portfolio state changes (consumed by frontend/monitoring)
 //
-// Redis keys:
-//   - manthan:portfolio:{strategy_id}        → current portfolio JSON snapshot
-//   - manthan:position:{strategy_id}:{symbol} → individual position state
-//   - manthan:positions:active                → set of all active {strategy_id}:{symbol}
+// Postgres writes (audit / outbox only):
+//   - manthan_signal_decisions — INSERT one row per signal fired, then
+//     UPDATE dispatched_at after Kafka ACK (transactional outbox pattern).
+//     Row content differs by signal_type:
+//       ENTRY_BUY   — allocator entry decision (existing columns populated)
+//       SL_MODIFY   — trailing SL ratchet (payload JSONB)
+//       EXIT_TSL    — TSL crossed → exit (payload JSONB)
+//   - manthan_portfolio_state  — LEGACY UpdatePortfolioState still called from
+//     consumer.go on batch end. Belongs to portfolio svc long-term; stays here
+//     as a stub until that service exists.
 //
-// PostgreSQL tables:
-//   - manthan_positions        → per-position lifecycle (entry → SL trail → exit)
-//   - manthan_portfolio_state  → portfolio-level summary (capital, P&L)
-//   - manthan_cooldown         → re-entry cooldown tracking
-//   - manthan_signal_decisions → intent log (when DecisionLogEnabled=true)
-//
-// Decision-log mode (DecisionLogEnabled=true):
-//   On entry, writes manthan_signal_decisions (status=PROPOSED) instead of
-//   manthan_positions. Status flips to DISPATCHED after Kafka publish to
-//   trade-signals succeeds. The CONFIRMED/REJECTED transitions are owned by
-//   FillConsumer reacting to broker events. This makes "ghost positions"
-//   (DB row written but broker rejected/never placed) impossible.
-//
-//   When false (default), preserves legacy optimistic write to
-//   manthan_positions for safe rollout.
+// What this file NO LONGER does (deleted 2026-07-10 with the projector):
+//   - Write manthan_positions (positions svc will own; nobody writes it today)
+//   - Write manthan_position_events (positions svc)
+//   - Update Redis :position: keys (positions svc will own)
+//   - Notify users (moves to notification svc)
 type ManthanPublisher struct {
-	db                 *sql.DB
-	rdb                *redis.Client
-	tradeWriter        *kafka.Writer // trade-signals topic
-	portfolioWriter    *kafka.Writer // portfolio.allocations topic
-	logger             *zap.Logger
-	decisionLogEnabled bool
+	db              *sql.DB
+	rdb             *redis.Client
+	tradeWriter     *kafka.Writer // trade-signals topic
+	portfolioWriter *kafka.Writer // portfolio.allocations topic
+	logger          *zap.Logger
 }
 
 type ManthanPublisherConfig struct {
-	DB                 *sql.DB
-	Redis              *redis.Client
-	KafkaBrokers       []string
-	DecisionLogEnabled bool // gate for new manthan_signal_decisions write path
+	DB           *sql.DB
+	Redis        *redis.Client
+	KafkaBrokers []string
 }
 
 func NewManthanPublisher(cfg ManthanPublisherConfig, logger *zap.Logger) *ManthanPublisher {
 	p := &ManthanPublisher{
-		db:                 cfg.DB,
-		rdb:                cfg.Redis,
-		logger:             logger,
-		decisionLogEnabled: cfg.DecisionLogEnabled,
-	}
-	if cfg.DecisionLogEnabled {
-		logger.Info("Manthan decision-log mode ENABLED — writing manthan_signal_decisions on entry (skip optimistic manthan_positions write)")
+		db:     cfg.DB,
+		rdb:    cfg.Redis,
+		logger: logger,
 	}
 
 	if len(cfg.KafkaBrokers) > 0 && cfg.KafkaBrokers[0] != "" {
@@ -99,25 +89,27 @@ func (p *ManthanPublisher) Close() {
 	}
 }
 
-// --- OrderPublisher interface implementation ---
+// ────────────────────────────────────────────────────────────────────
+// Entry — signal_type='ENTRY_BUY'
+// ────────────────────────────────────────────────────────────────────
 
+// PublishEntryOrder fires a MANTHAN entry signal:
+//  1. INSERT signal_decisions row with status='PROPOSED' (outbox)
+//  2. Publish to Kafka trade-signals
+//  3. On Kafka ACK: UPDATE status='DISPATCHED', dispatched_at=NOW()
+//  4. Publish to Kafka portfolio.allocations (best-effort)
+//
+// Startup recovery: rows stuck at PROPOSED with no dispatched_at get
+// republished by the recovery worker (to be added; deferred until stale
+// rows become a real problem).
 func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanOrder) error {
-	// 1. DB write — branch by mode.
-	//    decisionLogEnabled=false → legacy optimistic write to manthan_positions
-	//    decisionLogEnabled=true  → write manthan_signal_decisions (PROPOSED)
-	//                               manthan_positions stays empty until broker fills
+	// 1. Audit INSERT (status='PROPOSED') — outbox row.
 	if p.db != nil {
-		if p.decisionLogEnabled {
-			if err := p.dbInsertDecision(ctx, order); err != nil {
-				p.logger.Error("DB insert signal_decision failed",
-					zap.String("symbol", order.Symbol),
-					zap.String("signal_id", order.OrderID),
-					zap.Error(err))
-			}
-		} else {
-			if err := p.dbInsertPosition(ctx, order); err != nil {
-				p.logger.Error("DB insert position failed", zap.String("symbol", order.Symbol), zap.Error(err))
-			}
+		if err := p.dbInsertEntryDecision(ctx, order); err != nil {
+			p.logger.Error("PublishEntryOrder: signal_decisions INSERT failed",
+				zap.String("symbol", order.Symbol),
+				zap.String("signal_id", order.OrderID),
+				zap.Error(err))
 		}
 	}
 
@@ -134,6 +126,7 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 				{Key: "strategy_id", Value: []byte(order.StrategyID)},
 				{Key: "symbol", Value: []byte(order.Symbol)},
 				{Key: "signal_id", Value: []byte(order.OrderID)},
+				{Key: "signal_type", Value: []byte("ENTRY_BUY")},
 			},
 		}); err != nil {
 			p.logger.Error("Kafka trade-signals publish failed", zap.Error(err))
@@ -142,20 +135,16 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 		}
 	}
 
-	// 2b. Flip decision PROPOSED → DISPATCHED only after Kafka publish succeeds.
-	//     If Kafka failed, the decision stays PROPOSED so the reaper or a retry
-	//     can pick it up. We never lie about dispatch state.
-	if p.decisionLogEnabled && p.db != nil && kafkaOK {
+	// 3. Mark DISPATCHED after Kafka ACK. If Kafka failed, stays PROPOSED for
+	//    retry by a future recovery worker.
+	if p.db != nil && kafkaOK {
 		if err := p.markDecisionDispatched(ctx, order.OrderID); err != nil {
-			p.logger.Warn("Mark decision DISPATCHED failed (will reconcile on next event)",
+			p.logger.Warn("PublishEntryOrder: mark DISPATCHED failed",
 				zap.String("signal_id", order.OrderID), zap.Error(err))
 		}
 	}
 
-	// 3. Kafka — portfolio.allocations (best-effort notification topic for
-	// the frontend WS; failure should NOT bubble up to the caller, but
-	// silent drops during a Kafka outage mean the frontend stops updating
-	// with no log signal).
+	// 4. Kafka — portfolio.allocations (best-effort, feeds frontend)
 	if p.portfolioWriter != nil {
 		event := map[string]any{
 			"type":        "POSITION_OPENED",
@@ -182,57 +171,33 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 		}
 	}
 
-	// 4. Redis — position state + active set
-	if p.rdb != nil {
-		posKey := fmt.Sprintf("manthan:position:%s:%s", order.StrategyID, order.Symbol)
-		setMember := fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)
-		posData, _ := json.Marshal(map[string]any{
-			"symbol":       order.Symbol,
-			"entry_price":  order.EntryPrice,
-			"quantity":     order.Quantity,
-			"invested":     order.InvestedAmt,
-			"stop_loss":    order.StopLoss,
-			"high":         order.EntryPrice,
-			"status":       "ACTIVE",
-			"entry_time":   order.Timestamp.Format(time.RFC3339),
-			"industry":     order.Industry,
-			"mcap_bucket":  order.MCapBucket,
-			"ema_pct":      order.EMAAllocPct,
-			"trading_mode": order.TradingMode,
-		})
-		if err := p.rdb.Set(ctx, posKey, posData, 30*24*time.Hour).Err(); err != nil {
-			p.logger.Warn("PublishEntryOrder: Redis Set failed",
-				zap.String("key", posKey), zap.Error(err))
-		}
-		if err := p.rdb.SAdd(ctx, "manthan:positions:active", setMember).Err(); err != nil {
-			p.logger.Warn("PublishEntryOrder: Redis SAdd (active set) failed",
-				zap.String("member", setMember), zap.Error(err))
-		}
-	}
-
 	return nil
 }
 
+// ────────────────────────────────────────────────────────────────────
+// SL modify — signal_type='SL_MODIFY'
+// ────────────────────────────────────────────────────────────────────
+
+// PublishSLModify fires a trailing SL ratchet signal:
+//  1. INSERT audit row (signal_type='SL_MODIFY', parent = the entry signal)
+//  2. Publish Kafka trade-signals so trade-execution modifies the broker SL
+//  3. On Kafka ACK: UPDATE dispatched_at
+//  4. Publish portfolio.allocations (best-effort notification)
+//
+// No more manthan_positions UPDATE (was here — moves to positions svc).
 func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOrder) error {
-	// 1. DB — update position SL (LEGACY path; the CQRS projector owns this
-	// when DecisionLogEnabled=true). Silent failure here meant DB.current_sl
-	// drifted from the broker truth and the next trail recomputation could
-	// LOWER the stop.
+	// 1. Audit
 	if p.db != nil {
-		if _, err := p.db.ExecContext(ctx, `
-			UPDATE manthan_positions
-			SET current_sl = $1, high_since_entry = $2, last_trail_level = $2, updated_at = NOW()
-			WHERE strategy_id = $3 AND symbol = $4 AND status = 'ACTIVE'`,
-			order.NewSL, order.NewHigh, order.StrategyID, order.Symbol); err != nil {
-			p.logger.Warn("PublishSLModify: DB update failed",
+		if err := p.dbInsertSLModifyDecision(ctx, order); err != nil {
+			p.logger.Warn("PublishSLModify: signal_decisions INSERT failed",
 				zap.String("symbol", order.Symbol),
-				zap.Float64("new_sl", order.NewSL), zap.Error(err))
+				zap.String("signal_id", order.OrderID),
+				zap.Error(err))
 		}
 	}
 
-	// 2. Kafka — trade-signals (SL modify). CRITICAL outbound: this is what
-	// drives trade-execution to update the broker SL. Silent failure here
-	// was the worst class — rules-engine THINKS it told the broker, but didn't.
+	// 2. Kafka — trade-signals (critical: without this, broker SL never updates)
+	kafkaOK := false
 	if p.tradeWriter != nil {
 		body, _ := json.Marshal(order)
 		if err := p.tradeWriter.WriteMessages(ctx, kafka.Message{
@@ -242,16 +207,28 @@ func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOr
 				{Key: "order_type", Value: []byte("MANTHAN_SL_MODIFY")},
 				{Key: "user_id", Value: []byte(order.UserID)},
 				{Key: "symbol", Value: []byte(order.Symbol)},
+				{Key: "signal_id", Value: []byte(order.OrderID)},
+				{Key: "signal_type", Value: []byte("SL_MODIFY")},
 			},
 		}); err != nil {
-			p.logger.Error("PublishSLModify: Kafka trade-signals publish failed (broker SL NOT updated)",
+			p.logger.Error("PublishSLModify: Kafka publish failed (broker SL NOT updated)",
 				zap.String("symbol", order.Symbol),
 				zap.String("order_id", order.OrderID),
 				zap.Float64("new_sl", order.NewSL), zap.Error(err))
+		} else {
+			kafkaOK = true
 		}
 	}
 
-	// 3. Kafka — portfolio.allocations (best-effort notification)
+	// 3. Mark DISPATCHED
+	if p.db != nil && kafkaOK {
+		if err := p.markDecisionDispatched(ctx, order.OrderID); err != nil {
+			p.logger.Warn("PublishSLModify: mark DISPATCHED failed",
+				zap.String("signal_id", order.OrderID), zap.Error(err))
+		}
+	}
+
+	// 4. Kafka — portfolio.allocations
 	if p.portfolioWriter != nil {
 		event := map[string]any{
 			"type":        "SL_MODIFIED",
@@ -273,48 +250,34 @@ func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOr
 		}
 	}
 
-	// 4. Redis — update position
-	if p.rdb != nil {
-		posKey := fmt.Sprintf("manthan:position:%s:%s", order.StrategyID, order.Symbol)
-		existing, err := p.rdb.Get(ctx, posKey).Bytes()
-		if err == nil {
-			var pos map[string]any
-			if json.Unmarshal(existing, &pos) == nil {
-				pos["stop_loss"] = order.NewSL
-				pos["high"] = order.NewHigh
-				updated, _ := json.Marshal(pos)
-				if err := p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour).Err(); err != nil {
-					p.logger.Warn("PublishSLModify: Redis Set failed",
-						zap.String("key", posKey), zap.Error(err))
-				}
-			}
-		}
-	}
-
 	return nil
 }
 
+// ────────────────────────────────────────────────────────────────────
+// SL exit (TSL crossed) — signal_type='EXIT_TSL'
+// ────────────────────────────────────────────────────────────────────
+
+// PublishSLExit fires a TSL-triggered exit signal:
+//  1. INSERT audit row (signal_type='EXIT_TSL', parent = the entry signal)
+//  2. Publish Kafka trade-signals so trade-execution places the broker sell
+//  3. On Kafka ACK: UPDATE dispatched_at
+//  4. Publish portfolio.allocations (best-effort notification)
+//
+// No more manthan_positions UPDATE (was here — moves to positions svc).
+// No more Redis cache mutation (moves to positions svc).
 func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder) error {
-	// 1. DB — mark position exited (LEGACY path). Silent failure here meant
-	// the row stayed ACTIVE in DB → next restart, rehydrate brings the
-	// position back to memory as ACTIVE → ghost position the broker has
-	// already closed.
+	// 1. Audit
 	if p.db != nil {
-		if _, err := p.db.ExecContext(ctx, `
-			UPDATE manthan_positions
-			SET status = 'EXITED', exit_price = $1, realized_pnl = $2,
-			    exit_reason = 'SL_TRIGGERED', exit_time = NOW(), updated_at = NOW()
-			WHERE strategy_id = $3 AND symbol = $4 AND status = 'ACTIVE'`,
-			order.ExitPrice, order.PnL, order.StrategyID, order.Symbol); err != nil {
-			p.logger.Warn("PublishSLExit: DB update failed",
+		if err := p.dbInsertExitDecision(ctx, order); err != nil {
+			p.logger.Warn("PublishSLExit: signal_decisions INSERT failed",
 				zap.String("symbol", order.Symbol),
-				zap.Float64("exit_price", order.ExitPrice), zap.Error(err))
+				zap.String("signal_id", order.OrderID),
+				zap.Error(err))
 		}
 	}
 
-	// 2. Kafka — trade-signals (sell order). CRITICAL outbound: this is what
-	// drives trade-execution to actually exit at the broker. Silent failure
-	// would leave the position open with rules-engine thinking it's closed.
+	// 2. Kafka — trade-signals (critical)
+	kafkaOK := false
 	if p.tradeWriter != nil {
 		body, _ := json.Marshal(order)
 		if err := p.tradeWriter.WriteMessages(ctx, kafka.Message{
@@ -324,15 +287,27 @@ func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder)
 				{Key: "order_type", Value: []byte("MANTHAN_SL_EXIT")},
 				{Key: "user_id", Value: []byte(order.UserID)},
 				{Key: "symbol", Value: []byte(order.Symbol)},
+				{Key: "signal_id", Value: []byte(order.OrderID)},
+				{Key: "signal_type", Value: []byte("EXIT_TSL")},
 			},
 		}); err != nil {
-			p.logger.Error("PublishSLExit: Kafka trade-signals publish failed (broker NOT notified to exit)",
+			p.logger.Error("PublishSLExit: Kafka publish failed (broker NOT notified to exit)",
 				zap.String("symbol", order.Symbol),
 				zap.String("order_id", order.OrderID), zap.Error(err))
+		} else {
+			kafkaOK = true
 		}
 	}
 
-	// 3. Kafka — portfolio.allocations (best-effort notification)
+	// 3. Mark DISPATCHED
+	if p.db != nil && kafkaOK {
+		if err := p.markDecisionDispatched(ctx, order.OrderID); err != nil {
+			p.logger.Warn("PublishSLExit: mark DISPATCHED failed",
+				zap.String("signal_id", order.OrderID), zap.Error(err))
+		}
+	}
+
+	// 4. Kafka — portfolio.allocations
 	if p.portfolioWriter != nil {
 		event := map[string]any{
 			"type":        "POSITION_EXITED",
@@ -355,140 +330,20 @@ func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder)
 		}
 	}
 
-	// 4. Redis — remove from active, update position
-	if p.rdb != nil {
-		member := fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)
-		if err := p.rdb.SRem(ctx, "manthan:positions:active", member).Err(); err != nil {
-			p.logger.Warn("PublishSLExit: Redis SRem failed",
-				zap.String("member", member), zap.Error(err))
-		}
-
-		posKey := fmt.Sprintf("manthan:position:%s:%s", order.StrategyID, order.Symbol)
-		posData, _ := json.Marshal(map[string]any{
-			"symbol":     order.Symbol,
-			"status":     "EXITED",
-			"exit_price": order.ExitPrice,
-			"pnl":        order.PnL,
-			"sl_price":   order.SLPrice,
-			"exit_time":  time.Now().UTC().Format(time.RFC3339),
-		})
-		if err := p.rdb.Set(ctx, posKey, posData, 7*24*time.Hour).Err(); err != nil {
-			p.logger.Warn("PublishSLExit: Redis Set failed",
-				zap.String("key", posKey), zap.Error(err))
-		}
-	}
-
 	return nil
 }
 
-// UpdatePositionFill reconciles the manthan_positions row and Redis cache with
-// the actual broker fill price after a FILL_CONFIRMED event. Called from
-// FillConsumer AFTER PortfolioManager.ProcessFillEvent has updated in-memory
-// state — this persists that update so a rules-engine restart rehydrates the
-// real price (not the optimistic LTP-at-signal-time).
-//
-// Also recalculates current_sl from the real fill price (previously computed
-// from optimistic entry). high_since_entry and last_trail_level are reset to
-// the real fill price since trailing starts from there.
-func (p *ManthanPublisher) UpdatePositionFill(ctx context.Context, strategyID, symbol string, fillPrice float64, filledQty int32, slPrice float64) {
-	invested := fillPrice * float64(filledQty)
-
-	if p.db != nil {
-		_, err := p.db.ExecContext(ctx, `
-			UPDATE manthan_positions
-			SET entry_price      = $1,
-			    invested_amt     = $2,
-			    current_sl       = $3,
-			    high_since_entry = $1,
-			    last_trail_level = $1,
-			    quantity         = $4,
-			    updated_at       = NOW()
-			WHERE strategy_id = $5 AND symbol = $6 AND status = 'ACTIVE'`,
-			fillPrice, invested, slPrice, filledQty, strategyID, symbol)
-		if err != nil {
-			p.logger.Warn("UpdatePositionFill DB update failed",
-				zap.String("strategy_id", strategyID),
-				zap.String("symbol", symbol), zap.Error(err))
-		}
-	}
-
-	if p.rdb != nil {
-		posKey := fmt.Sprintf("manthan:position:%s:%s", strategyID, symbol)
-		existing, err := p.rdb.Get(ctx, posKey).Bytes()
-		if err == nil {
-			var pos map[string]any
-			if json.Unmarshal(existing, &pos) == nil {
-				pos["entry_price"] = fillPrice
-				pos["invested"] = invested
-				pos["stop_loss"] = slPrice
-				pos["high"] = fillPrice
-				pos["quantity"] = filledQty
-				updated, _ := json.Marshal(pos)
-				if err := p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour).Err(); err != nil {
-					p.logger.Warn("UpdatePositionFill: Redis Set failed",
-						zap.String("key", posKey), zap.Error(err))
-				}
-			}
-		}
-	}
-}
-
-// UpdatePositionSL writes the broker's actual SL trigger price back to
-// manthan_positions and the Redis cache. Called from FillConsumer when a
-// SL_PLACED or SL_MODIFIED event arrives. Only used in LEGACY mode — when
-// the CQRS projector is enabled it owns the manthan_positions update via
-// its transactional path (see position_projector.go SL_PLACED / SL_MODIFIED).
-//
-// Critical for the trailing-SL contract: without this, the broker may have
-// DPR-clamped our initial SL to a tighter trigger (e.g. requested 332.56 →
-// accepted 390), but manthan_positions.current_sl still shows our requested
-// value. Subsequent trail math computed off the stale DB row would emit
-// SL_MODIFY signals BELOW the broker's actual trigger — lowering the stop.
-//
-// Idempotent: same trigger arriving twice produces an identical UPDATE.
-// `WHERE status='ACTIVE'` filters out racing EXIT updates.
-func (p *ManthanPublisher) UpdatePositionSL(ctx context.Context, strategyID, symbol string, brokerTrigger float64) {
-	if brokerTrigger <= 0 {
-		return
-	}
-	if p.db != nil {
-		if _, err := p.db.ExecContext(ctx, `
-			UPDATE manthan_positions
-			SET current_sl = $1, updated_at = NOW()
-			WHERE strategy_id = $2 AND symbol = $3 AND status = 'ACTIVE'`,
-			brokerTrigger, strategyID, symbol); err != nil {
-			p.logger.Warn("UpdatePositionSL DB update failed",
-				zap.String("strategy_id", strategyID),
-				zap.String("symbol", symbol),
-				zap.Float64("trigger", brokerTrigger),
-				zap.Error(err))
-		}
-	}
-
-	if p.rdb != nil {
-		posKey := fmt.Sprintf("manthan:position:%s:%s", strategyID, symbol)
-		existing, err := p.rdb.Get(ctx, posKey).Bytes()
-		if err == nil {
-			var pos map[string]any
-			if json.Unmarshal(existing, &pos) == nil {
-				pos["stop_loss"] = brokerTrigger
-				if updated, mErr := json.Marshal(pos); mErr == nil {
-					if err := p.rdb.Set(ctx, posKey, updated, 30*24*time.Hour).Err(); err != nil {
-						p.logger.Warn("UpdatePositionSL: Redis Set failed",
-							zap.String("key", posKey), zap.Error(err))
-					}
-				}
-			}
-		}
-	}
-}
+// ────────────────────────────────────────────────────────────────────
+// Portfolio state (legacy — belongs to portfolio svc)
+// ────────────────────────────────────────────────────────────────────
 
 // UpdatePortfolioState syncs portfolio summary to DB + Redis.
-// Called after every entry/exit to keep state current.
+// Called from consumer.go after every batch of entries.
+//
+// STAYS as legacy until portfolio svc exists (per plan §4.5). At that point
+// this method + manthan_portfolio_state table become portfolio svc's job.
 func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *types.Portfolio) {
-	// Snapshot all fields we need under a single RLock. Releasing before the
-	// DB + Redis round-trips below keeps the lock window short and avoids
-	// holding it across IO.
+	// Snapshot fields under a single RLock — keeps window short, no I/O held.
 	portfolio.Mu.RLock()
 	activeCount := 0
 	for _, pos := range portfolio.Positions {
@@ -504,7 +359,6 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 	perStockBase := portfolio.PerStockBase
 	portfolio.Mu.RUnlock()
 
-	// DB
 	if p.db != nil {
 		if _, err := p.db.ExecContext(ctx, `
 			INSERT INTO manthan_portfolio_state
@@ -523,7 +377,6 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 		}
 	}
 
-	// Redis
 	if p.rdb != nil {
 		key := fmt.Sprintf("manthan:portfolio:%s", strategyID)
 		data, _ := json.Marshal(map[string]any{
@@ -543,35 +396,22 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 	}
 }
 
-func (p *ManthanPublisher) dbInsertPosition(ctx context.Context, order ManthanOrder) error {
-	_, err := p.db.ExecContext(ctx, `
-		INSERT INTO manthan_positions (
-			strategy_id, user_id, symbol, isin, industry, mcap_bucket, index_name,
-			entry_price, quantity, invested_amt, ema_alloc_pct,
-			high_since_entry, current_sl, last_trail_level, status
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'ACTIVE')`,
-		order.StrategyID, order.UserID, order.Symbol, order.ISIN,
-		order.Industry, order.MCapBucket, order.IndexName,
-		order.EntryPrice, order.Quantity, order.InvestedAmt, order.EMAAllocPct/100,
-		order.EntryPrice, order.StopLoss, order.EntryPrice)
-	return err
-}
+// ────────────────────────────────────────────────────────────────────
+// signal_decisions writers (per signal_type)
+// ────────────────────────────────────────────────────────────────────
 
-// dbInsertDecision records the entry intent in manthan_signal_decisions with
-// status='PROPOSED'. Used when DecisionLogEnabled=true. The signal_id is the
-// order's server-generated UUID (also the Kafka message key, so trade-execution
-// can echo it back on every broker event for idempotent reconciliation).
-//
-// ON CONFLICT DO NOTHING makes this safe under accidental retry: if the same
-// signal_id is inserted twice (e.g. catch-up + live consumer race), the second
-// INSERT is a no-op rather than a constraint violation that aborts the tx.
-func (p *ManthanPublisher) dbInsertDecision(ctx context.Context, order ManthanOrder) error {
+// dbInsertEntryDecision writes the ENTRY_BUY row. Existing columns are used
+// (ltp_at_decision / intended_qty / intended_invested / initial_sl_target)
+// per the schema; payload is NULL for entries because those columns exist.
+// ON CONFLICT DO NOTHING is safe under retry.
+func (p *ManthanPublisher) dbInsertEntryDecision(ctx context.Context, order ManthanOrder) error {
 	_, err := p.db.ExecContext(ctx, `
 		INSERT INTO manthan_signal_decisions (
 			signal_id, user_id, strategy_id, symbol, isin,
+			signal_type,
 			ltp_at_decision, ema_alloc_pct, intended_qty, intended_invested,
 			initial_sl_target, industry, mcap_bucket, index_name, status
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'PROPOSED')
+		) VALUES ($1,$2,$3,$4,$5,'ENTRY_BUY',$6,$7,$8,$9,$10,$11,$12,$13,'PROPOSED')
 		ON CONFLICT (signal_id) DO NOTHING`,
 		order.OrderID, order.UserID, order.StrategyID, order.Symbol, order.ISIN,
 		order.EntryPrice, order.EMAAllocPct/100, order.Quantity, order.InvestedAmt,
@@ -579,10 +419,65 @@ func (p *ManthanPublisher) dbInsertDecision(ctx context.Context, order ManthanOr
 	return err
 }
 
-// markDecisionDispatched flips PROPOSED → DISPATCHED after the Kafka publish
-// to trade-signals succeeded. We use a guarded UPDATE (only flip from
-// PROPOSED) so a late call after the FillConsumer has already set CONFIRMED
-// won't regress the status.
+// dbInsertSLModifyDecision writes the SL_MODIFY row. Entry-specific columns
+// are left NULL (allowed by migration 009's chk_msd_entry_fields_required);
+// type-specific fields live in payload JSONB. Parent signal_id is resolved
+// via lookupParentSignalID.
+func (p *ManthanPublisher) dbInsertSLModifyDecision(ctx context.Context, order SLModifyOrder) error {
+	parentID, err := p.lookupParentSignalID(ctx, order.StrategyID, order.Symbol)
+	if err != nil {
+		// Best-effort: log and continue with NULL parent. The audit row still
+		// gets written so we have a record that we fired SL_MODIFY.
+		p.logger.Debug("dbInsertSLModifyDecision: parent lookup failed",
+			zap.String("symbol", order.Symbol), zap.Error(err))
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"new_sl":   order.NewSL,
+		"old_sl":   order.OldSL,
+		"new_high": order.NewHigh,
+	})
+
+	_, err = p.db.ExecContext(ctx, `
+		INSERT INTO manthan_signal_decisions (
+			signal_id, user_id, strategy_id, symbol,
+			signal_type, parent_signal_id, payload, status
+		) VALUES ($1,$2,$3,$4,'SL_MODIFY',$5,$6,'PROPOSED')
+		ON CONFLICT (signal_id) DO NOTHING`,
+		order.OrderID, order.UserID, order.StrategyID, order.Symbol,
+		nullableID(parentID), payload)
+	return err
+}
+
+// dbInsertExitDecision writes the EXIT_TSL row. Same pattern as SL_MODIFY.
+func (p *ManthanPublisher) dbInsertExitDecision(ctx context.Context, order SLExitOrder) error {
+	parentID, err := p.lookupParentSignalID(ctx, order.StrategyID, order.Symbol)
+	if err != nil {
+		p.logger.Debug("dbInsertExitDecision: parent lookup failed",
+			zap.String("symbol", order.Symbol), zap.Error(err))
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"exit_price": order.ExitPrice,
+		"sl_price":   order.SLPrice,
+		"pnl":        order.PnL,
+		"quantity":   order.Quantity,
+	})
+
+	_, err = p.db.ExecContext(ctx, `
+		INSERT INTO manthan_signal_decisions (
+			signal_id, user_id, strategy_id, symbol,
+			signal_type, parent_signal_id, payload, status
+		) VALUES ($1,$2,$3,$4,'EXIT_TSL',$5,$6,'PROPOSED')
+		ON CONFLICT (signal_id) DO NOTHING`,
+		order.OrderID, order.UserID, order.StrategyID, order.Symbol,
+		nullableID(parentID), payload)
+	return err
+}
+
+// markDecisionDispatched flips PROPOSED → DISPATCHED after Kafka ACK.
+// Guarded UPDATE — only flips from PROPOSED, so a late call after positions
+// svc has moved the row further (CONFIRMED etc) won't regress.
 func (p *ManthanPublisher) markDecisionDispatched(ctx context.Context, signalID string) error {
 	_, err := p.db.ExecContext(ctx, `
 		UPDATE manthan_signal_decisions
@@ -590,4 +485,33 @@ func (p *ManthanPublisher) markDecisionDispatched(ctx context.Context, signalID 
 		WHERE signal_id = $1 AND status = 'PROPOSED'`,
 		signalID)
 	return err
+}
+
+// lookupParentSignalID finds the entry signal for (strategy_id, symbol).
+// Returns the most recent DISPATCHED / CONFIRMED / PARTIAL ENTRY_BUY row.
+// Returns empty string + nil error if none found (legacy positions pre-schema
+// don't have decisions rows; those SL_MODIFY / EXIT_TSL rows get NULL parent).
+func (p *ManthanPublisher) lookupParentSignalID(ctx context.Context, strategyID, symbol string) (string, error) {
+	var parentID string
+	err := p.db.QueryRowContext(ctx, `
+		SELECT signal_id
+		FROM manthan_signal_decisions
+		WHERE strategy_id = $1
+		  AND symbol = $2
+		  AND signal_type = 'ENTRY_BUY'
+		  AND status IN ('DISPATCHED','CONFIRMED','PARTIAL')
+		ORDER BY decided_at DESC
+		LIMIT 1`, strategyID, symbol).Scan(&parentID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return parentID, err
+}
+
+// nullableID converts empty string to sql.NullString for FK-nullable columns.
+func nullableID(id string) sql.NullString {
+	if id == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: id, Valid: true}
 }

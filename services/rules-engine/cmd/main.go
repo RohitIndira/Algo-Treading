@@ -152,7 +152,6 @@ func main() {
 		Store:                store,
 		AliveChecker:         ucClient,
 		ConfigConsumer:       configConsumer,
-		DecisionLogEnabled:   os.Getenv("MANTHAN_DECISION_LOG_ENABLED") == "true",
 		NotificationsEnabled: os.Getenv("MANTHAN_NOTIFICATIONS_ENABLED") == "true",
 		ExtRedisAddr:         os.Getenv("EXT_REDIS_ADDR"),
 		ExtRedisPassword:     os.Getenv("EXT_REDIS_PASSWORD"),
