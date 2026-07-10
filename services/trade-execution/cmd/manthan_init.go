@@ -18,19 +18,20 @@ import (
 
 // ManthanModule holds all Manthan order execution components.
 type ManthanModule struct {
-	SignalConsumer    *manthan.SignalConsumer
-	SafetyMonitor     *manthan.SafetyMonitor
-	Reconciler        *manthan.Reconciler
-	Recovery          *manthan.Recovery
-	WSSBridge         *manthan.WSSBridge
-	EntryHandler      *manthan.EntryHandler
-	SLHandler         *manthan.SLHandler
-	BrokerAdapter     *manthan.BrokerAdapter
-	ExternalDetector  *manthan.ExternalActivityDetector // nil when disabled
-	ProtectiveReplay  *manthan.ProtectiveReplay         // custom-GTC AMO replayer
-	JWTNotifier       *manthan.JWTExpiryNotifier        // pre-open JWT-expiry alerts
-	InboxWorker       *manthan.InboxWorker              // drains signal_inbox (transactional inbox)
-	ArmRetryWorker    *manthan.ArmRetryWorker           // Layer 4: drains manthan_arm_retries on re-login
+	SignalConsumer      *manthan.SignalConsumer
+	SafetyMonitor       *manthan.SafetyMonitor
+	Reconciler          *manthan.Reconciler
+	Recovery            *manthan.Recovery
+	WSSBridge           *manthan.WSSBridge
+	EntryHandler        *manthan.EntryHandler
+	SLHandler           *manthan.SLHandler
+	BrokerAdapter       *manthan.BrokerAdapter
+	ExternalDetector    *manthan.ExternalActivityDetector  // nil when disabled
+	ProtectiveReplay    *manthan.ProtectiveReplay          // custom-GTC AMO replayer
+	JWTNotifier         *manthan.JWTExpiryNotifier         // pre-open JWT-expiry alerts
+	InboxWorker         *manthan.InboxWorker               // drains signal_inbox (transactional inbox)
+	ArmRetryWorker      *manthan.ArmRetryWorker            // Layer 4: drains manthan_arm_retries on re-login
+	OrderEventsConsumer *manthan.OrderEventsConsumer       // Kafka reader for order.events from orderstatus svc (Chunk E)
 }
 
 // InitManthan initializes all Manthan order execution components.
@@ -127,6 +128,17 @@ func InitManthan(
 			})
 		})
 	}
+
+	// Chunk E: parallel Kafka consumer for order.events (from orderstatus svc).
+	// Dual-path with the in-process WSS listener below during rollout — same
+	// bridge, same downstream handlers, ok-flag in HandleUpdate makes the
+	// second-arriving path silently no-op after the first has been consumed.
+	// Once orderstatus svc is trusted the in-process WSS wiring can go.
+	orderEventsConsumer := manthan.NewOrderEventsConsumer(
+		manthan.OrderEventsConsumerConfig{KafkaBrokers: kafkaBrokers},
+		wssBridge,
+		logger,
+	)
 
 	// Wire WSS bridge into status service — route Manthan order updates
 	if statusSvc != nil {
@@ -304,7 +316,8 @@ func InitManthan(
 		ProtectiveReplay: protectiveReplay,
 		InboxWorker:      inboxWorker,
 		JWTNotifier:      jwtNotifier,
-		ArmRetryWorker:   armRetryWorker,
+		ArmRetryWorker:      armRetryWorker,
+		OrderEventsConsumer: orderEventsConsumer,
 	}
 }
 
@@ -330,6 +343,16 @@ func (m *ManthanModule) Start(ctx context.Context) {
 		go func() {
 			log.Println("[manthan] Starting reconciler (broker ↔ DB truth sync)...")
 			m.Reconciler.Start(ctx)
+		}()
+	}
+
+	// Chunk E: Kafka consumer for order.events (from orderstatus svc).
+	// Runs in parallel with the in-process WSS listener during rollout.
+	// Both feed the same wssBridge; whichever arrives first wins, second no-ops.
+	if m.OrderEventsConsumer != nil {
+		go func() {
+			log.Println("[manthan] Starting order.events consumer (from orderstatus svc)...")
+			m.OrderEventsConsumer.Start(ctx)
 		}()
 	}
 
