@@ -190,7 +190,7 @@ COMMENT ON COLUMN manthan_positions.signal_id IS
 COMMENT ON COLUMN manthan_positions.event_seq IS
     'Last applied broker event_seq. Used for stale-write protection in UPSERT (WHERE event_seq < EXCLUDED.event_seq).';
 COMMENT ON COLUMN manthan_positions.broker_order_id IS
-    'Broker-assigned entry order id (e.g. NZWKE00292H4). Cross-references trading_execution.manthan_orders.';
+    'Broker-assigned entry order id (e.g. NZWKE00292H4). Cross-references execution_db.manthan_orders.';
 
 -- =============================================================================
 -- 4) Backwards-compatibility view — for any read path not yet migrated

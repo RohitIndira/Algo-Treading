@@ -11,7 +11,7 @@ import (
 type Config struct {
 	Server      ServerConfig
 	Database    postgres.Config
-	ExecutionDB postgres.Config // second connection → trading_execution DB (for user_credentials)
+	ExecutionDB postgres.Config // second connection → execution_db DB (for user_credentials)
 	Kafka       KafkaConfig
 	LogLevel    string
 	EncryptionKey string
@@ -48,7 +48,7 @@ func Load() (*Config, error) {
 			Port:     getEnvAsInt("EXECUTION_DB_PORT", 5432),
 			User:     getEnv("EXECUTION_DB_USER", "postgres"),
 			Password: getEnv("EXECUTION_DB_PASSWORD", "postgres"),
-			Database: getEnv("EXECUTION_DB_NAME", "trading_execution"),
+			Database: getEnv("EXECUTION_DB_NAME", "execution_db"),
 			SSLMode:  getEnv("EXECUTION_DB_SSLMODE", "disable"),
 		},
 		Kafka: KafkaConfig{

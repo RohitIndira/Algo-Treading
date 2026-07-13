@@ -5,7 +5,7 @@
 // owns the strategies + user_credentials tables; everyone else asks via
 // gRPC. This avoids:
 //
-//   - orderstatus needing a connection to trading_execution DB
+//   - orderstatus needing a connection to execution_db DB
 //   - orderstatus holding the token encryption key
 //   - orderstatus running any decryption code
 //

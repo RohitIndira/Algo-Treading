@@ -28,7 +28,7 @@ type TokenLookup interface {
 }
 
 // TradingDBTokenLookup is a TokenLookup backed by manthan_orders in
-// trading_execution — the authoritative writer for exchange_token (owned
+// execution_db — the authoritative writer for exchange_token (owned
 // by the trade-execution service). Previously this pointed at a
 // stockk_trading replica that drifted silently; killed in Chunk DB.1.
 //
@@ -41,7 +41,7 @@ type TradingDBTokenLookup struct {
 }
 
 // NewTradingDBTokenLookup wraps an already-opened *sql.DB pointing at
-// trading_execution. Kept the "TradingDB" name for API stability — the
+// execution_db. Kept the "TradingDB" name for API stability — the
 // underlying DB target changed in DB.1 but existing callers don't need
 // to know.
 func NewTradingDBTokenLookup(db *sql.DB) *TradingDBTokenLookup {

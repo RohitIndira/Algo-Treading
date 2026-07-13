@@ -41,7 +41,7 @@ import (
 type HealthHandler struct {
 	signalsDB     *sql.DB // market_data
 	positionsDB   *sql.DB // trading_db
-	ordersDB      *sql.DB // trading_execution
+	ordersDB      *sql.DB // execution_db
 	redisClient   *redis.Client
 	extRedis      *redis.Client
 	userConfigGRP *grpc_clients.UserConfigClient
@@ -162,7 +162,7 @@ func (h *HealthHandler) eachDB() map[string]*sql.DB {
 	return map[string]*sql.DB{
 		"postgres_market_data":      h.signalsDB,
 		"postgres_trading_db":       h.positionsDB,
-		"postgres_trading_execution": h.ordersDB,
+		"postgres_execution_db": h.ordersDB,
 	}
 }
 

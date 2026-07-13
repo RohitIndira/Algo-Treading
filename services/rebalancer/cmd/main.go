@@ -52,7 +52,7 @@ func main() {
 	defer cancel()
 
 	// --- DB connections ---
-	// Phase 0.6a (2026-06-23) removed the trading_execution connection —
+	// Phase 0.6a (2026-06-23) removed the execution_db connection —
 	// the only thing that used it was ResolveBrokerAuth, which now goes
 	// through user-config gRPC. rebalancer is no longer coupled to
 	// trade-execution's DB schema.

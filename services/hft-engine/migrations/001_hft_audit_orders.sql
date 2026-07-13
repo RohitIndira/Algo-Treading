@@ -1,6 +1,6 @@
 -- 001_hft_audit_orders.sql
 -- Audit log for every Place / Modify / Cancel / Fill that the HFT engine
--- emits or observes. Lives in the `trading_execution` database (same DB as
+-- emits or observes. Lives in the `execution_db` database (same DB as
 -- manthan_orders) so the dashboard can join in a single query.
 --
 -- Writes are append-only and async (batched every 1s by audit.Writer) — the

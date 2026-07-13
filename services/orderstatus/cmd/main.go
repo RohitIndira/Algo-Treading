@@ -4,7 +4,7 @@
 //
 // This binary is the "read side" of the CQRS split defined in
 // docs/orderstatus_service_design.md. Trade-execution places orders and
-// INSERTs manthan_orders in trading_execution DB; orderstatus watches broker
+// INSERTs manthan_orders in execution_db DB; orderstatus watches broker
 // and appends to broker_events in order_status_db. The two never cross.
 //
 // Chunk A (2026-07-10): skeleton only — boots, connects to DB + Kafka,

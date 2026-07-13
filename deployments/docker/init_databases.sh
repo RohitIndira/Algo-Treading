@@ -26,7 +26,7 @@ set -e
 # etc.) but only ONE service writes.
 DBS=(
     # dbname             # owner service (writer)
-    "trading_execution   trade-execution"
+    "execution_db   trade-execution"
     "market_data         data-ingestion"
     "positions_db        positions"
     "order_status_db     orderstatus"

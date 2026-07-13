@@ -38,7 +38,7 @@ type PositionRow struct {
 }
 
 // OrderRow is one row of manthan_orders (owned by trade-execution in
-// trading_execution) — an individual order/fill. Used for the Stock P&L
+// execution_db) — an individual order/fill. Used for the Stock P&L
 // drilldown trades table.
 type OrderRow struct {
 	Symbol       string
@@ -70,7 +70,7 @@ type StrategyMetaRow struct {
 // TWO Postgres databases because writers live in different services:
 //
 //   strategies + trade_configs + manthan_positions  → trading_db      (rules-engine)
-//   manthan_orders                                  → trading_execution (trade-execution)
+//   manthan_orders                                  → execution_db (trade-execution)
 //
 // Previously this store hit a single `stockk_trading` DB that had both
 // tables copied in — but that DB was a silent replica that drifted from
@@ -86,7 +86,7 @@ type Store interface {
 	// Positions returns every position row for a strategy, in insert
 	// order (entry_time ASC). Handler filters ACTIVE vs EXITED as needed.
 	// Includes exchange_token (looked up from manthan_orders in a
-	// separate query against trading_execution) so the LTP fetch is
+	// separate query against execution_db) so the LTP fetch is
 	// one hop away.
 	Positions(ctx context.Context, strategyID, userID string) ([]PositionRow, error)
 
@@ -111,7 +111,7 @@ type PostgresStore struct {
 }
 
 // NewPostgresStore wires the store to two open *sql.DB pools:
-// positionsDB → trading_db, ordersDB → trading_execution.
+// positionsDB → trading_db, ordersDB → execution_db.
 //
 // Both are opened once at boot in main.go and reused across handlers
 // (ManthanHandler shares the same pools).
@@ -160,7 +160,7 @@ func (s *PostgresStore) StrategyMeta(ctx context.Context, strategyID, userID str
 }
 
 // Positions returns every position for (strategy, user). Because
-// manthan_positions (trading_db) and manthan_orders (trading_execution)
+// manthan_positions (trading_db) and manthan_orders (execution_db)
 // live in DIFFERENT Postgres databases now, we can't do the exchange_token
 // enrichment as a single JOIN. Instead:
 //

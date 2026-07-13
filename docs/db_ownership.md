@@ -17,7 +17,7 @@ by many writers" pattern that made pre-CQRS refactors risky.
    the read is too hot for gRPC (e.g. portfolio svc reading positions
    directly instead of round-tripping).
 3. **DB name = domain, not just the primary owner.** `positions_db` is owned
-   by positions svc; `trading_execution` is owned by trade-execution. But when
+   by positions svc; `execution_db` is owned by trade-execution. But when
    two services co-own disjoint tables in the same DB, the name reflects the
    shared domain — e.g. `trading_db` hosts BOTH user-config's strategy tables
    AND rules-engine's manthan_* tables (no table overlaps).
@@ -31,7 +31,7 @@ by many writers" pattern that made pre-CQRS refactors risky.
 | Database              | Writer(s)                    | Read-only consumers                                           | Purpose                                                    |
 |-----------------------|------------------------------|--------------------------------------------------------------|------------------------------------------------------------|
 | `trading_db`          | rules-engine + user-config   | api-gateway (Manthan handler, live-algos store), rebalancer, hft-engine | Strategies + trade_configs (user-config); manthan_positions, manthan_cooldown, manthan_signal_decisions, manthan_portfolio_state (rules-engine) |
-| `trading_execution`   | trade-execution + user-config (only writes user_credentials) | api-gateway (Manthan handler, live-algos store, portfolio token lookup), hft-engine | manthan_orders, manthan_order_events (trade-execution's audit trail); user_credentials |
+| `execution_db`   | trade-execution + user-config (only writes user_credentials) | api-gateway (Manthan handler, live-algos store, portfolio token lookup), hft-engine | manthan_orders, manthan_order_events (trade-execution's audit trail); user_credentials |
 | `market_data`         | data-ingestion               | api-gateway (Manthan handler), rules-engine (via MANTHAN_SIGNALS_DB), rebalancer | Instruments, daily_ohlcv, manthan_signals, manthan_stocks, breakout_events |
 | `positions_db`        | positions svc                | portfolio svc (via `positions_reader` role)                  | positions, position_events (CQRS query side for portfolio) |
 | `order_status_db`     | orderstatus svc              | (none yet)                                                    | broker_events (WSS + REST reconciler audit)                |
@@ -46,7 +46,7 @@ scheduled for review; see "Under consideration" below.)
 **Killed 2026-07-13 (DB.1):**
 
 - `stockk_trading` — a silent replica of `manthan_positions` (trading_db)
-  and `manthan_orders` (trading_execution). Was read by api-gateway's
+  and `manthan_orders` (execution_db). Was read by api-gateway's
   live-algos handler + portfolio token lookup because it had both tables
   in one DB, enabling a single CTE JOIN. But it drifted from the
   authoritative sources whenever the copy job lagged, showing stale
@@ -72,14 +72,11 @@ Grep across all Go source + `deployments/` + `.env*` finds ZERO references
 for any of these (only comment mentions of `stockk_auth` as a future
 placeholder in `services/trade-execution/internal/repository/grpc_credentials_repository.go:8,38`).
 
-## Under consideration (Phase 2, DB.3 / DB.4)
+## Renames DONE and considered
 
-Renaming for clarity — the DB name should tell you the OWNER at a glance:
-
-| Current           | Proposed         | Rationale                                              |
-|-------------------|------------------|--------------------------------------------------------|
-| `trading_execution` | `execution_db` | trade-execution owns it; shorter                       |
-| `market_data`     | `signals_db`     | data-ingestion owns it; `market_data` too generic      |
+DB.3 (2026-07-13, this branch): renamed `trading_execution` → `execution_db`.
+Trade-execution owns writes; the name now matches the CQRS pattern of
+`positions_db` + `order_status_db`.
 
 Not renaming `trading_db` — it's SHARED between user-config (strategy tables)
 and rules-engine (manthan_* tables). Splitting it would be a real data
@@ -88,7 +85,15 @@ independent schema evolution).
 
 `stockk_market` currently has no in-code writer — populated by an external
 Python ETL script (`/tmp/perf_etl.py` — legacy). Long-term: fold into
-`market_data` (or `signals_db` post-rename). Deferred behind the ETL rewrite.
+`signals_db`. Deferred behind the ETL rewrite.
+
+**Staging deploy note (DB.3):** the staging box still has the DB named
+`trading_execution`. To deploy this branch there, EITHER (a) run
+`ALTER DATABASE trading_execution RENAME TO execution_db;` on staging
+Postgres (requires no active connections — bounce services first), OR
+(b) set the appropriate DB-name env var in each service's
+ecosystem.config.js to `trading_execution` so the code still resolves
+the old name via the env-var override.
 
 ## When you add a new service
 
@@ -103,7 +108,7 @@ Python ETL script (`/tmp/perf_etl.py` — legacy). Long-term: fold into
 ## Historical timeline
 
 - Pre-2026-06: monolithic `trading_db` — everything writes here.
-- 2026-06-15..07-01: CQRS extraction begins. `trading_execution` split out
+- 2026-06-15..07-01: CQRS extraction begins. `execution_db` split out
   for trade-execution's audit trail (chunks E.*). `order_status_db` split
   for orderstatus svc.
 - 2026-07-13: positions svc CQRS split — `positions_db` created + portfolio
@@ -112,3 +117,6 @@ Python ETL script (`/tmp/perf_etl.py` — legacy). Long-term: fold into
   portfolio token lookup now hit authoritative sources with Go-side JOIN.
 - 2026-07-13: DB.2 — `init_databases.sh` creates all canonical DBs on
   fresh `docker-compose up`.
+- 2026-07-13: DB.3 — `trading_execution` renamed to `execution_db`. All
+  service code defaults + `.env` files updated. Historical arch docs
+  under `docs/architecture/` kept as-is (they describe pre-rename state).

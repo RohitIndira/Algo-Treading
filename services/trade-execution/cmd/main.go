@@ -903,7 +903,7 @@ func buildPostgresURL() string {
 		getEnv("POSTGRES_PORT", "5432"),
 		getEnv("POSTGRES_USER", "postgres"),
 		getEnv("POSTGRES_PASSWORD", "postgres"),
-		getEnv("POSTGRES_DB", "trading_execution"),
+		getEnv("POSTGRES_DB", "execution_db"),
 		getEnv("POSTGRES_SSL_MODE", "disable"),
 	)
 }

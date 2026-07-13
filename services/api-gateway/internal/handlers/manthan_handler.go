@@ -29,7 +29,7 @@ import (
 type ManthanHandler struct {
 	signalsDB   *sql.DB       // market_data DB       — manthan_signals
 	positionsDB *sql.DB       // trading_db DB        — manthan_positions, manthan_cooldown
-	ordersDB    *sql.DB       // trading_execution DB — manthan_orders, manthan_order_events
+	ordersDB    *sql.DB       // execution_db DB — manthan_orders, manthan_order_events
 	redisClient *redis.Client // local Redis (EMA weights pub/sub)
 	extRedis    *redis.Client // external Redis (live LTP feed); may be nil
 
@@ -238,7 +238,7 @@ func (h *ManthanHandler) GetOverview(w http.ResponseWriter, r *http.Request) {
 	// Mutates in place — positions/signals already in resp keep their LTP.
 	resp.Positions, resp.TodaySignals = h.enrichLiveLTP(ctx, resp.Positions, resp.TodaySignals)
 
-	// 5. Broker-side Manthan orders (trading_execution DB) — so the frontend
+	// 5. Broker-side Manthan orders (execution_db DB) — so the frontend
 	// can show placed / filled / rejected orders in the Order Activity panel.
 	if h.ordersDB != nil {
 		if orders, err := h.loadManthanOrders(ctx, userID, strategyID); err == nil {

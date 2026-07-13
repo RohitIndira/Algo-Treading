@@ -11,7 +11,7 @@ import (
 )
 
 // encryptionKey() was removed 2026-06-23 in Phase 0.6a — rebalancer no
-// longer reads encrypted JWTs from trading_execution.user_credentials,
+// longer reads encrypted JWTs from execution_db.user_credentials,
 // so it no longer needs the encryption key. user-config (the single
 // owner of user_credentials) now handles decryption server-side and
 // returns plaintext over the GetUserCredentials gRPC RPC.
@@ -154,7 +154,7 @@ func isDelivery(prdType string) bool {
 // line (no auth = no broker calls = no rebalance).
 //
 // Phase 0.6a (2026-06-23) replaced the legacy direct SQL read of
-// trading_execution.user_credentials with this gRPC wrapper. user-config
+// execution_db.user_credentials with this gRPC wrapper. user-config
 // is now the single owner of user_credentials per
 // docs/architecture/data-ownership.md. Decryption is server-side; this
 // function never touches encrypted ciphertext or the encryption key.

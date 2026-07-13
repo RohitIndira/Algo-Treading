@@ -169,11 +169,11 @@ func tradingModeToString(m pb.TradingMode) string {
 // FetchUserCredentials fetches the broker auth bundle for a user via
 // user-config gRPC. Replaces the legacy direct read of
 //
-//	trading_execution.user_credentials
+//	execution_db.user_credentials
 //
 // plus the in-process AES-GCM decryption that lived in ResolveBrokerAuth.
 // After this method exists, rebalancer no longer needs to:
-//   - know about the trading_execution database
+//   - know about the execution_db database
 //   - hold the encryption key
 //   - run any decryption code
 //

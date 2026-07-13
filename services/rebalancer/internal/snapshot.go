@@ -19,7 +19,7 @@ import (
 // Phase 0.2 migrated the strategies fetch from direct SQL to gRPC.
 // Phase 0.6a migrated the broker-auth lookup the same way, eliminating
 // rebalancer's last cross-service direct read AND its dependency on the
-// trading_execution database connection entirely.
+// execution_db database connection entirely.
 //
 // Returns ONLY strategies that have all required pieces: active, has trade
 // config (already filtered server-side), has user credentials. Anything

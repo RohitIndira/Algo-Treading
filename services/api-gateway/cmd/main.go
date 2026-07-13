@@ -154,7 +154,7 @@ func main() {
 		pgSSL := envOr("POSTGRES_SSLMODE", "disable")
 		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "market_data")
 		positionsDBName = envOr("MANTHAN_POSITIONS_DB", "trading_db")
-		ordersDBName = envOr("MANTHAN_ORDERS_DB", "trading_execution")
+		ordersDBName = envOr("MANTHAN_ORDERS_DB", "execution_db")
 		perfDBName := envOr("MANTHAN_PERF_DB", "stockk_market")
 
 		openPG := func(dbName string) (*sql.DB, error) {
@@ -293,7 +293,7 @@ func main() {
 	// endpoint keeps working normally.
 	// livealgos store reads from TWO existing DB pools:
 	//   positionsDB  (trading_db)         — manthan_positions, strategies, trade_configs
-	//   ordersDB     (trading_execution)  — manthan_orders
+	//   ordersDB     (execution_db)  — manthan_orders
 	// Previously this opened a THIRD `stockk_trading` DB which was a
 	// silent replica that drifted from the authoritative sources — see
 	// docs/db_ownership.md. Killed in Chunk DB.1.
@@ -351,7 +351,7 @@ func main() {
 	// unreachable at boot the routes stay unregistered and requests get
 	// a clean 404. See docs/portfolio_service_design.md.
 	var portfolioHandler *handlers.PortfolioHandler
-	// Token lookup uses ordersDB (trading_execution.manthan_orders) — the
+	// Token lookup uses ordersDB (execution_db.manthan_orders) — the
 	// authoritative writer for exchange_token. Previously read from
 	// stockk_trading which was a silent replica; DB.1 killed that path.
 	if pfAddr := envOr("PORTFOLIO_GRPC_ADDR", "localhost:9005"); pfAddr != "" && ordersDB != nil {

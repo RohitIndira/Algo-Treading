@@ -161,7 +161,7 @@ type CredentialsEvent struct {
 }
 
 // UpdateUserCredentials encrypts + upserts the user's broker credentials in
-// trading_execution.user_credentials, then publishes a USER_CREDENTIALS_UPDATED
+// execution_db.user_credentials, then publishes a USER_CREDENTIALS_UPDATED
 // event to Kafka so any service caching the JWT can invalidate.
 //
 // Idempotent: ON CONFLICT (user_id) DO UPDATE on the underlying table — the

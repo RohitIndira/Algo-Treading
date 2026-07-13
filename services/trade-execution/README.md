@@ -166,7 +166,7 @@ SERVICE_PORT=9004
 
 # Database
 POSTGRES_HOST=localhost
-POSTGRES_DB=trading_execution
+POSTGRES_DB=execution_db
 
 # Message Queue
 RABBITMQ_URL=amqp://guest:guest@localhost:5672/
@@ -207,10 +207,10 @@ go build -o ../../bin/trade-execution.exe ./cmd/main.go
 
 ```powershell
 # Create database
-createdb trading_execution
+createdb execution_db
 
 # Run migrations
-psql -d trading_execution -f migrations/001_create_orders_table.sql
+psql -d execution_db -f migrations/001_create_orders_table.sql
 
 Troubleshooting
 ---------------
@@ -223,11 +223,11 @@ It means the `orders` table hasn't been created in the database you're connectin
 
 Quick fixes:
 
-- Ensure your `POSTGRES_DB` environment variable points to `trading_execution` for this service (see `.env` in this folder).
+- Ensure your `POSTGRES_DB` environment variable points to `execution_db` for this service (see `.env` in this folder).
 - Run the migration directly:
 
 ```bash
-PGPASSWORD=postgres psql -h localhost -U postgres -d trading_execution -f services/trade-execution/migrations/001_create_orders_table.sql
+PGPASSWORD=postgres psql -h localhost -U postgres -d execution_db -f services/trade-execution/migrations/001_create_orders_table.sql
 ```
 
 - Or run the helper that creates DBs and runs all migrations:
@@ -239,10 +239,10 @@ PGPASSWORD=postgres psql -h localhost -U postgres -d trading_execution -f servic
 After the migration runs, restart the trade-execution service and the error should be resolved.
 
 # Check tables
-psql -d trading_execution -c "\dt"
+psql -d execution_db -c "\dt"
 
 # Query orders
-psql -d trading_execution -c "SELECT order_id, status, created_at FROM orders LIMIT 10;"
+psql -d execution_db -c "SELECT order_id, status, created_at FROM orders LIMIT 10;"
 ```
 
 ### Testing
@@ -274,7 +274,7 @@ docker logs -f trade-execution-service
 rabbitmqctl list_queues name messages consumers
 
 # PostgreSQL connections
-psql -d trading_execution -c "SELECT * FROM pg_stat_activity WHERE datname='trading_execution';"
+psql -d execution_db -c "SELECT * FROM pg_stat_activity WHERE datname='execution_db';"
 
 # Redis keys
 redis-cli KEYS "order:*"
@@ -375,7 +375,7 @@ Week 7: Production
 ### Issue: Service won't start
 ```powershell
 # Check dependencies
-psql -U postgres -d trading_execution -c "SELECT 1;"
+psql -U postgres -d execution_db -c "SELECT 1;"
 curl http://localhost:15672/api/overview
 redis-cli PING
 ```
@@ -389,7 +389,7 @@ rabbitmqctl list_consumers
 grep "ERROR" logs/trade-execution.log
 
 # Verify database connection
-psql -d trading_execution -c "SELECT COUNT(*) FROM orders WHERE status='PENDING';"
+psql -d execution_db -c "SELECT COUNT(*) FROM orders WHERE status='PENDING';"
 ```
 
 ### Issue: Odin API errors
@@ -438,7 +438,7 @@ echo $ODIN_API_KEY
 - [ ] Protocol Buffers compiler installed
 
 ### Infrastructure
-- [ ] Database created (`trading_execution`)
+- [ ] Database created (`execution_db`)
 - [ ] RabbitMQ queues configured
 - [ ] Redis connection tested
 - [ ] Environment variables set
