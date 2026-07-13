@@ -85,16 +85,17 @@ type Manthan struct {
 	logger *zap.Logger
 
 	// Components held for shutdown / debugging.
-	publisher     *ManthanPublisher
-	portfolioMgr  *PortfolioManager
-	consumer      *Consumer
-	ltpFeed       *LTPFeed // may be nil — external Redis was not configured
-	signalsDB     *sql.DB  // opened by Wire; closed by Close
-	manthanDB     *sql.DB  // borrowed — main.go owns the lifecycle
-	aliveChecker  StrategyAliveChecker
-	redis         *cache.RedisCache
-	strategyByID  func(strategyID string) *types.UserStrategy
-	getStrategies func() []types.UserStrategy
+	publisher        *ManthanPublisher
+	portfolioMgr     *PortfolioManager
+	consumer         *Consumer
+	cooldownConsumer *CooldownConsumer // position.events → manthan_cooldown (Chunk P.E)
+	ltpFeed          *LTPFeed          // may be nil — external Redis was not configured
+	signalsDB        *sql.DB           // opened by Wire; closed by Close
+	manthanDB        *sql.DB           // borrowed — main.go owns the lifecycle
+	aliveChecker     StrategyAliveChecker
+	redis            *cache.RedisCache
+	strategyByID     func(strategyID string) *types.UserStrategy
+	getStrategies    func() []types.UserStrategy
 }
 
 // Wire builds the entire Manthan stack from Deps. Sync side-effects
@@ -257,6 +258,16 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 		logger,
 	)
 
+	// Cooldown consumer (position.events → manthan_cooldown), Chunk P.E.
+	// UPSERTs manthan_cooldown on MANTHAN + POSITION_EXITED + SL_TRIGGER
+	// per §5.3 of docs/positions_service_design.md. Manthan re-entry gate
+	// (ATH × 0.80) is enforced by the allocator's cooldown lookup.
+	m.cooldownConsumer = NewCooldownConsumer(
+		CooldownConsumerConfig{KafkaBrokers: deps.KafkaBrokers},
+		deps.ManthanDB,
+		logger,
+	)
+
 	// Optional LTP feed.
 	if deps.ExtRedisAddr != "" {
 		feed, ltpErr := NewLTPFeed(LTPFeedConfig{
@@ -347,6 +358,14 @@ func (m *Manthan) Start(ctx context.Context) {
 	// DISPATCHED forever until positions svc takes over the outcome updates.
 	// See docs/rules_engine_refactor.md §4.5.
 
+	// Cooldown consumer (position.events → manthan_cooldown). Chunk P.E.
+	if m.cooldownConsumer != nil {
+		go func() {
+			m.cooldownConsumer.Start(ctx)
+		}()
+		m.logger.Info("Manthan cooldown consumer started — position.events → manthan_cooldown")
+	}
+
 	// LTP feed poller — drives trailing SL.
 	if m.ltpFeed != nil {
 		go func() {
@@ -364,6 +383,9 @@ func (m *Manthan) Close() {
 	}
 	if m.publisher != nil {
 		m.publisher.Close()
+	}
+	if m.cooldownConsumer != nil {
+		_ = m.cooldownConsumer.Close()
 	}
 	if m.signalsDB != nil {
 		_ = m.signalsDB.Close()
