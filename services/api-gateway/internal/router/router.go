@@ -16,7 +16,6 @@ func NewRouter(
 	websocketHandler *handlers.WebSocketHandler,
 	paperHandler *handlers.PaperTradingHandler,
 	manthanHandler *handlers.ManthanHandler,
-	hftHandler *handlers.HFTHandler,
 	healthHandler *handlers.HealthHandler,
 	marketHandler *handlers.MarketHandler,
 	algosHandler *handlers.AlgosHandler,
@@ -110,14 +109,6 @@ func NewRouter(
 		api.HandleFunc("/market/quote", marketHandler.GetQuote).Methods("GET")
 	}
 
-	// HFT strategy lifecycle — drives an already-created HFT_BIDDING
-	// strategy in the hft-engine. Creation goes through /strategies above.
-	// /hft/{id}/start and /stop moved to the protected subrouter below —
-	// they can start real-money HFT runs. /state stays public (read-only).
-	if hftHandler != nil {
-		api.HandleFunc("/hft/{strategy_id}/state", hftHandler.GetHFTState).Methods("GET")
-	}
-
 	// ── Protected subrouter ─────────────────────────────────────────
 	// Every route registered on `protected` requires a valid JWT via
 	// the AuthMiddleware. Today the verifier is NoopVerifier (shape
@@ -131,8 +122,6 @@ func NewRouter(
 	//   GET  /api/v1/whoami                       (test route — echoes userID)
 	//   POST /api/v1/live-orders/force-exit-all   (can liquidate real book)
 	//   POST /api/v1/live-orders/force-exit-strategy (can liquidate strategy)
-	//   POST /api/v1/hft/{strategy_id}/start      (starts LIVE HFT)
-	//   POST /api/v1/hft/{strategy_id}/stop       (stops LIVE HFT)
 	//
 	// Additional user-specific routes (dashboard, live-orders GET, etc.)
 	// will migrate here in follow-up sessions once frontend adds the
@@ -261,12 +250,6 @@ func NewRouter(
 		protected.HandleFunc("/live-orders/force-exit-strategy", paperHandler.ForceExitStrategyLive).Methods("POST")
 	}
 
-	// HFT start/stop — moved from the public `api.` subrouter above.
-	if hftHandler != nil {
-		protected.HandleFunc("/hft/{strategy_id}/start", hftHandler.StartHFT).Methods("POST")
-		protected.HandleFunc("/hft/{strategy_id}/stop", hftHandler.StopHFT).Methods("POST")
-	}
-
 	// WebSocket routes for live match feed
 	r.HandleFunc("/ws/matches", websocketHandler.HandleMatchesFeed)        // Single user
 	r.HandleFunc("/ws/matches/all", websocketHandler.HandleAllMatchesFeed) // All users
@@ -275,10 +258,6 @@ func NewRouter(
 	// → frontend WS so the user sees broker-session-expired, manual-exit,
 	// JWT-expiring, etc. and the UI can prompt re-login / show toasts.
 	r.HandleFunc("/ws/notifications", websocketHandler.HandleNotificationsFeed)
-
-	// Live HFT order/fill tape — streams every engine event (PLACE/FILL/
-	// MODIFY/CANCEL/ARM/PAUSE/RESUME) for one strategy to the dashboard.
-	r.HandleFunc("/ws/hft/{strategy_id}", websocketHandler.HandleHFTFeed)
 
 	return r
 }

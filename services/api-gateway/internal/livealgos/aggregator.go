@@ -114,7 +114,6 @@ func algoIDFromStrategyType(t pb.StrategyType) string {
 		return "algo_manthan_v1"
 	// Future:
 	// case pb.StrategyType_WEEK52_BREAKOUT: return "algo_52w_v1"
-	// case pb.StrategyType_HFT_BIDDING:     return "algo_hft_v1"
 	default:
 		return ""
 	}

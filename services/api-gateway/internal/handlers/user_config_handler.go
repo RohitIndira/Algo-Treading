@@ -9,7 +9,6 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/dto"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
-	hftpb "github.com/RohitIndira/Algo-Treading/api/proto/hft_engine"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/gorilla/mux"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -18,19 +17,10 @@ import (
 
 type UserConfigHandler struct {
 	client *grpc_clients.UserConfigClient
-	// hftClient is optional. When set, CreateStrategy auto-fires Entry on
-	// the hft-engine for HFT_BIDDING strategies created with
-	// activate_immediately=true, turning the two-step
-	// create→start dance into one round-trip. nil is fine — auto-start
-	// is then a no-op and the operator must POST /hft/{id}/start manually.
-	hftClient *grpc_clients.HFTClient
 }
 
-func NewUserConfigHandler(client *grpc_clients.UserConfigClient, hftClient *grpc_clients.HFTClient) *UserConfigHandler {
-	return &UserConfigHandler{
-		client:    client,
-		hftClient: hftClient,
-	}
+func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHandler {
+	return &UserConfigHandler{client: client}
 }
 
 // CreateStrategy handles POST /api/v1/strategies
@@ -108,7 +98,6 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		Conditions:          dtoConditionsToProto(reqDTO.Conditions),
 		TradeConfig:         dtoTradeConfigToProto(reqDTO.TradeConfig),
 		RiskLimits:          dtoRiskLimitsToProto(reqDTO.RiskLimits),
-		HftConfig:           dtoHFTConfigToProto(reqDTO.HFTConfig),
 		IndiraAuth: &common.IndiraAuthContext{
 			UserId:      userIdHeader,
 			AppId:       appId,
@@ -141,46 +130,6 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 			return
 		case pb.StrategyType_MANTHAN:
 			respondIndiraOK(w, buildManthanResponse(resp))
-			return
-		case pb.StrategyType_HFT_BIDDING:
-			out := buildHFTResponse(resp)
-			// Auto-fire Entry on the hft-engine when the caller wanted the
-			// strategy live immediately. activate_immediately=true previously
-			// only set the DB row's active=true bit but did NOT subscribe
-			// the engine to market data, so nothing actually ran until the
-			// operator made a second POST /hft/{id}/start call. We now
-			// chain the two together for HFT_BIDDING.
-			//
-			// Failure mode is best-effort: a failed auto-start does NOT
-			// roll back the create (the row stays, the operator can retry
-			// /hft/start manually). We surface the failure in the response
-			// so the UI can show it without a 500.
-			if h.hftClient != nil && reqDTO.ActivateImmediately {
-				entryResp, entryErr := h.hftClient.Entry(r.Context(), &hftpb.EntryRequest{
-					StrategyId: resp.Strategy.StrategyId,
-				})
-				switch {
-				case entryErr != nil:
-					out["auto_start"] = map[string]interface{}{
-						"success": false,
-						"error":   "hft-engine Entry call failed: " + entryErr.Error(),
-						"hint":    "strategy created but engine not running — retry POST /api/v1/hft/{id}/start",
-					}
-				case entryResp != nil && !entryResp.Success:
-					out["auto_start"] = map[string]interface{}{
-						"success": false,
-						"status":  entryResp.Status,
-						"error":   entryResp.Error,
-						"hint":    "strategy created but engine refused Entry — retry POST /api/v1/hft/{id}/start after fixing the underlying cause",
-					}
-				default:
-					out["auto_start"] = map[string]interface{}{
-						"success": true,
-						"status":  entryResp.Status,
-					}
-				}
-			}
-			respondIndiraOK(w, out)
 			return
 		}
 	}
@@ -236,22 +185,6 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 }
 
 // DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}
-//
-// Lifecycle ordering matters here. The hft-engine holds the strategy as an
-// in-memory Runner goroutine that places live broker orders on every tick;
-// the DB row is just configuration. Deleting only the DB row leaves a
-// zombie Runner that keeps trading until the engine restarts. So we stop
-// the engine FIRST, then delete the row.
-//
-//   - hftClient.Exit succeeds         → engine stopped, resting orders
-//                                       cancelled, terminal state persisted.
-//     Proceed with DB delete.
-//   - hftClient.Exit → NOT_RUNNING    → strategy wasn't live in engine
-//                                       memory (paper, never started, or
-//                                       already finished). Proceed.
-//   - hftClient.Exit → other error    → ABORT. We will not delete the row
-//                                       while a Runner may still be live.
-//                                       Caller retries.
 func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
@@ -260,24 +193,6 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 	if userID == "" {
 		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
 		return
-	}
-
-	if h.hftClient != nil {
-		exitResp, exitErr := h.hftClient.Exit(r.Context(), &hftpb.ExitRequest{
-			StrategyId: strategyID,
-		})
-		switch {
-		case exitErr != nil:
-			respondWithError(w, http.StatusBadGateway,
-				"Failed to stop strategy in hft-engine before delete: "+exitErr.Error()+
-					" — retry once the engine is reachable")
-			return
-		case exitResp != nil && !exitResp.Success && exitResp.Status != "NOT_RUNNING":
-			respondWithError(w, http.StatusConflict,
-				"hft-engine refused to stop the strategy: "+exitResp.Error+
-					" (status="+exitResp.Status+") — resolve and retry")
-			return
-		}
 	}
 
 	req := &pb.DeleteStrategyRequest{

@@ -38,39 +38,10 @@ func mapStrategyType(t string) pb.StrategyType {
 		return pb.StrategyType_WEEK52_BREAKOUT
 	case "MANTHAN":
 		return pb.StrategyType_MANTHAN
-	case "HFT_BIDDING":
-		return pb.StrategyType_HFT_BIDDING
 	case "NEWS":
 		return pb.StrategyType_NEWS
 	default:
 		return pb.StrategyType_NEWS
-	}
-}
-
-// dtoHFTConfigToProto converts the JSON HFT config DTO to its proto form.
-// Returns nil when the DTO is nil (non-HFT strategies).
-func dtoHFTConfigToProto(h *dto.HFTConfig) *pb.HFTConfig {
-	if h == nil {
-		return nil
-	}
-	return &pb.HFTConfig{
-		Symbol:              h.Symbol,
-		Isin:                h.ISIN,
-		Exchange:            h.Exchange,
-		Side:                h.Side,
-		ProductType:         h.ProductType,
-		TickSize:            h.TickSize,
-		MaxBuyQty:           h.MaxBuyQty,
-		MaxSellQty:          h.MaxSellQty,
-		SingleBuyQty:        h.SingleBuyQty,
-		SingleSellQty:       h.SingleSellQty,
-		BuyLimitPrice:       h.BuyLimitPrice,
-		SellLimitPrice:      h.SellLimitPrice,
-		WindowStart:         h.WindowStart,
-		WindowEnd:           h.WindowEnd,
-		ModifyOnPriceChange: h.ModifyOnPriceChange,
-		BuyTriggerPrice:     h.BuyTriggerPrice,
-		SellTriggerPrice:    h.SellTriggerPrice,
 	}
 }
 
@@ -256,10 +227,6 @@ func dtoUpdateStrategyToProto(reqDTO *dto.UpdateStrategyRequest) *pb.UpdateStrat
 		tm := mapTradingMode(*reqDTO.TradingMode)
 		req.TradingMode = &tm
 	}
-	if reqDTO.HFTConfig != nil {
-		req.HftConfig = dtoHFTConfigToProto(reqDTO.HFTConfig)
-	}
-
 	return req
 }
 
@@ -273,8 +240,6 @@ func strategyTypeName(t pb.StrategyType) string {
 		return "52W_BREAKOUT"
 	case pb.StrategyType_MANTHAN:
 		return "MANTHAN"
-	case pb.StrategyType_HFT_BIDDING:
-		return "HFT_BIDDING"
 	default:
 		return "UNSPECIFIED"
 	}
@@ -347,28 +312,6 @@ func slimStrategy(s *pb.Strategy) map[string]interface{} {
 				"product_type":     tc.ProductType.String(),
 			}
 		}
-	case pb.StrategyType_HFT_BIDDING:
-		if h := s.HftConfig; h != nil {
-			out["hft_config"] = map[string]interface{}{
-				"symbol":                 h.Symbol,
-				"isin":                   h.Isin,
-				"exchange":               h.Exchange,
-				"side":                   h.Side,
-				"product_type":           h.ProductType,
-				"tick_size":              h.TickSize,
-				"max_buy_qty":            h.MaxBuyQty,
-				"max_sell_qty":           h.MaxSellQty,
-				"single_buy_qty":         h.SingleBuyQty,
-				"single_sell_qty":        h.SingleSellQty,
-				"buy_limit_price":        h.BuyLimitPrice,
-				"sell_limit_price":       h.SellLimitPrice,
-				"buy_trigger_price":      h.BuyTriggerPrice,
-				"sell_trigger_price":     h.SellTriggerPrice,
-				"window_start":           h.WindowStart,
-				"window_end":             h.WindowEnd,
-				"modify_on_price_change": h.ModifyOnPriceChange,
-			}
-		}
 	}
 	return out
 }
@@ -395,8 +338,8 @@ func slimPagination(p *common.PaginationResponse) map[string]interface{} {
 	}
 }
 
-// build52WResponse / buildManthanResponse / buildHFTResponse all delegate
-// to slimStrategy so the create-response shape matches list/get/update.
+// build52WResponse / buildManthanResponse delegate to slimStrategy so the
+// create-response shape matches list/get/update.
 //
 // As of 2026-07-03 these return the slim strategy DIRECTLY (no wrapper).
 // respondIndiraOK in the handler wraps them inside the Indira envelope's
@@ -412,10 +355,6 @@ func build52WResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
 }
 
 func buildManthanResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
-	return slimStrategy(resp.Strategy)
-}
-
-func buildHFTResponse(resp *pb.CreateStrategyResponse) map[string]interface{} {
 	return slimStrategy(resp.Strategy)
 }
 

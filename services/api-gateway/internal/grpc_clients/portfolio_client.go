@@ -14,7 +14,7 @@ import (
 // docs/portfolio_service_design.md.
 //
 // One conn per gateway process, shared across handlers (matches the
-// pattern of UserConfigClient / HFTClient in this package).
+// pattern of UserConfigClient in this package).
 type PortfolioClient struct {
 	client  pfpb.PortfolioServiceClient
 	conn    *grpc.ClientConn
@@ -23,7 +23,7 @@ type PortfolioClient struct {
 
 // NewPortfolioClient dials portfolio svc. addr is typically
 // "localhost:9005" locally or the K8s service DNS in staging. Lazy dial —
-// does not block on connect, mirroring HFT/UserConfig behaviour.
+// does not block on connect, mirroring UserConfig behaviour.
 func NewPortfolioClient(addr string, timeout time.Duration) (*PortfolioClient, error) {
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
