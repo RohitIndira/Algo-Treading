@@ -18,4 +18,5 @@ use (
 	./services/trade-execution
 	./services/user-config
 	./services/orderstatus
+	./services/positions
 )
