@@ -140,6 +140,12 @@ func main() {
 	var healthHandler *handlers.HealthHandler
 	var perfHandler *handlers.PerformanceHandler
 	var extRedis *redis.Client // hoisted: reused by the market-quote handler
+	// positionsDB, ordersDB + their DB names hoisted so downstream setup
+	// (live-algos store in DB.1, portfolio token lookup in PF.D) can reuse
+	// the same pools instead of dialling a second time.
+	var positionsDB *sql.DB
+	var ordersDB *sql.DB
+	var positionsDBName, ordersDBName string
 	{
 		pgHost := envOr("POSTGRES_HOST", "localhost")
 		pgPort := envOr("POSTGRES_PORT", "5432")
@@ -147,8 +153,8 @@ func main() {
 		pgPass := envOr("POSTGRES_PASSWORD", "postgres")
 		pgSSL := envOr("POSTGRES_SSLMODE", "disable")
 		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "market_data")
-		positionsDBName := envOr("MANTHAN_POSITIONS_DB", "trading_db")
-		ordersDBName := envOr("MANTHAN_ORDERS_DB", "trading_execution")
+		positionsDBName = envOr("MANTHAN_POSITIONS_DB", "trading_db")
+		ordersDBName = envOr("MANTHAN_ORDERS_DB", "trading_execution")
 		perfDBName := envOr("MANTHAN_PERF_DB", "stockk_market")
 
 		openPG := func(dbName string) (*sql.DB, error) {
@@ -177,19 +183,19 @@ func main() {
 			defer signalsDB.Close()
 		}
 
-		positionsDB, err := openPG(positionsDBName)
-		if err != nil {
+		if db, err := openPG(positionsDBName); err != nil {
 			log.Printf("Warning: Manthan positions DB (%s) open/ping failed: %v", positionsDBName, err)
 		} else {
 			log.Printf("Manthan positions DB connected (%s)", positionsDBName)
+			positionsDB = db
 			defer positionsDB.Close()
 		}
 
-		ordersDB, err := openPG(ordersDBName)
-		if err != nil {
+		if db, err := openPG(ordersDBName); err != nil {
 			log.Printf("Warning: Manthan orders DB (%s) open/ping failed: %v", ordersDBName, err)
 		} else {
 			log.Printf("Manthan orders DB connected (%s)", ordersDBName)
+			ordersDB = db
 			defer ordersDB.Close()
 		}
 
@@ -285,36 +291,22 @@ func main() {
 	// Both are nil-safe — if the DB pool or Redis client fail to init,
 	// the router skips registering the details routes and the LIST
 	// endpoint keeps working normally.
+	// livealgos store reads from TWO existing DB pools:
+	//   positionsDB  (trading_db)         — manthan_positions, strategies, trade_configs
+	//   ordersDB     (trading_execution)  — manthan_orders
+	// Previously this opened a THIRD `stockk_trading` DB which was a
+	// silent replica that drifted from the authoritative sources — see
+	// docs/db_ownership.md. Killed in Chunk DB.1.
+	//
+	// Both pools are already opened + ping-verified above under the
+	// manthan handler block; here we just borrow the handles.
 	var liveAlgosStore livealgos.Store
-	// tradingDB hoisted to the outer scope so downstream setup (portfolio
-	// handler's token lookup) can reuse the same connection pool instead
-	// of dialling a second time.
-	var tradingDB *sql.DB
-	tradingDBName := envOr("STOCKK_TRADING_DB", "stockk_trading")
-	if db, err := sql.Open("postgres", fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		envOr("POSTGRES_HOST", "localhost"),
-		envOr("POSTGRES_PORT", "5432"),
-		envOr("POSTGRES_USER", "postgres"),
-		envOr("POSTGRES_PASSWORD", "postgres"),
-		tradingDBName,
-		envOr("POSTGRES_SSLMODE", "disable"),
-	)); err != nil {
-		log.Printf("Warning: %s DB open failed: %v (details endpoints disabled)", tradingDBName, err)
+	if positionsDB != nil && ordersDB != nil {
+		liveAlgosStore = livealgos.NewPostgresStore(positionsDB, ordersDB)
+		log.Printf("Live-algos store wired (positions=%s, orders=%s)", positionsDBName, ordersDBName)
 	} else {
-		db.SetMaxOpenConns(5)
-		db.SetMaxIdleConns(2)
-		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := db.PingContext(pCtx); err != nil {
-			log.Printf("Warning: %s DB ping failed: %v (details endpoints disabled)", tradingDBName, err)
-			_ = db.Close()
-		} else {
-			log.Printf("Live-algos trading DB connected (%s)", tradingDBName)
-			defer db.Close()
-			liveAlgosStore = livealgos.NewPostgresStore(db)
-			tradingDB = db
-		}
-		pCancel()
+		log.Printf("Warning: live-algos details store disabled — need both positionsDB (%v) and ordersDB (%v)",
+			positionsDB != nil, ordersDB != nil)
 	}
 
 	var liveAlgosLTP *livealgos.LTPStore
@@ -359,7 +351,10 @@ func main() {
 	// unreachable at boot the routes stay unregistered and requests get
 	// a clean 404. See docs/portfolio_service_design.md.
 	var portfolioHandler *handlers.PortfolioHandler
-	if pfAddr := envOr("PORTFOLIO_GRPC_ADDR", "localhost:9005"); pfAddr != "" && tradingDB != nil {
+	// Token lookup uses ordersDB (trading_execution.manthan_orders) — the
+	// authoritative writer for exchange_token. Previously read from
+	// stockk_trading which was a silent replica; DB.1 killed that path.
+	if pfAddr := envOr("PORTFOLIO_GRPC_ADDR", "localhost:9005"); pfAddr != "" && ordersDB != nil {
 		pfClient, err := grpc_clients.NewPortfolioClient(pfAddr, 5*time.Second)
 		if err != nil {
 			log.Printf("Warning: portfolio gRPC dial (%s) failed: %v (portfolio endpoints disabled)", pfAddr, err)
@@ -368,7 +363,7 @@ func main() {
 			// LTPSource interface satisfied by *livealgos.LTPStore. Nil is fine —
 			// enricher's LTPSource nil-guard treats it as UNAVAILABLE.
 			enricher := portfolio.NewEnricher(
-				portfolio.NewTradingDBTokenLookup(tradingDB),
+				portfolio.NewTradingDBTokenLookup(ordersDB),
 				liveAlgosLTP,
 			)
 			portfolioHandler = handlers.NewPortfolioHandler(pfClient, enricher)

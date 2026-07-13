@@ -27,8 +27,10 @@ type TokenLookup interface {
 	TokensBySymbols(ctx context.Context, symbols []string) (map[string]string, error)
 }
 
-// TradingDBTokenLookup is a TokenLookup backed by
-// stockk_trading.manthan_orders.
+// TradingDBTokenLookup is a TokenLookup backed by manthan_orders in
+// trading_execution — the authoritative writer for exchange_token (owned
+// by the trade-execution service). Previously this pointed at a
+// stockk_trading replica that drifted silently; killed in Chunk DB.1.
 //
 // exchange_token is stable per symbol regardless of user or strategy,
 // so we DISTINCT ON (symbol) — one row per symbol regardless of how
@@ -38,6 +40,10 @@ type TradingDBTokenLookup struct {
 	db *sql.DB
 }
 
+// NewTradingDBTokenLookup wraps an already-opened *sql.DB pointing at
+// trading_execution. Kept the "TradingDB" name for API stability — the
+// underlying DB target changed in DB.1 but existing callers don't need
+// to know.
 func NewTradingDBTokenLookup(db *sql.DB) *TradingDBTokenLookup {
 	return &TradingDBTokenLookup{db: db}
 }
