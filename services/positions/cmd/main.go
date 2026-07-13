@@ -20,6 +20,8 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+
+	"github.com/RohitIndira/Algo-Treading/services/positions/internal/consumer"
 )
 
 func main() {
@@ -108,21 +110,38 @@ func main() {
 		}
 	}()
 
-	// ── TODO Chunks P.B/P.B.5/P.C/P.D/P.E/P.G — wire up here ──────────
-	//   P.B    order.events Kafka consumer + position_events writer
-	//   P.B.5  gRPC client to trade-execution.LookupOrderMeta
-	//   P.C    state machine: FILLED BUY→INSERT, SELL→UPDATE + realized_pnl
+	// ── order.events consumer (Chunk P.B) ──────────────────────────────
+	// Log-only handler for now; P.C replaces with the state machine that
+	// enriches via LookupOrderMeta gRPC + writes positions + position_events.
+	//
+	// Set POSITIONS_START_FROM=FIRST to replay history from topic head on
+	// first boot (useful for local smoke tests against pre-existing events).
+	// Default is LastOffset — production-safe.
+	orderEventsConsumer := consumer.New(
+		consumer.Config{KafkaBrokers: brokers},
+		&consumer.LoggingHandler{Logger: logger},
+		logger,
+		getEnv("POSITIONS_START_FROM", "LAST") == "FIRST",
+	)
+	defer func() { _ = orderEventsConsumer.Close() }()
+
+	consumerCtx, consumerCancel := context.WithCancel(context.Background())
+	defer consumerCancel()
+	go orderEventsConsumer.Start(consumerCtx)
+
+	// ── TODO Chunks P.B.5/P.C/P.D/P.G — wire up here ──────────────────
+	//   P.B.5  gRPC client to trade-execution.LookupOrderMeta + LRU cache
+	//   P.C    state-machine handler (replaces LoggingHandler above)
 	//   P.D    position.events publisher wired into state machine
-	//   P.E    (in rules-engine) consumes position.events → cooldown INSERT
 	//   P.G    reconciler drift detection → positions.drift.detected publisher
 
 	// silence "declared and not used" until the chunks above land
 	_ = positionEventsWriter
 	_ = driftWriter
 
-	logger.Info("positions svc ready — awaiting subsequent chunks",
-		zap.String("chunk", "P.A"),
-		zap.String("next", "P.B — order.events consumer + audit writer"))
+	logger.Info("positions svc ready",
+		zap.String("chunk", "P.B"),
+		zap.String("next", "P.B.5 — gRPC client for LookupOrderMeta enrichment"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
