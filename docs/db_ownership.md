@@ -89,12 +89,24 @@ in session scratchpad for anything with data.
 - Dropped `trade_signals` — Cat B trim ordered by migration 008 back on
   2026-06-25; never applied locally until now.
 
-**`signals_db`: 29 → 28 tables + 1 matview → 0**
+**`signals_db`: 29 → 4 tables + 1 matview → 0** (417 MB → 18 MB)
 
 - Dropped `data_load_log` — schema stub for an unfinished bhavcopy loader;
   zero code writers/readers.
 - Dropped `mv_52w_high_low` MATVIEW — refresh cron never wired; 52W data
   lives in Redis keys (`52w:token:<id>`), not the matview.
+- Dropped `breakout_events` (empty) — written by
+  `services/data-ingestion/internal/historical/ws_monitor.go:541` via
+  `InsertBreakoutEvent()`, only called from `cmd/historical-worker/`
+  which is NOT running in the current setup. User decided the historical
+  worker path isn't in use.
+- Dropped `daily_ohlcv` + 22 year partitions (1,243,969 rows, ~400 MB)
+  via CASCADE. Read by `GetAllPrevClose()` at `ws_monitor.go:101` for
+  stock-split detection — same historical-worker code path as above.
+  Schema-only pg_dump preserved in scratchpad for regeneration.
+  ⚠️ WARNING: if `historical-worker` is ever run against this DB, it
+  will crash on the missing tables until they're recreated (via the
+  schema dump) OR the code path is refactored to not need them.
 
 **`stockk_market`: 29 → 4 tables** (reclaimed ~260 MB → 10 MB)
 
