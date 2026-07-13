@@ -25,6 +25,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/notifications"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/performance"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/portfolio"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/router"
 )
 
@@ -285,8 +286,12 @@ func main() {
 	// the router skips registering the details routes and the LIST
 	// endpoint keeps working normally.
 	var liveAlgosStore livealgos.Store
+	// tradingDB hoisted to the outer scope so downstream setup (portfolio
+	// handler's token lookup) can reuse the same connection pool instead
+	// of dialling a second time.
+	var tradingDB *sql.DB
 	tradingDBName := envOr("STOCKK_TRADING_DB", "stockk_trading")
-	if tradingDB, err := sql.Open("postgres", fmt.Sprintf(
+	if db, err := sql.Open("postgres", fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		envOr("POSTGRES_HOST", "localhost"),
 		envOr("POSTGRES_PORT", "5432"),
@@ -297,16 +302,17 @@ func main() {
 	)); err != nil {
 		log.Printf("Warning: %s DB open failed: %v (details endpoints disabled)", tradingDBName, err)
 	} else {
-		tradingDB.SetMaxOpenConns(5)
-		tradingDB.SetMaxIdleConns(2)
+		db.SetMaxOpenConns(5)
+		db.SetMaxIdleConns(2)
 		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := tradingDB.PingContext(pCtx); err != nil {
+		if err := db.PingContext(pCtx); err != nil {
 			log.Printf("Warning: %s DB ping failed: %v (details endpoints disabled)", tradingDBName, err)
-			_ = tradingDB.Close()
+			_ = db.Close()
 		} else {
 			log.Printf("Live-algos trading DB connected (%s)", tradingDBName)
-			defer tradingDB.Close()
-			liveAlgosStore = livealgos.NewPostgresStore(tradingDB)
+			defer db.Close()
+			liveAlgosStore = livealgos.NewPostgresStore(db)
+			tradingDB = db
 		}
 		pCancel()
 	}
@@ -346,6 +352,30 @@ func main() {
 
 	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP)
 
+	// ── Portfolio handler (PF.D) ────────────────────────────────────────
+	// Dials portfolio svc's gRPC, composes an Enricher over the same
+	// LTP client the live-algos handler uses, and registers the three
+	// /users/me/portfolio/* routes below. Nil-safe: if portfolio svc is
+	// unreachable at boot the routes stay unregistered and requests get
+	// a clean 404. See docs/portfolio_service_design.md.
+	var portfolioHandler *handlers.PortfolioHandler
+	if pfAddr := envOr("PORTFOLIO_GRPC_ADDR", "localhost:9005"); pfAddr != "" && tradingDB != nil {
+		pfClient, err := grpc_clients.NewPortfolioClient(pfAddr, 5*time.Second)
+		if err != nil {
+			log.Printf("Warning: portfolio gRPC dial (%s) failed: %v (portfolio endpoints disabled)", pfAddr, err)
+		} else {
+			defer pfClient.Close()
+			// LTPSource interface satisfied by *livealgos.LTPStore. Nil is fine —
+			// enricher's LTPSource nil-guard treats it as UNAVAILABLE.
+			enricher := portfolio.NewEnricher(
+				portfolio.NewTradingDBTokenLookup(tradingDB),
+				liveAlgosLTP,
+			)
+			portfolioHandler = handlers.NewPortfolioHandler(pfClient, enricher)
+			log.Printf("Portfolio gRPC client wired (%s) → /users/me/portfolio/* enabled", pfAddr)
+		}
+	}
+
 	// JWT verifier for the protected subrouter.
 	//
 	// PATTERN 4 (cached introspection) — bridge until Codifi shares the
@@ -381,7 +411,7 @@ func main() {
 	})
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, verifier, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
