@@ -53,10 +53,11 @@ scheduled for review; see "Under consideration" below.)
   positions in the UI. DB.1 replaced the SQL JOIN with a Go-side merge
   reading both authoritative DBs.
 
-**Zero-usage — safe to drop (DB.5, pending):**
+**Dropped 2026-07-13 (DB.5):**
 
 - `stockk_auth`
-- `stockk_trading` (see above)
+- `stockk_trading` (see DB.1 above; dump preserved in scratchpad
+  before drop, `stockk_trading_final_backup.dump`, ~125 KB pgcustom)
 - `trading_notifications`
 - `trading_orders`
 - `trading_platform`
@@ -68,9 +69,10 @@ scheduled for review; see "Under consideration" below.)
 - `odin_streamer` (same)
 - `user_login_db` (predecessor of the user-config service, now in `trading_db`)
 
-Grep across all Go source + `deployments/` + `.env*` finds ZERO references
-for any of these (only comment mentions of `stockk_auth` as a future
-placeholder in `services/trade-execution/internal/repository/grpc_credentials_repository.go:8,38`).
+Grep across all Go source + `deployments/` + `.env*` found ZERO references
+for any of these before drop. Only lingering mention was `stockk_auth` as
+a placeholder comment in
+`services/trade-execution/internal/repository/grpc_credentials_repository.go:8,38`.
 
 ## Renames DONE and considered
 
@@ -129,3 +131,7 @@ names.
   `"market_data"` message-type literals in trade-execution/marketws +
   data-ingestion/ws_monitor + oco/trailing + paper/market_client left
   intact — those are wire-protocol contracts, not DB references.
+- 2026-07-13: DB.5 — DROP DATABASE for 12 zero-usage DBs (list above).
+  Local Postgres now has exactly 6 DBs — the canonical map. Insurance
+  pg_dump of stockk_trading kept in session scratchpad; the other 11
+  were empty (zero rows), no dump needed.
