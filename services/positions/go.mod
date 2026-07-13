@@ -4,6 +4,7 @@ go 1.23.0
 
 require (
 	github.com/RohitIndira/Algo-Treading/api/proto/trade_execution v0.0.0
+	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.10.9
 	github.com/segmentio/kafka-go v0.4.47
 	go.uber.org/zap v1.27.0

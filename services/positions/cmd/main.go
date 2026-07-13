@@ -22,6 +22,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/consumer"
+	"github.com/RohitIndira/Algo-Treading/services/positions/internal/statemachine"
+	"github.com/RohitIndira/Algo-Treading/services/positions/internal/store"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/tradeexec"
 )
 
@@ -130,20 +132,25 @@ func main() {
 	defer func() { _ = tradeExecClient.Close() }()
 	logger.Info("trade-execution gRPC ready", zap.String("addr", tradeExecAddr))
 
-	// silence unused until P.C replaces LoggingHandler with the state-machine
-	// handler that consumes it
-	_ = tradeExecClient
+	// ── state machine handler (Chunk P.C) ──────────────────────────────
+	// Replaces P.B's LoggingHandler stub. Turns FILLED events into positions
+	// state transitions per §7 of docs/positions_service_design.md:
+	//   BUY  fill + LookupOrderMeta.Found  → INSERT MANTHAN row
+	//   BUY  fill + not found              → INSERT USER_MANUAL row
+	//   SELL fill + SL_SELL/EXIT metadata  → close specific lot by
+	//                                         entry_signal_id + realized_pnl
+	//   SELL fill + not found (manual)     → FIFO across ACTIVE lots
+	//                                         (USER_MANUAL first, spillover MANTHAN)
+	positionStore := store.New(db, logger)
+	stateMachine := statemachine.New(positionStore, tradeExecClient, logger)
 
 	// ── order.events consumer (Chunk P.B) ──────────────────────────────
-	// Log-only handler for now; P.C replaces with the state machine that
-	// enriches via LookupOrderMeta gRPC + writes positions + position_events.
-	//
 	// Set POSITIONS_START_FROM=FIRST to replay history from topic head on
 	// first boot (useful for local smoke tests against pre-existing events).
 	// Default is LastOffset — production-safe.
 	orderEventsConsumer := consumer.New(
 		consumer.Config{KafkaBrokers: brokers},
-		&consumer.LoggingHandler{Logger: logger},
+		stateMachine,
 		logger,
 		getEnv("POSITIONS_START_FROM", "LAST") == "FIRST",
 	)
@@ -164,8 +171,8 @@ func main() {
 	_ = driftWriter
 
 	logger.Info("positions svc ready",
-		zap.String("chunk", "P.B.5"),
-		zap.String("next", "P.C — state machine replaces LoggingHandler; realized_pnl computed"))
+		zap.String("chunk", "P.C"),
+		zap.String("next", "P.D — publish position.events on state transitions"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
