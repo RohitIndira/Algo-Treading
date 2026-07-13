@@ -32,7 +32,7 @@ by many writers" pattern that made pre-CQRS refactors risky.
 |-----------------------|------------------------------|--------------------------------------------------------------|------------------------------------------------------------|
 | `trading_db`          | rules-engine + user-config   | api-gateway (Manthan handler, live-algos store), rebalancer, hft-engine | Strategies + trade_configs (user-config); manthan_positions, manthan_cooldown, manthan_signal_decisions, manthan_portfolio_state (rules-engine) |
 | `execution_db`   | trade-execution + user-config (only writes user_credentials) | api-gateway (Manthan handler, live-algos store, portfolio token lookup), hft-engine | manthan_orders, manthan_order_events (trade-execution's audit trail); user_credentials |
-| `market_data`         | data-ingestion               | api-gateway (Manthan handler), rules-engine (via MANTHAN_SIGNALS_DB), rebalancer | Instruments, daily_ohlcv, manthan_signals, manthan_stocks, breakout_events |
+| `signals_db`         | data-ingestion               | api-gateway (Manthan handler), rules-engine (via MANTHAN_SIGNALS_DB), rebalancer | Instruments, daily_ohlcv, manthan_signals, manthan_stocks, breakout_events |
 | `positions_db`        | positions svc                | portfolio svc (via `positions_reader` role)                  | positions, position_events (CQRS query side for portfolio) |
 | `order_status_db`     | orderstatus svc              | (none yet)                                                    | broker_events (WSS + REST reconciler audit)                |
 | `stockk_market`       | (nothing in-code; populated by external ETL) | api-gateway (performance handler) | algo_performance_daily, benchmark_daily |
@@ -87,13 +87,18 @@ independent schema evolution).
 Python ETL script (`/tmp/perf_etl.py` — legacy). Long-term: fold into
 `signals_db`. Deferred behind the ETL rewrite.
 
-**Staging deploy note (DB.3):** the staging box still has the DB named
-`trading_execution`. To deploy this branch there, EITHER (a) run
-`ALTER DATABASE trading_execution RENAME TO execution_db;` on staging
-Postgres (requires no active connections — bounce services first), OR
-(b) set the appropriate DB-name env var in each service's
-ecosystem.config.js to `trading_execution` so the code still resolves
-the old name via the env-var override.
+**Staging deploy note (DB.3 + DB.4):** the staging box still has the DBs
+named `trading_execution` and `market_data`. To deploy this branch there,
+EITHER (a) run these on staging Postgres (requires no active
+connections — bounce services first):
+
+    ALTER DATABASE trading_execution RENAME TO execution_db;
+    ALTER DATABASE market_data       RENAME TO signals_db;
+
+OR (b) set the appropriate DB-name env var in each service's
+ecosystem.config.js to the old name so the code still resolves it via
+env-var override. Either way, no data movement is required — just the
+names.
 
 ## When you add a new service
 
@@ -120,3 +125,7 @@ the old name via the env-var override.
 - 2026-07-13: DB.3 — `trading_execution` renamed to `execution_db`. All
   service code defaults + `.env` files updated. Historical arch docs
   under `docs/architecture/` kept as-is (they describe pre-rename state).
+- 2026-07-13: DB.4 — `market_data` renamed to `signals_db`. WS-protocol
+  `"market_data"` message-type literals in trade-execution/marketws +
+  data-ingestion/ws_monitor + oco/trailing + paper/market_client left
+  intact — those are wire-protocol contracts, not DB references.

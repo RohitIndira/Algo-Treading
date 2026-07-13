@@ -15,7 +15,7 @@ import (
 // ManthanHandler serves aggregated data for the Manthan frontend page.
 //
 // Data lives across TWO Postgres databases:
-//   - market_data.manthan_signals     — today's eligible universe (written by
+//   - signals_db.manthan_signals     — today's eligible universe (written by
 //                                        data-ingestion/manthan-live)
 //   - trading_db.manthan_positions    — open positions with trailing-SL trail
 //                                        (written by rules-engine)
@@ -27,7 +27,7 @@ import (
 //       isin:{ISIN}         → {"nsecode":"13337", ...}   (ISIN → NSE token)
 //       market:nse:{token}  → {"ltp":916.15, ...}         (current LTP)
 type ManthanHandler struct {
-	signalsDB   *sql.DB       // market_data DB       — manthan_signals
+	signalsDB   *sql.DB       // signals_db DB       — manthan_signals
 	positionsDB *sql.DB       // trading_db DB        — manthan_positions, manthan_cooldown
 	ordersDB    *sql.DB       // execution_db DB — manthan_orders, manthan_order_events
 	redisClient *redis.Client // local Redis (EMA weights pub/sub)
@@ -199,7 +199,7 @@ func (h *ManthanHandler) GetOverview(w http.ResponseWriter, r *http.Request) {
 		resp.Totals.InCooldown = len(cooldowns)
 	}
 
-	// 2. Today's eligible signals (market_data) + taken/cooldown state join
+	// 2. Today's eligible signals (signals_db) + taken/cooldown state join
 	if h.signalsDB != nil {
 		signals, _ := h.loadTodaySignals(ctx)
 		cooldownSet := make(map[string]struct{}, len(resp.Cooldowns))

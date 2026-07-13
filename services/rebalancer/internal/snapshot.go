@@ -182,7 +182,7 @@ func LoadPortfolioSnapshot(
 }
 
 // LoadEligibleSignals reads today's eligible Manthan signals from
-// market_data.manthan_signals. Returns alphabetically by symbol so
+// signals_db.manthan_signals. Returns alphabetically by symbol so
 // rebalancer's tie-break matches Manthan's "alphabetical on exits" rule.
 func LoadEligibleSignals(ctx context.Context, marketDB *sql.DB) ([]EligibleSignal, error) {
 	rows, err := marketDB.QueryContext(ctx, `

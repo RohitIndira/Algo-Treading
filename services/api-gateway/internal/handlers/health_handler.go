@@ -39,7 +39,7 @@ import (
 // All probes run in parallel and have a 2-second hard timeout per component
 // — a slow dependency can't stall the health endpoint past ~2s.
 type HealthHandler struct {
-	signalsDB     *sql.DB // market_data
+	signalsDB     *sql.DB // signals_db
 	positionsDB   *sql.DB // trading_db
 	ordersDB      *sql.DB // execution_db
 	redisClient   *redis.Client
@@ -160,7 +160,7 @@ func (h *HealthHandler) Health(w http.ResponseWriter, r *http.Request) {
 // iteration order, so the JSON output is stable across calls.
 func (h *HealthHandler) eachDB() map[string]*sql.DB {
 	return map[string]*sql.DB{
-		"postgres_market_data":      h.signalsDB,
+		"postgres_signals_db":      h.signalsDB,
 		"postgres_trading_db":       h.positionsDB,
 		"postgres_execution_db": h.ordersDB,
 	}

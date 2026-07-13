@@ -56,7 +56,7 @@ type CurrentCapital struct {
 	Prices map[string]float64
 }
 
-// EligibleSignal is one row from market_data.manthan_signals (today only).
+// EligibleSignal is one row from signals_db.manthan_signals (today only).
 type EligibleSignal struct {
 	Symbol     string
 	ISIN       string

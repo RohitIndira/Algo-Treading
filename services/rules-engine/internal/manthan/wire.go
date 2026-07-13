@@ -35,14 +35,14 @@ type Deps struct {
 	ManthanDB *sql.DB
 
 	// Manthan signals source — a separate PostgreSQL connection because
-	// manthan_signals lives in market_data (today) / stockk_market (Phase 3).
+	// manthan_signals lives in signals_db (today) / stockk_market (Phase 3).
 	// Wire opens this connection itself; pass the postgres credentials.
 	PostgresHost     string
 	PostgresPort     string
 	PostgresUser     string
 	PostgresPassword string
 	PostgresSSLMode  string
-	SignalsDBName    string // env-driven, default "market_data"
+	SignalsDBName    string // env-driven, default "signals_db"
 
 	// Caches.
 	Redis *cache.RedisCache
@@ -143,7 +143,7 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 	// lives in a different DB from manthan_positions.
 	signalsDBName := deps.SignalsDBName
 	if signalsDBName == "" {
-		signalsDBName = "market_data"
+		signalsDBName = "signals_db"
 	}
 	if deps.PostgresHost != "" {
 		dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",

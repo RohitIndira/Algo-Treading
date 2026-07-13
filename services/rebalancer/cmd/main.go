@@ -2,7 +2,7 @@
 //
 // Reads:
 //   - user-config gRPC (active MANTHAN strategies + trade_configs + broker auth) — Phase 0.2 + 0.6a
-//   - market_data.manthan_signals (today's eligible signals; Phase 0.5 migrates to gRPC)
+//   - signals_db.manthan_signals (today's eligible signals; Phase 0.5 migrates to gRPC)
 //   - Indira broker (fund-limit + position-book + holdings, real capital)
 //   - Redis manthan:ema:allocations (today's per-index EMA targets)
 //   - trading_db.manthan_positions / manthan_cooldown / manthan_signal_decisions
@@ -62,7 +62,7 @@ func main() {
 	// match the current dev/staging layout; post-cutover both .env files
 	// will set TRADING_DB=stockk_trading and MARKET_DB=stockk_market.
 	tradingDBName := getEnv("TRADING_DB", "trading_db")
-	marketDBName := getEnv("MARKET_DB", "market_data")
+	marketDBName := getEnv("MARKET_DB", "signals_db")
 	tradingDB := mustOpen(logger, tradingDBName, buildDSN(tradingDBName))
 	defer tradingDB.Close()
 	marketDB := mustOpen(logger, marketDBName, buildDSN(marketDBName))

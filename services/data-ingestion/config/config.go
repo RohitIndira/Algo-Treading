@@ -72,7 +72,7 @@ type Config struct {
 
 	MongoConnectTimeout time.Duration
 
-	// PostgreSQL (market_data database for historical OHLCV)
+	// PostgreSQL (signals_db database for historical OHLCV)
 	PGHost     string
 	PGPort     int
 	PGUser     string
@@ -132,7 +132,7 @@ func Load() *Config {
 		PGPort:              pgPort,
 		PGUser:              getEnv("MARKET_DATA_DB_USER", "postgres"),
 		PGPassword:          getEnv("MARKET_DATA_DB_PASSWORD", "postgres"),
-		PGDatabase:          getEnv("MARKET_DATA_DB_NAME", "market_data"),
+		PGDatabase:          getEnv("MARKET_DATA_DB_NAME", "signals_db"),
 		PGSSLMode:           getEnv("MARKET_DATA_DB_SSLMODE", "disable"),
 	}
 }

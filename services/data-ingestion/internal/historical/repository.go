@@ -8,7 +8,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// Repository handles PostgreSQL operations for the market_data database.
+// Repository handles PostgreSQL operations for the signals_db database.
 type Repository struct {
 	db     *sql.DB
 	logger *zap.Logger

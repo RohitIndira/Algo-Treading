@@ -123,9 +123,9 @@ func main() {
 
 	// Initialize Manthan handler — Manthan data is split across two Postgres DBs:
 	//
-	//   MANTHAN_SIGNALS_DB   — holds market_data.manthan_signals
+	//   MANTHAN_SIGNALS_DB   — holds signals_db.manthan_signals
 	//                          (written by data-ingestion / manthan-live).
-	//                          Default: market_data.
+	//                          Default: signals_db.
 	//   MANTHAN_POSITIONS_DB — holds trading_db.manthan_positions
 	//                          and trading_db.manthan_cooldown
 	//                          (written by the rules-engine publisher).
@@ -152,7 +152,7 @@ func main() {
 		pgUser := envOr("POSTGRES_USER", "postgres")
 		pgPass := envOr("POSTGRES_PASSWORD", "postgres")
 		pgSSL := envOr("POSTGRES_SSLMODE", "disable")
-		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "market_data")
+		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "signals_db")
 		positionsDBName = envOr("MANTHAN_POSITIONS_DB", "trading_db")
 		ordersDBName = envOr("MANTHAN_ORDERS_DB", "execution_db")
 		perfDBName := envOr("MANTHAN_PERF_DB", "stockk_market")

@@ -27,7 +27,7 @@ set -e
 DBS=(
     # dbname             # owner service (writer)
     "execution_db   trade-execution"
-    "market_data         data-ingestion"
+    "signals_db         data-ingestion"
     "positions_db        positions"
     "order_status_db     orderstatus"
 )
