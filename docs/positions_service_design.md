@@ -195,7 +195,11 @@ Cross-DB FK isn't enforceable (rules-engine's `trading_db` vs positions svc's `p
 
 ### 5.2 Topics produced
 
-**New topic:** `position.events`, partition key = `position_id`
+**Two new topics:**
+- `position.events` — lifecycle events (partition key = `position_id`)
+- `positions.drift.detected` — reconciler drift alerts (partition key = `user_id`); see §11 Q2 for payload
+
+**`position.events`** partition key = `position_id`
 
 ```json
 {
@@ -404,11 +408,63 @@ Default in this doc: USER_MANUAL positions get sold FIRST (FIFO), spillover hits
 
 Recommend keeping default. User-friendly for accounting: your manual trades sell out first, your algo positions stay intact unless you sell "into" them.
 
-### Q2 — Same broker holding, split origins — how do we survive a broker restart / re-auth?
+### Q2 — Drift detection between our DB and broker — RATIFIED 2026-07-13
 
-If broker resets holdings view on relogin and we get a `GetHoldings` response showing only NET qty, we can't tell which origin is which. Our DB is source of truth for the split.
+**Decision: NEVER auto-fix. Publish drift events to a dedicated Kafka topic.**
 
-**Reconciler behavior:** if DB positions sum ≠ broker holdings, log alert but DON'T auto-adjust. Human intervention needed. (Same as safety_monitor's "don't liquidate on drift" lesson.)
+If broker's `GetHoldings` returns `net_qty` for a symbol that differs from
+`SUM(quantity)` across our ACTIVE positions for that (user, symbol),
+positions svc publishes ONE event to a new topic:
+
+**New Kafka topic:** `positions.drift.detected` (partition key = `user_id`)
+
+Payload:
+```json
+{
+  "event_id":            "01H8...",
+  "event_type":          "POSITION_DRIFT",
+  "detected_at_ms":      1783576973805,
+  "user_id":             "S4450",
+  "symbol":              "SBI",
+  "our_qty":             30,
+  "broker_qty":          25,
+  "drift_qty":           5,           // our_qty - broker_qty (positive = we have MORE than broker)
+  "our_lots": [
+    {"position_id": "pos-abc-1", "origin": "MANTHAN",     "quantity": 20, "entry_price": 500.0, "signal_id": "sig-1"},
+    {"position_id": "pos-abc-2", "origin": "USER_MANUAL", "quantity": 10, "entry_price": 510.0, "signal_id": null}
+  ],
+  "reconciler_run_at_ms": 1783576973000,
+  "severity":            "WARNING"    // or "CRITICAL" if |drift_qty| > threshold (default 10 shares OR ₹10k value)
+}
+```
+
+**Consumers of `positions.drift.detected`:**
+
+| Consumer | What it does |
+|---|---|
+| notification svc (future) | Sends user + ops alert (Slack / email / push) |
+| ops dashboard (future) | Displays open drifts, lets ops person mark resolved |
+| rules-engine (later, optional) | Can halt Manthan trading for the user until drift resolved |
+
+**Positions svc itself does NOT mutate any position row on drift.** It only
+observes + publishes. All corrective action is a downstream decision (human
+via ops, or automated via a dedicated corp-action processor if that pipeline
+is later built). Same lesson as the safety_monitor 2026-06-12 liquidation:
+never let a reconciler destroy real state.
+
+**Emission rules to prevent spam:**
+- Emit ONE event per (user_id, symbol) drift per reconciler run
+- Dedup with 60-second in-memory cache: same drift within 60s → don't re-emit
+- On drift RESOLUTION (DB matches broker again), emit a `POSITION_DRIFT_RESOLVED` event
+
+**Threshold config** (env vars):
+- `POSITIONS_DRIFT_WARN_QTY` — default 1 (any drift ≥ 1 share = WARNING)
+- `POSITIONS_DRIFT_CRIT_QTY` — default 10
+- `POSITIONS_DRIFT_CRIT_VALUE_INR` — default 10000
+
+**Cadence:**
+- Reconciler checks drift once per Layer 3 pass (every 5min)
+- Also on-demand: manual GET `/reconcile?user_id=X` endpoint for ops
 
 ### Q3 — Top-up: same user BUYs more IDEA via Manthan — RATIFIED 2026-07-13
 
@@ -444,11 +500,16 @@ Grepped: after e467fd2, rules-engine's `publisher.go` no longer writes `manthan_
 
 ### Q5 — When does positions svc become the AUTHORITATIVE writer for `manthan_positions`?
 
-Suggested cutover:
-1. Deploy positions svc reading `order.events`
-2. Verify positions_db.positions matches trading_db.manthan_positions for 1 trading day
-3. Flip rules-engine's `PortfolioManager.RehydrateActivePositions` to read from positions_db instead
-4. Retire trading_db.manthan_positions (or keep as archive)
+**Decision 2026-07-13: deferred — decide at deploy time.**
+
+Positions svc's writer path is coded and shipping. When to flip the rest of
+the system (rules-engine's `PortfolioManager.RehydrateActivePositions`,
+frontend read paths) to trust `positions_db` over `trading_db.manthan_positions`
+is a deploy-time decision, not a code-time one. Options remain open:
+shadow-mode, parallel-run, immediate cutover, or dual-write indefinitely.
+
+Decide when the code is ready + you can see how positions_db actually
+behaves on real data.
 
 ## 12. Sign-off checklist before P.A starts
 
