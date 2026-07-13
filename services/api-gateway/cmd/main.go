@@ -323,13 +323,24 @@ func main() {
 		})
 		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		if err := ltpClient.Ping(pCtx).Err(); err != nil {
-			log.Printf("Warning: LTP redis ping (%s) failed: %v (details endpoints degrade to zero LTP)", ltpAddr, err)
-			_ = ltpClient.Close()
+			log.Printf("Warning: LTP redis ping (%s) failed: %v (details endpoints report ltpStatus=UNAVAILABLE until probe recovers)", ltpAddr, err)
+			// Keep the client + store around so the runtime probe can
+			// flip HEALTHY if the tunnel comes back — no need to bounce
+			// api-gateway. See livealgos.LTPStore.Start.
+			liveAlgosLTP = livealgos.NewLTPStore(ltpClient)
 		} else {
 			log.Printf("Live-algos LTP redis connected (%s)", ltpAddr)
-			defer ltpClient.Close()
 			liveAlgosLTP = livealgos.NewLTPStore(ltpClient)
+			liveAlgosLTP.MarkHealthy(true) // seed healthy before Start's first tick
 		}
+		defer ltpClient.Close()
+		// Start the 5s probe. Detects silent tunnel half-close per
+		// reference_ltp_tunnel_silent_fail — a single failing PING
+		// flips the store UNAVAILABLE so subsequent responses carry
+		// ltpStatus=UNAVAILABLE instead of returning 0 LTPs.
+		probeCtx, probeCancel := context.WithCancel(context.Background())
+		defer probeCancel()
+		go liveAlgosLTP.Start(probeCtx, 5*time.Second)
 		pCancel()
 	}
 

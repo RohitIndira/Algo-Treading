@@ -207,21 +207,25 @@ func (h *LiveAlgosHandler) GetStrategyDetails(w http.ResponseWriter, r *http.Req
 	}
 
 	// LTP: only for ACTIVE positions with a resolved exchange_token.
-	// Degrade gracefully if the tunnel is temporarily down — response
-	// still renders positions, just with 0 LTP (frontend can show a
-	// stale-marker on those cards).
+	// The store reports HEALTHY/UNAVAILABLE and BuildDetails renders
+	// `ltpStatus` on the response so the UI can display "—" (never 0)
+	// when the tunnel is down.
 	tokens := collectActiveTokens(positions)
-	var ltps map[string]livealgos.LTPQuote
-	if len(tokens) > 0 {
-		ltps, err = h.ltp.FetchByTokens(r.Context(), tokens)
-		if err != nil {
-			log.Printf("livealgos: LTP fetch failed (rendering without): %v", err)
-			ltps = nil
-		}
+	var (
+		ltps      map[string]livealgos.LTPQuote
+		ltpStatus = livealgos.StatusHealthy
+	)
+	if len(tokens) > 0 && h.ltp != nil {
+		ltps, ltpStatus = h.ltp.FetchByTokens(r.Context(), tokens)
+	} else if h.ltp == nil {
+		// LTP subsystem wasn't wired at boot (Redis was down then) —
+		// stay explicit rather than pretending healthy.
+		ltpStatus = livealgos.StatusUnavailable
 	}
 
 	algoID, algoName := resolveAlgoMeta(h.catalog, meta.StrategyType)
 	payload := livealgos.BuildDetails(meta, positions, ltps, algoID, algoName)
+	payload.LTPStatus = string(ltpStatus)
 	respondIndiraOK(w, payload)
 }
 
@@ -259,13 +263,19 @@ func (h *LiveAlgosHandler) GetHoldings(w http.ResponseWriter, r *http.Request) {
 
 	active := filterByStatus(positions, "ACTIVE")
 	tokens := collectTokens(active)
-	ltps, err := h.ltp.FetchByTokens(r.Context(), tokens)
-	if err != nil {
-		log.Printf("livealgos: holdings LTP (rendering without): %v", err)
-		ltps = nil
+	var (
+		ltps      map[string]livealgos.LTPQuote
+		ltpStatus = livealgos.StatusHealthy
+	)
+	if len(tokens) > 0 && h.ltp != nil {
+		ltps, ltpStatus = h.ltp.FetchByTokens(r.Context(), tokens)
+	} else if h.ltp == nil {
+		ltpStatus = livealgos.StatusUnavailable
 	}
 
-	respondIndiraOK(w, livealgos.BuildHoldings(active, ltps))
+	payload := livealgos.BuildHoldings(active, ltps)
+	payload.LTPStatus = string(ltpStatus)
+	respondIndiraOK(w, payload)
 }
 
 // GetTrades handles GET /users/me/live-algos/{strategyId}/trades.
