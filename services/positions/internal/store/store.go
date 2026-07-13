@@ -78,6 +78,34 @@ func (s *Store) FindActiveLotsFIFO(ctx context.Context, userID, symbol string) (
 	return out, rows.Err()
 }
 
+// FindAllActiveLotsForUser returns every ACTIVE lot (both MANTHAN + USER_MANUAL)
+// for one user. Used by the reconciler (Chunk P.G) to compare against broker
+// holdings; the reconciler groups by symbol itself.
+//
+// Ordered by (symbol, entry_time) so callers walking output stay deterministic.
+func (s *Store) FindAllActiveLotsForUser(ctx context.Context, userID string) ([]*Position, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+positionColumns+`
+		FROM positions
+		WHERE user_id = $1
+		  AND status  = 'ACTIVE'
+		ORDER BY symbol ASC, entry_time ASC`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("FindAllActiveLotsForUser query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Position
+	for rows.Next() {
+		pos, err := scanPosition(rows)
+		if err != nil {
+			return nil, fmt.Errorf("FindAllActiveLotsForUser scan: %w", err)
+		}
+		out = append(out, pos)
+	}
+	return out, rows.Err()
+}
+
 // PositionExistsForEntry returns true if we've already INSERTed a position
 // row for this BUY broker_order_id — the idempotency check on the BUY path.
 // Kafka may replay the same FILLED event; without this we'd double-insert.

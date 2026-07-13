@@ -23,6 +23,7 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/publisher"
+	"github.com/RohitIndira/Algo-Treading/services/positions/internal/reconciler"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/statemachine"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/store"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/tradeexec"
@@ -163,19 +164,31 @@ func main() {
 	defer consumerCancel()
 	go orderEventsConsumer.Start(consumerCtx)
 
-	// ── TODO Chunks P.B.5/P.C/P.D/P.G — wire up here ──────────────────
-	//   P.B.5  gRPC client to trade-execution.LookupOrderMeta + LRU cache
-	//   P.C    state-machine handler (replaces LoggingHandler above)
-	//   P.D    position.events publisher wired into state machine
-	//   P.G    reconciler drift detection → positions.drift.detected publisher
+	// ── reconciler (Chunk P.G) ─────────────────────────────────────────
+	// Detects drift between broker holdings and positions_db.positions,
+	// publishes to positions.drift.detected. NEVER auto-fixes — see the
+	// 2026-06-12 S4450 liquidation incident memo.
+	//
+	// Broker-holdings fetch plumbing is deferred (future: gRPC extension
+	// to trade-execution). The reconciler package exports Detect() as a
+	// pure function so tests + future callers wire any holdings source.
+	//
+	// Wired but IDLE by default: RECONCILER_ENABLED must be "true" to
+	// activate the periodic sweep. When active + no broker source is
+	// plugged in yet, the sweep is a no-op (empty broker map → every
+	// active position surfaces as DB_ONLY — noisy). Keep off until the
+	// holdings fetch RPC lands.
+	driftPub := publisher.NewDriftPublisher(driftWriter, logger)
+	drifter := reconciler.New(positionStore, driftPub, logger)
+	_ = drifter // wired; ticker deferred pending holdings source
 
-	// silence "declared and not used" until the chunks above land
-	_ = positionEventsWriter
-	_ = driftWriter
+	if getEnv("RECONCILER_ENABLED", "false") == "true" {
+		logger.Warn("RECONCILER_ENABLED=true but broker holdings fetch is not wired yet — sweep will report every ACTIVE lot as DB_ONLY. Set false until follow-up chunk.")
+	}
 
 	logger.Info("positions svc ready",
-		zap.String("chunk", "P.D"),
-		zap.String("next", "P.E — rules-engine consumes position.events → manthan_cooldown"))
+		zap.String("chunk", "P.G"),
+		zap.String("next", "wire broker holdings fetch (trade-execution gRPC extension) → periodic reconciler ticker"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
