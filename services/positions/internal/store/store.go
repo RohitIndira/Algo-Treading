@@ -106,6 +106,34 @@ func (s *Store) FindAllActiveLotsForUser(ctx context.Context, userID string) ([]
 	return out, rows.Err()
 }
 
+// DistinctUsersWithActive returns the set of user_ids that have at least
+// one ACTIVE lot in positions_db. Used by the reconciler ticker to decide
+// whose broker holdings to fetch each sweep — users with nothing at stake
+// don't need a round-trip.
+//
+// Order is stable (alphabetical) so log lines across sweeps stay comparable.
+func (s *Store) DistinctUsersWithActive(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT user_id
+		FROM positions
+		WHERE status = 'ACTIVE'
+		ORDER BY user_id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("DistinctUsersWithActive query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, fmt.Errorf("DistinctUsersWithActive scan: %w", err)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 // PositionExistsForEntry returns true if we've already INSERTed a position
 // row for this BUY broker_order_id — the idempotency check on the BUY path.
 // Kafka may replay the same FILLED event; without this we'd double-insert.

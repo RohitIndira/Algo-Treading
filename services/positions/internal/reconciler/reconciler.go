@@ -13,6 +13,7 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/store"
@@ -26,6 +27,19 @@ type PositionSource interface {
 	FindAllActiveLotsForUser(ctx context.Context, userID string) ([]*store.Position, error)
 }
 
+// UsersSource returns the set of users to sweep each tick. The store's
+// DistinctUsersWithActive satisfies this — one row per user_id with an
+// ACTIVE lot.
+type UsersSource interface {
+	DistinctUsersWithActive(ctx context.Context) ([]string, error)
+}
+
+// HoldingsFetcher fetches the broker's per-symbol delivery quantity for
+// one user. The tradeexec gRPC client satisfies this via GetBrokerHoldings.
+type HoldingsFetcher interface {
+	GetBrokerHoldings(ctx context.Context, userID string) (map[string]int, error)
+}
+
 // DriftEmitter is the fan-out surface. *publisher.DriftPublisher satisfies
 // this; tests plug a capturing stub.
 type DriftEmitter interface {
@@ -33,16 +47,122 @@ type DriftEmitter interface {
 }
 
 // Reconciler is stateless — one instance can be reused across all users.
+// Sweep-scoped state (list of users this tick, one user's holdings) lives
+// on the stack per RunTicker iteration.
 type Reconciler struct {
-	store  PositionSource
-	drift  DriftEmitter
-	logger *zap.Logger
+	store    PositionSource
+	users    UsersSource
+	holdings HoldingsFetcher
+	drift    DriftEmitter
+	logger   *zap.Logger
 }
 
-// New wires the reconciler. Both dependencies may be nil for smoke tests
-// that only exercise Detect() (the pure function).
+// New wires the reconciler for per-user Detect/DetectAndPublish only.
+// Enough for tests + one-off invocations. See NewWithTicker for periodic
+// sweeps that also need UsersSource + HoldingsFetcher.
 func New(src PositionSource, emitter DriftEmitter, logger *zap.Logger) *Reconciler {
 	return &Reconciler{store: src, drift: emitter, logger: logger}
+}
+
+// NewWithTicker wires the reconciler for periodic sweeps. All four
+// dependencies must be non-nil for RunTicker to do anything.
+func NewWithTicker(
+	src PositionSource,
+	users UsersSource,
+	holdings HoldingsFetcher,
+	emitter DriftEmitter,
+	logger *zap.Logger,
+) *Reconciler {
+	return &Reconciler{store: src, users: users, holdings: holdings, drift: emitter, logger: logger}
+}
+
+// RunTicker sweeps every user with ACTIVE positions once per interval,
+// fetches broker holdings, and publishes drift events. Blocks until ctx
+// is cancelled. Safe to call once — spawns no goroutines of its own.
+//
+// Per-user error handling:
+//   - Auth-lookup or broker-fetch failure ⇒ SKIP the user this tick. We
+//     never publish false BROKER_ONLY / DB_ONLY drifts on transient
+//     failure — the drift topic must be trustworthy for the ops human.
+//   - Store failure listing users ⇒ log + skip the whole tick.
+//
+// Returns immediately (with a warn) if the three periodic-sweep deps
+// weren't wired via NewWithTicker — supports the "enabled but no
+// holdings source" boot path in main.go.
+func (r *Reconciler) RunTicker(ctx context.Context, interval time.Duration) {
+	if r.users == nil || r.holdings == nil {
+		if r.logger != nil {
+			r.logger.Warn("reconciler.RunTicker: users or holdings source missing — no-op")
+		}
+		return
+	}
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	if r.logger != nil {
+		r.logger.Info("reconciler ticker started", zap.Duration("interval", interval))
+		defer r.logger.Info("reconciler ticker stopped")
+	}
+
+	// Kick one sweep immediately so ops sees drift within seconds of boot,
+	// not after the first interval.
+	r.sweepOnce(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.sweepOnce(ctx)
+		}
+	}
+}
+
+// sweepOnce runs one full drift-detection pass over all users with ACTIVE
+// positions. Exposed as a method (not inlined into RunTicker) so tests can
+// drive one iteration deterministically.
+func (r *Reconciler) sweepOnce(ctx context.Context) {
+	users, err := r.users.DistinctUsersWithActive(ctx)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("reconciler sweep: list users failed — skipping tick",
+				zap.Error(err))
+		}
+		return
+	}
+
+	var totalDrifts, skippedUsers int
+	for _, uid := range users {
+		holdings, err := r.holdings.GetBrokerHoldings(ctx, uid)
+		if err != nil {
+			skippedUsers++
+			if r.logger != nil {
+				r.logger.Warn("reconciler sweep: broker fetch failed — skipping user",
+					zap.String("user_id", uid), zap.Error(err))
+			}
+			continue
+		}
+		n, err := r.DetectAndPublish(ctx, uid, holdings)
+		if err != nil {
+			if r.logger != nil {
+				r.logger.Warn("reconciler sweep: DetectAndPublish failed",
+					zap.String("user_id", uid), zap.Error(err))
+			}
+			continue
+		}
+		totalDrifts += n
+	}
+
+	if r.logger != nil {
+		r.logger.Info("reconciler sweep complete",
+			zap.Int("users_scanned", len(users)),
+			zap.Int("users_skipped", skippedUsers),
+			zap.Int("total_drifts", totalDrifts))
+	}
 }
 
 // DetectAndPublish is the main entry point per user. Loads ACTIVE lots,

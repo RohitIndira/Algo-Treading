@@ -8,6 +8,7 @@ package reconciler
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/publisher"
@@ -242,6 +243,122 @@ func TestDetectAndPublish_EmitsOneEventPerDrift(t *testing.T) {
 		}
 	}
 }
+
+// -------------------------------------------------------------------------
+// sweepOnce — periodic tick behavior
+// -------------------------------------------------------------------------
+
+// stubUsers records DistinctUsersWithActive calls + returns a fixed set.
+type stubUsers struct {
+	users []string
+	err   error
+	calls int
+}
+
+func (s *stubUsers) DistinctUsersWithActive(_ context.Context) ([]string, error) {
+	s.calls++
+	return s.users, s.err
+}
+
+// stubHoldings returns a per-user holdings map. err by userID lets tests
+// mimic a broker fetch that succeeds for user A but fails for user B.
+type stubHoldings struct {
+	byUser  map[string]map[string]int
+	errByID map[string]error
+	calls   int
+}
+
+func (s *stubHoldings) GetBrokerHoldings(_ context.Context, userID string) (map[string]int, error) {
+	s.calls++
+	if e, ok := s.errByID[userID]; ok {
+		return nil, e
+	}
+	return s.byUser[userID], nil
+}
+
+// perUserSource routes FindAllActiveLotsForUser by userID.
+type perUserSource struct {
+	byUser map[string][]*store.Position
+}
+
+func (p *perUserSource) FindAllActiveLotsForUser(_ context.Context, userID string) ([]*store.Position, error) {
+	return p.byUser[userID], nil
+}
+
+func TestSweepOnce_FetchFailureDoesNotPublishFalseDrift(t *testing.T) {
+	// User has one MANTHAN lot for SBI at qty=20. If the reconciler
+	// interpreted a fetch failure as "broker has nothing", it would
+	// publish a false DB_ONLY drift. That must NOT happen.
+	src := &perUserSource{byUser: map[string][]*store.Position{
+		"S4450": {mkPos(store.OriginManthan, "SBI", 20)},
+	}}
+	users := &stubUsers{users: []string{"S4450"}}
+	holdings := &stubHoldings{errByID: map[string]error{
+		"S4450": fmt.Errorf("indira 401"),
+	}}
+	emitter := &capturingEmitter{}
+	logger, _ := zap.NewDevelopment()
+
+	r := NewWithTicker(src, users, holdings, emitter, logger)
+	r.sweepOnce(context.Background())
+
+	if users.calls != 1 {
+		t.Errorf("users.calls: got %d, want 1", users.calls)
+	}
+	if holdings.calls != 1 {
+		t.Errorf("holdings.calls: got %d, want 1", holdings.calls)
+	}
+	if len(emitter.events) != 0 {
+		t.Errorf("published %d drift events on broker fetch failure — must be 0: %+v",
+			len(emitter.events), emitter.events)
+	}
+}
+
+func TestSweepOnce_MultiUserAllOK(t *testing.T) {
+	src := &perUserSource{byUser: map[string][]*store.Position{
+		"S4450": {mkPos(store.OriginManthan, "SBI", 20)},
+		"U0001": {mkPos(store.OriginUserManual, "IDEA", 100)},
+	}}
+	users := &stubUsers{users: []string{"S4450", "U0001"}}
+	holdings := &stubHoldings{byUser: map[string]map[string]int{
+		"S4450": {"SBI": 20},        // aligned → 0 drifts
+		"U0001": {"IDEA": 90},       // qty mismatch → 1 drift
+	}}
+	emitter := &capturingEmitter{}
+	r := NewWithTicker(src, users, holdings, emitter, nil)
+
+	r.sweepOnce(context.Background())
+
+	if holdings.calls != 2 {
+		t.Errorf("expected holdings fetched for both users, got %d", holdings.calls)
+	}
+	if len(emitter.events) != 1 {
+		t.Fatalf("want 1 drift (U0001 IDEA), got %d: %+v", len(emitter.events), emitter.events)
+	}
+	if emitter.events[0].UserID != "U0001" || emitter.events[0].Symbol != "IDEA" {
+		t.Errorf("wrong drift: got %+v", emitter.events[0])
+	}
+}
+
+func TestSweepOnce_UsersFetchFailureNoOp(t *testing.T) {
+	users := &stubUsers{err: fmt.Errorf("db down")}
+	holdings := &stubHoldings{}
+	emitter := &capturingEmitter{}
+	r := NewWithTicker(&perUserSource{}, users, holdings, emitter, nil)
+
+	r.sweepOnce(context.Background())
+
+	if holdings.calls != 0 {
+		t.Errorf("holdings must not be called when users listing fails, got %d", holdings.calls)
+	}
+	if len(emitter.events) != 0 {
+		t.Errorf("published %d events on users-fetch failure — must be 0", len(emitter.events))
+	}
+}
+
+// -------------------------------------------------------------------------
+// DetectAndPublish (rest of old tests)
+// -------------------------------------------------------------------------
 
 func TestDetectAndPublish_NoDriftEmitsNothing(t *testing.T) {
 	src := &stubSource{lots: []*store.Position{

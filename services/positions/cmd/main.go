@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -164,31 +165,40 @@ func main() {
 	defer consumerCancel()
 	go orderEventsConsumer.Start(consumerCtx)
 
-	// ── reconciler (Chunk P.G) ─────────────────────────────────────────
-	// Detects drift between broker holdings and positions_db.positions,
-	// publishes to positions.drift.detected. NEVER auto-fixes — see the
-	// 2026-06-12 S4450 liquidation incident memo.
+	// ── reconciler ticker (Chunk P.G.2) ────────────────────────────────
+	// Every RECONCILER_INTERVAL_SEC (default 300s = 5 min), for each user
+	// with ACTIVE positions:
+	//   1. fetch broker delivery holdings via tradeExecClient.GetBrokerHoldings
+	//   2. call reconciler.DetectAndPublish → publishes to positions.drift.detected
 	//
-	// Broker-holdings fetch plumbing is deferred (future: gRPC extension
-	// to trade-execution). The reconciler package exports Detect() as a
-	// pure function so tests + future callers wire any holdings source.
+	// NEVER auto-fixes drift — the 2026-06-12 S4450 liquidation incident
+	// memo shows why any auto-remediation on positions is a foot-gun.
 	//
-	// Wired but IDLE by default: RECONCILER_ENABLED must be "true" to
-	// activate the periodic sweep. When active + no broker source is
-	// plugged in yet, the sweep is a no-op (empty broker map → every
-	// active position surfaces as DB_ONLY — noisy). Keep off until the
-	// holdings fetch RPC lands.
+	// Gated by RECONCILER_ENABLED (default "false") so operators can
+	// disable during noisy startup periods (e.g. mid-day deploys where
+	// broker holdings snapshot hasn't stabilised).
 	driftPub := publisher.NewDriftPublisher(driftWriter, logger)
-	drifter := reconciler.New(positionStore, driftPub, logger)
-	_ = drifter // wired; ticker deferred pending holdings source
+	drifter := reconciler.NewWithTicker(
+		positionStore,
+		positionStore,
+		tradeExecClient,
+		driftPub,
+		logger,
+	)
 
 	if getEnv("RECONCILER_ENABLED", "false") == "true" {
-		logger.Warn("RECONCILER_ENABLED=true but broker holdings fetch is not wired yet — sweep will report every ACTIVE lot as DB_ONLY. Set false until follow-up chunk.")
+		interval := parseIntervalSec(getEnv("RECONCILER_INTERVAL_SEC", "300"))
+		reconcilerCtx, reconcilerCancel := context.WithCancel(context.Background())
+		defer reconcilerCancel()
+		go drifter.RunTicker(reconcilerCtx, interval)
+		logger.Info("reconciler ticker started", zap.Duration("interval", interval))
+	} else {
+		logger.Info("reconciler ticker OFF (set RECONCILER_ENABLED=true to activate)")
 	}
 
 	logger.Info("positions svc ready",
-		zap.String("chunk", "P.G"),
-		zap.String("next", "wire broker holdings fetch (trade-execution gRPC extension) → periodic reconciler ticker"))
+		zap.String("chunk", "P.G.2"),
+		zap.String("next", "notification svc + portfolio svc"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
@@ -209,6 +219,17 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseIntervalSec returns a Duration from a stringified seconds value.
+// Falls back to 5 minutes on parse failure / non-positive input — better
+// to run a safe default than to crash boot on a stray env var.
+func parseIntervalSec(s string) time.Duration {
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(n) * time.Second
 }
 
 func splitCsv(s string) []string {

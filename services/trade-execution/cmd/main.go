@@ -538,6 +538,22 @@ func main() {
 	// here — grpcServer.Start is much later (line ~756), no RPC race.
 	grpcServer.SetManthanRepo(manthan.NewRepository(db.DB))
 
+	// Wire the holdings provider so GetBrokerHoldings (positions svc
+	// reconciler ticker) can fetch a user's Indira delivery holdings.
+	// Nil-guard: manthan disabled ⇒ no BrokerAdapter, RPC returns Unavailable.
+	if manthanModule != nil && manthanModule.BrokerAdapter != nil && manthanModule.AuthProvider != nil {
+		brokerAdapter := manthanModule.BrokerAdapter
+		authProvider := manthanModule.AuthProvider
+		grpcServer.SetHoldingsProvider(func(ctx context.Context, userID string) (map[string]int, error) {
+			auth := authProvider(userID)
+			if auth == nil {
+				return nil, fmt.Errorf("auth lookup failed for user %s", userID)
+			}
+			return brokerAdapter.GetEffectiveHoldings(ctx, *auth)
+		})
+		log.Println("✓ GetBrokerHoldings RPC wired (positions svc reconciler)")
+	}
+
 	if manthanModule != nil {
 		// Bridge AU004 detections to the frontend live-orders WebSocket.
 		// The notifier handles the Kafka publish + dedup; this hook reuses the

@@ -43,6 +43,21 @@ service TradeExecutionService {
   // via broker app). Positions svc treats that as USER_MANUAL origin.
   rpc LookupOrderMeta(LookupOrderMetaRequest) returns (LookupOrderMetaResponse);
 
+  // GetBrokerHoldings — returns a per-symbol net delivery quantity map for
+  // the user's Indira account.
+  //
+  // Consumed by positions svc reconciler (Chunk P.G) every ~5 minutes to
+  // compare against positions_db.positions and publish drift to
+  // positions.drift.detected. Never auto-fixes — see the 2026-06-12 S4450
+  // liquidation incident.
+  //
+  // Implementation delegates to BrokerAdapter.GetEffectiveHoldings, which
+  // is freeQty-safe: it sums position-book NetQty (CNC delivery rows,
+  // MIS/intraday filtered out) + holdings.Qty. That combination gives the
+  // true delivery quantity regardless of pledge/T+0 lock state — see
+  // broker_adapter.go:848-931.
+  rpc GetBrokerHoldings(GetBrokerHoldingsRequest) returns (GetBrokerHoldingsResponse);
+
   // Health check
   rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
 }
@@ -374,4 +389,23 @@ message LookupOrderMetaResponse {
   // Optional error detail when found=false due to non-NOT_FOUND reason
   // (DB unreachable etc.). NOT_FOUND itself sets found=false with nil error.
   common.Error error           = 8;
+}
+
+// GetBrokerHoldings — per-user snapshot of Indira delivery holdings.
+// Consumed by positions svc reconciler (Chunk P.G).
+message GetBrokerHoldingsRequest {
+  string user_id = 1;
+}
+
+message GetBrokerHoldingsResponse {
+  // success=false → auth lookup / broker fetch failed. Positions svc must
+  // skip this user's sweep (NOT publish false BROKER_ONLY drifts).
+  bool success = 1;
+
+  // Per-symbol net delivery quantity. Keys are uppercased NSE dispSyms
+  // ("KINGFA"), matching BrokerAdapter.GetEffectiveHoldings' convention.
+  // Empty map = user has zero delivery holdings (a real, valid state).
+  map<string, int32> holdings = 2;
+
+  common.Error error = 3;
 }

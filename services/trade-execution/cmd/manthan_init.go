@@ -32,6 +32,11 @@ type ManthanModule struct {
 	InboxWorker         *manthan.InboxWorker               // drains signal_inbox (transactional inbox)
 	ArmRetryWorker      *manthan.ArmRetryWorker            // Layer 4: drains manthan_arm_retries on re-login
 	OrderEventsConsumer *manthan.OrderEventsConsumer       // Kafka reader for order.events from orderstatus svc (Chunk E)
+
+	// AuthProvider — the same per-user credentials closure used internally
+	// by all handlers. Exposed so main.go can compose it with BrokerAdapter
+	// for the gRPC GetBrokerHoldings RPC (positions svc reconciler consumer).
+	AuthProvider func(userID string) *manthan.BrokerAuth
 }
 
 // InitManthan initializes all Manthan order execution components.
@@ -318,6 +323,7 @@ func InitManthan(
 		JWTNotifier:      jwtNotifier,
 		ArmRetryWorker:      armRetryWorker,
 		OrderEventsConsumer: orderEventsConsumer,
+		AuthProvider:        getAuth,
 	}
 }
 
