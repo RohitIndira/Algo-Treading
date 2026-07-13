@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package portfolio;
+
+import "api/proto/common/common.proto";
+
+option go_package = "github.com/RohitIndira/Algo-Treading/api/proto/portfolio";
+
+// Portfolio Service — read-only query surface for the UI's portfolio pages.
+// See docs/portfolio_service_design.md.
+//
+// api-gateway proxies to this service; UI never talks directly. api-gateway
+// enriches the responses with LTP + unrealized_pnl before returning to the
+// browser (§3 of the design doc).
+service PortfolioService {
+  // GetPortfolioSummary — one-shot rollup for the summary card.
+  //   invested / realized (lifetime + today) / active + closed counts /
+  //   MANTHAN vs USER_MANUAL invested split.
+  // Unrealized P&L is api-gateway's to add.
+  rpc GetPortfolioSummary(GetPortfolioSummaryRequest) returns (GetPortfolioSummaryResponse);
+
+  // GetActivePositions — every ACTIVE lot for the user, entry_time ASC.
+  // Sort matches the FIFO exit rule in §7.2 of positions_service_design.md.
+  rpc GetActivePositions(GetActivePositionsRequest) returns (GetActivePositionsResponse);
+
+  // GetClosedPositions — paginated EXITED lots, exit_time DESC.
+  // Default page_size = 50, max = 200. total_count in response drives the
+  // UI paginator.
+  rpc GetClosedPositions(GetClosedPositionsRequest) returns (GetClosedPositionsResponse);
+
+  // Health check.
+  rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GetPortfolioSummary
+// ────────────────────────────────────────────────────────────────────────────
+
+message GetPortfolioSummaryRequest {
+  string user_id = 1;
+}
+
+message Summary {
+  // Aggregates over positions_db.positions for this user.
+  double total_invested                = 1;  // SUM(invested_amount) WHERE ACTIVE
+  double total_realized_pnl_lifetime   = 2;  // SUM(realized_pnl)   WHERE EXITED
+  double today_realized_pnl            = 3;  // SUM(realized_pnl)   WHERE EXITED AND exit_time >= IST today 00:00
+  int32  active_lot_count              = 4;
+  int32  closed_lot_count              = 5;
+
+  // Invested split by origin (both restricted to ACTIVE lots).
+  double manthan_invested              = 6;
+  double user_manual_invested          = 7;
+}
+
+message GetPortfolioSummaryResponse {
+  bool success = 1;
+  Summary summary = 2;
+  common.Error error = 3;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GetActivePositions
+// ────────────────────────────────────────────────────────────────────────────
+
+message GetActivePositionsRequest {
+  string user_id = 1;
+}
+
+message ActivePosition {
+  string position_id     = 1;   // uuid
+  string origin          = 2;   // MANTHAN | USER_MANUAL
+  string symbol          = 3;
+  string exchange        = 4;
+  string strategy_id     = 5;   // uuid; empty for USER_MANUAL
+  string signal_id       = 6;   // uuid; empty for USER_MANUAL
+
+  // Timestamps carried as unix millis so the wire stays language-neutral.
+  int64  entry_time_ms   = 7;
+
+  double entry_price     = 8;
+  int32  quantity        = 9;
+  double invested_amount = 10;
+
+  // Manthan-only fields; both 0 for USER_MANUAL lots.
+  double current_sl        = 11;
+  double high_since_entry  = 12;
+}
+
+message GetActivePositionsResponse {
+  bool success = 1;
+  repeated ActivePosition positions = 2;
+  common.Error error = 3;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GetClosedPositions
+// ────────────────────────────────────────────────────────────────────────────
+
+message GetClosedPositionsRequest {
+  string user_id = 1;
+  int32  page      = 2;   // 1-indexed; <1 coerced to 1 server-side
+  int32  page_size = 3;   // clamped to [1, 200] server-side; 0 → 50
+}
+
+message ClosedPosition {
+  string position_id  = 1;
+  string origin       = 2;
+  string symbol       = 3;
+
+  int64  entry_time_ms = 4;
+  double entry_price   = 5;
+  int32  quantity      = 6;
+
+  int64  exit_time_ms  = 7;
+  double exit_price    = 8;
+  string exit_reason   = 9;   // SL_TRIGGER | MANUAL_EXIT | STRATEGY_EXIT | LIQUIDATION
+  double realized_pnl  = 10;
+  double invested_amount = 11;
+}
+
+message GetClosedPositionsResponse {
+  bool success = 1;
+  repeated ClosedPosition positions = 2;
+  int32 total_count = 3;   // total EXITED rows for this user across all pages
+  common.Error error = 4;
+}

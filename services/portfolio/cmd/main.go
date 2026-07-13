@@ -27,6 +27,10 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+
+	pb "github.com/RohitIndira/Algo-Treading/api/proto/portfolio"
+	"github.com/RohitIndira/Algo-Treading/services/portfolio/internal/server"
+	"github.com/RohitIndira/Algo-Treading/services/portfolio/internal/store"
 )
 
 func main() {
@@ -34,8 +38,8 @@ func main() {
 	defer func() { _ = logger.Sync() }()
 
 	logger.Info("portfolio svc starting",
-		zap.String("version", "0.1.0-skeleton"),
-		zap.String("chunk", "PF.A"),
+		zap.String("version", "0.1.0-pf.c"),
+		zap.String("chunk", "PF.C"),
 		zap.String("pid", fmt.Sprintf("%d", os.Getpid())))
 
 	// ── DB: positions_db (read-only pool) ──────────────────────────────
@@ -89,18 +93,22 @@ func main() {
 	grpcSrv := grpc.NewServer()
 	reflection.Register(grpcSrv) // grpcurl introspection
 
+	// PF.C: register PortfolioService with the store-backed handlers.
+	portfolioStore := store.New(db, logger)
+	pb.RegisterPortfolioServiceServer(grpcSrv, server.New(portfolioStore, logger))
+
 	go func() {
 		logger.Info("grpc server listening",
 			zap.String("port", grpcPort),
-			zap.String("registered", "(none yet — PF.C)"))
+			zap.String("registered", "portfolio.PortfolioService"))
 		if err := grpcSrv.Serve(lis); err != nil {
 			logger.Error("grpc server failed", zap.Error(err))
 		}
 	}()
 
 	logger.Info("portfolio svc ready",
-		zap.String("chunk", "PF.A"),
-		zap.String("next", "PF.B — Store query layer (summary / active / closed)"))
+		zap.String("chunk", "PF.C"),
+		zap.String("next", "AG.LTP — api-gateway LTP liveness probe / PF.D — HTTP proxy handlers"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
