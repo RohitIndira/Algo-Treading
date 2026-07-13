@@ -1049,3 +1049,92 @@ func nullStr(s string) interface{} {
 	}
 	return s
 }
+
+// OrderMeta is the payload returned by LookupOrderMeta. Mirrors the
+// LookupOrderMetaResponse proto shape so the gRPC handler is a pure mapper.
+//
+// For ENTRY orders: EntrySignalID == SignalID and EntryBrokerOrderID
+// equals the row's own broker_order_id. For SL_SELL / EXIT orders those
+// point at the parent ENTRY row.
+type OrderMeta struct {
+	Found                bool
+	SignalID             string
+	OrderType            string
+	StrategyID           string
+	UserID               string
+	EntrySignalID        string
+	EntryBrokerOrderID   string
+}
+
+// LookupOrderMeta resolves a broker_order_id to its Manthan lineage.
+// Consumed by positions svc via gRPC to enrich order.events (which only
+// carry broker_order_id) with signal_id + order_type + entry lineage.
+//
+// Semantics:
+//
+//	(meta{Found:true},  nil)  — row found; all fields populated
+//	(meta{Found:false}, nil)  — row not found in manthan_orders (probably a
+//	                             user manual buy/sell via broker app)
+//	(nil,               err)  — DB error; caller decides whether to retry
+//
+// Uses manthan_orders.parent_order_id (self-FK) to climb one hop for
+// non-ENTRY orders. For ENTRY orders the same row's fields are returned.
+func (r *Repository) LookupOrderMeta(ctx context.Context, brokerOrderID string) (*OrderMeta, error) {
+	if brokerOrderID == "" {
+		return nil, fmt.Errorf("broker_order_id is required")
+	}
+
+	// LEFT JOIN self on parent_order_id so a single round-trip returns the
+	// ENTRY lineage even for SL/EXIT rows. When parent_order_id is NULL
+	// (i.e. this row IS the entry) the ent.* columns come back NULL and we
+	// fall back to mo.* below.
+	var (
+		signalID              string
+		orderType             string
+		strategyID            sql.NullString
+		userID                string
+		entrySignalID         sql.NullString
+		entryBrokerOrderID    sql.NullString
+	)
+	err := r.db.QueryRowContext(ctx, `
+		SELECT
+		  mo.signal_id,
+		  mo.order_type,
+		  mo.strategy_id,
+		  mo.user_id,
+		  ent.signal_id        AS entry_signal_id,
+		  ent.broker_order_id  AS entry_broker_order_id
+		FROM manthan_orders mo
+		LEFT JOIN manthan_orders ent ON ent.id = mo.parent_order_id
+		WHERE mo.broker_order_id = $1
+		LIMIT 1`,
+		brokerOrderID,
+	).Scan(&signalID, &orderType, &strategyID, &userID, &entrySignalID, &entryBrokerOrderID)
+	if err == sql.ErrNoRows {
+		return &OrderMeta{Found: false}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("LookupOrderMeta select: %w", err)
+	}
+
+	// Fall back: this IS the entry order (parent_order_id was NULL). The
+	// entry lineage points to itself.
+	esID := entrySignalID.String
+	ebID := entryBrokerOrderID.String
+	if !entrySignalID.Valid {
+		esID = signalID
+	}
+	if !entryBrokerOrderID.Valid {
+		ebID = brokerOrderID
+	}
+
+	return &OrderMeta{
+		Found:              true,
+		SignalID:           signalID,
+		OrderType:          orderType,
+		StrategyID:         strategyID.String,
+		UserID:             userID,
+		EntrySignalID:      esID,
+		EntryBrokerOrderID: ebID,
+	}, nil
+}

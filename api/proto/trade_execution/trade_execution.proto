@@ -26,7 +26,23 @@ service TradeExecutionService {
   
   // Get order statistics for a user
   rpc GetOrderStatistics(GetOrderStatisticsRequest) returns (GetOrderStatisticsResponse);
-  
+
+  // LookupOrderMeta — resolves a broker_order_id to its Manthan lineage.
+  //
+  // Used by positions svc to enrich order.events (which only carry
+  // broker_order_id) with signal_id + order_type so it can route
+  // BUY fills to the right lot (per §7.1 of positions_service_design.md).
+  //
+  // For SL_SELL / EXIT orders, entry_signal_id + entry_broker_order_id
+  // point to the ENTRY that spawned this SL — lets positions svc find
+  // the specific MANTHAN lot to close under the separate-row-per-BUY
+  // model (§11 Q3, ratified 2026-07-13).
+  //
+  // found=false when broker_order_id doesn't exist in manthan_orders,
+  // i.e. it wasn't a Manthan-placed order (probably a user manual buy/sell
+  // via broker app). Positions svc treats that as USER_MANUAL origin.
+  rpc LookupOrderMeta(LookupOrderMetaRequest) returns (LookupOrderMetaResponse);
+
   // Health check
   rpc HealthCheck(common.HealthCheckRequest) returns (common.HealthCheckResponse);
 }
@@ -328,4 +344,34 @@ message OdinOrderResponse {
   string message = 4;
   map<string, string> details = 5;
   string raw_response = 6;
+}
+
+// LookupOrderMeta — resolves a broker_order_id to its Manthan lineage.
+// Consumed by positions svc to enrich order.events. See §6 of
+// docs/positions_service_design.md.
+message LookupOrderMetaRequest {
+  string broker_order_id = 1;
+}
+
+message LookupOrderMetaResponse {
+  // found=false → broker_order_id not in manthan_orders (user manual buy/sell
+  // via broker app). Positions svc treats as origin=USER_MANUAL.
+  bool   found                 = 1;
+
+  // Populated only when found=true.
+  string signal_id             = 2;   // this row's own signal_id
+  string order_type            = 3;   // ENTRY | SL_SELL | EXIT | AMO
+  string strategy_id           = 4;
+  string user_id               = 5;
+
+  // For SL_SELL / EXIT orders: the ENTRY that spawned this SL. Lets
+  // positions svc find the specific MANTHAN lot to close under the
+  // separate-row-per-BUY model (§11 Q3 in the design doc).
+  // For ENTRY orders: equal to signal_id / broker_order_id respectively.
+  string entry_signal_id       = 6;
+  string entry_broker_order_id = 7;
+
+  // Optional error detail when found=false due to non-NOT_FOUND reason
+  // (DB unreachable etc.). NOT_FOUND itself sets found=false with nil error.
+  common.Error error           = 8;
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/indira"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/lifecycle"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/manthan"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/oco"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/paper"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
@@ -531,6 +532,12 @@ func main() {
 
 	// ── Manthan Order Execution Module ──────────────────────────────────
 	manthanModule := InitManthan(ctx, db.DB, indiraClient.IndiraClient(), statusService, orderExecutor.CredentialsCache(), cfg.KafkaBrokers, logger)
+
+	// Wire the Manthan repository into the gRPC server so LookupOrderMeta
+	// (called from positions svc via gRPC) can query manthan_orders. Safe
+	// here — grpcServer.Start is much later (line ~756), no RPC race.
+	grpcServer.SetManthanRepo(manthan.NewRepository(db.DB))
+
 	if manthanModule != nil {
 		// Bridge AU004 detections to the frontend live-orders WebSocket.
 		// The notifier handles the Kafka publish + dedup; this hook reuses the

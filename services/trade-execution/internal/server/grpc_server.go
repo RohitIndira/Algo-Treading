@@ -15,6 +15,7 @@ import (
 	commonpb "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/trade_execution"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
+	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/manthan"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
 )
@@ -22,10 +23,18 @@ import (
 // Server implements the TradeExecutionService gRPC server
 type Server struct {
 	pb.UnimplementedTradeExecutionServiceServer
-	repo       repository.OrderRepository
-	executor   *executor.OrderExecutor
-	port       int
-	grpcServer *grpc.Server // stored for graceful shutdown
+	repo        repository.OrderRepository
+	manthanRepo *manthan.Repository // nil until SetManthanRepo — LookupOrderMeta needs it
+	executor    *executor.OrderExecutor
+	port        int
+	grpcServer  *grpc.Server // stored for graceful shutdown
+}
+
+// SetManthanRepo wires the Manthan repository so LookupOrderMeta can query
+// manthan_orders. Called from main.go AFTER InitManthan constructs the
+// module (order of ops means we can't inject this at NewServer time).
+func (s *Server) SetManthanRepo(r *manthan.Repository) {
+	s.manthanRepo = r
 }
 
 // NewServer creates a new gRPC server
@@ -254,6 +263,46 @@ func (s *Server) GetOrderStatistics(ctx context.Context, req *pb.GetOrderStatist
 		Statistics: &pb.OrderStatistics{
 			UserId: req.UserId,
 		},
+	}, nil
+}
+
+// LookupOrderMeta resolves a broker_order_id to its Manthan lineage.
+// See §6 of docs/positions_service_design.md for the contract.
+//
+// Consumer: positions svc, on every order.events message. Called at ~fill
+// event rate (dozens per user per day) — cheap query with LEFT JOIN self on
+// parent_order_id in one round trip.
+func (s *Server) LookupOrderMeta(ctx context.Context, req *pb.LookupOrderMetaRequest) (*pb.LookupOrderMetaResponse, error) {
+	if req.GetBrokerOrderId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "broker_order_id is required")
+	}
+	if s.manthanRepo == nil {
+		return nil, status.Error(codes.Unavailable, "manthan repository not wired")
+	}
+
+	meta, err := s.manthanRepo.LookupOrderMeta(ctx, req.GetBrokerOrderId())
+	if err != nil {
+		return &pb.LookupOrderMetaResponse{
+			Found: false,
+			Error: &commonpb.Error{
+				Code:    "INTERNAL",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+	if !meta.Found {
+		// Clean "not found" — no error, just tells caller this is a user manual
+		// buy/sell (not a Manthan-placed order).
+		return &pb.LookupOrderMetaResponse{Found: false}, nil
+	}
+	return &pb.LookupOrderMetaResponse{
+		Found:                true,
+		SignalId:             meta.SignalID,
+		OrderType:            meta.OrderType,
+		StrategyId:           meta.StrategyID,
+		UserId:               meta.UserID,
+		EntrySignalId:        meta.EntrySignalID,
+		EntryBrokerOrderId:   meta.EntryBrokerOrderID,
 	}, nil
 }
 

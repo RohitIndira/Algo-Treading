@@ -104,6 +104,8 @@ topics=(
     "manthan.execution.events"    # Trade Execution - fill confirmations for rules-engine sync
     "manthan.notifications"       # Rules Engine - user-facing notifications (RETIRING — moves to notification svc)
     "order.events"                # Orderstatus Svc - every observed broker event (2026-07-10, CQRS split target)
+    "position.events"             # Positions Svc - position lifecycle events (2026-07-13, CQRS split target)
+    "positions.drift.detected"    # Positions Svc - reconciler drift alerts (2026-07-13)
 )
 
 for topic in "${topics[@]}"; do
