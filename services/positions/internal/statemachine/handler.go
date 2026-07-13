@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/consumer"
+	"github.com/RohitIndira/Algo-Treading/services/positions/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/store"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/tradeexec"
 )
@@ -28,16 +29,24 @@ type OrderMetaLookup interface {
 	LookupOrderMeta(ctx context.Context, brokerOrderID string) (tradeexec.OrderMeta, error)
 }
 
+// EventPublisher is the surface the state machine calls after every
+// successful DB mutation. Prod uses *publisher.Publisher; tests pass nil
+// (Publish is nil-safe) or a capturing stub for assertions.
+type EventPublisher interface {
+	Publish(ctx context.Context, ev *publisher.PositionEvent)
+}
+
 // Handler implements consumer.Handler. Injected into the OrderEventsConsumer
 // in main.go — replaces LoggingHandler once P.C is wired.
 type Handler struct {
 	store  *store.Store
 	lookup OrderMetaLookup
+	pub    EventPublisher // may be nil — publish paths are nil-safe
 	logger *zap.Logger
 }
 
-func New(s *store.Store, lookup OrderMetaLookup, logger *zap.Logger) *Handler {
-	return &Handler{store: s, lookup: lookup, logger: logger}
+func New(s *store.Store, lookup OrderMetaLookup, pub EventPublisher, logger *zap.Logger) *Handler {
+	return &Handler{store: s, lookup: lookup, pub: pub, logger: logger}
 }
 
 // Handle routes one parsed OrderEvent per §7 of the design doc.
@@ -161,6 +170,22 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		zap.Float64("entry_price", pos.EntryPrice),
 		zap.String("signal_id", pos.SignalID),
 		zap.String("broker_order_id", ev.BrokerOrderID))
+
+	if h.pub != nil {
+		h.pub.Publish(ctx, &publisher.PositionEvent{
+			EventType:     publisher.EventPositionOpened,
+			PositionID:    pos.PositionID.String(),
+			Origin:        pos.Origin,
+			UserID:        pos.UserID,
+			StrategyID:    pos.StrategyID,
+			SignalID:      pos.SignalID,
+			Symbol:        pos.Symbol,
+			Action:        publisher.ActionEntry,
+			Price:         pos.EntryPrice,
+			Quantity:      pos.Quantity,
+			BrokerOrderID: ev.BrokerOrderID,
+		})
+	}
 	return nil
 }
 
@@ -245,6 +270,24 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 		zap.Float64("entry_price", pos.EntryPrice),
 		zap.Float64("exit_price", exitPrice),
 		zap.Float64("realized_pnl", realizedPnL))
+
+	if h.pub != nil {
+		h.pub.Publish(ctx, &publisher.PositionEvent{
+			EventType:     publisher.EventPositionExited,
+			PositionID:    pos.PositionID.String(),
+			Origin:        pos.Origin,
+			UserID:        pos.UserID,
+			StrategyID:    pos.StrategyID,
+			SignalID:      pos.SignalID,
+			Symbol:        pos.Symbol,
+			Action:        publisher.ActionExit,
+			Price:         exitPrice,
+			Quantity:      qtyClosed,
+			ExitReason:    store.ExitReasonSLTrigger,
+			RealizedPnL:   realizedPnL,
+			BrokerOrderID: ev.BrokerOrderID,
+		})
+	}
 	return nil
 }
 
@@ -341,6 +384,24 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 				zap.Float64("entry_price", lot.EntryPrice),
 				zap.Float64("exit_price", exitPrice),
 				zap.Float64("realized_pnl", realizedPnL))
+
+			if h.pub != nil {
+				h.pub.Publish(ctx, &publisher.PositionEvent{
+					EventType:     publisher.EventPositionExited,
+					PositionID:    lot.PositionID.String(),
+					Origin:        lot.Origin,
+					UserID:        lot.UserID,
+					StrategyID:    lot.StrategyID,
+					SignalID:      lot.SignalID,
+					Symbol:        lot.Symbol,
+					Action:        publisher.ActionExit,
+					Price:         exitPrice,
+					Quantity:      delta,
+					ExitReason:    store.ExitReasonManualExit,
+					RealizedPnL:   realizedPnL,
+					BrokerOrderID: ev.BrokerOrderID,
+				})
+			}
 		} else {
 			// Partial — decrement qty, status stays ACTIVE.
 			if err := h.store.UpdatePartialExitWithEvent(ctx, lot.PositionID, delta, auditEvent); err != nil {
@@ -352,6 +413,27 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 				zap.Int("qty_reduced_by", delta),
 				zap.Int("qty_remaining", lot.Quantity-delta),
 				zap.Float64("realized_pnl_delta", realizedPnL))
+
+			// Partial manual exits still publish POSITION_MODIFIED so downstream
+			// consumers see the shrink. Consumers can distinguish full vs
+			// partial by comparing action=EXIT with the position's current
+			// quantity — POSITION_EXITED means status=EXITED at the DB.
+			if h.pub != nil {
+				h.pub.Publish(ctx, &publisher.PositionEvent{
+					EventType:     publisher.EventManualInterrupt,
+					PositionID:    lot.PositionID.String(),
+					Origin:        lot.Origin,
+					UserID:        lot.UserID,
+					StrategyID:    lot.StrategyID,
+					SignalID:      lot.SignalID,
+					Symbol:        lot.Symbol,
+					Action:        publisher.ActionExit,
+					Price:         exitPrice,
+					Quantity:      delta,
+					RealizedPnL:   realizedPnL,
+					BrokerOrderID: ev.BrokerOrderID,
+				})
+			}
 		}
 		touched++
 	}

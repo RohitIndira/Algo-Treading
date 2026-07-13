@@ -67,7 +67,8 @@ func openTestDB(t *testing.T) *sql.DB {
 func newHandler(t *testing.T, db *sql.DB, resp map[string]tradeexec.OrderMeta) *Handler {
 	t.Helper()
 	logger, _ := zap.NewDevelopment()
-	return New(store.New(db, logger), &stubLookup{responses: resp}, logger)
+	// Tests skip the publisher — nil is safe (Publish is a no-op).
+	return New(store.New(db, logger), &stubLookup{responses: resp}, nil, logger)
 }
 
 func fillEvent(eventID, brokerOrderID, userID, symbol, buySell string, qty int, tradedPrice float64) *consumer.OrderEvent {

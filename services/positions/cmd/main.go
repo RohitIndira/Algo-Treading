@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/consumer"
+	"github.com/RohitIndira/Algo-Treading/services/positions/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/statemachine"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/store"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/tradeexec"
@@ -132,17 +133,19 @@ func main() {
 	defer func() { _ = tradeExecClient.Close() }()
 	logger.Info("trade-execution gRPC ready", zap.String("addr", tradeExecAddr))
 
-	// ── state machine handler (Chunk P.C) ──────────────────────────────
+	// ── position.events publisher (Chunk P.D) ──────────────────────────
+	// Fans out every state-machine mutation to Kafka. Partition key =
+	// position_id per §5.2 of the design doc — all events for one
+	// position on the same partition = strict lifecycle ordering for
+	// downstream consumers (rules-engine cooldown, api-gateway push).
+	positionEventsPub := publisher.NewPublisher(positionEventsWriter, logger)
+
+	// ── state machine handler (Chunk P.C, extended P.D) ────────────────
 	// Replaces P.B's LoggingHandler stub. Turns FILLED events into positions
-	// state transitions per §7 of docs/positions_service_design.md:
-	//   BUY  fill + LookupOrderMeta.Found  → INSERT MANTHAN row
-	//   BUY  fill + not found              → INSERT USER_MANUAL row
-	//   SELL fill + SL_SELL/EXIT metadata  → close specific lot by
-	//                                         entry_signal_id + realized_pnl
-	//   SELL fill + not found (manual)     → FIFO across ACTIVE lots
-	//                                         (USER_MANUAL first, spillover MANTHAN)
+	// state transitions per §7 of docs/positions_service_design.md, then
+	// publishes each mutation to position.events.
 	positionStore := store.New(db, logger)
-	stateMachine := statemachine.New(positionStore, tradeExecClient, logger)
+	stateMachine := statemachine.New(positionStore, tradeExecClient, positionEventsPub, logger)
 
 	// ── order.events consumer (Chunk P.B) ──────────────────────────────
 	// Set POSITIONS_START_FROM=FIRST to replay history from topic head on
@@ -171,8 +174,8 @@ func main() {
 	_ = driftWriter
 
 	logger.Info("positions svc ready",
-		zap.String("chunk", "P.C"),
-		zap.String("next", "P.D — publish position.events on state transitions"))
+		zap.String("chunk", "P.D"),
+		zap.String("next", "P.E — rules-engine consumes position.events → manthan_cooldown"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
