@@ -241,20 +241,35 @@ message LookupOrderMetaRequest {
 }
 
 message LookupOrderMetaResponse {
-  bool    found            = 1;   // false if broker_order_id not in manthan_orders
-  string  signal_id        = 2;   // populated iff this was a MANTHAN-placed order
-  string  order_type       = 3;   // ENTRY | SL_SELL | EXIT | AMO
-  string  strategy_id      = 4;
-  string  user_id          = 5;
+  bool    found                = 1;   // false if broker_order_id not in manthan_orders
+  string  signal_id            = 2;   // populated iff this was a MANTHAN-placed order
+  string  order_type           = 3;   // ENTRY | SL_SELL | EXIT | AMO
+  string  strategy_id          = 4;
+  string  user_id              = 5;
+  string  entry_signal_id      = 6;   // for SL_SELL/EXIT orders: the ENTRY signal that
+                                       // spawned this SL/exit. Lets positions svc find
+                                       // the exact entry LOT to close (per §11 Q3
+                                       // separate-rows-per-buy model). Equal to signal_id
+                                       // when order_type=ENTRY.
+  string  entry_broker_order_id = 7;   // convenience: broker_order_id of the entry order
+                                       // for the SL/exit. Same lookup target as
+                                       // entry_signal_id, exposed for API ergonomics.
 }
 ```
 
 Backed by a single SQL query against `trading_execution.manthan_orders`:
 ```sql
-SELECT signal_id, order_type, strategy_id, user_id
-FROM manthan_orders
+SELECT signal_id, order_type, strategy_id, user_id,
+       parent_order_id AS entry_broker_order_id,
+       (SELECT signal_id FROM manthan_orders WHERE id = mo.parent_order_id)
+         AS entry_signal_id
+FROM manthan_orders mo
 WHERE broker_order_id = $1;
 ```
+
+The `parent_order_id` self-FK on `manthan_orders` already exists — every SL
+or exit order carries a link back to its parent entry. positions svc uses
+`entry_signal_id` to find the specific lot to close.
 
 **Cache:** positions svc holds a 24h TTL in-memory LRU (10k entries) so repeat lookups don't hammer trade-execution. Cache misses go via gRPC; NOT_FOUND responses are cached with a short TTL (60s) — could be racing an in-flight INSERT.
 
@@ -281,24 +296,53 @@ Call trade-execution.LookupOrderMeta(broker_order_id)
 
 ### 7.2 `order.events` with `event_type=FILLED` and `buy_sell="2"` (SELL fill)
 
+Because every BUY is its own row (per §11 Q3), SELL logic needs a rule for
+which row(s) to touch. Two branches:
+
 ```
 Call trade-execution.LookupOrderMeta(broker_order_id)
     │
-    ├── found=true, order_type IN (SL_SELL, EXIT)
-    │     → look up MANTHAN position by signal_id (parent link)
-    │     → UPDATE position: status='EXITED', exit_price, exit_reason
+    ├── found=true, order_type IN (SL_SELL, EXIT)  — Manthan-driven exit
+    │     Look up parent entry via parent_signal_id chain
+    │     (rules-engine's SL signal already carries parent_signal_id → entry signal_id)
+    │     → find the SPECIFIC MANTHAN row whose signal_id matches parent
+    │     → UPDATE only that row: status='EXITED', exit_price, exit_reason='SL_TRIGGER'
     │     → realized_pnl = (exit_price - entry_price) × quantity_exited
     │     → INSERT position_events: SL_FILLED
-    │     → PUBLISH position.events: POSITION_EXITED (SL_TRIGGER)
+    │     → PUBLISH position.events: POSITION_EXITED
     │
-    └── found=false — MANUAL SELL
-          → For (user_id, symbol), get ACTIVE positions ordered: USER_MANUAL first, then MANTHAN oldest-first
-          → Deduct filled_qty across them:
-              consume USER_MANUAL positions first (mark EXITED as we go)
-              spillover consumes MANTHAN positions (mark EXITED with reason=MANUAL_EXIT)
-          → INSERT position_events: MANUAL_SELL_APPLIED, one row per touched position
-          → PUBLISH position.events: POSITION_EXITED for each position touched
+    │     Only ONE lot exits per SL fire. Other lots on same symbol
+    │     continue trailing independently.
+    │
+    └── found=false — user manual SELL
+          → For (user_id, symbol), get ACTIVE lots ordered:
+              1. origin='USER_MANUAL' first, entry_time ASC (FIFO within origin)
+              2. origin='MANTHAN' next,     entry_time ASC (FIFO within origin)
+          → Iterate: consume filled_qty from each lot in that order
+              full lot consumed → status='EXITED', reason based on origin:
+                 USER_MANUAL → reason='MANUAL_EXIT'
+                 MANTHAN     → reason='MANUAL_EXIT' (user reached into Manthan's shares)
+              partial lot consumed → UPDATE quantity -= delta, status='ACTIVE'
+          → INSERT position_events per touched lot: MANUAL_SELL_APPLIED
+          → PUBLISH position.events per touched lot
 ```
+
+**Concrete example** — user has 20 MANTHAN SBI @ ₹500 + 10 USER_MANUAL SBI @ ₹510, sells 15 manually at ₹520:
+
+| Row | Before | After | Deducted | realized_pnl added |
+|---|---|---|---|---|
+| pos-abc-2 USER_MANUAL | qty=10 | qty=0, EXITED reason=MANUAL_EXIT | 10 (fully) | (520 − 510) × 10 = ₹100 |
+| pos-abc-1 MANTHAN     | qty=20 | qty=15, ACTIVE                 | 5 (partial) | (520 − 500) × 5 = ₹100 |
+
+Manthan's remaining 15 shares still trail SL. Nothing else changes.
+
+Accounting check: broker holding was 30, sold 15, now 25. Our DB: 0 + 15 = 15
+(EXITED rows don't count towards active qty; wait — reconciler cares about
+NET holdings). DB SUM(quantity WHERE status='ACTIVE') = 15. Broker = 25.
+❌ Mismatch — the 10 EXITED USER_MANUAL shares are gone from broker (sold)
+but the accounting math is: 0 (EXITED USER_MANUAL, sold) + 15 (partial
+MANTHAN remaining) = 15. Broker sold 15 total, so remaining broker = 30-15 = 15.
+✓ Matches. All good.
 
 ### 7.3 Other `event_type`s
 
@@ -366,15 +410,33 @@ If broker resets holdings view on relogin and we get a `GetHoldings` response sh
 
 **Reconciler behavior:** if DB positions sum ≠ broker holdings, log alert but DON'T auto-adjust. Human intervention needed. (Same as safety_monitor's "don't liquidate on drift" lesson.)
 
-### Q3 — Top-up: same user BUYs more IDEA via Manthan (a second signal for same symbol)
+### Q3 — Top-up: same user BUYs more IDEA via Manthan — RATIFIED 2026-07-13
 
-Two options:
-- **Merge:** UPDATE existing MANTHAN position, weighted-avg entry_price, add qty
-- **New row:** INSERT a second MANTHAN position with new signal_id
+**Decision: separate rows for every BUY (Option B).**
 
-Existing behavior in the deleted projector was **merge** (per parent_signal_id link). Preserving that keeps rules-engine's cap-check math consistent.
+Every distinct BUY fill creates its own `positions` row. Never merge. This
+gives us per-lot traceability: "these 20 shares came from signal X, those 10
+came from signal Y" is always answerable.
 
-Recommend: **merge**. Requires `parent_signal_id` support in `order.events`.
+**Applies uniformly:**
+- Multiple MANTHAN signals for same symbol → separate MANTHAN rows
+- Multiple user manual BUYs for same symbol → separate USER_MANUAL rows
+- Any combination
+
+**Reconciler check:** SUM(quantity) across all ACTIVE rows for (user, symbol)
+must equal broker's holding for that symbol. Divergence = drift alert.
+
+**Implication for rules-engine cap-check** (25% sector / 50% MCap): counts
+UNIQUE symbols per sector/bucket, not row count. So multiple lots on the
+same symbol still = one "position slot" for cap-check purposes. Query:
+`SELECT COUNT(DISTINCT symbol) FROM positions WHERE origin='MANTHAN' AND
+status='ACTIVE' AND user_id=?`
+
+**Implication for SL:** each entry lot places its OWN broker SL order.
+Broker returns different `broker_order_id` for each. When broker fires an
+SL, orderstatus emits `order.events` with that specific `broker_order_id`,
+which maps 1:1 to a specific position row via `entry_broker_order_id`
+lookup. Clean per-lot exit.
 
 ### Q4 — Reject rules-engine's UPDATE of `manthan_positions` — anywhere still doing it?
 
