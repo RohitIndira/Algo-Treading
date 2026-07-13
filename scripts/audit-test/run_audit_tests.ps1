@@ -18,14 +18,15 @@ $cfg = @{}
 Get-Content (Join-Path $here 'config.sh') | ForEach-Object {
     if ($_ -match "^\s*([A-Za-z_]\w*)='([^']*)'") { $cfg[$Matches[1]] = $Matches[2] }
 }
-$BROKER       = $cfg['KAFKA_BROKER']
-$TOPIC        = $cfg['TOPIC']
-$REDIS_HOST   = $cfg['REDIS_HOST']
-$REDIS_PORT   = if ($cfg['REDIS_PORT'])   { [int]$cfg['REDIS_PORT']   } else { 6379 }
-$REDIS_DB     = if ($cfg['REDIS_DB'])     { [int]$cfg['REDIS_DB']     } else { 1 }
-$TICKSTORE_DB = if ($cfg['TICKSTORE_DB']) { [int]$cfg['TICKSTORE_DB'] } else { 1 }
-$REAL_TOKEN   = $cfg['REAL_TOKEN']
-$REAL_SYMBOL  = $cfg['REAL_SYMBOL']
+$BROKER         = $cfg['KAFKA_BROKER']
+$TOPIC          = $cfg['TOPIC']
+$REDIS_HOST     = $cfg['REDIS_HOST']
+$REDIS_PASSWORD = $cfg['REDIS_PASSWORD']
+$REDIS_PORT     = if ($cfg['REDIS_PORT'])   { [int]$cfg['REDIS_PORT']   } else { 6379 }
+$REDIS_DB       = if ($cfg['REDIS_DB'])     { [int]$cfg['REDIS_DB']     } else { 1 }
+$TICKSTORE_DB   = if ($cfg['TICKSTORE_DB']) { [int]$cfg['TICKSTORE_DB'] } else { 1 }
+$REAL_TOKEN     = $cfg['REAL_TOKEN']
+$REAL_SYMBOL    = $cfg['REAL_SYMBOL']
 $EXCH         = 'nse'
 
 $pubExe = Join-Path $pubDir 'kafka_publisher.exe'
@@ -108,6 +109,7 @@ function Invoke-Redis {
         return $enc.GetString($buf, 0, $n)
     }
 
+    if ($REDIS_PASSWORD) { Send-Cmd 'AUTH', $REDIS_PASSWORD | Out-Null }
     Send-Cmd 'SELECT', "$Db" | Out-Null
     $result = Send-Cmd $Cmd
     $client.Close()
@@ -141,18 +143,21 @@ function Case-Trade {
 
 function Case-Dpr {
     Write-Host ''
-    Write-Host '[DPR] token=22 (ACC) ltp=2500 band=[2400,2450] -> expect DPR_UPPER_BREACH'
-    $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $j  = '{"symbol":"ACC","token":"22","exchange":"nse","ltp":2500,"prev_close":2490,' +
+    Write-Host '[DPR] ACC (token 22) ltp=1610 above real dpr_upper 1598.6 -> expect DPR_UPPER_BREACH'
+    # Uses ACC's REAL circuit band [1065.8, 1598.6]; ltp is bumped just above the
+    # upper so the LIMIT order prices above the band. (The .sh version reads the
+    # live band from Redis when present; PowerShell keeps ACC's known band static.)
+    $ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $j  = '{"symbol":"ACC","token":"22","exchange":"nse","ltp":1610,"prev_close":1360,' +
           '"volume":1000,"timestamp":' + $ts + ',"tick_size":0.05,"percent_change":0.3,' +
-          '"dpr_lower":2400,"dpr_upper":2450}'
+          '"dpr_lower":1065.8,"dpr_upper":1598.6}'
     try {
         Redis-Set -Db $REDIS_DB -Key ('market:' + $EXCH + ':22') -Val $j
-        Write-Host ('  Redis seeded  market:' + $EXCH + ':22  (ltp=2500, band=[2400,2450])')
+        Write-Host ('  Redis seeded  market:' + $EXCH + ':22  (ltp=1610, band=[1065.8,1598.6])')
     } catch {
         Write-Host ('  WARNING: Redis seed failed - ' + $_.Exception.Message)
     }
-    Publish-News -Token '22' -Symbol 'ACC' -Category 'AUDIT_DPR' -Ltp 2500
+    Publish-News -Token '22' -Symbol 'ACC' -Category 'AUDIT_DPR' -Ltp 1610
 }
 
 function Case-Exposure {

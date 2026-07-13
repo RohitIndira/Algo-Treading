@@ -3,9 +3,11 @@
 #
 # NOTE: set GATEWAY_URL in config.sh to the ACTUAL gateway host reachable from
 # this machine (localhost only works if the gateway runs here). The news-driven
-# audit cases (qty/value/dpr/velocity/trade) still need the Linux box (Kafka/Redis).
+# audit cases (qty/value/dpr/exposure/ban/trade) publish via run_audit_tests.ps1,
+# which reaches Kafka/Redis directly — no Linux box needed.
 #
-# Run:  powershell -ExecutionPolicy Bypass -File .\create_strategies.ps1
+# Run:  powershell -ExecutionPolicy Bypass -File .\create_strategies.ps1              # all 6
+#       powershell -ExecutionPolicy Bypass -File .\create_strategies.ps1 exposure     # just one: trade|qty|value|dpr|exposure|ban
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -48,13 +50,34 @@ function New-Strategy($name, $qty, $cat, $desc) {
   }
 }
 
+function Strat-Trade    { New-Strategy 'AUDIT-TRADE'    1     'AUDIT_TRADE'    'passes all checks; one order placed (token 2885 RELIANCE)' }
+function Strat-Dpr      { New-Strategy 'AUDIT-DPR'      10    'AUDIT_DPR'      'DPR_UPPER_BREACH (token 22 ACC, LTP seeded above real dpr_upper 1598.6)' }
+function Strat-Qty      { New-Strategy 'AUDIT-QTY'      60000 'AUDIT_QTY'      'QTY_LIMIT_EXCEEDED (token 2885 RELIANCE)' }
+function Strat-Value    { New-Strategy 'AUDIT-VALUE'    50000 'AUDIT_VALUE'    'ORDER_VALUE_LIMIT_EXCEEDED (token 2885 RELIANCE)' }
+function Strat-Exposure { New-Strategy 'AUDIT-EXPOSURE' 1000  'AUDIT_EXPOSURE' 'EXPOSURE_LIMIT_EXCEEDED on 2nd order (tokens 21690 DIXON + 25 ADANIENT)' }
+function Strat-Ban      { New-Strategy 'AUDIT-BAN'      1     'AUDIT_BAN'      'BANNED_TOKEN (token 14366 IDEA, in BANNED_TOKENS env)' }
+
 Write-Host "Gateway=$GATEWAY  Client=$CID  Mode=$MODE"
-New-Strategy 'AUDIT-TRADE'    1     'AUDIT_TRADE'    'passes all checks; one order placed (token 2885 RELIANCE)'
-New-Strategy 'AUDIT-DPR'      10    'AUDIT_DPR'      'DPR_UPPER_BREACH (token 22 ACC, LTP seeded above dpr_upper)'
-New-Strategy 'AUDIT-QTY'      60000 'AUDIT_QTY'      'QTY_LIMIT_EXCEEDED (token 2885 RELIANCE)'
-New-Strategy 'AUDIT-VALUE'    50000 'AUDIT_VALUE'    'ORDER_VALUE_LIMIT_EXCEEDED (token 2885 RELIANCE)'
-New-Strategy 'AUDIT-EXPOSURE' 1000  'AUDIT_EXPOSURE' 'EXPOSURE_LIMIT_EXCEEDED on 2nd order (tokens 21690 DIXON + 25 ADANIENT)'
-New-Strategy 'AUDIT-BAN'      1     'AUDIT_BAN'      'BANNED_TOKEN (token 14366 IDEA, in BANNED_TOKENS env)'
+
+$target = if ($args.Count -gt 0) { $args[0] } else { 'all' }
+switch ($target) {
+    'trade'    { Strat-Trade }
+    'qty'      { Strat-Qty }
+    'value'    { Strat-Value }
+    'dpr'      { Strat-Dpr }
+    'exposure' { Strat-Exposure }
+    'ban'      { Strat-Ban }
+    'all'      { Strat-Trade; Strat-Dpr; Strat-Qty; Strat-Value; Strat-Exposure; Strat-Ban }
+    default {
+        Write-Host 'usage: create_strategies.ps1 [trade|qty|value|dpr|exposure|ban|all]'
+        exit 1
+    }
+}
+
 Write-Host ""
 Write-Host "Strategies created. Watch STRATEGY_INITIALIZED in rules-engine logs."
-Write-Host "Now run:  powershell -ExecutionPolicy Bypass -File .\run_audit_tests.ps1 [qty|value|dpr|exposure|ban|trade|all]"
+if ($target -eq 'all') {
+    Write-Host "Now run:  powershell -ExecutionPolicy Bypass -File .\run_audit_tests.ps1 [qty|value|dpr|exposure|ban|trade|all]"
+} else {
+    Write-Host "Now run:  powershell -ExecutionPolicy Bypass -File .\run_audit_tests.ps1 $target"
+}

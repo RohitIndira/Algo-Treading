@@ -51,6 +51,10 @@ type Config struct {
 
 	// MongoDB Configuration (for trading holidays)
 	MongoDB MongoDBConfig
+
+	// BypassHolidayCheck, when true, processes today's news even if today is a
+	// trading holiday (SEBI Saturday mock/demo). From BYPASS_HOLIDAY_CHECK.
+	BypassHolidayCheck bool
 }
 
 // MongoDBConfig holds MongoDB connection configuration
@@ -157,12 +161,13 @@ type LoggingConfig struct {
 
 // MarketHoursConfig holds market trading hours configuration
 type MarketHoursConfig struct {
-	OpenHour     int    // Market opening hour (0-23)
-	OpenMinute   int    // Market opening minute (0-59)
-	CloseHour    int    // Market closing hour (0-23)
-	CloseMinute  int    // Market closing minute (0-59)
-	Timezone     string // Timezone (e.g., "Asia/Kolkata")
-	EnforceHours bool   // Whether to enforce market hours check
+	OpenHour      int    // Market opening hour (0-23)
+	OpenMinute    int    // Market opening minute (0-59)
+	CloseHour     int    // Market closing hour (0-23)
+	CloseMinute   int    // Market closing minute (0-59)
+	Timezone      string // Timezone (e.g., "Asia/Kolkata")
+	EnforceHours  bool   // Whether to enforce market hours check
+	AllowSaturday bool   // Treat Saturday as a trading day (SEBI mock session)
 }
 
 // LoadConfig loads configuration from environment variables
@@ -276,12 +281,13 @@ func LoadConfig() (*Config, error) {
 		},
 
 		MarketHours: MarketHoursConfig{
-			OpenHour:     getEnvAsInt("MARKET_OPEN_HOUR", 9),
-			OpenMinute:   getEnvAsInt("MARKET_OPEN_MINUTE", 15),
-			CloseHour:    getEnvAsInt("MARKET_CLOSE_HOUR", 15),
-			CloseMinute:  getEnvAsInt("MARKET_CLOSE_MINUTE", 30),
-			Timezone:     getEnv("MARKET_TIMEZONE", "Asia/Kolkata"),
-			EnforceHours: getEnvAsBool("MARKET_ENFORCE_HOURS", true),
+			OpenHour:      getEnvAsInt("MARKET_OPEN_HOUR", 9),
+			OpenMinute:    getEnvAsInt("MARKET_OPEN_MINUTE", 15),
+			CloseHour:     getEnvAsInt("MARKET_CLOSE_HOUR", 15),
+			CloseMinute:   getEnvAsInt("MARKET_CLOSE_MINUTE", 30),
+			Timezone:      getEnv("MARKET_TIMEZONE", "Asia/Kolkata"),
+			EnforceHours:  getEnvAsBool("MARKET_ENFORCE_HOURS", true),
+			AllowSaturday: getEnvAsBool("ALLOW_SATURDAY_MOCK", false),
 		},
 
 		UserConfigGRPCAddr: getEnv("USER_CONFIG_GRPC_ADDR", getEnv("USER_CONFIG_SERVICE_ADDR", "localhost:50051")),
@@ -289,6 +295,8 @@ func LoadConfig() (*Config, error) {
 		MongoDB: MongoDBConfig{
 			URI: getEnv("MONGODB_URI", "mongodb://localhost:27017"),
 		},
+
+		BypassHolidayCheck: getEnvAsBool("BYPASS_HOLIDAY_CHECK", false),
 	}
 
 	// Validate configuration

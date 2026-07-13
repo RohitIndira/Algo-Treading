@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -43,14 +44,14 @@ func NewOutboxWorker(repo *repository.StrategyRepository, kafkaWriter KafkaWrite
 
 // Start starts the worker loop
 func (w *OutboxWorker) Start(ctx context.Context) {
-	fmt.Println("[OutboxWorker] Starting outbox worker...")
+	log.Println("[OutboxWorker] Starting outbox worker...")
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("[OutboxWorker] Stopping outbox worker...")
+			log.Println("[OutboxWorker] Stopping outbox worker...")
 			return
 		case <-ticker.C:
 			// Recover guards this tick only, so a panic in one batch doesn't
@@ -58,11 +59,11 @@ func (w *OutboxWorker) Start(ctx context.Context) {
 			func() {
 				defer func() {
 					if rec := recover(); rec != nil {
-						fmt.Printf("[OutboxWorker] PANIC recovered: %v\n%s\n", rec, debug.Stack())
+						log.Printf("[OutboxWorker] PANIC recovered: %v\n%s", rec, debug.Stack())
 					}
 				}()
 				if err := w.processOutbox(ctx); err != nil {
-					fmt.Printf("[OutboxWorker] Error processing outbox: %v\n", err)
+					log.Printf("[OutboxWorker] Error processing outbox: %v", err)
 				}
 			}()
 		}
@@ -81,7 +82,7 @@ func (w *OutboxWorker) processOutbox(ctx context.Context) error {
 		return nil
 	}
 
-	fmt.Printf("[OutboxWorker] Processing %d events\n", len(events))
+	log.Printf("[OutboxWorker] Processing %d events", len(events))
 	processedIDs := make([]int64, 0, len(events))
 
 	for _, event := range events {
@@ -93,7 +94,7 @@ func (w *OutboxWorker) processOutbox(ctx context.Context) error {
 				if markErr := w.repo.MarkOutboxEventsProcessed(ctx, processedIDs); markErr != nil {
 					return fmt.Errorf("failed to mark events processed after partial success: %w", markErr)
 				}
-				fmt.Printf("[OutboxWorker] Successfully processed %d events (partial batch)\n", len(processedIDs))
+				log.Printf("[OutboxWorker] Successfully processed %d events (partial batch)", len(processedIDs))
 			}
 			return err
 		}
@@ -107,7 +108,7 @@ func (w *OutboxWorker) processOutbox(ctx context.Context) error {
 		if err := w.repo.MarkOutboxEventsProcessed(ctx, processedIDs); err != nil {
 			return fmt.Errorf("failed to mark events processed: %w", err)
 		}
-		fmt.Printf("[OutboxWorker] Successfully processed %d events\n", len(processedIDs))
+		log.Printf("[OutboxWorker] Successfully processed %d events", len(processedIDs))
 	}
 
 	return nil
@@ -130,7 +131,7 @@ type deleteOutboxPayload struct {
 // Returns (published=true) when the outbox row should be marked processed.
 func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.ExecutionOutbox) (bool, error) {
 	if len(event.Payload) == 0 {
-		fmt.Printf("[OutboxWorker] WARNING: empty payload for outbox id=%d event_type=%s, marking processed\n", event.ID, event.EventType)
+		log.Printf("[OutboxWorker] WARNING: empty payload for outbox id=%d event_type=%s, marking processed", event.ID, event.EventType)
 		return true, nil
 	}
 
@@ -143,7 +144,7 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			return false, fmt.Errorf("failed to unmarshal STRATEGY_CREATED payload for outbox id=%d: %w payload=%s", event.ID, err, truncate(string(event.Payload), 500))
 		}
 		if s.UserID == "" || s.StrategyID.String() == "" {
-			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_CREATED outbox id=%d, skipping+marking processed\n", event.ID)
+			log.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_CREATED outbox id=%d, skipping+marking processed", event.ID)
 			return true, nil
 		}
 		kafkaEvent = events.ToFullConfigEvent(events.ConfigCreated, &s)
@@ -154,7 +155,7 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			return false, fmt.Errorf("failed to unmarshal STRATEGY_UPDATED payload for outbox id=%d: %w payload=%s", event.ID, err, truncate(string(event.Payload), 500))
 		}
 		if s.UserID == "" || s.StrategyID.String() == "" {
-			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_UPDATED outbox id=%d, skipping+marking processed\n", event.ID)
+			log.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_UPDATED outbox id=%d, skipping+marking processed", event.ID)
 			return true, nil
 		}
 		kafkaEvent = events.ToFullConfigEvent(events.ConfigUpdated, &s)
@@ -165,7 +166,7 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			return false, fmt.Errorf("failed to unmarshal STRATEGY_DELETED payload for outbox id=%d: %w payload=%s", event.ID, err, truncate(string(event.Payload), 500))
 		}
 		if thin.UserID == "" || thin.StrategyID == "" {
-			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_DELETED outbox id=%d, skipping+marking processed\n", event.ID)
+			log.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_DELETED outbox id=%d, skipping+marking processed", event.ID)
 			return true, nil
 		}
 		kafkaEvent = events.ToThinConfigEvent(events.ConfigDeleted, thin.UserID, thin.StrategyID, thin.Version)
@@ -176,7 +177,7 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			return false, fmt.Errorf("failed to unmarshal STRATEGY_ACTIVATED payload for outbox id=%d: %w payload=%s", event.ID, err, truncate(string(event.Payload), 500))
 		}
 		if thin.UserID == "" || thin.StrategyID == "" {
-			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_ACTIVATED outbox id=%d, skipping+marking processed\n", event.ID)
+			log.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_ACTIVATED outbox id=%d, skipping+marking processed", event.ID)
 			return true, nil
 		}
 		// Emit a full CONFIG_UPDATED (not thin CONFIG_RESUMED) so the rules engine can
@@ -199,18 +200,18 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			return false, fmt.Errorf("failed to unmarshal STRATEGY_DEACTIVATED payload for outbox id=%d: %w payload=%s", event.ID, err, truncate(string(event.Payload), 500))
 		}
 		if thin.UserID == "" || thin.StrategyID == "" {
-			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_DEACTIVATED outbox id=%d, skipping+marking processed\n", event.ID)
+			log.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_DEACTIVATED outbox id=%d, skipping+marking processed", event.ID)
 			return true, nil
 		}
 		kafkaEvent = events.ToThinConfigEvent(events.ConfigPaused, thin.UserID, thin.StrategyID, thin.Version)
 
 	default:
-		fmt.Printf("[OutboxWorker] WARNING: unknown outbox event_type=%s id=%d, skipping+marking processed\n", event.EventType, event.ID)
+		log.Printf("[OutboxWorker] WARNING: unknown outbox event_type=%s id=%d, skipping+marking processed", event.EventType, event.ID)
 		return true, nil
 	}
 
 	if kafkaEvent.UserID == "" {
-		fmt.Printf("[OutboxWorker] CRITICAL: computed kafka event has empty user_id for outbox id=%d, skipping+marking processed\n", event.ID)
+		log.Printf("[OutboxWorker] CRITICAL: computed kafka event has empty user_id for outbox id=%d, skipping+marking processed", event.ID)
 		return true, nil
 	}
 

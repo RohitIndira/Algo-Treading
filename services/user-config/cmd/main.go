@@ -84,6 +84,7 @@ func main() {
 	// Route the standard library logger to stdout so stdlib log.* output shares
 	// the single stream PM2 captures alongside the zap logger.
 	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	// Load .env file if it exists
 	if err := godotenv.Load(); err != nil {

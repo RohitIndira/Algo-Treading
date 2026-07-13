@@ -22,6 +22,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/holiday"
 	intkafka "github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/kafka"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/logmask"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/publisher"
@@ -45,6 +46,11 @@ func main() {
 	log.SetOutput(os.Stdout)
 
 	loadEnv()
+	// Compliance caps are package-level vars in the consumer package, initialized
+	// at program init — which runs BEFORE loadEnv() above. Re-read them now that
+	// .env is in the environment, otherwise MAX_ORDER_VALUE / MAX_EXPOSURE_LIMIT /
+	// BANNED_TOKENS / VELOCITY_* from .env are silently ignored.
+	consumer.LoadComplianceLimitsFromEnv()
 
 	// Create context bound to OS signals
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -63,6 +69,15 @@ func main() {
 	}
 	defer pkgLgr.Close()
 	logger := pkgLgr.Logger
+
+	// Optional: hide real strategy identity in logs. When STRATEGY_NAME_LOG_OVERRIDE
+	// is set, strategy_id is dropped from logs and strategy_name is shown as this
+	// fixed placeholder for every strategy (used for mock/demo sessions). No-op when unset.
+	if ov := os.Getenv("STRATEGY_NAME_LOG_OVERRIDE"); ov != "" {
+		logger = logmask.Wrap(logger, ov)
+		logger.Info("strategy log masking enabled (strategy_id hidden, strategy_name forced)",
+			zap.String("strategy_name", ov))
+	}
 
 	logger.Info("Starting Rules Engine Service",
 		zap.String("version", cfg.ServiceVersion),
@@ -162,7 +177,8 @@ func main() {
 		zap.Int("close_hour", cfg.MarketHours.CloseHour),
 		zap.Int("close_minute", cfg.MarketHours.CloseMinute),
 		zap.String("timezone", cfg.MarketHours.Timezone),
-		zap.Bool("enforce_hours", cfg.MarketHours.EnforceHours))
+		zap.Bool("enforce_hours", cfg.MarketHours.EnforceHours),
+		zap.Bool("allow_saturday_mock", cfg.MarketHours.AllowSaturday))
 
 	marketHours := utils.NewMarketHours(
 		cfg.MarketHours.OpenHour,
@@ -170,6 +186,7 @@ func main() {
 		cfg.MarketHours.CloseHour,
 		cfg.MarketHours.CloseMinute,
 		cfg.MarketHours.Timezone,
+		cfg.MarketHours.AllowSaturday,
 	)
 	logger.Info("Market hours initialized",
 		zap.String("status", marketHours.GetMarketStatus()))
@@ -180,6 +197,7 @@ func main() {
 	holidayChecker, err = holiday.New(ctx, holiday.Config{
 		MongoURI: cfg.MongoDB.URI,
 		Timezone: cfg.MarketHours.Timezone,
+		Bypass:   cfg.BypassHolidayCheck,
 	}, logger)
 	if err != nil {
 		logger.Warn("Failed to initialize holiday checker - orders will be placed on holidays too",

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# create_test_strategies.sh — creates 4 PAPER strategies, one per audit case.
+# create_test_strategies.sh — creates 6 PAPER strategies, one per audit case.
 #
 # Isolation trick: each strategy has match_all_news=false and a UNIQUE category.
 # The rules-engine only matches a strategy when the news category is in its list,
@@ -10,12 +10,14 @@
 #   AUDIT-DPR       cat=AUDIT_DPR       qty 10     → DPR_UPPER_BREACH
 #   AUDIT-QTY       cat=AUDIT_QTY       qty 60000  → QTY_LIMIT_EXCEEDED
 #   AUDIT-VALUE     cat=AUDIT_VALUE     qty 50000  → ORDER_VALUE_LIMIT_EXCEEDED
-#   AUDIT-VELOCITY  cat=AUDIT_VELOCITY  qty 10     → VELOCITY_BREACH
+#   AUDIT-EXPOSURE  cat=AUDIT_EXPOSURE  qty 6500   → EXPOSURE_LIMIT_EXCEEDED (2nd order)
+#   AUDIT-BAN       cat=AUDIT_BAN       qty 1      → BANNED_TOKEN
 #
 # All also emit ORDER_AUDIT (per order) + STRATEGY_INITIALIZED (on create).
 # PAPER mode → no real broker orders (checks run identically to LIVE).
 #
-# Usage:  GATEWAY_URL=http://uat:8081 ./create_test_strategies.sh
+# Usage:  ./create_test_strategies.sh            # all 6
+#         ./create_test_strategies.sh exposure   # just one: trade|qty|value|dpr|exposure|ban
 set -euo pipefail
 
 # Paste your values in config.sh (same folder) — this sources them.
@@ -77,13 +79,31 @@ JSON
   echo ""
 }
 
+strat_trade()    { create_strategy "ORDER_WIN_NEWS_6_7_26_21" 1     "AUDIT_TRADE"    "Passes all checks; ONE order placed → order req/res in trade-execution logs"; }
+strat_dpr()      { create_strategy "LowImpactNews-10"    10    "AUDIT_DPR"      "DPR breach (seeded); expect DPR_UPPER_BREACH"; }
+strat_qty()      { create_strategy "FinResults----10"         60000 "AUDIT_QTY"      "Expect QTY_LIMIT_EXCEEDED"; }
+strat_value()    { create_strategy "High_Value_Order-10" 50000 "AUDIT_VALUE"    "Expect ORDER_VALUE_LIMIT_EXCEEDED"; }
+strat_exposure() { create_strategy "High_Exp_Order-11"   6500  "AUDIT_EXPOSURE" "RELIANCE (~87L) then ONGC (~16L), seeded LTP; 2nd order expects EXPOSURE_LIMIT_EXCEEDED"; }
+strat_ban()      { create_strategy "High_Ban_Order-10"   1     "AUDIT_BAN"      "Token must be in rules-engine's BANNED_TOKENS; expect BANNED_TOKEN"; }
+
 echo "Gateway: ${GATEWAY_URL}   Client: ${CLIENT_ID}   Mode: ${TRADING_MODE}"
-create_strategy "AUDIT-TRADE-1"    1     "AUDIT_TRADE"    "Passes all checks; ONE order placed → order req/res in trade-execution logs"
-create_strategy "AUDIT-DPR-1"      10    "AUDIT_DPR"      "DPR breach (seeded); expect DPR_UPPER_BREACH"
-create_strategy "AUDIT-QTY-1"      60000 "AUDIT_QTY"      "Expect QTY_LIMIT_EXCEEDED"
-create_strategy "AUDIT-VALUE-1"    50000 "AUDIT_VALUE"    "Expect ORDER_VALUE_LIMIT_EXCEEDED"
-create_strategy "AUDIT-VELOCITY-1" 10    "AUDIT_VELOCITY" "Velocity breach (seeded ticks); expect VELOCITY_BREACH"
+
+target="${1:-all}"
+case "$target" in
+  trade)    strat_trade ;;
+  qty)      strat_qty ;;
+  value)    strat_value ;;
+  dpr)      strat_dpr ;;
+  exposure) strat_exposure ;;
+  ban)      strat_ban ;;
+  all)      strat_trade; strat_dpr; strat_qty; strat_value; strat_exposure; strat_ban ;;
+  *) echo "usage: $0 [trade|qty|value|dpr|exposure|ban|all]"; exit 1 ;;
+esac
 
 echo ""
 echo "Strategies created. Give Kafka a few seconds to propagate CONFIG_CREATED to"
-echo "the rules-engine config store, then run:  ./run_audit_tests.sh"
+if [ "$target" = "all" ]; then
+  echo "the rules-engine config store, then run:  ./run_audit_tests.sh"
+else
+  echo "the rules-engine config store, then run:  ./run_audit_tests.sh ${target}"
+fi

@@ -25,6 +25,7 @@ func main() {
 	// everything (CORS, proxy errors, gRPC, routes) via the stdlib log package;
 	// sending it to stdout puts it in the same single stream PM2 captures.
 	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	// Load config
 	cfg, err := config.Load()

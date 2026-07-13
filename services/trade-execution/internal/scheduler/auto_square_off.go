@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -130,6 +132,15 @@ func (s *AutoSquareOffScheduler) SetPaperForceExitStrategy(fn func(ctx context.C
 	s.paperForceExitStrategy = fn
 }
 
+// SetPaperSquareOffTime overrides the global paper square-off time (default
+// 15:00 IST). Used to align paper square-off with an extended session close
+// (e.g. 15:50 for a SEBI Saturday mock ending 16:00). No-op on empty string.
+func (s *AutoSquareOffScheduler) SetPaperSquareOffTime(t string) {
+	if t != "" {
+		s.paperSquareOffTime = t
+	}
+}
+
 // SetLTPLookup wires a Redis LTP source so square-off orders are placed as
 // SL-L at trigger=LTP±0.1%, limit=LTP±1.5% instead of plain MARKET orders.
 func (s *AutoSquareOffScheduler) SetLTPLookup(l LTPLookup) {
@@ -223,17 +234,36 @@ func (s *AutoSquareOffScheduler) Stop() {
 	close(s.stopChan)
 }
 
-// marketCloseMinutes is the hard cutoff (15:30 IST) after which live orders cannot be placed.
-// NSE closes the continuous session at 15:30; any order sent after this becomes an AMO
-// (After Market Order) and executes the next morning at open — which is never what we want.
-const marketCloseMinutes = 15*60 + 30 // 15:30 IST
+// marketCloseMinutes is the hard cutoff (minutes since midnight IST) after which
+// live orders cannot be placed. NSE closes the continuous session at 15:30; any
+// order sent after this becomes an AMO (After Market Order) and executes the next
+// morning at open — which is never what we want.
+//
+// Default 15:30 IST, overridable via MARKET_CLOSE_HOUR / MARKET_CLOSE_MINUTE so
+// the window can be extended for a SEBI Saturday mock session (e.g. 16:00).
+// Evaluated once at package init.
+var marketCloseMinutes = func() int {
+	h, m := 15, 30
+	if v, err := strconv.Atoi(os.Getenv("MARKET_CLOSE_HOUR")); err == nil && v >= 0 && v <= 23 {
+		h = v
+	}
+	if v, err := strconv.Atoi(os.Getenv("MARKET_CLOSE_MINUTE")); err == nil && v >= 0 && v <= 59 {
+		m = v
+	}
+	return h*60 + m
+}()
+
+// marketCloseHHMM formats marketCloseMinutes as "HH:MM" for log/error messages.
+func marketCloseHHMM() string {
+	return fmt.Sprintf("%02d:%02d", marketCloseMinutes/60, marketCloseMinutes%60)
+}
 
 // runStartupCatchUp fires square-off for any windows that were missed while
 // the service was down (e.g. restarted after 15:05). Safe to call multiple
 // times — the lastExecuteDate guards prevent double-execution.
 func (s *AutoSquareOffScheduler) runStartupCatchUp(ctx context.Context) {
 	now := time.Now().In(timezone.IST)
-	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+	if timezone.IsMarketClosedDay(now) {
 		return
 	}
 	today := now.Format("2006-01-02")
@@ -353,7 +383,7 @@ func (s *AutoSquareOffScheduler) runStartupUserCatchUp(ctx context.Context, now 
 // weekday and we haven't already executed today.
 func (s *AutoSquareOffScheduler) shouldSquareOff() bool {
 	now := time.Now().In(timezone.IST)
-	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+	if timezone.IsMarketClosedDay(now) {
 		return false
 	}
 	hour, minute := s.parseTime(s.squareOffTime)
@@ -377,7 +407,7 @@ func (s *AutoSquareOffScheduler) shouldSquareOff() bool {
 // weekday and paper square-off hasn't already run today.
 func (s *AutoSquareOffScheduler) shouldPaperSquareOff() bool {
 	now := time.Now().In(timezone.IST)
-	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+	if timezone.IsMarketClosedDay(now) {
 		return false
 	}
 	hour, minute := s.parseTime(s.paperSquareOffTime)
@@ -495,7 +525,7 @@ func (s *AutoSquareOffScheduler) squareOffAllPositions(ctx context.Context) erro
 // Runs every minute tick on weekdays. Guards against firing twice per user per day.
 func (s *AutoSquareOffScheduler) checkUserSquareOffs(ctx context.Context) {
 	now := time.Now().In(timezone.IST)
-	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+	if timezone.IsMarketClosedDay(now) {
 		return
 	}
 	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
@@ -718,11 +748,12 @@ func (s *AutoSquareOffScheduler) squareOffUserViaPositionBook(ctx context.Contex
 // createAndExecuteSquareOffOrder creates a reverse order to close a position
 // and executes it via the broker.
 func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Context, originalOrder *models.Order) error {
-	// Hard guard: never place live orders after market close (15:30 IST).
+	// Hard guard: never place live orders after market close (default 15:30 IST,
+	// configurable via MARKET_CLOSE_HOUR/MINUTE).
 	// This is the last line of defence against AMOs regardless of how this function was reached.
 	now := time.Now().In(timezone.IST)
 	if now.Hour()*60+now.Minute() >= marketCloseMinutes {
-		return fmt.Errorf("market closed (%02d:%02d IST ≥ 15:30) — refusing to place order to avoid AMO", now.Hour(), now.Minute())
+		return fmt.Errorf("market closed (%02d:%02d IST ≥ %s) — refusing to place order to avoid AMO", now.Hour(), now.Minute(), marketCloseHHMM())
 	}
 
 	// Cancel this symbol's resting SL/TP (OCO) and multi-level exit legs BEFORE
@@ -829,7 +860,7 @@ func (s *AutoSquareOffScheduler) createAndExecuteSquareOffOrder(ctx context.Cont
 // every other strategy's open positions untouched.
 func (s *AutoSquareOffScheduler) checkStrategySquareOffs(ctx context.Context) {
 	now := time.Now().In(timezone.IST)
-	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+	if timezone.IsMarketClosedDay(now) {
 		return
 	}
 	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())

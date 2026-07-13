@@ -4,17 +4,60 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"runtime/debug"
+	"strconv"
 	"time"
 )
 
-const (
-	paperDeactivationHour   = 15
-	paperDeactivationMinute = 0 // Paper strategies deactivate at 15:00 IST (matches paper square-off)
-	liveDeactivationHour    = 15
-	liveDeactivationMinute  = 5 // Live strategies deactivate at 15:05 IST (matches live square-off)
-	istTimezone             = "Asia/Kolkata"
-)
+const istTimezone = "Asia/Kolkata"
+
+// EOD deactivation times, kept aligned with the trade-execution square-off times.
+// Defaults: paper 15:00, live 15:05 IST. Overridable via env so they can track an
+// extended session close (e.g. 15:50 / 15:55 for a SEBI Saturday mock ending 16:00).
+// Evaluated once at package init.
+var paperDeactivationHour, paperDeactivationMinute = parseHHMM(envDefault("EOD_PAPER_DEACTIVATION_TIME", "15:00"), 15, 0)
+var liveDeactivationHour, liveDeactivationMinute = parseHHMM(envDefault("EOD_LIVE_DEACTIVATION_TIME", "15:05"), 15, 5)
+
+// envDefault returns the env var value for key, or def if unset/empty.
+func envDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// parseHHMM parses "HH:MM" into (hour, minute), returning (defH, defM) if the
+// value is malformed or out of range.
+func parseHHMM(s string, defH, defM int) (int, int) {
+	var h, m int
+	if n, err := fmt.Sscanf(s, "%d:%d", &h, &m); n != 2 || err != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return defH, defM
+	}
+	return h, m
+}
+
+// allowSaturdayMock, when true, treats Saturday as a normal trading day so EOD
+// deactivation runs during SEBI's Saturday mock/special sessions. Sunday is
+// always closed. Controlled by the ALLOW_SATURDAY_MOCK env var (default false),
+// read once at package init.
+var allowSaturdayMock = func() bool {
+	v, _ := strconv.ParseBool(os.Getenv("ALLOW_SATURDAY_MOCK"))
+	return v
+}()
+
+// isClosedWeekend reports whether t is a weekend day on which trading is closed.
+// Sunday is always closed; Saturday is closed unless Saturday mock is enabled.
+func isClosedWeekend(t time.Time) bool {
+	switch t.Weekday() {
+	case time.Sunday:
+		return true
+	case time.Saturday:
+		return !allowSaturdayMock
+	default:
+		return false
+	}
+}
 
 // StrategyDeactivator is the interface the scheduler needs from the service layer.
 type StrategyDeactivator interface {
@@ -80,7 +123,7 @@ func (s *EODDeactivationScheduler) Start(ctx context.Context) {
 				}()
 
 				now := t.In(loc)
-				if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+				if isClosedWeekend(now) {
 					return
 				}
 

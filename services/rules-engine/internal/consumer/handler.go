@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"runtime/debug"
@@ -79,13 +80,29 @@ func loadBannedTokens() map[int64]struct{} {
 	return m
 }
 
+// LoadComplianceLimitsFromEnv re-reads the pre-trade compliance caps from the
+// environment. It MUST be called from main() AFTER the .env file is loaded,
+// because the package-level vars above are initialized at program init — which
+// runs BEFORE main() loads .env — so without this call the .env values for
+// MAX_ORDER_QUANTITY / MAX_ORDER_VALUE / MAX_EXPOSURE_LIMIT / VELOCITY_* /
+// BANNED_TOKENS are silently ignored and the compiled defaults win.
+func LoadComplianceLimitsFromEnv() {
+	maxOrderQuantity = envInt32("MAX_ORDER_QUANTITY", 50000)
+	maxOrderValueINR = envFloat("MAX_ORDER_VALUE", 20000000)
+	velocityPct = envFloat("VELOCITY_PCT", 1.0)
+	velocityWindowMs = envInt32("VELOCITY_WINDOW_MS", 1000)
+	maxExposureLimitINR = envFloat("MAX_EXPOSURE_LIMIT", 0)
+	bannedTokens = loadBannedTokens()
+	log.Printf("compliance limits loaded: MAX_ORDER_QUANTITY=%d MAX_ORDER_VALUE=%.0f MAX_EXPOSURE_LIMIT=%.0f VELOCITY_PCT=%.2f VELOCITY_WINDOW_MS=%d BANNED_TOKENS=%d",
+		maxOrderQuantity, maxOrderValueINR, maxExposureLimitINR, velocityPct, velocityWindowMs, len(bannedTokens))
+}
+
 // auditOrderReceived emits one structured audit record for every order request
 // the engine builds — the complete order detail required by the compliance
 // trail: timestamp, user, security, quantity, price, order type, product type.
 func (h *Handler) auditOrderReceived(o *models.OrderRequest, ltp float64) {
 	h.logger.Info("ORDER_AUDIT",
 		zap.String("event", "ORDER_AUDIT"),
-		zap.String("order_id", o.OrderID),
 		zap.Time("ts", time.Now()),
 		zap.String("user_id", o.UserID),
 		zap.String("strategy_id", o.StrategyID),
@@ -110,7 +127,6 @@ func (h *Handler) rejectForCompliance(o *models.OrderRequest, ltp float64, reaso
 		zap.String("reason", reason),
 		zap.Float64("limit_value", limit),
 		zap.Float64("actual_value", actual),
-		zap.String("order_id", o.OrderID),
 		zap.Time("ts", time.Now()),
 		zap.String("user_id", o.UserID),
 		zap.String("strategy_id", o.StrategyID),
@@ -122,7 +138,6 @@ func (h *Handler) rejectForCompliance(o *models.OrderRequest, ltp float64, reaso
 		zap.Float64("price", o.Price),
 		zap.String("order_type", o.OrderType),
 		zap.String("product_type", o.ProductType),
-		zap.Float64("ltp", ltp),
 	)
 }
 
@@ -137,7 +152,6 @@ func (h *Handler) rejectForDPR(o *models.OrderRequest, ltp float64, reason strin
 		zap.Float64("actual_value", actual),
 		zap.Float64("dpr_lower", dprLower),
 		zap.Float64("dpr_upper", dprUpper),
-		zap.String("order_id", o.OrderID),
 		zap.Time("ts", time.Now()),
 		zap.String("user_id", o.UserID),
 		zap.String("strategy_id", o.StrategyID),
@@ -149,7 +163,6 @@ func (h *Handler) rejectForDPR(o *models.OrderRequest, ltp float64, reason strin
 		zap.Float64("price", o.Price),
 		zap.String("order_type", o.OrderType),
 		zap.String("product_type", o.ProductType),
-		zap.Float64("ltp", ltp),
 	)
 }
 

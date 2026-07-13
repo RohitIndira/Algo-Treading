@@ -54,7 +54,7 @@ func (c *StrategyEventsConsumer) processMessageRecovered(ctx context.Context, ms
 // or the same position gets closed twice → net short → SEBI penalty.
 func isEODSquareOffWindow() bool {
 	now := time.Now().In(timezone.IST)
-	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+	if timezone.IsMarketClosedDay(now) {
 		return false
 	}
 	totalMin := now.Hour()*60 + now.Minute()

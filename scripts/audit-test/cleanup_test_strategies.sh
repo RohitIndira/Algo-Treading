@@ -20,10 +20,12 @@ command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 auth=(-H "Authorization: Bearer ${ACCESS_TOKEN}" -H "appId: ${APP_ID}" -H "userId: ${CLIENT_ID}" -H "source: ${SOURCE}")
 
 echo "Listing strategies for ${CLIENT_ID} ..."
-list=$(curl -sS "${GATEWAY_URL}/api/v1/users/${CLIENT_ID}/strategies?page=1&page_size=100" "${auth[@]}")
+list=$(curl -sS "${GATEWAY_URL}/api/v1/users/${CLIENT_ID}/strategies?page=1&page_size=200" "${auth[@]}")
 
-# Pull (strategy_id, strategy_name) for AUDIT-* strategies.
-echo "$list" | jq -r '.strategies[]? | select(.strategy_name | startswith("AUDIT-")) | "\(.strategy_id)\t\(.strategy_name)"' \
+# Match by category, not strategy_name — create_test_strategies.sh names strategies
+# freely (e.g. "High_Exp_Order-11"), but every AUDIT test strategy's condition
+# category always starts with AUDIT_ (AUDIT_TRADE/DPR/QTY/VALUE/EXPOSURE/BAN/LIFECYCLE).
+echo "$list" | jq -r '.strategies[]? | select((.conditions.categories // []) | any(startswith("AUDIT_"))) | "\(.strategy_id)\t\(.strategy_name)"' \
 | while IFS=$'\t' read -r sid sname; do
   [ -z "$sid" ] && continue
   if [ "$ACTION" = "delete" ]; then

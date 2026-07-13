@@ -27,6 +27,7 @@ type Checker struct {
 	collection *mongo.Collection
 	logger     *zap.Logger
 	timezone   *time.Location
+	bypass     bool // when true, IsTodayHoliday always returns false (mock/demo)
 
 	mu       sync.RWMutex
 	holidays map[string]struct{} // "YYYY-MM-DD" → present means holiday
@@ -36,6 +37,11 @@ type Checker struct {
 type Config struct {
 	MongoURI string
 	Timezone string // e.g. "Asia/Kolkata"
+	// Bypass, when true, makes IsTodayHoliday always return false so news is
+	// processed even on a holiday (used for SEBI Saturday mock/demo sessions).
+	// The holiday set is still loaded (backfill's previous-trading-day math is
+	// unaffected); only the "skip today" gate is disabled.
+	Bypass bool
 }
 
 // New connects to MongoDB, loads the initial holiday set, and returns
@@ -65,7 +71,12 @@ func New(ctx context.Context, cfg Config, logger *zap.Logger) (*Checker, error) 
 		collection: client.Database("OdinMasterData").Collection("HolidayMaster"),
 		logger:     logger,
 		timezone:   loc,
+		bypass:     cfg.Bypass,
 		holidays:   make(map[string]struct{}),
+	}
+
+	if cfg.Bypass {
+		logger.Warn("Holiday check BYPASSED — today's news will be processed even if today is a trading holiday (mock/demo mode)")
 	}
 
 	if err := c.Refresh(ctx); err != nil {
@@ -126,6 +137,9 @@ func (c *Checker) Refresh(ctx context.Context) error {
 // IsTodayHoliday returns true if today (in the configured timezone) is a
 // trading holiday for either BSE or NSE equity.
 func (c *Checker) IsTodayHoliday() bool {
+	if c.bypass {
+		return false
+	}
 	today := time.Now().In(c.timezone).Format("2006-01-02")
 	c.mu.RLock()
 	_, ok := c.holidays[today]

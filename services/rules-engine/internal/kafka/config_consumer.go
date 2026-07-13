@@ -116,6 +116,11 @@ func (c *ConfigConsumer) processMessage(ctx context.Context, msg kafka.Message) 
 				m.StrategyID, m.UserID, m.StrategyName, m.Version, m.TradingMode,
 				m.TradeConfig.Quantity, m.TradeConfig.OrderType, m.TradeConfig.Exchange,
 				m.RiskLimits.MaxAmountPerStock, m.RiskLimits.MaxTradesPerStrategy, m.ProcessAfterMarketNews)
+		} else {
+			// CONFIG_UPDATED covers plain edits AND re-activations (the outbox emits a
+			// full CONFIG_UPDATED for activate), so this is where "activate" shows up.
+			log.Printf("STRATEGY_UPDATED event=STRATEGY_UPDATED strategy_id=%s user_id=%s strategy_name=%q version=%d trading_mode=%s active=%t",
+				m.StrategyID, m.UserID, m.StrategyName, m.Version, m.TradingMode, m.Active)
 		}
 
 		// Trigger AMN backfill when a newly created strategy opts in.
@@ -126,21 +131,44 @@ func (c *ConfigConsumer) processMessage(ctx context.Context, msg kafka.Message) 
 		}
 
 	case "CONFIG_PAUSED":
+		// Capture the name before pausing (thin events don't carry it).
+		pausedName := ""
+		if s, ok := c.configStore.GetStrategy(ev.UserID, ev.StrategyID); ok {
+			pausedName = s.StrategyName
+		}
 		if err := c.configStore.Pause(ev.UserID, ev.StrategyID, ev.Version); err != nil {
 			c.errors.Add(1)
 			log.Printf("config consumer: pause failed: %v", err)
+		} else {
+			log.Printf("STRATEGY_DEACTIVATED event=STRATEGY_DEACTIVATED strategy_id=%s user_id=%s strategy_name=%q version=%d",
+				ev.StrategyID, ev.UserID, pausedName, ev.Version)
 		}
 
 	case "CONFIG_RESUMED":
+		resumedName := ""
+		if s, ok := c.configStore.GetStrategy(ev.UserID, ev.StrategyID); ok {
+			resumedName = s.StrategyName
+		}
 		if err := c.configStore.Resume(ev.UserID, ev.StrategyID, ev.Version); err != nil {
 			c.errors.Add(1)
 			log.Printf("config consumer: resume failed: %v", err)
+		} else {
+			log.Printf("STRATEGY_RESUMED event=STRATEGY_RESUMED strategy_id=%s user_id=%s strategy_name=%q version=%d",
+				ev.StrategyID, ev.UserID, resumedName, ev.Version)
 		}
 
 	case "CONFIG_DELETED":
+		// Capture the name before removing it from the store.
+		deletedName := ""
+		if s, ok := c.configStore.GetStrategy(ev.UserID, ev.StrategyID); ok {
+			deletedName = s.StrategyName
+		}
 		if err := c.configStore.Remove(ev.UserID, ev.StrategyID, ev.Version); err != nil {
 			c.errors.Add(1)
 			log.Printf("config consumer: remove failed: %v", err)
+		} else {
+			log.Printf("STRATEGY_DELETED event=STRATEGY_DELETED strategy_id=%s user_id=%s strategy_name=%q version=%d",
+				ev.StrategyID, ev.UserID, deletedName, ev.Version)
 		}
 
 	default:

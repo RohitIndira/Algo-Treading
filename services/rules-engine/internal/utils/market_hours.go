@@ -11,6 +11,24 @@ type MarketHours struct {
 	CloseHour   int
 	CloseMinute int
 	Timezone    *time.Location
+	// AllowSaturday, when true, treats Saturday as a normal trading day so the
+	// engine generates signals during SEBI's Saturday mock/special sessions.
+	// Sunday is always closed. Wired from the ALLOW_SATURDAY_MOCK env var.
+	AllowSaturday bool
+}
+
+// isClosedWeekend reports whether weekday is a weekend day on which trading is
+// closed. Sunday is always closed; Saturday is closed unless AllowSaturday is
+// set (SEBI Saturday mock session).
+func (mh *MarketHours) isClosedWeekend(weekday time.Weekday) bool {
+	switch weekday {
+	case time.Sunday:
+		return true
+	case time.Saturday:
+		return !mh.AllowSaturday
+	default:
+		return false
+	}
 }
 
 // DefaultMarketHours returns the standard Indian market hours (9:15 AM to 3:30 PM IST)
@@ -31,8 +49,9 @@ func DefaultMarketHours() *MarketHours {
 	}
 }
 
-// NewMarketHours creates a new MarketHours instance with custom configuration
-func NewMarketHours(openHour, openMinute, closeHour, closeMinute int, timezone string) *MarketHours {
+// NewMarketHours creates a new MarketHours instance with custom configuration.
+// allowSaturday enables Saturday as a trading day for SEBI mock sessions.
+func NewMarketHours(openHour, openMinute, closeHour, closeMinute int, timezone string, allowSaturday bool) *MarketHours {
 	// Load specified timezone
 	loc, err := time.LoadLocation(timezone)
 	if err != nil {
@@ -41,11 +60,12 @@ func NewMarketHours(openHour, openMinute, closeHour, closeMinute int, timezone s
 	}
 
 	return &MarketHours{
-		OpenHour:    openHour,
-		OpenMinute:  openMinute,
-		CloseHour:   closeHour,
-		CloseMinute: closeMinute,
-		Timezone:    loc,
+		OpenHour:      openHour,
+		OpenMinute:    openMinute,
+		CloseHour:     closeHour,
+		CloseMinute:   closeMinute,
+		Timezone:      loc,
+		AllowSaturday: allowSaturday,
 	}
 }
 
@@ -62,8 +82,8 @@ func (mh *MarketHours) IsMarketOpenAt(t time.Time) bool {
 	// Get weekday
 	weekday := marketTime.Weekday()
 
-	// Check if it's a weekend (Saturday or Sunday)
-	if weekday == time.Saturday || weekday == time.Sunday {
+	// Check if it's a closed weekend (Sunday always; Saturday unless mock enabled)
+	if mh.isClosedWeekend(weekday) {
 		return false
 	}
 
@@ -85,7 +105,7 @@ func (mh *MarketHours) GetMarketStatus() string {
 	now := time.Now().In(mh.Timezone)
 	weekday := now.Weekday()
 
-	if weekday == time.Saturday || weekday == time.Sunday {
+	if mh.isClosedWeekend(weekday) {
 		return "Market closed (Weekend)"
 	}
 
@@ -123,8 +143,8 @@ func (mh *MarketHours) TimeUntilOpen() time.Duration {
 		nextOpen = nextOpen.Add(24 * time.Hour)
 	}
 
-	// Skip weekends
-	for nextOpen.Weekday() == time.Saturday || nextOpen.Weekday() == time.Sunday {
+	// Skip closed weekend days (Saturday counts as open when mock is enabled)
+	for mh.isClosedWeekend(nextOpen.Weekday()) {
 		nextOpen = nextOpen.Add(24 * time.Hour)
 	}
 

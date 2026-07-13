@@ -737,6 +737,8 @@ func main() {
 		orderExecutor,
 		cfg.AutoSquareOffTime,
 	)
+	// Align the global paper square-off time (default 15:00; extendable for mock sessions).
+	autoSquareOff.SetPaperSquareOffTime(cfg.PaperAutoSquareOffTime)
 	// Wire paper monitor so paper positions are closed at market close alongside live positions.
 	autoSquareOff.SetPaperSquareOff(paperMonitor.SquareOffAll)
 	// Wire per-user paper exit: closes a specific user's paper positions at their custom time (UI override).
@@ -1303,7 +1305,8 @@ type Config struct {
 	// Observability
 	MetricsPort int
 	// Auto square-off
-	AutoSquareOffTime string // "HH:MM" format, default "15:05"
+	AutoSquareOffTime      string // live, "HH:MM" format, default "15:05"
+	PaperAutoSquareOffTime string // paper, "HH:MM" format, default "15:00"
 	// Startup recovery toggles. Both are read-only / additive recovery passes
 	// gated by env flags so they can be rolled out independently and rolled
 	// back without redeploy.
@@ -1340,6 +1343,7 @@ func loadConfig() Config {
 		RedisDB:                  getEnvInt("REDIS_DB", 0),
 		MetricsPort:              getEnvInt("METRICS_PORT", 9090),
 		AutoSquareOffTime:        getEnv("AUTO_SQUARE_OFF_TIME", "15:05"),
+		PaperAutoSquareOffTime:   getEnv("PAPER_AUTO_SQUARE_OFF_TIME", "15:00"),
 		EnableStartupReconcile:   getEnvBool("ENABLE_STARTUP_RECONCILE", false),
 		EnableMLReload:           getEnvBool("ENABLE_ML_RELOAD", false),
 		FillReconcileIntervalSec: getEnvInt("FILL_RECONCILE_INTERVAL_SEC", 30),
