@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/consumer"
+	"github.com/RohitIndira/Algo-Treading/services/positions/internal/tradeexec"
 )
 
 func main() {
@@ -110,6 +111,29 @@ func main() {
 		}
 	}()
 
+	// ── trade-execution gRPC client + LRU cache (Chunk P.B.5) ──────────
+	// Enriches every order.events message with signal_id + entry lineage
+	// via trade-exec's LookupOrderMeta RPC. Cache TTLs: 24h for found,
+	// 60s for NOT_FOUND (may be racing an in-flight INSERT). Wired into
+	// the state-machine handler in P.C — for P.B.5 we just verify dial.
+	tradeExecAddr := getEnv("TRADE_EXEC_GRPC_ADDR", "localhost:9004")
+	orderMetaCache := tradeexec.NewCache(tradeexec.Config{})
+	orderMetaCache.Start()
+
+	teCtx, teCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	tradeExecClient, err := tradeexec.New(teCtx, tradeExecAddr, orderMetaCache, logger)
+	teCancel()
+	if err != nil {
+		logger.Fatal("trade-execution gRPC dial failed",
+			zap.String("addr", tradeExecAddr), zap.Error(err))
+	}
+	defer func() { _ = tradeExecClient.Close() }()
+	logger.Info("trade-execution gRPC ready", zap.String("addr", tradeExecAddr))
+
+	// silence unused until P.C replaces LoggingHandler with the state-machine
+	// handler that consumes it
+	_ = tradeExecClient
+
 	// ── order.events consumer (Chunk P.B) ──────────────────────────────
 	// Log-only handler for now; P.C replaces with the state machine that
 	// enriches via LookupOrderMeta gRPC + writes positions + position_events.
@@ -140,8 +164,8 @@ func main() {
 	_ = driftWriter
 
 	logger.Info("positions svc ready",
-		zap.String("chunk", "P.B"),
-		zap.String("next", "P.B.5 — gRPC client for LookupOrderMeta enrichment"))
+		zap.String("chunk", "P.B.5"),
+		zap.String("next", "P.C — state machine replaces LoggingHandler; realized_pnl computed"))
 
 	// ── Graceful shutdown ──────────────────────────────────────────────
 	stop := make(chan os.Signal, 1)
