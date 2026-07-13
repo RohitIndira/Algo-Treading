@@ -25,6 +25,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/notifications"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/performance"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/portfolio"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/router"
 )
 
@@ -122,9 +123,9 @@ func main() {
 
 	// Initialize Manthan handler — Manthan data is split across two Postgres DBs:
 	//
-	//   MANTHAN_SIGNALS_DB   — holds market_data.manthan_signals
+	//   MANTHAN_SIGNALS_DB   — holds signals_db.manthan_signals
 	//                          (written by data-ingestion / manthan-live).
-	//                          Default: market_data.
+	//                          Default: signals_db.
 	//   MANTHAN_POSITIONS_DB — holds trading_db.manthan_positions
 	//                          and trading_db.manthan_cooldown
 	//                          (written by the rules-engine publisher).
@@ -139,15 +140,21 @@ func main() {
 	var healthHandler *handlers.HealthHandler
 	var perfHandler *handlers.PerformanceHandler
 	var extRedis *redis.Client // hoisted: reused by the market-quote handler
+	// positionsDB, ordersDB + their DB names hoisted so downstream setup
+	// (live-algos store in DB.1, portfolio token lookup in PF.D) can reuse
+	// the same pools instead of dialling a second time.
+	var positionsDB *sql.DB
+	var ordersDB *sql.DB
+	var positionsDBName, ordersDBName string
 	{
 		pgHost := envOr("POSTGRES_HOST", "localhost")
 		pgPort := envOr("POSTGRES_PORT", "5432")
 		pgUser := envOr("POSTGRES_USER", "postgres")
 		pgPass := envOr("POSTGRES_PASSWORD", "postgres")
 		pgSSL := envOr("POSTGRES_SSLMODE", "disable")
-		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "market_data")
-		positionsDBName := envOr("MANTHAN_POSITIONS_DB", "trading_db")
-		ordersDBName := envOr("MANTHAN_ORDERS_DB", "trading_execution")
+		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "signals_db")
+		positionsDBName = envOr("MANTHAN_POSITIONS_DB", "trading_db")
+		ordersDBName = envOr("MANTHAN_ORDERS_DB", "execution_db")
 		perfDBName := envOr("MANTHAN_PERF_DB", "stockk_market")
 
 		openPG := func(dbName string) (*sql.DB, error) {
@@ -176,19 +183,19 @@ func main() {
 			defer signalsDB.Close()
 		}
 
-		positionsDB, err := openPG(positionsDBName)
-		if err != nil {
+		if db, err := openPG(positionsDBName); err != nil {
 			log.Printf("Warning: Manthan positions DB (%s) open/ping failed: %v", positionsDBName, err)
 		} else {
 			log.Printf("Manthan positions DB connected (%s)", positionsDBName)
+			positionsDB = db
 			defer positionsDB.Close()
 		}
 
-		ordersDB, err := openPG(ordersDBName)
-		if err != nil {
+		if db, err := openPG(ordersDBName); err != nil {
 			log.Printf("Warning: Manthan orders DB (%s) open/ping failed: %v", ordersDBName, err)
 		} else {
 			log.Printf("Manthan orders DB connected (%s)", ordersDBName)
+			ordersDB = db
 			defer ordersDB.Close()
 		}
 
@@ -284,31 +291,22 @@ func main() {
 	// Both are nil-safe — if the DB pool or Redis client fail to init,
 	// the router skips registering the details routes and the LIST
 	// endpoint keeps working normally.
+	// livealgos store reads from TWO existing DB pools:
+	//   positionsDB  (trading_db)         — manthan_positions, strategies, trade_configs
+	//   ordersDB     (execution_db)  — manthan_orders
+	// Previously this opened a THIRD `stockk_trading` DB which was a
+	// silent replica that drifted from the authoritative sources — see
+	// docs/db_ownership.md. Killed in Chunk DB.1.
+	//
+	// Both pools are already opened + ping-verified above under the
+	// manthan handler block; here we just borrow the handles.
 	var liveAlgosStore livealgos.Store
-	tradingDBName := envOr("STOCKK_TRADING_DB", "stockk_trading")
-	if tradingDB, err := sql.Open("postgres", fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		envOr("POSTGRES_HOST", "localhost"),
-		envOr("POSTGRES_PORT", "5432"),
-		envOr("POSTGRES_USER", "postgres"),
-		envOr("POSTGRES_PASSWORD", "postgres"),
-		tradingDBName,
-		envOr("POSTGRES_SSLMODE", "disable"),
-	)); err != nil {
-		log.Printf("Warning: %s DB open failed: %v (details endpoints disabled)", tradingDBName, err)
+	if positionsDB != nil && ordersDB != nil {
+		liveAlgosStore = livealgos.NewPostgresStore(positionsDB, ordersDB)
+		log.Printf("Live-algos store wired (positions=%s, orders=%s)", positionsDBName, ordersDBName)
 	} else {
-		tradingDB.SetMaxOpenConns(5)
-		tradingDB.SetMaxIdleConns(2)
-		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := tradingDB.PingContext(pCtx); err != nil {
-			log.Printf("Warning: %s DB ping failed: %v (details endpoints disabled)", tradingDBName, err)
-			_ = tradingDB.Close()
-		} else {
-			log.Printf("Live-algos trading DB connected (%s)", tradingDBName)
-			defer tradingDB.Close()
-			liveAlgosStore = livealgos.NewPostgresStore(tradingDB)
-		}
-		pCancel()
+		log.Printf("Warning: live-algos details store disabled — need both positionsDB (%v) and ordersDB (%v)",
+			positionsDB != nil, ordersDB != nil)
 	}
 
 	var liveAlgosLTP *livealgos.LTPStore
@@ -323,17 +321,55 @@ func main() {
 		})
 		pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		if err := ltpClient.Ping(pCtx).Err(); err != nil {
-			log.Printf("Warning: LTP redis ping (%s) failed: %v (details endpoints degrade to zero LTP)", ltpAddr, err)
-			_ = ltpClient.Close()
+			log.Printf("Warning: LTP redis ping (%s) failed: %v (details endpoints report ltpStatus=UNAVAILABLE until probe recovers)", ltpAddr, err)
+			// Keep the client + store around so the runtime probe can
+			// flip HEALTHY if the tunnel comes back — no need to bounce
+			// api-gateway. See livealgos.LTPStore.Start.
+			liveAlgosLTP = livealgos.NewLTPStore(ltpClient)
 		} else {
 			log.Printf("Live-algos LTP redis connected (%s)", ltpAddr)
-			defer ltpClient.Close()
 			liveAlgosLTP = livealgos.NewLTPStore(ltpClient)
+			liveAlgosLTP.MarkHealthy(true) // seed healthy before Start's first tick
 		}
+		defer ltpClient.Close()
+		// Start the 5s probe. Detects silent tunnel half-close per
+		// reference_ltp_tunnel_silent_fail — a single failing PING
+		// flips the store UNAVAILABLE so subsequent responses carry
+		// ltpStatus=UNAVAILABLE instead of returning 0 LTPs.
+		probeCtx, probeCancel := context.WithCancel(context.Background())
+		defer probeCancel()
+		go liveAlgosLTP.Start(probeCtx, 5*time.Second)
 		pCancel()
 	}
 
 	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP)
+
+	// ── Portfolio handler (PF.D) ────────────────────────────────────────
+	// Dials portfolio svc's gRPC, composes an Enricher over the same
+	// LTP client the live-algos handler uses, and registers the three
+	// /users/me/portfolio/* routes below. Nil-safe: if portfolio svc is
+	// unreachable at boot the routes stay unregistered and requests get
+	// a clean 404. See docs/portfolio_service_design.md.
+	var portfolioHandler *handlers.PortfolioHandler
+	// Token lookup uses ordersDB (execution_db.manthan_orders) — the
+	// authoritative writer for exchange_token. Previously read from
+	// stockk_trading which was a silent replica; DB.1 killed that path.
+	if pfAddr := envOr("PORTFOLIO_GRPC_ADDR", "localhost:9005"); pfAddr != "" && ordersDB != nil {
+		pfClient, err := grpc_clients.NewPortfolioClient(pfAddr, 5*time.Second)
+		if err != nil {
+			log.Printf("Warning: portfolio gRPC dial (%s) failed: %v (portfolio endpoints disabled)", pfAddr, err)
+		} else {
+			defer pfClient.Close()
+			// LTPSource interface satisfied by *livealgos.LTPStore. Nil is fine —
+			// enricher's LTPSource nil-guard treats it as UNAVAILABLE.
+			enricher := portfolio.NewEnricher(
+				portfolio.NewTradingDBTokenLookup(ordersDB),
+				liveAlgosLTP,
+			)
+			portfolioHandler = handlers.NewPortfolioHandler(pfClient, enricher)
+			log.Printf("Portfolio gRPC client wired (%s) → /users/me/portfolio/* enabled", pfAddr)
+		}
+	}
 
 	// JWT verifier for the protected subrouter.
 	//
@@ -370,7 +406,7 @@ func main() {
 	})
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, verifier, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

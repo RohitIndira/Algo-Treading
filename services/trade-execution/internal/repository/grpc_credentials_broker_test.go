@@ -14,7 +14,7 @@
 //
 // Requires (all defaults to localhost):
 //   - user-config gRPC running on :50051
-//   - S4450 row seeded in trading_execution.user_credentials with a VALID JWT
+//   - S4450 row seeded in execution_db.user_credentials with a VALID JWT
 //   - Outbound HTTPS to livemiddleware.indiratrade.com working
 //
 // Run with:

@@ -58,7 +58,7 @@ func main() {
 
 	lgr.Info("Database connection established")
 
-	// Connect to the trade-execution DB (trading_execution) to store/read user credentials
+	// Connect to the trade-execution DB (execution_db) to store/read user credentials
 	execDBClient, err := postgres.New(cfg.ExecutionDB)
 	if err != nil {
 		lgr.Warn("Failed to connect to execution DB — credentials will NOT be saved", zap.Error(err))
@@ -91,12 +91,12 @@ func main() {
 	sqlxDB := sqlx.NewDb(dbClient.DB, "postgres")
 	repo := repository.NewStrategyRepository(sqlxDB)
 
-	// Initialize credentials repository (writes to trading_execution DB)
+	// Initialize credentials repository (writes to execution_db DB)
 	var credsRepo repository.CredentialsRepository
 	if execDBClient != nil {
 		execSqlxDB := sqlx.NewDb(execDBClient.DB, "postgres")
 		credsRepo = repository.NewCredentialsRepository(execSqlxDB, cfg.EncryptionKey)
-		lgr.Info("Credentials repository initialized (trading_execution)")
+		lgr.Info("Credentials repository initialized (execution_db)")
 	} else {
 		credsRepo = repository.NewNoopCredentialsRepository()
 		lgr.Warn("Using no-op credentials repository — credentials will not be persisted")

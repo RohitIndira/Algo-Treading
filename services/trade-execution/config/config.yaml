@@ -8,7 +8,7 @@ postgres:
   port: 5432
   user: trading_user
   password: ${POSTGRES_PASSWORD}
-  database: trading_execution
+  database: execution_db
   ssl_mode: disable
   max_open_conns: 25
   max_idle_conns: 5

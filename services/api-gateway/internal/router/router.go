@@ -22,6 +22,7 @@ func NewRouter(
 	algosHandler *handlers.AlgosHandler,
 	perfHandler *handlers.PerformanceHandler,
 	liveAlgosHandler *handlers.LiveAlgosHandler,
+	portfolioHandler *handlers.PortfolioHandler,
 	verifier auth.Verifier,
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
@@ -222,6 +223,19 @@ func NewRouter(
 			protected.HandleFunc("/users/me/live-algos/{strategyId}/trades", liveAlgosHandler.GetTrades).Methods("GET")
 			protected.HandleFunc("/users/me/live-algos/{strategyId}/holdings/{symbol}", liveAlgosHandler.GetStockPnL).Methods("GET")
 		}
+	}
+
+	// Portfolio tab — CQRS query side. All read-only; api-gateway proxies
+	// to portfolio svc via gRPC and enriches with LTP + unrealized P&L.
+	// URL uses the literal "me" — identity from JWT. Same IDOR-by-design
+	// as live-algos. See docs/portfolio_service_design.md §6.
+	//
+	// Nil-safe: portfolio svc down at boot ⇒ these routes stay unregistered
+	// and requests get a clean 404 instead of a 500.
+	if portfolioHandler != nil {
+		protected.HandleFunc("/users/me/portfolio/summary", portfolioHandler.GetSummary).Methods("GET")
+		protected.HandleFunc("/users/me/portfolio/positions", portfolioHandler.GetPositions).Methods("GET")
+		protected.HandleFunc("/users/me/portfolio/history", portfolioHandler.GetHistory).Methods("GET")
 	}
 
 	// Strategy CRUD + user-strategy list — MOVED here from public on

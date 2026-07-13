@@ -89,7 +89,7 @@ func main() {
 	tradingDB := mustOpenDB(logger, "trading_db", cfg.TradingDB.DSN())
 	defer tradingDB.Close()
 
-	tradingExecDB := mustOpenDB(logger, "trading_execution", cfg.TradingExecDB.DSN())
+	tradingExecDB := mustOpenDB(logger, "execution_db", cfg.TradingExecDB.DSN())
 	defer tradingExecDB.Close()
 
 	// ── 4. Wire repo + audit + broker + manager ──────────────────────────
@@ -233,7 +233,7 @@ func main() {
 		}
 		if err := tradingExecDB.PingContext(ctx); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"not_ready","detail":"trading_execution ping failed"}`))
+			_, _ = w.Write([]byte(`{"status":"not_ready","detail":"execution_db ping failed"}`))
 			return
 		}
 		w.WriteHeader(http.StatusOK)

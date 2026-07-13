@@ -19,7 +19,7 @@ type IndiraCredentials struct {
 }
 
 // CredentialsRepository saves/fetches Indira broker credentials in the
-// trade-execution database (trading_execution.user_credentials).
+// trade-execution database (execution_db.user_credentials).
 type CredentialsRepository interface {
 	StoreIndiraCredentials(ctx context.Context, userID, indiraUserID, appID, source, bearerToken string) error
 	// GetIndiraCredentials returns the decrypted credentials for a user.
@@ -33,7 +33,7 @@ type credentialsRepository struct {
 }
 
 // NewCredentialsRepository creates a new CredentialsRepository backed by db.
-// db must be a connection to the trading_execution database.
+// db must be a connection to the execution_db database.
 func NewCredentialsRepository(db *sqlx.DB, encryptionKey string) CredentialsRepository {
 	return &credentialsRepository{
 		db:            db,

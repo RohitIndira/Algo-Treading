@@ -401,7 +401,7 @@ func (s *UserConfigServer) HealthCheck(ctx context.Context, req *common.HealthCh
 
 // UpdateUserCredentials persists the user's broker auth (called from the SSO
 // login flow + JWT-refresh flow). Encrypts the bearer token, upserts
-// trading_execution.user_credentials, and publishes USER_CREDENTIALS_UPDATED
+// execution_db.user_credentials, and publishes USER_CREDENTIALS_UPDATED
 // to user-config-events so trade-execution can invalidate its CredentialsCache.
 //
 // Idempotent: ON CONFLICT (user_id) DO UPDATE on the underlying table — calling

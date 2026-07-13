@@ -137,6 +137,14 @@ type DetailsResponse struct {
 	AllocationSector  []AllocationEntry `json:"allocationBySector"`
 	AllocationMCap    []AllocationEntry `json:"allocationByMarketCap"`
 	TopPastTrades   []TradeRow   `json:"topPastTrades"`   // most recent 5 exited
+
+	// LTPStatus surfaces the LTP subsystem's health for this response:
+	// "HEALTHY" — probe up + fetch succeeded (holdings carry a real ltp)
+	// "UNAVAILABLE" — probe down OR MGet failed (holdings' ltp fields are 0
+	//                 but the UI should render "—" instead of "0")
+	// See docs/portfolio_service_design.md §4 for the no-silent-fail
+	// contract and reference_ltp_tunnel_silent_fail for the incident.
+	LTPStatus       string       `json:"ltpStatus,omitempty"`
 }
 
 // DetailsChart is the P&L-over-time line on Screen 1. Points are
@@ -174,7 +182,9 @@ type AllocationEntry struct {
 
 // HoldingsResponse wraps the full active positions list.
 type HoldingsResponse struct {
-	Holdings []Holding `json:"holdings"`
+	Holdings  []Holding `json:"holdings"`
+	// LTPStatus — see DetailsResponse.LTPStatus for semantics.
+	LTPStatus string    `json:"ltpStatus,omitempty"`
 }
 
 // Holding is one card in the holdings list. Currency fields are

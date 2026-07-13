@@ -5,7 +5,7 @@ package dto
 // Posted by the frontend after a successful SSO login (and on every JWT
 // refresh — e.g. when SSO issues a fresh token after the previous one
 // expired). The handler encrypts BearerToken and upserts the row in
-// trading_execution.user_credentials so backend-only flows (the protective
+// execution_db.user_credentials so backend-only flows (the protective
 // replayer at 15:35 IST, the live order path) always have a fresh token.
 //
 // Fields default from request headers when blank:

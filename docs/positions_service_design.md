@@ -261,7 +261,7 @@ message LookupOrderMetaResponse {
 }
 ```
 
-Backed by a single SQL query against `trading_execution.manthan_orders`:
+Backed by a single SQL query against `execution_db.manthan_orders`:
 ```sql
 SELECT signal_id, order_type, strategy_id, user_id,
        parent_order_id AS entry_broker_order_id,

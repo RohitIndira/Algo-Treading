@@ -149,7 +149,7 @@ USER_CONFIG_GRPC_ADDR=localhost:50051
 # Postgres — trading_db today, stockk_trading after Phase 3 cutover
 POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD,
 POSTGRES_DB, POSTGRES_SSLMODE
-MANTHAN_SIGNALS_DB=market_data    # source DB for the manthan_signals table
+MANTHAN_SIGNALS_DB=signals_db    # source DB for the manthan_signals table
 
 # Redis — local (publisher cache) + external (Indira LTP feed)
 REDIS_URI / REDIS_ADDRS, REDIS_PASSWORD, REDIS_DB, …

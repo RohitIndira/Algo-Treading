@@ -72,7 +72,7 @@ curl https://manthan.stockk.trade/readyz
 ```
 Response: `200` when healthy:
 ```json
-{"status":"ok","checks":{"trading_db":"ok","trading_execution":"ok","redis":"ok","kafka":"ok","user_config":"ok","rules_engine":"ok","trade_execution":"ok"}}
+{"status":"ok","checks":{"trading_db":"ok","execution_db":"ok","redis":"ok","kafka":"ok","user_config":"ok","rules_engine":"ok","trade_execution":"ok"}}
 ```
 Returns `503` if any check fails, with the failed checks listed.
 

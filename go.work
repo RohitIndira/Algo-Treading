@@ -7,6 +7,7 @@ use (
 	./api/proto/hft_engine
 	./api/proto/risk_management
 	./api/proto/rules_engine
+	./api/proto/portfolio
 	./api/proto/trade_execution
 	./api/proto/user_config
 	./pkg/indira
@@ -18,5 +19,6 @@ use (
 	./services/trade-execution
 	./services/user-config
 	./services/orderstatus
+	./services/portfolio
 	./services/positions
 )

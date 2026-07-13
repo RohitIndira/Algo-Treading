@@ -19,7 +19,7 @@ import (
 // strategy and publishes entry orders.
 //
 // Source-of-truth hierarchy for signals:
-//   - Postgres `manthan_signals` (market_data DB) — durable, authoritative.
+//   - Postgres `manthan_signals` (signals_db DB) — durable, authoritative.
 //   - Kafka `manthan.signals`                     — transport/notification.
 //   - Redis `manthan:signals:{date}`              — hot cache (rebuildable from DB).
 type Consumer struct {
@@ -63,7 +63,7 @@ type ConsumerConfig struct {
 
 // NewConsumer creates a new manthan signal consumer.
 //
-// signalsDB points at the Postgres `manthan_signals` table (market_data DB) —
+// signalsDB points at the Postgres `manthan_signals` table (signals_db DB) —
 // used for startup warm-up and as a fallback for catch-up when Redis is cold.
 // May be nil: consumer still works, but warm-up/fallback are no-ops.
 func NewConsumer(
@@ -326,7 +326,7 @@ func (c *Consumer) loadSignalsForDate(ctx context.Context, date string) []types.
 }
 
 // loadSignalsFromDB reads signals for a given date from the authoritative
-// Postgres `manthan_signals` table (lives in market_data DB).
+// Postgres `manthan_signals` table (lives in signals_db DB).
 // Used for startup warm-up and as a fallback when Redis cache is cold.
 func (c *Consumer) loadSignalsFromDB(ctx context.Context, date string) ([]types.ManthanSignal, error) {
 	if c.signalsDB == nil {

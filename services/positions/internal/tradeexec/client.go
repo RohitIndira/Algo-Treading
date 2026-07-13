@@ -134,3 +134,38 @@ func (c *Client) LookupOrderMeta(ctx context.Context, brokerOrderID string) (Ord
 
 	return meta, nil
 }
+
+// GetBrokerHoldings fetches the user's Indira delivery holdings map from
+// trade-execution's BrokerAdapter (freeQty-safe: delivery NetQty + holdings.Qty).
+// No caching — the reconciler polls at ~5 min intervals, cache would just
+// serve staler data. Called by the reconciler ticker; not on the hot path.
+//
+// Returns:
+//
+//	(map, nil)         — user has holdings (may be empty map = zero delivery)
+//	(nil, err)         — RPC failure OR broker fetch failure OR auth lookup failure.
+//	                     Reconciler must SKIP this user's sweep (do NOT publish
+//	                     false BROKER_ONLY drifts on transient failure).
+func (c *Client) GetBrokerHoldings(ctx context.Context, userID string) (map[string]int, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("userID is required")
+	}
+
+	resp, err := c.rpc.GetBrokerHoldings(ctx, &pb.GetBrokerHoldingsRequest{
+		UserId: userID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("GetBrokerHoldings RPC: %w", err)
+	}
+	if !resp.GetSuccess() {
+		e := resp.GetError()
+		return nil, fmt.Errorf("GetBrokerHoldings server error: %s %s", e.GetCode(), e.GetMessage())
+	}
+
+	// Convert int32 wire → int for the reconciler (which speaks native int).
+	out := make(map[string]int, len(resp.GetHoldings()))
+	for sym, qty := range resp.GetHoldings() {
+		out[sym] = int(qty)
+	}
+	return out, nil
+}

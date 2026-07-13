@@ -23,11 +23,12 @@ import (
 // Server implements the TradeExecutionService gRPC server
 type Server struct {
 	pb.UnimplementedTradeExecutionServiceServer
-	repo        repository.OrderRepository
-	manthanRepo *manthan.Repository // nil until SetManthanRepo — LookupOrderMeta needs it
-	executor    *executor.OrderExecutor
-	port        int
-	grpcServer  *grpc.Server // stored for graceful shutdown
+	repo             repository.OrderRepository
+	manthanRepo      *manthan.Repository                                             // nil until SetManthanRepo — LookupOrderMeta needs it
+	holdingsProvider func(ctx context.Context, userID string) (map[string]int, error) // nil until SetHoldingsProvider — GetBrokerHoldings needs it
+	executor         *executor.OrderExecutor
+	port             int
+	grpcServer       *grpc.Server // stored for graceful shutdown
 }
 
 // SetManthanRepo wires the Manthan repository so LookupOrderMeta can query
@@ -35,6 +36,16 @@ type Server struct {
 // module (order of ops means we can't inject this at NewServer time).
 func (s *Server) SetManthanRepo(r *manthan.Repository) {
 	s.manthanRepo = r
+}
+
+// SetHoldingsProvider wires the per-user holdings fetcher used by
+// GetBrokerHoldings. Called from main.go AFTER InitManthan constructs the
+// BrokerAdapter + auth cache (same reason SetManthanRepo is deferred).
+//
+// The fn closure captures BrokerAdapter + the credentials cache so this
+// package stays free of manthan/executor imports beyond what's already here.
+func (s *Server) SetHoldingsProvider(fn func(ctx context.Context, userID string) (map[string]int, error)) {
+	s.holdingsProvider = fn
 }
 
 // NewServer creates a new gRPC server
@@ -303,6 +314,47 @@ func (s *Server) LookupOrderMeta(ctx context.Context, req *pb.LookupOrderMetaReq
 		UserId:               meta.UserID,
 		EntrySignalId:        meta.EntrySignalID,
 		EntryBrokerOrderId:   meta.EntryBrokerOrderID,
+	}, nil
+}
+
+// GetBrokerHoldings returns the user's Indira delivery holdings map.
+// Consumer: positions svc reconciler ticker (every ~5 min per active user).
+//
+// Delegates to BrokerAdapter.GetEffectiveHoldings via the closure wired
+// in main.go — that path is freeQty-safe: sums position-book delivery
+// NetQty + holdings.Qty (see broker_adapter.go:848-931).
+//
+// success=false on auth-lookup or broker-fetch failure. The reconciler
+// SKIPS this user's sweep in that case — publishing false BROKER_ONLY
+// drifts on transient fetch errors would spam the drift topic.
+func (s *Server) GetBrokerHoldings(ctx context.Context, req *pb.GetBrokerHoldingsRequest) (*pb.GetBrokerHoldingsResponse, error) {
+	if req.GetUserId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "user_id is required")
+	}
+	if s.holdingsProvider == nil {
+		return nil, status.Error(codes.Unavailable, "holdings provider not wired")
+	}
+
+	holdings, err := s.holdingsProvider(ctx, req.GetUserId())
+	if err != nil {
+		return &pb.GetBrokerHoldingsResponse{
+			Success: false,
+			Error: &commonpb.Error{
+				Code:    "BROKER_FETCH_FAILED",
+				Message: err.Error(),
+			},
+		}, nil
+	}
+
+	// Map[string]int → map[string]int32 for wire — Indira qty is well within
+	// int32 range (typical: 1-10k shares per symbol).
+	out := make(map[string]int32, len(holdings))
+	for sym, qty := range holdings {
+		out[sym] = int32(qty)
+	}
+	return &pb.GetBrokerHoldingsResponse{
+		Success:  true,
+		Holdings: out,
 	}, nil
 }
 

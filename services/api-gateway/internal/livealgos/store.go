@@ -9,12 +9,12 @@ import (
 )
 
 // ErrStrategyNotFound is returned by StrategyMeta when the strategy id
-// doesn't exist in stockk_trading.strategies. Handler maps this to 404.
+// doesn't exist in the strategies table. Handler maps this to 404.
 var ErrStrategyNotFound = errors.New("livealgos: strategy not found")
 
-// PositionRow is one row of stockk_trading.manthan_positions.
-// Fields nullable in the DB use sql.NullString/Float64 so the query
-// can distinguish "value not set" from "value zero".
+// PositionRow is one row of manthan_positions (owned by rules-engine in
+// trading_db). Fields nullable in the DB use sql.NullString/Float64 so
+// the query can distinguish "value not set" from "value zero".
 type PositionRow struct {
 	ID              int64
 	StrategyID      string
@@ -37,8 +37,9 @@ type PositionRow struct {
 	ExchangeToken   sql.NullString // joined from manthan_orders below
 }
 
-// OrderRow is one row of stockk_trading.manthan_orders — an individual
-// order/fill. Used for the Stock P&L drilldown trades table.
+// OrderRow is one row of manthan_orders (owned by trade-execution in
+// execution_db) — an individual order/fill. Used for the Stock P&L
+// drilldown trades table.
 type OrderRow struct {
 	Symbol       string
 	OrderSide    string  // BUY / SELL
@@ -65,9 +66,16 @@ type StrategyMetaRow struct {
 	CreatedAt      time.Time
 }
 
-// Store is the DB-access surface for Live Algos endpoints. Backed by
-// stockk_trading Postgres today; interface stays thin so it can be
-// swapped for a caching wrapper or a mock in tests.
+// Store is the DB-access surface for Live Algos endpoints. Reads from
+// TWO Postgres databases because writers live in different services:
+//
+//   strategies + trade_configs + manthan_positions  → trading_db      (rules-engine)
+//   manthan_orders                                  → execution_db (trade-execution)
+//
+// Previously this store hit a single `stockk_trading` DB that had both
+// tables copied in — but that DB was a silent replica that drifted from
+// the authoritative sources, causing UI vs main-handler inconsistencies.
+// See docs/db_ownership.md for the current ownership map.
 type Store interface {
 	// StrategyMeta returns the header row + capital info for one strategy
 	// owned by userID. ErrStrategyNotFound when no such (strategy, user)
@@ -77,8 +85,9 @@ type Store interface {
 
 	// Positions returns every position row for a strategy, in insert
 	// order (entry_time ASC). Handler filters ACTIVE vs EXITED as needed.
-	// Includes exchange_token (LEFT JOIN'd from an order that opened
-	// the position) so LTP fetch is one hop away.
+	// Includes exchange_token (looked up from manthan_orders in a
+	// separate query against execution_db) so the LTP fetch is
+	// one hop away.
 	Positions(ctx context.Context, strategyID, userID string) ([]PositionRow, error)
 
 	// Orders returns every FILLED order for a strategy+symbol, most-recent
@@ -86,15 +95,28 @@ type Store interface {
 	OrdersForSymbol(ctx context.Context, strategyID, userID, symbol string) ([]OrderRow, error)
 }
 
-// PostgresStore implements Store against stockk_trading Postgres.
+// PostgresStore implements Store using two DB pools.
+//
+// positionsDB holds strategies + trade_configs + manthan_positions (the
+// rules-engine + user-config write side). ordersDB holds manthan_orders
+// (trade-execution's write side). Callers own both pool lifecycles.
+//
+// Passing nil for either is legal — StrategyMeta needs positionsDB,
+// Positions needs both (tokens degrade gracefully to nil if ordersDB
+// is nil), OrdersForSymbol needs ordersDB. The router already
+// nil-guards the whole details tier if any of these are missing.
 type PostgresStore struct {
-	db *sql.DB
+	positionsDB *sql.DB
+	ordersDB    *sql.DB
 }
 
-// NewPostgresStore wires the store to an open *sql.DB. Handler pool is
-// opened once at boot in main.go.
-func NewPostgresStore(db *sql.DB) *PostgresStore {
-	return &PostgresStore{db: db}
+// NewPostgresStore wires the store to two open *sql.DB pools:
+// positionsDB → trading_db, ordersDB → execution_db.
+//
+// Both are opened once at boot in main.go and reused across handlers
+// (ManthanHandler shares the same pools).
+func NewPostgresStore(positionsDB, ordersDB *sql.DB) *PostgresStore {
+	return &PostgresStore{positionsDB: positionsDB, ordersDB: ordersDB}
 }
 
 // StrategyMeta joins strategies + trade_configs to return everything a
@@ -119,7 +141,7 @@ func (s *PostgresStore) StrategyMeta(ctx context.Context, strategyID, userID str
 		  AND s.user_id = $2
 		LIMIT 1`
 
-	row := s.db.QueryRowContext(ctx, q, strategyID, userID)
+	row := s.positionsDB.QueryRowContext(ctx, q, strategyID, userID)
 
 	var r StrategyMetaRow
 	err := row.Scan(
@@ -137,48 +159,49 @@ func (s *PostgresStore) StrategyMeta(ctx context.Context, strategyID, userID str
 	return &r, nil
 }
 
-// Positions returns every position for (strategy, user). Also joins to
-// manthan_orders to pick up exchange_token so the LTP fetch step doesn't
-// need a second round-trip. DISTINCT ON keeps only one order per symbol
-// (the earliest FILLED buy) since exchange_token is stable per symbol.
+// Positions returns every position for (strategy, user). Because
+// manthan_positions (trading_db) and manthan_orders (execution_db)
+// live in DIFFERENT Postgres databases now, we can't do the exchange_token
+// enrichment as a single JOIN. Instead:
+//
+//	1. SELECT positions from positionsDB
+//	2. SELECT distinct (symbol, exchange_token) from ordersDB
+//	3. Merge in Go
+//
+// This costs one extra round-trip vs the old single-DB JOIN, but it's
+// the price of not having a silently-drifting replica DB. Both queries
+// are indexed on (strategy_id, user_id) so latency is a few ms each.
+//
+// ordersDB nil is legal — Positions() still returns the row list, just
+// with every ExchangeToken=NULL. Caller's LTP fetch step will skip
+// those rows (already behaves that way — see collectActiveTokens).
 func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string) ([]PositionRow, error) {
-	const q = `
-		WITH tokens AS (
-			SELECT DISTINCT ON (symbol) symbol, exchange_token
-			  FROM public.manthan_orders
-			 WHERE strategy_id::text = $1
-			   AND user_id = $2
-			   AND status = 'FILLED'
-			   AND exchange_token IS NOT NULL
-			 ORDER BY symbol, filled_at ASC
-		)
+	const positionsQ = `
 		SELECT
-			p.id,
-			p.strategy_id::text,
-			p.user_id,
-			p.symbol,
-			p.isin,
-			p.industry,
-			p.mcap_bucket,
-			p.entry_price,
-			p.quantity,
-			p.invested_amt,
-			p.high_since_entry,
-			p.current_sl,
-			p.status,
-			p.exit_price,
-			p.realized_pnl,
-			p.exit_reason,
-			p.entry_time,
-			p.exit_time,
-			t.exchange_token
-		FROM public.manthan_positions p
-		LEFT JOIN tokens t ON t.symbol = p.symbol
-		WHERE p.strategy_id::text = $1
-		  AND p.user_id = $2
-		ORDER BY p.entry_time ASC`
+			id,
+			strategy_id::text,
+			user_id,
+			symbol,
+			isin,
+			industry,
+			mcap_bucket,
+			entry_price,
+			quantity,
+			invested_amt,
+			high_since_entry,
+			current_sl,
+			status,
+			exit_price,
+			realized_pnl,
+			exit_reason,
+			entry_time,
+			exit_time
+		FROM public.manthan_positions
+		WHERE strategy_id::text = $1
+		  AND user_id = $2
+		ORDER BY entry_time ASC`
 
-	rows, err := s.db.QueryContext(ctx, q, strategyID, userID)
+	rows, err := s.positionsDB.QueryContext(ctx, positionsQ, strategyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("livealgos: Positions query: %w", err)
 	}
@@ -194,11 +217,63 @@ func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string
 			&p.HighSinceEntry, &p.CurrentSL,
 			&p.Status, &p.ExitPrice, &p.RealizedPnL, &p.ExitReason,
 			&p.EntryTime, &p.ExitTime,
-			&p.ExchangeToken,
 		); err != nil {
 			return nil, fmt.Errorf("livealgos: Positions scan: %w", err)
 		}
 		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Second round-trip: symbol → exchange_token from the OTHER DB.
+	// Skipped when ordersDB is nil or when the position list is empty.
+	if s.ordersDB == nil || len(out) == 0 {
+		return out, nil
+	}
+
+	tokens, err := s.tokensForStrategy(ctx, strategyID, userID)
+	if err != nil {
+		// Non-fatal: return positions without exchange_token rather than
+		// killing the whole details page. LTP fetch degrades to no-LTP
+		// downstream and the AG.LTP subsystem surfaces ltpStatus.
+		return out, nil
+	}
+	for i := range out {
+		if tok, ok := tokens[out[i].Symbol]; ok {
+			out[i].ExchangeToken = sql.NullString{String: tok, Valid: true}
+		}
+	}
+	return out, nil
+}
+
+// tokensForStrategy queries manthan_orders (ordersDB) for the
+// (symbol → exchange_token) map, keyed to one strategy+user.
+// exchange_token is stable per symbol so DISTINCT ON returns the
+// earliest FILLED order's value.
+func (s *PostgresStore) tokensForStrategy(ctx context.Context, strategyID, userID string) (map[string]string, error) {
+	const q = `
+		SELECT DISTINCT ON (symbol) symbol, exchange_token
+		  FROM public.manthan_orders
+		 WHERE strategy_id::text = $1
+		   AND user_id = $2
+		   AND status = 'FILLED'
+		   AND exchange_token IS NOT NULL
+		 ORDER BY symbol, filled_at ASC`
+
+	rows, err := s.ordersDB.QueryContext(ctx, q, strategyID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("livealgos: tokens query: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]string{}
+	for rows.Next() {
+		var sym, tok string
+		if err := rows.Scan(&sym, &tok); err != nil {
+			return nil, fmt.Errorf("livealgos: tokens scan: %w", err)
+		}
+		out[sym] = tok
 	}
 	return out, rows.Err()
 }
@@ -225,7 +300,7 @@ func (s *PostgresStore) OrdersForSymbol(ctx context.Context, strategyID, userID,
 		  AND status = 'FILLED'
 		ORDER BY filled_at DESC`
 
-	rows, err := s.db.QueryContext(ctx, q, strategyID, userID, symbol)
+	rows, err := s.ordersDB.QueryContext(ctx, q, strategyID, userID, symbol)
 	if err != nil {
 		return nil, fmt.Errorf("livealgos: OrdersForSymbol query: %w", err)
 	}

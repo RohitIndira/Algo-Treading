@@ -25,7 +25,7 @@ type Config struct {
 	GRPCPort int // hft-engine's own gRPC listener. Default 9090.
 	HTTPPort int // optional health-probe HTTP listener (livez/readyz). Default 9091.
 
-	// ── trading_execution DB (shared with trade-execution) ────────────
+	// ── execution_db DB (shared with trade-execution) ────────────
 	// hft-engine writes audit rows + reads broker creds from this DB.
 	TradingExecDB DBConfig
 
@@ -102,7 +102,7 @@ func Load() *Config {
 			Port:     envInt("POSTGRES_PORT", 5432),
 			User:     env("POSTGRES_USER", "postgres"),
 			Password: env("POSTGRES_PASSWORD", "postgres"),
-			Name:     env("TRADING_EXEC_DB", "trading_execution"),
+			Name:     env("TRADING_EXEC_DB", "execution_db"),
 			SSLMode:  env("POSTGRES_SSL_MODE", "disable"),
 		},
 		TradingDB: DBConfig{
