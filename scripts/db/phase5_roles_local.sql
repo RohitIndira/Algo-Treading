@@ -10,12 +10,9 @@
 -- COVERAGE: every table in stockk_auth / stockk_trading / stockk_market has an
 -- explicit owner + readers. No table is orphaned.
 --
--- EXCLUSIONS:
---   • hft_engine_svc role is intentionally NOT created (hft-engine is frozen
---     per 2026-06-24 audit). hft_audit_orders becomes a superuser-only table
---     until hft-engine is unfrozen.
---
 -- Idempotent: re-running drops + recreates roles. Connections must be closed.
+-- (hft-engine service was removed 2026-07-14; the hft_audit_orders table
+-- was dropped alongside it. See docs/db_ownership.md for the record.)
 -- ────────────────────────────────────────────────────────────────────
 
 -- Drop existing roles before recreating (idempotent).
@@ -123,7 +120,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 -- Per-table writer mapping (audit findings):
 --   execution_events              → trade_execution_svc (W)
 --   execution_outbox              → rules_engine_svc (W)
---   hft_audit_orders              → SUPERUSER ONLY (hft frozen)
 --   manthan_cooldown              → rules_engine_svc (W)
 --   manthan_order_events          → trade_execution_svc (W)
 --   manthan_orders                → trade_execution_svc (W)
@@ -210,9 +206,6 @@ GRANT USAGE ON SCHEMA public TO api_gateway_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO api_gateway_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT ON TABLES TO api_gateway_reader;
-
--- ─── hft_audit_orders: NO service writes (hft frozen). Superuser-only.
--- Already covered: no role has been granted write on this table.
 
 -- ════════════════════════════════════════════════════════════════════
 -- stockk_market  (27 entries: 22 OHLCV partitions + 5 main tables)
