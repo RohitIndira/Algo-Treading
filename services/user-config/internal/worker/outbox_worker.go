@@ -107,12 +107,22 @@ type activationOutboxPayload struct {
 	UserID     string `json:"user_id"`
 	Version    uint64 `json:"version"`
 	Active     bool   `json:"active"`
+
+	// PositionHandling is present on STRATEGY_DEACTIVATED events driven
+	// by the Pause modal (KEEP_POSITIONS_OPEN | SQUARE_OFF_AT_MARKET).
+	// Empty for legacy EOD auto-deactivate — trade-execution's consumer
+	// runs its classic closeStrategyPositions cleanup in that case.
+	PositionHandling string `json:"position_handling,omitempty"`
 }
 
 type deleteOutboxPayload struct {
 	StrategyID string `json:"strategy_id"`
 	UserID     string `json:"user_id"`
 	Version    uint64 `json:"version"`
+
+	// PositionHandling is present on STRATEGY_DELETED events driven by
+	// the Stop modal. Same semantics as activationOutboxPayload.
+	PositionHandling string `json:"position_handling,omitempty"`
 }
 
 // processOneOutboxEvent translates a single outbox row into the new Kafka contract and publishes it.
@@ -165,7 +175,7 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_DELETED outbox id=%d, skipping+marking processed\n", event.ID)
 			return true, nil
 		}
-		kafkaEvent = events.ToThinConfigEvent(events.ConfigDeleted, thin.UserID, thin.StrategyID, thin.Version)
+		kafkaEvent = events.ToLifecycleConfigEvent(events.ConfigDeleted, thin.UserID, thin.StrategyID, thin.Version, thin.PositionHandling)
 
 	case "STRATEGY_ACTIVATED":
 		var thin activationOutboxPayload
@@ -187,7 +197,7 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			fmt.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_DEACTIVATED outbox id=%d, skipping+marking processed\n", event.ID)
 			return true, nil
 		}
-		kafkaEvent = events.ToThinConfigEvent(events.ConfigPaused, thin.UserID, thin.StrategyID, thin.Version)
+		kafkaEvent = events.ToLifecycleConfigEvent(events.ConfigPaused, thin.UserID, thin.StrategyID, thin.Version, thin.PositionHandling)
 
 	default:
 		fmt.Printf("[OutboxWorker] WARNING: unknown outbox event_type=%s id=%d, skipping+marking processed\n", event.EventType, event.ID)

@@ -44,6 +44,18 @@ func ToThinConfigEvent(eventType ConfigEventType, userID string, strategyID stri
 	}
 }
 
+// ToLifecycleConfigEvent is the Paused / Deleted variant of ToThinConfigEvent
+// that carries the caller's position_handling choice. positionHandling is one
+// of "", "KEEP_POSITIONS_OPEN", "SQUARE_OFF_AT_MARKET" per the ConfigEvent
+// docstring. Empty string preserves the legacy behavior (EOD auto-deactivate,
+// pre-mockup callers) — consumers should treat that as "run classic
+// closeStrategyPositions cleanup".
+func ToLifecycleConfigEvent(eventType ConfigEventType, userID string, strategyID string, version uint64, positionHandling string) *ConfigEvent {
+	ev := ToThinConfigEvent(eventType, userID, strategyID, version)
+	ev.PositionHandling = positionHandling
+	return ev
+}
+
 // ToManthanConfigEvent builds a slim ConfigEvent for MANTHAN strategies.
 // Only includes fields the rules-engine needs: identity, capital, SL config.
 // No news conditions, no order-level fields (backend controls everything).

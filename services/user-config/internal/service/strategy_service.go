@@ -368,6 +368,17 @@ type ForceExitParams struct {
 	Source      string
 }
 
+// positionHandlingWireValue folds ForceExitParams into the
+// position_handling string that we persist on the outbox payload +
+// propagate through Kafka. Consumers (trade-execution) branch on this
+// value — see events/config_event.go PositionHandling docstring.
+func positionHandlingWireValue(params ForceExitParams) string {
+	if params.SquareOff {
+		return "SQUARE_OFF_AT_MARKET"
+	}
+	return "KEEP_POSITIONS_OPEN"
+}
+
 // squareOffIfRequested performs the pre-transition force-exit call to
 // trade-execution when params.SquareOff is set. Returns the number of
 // exit orders placed (0 for KEEP_POSITIONS_OPEN), or a wrapped error.
@@ -413,8 +424,10 @@ func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UU
 		return 0, err
 	}
 
-	// Delete from database (includes Outbox insertion)
-	if err := s.repo.Delete(ctx, strategyID, userID); err != nil {
+	// Delete from database (includes Outbox insertion). Stamp the
+	// position_handling on the outbox so downstream consumers know
+	// whether we already placed exit orders.
+	if err := s.repo.Delete(ctx, strategyID, userID, positionHandlingWireValue(params)); err != nil {
 		return positionsExited, fmt.Errorf("failed to delete strategy: %w", err)
 	}
 
@@ -450,8 +463,9 @@ func (s *StrategyService) DeactivateStrategy(ctx context.Context, strategyID uui
 		return nil, 0, err
 	}
 
-	// Deactivate in database
-	if err := s.repo.Deactivate(ctx, strategyID, userID); err != nil {
+	// Deactivate in database. Stamp position_handling on the outbox
+	// so trade-execution's consumer branches correctly.
+	if err := s.repo.Deactivate(ctx, strategyID, userID, positionHandlingWireValue(params)); err != nil {
 		return nil, positionsExited, fmt.Errorf("failed to deactivate strategy: %w", err)
 	}
 

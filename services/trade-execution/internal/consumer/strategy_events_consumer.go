@@ -28,7 +28,35 @@ type strategyEvent struct {
 	UserID     string          `json:"user_id"`
 	StrategyID string          `json:"strategy_id"`
 	Version    uint64          `json:"version"`
+
+	// PositionHandling tells this consumer whether user-config already
+	// dealt with open positions (via its HTTP force-exit call) or the
+	// caller explicitly wanted them left alone. Populated by user-config
+	// from the Deactivate/Delete gRPC request's position_handling field.
+	// See user-config events/config_event.go PositionHandling docstring
+	// for the full contract.
+	//
+	// Values:
+	//   ""                        legacy path — no explicit handling,
+	//                             typically EOD auto-deactivate. Run
+	//                             closeStrategyPositions as before.
+	//   "KEEP_POSITIONS_OPEN"     mobile Pause modal "keep positions".
+	//                             SKIP closeStrategyPositions — the user
+	//                             wants to manage their lots manually.
+	//   "SQUARE_OFF_AT_MARKET"    mobile picked "square off". user-config
+	//                             ALREADY called our HTTP force-exit
+	//                             endpoint synchronously, so the exit
+	//                             orders are SUBMITTED at the broker
+	//                             right now. SKIP closeStrategyPositions
+	//                             — otherwise we'd immediately CancelOrder
+	//                             those exits before they fill.
+	PositionHandling string `json:"position_handling,omitempty"`
 }
+
+const (
+	positionHandlingKeepOpen  = "KEEP_POSITIONS_OPEN"
+	positionHandlingSquareOff = "SQUARE_OFF_AT_MARKET"
+)
 
 // CredentialsCacheInvalidator is the minimal surface this consumer needs from
 // executor.CredentialsCache. Defined as an interface so the consumer doesn't
@@ -206,7 +234,50 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 		if ev.StrategyID == "" {
 			return nil
 		}
-		return c.closeStrategyPositions(ctx, ev)
+		// The mobile Pause/Stop modal always ships position_handling; if
+		// the caller explicitly picked KEEP_POSITIONS_OPEN or already
+		// squared off via HTTP, skipping closeStrategyPositions is
+		// critical — otherwise it would CancelOrder the just-placed
+		// exit orders or nuke lots the user meant to keep.
+		//
+		// Empty position_handling preserves the legacy behavior (EOD
+		// auto-deactivate + any pre-mockup callers) — run the classic
+		// cleanup so backwards-compat holds.
+		switch ev.PositionHandling {
+		case positionHandlingSquareOff:
+			c.logger.Info("Skipping closeStrategyPositions — user-config already placed exit orders",
+				zap.String("event_type", string(ev.Type)),
+				zap.String("strategy_id", ev.StrategyID),
+				zap.String("user_id", ev.UserID),
+				zap.String("position_handling", ev.PositionHandling))
+			// Still unhook the price monitor so no new triggers fire against
+			// the paused/deleted strategy while its exit orders settle.
+			if c.priceMonitor != nil {
+				if removed := c.priceMonitor.UnwatchByStrategy(ev.StrategyID); removed > 0 {
+					c.logger.Info("Unwatched price-monitored orders",
+						zap.String("strategy_id", ev.StrategyID),
+						zap.Int("removed", removed))
+				}
+			}
+			return nil
+		case positionHandlingKeepOpen:
+			c.logger.Info("Skipping closeStrategyPositions — caller chose to keep positions open",
+				zap.String("event_type", string(ev.Type)),
+				zap.String("strategy_id", ev.StrategyID),
+				zap.String("user_id", ev.UserID),
+				zap.String("position_handling", ev.PositionHandling))
+			// Same unwatch — no new signals should fire for a paused strategy.
+			if c.priceMonitor != nil {
+				if removed := c.priceMonitor.UnwatchByStrategy(ev.StrategyID); removed > 0 {
+					c.logger.Info("Unwatched price-monitored orders",
+						zap.String("strategy_id", ev.StrategyID),
+						zap.Int("removed", removed))
+				}
+			}
+			return nil
+		default:
+			return c.closeStrategyPositions(ctx, ev)
+		}
 	default:
 		return nil
 	}

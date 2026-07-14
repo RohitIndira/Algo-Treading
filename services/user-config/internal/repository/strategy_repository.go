@@ -441,8 +441,15 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 	return fullStrategy, nil
 }
 
-// Delete deletes a strategy
-func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, userID string) error {
+// Delete deletes a strategy.
+//
+// positionHandling is stamped on the outbox payload and propagates via
+// Kafka to trade-execution so it knows whether user-config already
+// placed exit orders (SQUARE_OFF_AT_MARKET) — in which case it MUST
+// NOT run its classic closeStrategyPositions cleanup, otherwise those
+// exit orders get cancelled before they fill. See events/config_event.go
+// PositionHandling docstring for the full contract.
+func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, userID string, positionHandling string) error {
 	tx, err := r.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -451,9 +458,9 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 
 	// Soft delete: Update deleted_at and set active = false
 	query := `
-		UPDATE strategies 
-		SET deleted_at = CURRENT_TIMESTAMP, active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1 
-		WHERE strategy_id = $1 AND user_id = $2 
+		UPDATE strategies
+		SET deleted_at = CURRENT_TIMESTAMP, active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
+		WHERE strategy_id = $1 AND user_id = $2
 		RETURNING strategy_id, version`
 
 	var deletedID uuid.UUID
@@ -468,11 +475,12 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 
 	// Insert into Execution Outbox (Deactivation/Deletion event)
 	eventPayload := map[string]interface{}{
-		"strategy_id": strategyID,
-		"user_id":     userID,
-		"version":     uint64(currentVersion),
-		"active":      false,
-		"deleted":     true,
+		"strategy_id":       strategyID,
+		"user_id":           userID,
+		"version":           uint64(currentVersion),
+		"active":            false,
+		"deleted":           true,
+		"position_handling": positionHandling,
 	}
 	payload, _ := json.Marshal(eventPayload)
 	outboxQuery := `
@@ -521,8 +529,13 @@ func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID,
 	return tx.Commit()
 }
 
-// Deactivate deactivates a strategy
-func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUID, userID string) error {
+// Deactivate deactivates a strategy.
+//
+// positionHandling is stamped on the outbox payload and propagates via
+// Kafka to trade-execution so it knows whether user-config already
+// placed exit orders. See Delete's docstring + events/config_event.go
+// for the full contract.
+func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUID, userID string, positionHandling string) error {
 	tx, err := r.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -539,10 +552,11 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 
 	// Outbox
 	eventPayload := map[string]interface{}{
-		"strategy_id": strategyID,
-		"user_id":     userID,
-		"version":     uint64(currentVersion),
-		"active":      false,
+		"strategy_id":       strategyID,
+		"user_id":           userID,
+		"version":           uint64(currentVersion),
+		"active":            false,
+		"position_handling": positionHandling,
 	}
 	payload, _ := json.Marshal(eventPayload)
 	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
