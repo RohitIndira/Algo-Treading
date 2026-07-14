@@ -118,6 +118,10 @@ func main() {
 	var manthanHandler *handlers.ManthanHandler
 	var healthHandler *handlers.HealthHandler
 	var perfHandler *handlers.PerformanceHandler
+	// Hoisted so livealgos handler can reuse for chart data in
+	// GetStrategyDetails (algo_performance_daily → DetailsChart).
+	var liveAlgosPerfStore performance.Store
+	var liveAlgosPerfClientMap map[string]string
 	var extRedis *redis.Client // hoisted: reused by the market-quote handler
 	// positionsDB, ordersDB + their DB names hoisted so downstream setup
 	// (live-algos store in DB.1, portfolio token lookup in PF.D) can reuse
@@ -191,9 +195,15 @@ func main() {
 			perfStore := performance.NewPostgresStore(perfDB)
 			// Maps algo id → reference client id in the sheet. Grows as
 			// we add more algos; for launch there's exactly one entry.
-			perfHandler = handlers.NewPerformanceHandler(perfStore, map[string]string{
+			perfClientMap := map[string]string{
 				"algo_manthan_v1": "A844",
-			})
+			}
+			perfHandler = handlers.NewPerformanceHandler(perfStore, perfClientMap)
+			// Share with the livealgos details handler so /users/me/live-algos/{sid}
+			// can serve the Manthan-Momentum growth chart (algo_performance_daily
+			// rebased to strategy created_at).
+			liveAlgosPerfStore = perfStore
+			liveAlgosPerfClientMap = perfClientMap
 		}
 
 		// Optional external Redis for live LTP (assigns the hoisted var)
@@ -321,7 +331,7 @@ func main() {
 		pCancel()
 	}
 
-	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP)
+	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP, liveAlgosPerfStore, liveAlgosPerfClientMap)
 
 	// ── Portfolio handler (PF.D) ────────────────────────────────────────
 	// Dials portfolio svc's gRPC, composes an Enricher over the same

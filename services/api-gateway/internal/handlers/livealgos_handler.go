@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
@@ -12,6 +13,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/auth"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/livealgos"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/performance"
 	"github.com/gorilla/mux"
 )
 
@@ -51,18 +53,31 @@ type LiveAlgosHandler struct {
 	// register the routes that need them.
 	store livealgos.Store
 	ltp   *livealgos.LTPStore
+
+	// perfStore + perfClientMap feed the DetailsResponse.Chart line —
+	// a per-day growth curve rebased so `Pct=100` on strategy
+	// deployment day. Both nil-safe: when either is missing (or the
+	// map has no entry for this algoID) BuildDetails' empty
+	// DetailsChart stays as-is and the frontend renders a "chart
+	// pending" placeholder.
+	perfStore     performance.Store
+	perfClientMap map[string]string
 }
 
 // NewLiveAlgosHandler wires the handler to its dependencies. Both
 // userConfig and catalog are required — a nil userConfig or catalog
 // would produce a runtime nil deref on the /live-algos list endpoint.
-// store + ltp are optional (see LiveAlgosHandler doc); pass nil when
-// unavailable and the Details-page routes stay unregistered upstream.
+// store, ltp, perfStore, perfClientMap are optional (see
+// LiveAlgosHandler doc); pass nil when unavailable and the Details-page
+// routes stay unregistered upstream (store+ltp) or the chart data
+// stays empty (perf).
 func NewLiveAlgosHandler(
 	userConfig *grpc_clients.UserConfigClient,
 	catalog algos.Catalog,
 	store livealgos.Store,
 	ltp *livealgos.LTPStore,
+	perfStore performance.Store,
+	perfClientMap map[string]string,
 ) *LiveAlgosHandler {
 	if userConfig == nil {
 		panic("handlers.NewLiveAlgosHandler: userConfig is required")
@@ -71,10 +86,12 @@ func NewLiveAlgosHandler(
 		panic("handlers.NewLiveAlgosHandler: catalog is required")
 	}
 	return &LiveAlgosHandler{
-		userConfig: userConfig,
-		catalog:    catalog,
-		store:      store,
-		ltp:        ltp,
+		userConfig:    userConfig,
+		catalog:       catalog,
+		store:         store,
+		ltp:           ltp,
+		perfStore:     perfStore,
+		perfClientMap: perfClientMap,
 	}
 }
 
@@ -226,7 +243,62 @@ func (h *LiveAlgosHandler) GetStrategyDetails(w http.ResponseWriter, r *http.Req
 	algoID, algoName := resolveAlgoMeta(h.catalog, meta.StrategyType)
 	payload := livealgos.BuildDetails(meta, positions, ltps, algoID, algoName)
 	payload.LTPStatus = string(ltpStatus)
+	payload.Chart = h.chartFor(r.Context(), algoID, meta.CreatedAt)
 	respondIndiraOK(w, payload)
+}
+
+// chartFor pulls per-day performance rows for algoID's reference client
+// and rebases them so `Pct=100` on `deployedAt` (the strategy's created_at).
+// Returns an empty DetailsChart when the perf store isn't wired, when
+// this algoID has no mapped reference client, or when no rows exist on
+// or after the deployment date — the frontend already handles empty
+// chart gracefully by showing a "chart pending" placeholder.
+//
+// The math: algo_performance_daily.return_pct is cumulative-since-algo-
+// inception. Rebasing to deployment means subtracting the first row's
+// return_pct so the earliest chart point sits at 100. Every subsequent
+// point is 100 + (row.ReturnPct - baseline) — i.e. growth from the day
+// this strategy deployed.
+func (h *LiveAlgosHandler) chartFor(ctx context.Context, algoID string, deployedAt time.Time) livealgos.DetailsChart {
+	if h.perfStore == nil || algoID == "" {
+		return livealgos.DetailsChart{Points: []livealgos.DetailsChartPoint{}}
+	}
+	refID, ok := h.perfClientMap[algoID]
+	if !ok || refID == "" {
+		return livealgos.DetailsChart{Points: []livealgos.DetailsChartPoint{}}
+	}
+
+	rows, err := h.perfStore.FetchDaily(ctx, algoID, refID)
+	if err != nil || len(rows) == 0 {
+		if err != nil {
+			log.Printf("livealgos: chartFor: fetch daily perf for algo=%s ref=%s: %v", algoID, refID, err)
+		}
+		return livealgos.DetailsChart{Points: []livealgos.DetailsChartPoint{}}
+	}
+
+	// Filter to rows on or after the strategy's deployment date. Use
+	// UTC date comparison — algo_performance_daily.date is a bare DATE
+	// (no tz) and deployedAt lands in UTC per proto.Timestamp defaults.
+	depDate := deployedAt.UTC().Truncate(24 * time.Hour)
+	sinceDeploy := make([]performance.DailyRow, 0, len(rows))
+	for _, row := range rows {
+		if !row.Date.Before(depDate) {
+			sinceDeploy = append(sinceDeploy, row)
+		}
+	}
+	if len(sinceDeploy) == 0 {
+		return livealgos.DetailsChart{Points: []livealgos.DetailsChartPoint{}}
+	}
+
+	baseline := sinceDeploy[0].ReturnPct
+	points := make([]livealgos.DetailsChartPoint, 0, len(sinceDeploy))
+	for _, row := range sinceDeploy {
+		points = append(points, livealgos.DetailsChartPoint{
+			Date: row.Date.Format("2006-01-02"),
+			Pct:  100 + (row.ReturnPct - baseline),
+		})
+	}
+	return livealgos.DetailsChart{Points: points}
 }
 
 // GetHoldings handles GET /users/me/live-algos/{strategyId}/holdings.
