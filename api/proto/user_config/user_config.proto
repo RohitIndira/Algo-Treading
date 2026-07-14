@@ -73,7 +73,8 @@ enum StrategyType {
   NEWS = 1;           // News-based strategy (existing)
   WEEK52_BREAKOUT = 2; // 52-week high/low breakout strategy
   MANTHAN = 3;         // Manthan ATH breakout strategy
-  HFT_BIDDING = 4;     // High-frequency chunk-aware bidding strategy
+  reserved 4;
+  reserved "HFT_BIDDING";
 }
 
 // Position Sizing Mode
@@ -186,41 +187,6 @@ message TradeConfig {
   double per_stock_amount = 22;                  // Auto: total_capital / max_positions
 }
 
-// HFT bidding strategy configuration.
-//
-// These fields are stored as the trade_configs.config_extra JSONB blob and
-// consumed verbatim by the hft-engine (services/hft-engine). The JSON keys
-// must match hft-engine's state.Config struct tags. `mode` is not carried
-// here — the user-config service derives it from the request trading_mode.
-message HFTConfig {
-  string symbol = 1;                 // e.g. "IDEA"
-  string isin = 2;                   // e.g. "INE669E01016"
-  string exchange = 3;               // "NSE" | "BSE"
-  string side = 4;                   // "BUY" | "SELL" | "BOTH"
-  string product_type = 5;           // "INTRADAY" | "DELIVERY" | "CASH"
-  double tick_size = 6;              // price tick, e.g. 0.05
-  int32 max_buy_qty = 7;             // total buy-side cap
-  int32 max_sell_qty = 8;            // total sell-side cap
-  int32 single_buy_qty = 9;          // qty per buy chunk
-  int32 single_sell_qty = 10;        // qty per sell chunk
-  double buy_limit_price = 11;       // buy-side price-band ceiling
-  double sell_limit_price = 12;      // sell-side price-band floor
-  string window_start = 13;          // "HH:MM" trade window open (optional)
-  string window_end = 14;            // "HH:MM" trade window close (optional)
-  bool modify_on_price_change = 15;  // chase the market with MODIFY
-  // Trigger price gate — continuous (re-evaluated every tick).
-  // Direction is side-dependent:
-  //   BUY  is "in zone" when LTP >= buy_trigger_price  (breakout buy)
-  //   SELL is "in zone" when LTP <= sell_trigger_price (breakdown sell)
-  // Behaviour: out-of-zone PAUSES the side (cancels resting chunk,
-  // stops placing) but does NOT lose accumulated fills. The next
-  // qualifying tick RESUMEs placement from where it left off until
-  // max_qty is reached. Side becomes terminal only via price-band
-  // halt or max_reached — never via the trigger alone.
-  double buy_trigger_price = 16;     // BUY in-zone when LTP >= this (required iff side in {BUY, BOTH})
-  double sell_trigger_price = 17;    // SELL in-zone when LTP <= this (required iff side in {SELL, BOTH})
-}
-
 // Risk management limits
 message RiskLimits {
   // Strategy ID link
@@ -292,8 +258,8 @@ message Strategy {
   // Strategy type
   StrategyType strategy_type = 13;
 
-  // HFT bidding config (set only when strategy_type = HFT_BIDDING)
-  HFTConfig hft_config = 14;
+  reserved 14;
+  reserved "hft_config";
 }
 
 message CreateStrategyRequest {
@@ -309,11 +275,11 @@ message CreateStrategyRequest {
     // Indira Securities authentication
     common.IndiraAuthContext indira_auth = 9;
 
-    // Strategy type (NEWS, 52W_BREAKOUT, MANTHAN, HFT_BIDDING)
+    // Strategy type (NEWS, 52W_BREAKOUT, MANTHAN)
     StrategyType strategy_type = 10;
 
-    // HFT bidding config (required when strategy_type = HFT_BIDDING)
-    HFTConfig hft_config = 11;
+    reserved 11;
+    reserved "hft_config";
 }
 
 message CreateStrategyResponse {
@@ -338,8 +304,8 @@ message UpdateStrategyRequest {
   // Version for optimistic locking
   int32 version = 9;
 
-  // HFT bidding config (only for HFT_BIDDING strategies)
-  optional HFTConfig hft_config = 10;
+  reserved 10;
+  reserved "hft_config";
 }
 
 message UpdateStrategyResponse {

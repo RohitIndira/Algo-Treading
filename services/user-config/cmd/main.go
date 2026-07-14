@@ -103,10 +103,9 @@ func main() {
 	}
 
 	// Optional ext-Redis client. user-config reads `symbol:{TICKER}` master
-	// data so HFT_BIDDING strategies can be created with just a symbol; ISIN
-	// is derived at validation time. If the env isn't set or the dial fails,
-	// the service still works — it'll just require callers to supply ISIN
-	// directly (rejected at validation with a clear error otherwise).
+	// data for symbol → ISIN resolution during strategy validation. If the
+	// env isn't set or the dial fails, the service still works — callers
+	// then have to supply ISIN directly.
 	var extRedis *goredis.Client
 	if addr := os.Getenv("EXT_REDIS_ADDR"); addr != "" {
 		extRedis = goredis.NewClient(&goredis.Options{

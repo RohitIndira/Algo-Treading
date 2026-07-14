@@ -22,40 +22,7 @@ const (
 	StrategyTypeNews        StrategyType = "NEWS"
 	StrategyType52WBreakout StrategyType = "52W_BREAKOUT"
 	StrategyTypeManthan     StrategyType = "MANTHAN"
-	StrategyTypeHFTBidding  StrategyType = "HFT_BIDDING"
 )
-
-// HFTConfig is the HFT bidding strategy configuration. It is persisted as
-// the trade_configs.config_extra JSONB blob and consumed verbatim by the
-// hft-engine — the JSON tags MUST match hft-engine's state.Config struct
-// tags. `Mode` is derived from the request TradingMode by the service.
-type HFTConfig struct {
-	Symbol              string  `json:"symbol"`
-	ISIN                string  `json:"isin"`
-	Exchange            string  `json:"exchange"`
-	Side                string  `json:"side"`         // BUY | SELL | BOTH
-	ProductType         string  `json:"product_type"` // INTRADAY | DELIVERY | CASH
-	TickSize            float64 `json:"tick_size"`
-	MaxBuyQty           int32   `json:"max_buy_qty"`
-	MaxSellQty          int32   `json:"max_sell_qty"`
-	SingleBuyQty        int32   `json:"single_buy_qty"`
-	SingleSellQty       int32   `json:"single_sell_qty"`
-	BuyLimitPrice       float64 `json:"buy_limit_price"`
-	SellLimitPrice      float64 `json:"sell_limit_price"`
-	WindowStart         string  `json:"window_start"`
-	WindowEnd           string  `json:"window_end"`
-	ModifyOnPriceChange bool    `json:"modify_on_price_change"`
-	// Trigger price gate — continuous (re-evaluated every tick):
-	//   BUY  in-zone when LTP >= BuyTriggerPrice  (breakout buy)
-	//   SELL in-zone when LTP <= SellTriggerPrice (breakdown sell)
-	// Out-of-zone PAUSEs the side (cancels resting chunk, stops placing)
-	// while preserving accumulated fills; next zone re-entry RESUMEs.
-	// Side becomes terminal only via price-band halt or max_reached.
-	// JSON keys must match hft-engine state.Config tags.
-	BuyTriggerPrice  float64 `json:"buy_trigger_price"`
-	SellTriggerPrice float64 `json:"sell_trigger_price"`
-	Mode             string  `json:"mode"` // PAPER | LIVE — set by the service from TradingMode
-}
 
 // Strategy represents a user trading strategy
 type Strategy struct {
@@ -75,10 +42,6 @@ type Strategy struct {
 	Conditions   *StrategyCondition `db:"-" json:"conditions,omitempty"`
 	TradeConfig  *TradeConfig       `db:"-" json:"trade_config,omitempty"`
 	RiskLimits   *RiskLimits        `db:"-" json:"risk_limits,omitempty"`
-
-	// HFTConfig is populated by the repo from trade_configs.config_extra
-	// when StrategyType == HFT_BIDDING. nil for all other strategy types.
-	HFTConfig *HFTConfig `db:"-" json:"hft_config,omitempty"`
 }
 
 // StrategyCondition represents the conditions for triggering a strategy
@@ -124,12 +87,6 @@ type TradeConfig struct {
 	MaxPositions       *int32   `db:"max_positions" json:"max_positions,omitempty"`      // Max stocks to hold (default 25)
 	PerStockAmount     *float64 `db:"per_stock_amount" json:"per_stock_amount,omitempty"` // Auto: total_capital / max_positions
 
-	// ConfigExtra is the raw trade_configs.config_extra JSONB column. For
-	// HFT_BIDDING strategies it holds the marshalled HFTConfig; NULL for
-	// every other strategy type. Kept as raw bytes so sqlx `SELECT *`
-	// struct scans don't fail on the column.
-	ConfigExtra []byte `db:"config_extra" json:"-"`
-
 	CreatedAt       time.Time `db:"created_at" json:"created_at"`
 }
 
@@ -169,9 +126,6 @@ type CreateStrategyRequest struct {
 	ActivateImmediately bool               `json:"activate_immediately"`
 	TradingMode         TradingMode        `json:"trading_mode"`
 
-	// HFTConfig is required when StrategyType == HFT_BIDDING, ignored otherwise.
-	HFTConfig *HFTConfig `json:"hft_config,omitempty"`
-
 	// Frontend authentication data
 	IndiraAuth *IndiraAuthContext `json:"indira_auth,omitempty"`
 }
@@ -194,6 +148,5 @@ type UpdateStrategyRequest struct {
 	TradeConfig  *TradeConfig       `json:"trade_config,omitempty"`
 	RiskLimits   *RiskLimits        `json:"risk_limits,omitempty"`
 	TradingMode  *TradingMode       `json:"trading_mode,omitempty"`
-	HFTConfig    *HFTConfig         `json:"hft_config,omitempty"`
 	Version      int32              `json:"version" validate:"required"`
 }
