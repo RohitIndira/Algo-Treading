@@ -4,7 +4,6 @@ use (
 	.
 	./services/api-gateway
 	./api/proto/common
-	./api/proto/hft_engine
 	./api/proto/risk_management
 	./api/proto/rules_engine
 	./api/proto/portfolio
@@ -13,7 +12,6 @@ use (
 	./pkg/indira
 	./pkg/logger
 	./services/data-ingestion
-	./services/hft-engine
 	./services/risk-management
 	./services/rules-engine
 	./services/trade-execution

@@ -229,12 +229,21 @@ func BuildStockPnL(symbol string, positions []PositionRow, orders []OrderRow) St
 
 // ─── Shared helpers ──────────────────────────────────────────────────
 
-// statusFromMeta derives the tri-state Status from strategies.active
-// + trading_mode (paper mode reads as PAUSED — same semantics as the
-// list endpoint).
+// statusFromMeta derives Status from strategies.stopped_at + active +
+// trading_mode. Same semantics as aggregator.go's statusFrom (see there
+// for the terminal-STOP rationale).
+//
+//	stopped_at != nil                  → STOPPED  (terminal; row survives
+//	                                              purely for history)
+//	active=true,  trading_mode=LIVE    → LIVE
+//	active=true,  trading_mode=PAPER   → PAUSED
+//	active=false                        → PAUSED  (Pause modal)
 func statusFromMeta(m *StrategyMetaRow) string {
-	if !m.Active {
+	if m.StoppedAt != nil {
 		return StatusStopped
+	}
+	if !m.Active {
+		return StatusPaused
 	}
 	if m.TradingMode == "PAPER" || m.TradingMode == "TRADING_MODE_PAPER" {
 		return StatusPaused

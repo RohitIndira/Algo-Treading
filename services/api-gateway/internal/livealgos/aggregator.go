@@ -17,15 +17,14 @@ import (
 //     doesn't appear on this screen (no "unknown algo" placeholder).
 //     Same-safe fallback: extend the catalog when we add strategy types.
 //
-//   - Strategy status is derived from active + trading_mode:
+//   - Strategy status is derived from stopped_at + active + trading_mode:
+//       stopped_at != nil                          → STOPPED (terminal)
 //       active=true, trading_mode is a LIVE mode   → LIVE
 //       active=true, trading_mode is PAPER         → PAUSED (paper is
 //                                                    "training-wheels"
 //                                                    for the strategy)
-//       active=false                                → STOPPED
-//     Notes for the future: user-config may add an explicit `paused`
-//     flag later; this function's contract stays the same, only the
-//     switch changes.
+//       active=false                                → PAUSED (user hit
+//                                                    Pause on the modal)
 //
 //   - Phase 1: all P&L numbers return with pnlPending=true and
 //     amount=0/percent=0. Frontend renders a spinner over that region.
@@ -114,7 +113,6 @@ func algoIDFromStrategyType(t pb.StrategyType) string {
 		return "algo_manthan_v1"
 	// Future:
 	// case pb.StrategyType_WEEK52_BREAKOUT: return "algo_52w_v1"
-	// case pb.StrategyType_HFT_BIDDING:     return "algo_hft_v1"
 	default:
 		return ""
 	}
@@ -122,12 +120,25 @@ func algoIDFromStrategyType(t pb.StrategyType) string {
 
 // statusFrom derives the tri-state Status enum from user-config's
 // Strategy fields. See the AlgoRow doc for the mapping.
+//
+// Mapping (matches the Pause/Stop mockup):
+//
+//	stopped_at != nil                  → STOPPED (terminal; user
+//	                                              redeploys to run again)
+//	active=true,  trading_mode=LIVE    → LIVE
+//	active=true,  trading_mode=PAPER   → PAUSED  (paper is "training-wheels")
+//	active=false                        → PAUSED  (user hit Pause on the modal)
+//
+// STOP is now a status transition, not a soft-delete — the row keeps
+// showing in the list with status=STOPPED so the user can see history.
+// See services/user-config/migrations/015_add_stopped_at.sql.
 func statusFrom(s *pb.Strategy) string {
-	if !s.Active {
+	if s.StoppedAt != nil {
 		return StatusStopped
 	}
-	// Active AND paper mode → treat as PAUSED for the user (they're
-	// running the algo in observation mode, not placing real orders).
+	if !s.Active {
+		return StatusPaused
+	}
 	if s.TradingMode == pb.TradingMode_PAPER {
 		return StatusPaused
 	}

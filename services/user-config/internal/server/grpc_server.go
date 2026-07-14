@@ -42,7 +42,6 @@ func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStr
 		RiskLimits:          protoRiskLimitsToModel(req.RiskLimits),
 		ActivateImmediately: req.ActivateImmediately,
 		TradingMode:         protoTradingModeToModel(req.TradingMode),
-		HFTConfig:           protoHFTConfigToModel(req.HftConfig),
 	}
 
 	// Extract Indira auth context if provided
@@ -111,9 +110,6 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 		mode := protoTradingModeToModel(*req.TradingMode)
 		modelReq.TradingMode = &mode
 	}
-	if req.HftConfig != nil {
-		modelReq.HFTConfig = protoHFTConfigToModel(req.HftConfig)
-	}
 
 	strategy, err := s.service.UpdateStrategy(ctx, modelReq)
 	if err != nil {
@@ -132,7 +128,11 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 	}, nil
 }
 
-// DeleteStrategy deletes a strategy
+// DeleteStrategy deletes a strategy. When
+// req.position_handling = SQUARE_OFF_AT_MARKET, user-config first calls
+// trade-execution to place reverse market/aggressive-limit exit orders
+// for every ACTIVE position of the strategy; the delete is gated on
+// that succeeding so a failing exit surfaces to the UI atomically.
 func (s *UserConfigServer) DeleteStrategy(ctx context.Context, req *pb.DeleteStrategyRequest) (*pb.DeleteStrategyResponse, error) {
 	strategyID, err := uuid.Parse(req.StrategyId)
 	if err != nil {
@@ -145,7 +145,8 @@ func (s *UserConfigServer) DeleteStrategy(ctx context.Context, req *pb.DeleteStr
 		}, nil
 	}
 
-	err = s.service.DeleteStrategy(ctx, strategyID, req.UserId)
+	positionsExited, err := s.service.DeleteStrategy(ctx, strategyID, req.UserId,
+		forceExitParamsFromProto(req.PositionHandling, req.IndiraAuth))
 	if err != nil {
 		return &pb.DeleteStrategyResponse{
 			Success: false,
@@ -154,12 +155,14 @@ func (s *UserConfigServer) DeleteStrategy(ctx context.Context, req *pb.DeleteStr
 				Code:    "DELETION_FAILED",
 				Message: err.Error(),
 			},
+			PositionsExited: int32(positionsExited),
 		}, nil
 	}
 
 	return &pb.DeleteStrategyResponse{
-		Success: true,
-		Message: "Strategy deleted successfully",
+		Success:         true,
+		Message:         "Strategy deleted successfully",
+		PositionsExited: int32(positionsExited),
 	}, nil
 }
 
@@ -273,7 +276,12 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 	}, nil
 }
 
-// DeactivateStrategy deactivates a strategy
+// DeactivateStrategy pauses a strategy. When
+// req.position_handling = SQUARE_OFF_AT_MARKET, user-config first calls
+// trade-execution to place reverse exit orders for every ACTIVE position
+// of the strategy; the deactivate is gated on that succeeding so a
+// failing exit surfaces to the UI atomically (matches the mockup's
+// "Algo Pause Failed" flow).
 func (s *UserConfigServer) DeactivateStrategy(ctx context.Context, req *pb.DeactivateStrategyRequest) (*pb.DeactivateStrategyResponse, error) {
 	strategyID, err := uuid.Parse(req.StrategyId)
 	if err != nil {
@@ -286,7 +294,8 @@ func (s *UserConfigServer) DeactivateStrategy(ctx context.Context, req *pb.Deact
 		}, nil
 	}
 
-	strategy, err := s.service.DeactivateStrategy(ctx, strategyID, req.UserId)
+	strategy, positionsExited, err := s.service.DeactivateStrategy(ctx, strategyID, req.UserId,
+		forceExitParamsFromProto(req.PositionHandling, req.IndiraAuth))
 	if err != nil {
 		return &pb.DeactivateStrategyResponse{
 			Success: false,
@@ -294,13 +303,31 @@ func (s *UserConfigServer) DeactivateStrategy(ctx context.Context, req *pb.Deact
 				Code:    "DEACTIVATION_FAILED",
 				Message: err.Error(),
 			},
+			PositionsExited: int32(positionsExited),
 		}, nil
 	}
 
 	return &pb.DeactivateStrategyResponse{
-		Success:  true,
-		Strategy: modelStrategyToProto(strategy),
+		Success:         true,
+		Strategy:        modelStrategyToProto(strategy),
+		PositionsExited: int32(positionsExited),
 	}, nil
+}
+
+// forceExitParamsFromProto folds the position_handling enum + optional
+// Indira auth block from any lifecycle request into the internal
+// ForceExitParams shape. UNSPECIFIED + KEEP_POSITIONS_OPEN both map to
+// SquareOff=false so no exit call is made.
+func forceExitParamsFromProto(ph pb.PositionHandling, auth *common.IndiraAuthContext) service.ForceExitParams {
+	p := service.ForceExitParams{
+		SquareOff: ph == pb.PositionHandling_SQUARE_OFF_AT_MARKET,
+	}
+	if p.SquareOff && auth != nil {
+		p.BearerToken = auth.BearerToken
+		p.AppID = auth.AppId
+		p.Source = auth.Source
+	}
+	return p
 }
 
 // GetStrategiesByIDs retrieves multiple strategies by their IDs
@@ -567,8 +594,6 @@ func modelStrategyTypeToProto(t models.StrategyType) pb.StrategyType {
 		return pb.StrategyType_WEEK52_BREAKOUT
 	case models.StrategyTypeManthan:
 		return pb.StrategyType_MANTHAN
-	case models.StrategyTypeHFTBidding:
-		return pb.StrategyType_HFT_BIDDING
 	case models.StrategyTypeNews:
 		return pb.StrategyType_NEWS
 	default:
@@ -593,67 +618,10 @@ func protoStrategyTypeToModel(t pb.StrategyType) models.StrategyType {
 		return models.StrategyType52WBreakout
 	case pb.StrategyType_MANTHAN:
 		return models.StrategyTypeManthan
-	case pb.StrategyType_HFT_BIDDING:
-		return models.StrategyTypeHFTBidding
 	case pb.StrategyType_NEWS:
 		return models.StrategyTypeNews
 	default:
 		return models.StrategyTypeNews
-	}
-}
-
-// protoHFTConfigToModel converts the proto HFTConfig to the domain model.
-// Returns nil when proto is nil (non-HFT strategies). Mode is left empty —
-// the service layer fills it from the request TradingMode.
-func protoHFTConfigToModel(p *pb.HFTConfig) *models.HFTConfig {
-	if p == nil {
-		return nil
-	}
-	return &models.HFTConfig{
-		Symbol:              p.Symbol,
-		ISIN:                p.Isin,
-		Exchange:            p.Exchange,
-		Side:                p.Side,
-		ProductType:         p.ProductType,
-		TickSize:            p.TickSize,
-		MaxBuyQty:           p.MaxBuyQty,
-		MaxSellQty:          p.MaxSellQty,
-		SingleBuyQty:        p.SingleBuyQty,
-		SingleSellQty:       p.SingleSellQty,
-		BuyLimitPrice:       p.BuyLimitPrice,
-		SellLimitPrice:      p.SellLimitPrice,
-		WindowStart:         p.WindowStart,
-		WindowEnd:           p.WindowEnd,
-		ModifyOnPriceChange: p.ModifyOnPriceChange,
-		BuyTriggerPrice:     p.BuyTriggerPrice,
-		SellTriggerPrice:    p.SellTriggerPrice,
-	}
-}
-
-// modelHFTConfigToProto converts the domain HFTConfig back to proto for
-// responses. Returns nil when model is nil.
-func modelHFTConfigToProto(m *models.HFTConfig) *pb.HFTConfig {
-	if m == nil {
-		return nil
-	}
-	return &pb.HFTConfig{
-		Symbol:              m.Symbol,
-		Isin:                m.ISIN,
-		Exchange:            m.Exchange,
-		Side:                m.Side,
-		ProductType:         m.ProductType,
-		TickSize:            m.TickSize,
-		MaxBuyQty:           m.MaxBuyQty,
-		MaxSellQty:          m.MaxSellQty,
-		SingleBuyQty:        m.SingleBuyQty,
-		SingleSellQty:       m.SingleSellQty,
-		BuyLimitPrice:       m.BuyLimitPrice,
-		SellLimitPrice:      m.SellLimitPrice,
-		WindowStart:         m.WindowStart,
-		WindowEnd:           m.WindowEnd,
-		ModifyOnPriceChange: m.ModifyOnPriceChange,
-		BuyTriggerPrice:     m.BuyTriggerPrice,
-		SellTriggerPrice:    m.SellTriggerPrice,
 	}
 }
 
@@ -846,6 +814,13 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 		UpdatedAt:    &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
 	}
 
+	// stopped_at is nullable — only set on the proto if the row has
+	// been STOPPED, so the client reads absent-vs-present as the
+	// stop-vs-not-stopped signal.
+	if model.StoppedAt != nil {
+		strategy.StoppedAt = &common.Timestamp{Seconds: model.StoppedAt.Unix()}
+	}
+
 	if model.Conditions != nil {
 		strategy.Conditions = modelConditionsToProto(model.Conditions)
 	}
@@ -854,9 +829,6 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 	}
 	if model.RiskLimits != nil {
 		strategy.RiskLimits = modelRiskLimitsToProto(model.RiskLimits)
-	}
-	if model.HFTConfig != nil {
-		strategy.HftConfig = modelHFTConfigToProto(model.HFTConfig)
 	}
 
 	return strategy

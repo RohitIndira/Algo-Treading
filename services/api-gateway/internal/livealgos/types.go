@@ -63,13 +63,14 @@ type PnL struct {
 //
 // Status semantics:
 //
-//	LIVE     — strategy.active == true AND trading_mode is a live mode
-//	           (LIVE_STOCK, LIVE_HFT, etc.). Actively placing orders.
-//	PAUSED   — strategy exists in the DB but a paused-by-user flag or
-//	           trading_mode == PAPER is set. Shown but no live trading.
-//	STOPPED  — strategy.active == false. Deactivated but the config row
-//	           still exists so we can show a historical entry until the
-//	           user deletes it.
+//	LIVE     — stopped_at IS NULL, active=true, trading_mode is a live
+//	           mode (LIVE_STOCK, LIVE_HFT, etc.). Actively placing orders.
+//	PAUSED   — stopped_at IS NULL, either active=false (Pause modal)
+//	           or trading_mode == PAPER. Shown but no live trading.
+//	           RESUME flips it back to LIVE.
+//	STOPPED  — stopped_at IS NOT NULL. Terminal — cannot be resumed.
+//	           Row is kept purely so the user sees history; deploy a
+//	           fresh strategy to run again.
 //
 // StrategyID (not part of AlgoRow's public JSON but used server-side)
 // identifies the specific deployed configuration. AlgoRow.ID is the

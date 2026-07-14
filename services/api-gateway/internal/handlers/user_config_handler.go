@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,7 +11,6 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/dto"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
-	hftpb "github.com/RohitIndira/Algo-Treading/api/proto/hft_engine"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/gorilla/mux"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -18,19 +19,10 @@ import (
 
 type UserConfigHandler struct {
 	client *grpc_clients.UserConfigClient
-	// hftClient is optional. When set, CreateStrategy auto-fires Entry on
-	// the hft-engine for HFT_BIDDING strategies created with
-	// activate_immediately=true, turning the two-step
-	// create→start dance into one round-trip. nil is fine — auto-start
-	// is then a no-op and the operator must POST /hft/{id}/start manually.
-	hftClient *grpc_clients.HFTClient
 }
 
-func NewUserConfigHandler(client *grpc_clients.UserConfigClient, hftClient *grpc_clients.HFTClient) *UserConfigHandler {
-	return &UserConfigHandler{
-		client:    client,
-		hftClient: hftClient,
-	}
+func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHandler {
+	return &UserConfigHandler{client: client}
 }
 
 // CreateStrategy handles POST /api/v1/strategies
@@ -108,7 +100,6 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		Conditions:          dtoConditionsToProto(reqDTO.Conditions),
 		TradeConfig:         dtoTradeConfigToProto(reqDTO.TradeConfig),
 		RiskLimits:          dtoRiskLimitsToProto(reqDTO.RiskLimits),
-		HftConfig:           dtoHFTConfigToProto(reqDTO.HFTConfig),
 		IndiraAuth: &common.IndiraAuthContext{
 			UserId:      userIdHeader,
 			AppId:       appId,
@@ -142,46 +133,6 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		case pb.StrategyType_MANTHAN:
 			respondIndiraOK(w, buildManthanResponse(resp))
 			return
-		case pb.StrategyType_HFT_BIDDING:
-			out := buildHFTResponse(resp)
-			// Auto-fire Entry on the hft-engine when the caller wanted the
-			// strategy live immediately. activate_immediately=true previously
-			// only set the DB row's active=true bit but did NOT subscribe
-			// the engine to market data, so nothing actually ran until the
-			// operator made a second POST /hft/{id}/start call. We now
-			// chain the two together for HFT_BIDDING.
-			//
-			// Failure mode is best-effort: a failed auto-start does NOT
-			// roll back the create (the row stays, the operator can retry
-			// /hft/start manually). We surface the failure in the response
-			// so the UI can show it without a 500.
-			if h.hftClient != nil && reqDTO.ActivateImmediately {
-				entryResp, entryErr := h.hftClient.Entry(r.Context(), &hftpb.EntryRequest{
-					StrategyId: resp.Strategy.StrategyId,
-				})
-				switch {
-				case entryErr != nil:
-					out["auto_start"] = map[string]interface{}{
-						"success": false,
-						"error":   "hft-engine Entry call failed: " + entryErr.Error(),
-						"hint":    "strategy created but engine not running — retry POST /api/v1/hft/{id}/start",
-					}
-				case entryResp != nil && !entryResp.Success:
-					out["auto_start"] = map[string]interface{}{
-						"success": false,
-						"status":  entryResp.Status,
-						"error":   entryResp.Error,
-						"hint":    "strategy created but engine refused Entry — retry POST /api/v1/hft/{id}/start after fixing the underlying cause",
-					}
-				default:
-					out["auto_start"] = map[string]interface{}{
-						"success": true,
-						"status":  entryResp.Status,
-					}
-				}
-			}
-			respondIndiraOK(w, out)
-			return
 		}
 	}
 	// Fallthrough for unknown strategy types — return the raw protobuf
@@ -197,19 +148,19 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 
 	var reqDTO dto.UpdateStrategyRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "Invalid request body: "+err.Error())
 		return
 	}
 
 	userIdHeader := r.Header.Get("userId")
 	if userIdHeader == "" {
-		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		respondIndiraError(w, http.StatusUnauthorized, "E_AUTH", "userId header is required")
 		return
 	}
 
 	// IDOR Protection
 	if reqDTO.UserID != "" && reqDTO.UserID != userIdHeader {
-		respondWithError(w, http.StatusForbidden, "User ID mismatch between header and body")
+		respondIndiraError(w, http.StatusForbidden, "E_FORBIDDEN", "User ID mismatch between header and body")
 		return
 	}
 	reqDTO.UserID = userIdHeader
@@ -220,86 +171,74 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 
 	resp, err := h.client.UpdateStrategy(r.Context(), pbReq)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to update strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to update strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success":  true,
-		"strategy": slimStrategy(resp.Strategy),
-	})
+	respondIndiraOK(w, slimStrategy(resp.Strategy))
 }
 
-// DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}
+// DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}.
 //
-// Lifecycle ordering matters here. The hft-engine holds the strategy as an
-// in-memory Runner goroutine that places live broker orders on every tick;
-// the DB row is just configuration. Deleting only the DB row leaves a
-// zombie Runner that keeps trading until the engine restarts. So we stop
-// the engine FIRST, then delete the row.
+// Body (JSON, optional):
 //
-//   - hftClient.Exit succeeds         → engine stopped, resting orders
-//                                       cancelled, terminal state persisted.
-//     Proceed with DB delete.
-//   - hftClient.Exit → NOT_RUNNING    → strategy wasn't live in engine
-//                                       memory (paper, never started, or
-//                                       already finished). Proceed.
-//   - hftClient.Exit → other error    → ABORT. We will not delete the row
-//                                       while a Runner may still be live.
-//                                       Caller retries.
+//	{
+//	  "user_id":           "S4450",                    // may be omitted if userId header set
+//	  "position_handling": "SQUARE_OFF_AT_MARKET" | "KEEP_POSITIONS_OPEN"
+//	}
+//
+// Also honours the ?user_id= query param for callers that don't send
+// a body (pre-mockup DELETE flow stays working).
+//
+// When position_handling = SQUARE_OFF_AT_MARKET AND the strategy is
+// LIVE, the standard Indira auth headers (Authorization Bearer, appId,
+// source, userId) are required — trade-execution needs them to place
+// exit orders at the broker.
 func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
-	userID := r.URL.Query().Get("user_id")
 
+	userID, positionHandling, auth, ok := parseLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	// Query param fallback for the pre-mockup DELETE flow
 	if userID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
+		userID = r.URL.Query().Get("user_id")
+	}
+	if userID == "" {
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST",
+			"user_id is required (in body, ?user_id= query, or userId header)")
 		return
 	}
 
-	if h.hftClient != nil {
-		exitResp, exitErr := h.hftClient.Exit(r.Context(), &hftpb.ExitRequest{
-			StrategyId: strategyID,
-		})
-		switch {
-		case exitErr != nil:
-			respondWithError(w, http.StatusBadGateway,
-				"Failed to stop strategy in hft-engine before delete: "+exitErr.Error()+
-					" — retry once the engine is reachable")
-			return
-		case exitResp != nil && !exitResp.Success && exitResp.Status != "NOT_RUNNING":
-			respondWithError(w, http.StatusConflict,
-				"hft-engine refused to stop the strategy: "+exitResp.Error+
-					" (status="+exitResp.Status+") — resolve and retry")
-			return
-		}
-	}
-
 	req := &pb.DeleteStrategyRequest{
-		StrategyId: strategyID,
-		UserId:     userID,
+		StrategyId:       strategyID,
+		UserId:           userID,
+		PositionHandling: positionHandling,
+		IndiraAuth:       auth,
 	}
 
 	resp, err := h.client.DeleteStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to delete strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to delete strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
 		statusCode := mapErrorCodeToHTTPStatus(resp.Error.Code)
-		respondWithError(w, statusCode, resp.Error.Message)
+		respondIndiraError(w, statusCode, resp.Error.Code, resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Strategy deleted successfully",
+	respondIndiraOK(w, map[string]interface{}{
+		"message":          "Strategy deleted successfully",
+		"positions_exited": resp.PositionsExited,
 	})
 }
 
@@ -310,7 +249,7 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 	userID := r.URL.Query().Get("user_id")
 
 	if userID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "user_id query parameter is required")
 		return
 	}
 
@@ -321,20 +260,17 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 
 	resp, err := h.client.GetStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to get strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to get strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
 		statusCode := mapErrorCodeToHTTPStatus(resp.Error.Code)
-		respondWithError(w, statusCode, resp.Error.Message)
+		respondIndiraError(w, statusCode, resp.Error.Code, resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success":  true,
-		"strategy": slimStrategy(resp.Strategy),
-	})
+	respondIndiraOK(w, slimStrategy(resp.Strategy))
 }
 
 // ListUserStrategies handles GET /api/v1/users/{user_id}/strategies
@@ -374,34 +310,38 @@ func (h *UserConfigHandler) ListUserStrategies(w http.ResponseWriter, r *http.Re
 
 	resp, err := h.client.ListUserStrategies(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to list strategies: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to list strategies: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success":    true,
+	respondIndiraOK(w, map[string]interface{}{
 		"strategies": slimStrategies(resp.Strategies),
 		"pagination": slimPagination(resp.Pagination),
 	})
 }
 
-// ActivateStrategy handles POST /api/v1/strategies/{strategy_id}/activate
+// ActivateStrategy handles POST /api/v1/strategies/{strategy_id}/activate.
+// Matches the mockup's "Resume" flow — flips active=true. No position
+// handling here (positions were already whatever they were during pause).
 func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
 
+	// Body is optional — Resume takes no parameters beyond identity.
 	var reqBody struct {
 		UserID string `json:"user_id"`
 	}
-
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
-		return
+	if r.Body != http.NoBody {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&reqBody); err != nil && !errors.Is(err, io.EOF) {
+			respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "Invalid request body: "+err.Error())
+			return
+		}
 	}
 
 	// Fall back to userId header if body is missing user_id
@@ -410,7 +350,7 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 	}
 
 	if reqBody.UserID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id is required (in body or userId header)")
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "user_id is required (in body or userId header)")
 		return
 	}
 
@@ -421,59 +361,135 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 
 	resp, err := h.client.ActivateStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to activate strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to activate strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondIndiraOK(w, map[string]interface{}{
+		"message":  "Strategy resumed successfully",
+		"strategy": slimStrategy(resp.Strategy),
+	})
 }
 
 // DeactivateStrategy handles POST /api/v1/strategies/{strategy_id}/deactivate
+// DeactivateStrategy handles POST /api/v1/strategies/{strategy_id}/deactivate.
+//
+// Body (JSON):
+//
+//	{
+//	  "user_id":           "S4450",                    // may be omitted if userId header set
+//	  "position_handling": "SQUARE_OFF_AT_MARKET" | "KEEP_POSITIONS_OPEN"
+//	}
+//
+// Matches the mockup's "Pause" modal: the user picks a radio between
+// KEEP_POSITIONS_OPEN and SQUARE_OFF_AT_MARKET, and this handler
+// surfaces the outcome (Algo Paused Successfully / Algo Pause Failed)
+// atomically.
 func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
 
-	var reqBody struct {
-		UserID string `json:"user_id"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+	userID, positionHandling, auth, ok := parseLifecycleRequest(w, r)
+	if !ok {
 		return
 	}
-
-	// Fall back to userId header if body is missing user_id
-	if reqBody.UserID == "" {
-		reqBody.UserID = r.Header.Get("userId")
-	}
-
-	if reqBody.UserID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id is required (in body or userId header)")
+	if userID == "" {
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "user_id is required (in body or userId header)")
 		return
 	}
 
 	req := &pb.DeactivateStrategyRequest{
-		StrategyId: strategyID,
-		UserId:     reqBody.UserID,
+		StrategyId:       strategyID,
+		UserId:           userID,
+		PositionHandling: positionHandling,
+		IndiraAuth:       auth,
 	}
 
 	resp, err := h.client.DeactivateStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to deactivate strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to deactivate strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondIndiraOK(w, map[string]interface{}{
+		"message":          "Strategy paused successfully",
+		"strategy":         slimStrategy(resp.Strategy),
+		"positions_exited": resp.PositionsExited,
+	})
+}
+
+// parseLifecycleRequest reads the shared inputs used by
+// Deactivate/Delete: user_id (body OR userId header), position_handling
+// (default KEEP_POSITIONS_OPEN), and Indira auth headers (only when
+// position_handling = SQUARE_OFF_AT_MARKET).
+//
+// On invalid input it writes an HTTP error response and returns
+// ok=false — the caller must simply `return`.
+//
+// The Indira auth block is only populated when SQUARE_OFF is requested;
+// KEEP_POSITIONS_OPEN paths don't need broker credentials and having
+// them upstream would just add auth failures for the plain pause flow.
+func parseLifecycleRequest(w http.ResponseWriter, r *http.Request) (userID string, ph pb.PositionHandling, auth *common.IndiraAuthContext, ok bool) {
+	// Body is optional — some callers hit DELETE without any body.
+	// Decode best-effort; ignore io.EOF and only reject actual malformed
+	// JSON so a bodyless DELETE is still accepted.
+	var body struct {
+		UserID           string `json:"user_id"`
+		PositionHandling string `json:"position_handling"`
+	}
+	if r.Body != http.NoBody {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+			return "", 0, nil, false
+		}
+	}
+
+	userID = body.UserID
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+
+	switch strings.ToUpper(body.PositionHandling) {
+	case "SQUARE_OFF_AT_MARKET":
+		ph = pb.PositionHandling_SQUARE_OFF_AT_MARKET
+	case "", "KEEP_POSITIONS_OPEN":
+		ph = pb.PositionHandling_KEEP_POSITIONS_OPEN
+	default:
+		respondWithError(w, http.StatusBadRequest,
+			"position_handling must be SQUARE_OFF_AT_MARKET or KEEP_POSITIONS_OPEN")
+		return "", 0, nil, false
+	}
+
+	if ph == pb.PositionHandling_SQUARE_OFF_AT_MARKET {
+		bearer := r.Header.Get("Authorization")
+		bearer = strings.TrimPrefix(bearer, "Bearer ")
+		appID := r.Header.Get("appId")
+		source := r.Header.Get("source")
+		if bearer == "" || appID == "" || source == "" {
+			respondWithError(w, http.StatusUnauthorized,
+				"SQUARE_OFF_AT_MARKET requires Authorization Bearer, appId, and source headers")
+			return "", 0, nil, false
+		}
+		auth = &common.IndiraAuthContext{
+			UserId:      userID,
+			AppId:       appID,
+			Source:      source,
+			BearerToken: bearer,
+		}
+	}
+
+	return userID, ph, auth, true
 }
 
 // HealthCheck handles GET /api/v1/health

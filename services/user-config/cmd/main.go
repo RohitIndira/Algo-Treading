@@ -19,6 +19,7 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/tradeexec"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/worker"
 	goredis "github.com/go-redis/redis/v8"
 	"github.com/jmoiron/sqlx"
@@ -103,10 +104,9 @@ func main() {
 	}
 
 	// Optional ext-Redis client. user-config reads `symbol:{TICKER}` master
-	// data so HFT_BIDDING strategies can be created with just a symbol; ISIN
-	// is derived at validation time. If the env isn't set or the dial fails,
-	// the service still works — it'll just require callers to supply ISIN
-	// directly (rejected at validation with a clear error otherwise).
+	// data for symbol → ISIN resolution during strategy validation. If the
+	// env isn't set or the dial fails, the service still works — callers
+	// then have to supply ISIN directly.
 	var extRedis *goredis.Client
 	if addr := os.Getenv("EXT_REDIS_ADDR"); addr != "" {
 		extRedis = goredis.NewClient(&goredis.Options{
@@ -131,6 +131,18 @@ func main() {
 
 	// Initialize service
 	svc := service.NewStrategyService(repo, credsRepo, kafkaWriter, cfg.Kafka.Topic, extRedis)
+
+	// Trade-execution HTTP client for the atomic SQUARE_OFF_AT_MARKET path
+	// of Deactivate/Delete. Nil-safe — if TRADE_EXECUTION_HTTP_URL is unset,
+	// SQUARE_OFF requests get a clear error and KEEP_POSITIONS_OPEN keeps
+	// working as before. See internal/tradeexec/client.go for the contract.
+	if tradeExecURL := os.Getenv("TRADE_EXECUTION_HTTP_URL"); tradeExecURL != "" {
+		svc.SetTradeExecClient(tradeexec.New(tradeExecURL))
+		lgr.Info("Trade-execution client wired for SQUARE_OFF_AT_MARKET path",
+			zap.String("url", tradeExecURL))
+	} else {
+		lgr.Warn("TRADE_EXECUTION_HTTP_URL unset — SQUARE_OFF_AT_MARKET requests will return an error; KEEP_POSITIONS_OPEN still works")
+	}
 
 	// Initialize Outbox Worker
 	if cfg.Kafka.Enabled && kafkaWriter != nil {

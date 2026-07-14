@@ -1,13 +1,19 @@
-// historical-worker: Market data service for 52W high/low tracking.
+// historical-worker: Market data service for 52W high/low tracking + EMAs.
 //
 // Modes:
-//   --mode=daily      6AM API sync + WebSocket monitor (default, for PM2)
+//   --mode=daily      6AM API sync scheduler (default, for PM2)
 //   --mode=apisync    One-time NSE + BSE API sync, then exit
-//   --mode=monitor    WebSocket breakout detection only
+//   --mode=emaseed    Seed EMAs from Yahoo Finance (first-time setup)
+//   --mode=emaupdate  Update EMAs from latest bhavcopy (manual)
+//
+// The old WebSocket breakout monitor + associated daily_ohlcv +
+// breakout_events tables were removed 2026-07-13 (DB.7b) — 52W
+// breakout data is already tracked in Redis (`52w:token:*` keys) and
+// nothing consumed the market.data.52w_breakouts Kafka topic anyway.
+// See docs/db_ownership.md for the drop record.
 //
 // Usage with PM2:
 //   pm2 start ./bin/historical-worker --name "market-data" -- --mode=daily
-
 package main
 
 import (
@@ -29,7 +35,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "daily", "Mode: daily, apisync, or monitor")
+	mode := flag.String("mode", "daily", "Mode: daily, apisync, emaseed, or emaupdate")
 	schedHour := flag.Int("hour", 6, "Daily API sync hour IST (default 6)")
 	schedMin := flag.Int("min", 0, "Daily API sync minute IST (default 0)")
 	flag.Parse()
@@ -110,15 +116,6 @@ func main() {
 
 	switch *mode {
 	case "daily":
-		// Start WebSocket monitor in background
-		monitor := historical.NewWSMonitor(repo, redisClient, cfg.KafkaBrokers, logger)
-		go func() {
-			if err := monitor.Start(ctx); err != nil {
-				logger.Error("WebSocket monitor failed", zap.Error(err))
-			}
-		}()
-		logger.Info("WebSocket monitor started in background")
-
 		// Run daily API sync scheduler (blocks until shutdown)
 		worker.RunDailyScheduler(ctx, *schedHour, *schedMin)
 
@@ -145,15 +142,8 @@ func main() {
 		}
 		logger.Info("EMA update complete")
 
-	case "monitor":
-		monitor := historical.NewWSMonitor(repo, redisClient, cfg.KafkaBrokers, logger)
-		logger.Info("Starting WebSocket monitor (standalone mode)")
-		if err := monitor.Start(ctx); err != nil {
-			logger.Fatal("WebSocket monitor failed", zap.Error(err))
-		}
-
 	default:
-		fmt.Fprintf(os.Stderr, "unknown mode: %s (use 'daily', 'apisync', or 'monitor')\n", *mode)
+		fmt.Fprintf(os.Stderr, "unknown mode: %s (use 'daily', 'apisync', 'emaseed', or 'emaupdate')\n", *mode)
 		os.Exit(1)
 	}
 }

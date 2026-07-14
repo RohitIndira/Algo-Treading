@@ -12,11 +12,18 @@ import (
 // doesn't exist in the strategies table. Handler maps this to 404.
 var ErrStrategyNotFound = errors.New("livealgos: strategy not found")
 
-// PositionRow is one row of manthan_positions (owned by rules-engine in
-// trading_db). Fields nullable in the DB use sql.NullString/Float64 so
-// the query can distinguish "value not set" from "value zero".
+// PositionRow is one row of positions_db.positions (owned by the
+// positions service — the canonical SSOT since the CQRS split from
+// rules-engine's manthan_positions). ISIN/Industry/MCapBucket are NOT
+// stored in positions_db; they are looked up per-symbol from
+// signals_db.manthan_signals (see Positions).
+//
+// Fields nullable in the DB use sql.NullString/Float64 so the query can
+// distinguish "value not set" from "value zero".
 type PositionRow struct {
-	ID              int64
+	// ID is positions.position_id (uuid) — string form. Was int64 back
+	// when we read from manthan_positions.id.
+	ID              string
 	StrategyID      string
 	UserID          string
 	Symbol          string
@@ -64,17 +71,29 @@ type StrategyMetaRow struct {
 	MaxPositions   int
 	PerStockAmount float64
 	CreatedAt      time.Time
+	// StoppedAt is set when the user hits STOP (terminal transition).
+	// Non-nil → derive Status=STOPPED regardless of Active. See
+	// aggregator_details.go statusFromMeta.
+	StoppedAt      *time.Time
 }
 
 // Store is the DB-access surface for Live Algos endpoints. Reads from
-// TWO Postgres databases because writers live in different services:
+// FOUR Postgres databases because writers live in different services:
 //
-//   strategies + trade_configs + manthan_positions  → trading_db      (rules-engine)
-//   manthan_orders                                  → execution_db (trade-execution)
+//   strategies + trade_configs        → trading_db    (user-config)
+//   positions                         → positions_db  (positions svc — SSOT
+//                                                      for lifecycle P&L)
+//   manthan_orders                    → execution_db  (trade-execution)
+//   manthan_signals (symbol metadata) → signals_db    (data-ingestion)
 //
-// Previously this store hit a single `stockk_trading` DB that had both
-// tables copied in — but that DB was a silent replica that drifted from
-// the authoritative sources, causing UI vs main-handler inconsistencies.
+// positions_db replaced the legacy trading_db.manthan_positions read
+// (2026-07 CQRS migration) because that table's realized_pnl writer
+// was unreliable — e.g. HSCL entry=676.13 exit=548 qty=30 got stored
+// as realized_pnl=0.00. positions_db is fed by the positions
+// service reconciler which trusts broker fills, so its numbers match
+// reality. signals_db.manthan_signals is joined per-symbol to supply
+// isin/industry/mcap_bucket (positions_db doesn't carry them).
+//
 // See docs/db_ownership.md for the current ownership map.
 type Store interface {
 	// StrategyMeta returns the header row + capital info for one strategy
@@ -95,28 +114,44 @@ type Store interface {
 	OrdersForSymbol(ctx context.Context, strategyID, userID, symbol string) ([]OrderRow, error)
 }
 
-// PostgresStore implements Store using two DB pools.
+// PostgresStore implements Store using four DB pools.
 //
-// positionsDB holds strategies + trade_configs + manthan_positions (the
-// rules-engine + user-config write side). ordersDB holds manthan_orders
-// (trade-execution's write side). Callers own both pool lifecycles.
+//   strategiesDB → trading_db   — strategies + trade_configs (user-config).
+//   positionsDB  → positions_db — positions.* (positions svc, SSOT).
+//   ordersDB     → execution_db — manthan_orders (trade-execution).
+//   signalsDB    → signals_db   — manthan_signals for symbol→(isin,
+//                                  industry, mcap_bucket) enrichment.
 //
-// Passing nil for either is legal — StrategyMeta needs positionsDB,
-// Positions needs both (tokens degrade gracefully to nil if ordersDB
-// is nil), OrdersForSymbol needs ordersDB. The router already
-// nil-guards the whole details tier if any of these are missing.
+// Any pool may be nil — the store degrades gracefully:
+//   - StrategyMeta needs strategiesDB (returns ErrStrategyNotFound if nil).
+//   - Positions needs positionsDB (returns [] if nil). ordersDB nil →
+//     exchange_token stays NULL; signalsDB nil → industry/isin/mcap
+//     stay empty on each row.
+//   - OrdersForSymbol needs ordersDB.
+//
+// The router already nil-guards the whole details tier if any of these
+// are missing at boot.
 type PostgresStore struct {
-	positionsDB *sql.DB
-	ordersDB    *sql.DB
+	strategiesDB *sql.DB
+	positionsDB  *sql.DB
+	ordersDB     *sql.DB
+	signalsDB    *sql.DB
 }
 
-// NewPostgresStore wires the store to two open *sql.DB pools:
-// positionsDB → trading_db, ordersDB → execution_db.
+// NewPostgresStore wires the store to four open *sql.DB pools:
+//   strategiesDB → trading_db
+//   positionsDB  → positions_db  (2026-07 CQRS SSOT; NOT trading_db anymore)
+//   ordersDB     → execution_db
+//   signalsDB    → signals_db    (for symbol metadata enrichment; nil-safe)
 //
-// Both are opened once at boot in main.go and reused across handlers
-// (ManthanHandler shares the same pools).
-func NewPostgresStore(positionsDB, ordersDB *sql.DB) *PostgresStore {
-	return &PostgresStore{positionsDB: positionsDB, ordersDB: ordersDB}
+// All are opened once at boot in main.go and reused across handlers.
+func NewPostgresStore(strategiesDB, positionsDB, ordersDB, signalsDB *sql.DB) *PostgresStore {
+	return &PostgresStore{
+		strategiesDB: strategiesDB,
+		positionsDB:  positionsDB,
+		ordersDB:     ordersDB,
+		signalsDB:    signalsDB,
+	}
 }
 
 // StrategyMeta joins strategies + trade_configs to return everything a
@@ -134,22 +169,28 @@ func (s *PostgresStore) StrategyMeta(ctx context.Context, strategyID, userID str
 			COALESCE(tc.total_capital, 0),
 			COALESCE(tc.max_positions, 0),
 			COALESCE(tc.per_stock_amount, 0),
-			s.created_at
+			s.created_at,
+			s.stopped_at
 		FROM public.strategies s
 		LEFT JOIN public.trade_configs tc ON tc.strategy_id = s.strategy_id
 		WHERE s.strategy_id::text = $1
 		  AND s.user_id = $2
 		LIMIT 1`
 
-	row := s.positionsDB.QueryRowContext(ctx, q, strategyID, userID)
+	row := s.strategiesDB.QueryRowContext(ctx, q, strategyID, userID)
 
 	var r StrategyMetaRow
+	var stoppedAt sql.NullTime
 	err := row.Scan(
 		&r.StrategyID, &r.UserID, &r.StrategyName, &r.StrategyType,
 		&r.TradingMode, &r.Active,
 		&r.TotalCapital, &r.MaxPositions, &r.PerStockAmount,
 		&r.CreatedAt,
+		&stoppedAt,
 	)
+	if stoppedAt.Valid {
+		r.StoppedAt = &stoppedAt.Time
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrStrategyNotFound
 	}
@@ -159,35 +200,41 @@ func (s *PostgresStore) StrategyMeta(ctx context.Context, strategyID, userID str
 	return &r, nil
 }
 
-// Positions returns every position for (strategy, user). Because
-// manthan_positions (trading_db) and manthan_orders (execution_db)
-// live in DIFFERENT Postgres databases now, we can't do the exchange_token
-// enrichment as a single JOIN. Instead:
+// Positions returns every MANTHAN-origin position for (strategy, user).
+// Reads from positions_db.positions (the CQRS SSOT since 2026-07). Since
+// positions_db doesn't store symbol metadata OR the exchange_token, we
+// enrich in three round-trips:
 //
-//	1. SELECT positions from positionsDB
-//	2. SELECT distinct (symbol, exchange_token) from ordersDB
-//	3. Merge in Go
+//	1. SELECT positions from positionsDB (positions_db)
+//	2. SELECT (symbol → isin, industry, mcap_bucket) from signalsDB
+//	   (signals_db.manthan_signals — latest run_date per symbol)
+//	3. SELECT distinct (symbol → exchange_token) from ordersDB
+//	   (execution_db.manthan_orders)
+//	4. Merge all three in Go
 //
-// This costs one extra round-trip vs the old single-DB JOIN, but it's
-// the price of not having a silently-drifting replica DB. Both queries
-// are indexed on (strategy_id, user_id) so latency is a few ms each.
+// All three secondary reads are nil-safe: signalsDB nil → industry/isin/
+// mcap stay empty on every row (allocation charts degrade to "(empty)"
+// buckets, ltpStatus still works). ordersDB nil → exchange_token stays
+// NULL and LTP fetch skips the row. Both writers are indexed on the
+// columns we hit, so latency is a few ms each even on a large book.
 //
-// ordersDB nil is legal — Positions() still returns the row list, just
-// with every ExchangeToken=NULL. Caller's LTP fetch step will skip
-// those rows (already behaves that way — see collectActiveTokens).
+// Origin filter: `origin = 'MANTHAN'` deliberately excludes USER_MANUAL
+// rows in positions_db — those don't belong on the live-algos details
+// page (they're surfaced through /users/me/portfolio/*). If the caller
+// ever needs both, add an `IncludeManual` field to the interface.
 func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string) ([]PositionRow, error) {
+	if s.positionsDB == nil {
+		return nil, nil
+	}
 	const positionsQ = `
 		SELECT
-			id,
+			position_id::text,
 			strategy_id::text,
 			user_id,
 			symbol,
-			isin,
-			industry,
-			mcap_bucket,
 			entry_price,
 			quantity,
-			invested_amt,
+			invested_amount,
 			high_since_entry,
 			current_sl,
 			status,
@@ -196,9 +243,10 @@ func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string
 			exit_reason,
 			entry_time,
 			exit_time
-		FROM public.manthan_positions
+		FROM public.positions
 		WHERE strategy_id::text = $1
 		  AND user_id = $2
+		  AND origin = 'MANTHAN'
 		ORDER BY entry_time ASC`
 
 	rows, err := s.positionsDB.QueryContext(ctx, positionsQ, strategyID, userID)
@@ -212,7 +260,6 @@ func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string
 		var p PositionRow
 		if err := rows.Scan(
 			&p.ID, &p.StrategyID, &p.UserID, &p.Symbol,
-			&p.ISIN, &p.Industry, &p.MCapBucket,
 			&p.EntryPrice, &p.Quantity, &p.InvestedAmt,
 			&p.HighSinceEntry, &p.CurrentSL,
 			&p.Status, &p.ExitPrice, &p.RealizedPnL, &p.ExitReason,
@@ -225,26 +272,102 @@ func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-
-	// Second round-trip: symbol → exchange_token from the OTHER DB.
-	// Skipped when ordersDB is nil or when the position list is empty.
-	if s.ordersDB == nil || len(out) == 0 {
+	if len(out) == 0 {
 		return out, nil
 	}
 
-	tokens, err := s.tokensForStrategy(ctx, strategyID, userID)
-	if err != nil {
-		// Non-fatal: return positions without exchange_token rather than
-		// killing the whole details page. LTP fetch degrades to no-LTP
-		// downstream and the AG.LTP subsystem surfaces ltpStatus.
-		return out, nil
-	}
-	for i := range out {
-		if tok, ok := tokens[out[i].Symbol]; ok {
-			out[i].ExchangeToken = sql.NullString{String: tok, Valid: true}
+	// Enrichment (2): symbol → isin/industry/mcap_bucket from signals_db.
+	// Non-fatal on error — allocation charts degrade to "(empty)" buckets
+	// but the money numbers stay accurate. Skipped when signalsDB is nil.
+	if s.signalsDB != nil {
+		if meta, err := s.symbolMetadata(ctx, collectSymbols(out)); err == nil {
+			for i := range out {
+				if m, ok := meta[out[i].Symbol]; ok {
+					if m.ISIN != "" {
+						out[i].ISIN = sql.NullString{String: m.ISIN, Valid: true}
+					}
+					if m.Industry != "" {
+						out[i].Industry = sql.NullString{String: m.Industry, Valid: true}
+					}
+					if m.MCapBucket != "" {
+						out[i].MCapBucket = sql.NullString{String: m.MCapBucket, Valid: true}
+					}
+				}
+			}
 		}
 	}
+
+	// Enrichment (3): symbol → exchange_token from execution_db.
+	// Skipped when ordersDB is nil.
+	if s.ordersDB != nil {
+		if tokens, err := s.tokensForStrategy(ctx, strategyID, userID); err == nil {
+			for i := range out {
+				if tok, ok := tokens[out[i].Symbol]; ok {
+					out[i].ExchangeToken = sql.NullString{String: tok, Valid: true}
+				}
+			}
+		}
+	}
+
 	return out, nil
+}
+
+// symbolMeta is the enrichment payload from signals_db.manthan_signals.
+// Fields default to "" when the signal row didn't set them.
+type symbolMeta struct {
+	ISIN       string
+	Industry   string
+	MCapBucket string
+}
+
+// symbolMetadata returns a symbol → symbolMeta map by hitting
+// signals_db.manthan_signals. Uses DISTINCT ON (symbol) ORDER BY
+// run_date DESC to grab the latest metadata row per symbol — a symbol
+// re-appearing across days keeps its most-recent classification.
+func (s *PostgresStore) symbolMetadata(ctx context.Context, symbols []string) (map[string]symbolMeta, error) {
+	if len(symbols) == 0 {
+		return nil, nil
+	}
+	const q = `
+		SELECT DISTINCT ON (symbol)
+			symbol,
+			COALESCE(isin, ''),
+			COALESCE(industry, ''),
+			COALESCE(mcap_bucket, '')
+		FROM public.manthan_signals
+		WHERE symbol = ANY($1)
+		ORDER BY symbol, run_date DESC`
+	rows, err := s.signalsDB.QueryContext(ctx, q, symbols)
+	if err != nil {
+		return nil, fmt.Errorf("livealgos: symbolMetadata query: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]symbolMeta{}
+	for rows.Next() {
+		var sym string
+		var m symbolMeta
+		if err := rows.Scan(&sym, &m.ISIN, &m.Industry, &m.MCapBucket); err != nil {
+			return nil, fmt.Errorf("livealgos: symbolMetadata scan: %w", err)
+		}
+		out[sym] = m
+	}
+	return out, rows.Err()
+}
+
+// collectSymbols returns the distinct symbols in a PositionRow slice.
+// Order preserved by first-occurrence for stable log/query traces.
+func collectSymbols(rows []PositionRow) []string {
+	seen := make(map[string]struct{}, len(rows))
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if _, ok := seen[r.Symbol]; ok {
+			continue
+		}
+		seen[r.Symbol] = struct{}{}
+		out = append(out, r.Symbol)
+	}
+	return out
 }
 
 // tokensForStrategy queries manthan_orders (ordersDB) for the

@@ -50,28 +50,7 @@ func main() {
 
 	log.Printf("Connected to User Config Service at %s", cfg.Services.UserConfigAddr)
 
-	// gRPC client: hft-engine. Non-fatal — grpc.Dial is lazy, so this only
-	// errors on a malformed address; if it does, HFT routes stay disabled
-	// (router nil-checks the handler) but the rest of the gateway runs.
-	var hftHandler *handlers.HFTHandler
-	hftClient, err := grpc_clients.NewHFTClient(
-		cfg.Services.HFTEngineAddr,
-		cfg.Server.GRPCTimeout,
-	)
-	if err != nil {
-		log.Printf("Warning: HFT engine client init failed: %v (HFT routes disabled)", err)
-	} else {
-		defer hftClient.Close()
-		hftHandler = handlers.NewHFTHandler(hftClient)
-		log.Printf("Connected to HFT Engine at %s", cfg.Services.HFTEngineAddr)
-	}
-
-	// Initialize handlers. hftClient is passed through to UserConfigHandler
-	// so CreateStrategy can auto-fire Entry on HFT_BIDDING strategies with
-	// activate_immediately=true — turning the create→start dance into a
-	// single round-trip. nil-safe: if hftClient init failed above, auto-start
-	// is silently skipped (operator can still POST /hft/{id}/start manually).
-	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient, hftClient)
+	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient)
 
 	// Initialize Redis client for WebSocket pub/sub
 	redisClient := redis.NewClient(&redis.Options{
@@ -139,13 +118,25 @@ func main() {
 	var manthanHandler *handlers.ManthanHandler
 	var healthHandler *handlers.HealthHandler
 	var perfHandler *handlers.PerformanceHandler
+	// Hoisted so livealgos handler can reuse for chart data in
+	// GetStrategyDetails (algo_performance_daily → DetailsChart).
+	var liveAlgosPerfStore performance.Store
+	var liveAlgosPerfClientMap map[string]string
 	var extRedis *redis.Client // hoisted: reused by the market-quote handler
 	// positionsDB, ordersDB + their DB names hoisted so downstream setup
 	// (live-algos store in DB.1, portfolio token lookup in PF.D) can reuse
 	// the same pools instead of dialling a second time.
+	//
+	// positionsSSotDB is the CQRS SSOT for lifecycle P&L (positions_db,
+	// written by services/positions). Distinct from positionsDB (trading_db)
+	// which still holds strategies + trade_configs + legacy manthan_positions.
+	// signalsDB hoisted so the live-algos store can enrich per-symbol
+	// isin/industry/mcap from signals_db.manthan_signals.
 	var positionsDB *sql.DB
+	var positionsSSotDB *sql.DB
 	var ordersDB *sql.DB
-	var positionsDBName, ordersDBName string
+	var signalsDB *sql.DB
+	var positionsDBName, ordersDBName, positionsSSotDBName string
 	{
 		pgHost := envOr("POSTGRES_HOST", "localhost")
 		pgPort := envOr("POSTGRES_PORT", "5432")
@@ -154,6 +145,7 @@ func main() {
 		pgSSL := envOr("POSTGRES_SSLMODE", "disable")
 		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "signals_db")
 		positionsDBName = envOr("MANTHAN_POSITIONS_DB", "trading_db")
+		positionsSSotDBName = envOr("POSITIONS_DB", "positions_db")
 		ordersDBName = envOr("MANTHAN_ORDERS_DB", "execution_db")
 		perfDBName := envOr("MANTHAN_PERF_DB", "stockk_market")
 
@@ -175,11 +167,11 @@ func main() {
 			return db, nil
 		}
 
-		signalsDB, err := openPG(signalsDBName)
-		if err != nil {
+		if db, err := openPG(signalsDBName); err != nil {
 			log.Printf("Warning: Manthan signals DB (%s) open/ping failed: %v", signalsDBName, err)
 		} else {
 			log.Printf("Manthan signals DB connected (%s)", signalsDBName)
+			signalsDB = db
 			defer signalsDB.Close()
 		}
 
@@ -189,6 +181,20 @@ func main() {
 			log.Printf("Manthan positions DB connected (%s)", positionsDBName)
 			positionsDB = db
 			defer positionsDB.Close()
+		}
+
+		// Positions SSOT (positions_db, written by services/positions). This
+		// is what live-algos Positions() reads — the legacy manthan_positions
+		// path had unreliable realized_pnl. Nil-safe: on connect failure the
+		// live-algos details tier returns an empty position list rather than
+		// falling back to the stale table (that regression is the whole point
+		// of switching).
+		if db, err := openPG(positionsSSotDBName); err != nil {
+			log.Printf("Warning: Positions SSOT DB (%s) open/ping failed: %v", positionsSSotDBName, err)
+		} else {
+			log.Printf("Positions SSOT DB connected (%s)", positionsSSotDBName)
+			positionsSSotDB = db
+			defer positionsSSotDB.Close()
 		}
 
 		if db, err := openPG(ordersDBName); err != nil {
@@ -212,9 +218,15 @@ func main() {
 			perfStore := performance.NewPostgresStore(perfDB)
 			// Maps algo id → reference client id in the sheet. Grows as
 			// we add more algos; for launch there's exactly one entry.
-			perfHandler = handlers.NewPerformanceHandler(perfStore, map[string]string{
+			perfClientMap := map[string]string{
 				"algo_manthan_v1": "A844",
-			})
+			}
+			perfHandler = handlers.NewPerformanceHandler(perfStore, perfClientMap)
+			// Share with the livealgos details handler so /users/me/live-algos/{sid}
+			// can serve the Manthan-Momentum growth chart (algo_performance_daily
+			// rebased to strategy created_at).
+			liveAlgosPerfStore = perfStore
+			liveAlgosPerfClientMap = perfClientMap
 		}
 
 		// Optional external Redis for live LTP (assigns the hoisted var)
@@ -291,19 +303,23 @@ func main() {
 	// Both are nil-safe — if the DB pool or Redis client fail to init,
 	// the router skips registering the details routes and the LIST
 	// endpoint keeps working normally.
-	// livealgos store reads from TWO existing DB pools:
-	//   positionsDB  (trading_db)         — manthan_positions, strategies, trade_configs
-	//   ordersDB     (execution_db)  — manthan_orders
-	// Previously this opened a THIRD `stockk_trading` DB which was a
-	// silent replica that drifted from the authoritative sources — see
-	// docs/db_ownership.md. Killed in Chunk DB.1.
-	//
-	// Both pools are already opened + ping-verified above under the
-	// manthan handler block; here we just borrow the handles.
+	// livealgos store reads from FOUR DB pools:
+	//   positionsDB     (trading_db)   — strategies + trade_configs (StrategyMeta)
+	//   positionsSSotDB (positions_db) — positions.* (CQRS SSOT, replaces the
+	//                                    legacy manthan_positions read whose
+	//                                    realized_pnl was unreliable)
+	//   ordersDB        (execution_db) — manthan_orders (Stock P&L drilldown)
+	//   signalsDB       (signals_db)   — manthan_signals for per-symbol
+	//                                    isin/industry/mcap enrichment
+	// signalsDB is nil-safe inside the store (empty industry/mcap on rows).
+	// positionsSSotDB nil returns an empty position list — which for a
+	// clean-cutover strategy is the correct display (see docs/db_ownership.md).
 	var liveAlgosStore livealgos.Store
 	if positionsDB != nil && ordersDB != nil {
-		liveAlgosStore = livealgos.NewPostgresStore(positionsDB, ordersDB)
-		log.Printf("Live-algos store wired (positions=%s, orders=%s)", positionsDBName, ordersDBName)
+		liveAlgosStore = livealgos.NewPostgresStore(positionsDB, positionsSSotDB, ordersDB, signalsDB)
+		log.Printf("Live-algos store wired (strategies=%s, positions_ssot=%s, orders=%s, signals=%s)",
+			positionsDBName, positionsSSotDBName, ordersDBName,
+			envOr("MANTHAN_SIGNALS_DB", "signals_db"))
 	} else {
 		log.Printf("Warning: live-algos details store disabled — need both positionsDB (%v) and ordersDB (%v)",
 			positionsDB != nil, ordersDB != nil)
@@ -342,7 +358,7 @@ func main() {
 		pCancel()
 	}
 
-	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP)
+	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP, liveAlgosPerfStore, liveAlgosPerfClientMap)
 
 	// ── Portfolio handler (PF.D) ────────────────────────────────────────
 	// Dials portfolio svc's gRPC, composes an Enricher over the same
@@ -406,7 +422,7 @@ func main() {
 	})
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, hftHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, corsConfig)
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

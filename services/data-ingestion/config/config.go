@@ -56,23 +56,20 @@ func init() {
 
 // Config holds data-ingestion configuration
 type Config struct {
-	MongoURI        string
-	MongoDatabase   string
-	MongoCollection string
+	// Mongo — used by manthan-live's Redis company-details cache backfill.
+	// (Not the news watcher — that was removed 2026-07-13.)
+	MongoURI            string
+	MongoDatabase       string
+	MongoConnectTimeout time.Duration
 
 	KafkaBrokers []string
-	KafkaTopic   string
 
-	WorkerCount int
-	MaxRetries  int
-	// timeouts
+	// Redis (LTP + Manthan cache)
 	RedisURI      string
 	RedisPassword string
 	RedisDB       int
 
-	MongoConnectTimeout time.Duration
-
-	// PostgreSQL (signals_db database for historical OHLCV)
+	// PostgreSQL (signals_db database — Manthan signals + historical OHLCV)
 	PGHost     string
 	PGPort     int
 	PGUser     string
@@ -88,20 +85,9 @@ func Load() *Config {
 		brokers = "localhost:9092"
 	}
 
-	topic := os.Getenv("KAFKA_TOPIC_NEWS")
-	if topic == "" {
-		// follow repo convention
-		topic = "news-events"
-	}
-
 	db := os.Getenv("MONGO_DATABASE")
 	if db == "" {
 		db = "CAG_CHATBOT"
-	}
-
-	coll := os.Getenv("MONGO_NEWS_COLLECTION")
-	if coll == "" {
-		coll = "NewsImpactDashboard"
 	}
 
 	redisURI := os.Getenv("REDIS_URI")
@@ -111,23 +97,16 @@ func Load() *Config {
 
 	redisPassword := os.Getenv("REDIS_PASSWORD")
 
-	workerCount := 4
-	maxRetries := 3
-
 	pgPort, _ := strconv.Atoi(getEnv("MARKET_DATA_DB_PORT", "5432"))
 
 	return &Config{
 		MongoURI:            getEnv("MONGO_URI", "mongodb://localhost:27017"),
 		MongoDatabase:       db,
-		MongoCollection:     coll,
+		MongoConnectTimeout: 10 * time.Second,
+		KafkaBrokers:        strings.Split(brokers, ","),
 		RedisURI:            redisURI,
 		RedisPassword:       redisPassword,
 		RedisDB:             0, // Default DB
-		KafkaBrokers:        strings.Split(brokers, ","),
-		KafkaTopic:          topic,
-		WorkerCount:         workerCount,
-		MaxRetries:          maxRetries,
-		MongoConnectTimeout: 10 * time.Second,
 		PGHost:              getEnv("MARKET_DATA_DB_HOST", "localhost"),
 		PGPort:              pgPort,
 		PGUser:              getEnv("MARKET_DATA_DB_USER", "postgres"),

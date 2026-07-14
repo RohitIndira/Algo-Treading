@@ -21,6 +21,29 @@ type ConfigEvent struct {
 	Version    uint64           `json:"version"`
 	Timestamp  int64            `json:"timestamp"` // UnixNano
 	Config     *StrategyPayload `json:"config"`    // nil for DELETED/PAUSED/RESUMED
+
+	// PositionHandling — how the caller wanted open positions handled
+	// on this lifecycle event. Only carries meaning on Paused / Deleted;
+	// empty on Created / Updated / Resumed. Set by user-config from the
+	// gRPC request's position_handling field.
+	//
+	// Values (mirrors api/proto/user_config PositionHandling enum):
+	//
+	//   ""                        legacy — no explicit handling, e.g.
+	//                             EOD auto-deactivate. trade-execution
+	//                             consumer runs the classic
+	//                             closeStrategyPositions cleanup.
+	//   "KEEP_POSITIONS_OPEN"     user chose to leave lots on the book.
+	//                             trade-execution consumer SKIPS position
+	//                             close so SLs keep protecting fills.
+	//   "SQUARE_OFF_AT_MARKET"    user-config already called
+	//                             trade-execution's force-exit endpoint
+	//                             synchronously (the exit orders are
+	//                             SUBMITTED at the broker). The consumer
+	//                             MUST SKIP closeStrategyPositions or it
+	//                             would immediately CancelOrder those
+	//                             same exits before they fill.
+	PositionHandling string `json:"position_handling,omitempty"`
 }
 
 // StrategyPayload is the full strategy configuration.

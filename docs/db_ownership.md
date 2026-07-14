@@ -74,6 +74,57 @@ for any of these before drop. Only lingering mention was `stockk_auth` as
 a placeholder comment in
 `services/trade-execution/internal/repository/grpc_credentials_repository.go:8,38`.
 
+## Table-level cleanup (DB.7, 2026-07-13)
+
+Per-table audit of each remaining DB — grep every table name across code +
+migrations, only drop where ZERO runtime SQL exists. Insurance dumps kept
+in session scratchpad for anything with data.
+
+**`trading_db`: 12 → 10 tables**
+
+- Dropped `manthan_position_events` — legacy from the deleted PositionProjector
+  (2026-07-10 refactor). Positions svc's `positions_db.position_events` is
+  the successor. Reproducible via migration
+  `services/rules-engine/migrations/011_drop_manthan_position_events.sql`.
+- Dropped `trade_signals` — Cat B trim ordered by migration 008 back on
+  2026-06-25; never applied locally until now.
+
+**`signals_db`: 29 → 4 tables + 1 matview → 0** (417 MB → 18 MB)
+
+- Dropped `data_load_log` — schema stub for an unfinished bhavcopy loader;
+  zero code writers/readers.
+- Dropped `mv_52w_high_low` MATVIEW — refresh cron never wired; 52W data
+  lives in Redis keys (`52w:token:<id>`), not the matview.
+- Dropped `breakout_events` (empty) — written by
+  `services/data-ingestion/internal/historical/ws_monitor.go:541` via
+  `InsertBreakoutEvent()`, only called from `cmd/historical-worker/`
+  which is NOT running in the current setup. User decided the historical
+  worker path isn't in use.
+- Dropped `daily_ohlcv` + 22 year partitions (1,243,969 rows, ~400 MB)
+  via CASCADE. Read by `GetAllPrevClose()` at `ws_monitor.go:101` for
+  stock-split detection — same historical-worker code path as above.
+  Schema-only pg_dump preserved in scratchpad for regeneration.
+  ⚠️ WARNING: if `historical-worker` is ever run against this DB, it
+  will crash on the missing tables until they're recreated (via the
+  schema dump) OR the code path is refactored to not need them.
+
+**`stockk_market`: 29 → 4 tables** (reclaimed ~260 MB → 10 MB)
+
+- Dropped 25 tables + 1 matview that were duplicates of `signals_db`
+  (`daily_ohlcv` + all 22 year partitions via CASCADE, `instruments`,
+  `breakout_events`, `mv_52w_high_low`). All had ZERO code writers targeting
+  `stockk_market` — data-ingestion writes into `signals_db`; nothing pointed
+  the ETL back at `stockk_market` after the refactor, so the copies froze
+  and drifted (same class of bug as the `stockk_trading` replica killed in
+  DB.1).
+- Kept: `algo_performance_daily` + `benchmark_daily` (queried by api-gateway
+  performance handler) + `manthan_signals` + `manthan_stocks` (kept per
+  user request for external-ETL compatibility).
+- Insurance dump of `instruments` (7810 rows) kept in scratchpad.
+
+**`execution_db` (8 tables), `positions_db` (2 tables), `order_status_db`
+(1 table): NO CHANGE** — every table has active writers and readers.
+
 ## Renames DONE and considered
 
 DB.3 (2026-07-13, this branch): renamed `trading_execution` → `execution_db`.
@@ -135,3 +186,9 @@ names.
   Local Postgres now has exactly 6 DBs — the canonical map. Insurance
   pg_dump of stockk_trading kept in session scratchpad; the other 11
   were empty (zero rows), no dump needed.
+- 2026-07-13: DB.7 — per-table audit across all 6 canonical DBs. Dropped
+  30 unused tables total (2 from trading_db, 2 from signals_db,
+  26 from stockk_market including 22 OHLCV partitions via CASCADE).
+  Every drop preceded by grep-verified zero runtime code refs +
+  insurance pg_dump. Local final state: trading_db=10, execution_db=8,
+  signals_db=28, positions_db=2, order_status_db=1, stockk_market=4.

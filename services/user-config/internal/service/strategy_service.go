@@ -10,6 +10,7 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/tradeexec"
 	goredis "github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
@@ -30,6 +31,13 @@ type StrategyService struct {
 	// that already carry ISIN and rejects symbol-only requests with a clear
 	// error so the caller can fall back to providing ISIN explicitly.
 	extRedis *goredis.Client
+
+	// tradeExec is the HTTP client to trade-execution's force-exit
+	// endpoints. Used when Deactivate/Delete callers request
+	// SQUARE_OFF_AT_MARKET. May be nil — in that case SQUARE_OFF_AT_MARKET
+	// requests are rejected with a clear error (KEEP_POSITIONS_OPEN still
+	// works). Set via SetTradeExecClient on boot.
+	tradeExec *tradeexec.Client
 }
 
 // NewStrategyService creates a new strategy service
@@ -42,6 +50,13 @@ func NewStrategyService(repo *repository.StrategyRepository, credsRepo repositor
 		kafkaEnabled: kafkaWriter != nil,
 		extRedis:     extRedis,
 	}
+}
+
+// SetTradeExecClient wires the trade-execution HTTP client used by the
+// SQUARE_OFF_AT_MARKET path of Deactivate + Delete. Optional — nil-safe
+// (callers requesting square-off without a client wired get a clean error).
+func (s *StrategyService) SetTradeExecClient(c *tradeexec.Client) {
+	s.tradeExec = c
 }
 
 // resolveISINFromSymbol looks up the ISIN for a symbol via the ext-Redis
@@ -336,14 +351,87 @@ func (s *StrategyService) UpdateStrategy(ctx context.Context, req *models.Update
 	return strategy, nil
 }
 
-// DeleteStrategy deletes a strategy
-func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UUID, userID string) error {
-	// Delete from database (includes Outbox insertion)
-	if err := s.repo.Delete(ctx, strategyID, userID); err != nil {
-		return fmt.Errorf("failed to delete strategy: %w", err)
+// ForceExitParams carries the square-off decision + broker auth needed
+// to place LIVE exit orders. Zero value == KEEP_POSITIONS_OPEN, which
+// is safe for every caller — the atomic square-off flow is opt-in.
+type ForceExitParams struct {
+	// SquareOff = true triggers the reverse-exit call to trade-execution
+	// BEFORE the state transition (deactivate / delete). If the exit call
+	// fails, the state transition is aborted so the UI can retry.
+	SquareOff bool
+
+	// BearerToken + AppID + Source are only consulted when SquareOff==true
+	// AND the strategy's TradingMode == LIVE. Paper square-off doesn't
+	// touch the broker so it doesn't need auth.
+	BearerToken string
+	AppID       string
+	Source      string
+}
+
+// positionHandlingWireValue folds ForceExitParams into the
+// position_handling string that we persist on the outbox payload +
+// propagate through Kafka. Consumers (trade-execution) branch on this
+// value — see events/config_event.go PositionHandling docstring.
+func positionHandlingWireValue(params ForceExitParams) string {
+	if params.SquareOff {
+		return "SQUARE_OFF_AT_MARKET"
+	}
+	return "KEEP_POSITIONS_OPEN"
+}
+
+// squareOffIfRequested performs the pre-transition force-exit call to
+// trade-execution when params.SquareOff is set. Returns the number of
+// exit orders placed (0 for KEEP_POSITIONS_OPEN), or a wrapped error.
+//
+// Both callers (DeactivateStrategy + DeleteStrategy) apply the same
+// pre-check, so factor it here to avoid drift.
+func (s *StrategyService) squareOffIfRequested(ctx context.Context, strategyID uuid.UUID, userID string, params ForceExitParams) (int, error) {
+	if !params.SquareOff {
+		return 0, nil
+	}
+	if s.tradeExec == nil {
+		return 0, fmt.Errorf("SQUARE_OFF_AT_MARKET not available: trade-execution client not wired on user-config")
 	}
 
-	return nil
+	// Need to know PAPER vs LIVE to pick the right endpoint.
+	strategy, err := s.repo.GetByID(ctx, strategyID, userID)
+	if err != nil {
+		return 0, fmt.Errorf("SQUARE_OFF_AT_MARKET: %w", err)
+	}
+	switch strategy.TradingMode {
+	case models.TradingModeLive:
+		return s.tradeExec.ForceExitStrategyLive(
+			ctx, strategyID.String(), userID,
+			params.BearerToken, params.AppID, params.Source,
+		)
+	case models.TradingModePaper:
+		return s.tradeExec.ForceExitStrategyPaper(ctx, strategyID.String(), userID)
+	default:
+		return 0, fmt.Errorf("SQUARE_OFF_AT_MARKET: unsupported trading_mode %q", strategy.TradingMode)
+	}
+}
+
+// DeleteStrategy deletes a strategy.
+//
+// When params.SquareOff is set, user-config first calls trade-execution
+// to place reverse exit orders for every ACTIVE position of this
+// strategy. Only if that succeeds is the strategy row deleted. The
+// returned positionsExited is the count of exit orders placed
+// (0 when KEEP_POSITIONS_OPEN or the strategy had nothing open).
+func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UUID, userID string, params ForceExitParams) (positionsExited int, _ error) {
+	positionsExited, err := s.squareOffIfRequested(ctx, strategyID, userID, params)
+	if err != nil {
+		return 0, err
+	}
+
+	// Delete from database (includes Outbox insertion). Stamp the
+	// position_handling on the outbox so downstream consumers know
+	// whether we already placed exit orders.
+	if err := s.repo.Delete(ctx, strategyID, userID, positionHandlingWireValue(params)); err != nil {
+		return positionsExited, fmt.Errorf("failed to delete strategy: %w", err)
+	}
+
+	return positionsExited, nil
 }
 
 // ActivateStrategy activates a strategy
@@ -362,20 +450,32 @@ func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.
 	return strategy, nil
 }
 
-// DeactivateStrategy deactivates a strategy
-func (s *StrategyService) DeactivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string) (*models.Strategy, error) {
-	// Deactivate in database
-	if err := s.repo.Deactivate(ctx, strategyID, userID); err != nil {
-		return nil, fmt.Errorf("failed to deactivate strategy: %w", err)
+// DeactivateStrategy pauses a strategy — flips active=false so
+// rules-engine stops generating new signals.
+//
+// When params.SquareOff is set, user-config first calls trade-execution
+// to place reverse exit orders for every ACTIVE position of this
+// strategy. Only if that succeeds is the deactivate applied. See
+// ForceExitParams for the auth requirements.
+func (s *StrategyService) DeactivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string, params ForceExitParams) (*models.Strategy, int, error) {
+	positionsExited, err := s.squareOffIfRequested(ctx, strategyID, userID, params)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Deactivate in database. Stamp position_handling on the outbox
+	// so trade-execution's consumer branches correctly.
+	if err := s.repo.Deactivate(ctx, strategyID, userID, positionHandlingWireValue(params)); err != nil {
+		return nil, positionsExited, fmt.Errorf("failed to deactivate strategy: %w", err)
 	}
 
 	// Get updated strategy
 	strategy, err := s.repo.GetByID(ctx, strategyID, userID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get strategy: %w", err)
+		return nil, positionsExited, fmt.Errorf("failed to get strategy: %w", err)
 	}
 
-	return strategy, nil
+	return strategy, positionsExited, nil
 }
 
 // GetStrategiesByIDs retrieves multiple strategies by their IDs
@@ -415,134 +515,6 @@ func (s *StrategyService) validateCreateRequest(ctx context.Context, req *models
 	}
 	if req.TradingMode != models.TradingModePaper && req.TradingMode != models.TradingModeLive {
 		return fmt.Errorf("invalid trading_mode: %s", req.TradingMode)
-	}
-
-	// --- HFT_BIDDING strategy: all runtime params live in HFTConfig,
-	// persisted as trade_configs.config_extra. No trade_config required
-	// from the caller — checked before the generic trade_config gate. ---
-	if req.StrategyType == models.StrategyTypeHFTBidding {
-		if len(req.StrategyName) < 3 || len(req.StrategyName) > 100 {
-			return fmt.Errorf("strategy_name must be between 3 and 100 characters")
-		}
-		if req.HFTConfig == nil {
-			return fmt.Errorf("hft_config is required for HFT_BIDDING strategy")
-		}
-		h := req.HFTConfig
-		if h.Symbol == "" {
-			return fmt.Errorf("hft_config.symbol is required")
-		}
-		// ISIN is optional in the API contract — caller may supply it
-		// directly (e.g. for non-NSE-EQ instruments not in our reverse
-		// map), or omit it in which case we resolve via the ext-Redis
-		// `symbol:{TICKER}` master-data lookup.
-		if h.ISIN == "" {
-			resolved, err := s.resolveISINFromSymbol(ctx, h.Symbol)
-			if err != nil {
-				return fmt.Errorf("hft_config.isin not supplied and could not be resolved from symbol: %w", err)
-			}
-			h.ISIN = resolved
-		}
-		if h.Exchange == "" {
-			h.Exchange = "NSE"
-		}
-		switch h.Side {
-		case "":
-			h.Side = "BOTH"
-		case "BUY", "SELL", "BOTH":
-			// ok
-		default:
-			return fmt.Errorf("hft_config.side must be BUY, SELL, or BOTH")
-		}
-		switch h.ProductType {
-		case "":
-			h.ProductType = "INTRADAY"
-		case "INTRADAY", "DELIVERY", "CASH":
-			// ok
-		default:
-			return fmt.Errorf("hft_config.product_type must be INTRADAY, DELIVERY, or CASH")
-		}
-		// tick_size is required from the caller — never default it here.
-		// Sub-Rs-100 NSE names tick at 0.01, larger caps tick at 0.05, and
-		// some series differ; a silent default rounds limit prices to the
-		// wrong grid and causes broker rejects or off-tick fills.
-		if h.TickSize <= 0 {
-			return fmt.Errorf("hft_config.tick_size is required (use 0.01 for sub-Rs-100 NSE names, 0.05 for larger caps)")
-		}
-		if h.Side == "BUY" || h.Side == "BOTH" {
-			if h.MaxBuyQty <= 0 {
-				return fmt.Errorf("hft_config.max_buy_qty must be > 0 for side %s", h.Side)
-			}
-			if h.SingleBuyQty < 1 || h.SingleBuyQty > h.MaxBuyQty {
-				return fmt.Errorf("hft_config.single_buy_qty must be between 1 and max_buy_qty")
-			}
-		}
-		if h.Side == "SELL" || h.Side == "BOTH" {
-			if h.MaxSellQty <= 0 {
-				return fmt.Errorf("hft_config.max_sell_qty must be > 0 for side %s", h.Side)
-			}
-			if h.SingleSellQty < 1 || h.SingleSellQty > h.MaxSellQty {
-				return fmt.Errorf("hft_config.single_sell_qty must be between 1 and max_sell_qty")
-			}
-		}
-		if h.BuyLimitPrice < 0 || h.SellLimitPrice < 0 {
-			return fmt.Errorf("hft_config limit prices must be non-negative")
-		}
-		// Trigger price gate (required per active side; direction is side-specific):
-		//   BUY  arms when LTP >= buy_trigger_price  (breakout buy)
-		//   SELL arms when LTP <= sell_trigger_price (breakdown sell)
-		// Sanity guards (same shape both sides — trigger sits between the
-		// arm price and the halt threshold so we never arm directly into a
-		// halt):
-		//   - BUY: trigger BELOW limit ceiling, otherwise we arm at a price
-		//     already above the halt threshold (ASK>limit) and never trade.
-		//   - SELL: trigger ABOVE limit floor, otherwise we arm at a price
-		//     already below the floor (BID<limit) and instantly halt.
-		if h.Side == "BUY" || h.Side == "BOTH" {
-			if h.BuyTriggerPrice <= 0 {
-				return fmt.Errorf("hft_config.buy_trigger_price must be > 0 for side %s", h.Side)
-			}
-			if h.BuyLimitPrice > 0 && h.BuyTriggerPrice >= h.BuyLimitPrice {
-				return fmt.Errorf("hft_config.buy_trigger_price (%.2f) must be < buy_limit_price (%.2f)", h.BuyTriggerPrice, h.BuyLimitPrice)
-			}
-		}
-		if h.Side == "SELL" || h.Side == "BOTH" {
-			if h.SellTriggerPrice <= 0 {
-				return fmt.Errorf("hft_config.sell_trigger_price must be > 0 for side %s", h.Side)
-			}
-			if h.SellLimitPrice > 0 && h.SellTriggerPrice <= h.SellLimitPrice {
-				return fmt.Errorf("hft_config.sell_trigger_price (%.2f) must be > sell_limit_price (%.2f)", h.SellTriggerPrice, h.SellLimitPrice)
-			}
-		}
-		// Mode mirrors the strategy's trading mode — the hft-engine gates
-		// on it to refuse a PAPER strategy on a LIVE engine and vice versa.
-		h.Mode = string(req.TradingMode)
-
-		// The hft-engine reads every runtime param from config_extra; the
-		// trade_configs typed columns are unused for HFT, but the row must
-		// still exist (FK + repo invariant). Fill harmless placeholders.
-		if req.TradeConfig == nil {
-			req.TradeConfig = &models.TradeConfig{}
-		}
-		req.TradeConfig.OrderType = "LIMIT"
-		req.TradeConfig.ProductType = h.ProductType
-		req.TradeConfig.Validity = "DAY"
-		req.TradeConfig.Exchange = h.Exchange
-		req.TradeConfig.OrderSide = "BUY"
-		req.TradeConfig.StopLossType = "FIXED"        // chk_stop_loss_type
-		req.TradeConfig.PositionSizingMode = "FIXED_QTY" // trade_configs_position_sizing_mode_check
-		if req.TradeConfig.Quantity <= 0 {
-			req.TradeConfig.Quantity = 1
-		}
-		if req.Conditions == nil {
-			req.Conditions = &models.StrategyCondition{}
-		}
-		if req.RiskLimits == nil {
-			req.RiskLimits = &models.RiskLimits{
-				EnableRiskChecks:    true,
-				EnableAutoSquareOff: false,
-			}
-		}
-		return nil
 	}
 
 	if req.TradeConfig == nil {
