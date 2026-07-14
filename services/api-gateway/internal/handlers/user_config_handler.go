@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -184,20 +186,44 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}
+// DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}.
+//
+// Body (JSON, optional):
+//
+//	{
+//	  "user_id":           "S4450",                    // may be omitted if userId header set
+//	  "position_handling": "SQUARE_OFF_AT_MARKET" | "KEEP_POSITIONS_OPEN"
+//	}
+//
+// Also honours the ?user_id= query param for callers that don't send
+// a body (pre-mockup DELETE flow stays working).
+//
+// When position_handling = SQUARE_OFF_AT_MARKET AND the strategy is
+// LIVE, the standard Indira auth headers (Authorization Bearer, appId,
+// source, userId) are required — trade-execution needs them to place
+// exit orders at the broker.
 func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
-	userID := r.URL.Query().Get("user_id")
 
+	userID, positionHandling, auth, ok := parseLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	// Query param fallback for the pre-mockup DELETE flow
 	if userID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
+		userID = r.URL.Query().Get("user_id")
+	}
+	if userID == "" {
+		respondWithError(w, http.StatusBadRequest, "user_id is required (in body, ?user_id= query, or userId header)")
 		return
 	}
 
 	req := &pb.DeleteStrategyRequest{
-		StrategyId: strategyID,
-		UserId:     userID,
+		StrategyId:       strategyID,
+		UserId:           userID,
+		PositionHandling: positionHandling,
+		IndiraAuth:       auth,
 	}
 
 	resp, err := h.client.DeleteStrategy(r.Context(), req)
@@ -213,8 +239,9 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 	}
 
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Strategy deleted successfully",
+		"success":          true,
+		"message":          "Strategy deleted successfully",
+		"positions_exited": resp.PositionsExited,
 	})
 }
 
@@ -349,32 +376,37 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 }
 
 // DeactivateStrategy handles POST /api/v1/strategies/{strategy_id}/deactivate
+// DeactivateStrategy handles POST /api/v1/strategies/{strategy_id}/deactivate.
+//
+// Body (JSON):
+//
+//	{
+//	  "user_id":           "S4450",                    // may be omitted if userId header set
+//	  "position_handling": "SQUARE_OFF_AT_MARKET" | "KEEP_POSITIONS_OPEN"
+//	}
+//
+// Matches the mockup's "Pause" modal: the user picks a radio between
+// KEEP_POSITIONS_OPEN and SQUARE_OFF_AT_MARKET, and this handler
+// surfaces the outcome (Algo Paused Successfully / Algo Pause Failed)
+// atomically.
 func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
 
-	var reqBody struct {
-		UserID string `json:"user_id"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+	userID, positionHandling, auth, ok := parseLifecycleRequest(w, r)
+	if !ok {
 		return
 	}
-
-	// Fall back to userId header if body is missing user_id
-	if reqBody.UserID == "" {
-		reqBody.UserID = r.Header.Get("userId")
-	}
-
-	if reqBody.UserID == "" {
+	if userID == "" {
 		respondWithError(w, http.StatusBadRequest, "user_id is required (in body or userId header)")
 		return
 	}
 
 	req := &pb.DeactivateStrategyRequest{
-		StrategyId: strategyID,
-		UserId:     reqBody.UserID,
+		StrategyId:       strategyID,
+		UserId:           userID,
+		PositionHandling: positionHandling,
+		IndiraAuth:       auth,
 	}
 
 	resp, err := h.client.DeactivateStrategy(r.Context(), req)
@@ -389,6 +421,70 @@ func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Re
 	}
 
 	respondWithJSON(w, http.StatusOK, resp)
+}
+
+// parseLifecycleRequest reads the shared inputs used by
+// Deactivate/Delete: user_id (body OR userId header), position_handling
+// (default KEEP_POSITIONS_OPEN), and Indira auth headers (only when
+// position_handling = SQUARE_OFF_AT_MARKET).
+//
+// On invalid input it writes an HTTP error response and returns
+// ok=false — the caller must simply `return`.
+//
+// The Indira auth block is only populated when SQUARE_OFF is requested;
+// KEEP_POSITIONS_OPEN paths don't need broker credentials and having
+// them upstream would just add auth failures for the plain pause flow.
+func parseLifecycleRequest(w http.ResponseWriter, r *http.Request) (userID string, ph pb.PositionHandling, auth *common.IndiraAuthContext, ok bool) {
+	// Body is optional — some callers hit DELETE without any body.
+	// Decode best-effort; ignore io.EOF and only reject actual malformed
+	// JSON so a bodyless DELETE is still accepted.
+	var body struct {
+		UserID           string `json:"user_id"`
+		PositionHandling string `json:"position_handling"`
+	}
+	if r.Body != http.NoBody {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+			return "", 0, nil, false
+		}
+	}
+
+	userID = body.UserID
+	if userID == "" {
+		userID = r.Header.Get("userId")
+	}
+
+	switch strings.ToUpper(body.PositionHandling) {
+	case "SQUARE_OFF_AT_MARKET":
+		ph = pb.PositionHandling_SQUARE_OFF_AT_MARKET
+	case "", "KEEP_POSITIONS_OPEN":
+		ph = pb.PositionHandling_KEEP_POSITIONS_OPEN
+	default:
+		respondWithError(w, http.StatusBadRequest,
+			"position_handling must be SQUARE_OFF_AT_MARKET or KEEP_POSITIONS_OPEN")
+		return "", 0, nil, false
+	}
+
+	if ph == pb.PositionHandling_SQUARE_OFF_AT_MARKET {
+		bearer := r.Header.Get("Authorization")
+		bearer = strings.TrimPrefix(bearer, "Bearer ")
+		appID := r.Header.Get("appId")
+		source := r.Header.Get("source")
+		if bearer == "" || appID == "" || source == "" {
+			respondWithError(w, http.StatusUnauthorized,
+				"SQUARE_OFF_AT_MARKET requires Authorization Bearer, appId, and source headers")
+			return "", 0, nil, false
+		}
+		auth = &common.IndiraAuthContext{
+			UserId:      userID,
+			AppId:       appID,
+			Source:      source,
+			BearerToken: bearer,
+		}
+	}
+
+	return userID, ph, auth, true
 }
 
 // HealthCheck handles GET /api/v1/health

@@ -84,6 +84,28 @@ enum PositionSizingMode {
   EMA_ALLOCATION = 2;   // EMA score-based allocation (Manthan)
 }
 
+// PositionHandling — how open positions are treated when a running
+// strategy is paused (Deactivate) or stopped (Delete). Semantics:
+//
+//   KEEP_POSITIONS_OPEN   — leave lots on the book; the algo stops
+//                           placing new signals but existing SLs
+//                           continue to protect the positions.
+//                           User manages further exits manually.
+//   SQUARE_OFF_AT_MARKET  — place reverse market orders to exit every
+//                           ACTIVE lot for this strategy BEFORE the
+//                           lifecycle transition. user-config gates
+//                           the state change on force-exit success —
+//                           if the exit call fails the strategy stays
+//                           running so the UI can surface the error.
+//
+// UNSPECIFIED is treated as KEEP_POSITIONS_OPEN (backwards compat with
+// existing callers that didn't set the field).
+enum PositionHandling {
+  POSITION_HANDLING_UNSPECIFIED = 0;
+  KEEP_POSITIONS_OPEN = 1;
+  SQUARE_OFF_AT_MARKET = 2;
+}
+
 // Strategy condition filters
 message StrategyConditions {
   // Match ALL news events (overrides all other conditions)
@@ -318,12 +340,28 @@ message UpdateStrategyResponse {
 message DeleteStrategyRequest {
   string strategy_id = 1;
   string user_id = 2;  // For authorization
+
+  // Position handling on stop. When SQUARE_OFF_AT_MARKET, user-config
+  // calls trade-execution's /ws/live-orders/force-exit-strategy (or the
+  // /ws/paper-trades/... twin, per strategy.trading_mode) BEFORE the row
+  // is deleted, and gates the delete on that call succeeding.
+  PositionHandling position_handling = 3;
+
+  // Required when position_handling = SQUARE_OFF_AT_MARKET AND the
+  // strategy's trading_mode = LIVE — the broker exit orders are placed
+  // with this JWT. Ignored for PAPER strategies or KEEP_POSITIONS_OPEN.
+  common.IndiraAuthContext indira_auth = 4;
 }
 
 message DeleteStrategyResponse {
   bool success = 1;
   string message = 2;
   common.Error error = 3;
+
+  // Count of ACTIVE lots that got a reverse market exit order placed.
+  // Zero when position_handling = KEEP_POSITIONS_OPEN or the strategy
+  // had no open positions.
+  int32 positions_exited = 4;
 }
 
 // Get strategy request
@@ -368,12 +406,27 @@ message ActivateStrategyResponse {
 message DeactivateStrategyRequest {
   string strategy_id = 1;
   string user_id = 2;  // For authorization
+
+  // Position handling on pause. When SQUARE_OFF_AT_MARKET, user-config
+  // calls trade-execution's /ws/live-orders/force-exit-strategy (or the
+  // paper twin) BEFORE flipping active=false, and gates the state change
+  // on that call succeeding.
+  PositionHandling position_handling = 3;
+
+  // Required when position_handling = SQUARE_OFF_AT_MARKET AND the
+  // strategy's trading_mode = LIVE. Same shape as CreateStrategyRequest.
+  common.IndiraAuthContext indira_auth = 4;
 }
 
 message DeactivateStrategyResponse {
   bool success = 1;
   Strategy strategy = 2;
   common.Error error = 3;
+
+  // Count of ACTIVE lots for which a reverse market exit order was
+  // placed. Zero on KEEP_POSITIONS_OPEN or when the strategy had no
+  // open positions.
+  int32 positions_exited = 4;
 }
 
 // Get strategies by IDs (for internal services)

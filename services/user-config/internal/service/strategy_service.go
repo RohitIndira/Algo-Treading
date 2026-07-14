@@ -10,6 +10,7 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/tradeexec"
 	goredis "github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
@@ -30,6 +31,13 @@ type StrategyService struct {
 	// that already carry ISIN and rejects symbol-only requests with a clear
 	// error so the caller can fall back to providing ISIN explicitly.
 	extRedis *goredis.Client
+
+	// tradeExec is the HTTP client to trade-execution's force-exit
+	// endpoints. Used when Deactivate/Delete callers request
+	// SQUARE_OFF_AT_MARKET. May be nil — in that case SQUARE_OFF_AT_MARKET
+	// requests are rejected with a clear error (KEEP_POSITIONS_OPEN still
+	// works). Set via SetTradeExecClient on boot.
+	tradeExec *tradeexec.Client
 }
 
 // NewStrategyService creates a new strategy service
@@ -42,6 +50,13 @@ func NewStrategyService(repo *repository.StrategyRepository, credsRepo repositor
 		kafkaEnabled: kafkaWriter != nil,
 		extRedis:     extRedis,
 	}
+}
+
+// SetTradeExecClient wires the trade-execution HTTP client used by the
+// SQUARE_OFF_AT_MARKET path of Deactivate + Delete. Optional — nil-safe
+// (callers requesting square-off without a client wired get a clean error).
+func (s *StrategyService) SetTradeExecClient(c *tradeexec.Client) {
+	s.tradeExec = c
 }
 
 // resolveISINFromSymbol looks up the ISIN for a symbol via the ext-Redis
@@ -336,14 +351,74 @@ func (s *StrategyService) UpdateStrategy(ctx context.Context, req *models.Update
 	return strategy, nil
 }
 
-// DeleteStrategy deletes a strategy
-func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UUID, userID string) error {
-	// Delete from database (includes Outbox insertion)
-	if err := s.repo.Delete(ctx, strategyID, userID); err != nil {
-		return fmt.Errorf("failed to delete strategy: %w", err)
+// ForceExitParams carries the square-off decision + broker auth needed
+// to place LIVE exit orders. Zero value == KEEP_POSITIONS_OPEN, which
+// is safe for every caller — the atomic square-off flow is opt-in.
+type ForceExitParams struct {
+	// SquareOff = true triggers the reverse-exit call to trade-execution
+	// BEFORE the state transition (deactivate / delete). If the exit call
+	// fails, the state transition is aborted so the UI can retry.
+	SquareOff bool
+
+	// BearerToken + AppID + Source are only consulted when SquareOff==true
+	// AND the strategy's TradingMode == LIVE. Paper square-off doesn't
+	// touch the broker so it doesn't need auth.
+	BearerToken string
+	AppID       string
+	Source      string
+}
+
+// squareOffIfRequested performs the pre-transition force-exit call to
+// trade-execution when params.SquareOff is set. Returns the number of
+// exit orders placed (0 for KEEP_POSITIONS_OPEN), or a wrapped error.
+//
+// Both callers (DeactivateStrategy + DeleteStrategy) apply the same
+// pre-check, so factor it here to avoid drift.
+func (s *StrategyService) squareOffIfRequested(ctx context.Context, strategyID uuid.UUID, userID string, params ForceExitParams) (int, error) {
+	if !params.SquareOff {
+		return 0, nil
+	}
+	if s.tradeExec == nil {
+		return 0, fmt.Errorf("SQUARE_OFF_AT_MARKET not available: trade-execution client not wired on user-config")
 	}
 
-	return nil
+	// Need to know PAPER vs LIVE to pick the right endpoint.
+	strategy, err := s.repo.GetByID(ctx, strategyID, userID)
+	if err != nil {
+		return 0, fmt.Errorf("SQUARE_OFF_AT_MARKET: %w", err)
+	}
+	switch strategy.TradingMode {
+	case models.TradingModeLive:
+		return s.tradeExec.ForceExitStrategyLive(
+			ctx, strategyID.String(), userID,
+			params.BearerToken, params.AppID, params.Source,
+		)
+	case models.TradingModePaper:
+		return s.tradeExec.ForceExitStrategyPaper(ctx, strategyID.String(), userID)
+	default:
+		return 0, fmt.Errorf("SQUARE_OFF_AT_MARKET: unsupported trading_mode %q", strategy.TradingMode)
+	}
+}
+
+// DeleteStrategy deletes a strategy.
+//
+// When params.SquareOff is set, user-config first calls trade-execution
+// to place reverse exit orders for every ACTIVE position of this
+// strategy. Only if that succeeds is the strategy row deleted. The
+// returned positionsExited is the count of exit orders placed
+// (0 when KEEP_POSITIONS_OPEN or the strategy had nothing open).
+func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UUID, userID string, params ForceExitParams) (positionsExited int, _ error) {
+	positionsExited, err := s.squareOffIfRequested(ctx, strategyID, userID, params)
+	if err != nil {
+		return 0, err
+	}
+
+	// Delete from database (includes Outbox insertion)
+	if err := s.repo.Delete(ctx, strategyID, userID); err != nil {
+		return positionsExited, fmt.Errorf("failed to delete strategy: %w", err)
+	}
+
+	return positionsExited, nil
 }
 
 // ActivateStrategy activates a strategy
@@ -362,20 +437,31 @@ func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.
 	return strategy, nil
 }
 
-// DeactivateStrategy deactivates a strategy
-func (s *StrategyService) DeactivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string) (*models.Strategy, error) {
+// DeactivateStrategy pauses a strategy — flips active=false so
+// rules-engine stops generating new signals.
+//
+// When params.SquareOff is set, user-config first calls trade-execution
+// to place reverse exit orders for every ACTIVE position of this
+// strategy. Only if that succeeds is the deactivate applied. See
+// ForceExitParams for the auth requirements.
+func (s *StrategyService) DeactivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string, params ForceExitParams) (*models.Strategy, int, error) {
+	positionsExited, err := s.squareOffIfRequested(ctx, strategyID, userID, params)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	// Deactivate in database
 	if err := s.repo.Deactivate(ctx, strategyID, userID); err != nil {
-		return nil, fmt.Errorf("failed to deactivate strategy: %w", err)
+		return nil, positionsExited, fmt.Errorf("failed to deactivate strategy: %w", err)
 	}
 
 	// Get updated strategy
 	strategy, err := s.repo.GetByID(ctx, strategyID, userID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get strategy: %w", err)
+		return nil, positionsExited, fmt.Errorf("failed to get strategy: %w", err)
 	}
 
-	return strategy, nil
+	return strategy, positionsExited, nil
 }
 
 // GetStrategiesByIDs retrieves multiple strategies by their IDs

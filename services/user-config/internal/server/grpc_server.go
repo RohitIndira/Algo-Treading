@@ -128,7 +128,11 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 	}, nil
 }
 
-// DeleteStrategy deletes a strategy
+// DeleteStrategy deletes a strategy. When
+// req.position_handling = SQUARE_OFF_AT_MARKET, user-config first calls
+// trade-execution to place reverse market/aggressive-limit exit orders
+// for every ACTIVE position of the strategy; the delete is gated on
+// that succeeding so a failing exit surfaces to the UI atomically.
 func (s *UserConfigServer) DeleteStrategy(ctx context.Context, req *pb.DeleteStrategyRequest) (*pb.DeleteStrategyResponse, error) {
 	strategyID, err := uuid.Parse(req.StrategyId)
 	if err != nil {
@@ -141,7 +145,8 @@ func (s *UserConfigServer) DeleteStrategy(ctx context.Context, req *pb.DeleteStr
 		}, nil
 	}
 
-	err = s.service.DeleteStrategy(ctx, strategyID, req.UserId)
+	positionsExited, err := s.service.DeleteStrategy(ctx, strategyID, req.UserId,
+		forceExitParamsFromProto(req.PositionHandling, req.IndiraAuth))
 	if err != nil {
 		return &pb.DeleteStrategyResponse{
 			Success: false,
@@ -150,12 +155,14 @@ func (s *UserConfigServer) DeleteStrategy(ctx context.Context, req *pb.DeleteStr
 				Code:    "DELETION_FAILED",
 				Message: err.Error(),
 			},
+			PositionsExited: int32(positionsExited),
 		}, nil
 	}
 
 	return &pb.DeleteStrategyResponse{
-		Success: true,
-		Message: "Strategy deleted successfully",
+		Success:         true,
+		Message:         "Strategy deleted successfully",
+		PositionsExited: int32(positionsExited),
 	}, nil
 }
 
@@ -269,7 +276,12 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 	}, nil
 }
 
-// DeactivateStrategy deactivates a strategy
+// DeactivateStrategy pauses a strategy. When
+// req.position_handling = SQUARE_OFF_AT_MARKET, user-config first calls
+// trade-execution to place reverse exit orders for every ACTIVE position
+// of the strategy; the deactivate is gated on that succeeding so a
+// failing exit surfaces to the UI atomically (matches the mockup's
+// "Algo Pause Failed" flow).
 func (s *UserConfigServer) DeactivateStrategy(ctx context.Context, req *pb.DeactivateStrategyRequest) (*pb.DeactivateStrategyResponse, error) {
 	strategyID, err := uuid.Parse(req.StrategyId)
 	if err != nil {
@@ -282,7 +294,8 @@ func (s *UserConfigServer) DeactivateStrategy(ctx context.Context, req *pb.Deact
 		}, nil
 	}
 
-	strategy, err := s.service.DeactivateStrategy(ctx, strategyID, req.UserId)
+	strategy, positionsExited, err := s.service.DeactivateStrategy(ctx, strategyID, req.UserId,
+		forceExitParamsFromProto(req.PositionHandling, req.IndiraAuth))
 	if err != nil {
 		return &pb.DeactivateStrategyResponse{
 			Success: false,
@@ -290,13 +303,31 @@ func (s *UserConfigServer) DeactivateStrategy(ctx context.Context, req *pb.Deact
 				Code:    "DEACTIVATION_FAILED",
 				Message: err.Error(),
 			},
+			PositionsExited: int32(positionsExited),
 		}, nil
 	}
 
 	return &pb.DeactivateStrategyResponse{
-		Success:  true,
-		Strategy: modelStrategyToProto(strategy),
+		Success:         true,
+		Strategy:        modelStrategyToProto(strategy),
+		PositionsExited: int32(positionsExited),
 	}, nil
+}
+
+// forceExitParamsFromProto folds the position_handling enum + optional
+// Indira auth block from any lifecycle request into the internal
+// ForceExitParams shape. UNSPECIFIED + KEEP_POSITIONS_OPEN both map to
+// SquareOff=false so no exit call is made.
+func forceExitParamsFromProto(ph pb.PositionHandling, auth *common.IndiraAuthContext) service.ForceExitParams {
+	p := service.ForceExitParams{
+		SquareOff: ph == pb.PositionHandling_SQUARE_OFF_AT_MARKET,
+	}
+	if p.SquareOff && auth != nil {
+		p.BearerToken = auth.BearerToken
+		p.AppID = auth.AppId
+		p.Source = auth.Source
+	}
+	return p
 }
 
 // GetStrategiesByIDs retrieves multiple strategies by their IDs
