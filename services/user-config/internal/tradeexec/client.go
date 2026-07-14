@@ -101,7 +101,7 @@ func (c *Client) post(ctx context.Context, path string, body map[string]string) 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("tradeexec: %s POST %s: %w", req.Method, path, err)
+		return 0, fmt.Errorf("tradeexec: POST %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 
