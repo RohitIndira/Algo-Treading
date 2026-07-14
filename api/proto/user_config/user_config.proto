@@ -282,6 +282,12 @@ message Strategy {
 
   reserved 14;
   reserved "hft_config";
+
+  // Set when the user hits STOP (terminal transition). Row keeps
+  // appearing in reads so the client can render status=STOPPED;
+  // resume/pause on a strategy with this set is rejected at
+  // user-config. See migrations/015_add_stopped_at.sql.
+  common.Timestamp stopped_at = 15;
 }
 
 message CreateStrategyRequest {

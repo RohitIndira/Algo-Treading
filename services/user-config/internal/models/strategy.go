@@ -37,7 +37,11 @@ type Strategy struct {
 	CreatedAt    time.Time   `db:"created_at" json:"created_at"`
 	UpdatedAt    time.Time   `db:"updated_at" json:"updated_at"`
 	DeletedAt    *time.Time  `db:"deleted_at" json:"deleted_at,omitempty"`
-	
+	// StoppedAt is set when the user hits STOP (terminal transition).
+	// Row stays visible in reads with status=STOPPED; RESUME rejects
+	// any row where this is non-null. See migrations/015_add_stopped_at.sql.
+	StoppedAt    *time.Time  `db:"stopped_at" json:"stopped_at,omitempty"`
+
 	// These are now separate tables, so we use pointers and `db:"-"` or handle in repo
 	Conditions   *StrategyCondition `db:"-" json:"conditions,omitempty"`
 	TradeConfig  *TradeConfig       `db:"-" json:"trade_config,omitempty"`

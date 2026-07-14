@@ -64,6 +64,10 @@ type StrategyMetaRow struct {
 	MaxPositions   int
 	PerStockAmount float64
 	CreatedAt      time.Time
+	// StoppedAt is set when the user hits STOP (terminal transition).
+	// Non-nil → derive Status=STOPPED regardless of Active. See
+	// aggregator_details.go statusFromMeta.
+	StoppedAt      *time.Time
 }
 
 // Store is the DB-access surface for Live Algos endpoints. Reads from
@@ -134,7 +138,8 @@ func (s *PostgresStore) StrategyMeta(ctx context.Context, strategyID, userID str
 			COALESCE(tc.total_capital, 0),
 			COALESCE(tc.max_positions, 0),
 			COALESCE(tc.per_stock_amount, 0),
-			s.created_at
+			s.created_at,
+			s.stopped_at
 		FROM public.strategies s
 		LEFT JOIN public.trade_configs tc ON tc.strategy_id = s.strategy_id
 		WHERE s.strategy_id::text = $1
@@ -144,12 +149,17 @@ func (s *PostgresStore) StrategyMeta(ctx context.Context, strategyID, userID str
 	row := s.positionsDB.QueryRowContext(ctx, q, strategyID, userID)
 
 	var r StrategyMetaRow
+	var stoppedAt sql.NullTime
 	err := row.Scan(
 		&r.StrategyID, &r.UserID, &r.StrategyName, &r.StrategyType,
 		&r.TradingMode, &r.Active,
 		&r.TotalCapital, &r.MaxPositions, &r.PerStockAmount,
 		&r.CreatedAt,
+		&stoppedAt,
 	)
+	if stoppedAt.Valid {
+		r.StoppedAt = &stoppedAt.Time
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrStrategyNotFound
 	}

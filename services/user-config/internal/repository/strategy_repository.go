@@ -456,11 +456,15 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 	}
 	defer tx.Rollback()
 
-	// Soft delete: Update deleted_at and set active = false
+	// STOP is a terminal transition — set stopped_at (NOT deleted_at)
+	// so the row keeps showing in reads with status=STOPPED. Reject any
+	// row that's ALREADY been stopped (idempotency + safety) and any
+	// row that's been soft-deleted (compliance / admin escape hatch).
+	// See migrations/015_add_stopped_at.sql for the design rationale.
 	query := `
 		UPDATE strategies
-		SET deleted_at = CURRENT_TIMESTAMP, active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
-		WHERE strategy_id = $1 AND user_id = $2
+		SET stopped_at = CURRENT_TIMESTAMP, active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
+		WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL AND stopped_at IS NULL
 		RETURNING strategy_id, version`
 
 	var deletedID uuid.UUID
@@ -468,9 +472,9 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&deletedID, &currentVersion)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return fmt.Errorf("strategy not found")
+			return fmt.Errorf("strategy not found or already stopped")
 		}
-		return fmt.Errorf("failed to delete strategy: %w", err)
+		return fmt.Errorf("failed to stop strategy: %w", err)
 	}
 
 	// Insert into Execution Outbox (Deactivation/Deletion event)
@@ -504,11 +508,19 @@ func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID,
 	}
 	defer tx.Rollback()
 
-	query := `UPDATE strategies SET active = true, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
+	// RESUME is only valid for a PAUSED (non-stopped, non-deleted) row.
+	// stopped_at IS NULL guard makes STOP terminal — a STOPPED strategy
+	// cannot be resumed (user redeploys instead). This surfaces as
+	// "failed to activate strategy: sql: no rows in result set" from
+	// the caller's perspective; service layer translates.
+	query := `UPDATE strategies SET active = true, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL AND stopped_at IS NULL RETURNING strategy_id, version`
 	var updatedID uuid.UUID
 	var currentVersion int32
 	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("strategy not found or already stopped (cannot resume a stopped strategy)")
+		}
 		return fmt.Errorf("failed to activate strategy: %w", err)
 	}
 
@@ -542,11 +554,17 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 	}
 	defer tx.Rollback()
 
-	query := `UPDATE strategies SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
+	// PAUSE is only valid for a non-stopped, non-deleted row. Refusing
+	// to pause a STOPPED row keeps the version chain clean and prevents
+	// an unnecessary outbox event downstream.
+	query := `UPDATE strategies SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL AND stopped_at IS NULL RETURNING strategy_id, version`
 	var updatedID uuid.UUID
 	var currentVersion int32
 	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("strategy not found or already stopped (cannot pause a stopped strategy)")
+		}
 		return fmt.Errorf("failed to deactivate strategy: %w", err)
 	}
 

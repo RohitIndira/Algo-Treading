@@ -17,15 +17,14 @@ import (
 //     doesn't appear on this screen (no "unknown algo" placeholder).
 //     Same-safe fallback: extend the catalog when we add strategy types.
 //
-//   - Strategy status is derived from active + trading_mode:
+//   - Strategy status is derived from stopped_at + active + trading_mode:
+//       stopped_at != nil                          → STOPPED (terminal)
 //       active=true, trading_mode is a LIVE mode   → LIVE
 //       active=true, trading_mode is PAPER         → PAUSED (paper is
 //                                                    "training-wheels"
 //                                                    for the strategy)
-//       active=false                                → STOPPED
-//     Notes for the future: user-config may add an explicit `paused`
-//     flag later; this function's contract stays the same, only the
-//     switch changes.
+//       active=false                                → PAUSED (user hit
+//                                                    Pause on the modal)
 //
 //   - Phase 1: all P&L numbers return with pnlPending=true and
 //     amount=0/percent=0. Frontend renders a spinner over that region.
@@ -124,15 +123,19 @@ func algoIDFromStrategyType(t pb.StrategyType) string {
 //
 // Mapping (matches the Pause/Stop mockup):
 //
-//	active=true,  trading_mode=LIVE   → LIVE
-//	active=true,  trading_mode=PAPER  → PAUSED  (paper is "training-wheels")
-//	active=false                       → PAUSED  (user hit Pause on the modal)
+//	stopped_at != nil                  → STOPPED (terminal; user
+//	                                              redeploys to run again)
+//	active=true,  trading_mode=LIVE    → LIVE
+//	active=true,  trading_mode=PAPER   → PAUSED  (paper is "training-wheels")
+//	active=false                        → PAUSED  (user hit Pause on the modal)
 //
-// STOPPED is NEVER returned here — all read queries in
-// user-config/internal/repository filter `deleted_at IS NULL`, so a
-// Stop (soft-delete) makes the row invisible to this endpoint entirely.
-// If a strategy_id isn't in the response, treat as STOPPED at the UI layer.
+// STOP is now a status transition, not a soft-delete — the row keeps
+// showing in the list with status=STOPPED so the user can see history.
+// See services/user-config/migrations/015_add_stopped_at.sql.
 func statusFrom(s *pb.Strategy) string {
+	if s.StoppedAt != nil {
+		return StatusStopped
+	}
 	if !s.Active {
 		return StatusPaused
 	}

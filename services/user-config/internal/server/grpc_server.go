@@ -814,6 +814,13 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 		UpdatedAt:    &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
 	}
 
+	// stopped_at is nullable — only set on the proto if the row has
+	// been STOPPED, so the client reads absent-vs-present as the
+	// stop-vs-not-stopped signal.
+	if model.StoppedAt != nil {
+		strategy.StoppedAt = &common.Timestamp{Seconds: model.StoppedAt.Unix()}
+	}
+
 	if model.Conditions != nil {
 		strategy.Conditions = modelConditionsToProto(model.Conditions)
 	}
