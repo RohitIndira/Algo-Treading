@@ -148,19 +148,19 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 
 	var reqDTO dto.UpdateStrategyRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "Invalid request body: "+err.Error())
 		return
 	}
 
 	userIdHeader := r.Header.Get("userId")
 	if userIdHeader == "" {
-		respondWithError(w, http.StatusUnauthorized, "userId header is required")
+		respondIndiraError(w, http.StatusUnauthorized, "E_AUTH", "userId header is required")
 		return
 	}
 
 	// IDOR Protection
 	if reqDTO.UserID != "" && reqDTO.UserID != userIdHeader {
-		respondWithError(w, http.StatusForbidden, "User ID mismatch between header and body")
+		respondIndiraError(w, http.StatusForbidden, "E_FORBIDDEN", "User ID mismatch between header and body")
 		return
 	}
 	reqDTO.UserID = userIdHeader
@@ -171,19 +171,16 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 
 	resp, err := h.client.UpdateStrategy(r.Context(), pbReq)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to update strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to update strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success":  true,
-		"strategy": slimStrategy(resp.Strategy),
-	})
+	respondIndiraOK(w, slimStrategy(resp.Strategy))
 }
 
 // DeleteStrategy handles DELETE /api/v1/strategies/{strategy_id}.
@@ -215,7 +212,8 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 		userID = r.URL.Query().Get("user_id")
 	}
 	if userID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id is required (in body, ?user_id= query, or userId header)")
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST",
+			"user_id is required (in body, ?user_id= query, or userId header)")
 		return
 	}
 
@@ -228,18 +226,17 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 
 	resp, err := h.client.DeleteStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to delete strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to delete strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
 		statusCode := mapErrorCodeToHTTPStatus(resp.Error.Code)
-		respondWithError(w, statusCode, resp.Error.Message)
+		respondIndiraError(w, statusCode, resp.Error.Code, resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success":          true,
+	respondIndiraOK(w, map[string]interface{}{
 		"message":          "Strategy deleted successfully",
 		"positions_exited": resp.PositionsExited,
 	})
@@ -252,7 +249,7 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 	userID := r.URL.Query().Get("user_id")
 
 	if userID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id query parameter is required")
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "user_id query parameter is required")
 		return
 	}
 
@@ -263,20 +260,17 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 
 	resp, err := h.client.GetStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to get strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to get strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
 		statusCode := mapErrorCodeToHTTPStatus(resp.Error.Code)
-		respondWithError(w, statusCode, resp.Error.Message)
+		respondIndiraError(w, statusCode, resp.Error.Code, resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success":  true,
-		"strategy": slimStrategy(resp.Strategy),
-	})
+	respondIndiraOK(w, slimStrategy(resp.Strategy))
 }
 
 // ListUserStrategies handles GET /api/v1/users/{user_id}/strategies
@@ -316,34 +310,38 @@ func (h *UserConfigHandler) ListUserStrategies(w http.ResponseWriter, r *http.Re
 
 	resp, err := h.client.ListUserStrategies(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to list strategies: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to list strategies: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success":    true,
+	respondIndiraOK(w, map[string]interface{}{
 		"strategies": slimStrategies(resp.Strategies),
 		"pagination": slimPagination(resp.Pagination),
 	})
 }
 
-// ActivateStrategy handles POST /api/v1/strategies/{strategy_id}/activate
+// ActivateStrategy handles POST /api/v1/strategies/{strategy_id}/activate.
+// Matches the mockup's "Resume" flow — flips active=true. No position
+// handling here (positions were already whatever they were during pause).
 func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
 
+	// Body is optional — Resume takes no parameters beyond identity.
 	var reqBody struct {
 		UserID string `json:"user_id"`
 	}
-
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
-		return
+	if r.Body != http.NoBody {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&reqBody); err != nil && !errors.Is(err, io.EOF) {
+			respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "Invalid request body: "+err.Error())
+			return
+		}
 	}
 
 	// Fall back to userId header if body is missing user_id
@@ -352,7 +350,7 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 	}
 
 	if reqBody.UserID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id is required (in body or userId header)")
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "user_id is required (in body or userId header)")
 		return
 	}
 
@@ -363,16 +361,19 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 
 	resp, err := h.client.ActivateStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to activate strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to activate strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondIndiraOK(w, map[string]interface{}{
+		"message":  "Strategy resumed successfully",
+		"strategy": slimStrategy(resp.Strategy),
+	})
 }
 
 // DeactivateStrategy handles POST /api/v1/strategies/{strategy_id}/deactivate
@@ -398,7 +399,7 @@ func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if userID == "" {
-		respondWithError(w, http.StatusBadRequest, "user_id is required (in body or userId header)")
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "user_id is required (in body or userId header)")
 		return
 	}
 
@@ -411,16 +412,20 @@ func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Re
 
 	resp, err := h.client.DeactivateStrategy(r.Context(), req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to deactivate strategy: "+err.Error())
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "Failed to deactivate strategy: "+err.Error())
 		return
 	}
 
 	if !resp.Success {
-		respondWithError(w, http.StatusBadRequest, resp.Error.Message)
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, resp)
+	respondIndiraOK(w, map[string]interface{}{
+		"message":          "Strategy paused successfully",
+		"strategy":         slimStrategy(resp.Strategy),
+		"positions_exited": resp.PositionsExited,
+	})
 }
 
 // parseLifecycleRequest reads the shared inputs used by
