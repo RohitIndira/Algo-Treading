@@ -126,9 +126,17 @@ func main() {
 	// positionsDB, ordersDB + their DB names hoisted so downstream setup
 	// (live-algos store in DB.1, portfolio token lookup in PF.D) can reuse
 	// the same pools instead of dialling a second time.
+	//
+	// positionsSSotDB is the CQRS SSOT for lifecycle P&L (positions_db,
+	// written by services/positions). Distinct from positionsDB (trading_db)
+	// which still holds strategies + trade_configs + legacy manthan_positions.
+	// signalsDB hoisted so the live-algos store can enrich per-symbol
+	// isin/industry/mcap from signals_db.manthan_signals.
 	var positionsDB *sql.DB
+	var positionsSSotDB *sql.DB
 	var ordersDB *sql.DB
-	var positionsDBName, ordersDBName string
+	var signalsDB *sql.DB
+	var positionsDBName, ordersDBName, positionsSSotDBName string
 	{
 		pgHost := envOr("POSTGRES_HOST", "localhost")
 		pgPort := envOr("POSTGRES_PORT", "5432")
@@ -137,6 +145,7 @@ func main() {
 		pgSSL := envOr("POSTGRES_SSLMODE", "disable")
 		signalsDBName := envOr("MANTHAN_SIGNALS_DB", "signals_db")
 		positionsDBName = envOr("MANTHAN_POSITIONS_DB", "trading_db")
+		positionsSSotDBName = envOr("POSITIONS_DB", "positions_db")
 		ordersDBName = envOr("MANTHAN_ORDERS_DB", "execution_db")
 		perfDBName := envOr("MANTHAN_PERF_DB", "stockk_market")
 
@@ -158,11 +167,11 @@ func main() {
 			return db, nil
 		}
 
-		signalsDB, err := openPG(signalsDBName)
-		if err != nil {
+		if db, err := openPG(signalsDBName); err != nil {
 			log.Printf("Warning: Manthan signals DB (%s) open/ping failed: %v", signalsDBName, err)
 		} else {
 			log.Printf("Manthan signals DB connected (%s)", signalsDBName)
+			signalsDB = db
 			defer signalsDB.Close()
 		}
 
@@ -172,6 +181,20 @@ func main() {
 			log.Printf("Manthan positions DB connected (%s)", positionsDBName)
 			positionsDB = db
 			defer positionsDB.Close()
+		}
+
+		// Positions SSOT (positions_db, written by services/positions). This
+		// is what live-algos Positions() reads — the legacy manthan_positions
+		// path had unreliable realized_pnl. Nil-safe: on connect failure the
+		// live-algos details tier returns an empty position list rather than
+		// falling back to the stale table (that regression is the whole point
+		// of switching).
+		if db, err := openPG(positionsSSotDBName); err != nil {
+			log.Printf("Warning: Positions SSOT DB (%s) open/ping failed: %v", positionsSSotDBName, err)
+		} else {
+			log.Printf("Positions SSOT DB connected (%s)", positionsSSotDBName)
+			positionsSSotDB = db
+			defer positionsSSotDB.Close()
 		}
 
 		if db, err := openPG(ordersDBName); err != nil {
@@ -280,19 +303,23 @@ func main() {
 	// Both are nil-safe — if the DB pool or Redis client fail to init,
 	// the router skips registering the details routes and the LIST
 	// endpoint keeps working normally.
-	// livealgos store reads from TWO existing DB pools:
-	//   positionsDB  (trading_db)         — manthan_positions, strategies, trade_configs
-	//   ordersDB     (execution_db)  — manthan_orders
-	// Previously this opened a THIRD `stockk_trading` DB which was a
-	// silent replica that drifted from the authoritative sources — see
-	// docs/db_ownership.md. Killed in Chunk DB.1.
-	//
-	// Both pools are already opened + ping-verified above under the
-	// manthan handler block; here we just borrow the handles.
+	// livealgos store reads from FOUR DB pools:
+	//   positionsDB     (trading_db)   — strategies + trade_configs (StrategyMeta)
+	//   positionsSSotDB (positions_db) — positions.* (CQRS SSOT, replaces the
+	//                                    legacy manthan_positions read whose
+	//                                    realized_pnl was unreliable)
+	//   ordersDB        (execution_db) — manthan_orders (Stock P&L drilldown)
+	//   signalsDB       (signals_db)   — manthan_signals for per-symbol
+	//                                    isin/industry/mcap enrichment
+	// signalsDB is nil-safe inside the store (empty industry/mcap on rows).
+	// positionsSSotDB nil returns an empty position list — which for a
+	// clean-cutover strategy is the correct display (see docs/db_ownership.md).
 	var liveAlgosStore livealgos.Store
 	if positionsDB != nil && ordersDB != nil {
-		liveAlgosStore = livealgos.NewPostgresStore(positionsDB, ordersDB)
-		log.Printf("Live-algos store wired (positions=%s, orders=%s)", positionsDBName, ordersDBName)
+		liveAlgosStore = livealgos.NewPostgresStore(positionsDB, positionsSSotDB, ordersDB, signalsDB)
+		log.Printf("Live-algos store wired (strategies=%s, positions_ssot=%s, orders=%s, signals=%s)",
+			positionsDBName, positionsSSotDBName, ordersDBName,
+			envOr("MANTHAN_SIGNALS_DB", "signals_db"))
 	} else {
 		log.Printf("Warning: live-algos details store disabled — need both positionsDB (%v) and ordersDB (%v)",
 			positionsDB != nil, ordersDB != nil)
