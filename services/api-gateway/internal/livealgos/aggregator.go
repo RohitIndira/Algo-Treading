@@ -121,12 +121,21 @@ func algoIDFromStrategyType(t pb.StrategyType) string {
 
 // statusFrom derives the tri-state Status enum from user-config's
 // Strategy fields. See the AlgoRow doc for the mapping.
+//
+// Mapping (matches the Pause/Stop mockup):
+//
+//	active=true,  trading_mode=LIVE   → LIVE
+//	active=true,  trading_mode=PAPER  → PAUSED  (paper is "training-wheels")
+//	active=false                       → PAUSED  (user hit Pause on the modal)
+//
+// STOPPED is NEVER returned here — all read queries in
+// user-config/internal/repository filter `deleted_at IS NULL`, so a
+// Stop (soft-delete) makes the row invisible to this endpoint entirely.
+// If a strategy_id isn't in the response, treat as STOPPED at the UI layer.
 func statusFrom(s *pb.Strategy) string {
 	if !s.Active {
-		return StatusStopped
+		return StatusPaused
 	}
-	// Active AND paper mode → treat as PAUSED for the user (they're
-	// running the algo in observation mode, not placing real orders).
 	if s.TradingMode == pb.TradingMode_PAPER {
 		return StatusPaused
 	}
