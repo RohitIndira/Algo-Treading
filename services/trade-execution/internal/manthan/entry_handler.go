@@ -225,6 +225,20 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 	}
 	orderID, err := h.repo.InsertOrder(ctx, order)
 	if err != nil {
+		// Race defense: another concurrent worker already has an active
+		// entry order for this (strategy, symbol, order_type). Migration
+		// 016's partial UNIQUE index just prevented us from placing a
+		// duplicate at the broker. The sibling worker's order IS being
+		// processed correctly; we just lost the race. Log + return
+		// gracefully — inbox_worker classifies this as DONE (not retry,
+		// not DLQ) via ErrDuplicateActiveEntry.
+		if errors.Is(err, ErrDuplicateActiveEntry) {
+			h.logger.Info("Skipping duplicate entry — sibling worker won race (DB-level dedup)",
+				zap.String("symbol", signal.Symbol),
+				zap.String("strategy", signal.StrategyID),
+				zap.String("signal_id", signal.OrderID))
+			return 0, fmt.Errorf("%w: sibling worker holds the active entry", ErrDuplicateActiveEntry)
+		}
 		return 0, fmt.Errorf("insert order: %w", err)
 	}
 

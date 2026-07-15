@@ -247,6 +247,25 @@ func (w *InboxWorker) processRow(ctx context.Context, row *InboxRow) {
 		return
 	}
 
+	// DB-level race defense (migration 016): a sibling worker already has
+	// an active entry order for this (strategy, symbol, order_type). Their
+	// order IS being processed; our attempt correctly failed at the
+	// partial UNIQUE index. Mark DONE (not retry, not DLQ) — this row is
+	// resolved by having lost the race. Retrying would deterministically
+	// fail again with the same violation until the sibling's order
+	// reaches a terminal state.
+	if errors.Is(handlerErr, ErrDuplicateActiveEntry) {
+		w.logger.Info("Inbox row duplicate — sibling worker holds the active entry, marking DONE",
+			zap.Int64("id", row.ID),
+			zap.String("signal_id", row.SignalID),
+			zap.String("type", row.OrderType))
+		if err := w.repo.MarkInboxDone(ctx, row.ID); err != nil {
+			w.logger.Warn("Inbox mark DONE (duplicate) failed",
+				zap.Int64("id", row.ID), zap.Error(err))
+		}
+		return
+	}
+
 	// Classify and apply the right status / backoff.
 	class := classifyHandlerErr(handlerErr)
 	if class == InboxErrPoison {

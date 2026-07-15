@@ -3,8 +3,11 @@ package manthan
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // Repository handles manthan_orders + manthan_order_events persistence.
@@ -12,11 +15,49 @@ type Repository struct {
 	db *sql.DB
 }
 
+// ErrDuplicateActiveEntry is returned by InsertOrder when the row would
+// violate uq_manthan_orders_active_entry (migration 016) — i.e. another
+// worker has ALREADY inserted an active entry order for this
+// (strategy_id, symbol, order_type) tuple and it hasn't yet reached a
+// terminal state.
+//
+// This is the DB-level race defense. In-process check-then-insert in
+// entry_handler.go can lose to a concurrent worker; the partial UNIQUE
+// index catches the loser atomically and this sentinel signals the
+// caller to skip the broker call + gracefully exit without retry.
+//
+// Never treat this as a poisonous / permanent error — the SIBLING
+// worker's insert IS being processed correctly; we just happened to
+// arrive second. Inbox worker marks the row DONE.
+var ErrDuplicateActiveEntry = errors.New("manthan: an active entry order already exists for (strategy_id, symbol, order_type)")
+
+// pgUniqueViolation is the SQLSTATE code Postgres returns for a UNIQUE
+// constraint or partial UNIQUE index conflict. See
+// https://www.postgresql.org/docs/current/errcodes-appendix.html
+const pgUniqueViolation = "23505"
+
 func NewRepository(db *sql.DB) *Repository {
 	return &Repository{db: db}
 }
 
 // InsertOrder creates a new manthan order record.
+//
+// Race-safe against concurrent duplicate placement:
+//   - Migration 016 added a partial UNIQUE INDEX
+//     (strategy_id, symbol, order_type) WHERE order_type IN
+//     ('LIMIT_BUY','MARKET_BUY') AND status IN
+//     ('PENDING','PLACED','PARTIAL').
+//   - Two workers racing to place an entry order for the same
+//     (strategy, symbol) both attempt the INSERT; whichever hits the
+//     DB first wins. The loser gets a Postgres 23505 unique_violation
+//     that we translate to ErrDuplicateActiveEntry, and the caller
+//     (entry_handler.go) short-circuits WITHOUT touching the broker.
+//   - Once the winning order reaches a terminal state (FILLED /
+//     CANCELLED / REJECTED), the row leaves the partial index and a
+//     subsequent entry for the same (strategy, symbol) is allowed
+//     (legit re-entry after exit).
+//
+// Any other error (schema, connection, permission) surfaces unchanged.
 func (r *Repository) InsertOrder(ctx context.Context, o *ManthanOrder) (int64, error) {
 	var id int64
 	err := r.db.QueryRowContext(ctx, `
@@ -32,7 +73,18 @@ func (r *Repository) InsertOrder(ctx context.Context, o *ManthanOrder) (int64, e
 		o.Qty, o.LimitPrice, o.TriggerPrice,
 		o.IndiraSymbol, o.ExchangeToken, o.Status, o.MaxRetries,
 	).Scan(&id)
-	return id, err
+	if err != nil {
+		// Detect the partial-UNIQUE conflict from migration 016 and
+		// translate to a semantic sentinel. Callers use errors.Is to
+		// decide "skip broker call, mark inbox DONE".
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && string(pqErr.Code) == pgUniqueViolation {
+			return 0, fmt.Errorf("%w: strategy=%s symbol=%s order_type=%s: %s",
+				ErrDuplicateActiveEntry, o.StrategyID, o.Symbol, o.OrderType, pqErr.Message)
+		}
+		return 0, err
+	}
+	return id, nil
 }
 
 // UpdateOrderPlaced marks an order as placed with broker.
