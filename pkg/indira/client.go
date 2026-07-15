@@ -146,11 +146,32 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	if auth.BearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
 	}
-	// Indira SSO middleware is case-sensitive on this value — it must be
-	// "True" (capital T). Lowercase "true" causes AU004 "Session data not
-	// received" because the request falls through to the non-SSO auth path
-	// while the JWT was minted under SSO.
-	req.Header.Set("sso", "True")
+	// The `sso` header selects which Indira auth middleware validates the
+	// request. Get this wrong and every strict endpoint (order-book,
+	// fund-limit, holdings, createWsToken, AccountInfo) returns AU004
+	// "Session expired" even for a freshly-minted JWT — because the
+	// session lives in the OTHER middleware's cache. place-order (crypto-
+	// only) still succeeds, which is what made this hard to spot:
+	// you'd place orders you couldn't then confirm or manage.
+	//
+	//   sso: True   →  SSO middleware   →  validates against WEB session cache
+	//                                       (JWTs where source=SSO / WEB, loginSource=SSO)
+	//   sso: False  →  APP middleware   →  validates against MOBILE session cache
+	//                                       (JWTs where source=IOS / AND, loginSource=APP)
+	//
+	// Value is case-sensitive ("True" / "False"). Verified 2026-07-15 by
+	// direct comparison: same JWT + headers, only the sso value flipped,
+	// turned all 5 strict-endpoint AU004s into 200 SUCCESS. Root of the
+	// double-fill / orphan-position class of incident that day.
+	//
+	// If auth.Source is unset we default to "True" for backward compat with
+	// the pre-2026-07-15 behavior (existing SSO web callers unchanged).
+	switch strings.ToUpper(auth.Source) {
+	case "IOS", "AND", "ANDROID", "APP":
+		req.Header.Set("sso", "False")
+	default:
+		req.Header.Set("sso", "True")
+	}
 
 	// Execute request
 	resp, err := c.httpClient.Do(req)
