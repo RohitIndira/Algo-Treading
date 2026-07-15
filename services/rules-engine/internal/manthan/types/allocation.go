@@ -1,6 +1,15 @@
 package types
 
 // AllocationResult is what the allocator produces for one stock for one user.
+//
+// RunDate is the SEMANTIC trading day this allocation was decided for
+// (from manthan_signals.run_date, e.g. "2026-07-15"). It's used to derive
+// a DETERMINISTIC signal_id in OrderGenerator — same (strategy, symbol,
+// runDate) always produces the same UUID, which makes rules-engine
+// idempotent across restarts / Kafka replays / manthan-live re-fires.
+// Never derive this from wall-clock in the generator — a signal being
+// processed 5 seconds after midnight would compute a DIFFERENT id from
+// the same signal processed 5 seconds before, defeating dedup.
 type AllocationResult struct {
 	Symbol        string
 	Industry      string
@@ -15,6 +24,7 @@ type AllocationResult struct {
 	ATHClose      float64
 	Week52High    float64
 	ISIN          string
+	RunDate       string // YYYY-MM-DD in IST — source signal's run_date; anchors the deterministic OrderID
 }
 
 // CapCheck holds the cap counters for sector and MCap allocation.

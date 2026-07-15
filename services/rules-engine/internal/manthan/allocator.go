@@ -217,6 +217,10 @@ func (a *Allocator) Allocate(
 			ATHClose:      sig.ATHClose,
 			Week52High:    sig.Week52High,
 			ISIN:          sig.ISIN,
+			// Carry the source signal's run_date all the way to OrderGenerator so
+			// the deterministic signal_id can be anchored to the SEMANTIC trade day
+			// (not wall-clock). See types/allocation.go RunDate doc.
+			RunDate:       sig.RunDate,
 		}
 
 		result.Allocations = append(result.Allocations, alloc)

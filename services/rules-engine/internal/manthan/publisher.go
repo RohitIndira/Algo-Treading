@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +14,18 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
+
+// ErrDuplicateDecision is returned by dbInsertEntryDecision /
+// dbInsertSLModifyDecision / dbInsertExitDecision when the row for this
+// signal_id already exists (ON CONFLICT DO NOTHING short-circuited the
+// insert). The publish functions catch it and SKIP the Kafka publish +
+// mark-dispatched steps — the previous invocation already did all that,
+// and re-publishing would produce a duplicate downstream order.
+//
+// This is the ONLY signal in rules-engine that says "this signal has
+// already been handled end-to-end; do nothing." Every other error
+// classifies as failure and gets retried.
+var ErrDuplicateDecision = errors.New("manthan: signal_id already dispatched (duplicate decision)")
 
 // ManthanPublisher publishes rules-engine's signals to the world.
 //
@@ -104,8 +117,19 @@ func (p *ManthanPublisher) Close() {
 // rows become a real problem).
 func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanOrder) error {
 	// 1. Audit INSERT (status='PROPOSED') — outbox row.
+	//    On ErrDuplicateDecision, this signal was already dispatched on a
+	//    prior call (Kafka replay, rules-engine restart, manthan-live re-fire).
+	//    Skip Kafka publish + portfolio broadcast — the previous invocation
+	//    already did those. Returning nil here tells the consumer to commit
+	//    the Kafka offset and move on: the work is done, redundantly.
 	if p.db != nil {
 		if err := p.dbInsertEntryDecision(ctx, order); err != nil {
+			if errors.Is(err, ErrDuplicateDecision) {
+				p.logger.Info("PublishEntryOrder: signal already dispatched — skipping Kafka publish (idempotent replay)",
+					zap.String("symbol", order.Symbol),
+					zap.String("signal_id", order.OrderID))
+				return nil
+			}
 			p.logger.Error("PublishEntryOrder: signal_decisions INSERT failed",
 				zap.String("symbol", order.Symbol),
 				zap.String("signal_id", order.OrderID),
@@ -187,8 +211,17 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 // No more manthan_positions UPDATE (was here — moves to positions svc).
 func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOrder) error {
 	// 1. Audit
+	//    ErrDuplicateDecision short-circuit — see PublishEntryOrder doc.
+	//    Same-level SL modifications from tick oscillation dedup here.
 	if p.db != nil {
 		if err := p.dbInsertSLModifyDecision(ctx, order); err != nil {
+			if errors.Is(err, ErrDuplicateDecision) {
+				p.logger.Info("PublishSLModify: signal already dispatched — skipping (same SL level already modified)",
+					zap.String("symbol", order.Symbol),
+					zap.String("signal_id", order.OrderID),
+					zap.Float64("new_sl", order.NewSL))
+				return nil
+			}
 			p.logger.Warn("PublishSLModify: signal_decisions INSERT failed",
 				zap.String("symbol", order.Symbol),
 				zap.String("signal_id", order.OrderID),
@@ -267,8 +300,17 @@ func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOr
 // No more Redis cache mutation (moves to positions svc).
 func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder) error {
 	// 1. Audit
+	//    ErrDuplicateDecision short-circuit — see PublishEntryOrder doc.
+	//    Same-level SL exits (tick oscillates across trigger) dedup here.
 	if p.db != nil {
 		if err := p.dbInsertExitDecision(ctx, order); err != nil {
+			if errors.Is(err, ErrDuplicateDecision) {
+				p.logger.Info("PublishSLExit: signal already dispatched — skipping (same SL exit already sent)",
+					zap.String("symbol", order.Symbol),
+					zap.String("signal_id", order.OrderID),
+					zap.Float64("sl_price", order.SLPrice))
+				return nil
+			}
 			p.logger.Warn("PublishSLExit: signal_decisions INSERT failed",
 				zap.String("symbol", order.Symbol),
 				zap.String("signal_id", order.OrderID),
@@ -400,22 +442,39 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 // signal_decisions writers (per signal_type)
 // ────────────────────────────────────────────────────────────────────
 
-// dbInsertEntryDecision writes the ENTRY_BUY row. Existing columns are used
-// (ltp_at_decision / intended_qty / intended_invested / initial_sl_target)
-// per the schema; payload is NULL for entries because those columns exist.
-// ON CONFLICT DO NOTHING is safe under retry.
+// dbInsertEntryDecision writes the ENTRY_BUY row for a fresh decision.
+// Returns ErrDuplicateDecision if the signal_id already exists — the
+// publisher uses that signal to skip Kafka re-publish + mark-dispatched
+// (both were already done on the first-time-through path).
+//
+// Uses RETURNING signal_id to distinguish "row newly inserted" from
+// "row already existed (ON CONFLICT DO NOTHING)". With DO NOTHING,
+// RETURNING emits ZERO rows on conflict — QueryRow.Scan gets
+// sql.ErrNoRows which we translate to ErrDuplicateDecision.
+//
+// Prior to 2026-07-15 the OrderIDs were random UUIDs so the ON CONFLICT
+// never fired; this insert always "succeeded" as INSERT and every retry
+// re-published to Kafka → duplicate broker orders. That's now fixed at
+// the OrderID layer (see order.go deterministicSignalID) and this dedup
+// path is the safety net that catches any residual replay.
 func (p *ManthanPublisher) dbInsertEntryDecision(ctx context.Context, order ManthanOrder) error {
-	_, err := p.db.ExecContext(ctx, `
+	var returnedID string
+	err := p.db.QueryRowContext(ctx, `
 		INSERT INTO manthan_signal_decisions (
 			signal_id, user_id, strategy_id, symbol, isin,
 			signal_type,
 			ltp_at_decision, ema_alloc_pct, intended_qty, intended_invested,
 			initial_sl_target, industry, mcap_bucket, index_name, status
 		) VALUES ($1,$2,$3,$4,$5,'ENTRY_BUY',$6,$7,$8,$9,$10,$11,$12,$13,'PROPOSED')
-		ON CONFLICT (signal_id) DO NOTHING`,
+		ON CONFLICT (signal_id) DO NOTHING
+		RETURNING signal_id`,
 		order.OrderID, order.UserID, order.StrategyID, order.Symbol, order.ISIN,
 		order.EntryPrice, order.EMAAllocPct/100, order.Quantity, order.InvestedAmt,
-		order.StopLoss, order.Industry, order.MCapBucket, order.IndexName)
+		order.StopLoss, order.Industry, order.MCapBucket, order.IndexName,
+	).Scan(&returnedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrDuplicateDecision
+	}
 	return err
 }
 
@@ -438,18 +497,27 @@ func (p *ManthanPublisher) dbInsertSLModifyDecision(ctx context.Context, order S
 		"new_high": order.NewHigh,
 	})
 
-	_, err = p.db.ExecContext(ctx, `
+	// Same dedup pattern as dbInsertEntryDecision — see its docstring for
+	// why RETURNING + sql.ErrNoRows → ErrDuplicateDecision.
+	var returnedID string
+	err = p.db.QueryRowContext(ctx, `
 		INSERT INTO manthan_signal_decisions (
 			signal_id, user_id, strategy_id, symbol,
 			signal_type, parent_signal_id, payload, status
 		) VALUES ($1,$2,$3,$4,'SL_MODIFY',$5,$6,'PROPOSED')
-		ON CONFLICT (signal_id) DO NOTHING`,
+		ON CONFLICT (signal_id) DO NOTHING
+		RETURNING signal_id`,
 		order.OrderID, order.UserID, order.StrategyID, order.Symbol,
-		nullableID(parentID), payload)
+		nullableID(parentID), payload,
+	).Scan(&returnedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrDuplicateDecision
+	}
 	return err
 }
 
 // dbInsertExitDecision writes the EXIT_TSL row. Same pattern as SL_MODIFY.
+// Returns ErrDuplicateDecision on ON CONFLICT — see dbInsertEntryDecision doc.
 func (p *ManthanPublisher) dbInsertExitDecision(ctx context.Context, order SLExitOrder) error {
 	parentID, err := p.lookupParentSignalID(ctx, order.StrategyID, order.Symbol)
 	if err != nil {
@@ -464,14 +532,20 @@ func (p *ManthanPublisher) dbInsertExitDecision(ctx context.Context, order SLExi
 		"quantity":   order.Quantity,
 	})
 
-	_, err = p.db.ExecContext(ctx, `
+	var returnedID string
+	err = p.db.QueryRowContext(ctx, `
 		INSERT INTO manthan_signal_decisions (
 			signal_id, user_id, strategy_id, symbol,
 			signal_type, parent_signal_id, payload, status
 		) VALUES ($1,$2,$3,$4,'EXIT_TSL',$5,$6,'PROPOSED')
-		ON CONFLICT (signal_id) DO NOTHING`,
+		ON CONFLICT (signal_id) DO NOTHING
+		RETURNING signal_id`,
 		order.OrderID, order.UserID, order.StrategyID, order.Symbol,
-		nullableID(parentID), payload)
+		nullableID(parentID), payload,
+	).Scan(&returnedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrDuplicateDecision
+	}
 	return err
 }
 
