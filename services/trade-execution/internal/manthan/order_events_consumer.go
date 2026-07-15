@@ -151,6 +151,25 @@ func (c *OrderEventsConsumer) Close() error {
 // handleMessage routes one Kafka message into the wssBridge. Any parse or
 // routing error is logged but never aborts the loop — losing one event
 // beats stalling every subsequent event behind a bad message.
+//
+// Fill-price policy (2026-07-15): orderstatus svc publishes to order.events
+// from TWO sources — WSS (real-time push, has `traded_price`) and
+// REST_ORDERBOOK (poll fallback, has `order_price` which for MARKET
+// orders is 0 and for LIMIT orders is the LIMIT price, not the fill
+// price). Propagating a REST fallback event with traded_price=0 into
+// the wssBridge would race the WSS event (whichever arrives first
+// "wins" at handleFill), corrupting downstream: services/positions
+// rejects zero-price fills, SL calculation multiplies 0 × 0.80 = 0,
+// P&L becomes noise. Verified 2026-07-15 (AADHARHFC id=1 filled_qty=38
+// avg=0 — REST event arrived before WSS and was propagated blindly).
+//
+// Rule: broker is truth. WSS is the authoritative fill-price source.
+// If we get a FILLED/PARTIAL event WITHOUT a real traded_price, we
+// suppress it — the WSS event with the real price is either coming or
+// already arrived. If BOTH sources fail to provide a real price, the
+// reconciler (runs every 5min, does its own tradebook lookup) will
+// eventually flip the row to FILLED with the correct avg. That's
+// eventual consistency, safely — never write a made-up price.
 func (c *OrderEventsConsumer) handleMessage(msg kafka.Message) {
 	var env orderEventEnvelope
 	if err := json.Unmarshal(msg.Value, &env); err != nil {
@@ -164,6 +183,23 @@ func (c *OrderEventsConsumer) handleMessage(msg kafka.Message) {
 		return
 	}
 
+	// Guard: fill event without a real price. Skip propagation — do NOT
+	// mark the row FILLED with a zero price. The paired WSS event (with
+	// traded_price) either arrived already (and won the race) or is
+	// coming; either way this REST fallback is redundant when zeroed out.
+	// Non-fill events (CANCELLED / REJECTED / PENDING) pass through
+	// unaffected — they don't carry price and downstream doesn't derive
+	// anything price-dependent from them.
+	if isFillEventType(env.EventType, env.Status) && env.TradedPrice <= 0 {
+		c.logger.Info("order.events fill event has no traded_price — skipping (waiting for WSS event)",
+			zap.String("event_id", env.EventID),
+			zap.String("broker_order_id", env.BrokerOrderID),
+			zap.String("source", env.Source),
+			zap.String("status", env.Status),
+			zap.Int("filled_qty", env.FilledQty))
+		return
+	}
+
 	// Feed into the same bridge the in-process WSS listener uses. If the
 	// order isn't a Manthan order (no Register call has landed for it),
 	// HandleUpdate returns false — silent no-op.
@@ -171,7 +207,7 @@ func (c *OrderEventsConsumer) handleMessage(msg kafka.Message) {
 		env.BrokerOrderID,
 		env.Status,
 		env.FilledQty,
-		env.TradedPrice, // avgFillPrice — publisher already used broker's fill for us
+		env.TradedPrice, // avgFillPrice — guarded above to always be > 0 on FILLED events
 		env.TriggerPrice,
 		env.Reason,
 	)
@@ -182,4 +218,18 @@ func (c *OrderEventsConsumer) handleMessage(msg kafka.Message) {
 		zap.String("status", env.Status),
 		zap.String("source", env.Source),
 		zap.Bool("bridge_handled", handled))
+}
+
+// isFillEventType returns true for events that MUST carry a real
+// traded_price. Both event_type ("FILLED") and status ("EXECUTED" or
+// terminal fill statuses) are checked because different orderstatus
+// svc code paths populate different fields — WSS emits event_type,
+// REST emits status directly.
+func isFillEventType(eventType, status string) bool {
+	if eventType == "FILLED" || eventType == "PARTIAL_FILLED" || eventType == "PARTIAL_FILL" {
+		return true
+	}
+	// IsFilledWSStatus / IsPartialWSStatus live in wss_bridge.go —
+	// same broker status enum we already use downstream.
+	return IsFilledWSStatus(status) || IsPartialWSStatus(status)
 }

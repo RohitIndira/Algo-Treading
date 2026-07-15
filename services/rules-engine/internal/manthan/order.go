@@ -10,6 +10,48 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 )
 
+// manthanSignalIDNamespace is a fixed, arbitrary UUID that scopes every
+// deterministic signal_id we mint in this package. Using a project-owned
+// namespace (not one of the well-known DNS/URL namespaces) means our
+// UUIDs can never collide with anything else in the ecosystem — the
+// namespace bits are unique to Manthan and stable forever.
+//
+// SECURITY: this value must NEVER change. Changing it re-keys every
+// existing deterministic id, which would break idempotency across the
+// upgrade (a signal generated pre-change vs post-change would compute
+// different ids, and downstream dedup would let both through).
+var manthanSignalIDNamespace = uuid.MustParse("6f4f7f2c-3b0f-4c5a-8c11-9ddaa63d8b6a")
+
+// deterministicSignalID returns a v5 UUID derived from the inputs. Same
+// inputs always produce the same UUID — that's the whole point. It lets
+// us anchor idempotency at the DB constraint level (UNIQUE(signal_id))
+// so no matter how many times rules-engine restarts, replays Kafka, or
+// gets duplicate manthan_signals from data-ingestion, we mint the SAME
+// id for the same (strategy, symbol, day[, discriminator]) tuple and
+// the second INSERT to manthan_signal_decisions cleanly conflicts.
+//
+// key format is "field1|field2|..." — the pipe is just a readable
+// separator; we don't parse it back out. Callers pass whatever
+// discriminates one legitimate signal from another of the same shape:
+//   entry:      strategyID|symbol|runDate
+//   SL modify:  strategyID|symbol|runDate|SLMOD|<newSL:2dp>
+//   SL exit:    strategyID|symbol|runDate|EXIT|<slPrice:2dp>
+//
+// The 2dp price truncation means "SL modify to 220.34" dedups against
+// itself but not against "SL modify to 220.35" — which is the intended
+// semantics for option (b): duplicates at the same level are dropped,
+// legitimate ratchets to a new level go through.
+func deterministicSignalID(parts ...string) string {
+	key := ""
+	for i, p := range parts {
+		if i > 0 {
+			key += "|"
+		}
+		key += p
+	}
+	return uuid.NewSHA1(manthanSignalIDNamespace, []byte(key)).String()
+}
+
 // OrderGenerator creates trade orders from allocation results.
 // All MANTHAN orders are: DELIVERY + MARKET + BUY with trailing SL.
 type OrderGenerator struct {
@@ -100,8 +142,16 @@ func (g *OrderGenerator) GenerateEntryOrders(
 	orders := make([]ManthanOrder, 0, len(allocations))
 
 	for _, alloc := range allocations {
+		// Idempotent OrderID — same (strategy, symbol, runDate) always yields
+		// the same UUID. Downstream UNIQUE(signal_id) on manthan_signal_decisions
+		// rejects the second attempt on any replay path (rules-engine restart,
+		// Kafka rewind, manthan-live re-fire). See deterministicSignalID doc.
+		//
+		// alloc.RunDate is the source signal's run_date (see AllocationResult).
+		// Never fall back to today() here — a cross-midnight retry would compute
+		// a different id and break dedup.
 		order := ManthanOrder{
-			OrderID:       uuid.New().String(),
+			OrderID:       deterministicSignalID(strategy.StrategyID, alloc.Symbol, alloc.RunDate),
 			UserID:        strategy.UserID,
 			StrategyID:    strategy.StrategyID,
 			Symbol:        alloc.Symbol,
@@ -139,12 +189,21 @@ func (g *OrderGenerator) GenerateEntryOrders(
 }
 
 // GenerateSLModify creates an SL modification order for trailing SL update.
+//
+// Idempotent by (strategy, symbol, today, newSL). Two consecutive ticks that
+// each produce the same new SL level dedup (only one modify goes to broker).
+// A ratchet to a different SL level cleanly produces a different OrderID.
+// Uses todayIST rather than a stored run_date because SL modifications are
+// strictly intra-market (09:15–15:30 IST); no cross-midnight risk.
 func (g *OrderGenerator) GenerateSLModify(
 	strategy types.UserStrategy,
 	update SLUpdate,
 ) SLModifyOrder {
 	return SLModifyOrder{
-		OrderID:     fmt.Sprintf("slmod-%s-%s", update.Symbol, uuid.New().String()[:8]),
+		OrderID: deterministicSignalID(
+			strategy.StrategyID, update.Symbol, todayIST(),
+			"SLMOD", fmt.Sprintf("%.2f", update.NewSL),
+		),
 		UserID:      strategy.UserID,
 		StrategyID:  strategy.StrategyID,
 		Symbol:      update.Symbol,
@@ -159,13 +218,25 @@ func (g *OrderGenerator) GenerateSLModify(
 }
 
 // GenerateSLExit creates a sell order when trailing SL is triggered.
+//
+// Idempotent by (strategy, symbol, today, EXIT, slPrice). Two ticks that both
+// cross the same SL level (typical: LTP oscillates around the trigger for
+// a second or two before the SL fires) dedup — only one MARKET SELL goes
+// out. Uses todayIST for the same reason as SL_MODIFY (intra-market only).
+// slPrice as tiebreaker means: if the position rebuilds and gets a new SL
+// at a different level and THAT one also triggers, it produces a distinct
+// OrderID (though same-day re-entry after SL exit is not expected for
+// Manthan, this keeps the id safe for future re-entry variants).
 func (g *OrderGenerator) GenerateSLExit(
 	strategy types.UserStrategy,
 	pos *types.Position,
 	exitPrice, pnl float64,
 ) SLExitOrder {
 	return SLExitOrder{
-		OrderID:     fmt.Sprintf("slexit-%s-%s", pos.Symbol, uuid.New().String()[:8]),
+		OrderID: deterministicSignalID(
+			strategy.StrategyID, pos.Symbol, todayIST(),
+			"EXIT", fmt.Sprintf("%.2f", pos.CurrentSL),
+		),
 		UserID:      strategy.UserID,
 		StrategyID:  strategy.StrategyID,
 		Symbol:      pos.Symbol,

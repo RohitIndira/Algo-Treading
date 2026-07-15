@@ -225,6 +225,20 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 	}
 	orderID, err := h.repo.InsertOrder(ctx, order)
 	if err != nil {
+		// Race defense: another concurrent worker already has an active
+		// entry order for this (strategy, symbol, order_type). Migration
+		// 016's partial UNIQUE index just prevented us from placing a
+		// duplicate at the broker. The sibling worker's order IS being
+		// processed correctly; we just lost the race. Log + return
+		// gracefully — inbox_worker classifies this as DONE (not retry,
+		// not DLQ) via ErrDuplicateActiveEntry.
+		if errors.Is(err, ErrDuplicateActiveEntry) {
+			h.logger.Info("Skipping duplicate entry — sibling worker won race (DB-level dedup)",
+				zap.String("symbol", signal.Symbol),
+				zap.String("strategy", signal.StrategyID),
+				zap.String("signal_id", signal.OrderID))
+			return 0, fmt.Errorf("%w: sibling worker holds the active entry", ErrDuplicateActiveEntry)
+		}
 		return 0, fmt.Errorf("insert order: %w", err)
 	}
 
@@ -381,15 +395,112 @@ func (h *EntryHandler) executeLive(ctx context.Context, orderID int64, order *Ma
 // fill on an illiquid stock where LIMIT retries couldn't cross the ASK.
 // On KINGFA 2026-04-23 the LIMIT sat ₹0.30 below ASK for 30s and never crossed;
 // a MARKET would have filled instantly at the current ASK.
+//
+// SAFETY (added after 2026-07-15 double-fill incident): before cancelling +
+// placing the MARKET on top, we do a FINAL authoritative poll to confirm the
+// LIMIT is truly unfilled. Why: the retry loop in waitForFill exits with
+// reasonLimitRetriesExhausted whenever EVERY poll during the wait window
+// failed to reach terminal state — INCLUDING when every poll returned
+// AU004 "Session expired" (auth-fail counts as "not yet filled" from the
+// outer loop's point of view). If the LIMIT had actually filled but we
+// couldn't confirm it because auth was down, blindly firing the MARKET
+// would leave us with 2× fills — exactly what happened to CUB / IPCALAB /
+// AADHARHFC on 2026-07-15 (broker returned EG003 "FULLY_EXECUTED order
+// not allowed to CANCEL" on the pre-MARKET cancel, and MARKET still fired).
+//
+// Rule: NEVER place a second order when the first order's state is UNKNOWN.
+// Only when we've CONFIRMED it's unfilled.
 func (h *EntryHandler) marketFallback(ctx context.Context, auth BrokerAuth, signal ManthanSignal, order *ManthanOrder, info *SymbolInfo, orderID int64, limitBrokerID string) (int64, error) {
-	h.logger.Warn("LIMIT retries exhausted — falling back to MARKET",
+	h.logger.Warn("LIMIT retries exhausted — verifying state before MARKET fallback",
 		zap.String("symbol", order.Symbol),
 		zap.String("stuck_broker_id", limitBrokerID))
+
+	// Refresh auth in case a re-login landed between our last poll and now
+	// (the mobile app may have posted a fresh JWT via /auth/credentials).
+	if h.refreshAuth != nil {
+		if fresh := h.refreshAuth(signal.UserID); fresh != nil {
+			auth = *fresh
+		}
+	}
+
+	// SAFETY POLL: get authoritative fill state before touching the LIMIT.
+	// This is the single defense against the "unknown-state = place MARKET"
+	// class of bug. Three outcomes:
+	//   (a) Poll succeeds + FILLED   → skip MARKET entirely, treat as filled
+	//   (b) Poll succeeds + PARTIAL  → hand off to partial-fill handler
+	//   (c) Poll succeeds + UNFILLED → continue with existing cancel+MARKET
+	//   (d) Poll FAILS (auth/network) → ABORT the fallback. Do not place a
+	//       second order when we can't confirm the first is done. Return an
+	//       error that classifyHandlerErr will tag as AUTH_EXPIRED (via
+	//       errors.Is wrap of ErrAuthExpired) so inbox_worker re-queues
+	//       with 30s backoff — by then auth is refreshed and the retry
+	//       will succeed.
+	status, filledQty, avgPrice, pollErr := h.broker.GetOrderStatus(ctx, auth, limitBrokerID)
+	if pollErr != nil {
+		reason := "poll failed"
+		if errors.Is(pollErr, indiraClient.ErrAuthExpired) {
+			reason = "auth expired"
+			notifyAuthExpired(h.authNotif, ctx, signal.UserID, "market-fallback-safety-poll")
+		}
+		h.logger.Warn("MARKET fallback ABORTED — LIMIT state unknown, refusing to double-place",
+			zap.String("symbol", order.Symbol),
+			zap.String("stuck_broker_id", limitBrokerID),
+			zap.String("reason", reason),
+			zap.Error(pollErr))
+		_ = h.repo.InsertEvent(ctx, orderID, "MARKET_FALLBACK_ABORTED", "PLACED", "PLACED",
+			"", 0, 0, "safety poll failed ("+reason+") — cannot confirm LIMIT fill state; re-queueing without placing MARKET")
+		// Wrap ErrAuthExpired if applicable so inbox_worker classifies as
+		// AUTH_EXPIRED (30s backoff, waits for re-login).
+		if errors.Is(pollErr, indiraClient.ErrAuthExpired) {
+			return orderID, fmt.Errorf("market fallback aborted (auth expired — cannot verify LIMIT fill state): %w", pollErr)
+		}
+		return orderID, fmt.Errorf("market fallback aborted (safety poll failed): %w", pollErr)
+	}
+
+	// (a) LIMIT is already FILLED — no MARKET needed. Route through the
+	// standard fill handler (records fill, places trailing SL).
+	if isFilledStatus(status) && filledQty >= order.Qty {
+		h.logger.Info("MARKET fallback SKIPPED — LIMIT already filled at broker",
+			zap.String("symbol", order.Symbol),
+			zap.String("broker_id", limitBrokerID),
+			zap.Int("filled_qty", filledQty),
+			zap.Float64("avg_price", avgPrice))
+		_ = h.repo.InsertEvent(ctx, orderID, "SAFETY_POLL_FOUND_FILL", "PLACED", "FILLED",
+			status, avgPrice, filledQty, "LIMIT filled during retry window — MARKET fallback skipped")
+		return h.handleFill(ctx, orderID, fillResult{
+			action:    actionFilled,
+			filledQty: filledQty,
+			avgPrice:  avgPrice,
+			brokerID:  limitBrokerID,
+		}, signal, info)
+	}
+
+	// (b) Partial fill during the retry window. Accept the partial via the
+	// standard partial handler (which only tops up the missing qty, not the
+	// whole order — so no double-buy on the filled slice).
+	if filledQty > 0 && filledQty < order.Qty {
+		h.logger.Info("MARKET fallback → partial-fill handler (LIMIT partially filled during retry)",
+			zap.String("symbol", order.Symbol),
+			zap.Int("filled_qty", filledQty),
+			zap.Int("order_qty", order.Qty))
+		return h.handlePartialFill(ctx, orderID, fillResult{
+			action:    actionPartialFilled,
+			filledQty: filledQty,
+			avgPrice:  avgPrice,
+			brokerID:  limitBrokerID,
+		}, signal, info, auth, limitBrokerID)
+	}
+
+	// (c) Confirmed unfilled — safe to cancel + place MARKET.
+	h.logger.Warn("MARKET fallback proceeding — LIMIT confirmed unfilled by safety poll",
+		zap.String("symbol", order.Symbol),
+		zap.String("stuck_broker_id", limitBrokerID),
+		zap.String("status", status))
 
 	// Cancel the stuck LIMIT first (ignore error — may already be cancelled/rejected)
 	_ = h.broker.CancelOrder(ctx, auth, info, limitBrokerID)
 	_ = h.repo.InsertEvent(ctx, orderID, "LIMIT_CANCELLED", "PLACED", "CANCELLED", "",
-		0, 0, "max LIMIT retries — switching to MARKET fallback")
+		0, 0, "max LIMIT retries — switching to MARKET fallback (safety-poll confirmed unfilled)")
 
 	// Place MARKET BUY — guaranteed fill at current ASK
 	marketBrokerID, mkErr := h.broker.PlaceMarketBuy(ctx, auth, info, order.Qty)
