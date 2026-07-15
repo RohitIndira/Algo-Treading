@@ -3,6 +3,7 @@ package manthan
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"go.uber.org/zap"
@@ -121,6 +122,15 @@ func (p *PreChecker) CheckSLModify(ctx context.Context, signal SLModifySignal, i
 
 // checkMarketHours validates we're within trading hours.
 // Entry orders rejected before 9:15 and after 15:20 (last 10 min buffer).
+//
+// DANGER-mode override (env MANTHAN_TEST_SKIP_CLOSE_CUTOFF=1): bypasses
+// the 15:20 post-cutoff rejection. Weekend + before-open checks stay
+// enforced. Use ONLY for controlled tests where you are actively
+// monitoring positions manually and will manually place SL if needed.
+// Never set in production — the 10-min buffer exists specifically so
+// that a fill can be confirmed AND its SL placed before market close;
+// bypass it and any position that fills after 15:20 goes into overnight
+// unprotected.
 func (p *PreChecker) checkMarketHours() PreCheckResult {
 	loc, _ := time.LoadLocation("Asia/Kolkata")
 	if loc == nil {
@@ -143,6 +153,12 @@ func (p *PreChecker) checkMarketHours() PreCheckResult {
 		return fail("market not open yet (before 9:15)")
 	}
 	if minuteOfDay >= marketClose {
+		if os.Getenv("MANTHAN_TEST_SKIP_CLOSE_CUTOFF") == "1" {
+			p.logger.Warn("⚠️  MARKET-CLOSE CUTOFF BYPASSED (MANTHAN_TEST_SKIP_CLOSE_CUTOFF=1) — proceeding after 15:20",
+				zap.Int("minute_of_day", minuteOfDay),
+				zap.String("clock", fmt.Sprintf("%02d:%02d IST", hour, min)))
+			return pass()
+		}
 		return fail("too close to market close (after 15:20)")
 	}
 
