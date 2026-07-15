@@ -180,10 +180,12 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 			log.Printf("[OutboxWorker] CRITICAL: empty user_id/strategy_id in STRATEGY_ACTIVATED outbox id=%d, skipping+marking processed", event.ID)
 			return true, nil
 		}
-		// Emit a full CONFIG_UPDATED (not thin CONFIG_RESUMED) so the rules engine can
-		// upsert the strategy even after a restart. A thin CONFIG_RESUMED silently no-ops
-		// when the rules engine restarted between deactivation and reactivation, because
-		// inactive strategies are absent from its in-memory Paused map after bulk-load.
+		// Emit a full CONFIG_ACTIVATED so the rules engine can upsert the strategy even
+		// after a restart AND re-run the AMN backfill for AMN strategies. (A thin
+		// CONFIG_RESUMED silently no-ops when the rules engine restarted between
+		// deactivation and reactivation, because inactive strategies are absent from
+		// its in-memory Paused map after bulk-load; and a plain CONFIG_UPDATED must
+		// never re-run the backfill.)
 		strategyUUID, err := uuid.Parse(thin.StrategyID)
 		if err != nil {
 			return false, fmt.Errorf("invalid strategy_id in STRATEGY_ACTIVATED outbox id=%d: %w", event.ID, err)
@@ -192,7 +194,17 @@ func (w *OutboxWorker) processOneOutboxEvent(ctx context.Context, event *models.
 		if err != nil {
 			return false, fmt.Errorf("failed to fetch strategy for STRATEGY_ACTIVATED outbox id=%d: %w", event.ID, err)
 		}
-		kafkaEvent = events.ToFullConfigEvent(events.ConfigUpdated, fullStrategy)
+		// Scope the reactivation backfill to the fresh AMN pick just persisted. Only
+		// AMN strategies carry a selection; non-AMN strategies get an empty list and
+		// the rules-engine skips the backfill trigger.
+		if fullStrategy.ProcessAfterMarketNews {
+			isins, isinErr := w.repo.GetLatestActivationISINs(ctx, strategyUUID)
+			if isinErr != nil {
+				return false, fmt.Errorf("failed to load AMN selection for STRATEGY_ACTIVATED outbox id=%d: %w", event.ID, isinErr)
+			}
+			fullStrategy.AMNSelectedStocks = isins
+		}
+		kafkaEvent = events.ToFullConfigEvent(events.ConfigActivated, fullStrategy)
 
 	case "STRATEGY_DEACTIVATED":
 		var thin activationOutboxPayload

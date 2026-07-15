@@ -48,7 +48,6 @@ func TestProcessEvent_Created_PublishesCorrectly(t *testing.T) {
 			ImpactScoreMax: 2,
 			Sentiments:     pq.StringArray{"POSITIVE"},
 			Categories:     pq.StringArray{"EARNINGS"},
-			StockCodes:     pq.Int64Array{500325},
 			Exchanges:      pq.StringArray{"NSE"},
 		},
 		TradeConfig: &models.TradeConfig{OrderType: "MARKET", ProductType: "INTRADAY", Validity: "DAY", Quantity: 1, Exchange: "NSE", OrderSide: "BUY", StopLossType: "FIXED"},
@@ -124,28 +123,15 @@ func TestProcessEvent_Deleted_PublishesCorrectly(t *testing.T) {
 	}
 }
 
-func TestProcessEvent_Activated_PublishesResumed(t *testing.T) {
-	w := &mockKafkaWriter{}
-	ow := NewOutboxWorker(nil, w, 0)
-	payload := []byte(`{"strategy_id":"strat-1","user_id":"user-1","version":2,"active":true}`)
-	outbox := &models.ExecutionOutbox{ID: 12, EventType: "STRATEGY_ACTIVATED", Payload: payload}
-
-	_, err := ow.processOneOutboxEvent(context.Background(), outbox)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(w.messages) != 1 {
-		t.Fatalf("expected 1 message")
-	}
-	var ce events.ConfigEvent
-	_ = json.Unmarshal(w.messages[0].Value, &ce)
-	if ce.Type != events.ConfigResumed {
-		t.Fatalf("expected %s got %s", events.ConfigResumed, ce.Type)
-	}
-	if ce.Config != nil {
-		t.Fatalf("expected thin resumed event")
-	}
-}
+// NOTE: STRATEGY_ACTIVATED is intentionally NOT unit-tested here. Its handler
+// re-reads the full strategy (repo.GetByID) and the fresh AMN pick
+// (repo.GetLatestActivationISINs) from the database and emits a full
+// CONFIG_ACTIVATED event, so it requires a real *repository.StrategyRepository
+// (the worker holds the concrete type, not a mockable interface). This path is
+// covered by integration tests against a live DB. The rules-engine side of the
+// contract — that CONFIG_ACTIVATED re-runs the AMN backfill while a plain
+// CONFIG_UPDATED does not — is unit-tested in
+// services/rules-engine/internal/kafka/config_consumer_test.go.
 
 func TestProcessEvent_Deactivated_PublishesPaused(t *testing.T) {
 	w := &mockKafkaWriter{}

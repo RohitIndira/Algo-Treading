@@ -12,6 +12,7 @@ import (
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
+	"github.com/RohitIndira/Algo-Treading/pkg/tradecap"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/repository"
@@ -80,6 +81,10 @@ type watchEntry struct {
 	triggered       int32   // atomic: 1 = already triggered
 	triggerAttempts int32   // atomic: number of times trigger+execute has been attempted
 	stockKey        string  // cached "exchange:token" key for deduplication
+	// triggeredAt is stamped the instant the price condition is first met (the CAS
+	// in evaluateEntry). Used to order/audit the strategy trade-cap reservation so
+	// that when several stocks cross at once the earliest crosser is favoured (FCFS).
+	triggeredAt time.Time
 	// onAfterFill is called after a successful ExecuteOrder. Used by the signal
 	// processor to wire multi-level exit setup for below_min + MULTI_LEVEL orders,
 	// where routeToMultiLevel cannot run at signal-arrival time (order must wait
@@ -130,6 +135,15 @@ type PriceMonitor struct {
 
 	// evalCh is the persistent evaluation channel. Workers drain this continuously.
 	evalCh chan evalJob
+
+	// capReserver enforces MaxTradesPerStrategy when a below_min watch triggers —
+	// the moment a monitored watch becomes a real trade. Shares the same Redis
+	// counter the rules-engine uses for immediate trades. nil-safe: when unset or
+	// Redis is unavailable the cap is not enforced here (fail-open).
+	capReserver *tradecap.Reserver
+	// strategyReserveLocks serializes trade-cap reservations per strategy so
+	// concurrent same-strategy triggers don't interleave. Keyed by strategy_id.
+	strategyReserveLocks sync.Map
 
 	stopChan chan struct{}
 }
@@ -217,6 +231,107 @@ func (pm *PriceMonitor) SetWSClient(ws MarketWSClient) {
 // target would execute with NO stop-loss or take-profit protection.
 func (pm *PriceMonitor) SetOCOAdopter(a OCOAdopter) {
 	pm.ocoAdopter = a
+}
+
+// SetCapReserver wires the shared per-strategy daily trade counter so the
+// monitor enforces MaxTradesPerStrategy when a watch triggers. Pass nil (or an
+// unavailable reserver) to leave cap enforcement disabled at trigger time.
+func (pm *PriceMonitor) SetCapReserver(r *tradecap.Reserver) {
+	pm.capReserver = r
+}
+
+// strategyReserveLock returns the per-strategy reservation mutex.
+func (pm *PriceMonitor) strategyReserveLock(strategyID string) *sync.Mutex {
+	v, _ := pm.strategyReserveLocks.LoadOrStore(strategyID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// reserveStrategySlot atomically claims one daily trade slot for the order's
+// strategy at trigger time. Returns reserved=true when a slot was taken (the
+// caller must Release it if the placement then fails), capReached=true when the
+// strategy is already at its limit (the caller must cancel the watch), or both
+// false when enforcement is disabled/unlimited (allow the trade, nothing to
+// release). A non-nil error is a transient Redis failure the caller should retry.
+func (pm *PriceMonitor) reserveStrategySlot(ctx context.Context, order *models.Order) (reserved, capReached bool, err error) {
+	if pm.capReserver == nil || !pm.capReserver.IsEnabled() || order.MaxTradesPerStrategy <= 0 {
+		return false, false, nil
+	}
+	mu := pm.strategyReserveLock(order.StrategyID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	n, err := pm.capReserver.Reserve(ctx, order.StrategyID, order.MaxTradesPerStrategy, 0, time.Now())
+	if err != nil {
+		return false, false, err
+	}
+	if n == tradecap.CapReached {
+		return false, true, nil
+	}
+	return true, false, nil
+}
+
+// releaseStrategySlot hands a reserved slot back when a triggered order will not
+// become a trade (placement failed). No-op when nothing was reserved.
+func (pm *PriceMonitor) releaseStrategySlot(ctx context.Context, order *models.Order, reserved bool) {
+	if !reserved || pm.capReserver == nil {
+		return
+	}
+	if err := pm.capReserver.Release(ctx, order.StrategyID, time.Now()); err != nil {
+		log.Printf("[price-monitor] failed to release trade slot for strategy %s (order %s): %v",
+			order.StrategyID, order.OrderID, err)
+	}
+}
+
+// cancelForCapReached cancels a watch whose target triggered after the strategy
+// had already used its daily trade budget. Mirrors the max-exceeded cancel path:
+// unwatch, mark CANCELLED, record an audit event, and notify the user.
+func (pm *PriceMonitor) cancelForCapReached(ctx context.Context, entry *watchEntry, ltp float64) {
+	order := entry.order
+	log.Printf("[price-monitor] ■ STRATEGY_TRADE_CAP_REACHED order=%s strategy=%s symbol=%s cap=%d triggeredAt=%s — cancelling watch (not placed)",
+		order.OrderID, order.StrategyID, order.Symbol, order.MaxTradesPerStrategy, entry.triggeredAt.Format(time.RFC3339Nano))
+
+	pm.Unwatch(order.OrderID)
+
+	if pm.orderRepo != nil {
+		if err := pm.orderRepo.UpdateStatus(ctx, order.OrderID, models.StatusCancelled); err != nil {
+			log.Printf("[price-monitor] failed to mark order %s cancelled after cap reached: %v", order.OrderID, err)
+		}
+		pm.orderRepo.RecordExecutionEvent(ctx, order.OrderID, "STRATEGY_TRADE_CAP_REACHED", map[string]interface{}{
+			"strategy_id":             order.StrategyID,
+			"max_trades_per_strategy": order.MaxTradesPerStrategy,
+			"trigger_ltp":             ltp,
+			"target_price":            entry.targetPrice,
+			"triggered_at":            entry.triggeredAt,
+		})
+	}
+
+	if pm.kafkaPub != nil {
+		now := time.Now()
+		update := &models.OrderUpdate{
+			UpdateID:   uuid.New().String(),
+			OrderID:    order.OrderID.String(),
+			UserID:     order.UserID,
+			UpdateType: "STRATEGY_TRADE_CAP_REACHED",
+			Priority:   "LOW",
+			Title:      "Daily Trade Limit Reached",
+			Message:    fmt.Sprintf("%s reached its target but the strategy's daily trade limit (%d) was already used — order not placed", order.Symbol, order.MaxTradesPerStrategy),
+			Status:     string(models.StatusCancelled),
+			CreatedAt:  now,
+			ExpiresAt:  now.Add(1 * time.Hour),
+			OrderSummary: models.OrderSummary{
+				Stock:     order.Symbol,
+				Action:    string(order.OrderSide),
+				Quantity:  order.Quantity,
+				Exchange:  string(order.Exchange),
+				OrderType: string(order.OrderType),
+				Price:     fmt.Sprintf("₹%.2f", ltp),
+			},
+			NotificationChannels: models.NotificationChannels{Push: false, InApp: true},
+		}
+		if err := pm.kafkaPub.PublishOrderUpdate(ctx, update); err != nil {
+			log.Printf("[price-monitor] failed to publish cap-reached event for order %s: %v", order.OrderID, err)
+		}
+	}
 }
 
 // Watch registers an order for price monitoring.
@@ -619,6 +734,9 @@ func (pm *PriceMonitor) evaluateEntry(ctx context.Context, entry *watchEntry, lt
 	if !atomic.CompareAndSwapInt32(&entry.triggered, 0, 1) {
 		return
 	}
+	// Stamp the exact instant the price condition was met — used to order the
+	// strategy trade-cap reservation (earliest crosser wins the slot) and audit.
+	entry.triggeredAt = time.Now()
 
 	log.Printf("[price-monitor] ✓ TRIGGERED %s:%s (order=%s) LTP=%.2f target=%.2f — placing order",
 		entry.order.Exchange, entry.order.Symbol, entry.order.OrderID, ltp, entry.targetPrice)
@@ -647,6 +765,30 @@ func (pm *PriceMonitor) triggerOrder(ctx context.Context, entry *watchEntry, ltp
 			pm.Unwatch(order.OrderID)
 			return
 		}
+	}
+
+	// ── Enforce the strategy's daily trade cap (hard ceiling) ────────────────
+	// This watch only becomes a real trade now, at trigger time, so this is where
+	// it consumes a slot. Reserve atomically on the shared counter before we
+	// announce or place anything. If the strategy has already used its budget
+	// (earlier immediate trades or earlier-triggering watches won the slots),
+	// cancel this watch instead of placing — FCFS. A transient Redis error is
+	// treated like an execute failure so it retries rather than bypassing the cap.
+	reserved, capReached, capErr := pm.reserveStrategySlot(ctx, order)
+	if capErr != nil {
+		attempts := atomic.AddInt32(&entry.triggerAttempts, 1)
+		log.Printf("[price-monitor] ✗ trade-cap reserve error for order %s (attempt %d/%d): %v",
+			order.OrderID, attempts, maxTriggerAttempts, capErr)
+		if attempts >= maxTriggerAttempts {
+			pm.Unwatch(order.OrderID)
+			return
+		}
+		atomic.StoreInt32(&entry.triggered, 0) // allow retry on the next tick
+		return
+	}
+	if capReached {
+		pm.cancelForCapReached(ctx, entry, ltp)
+		return
 	}
 
 	// Promote from STOP_LOSS → LIMIT so the executor places the order at broker.
@@ -756,6 +898,11 @@ func (pm *PriceMonitor) triggerOrder(ctx context.Context, entry *watchEntry, ltp
 	// onAfterFill (if set) is called on success to wire ML exit setup for
 	// below_min + MULTI_LEVEL orders.
 	if err := pm.executeFn.ExecuteOrder(ctx, order); err != nil {
+		// This attempt's reservation will not become a trade — hand the slot back
+		// so a failed placement never permanently consumes the strategy's budget.
+		// (A retry re-reserves; giving up leaves the slot free for another stock.)
+		pm.releaseStrategySlot(ctx, order, reserved)
+
 		attempts := atomic.AddInt32(&entry.triggerAttempts, 1)
 		log.Printf("[price-monitor] ✗ Failed to execute triggered order %s (trigger attempt %d/%d): %v",
 			order.OrderID, attempts, maxTriggerAttempts, err)

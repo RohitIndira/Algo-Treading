@@ -27,7 +27,13 @@ const (
 	maxMessageSize = 8192
 
 	wsEndpoint = "wss://livemiddleware.indiratrade.com/order-notify/websocket"
-	wsTokenAPI = "/order-notify/ws/createWsToken"
+	// Absolute URL, deliberately NOT relative to Client.baseURL: baseURL carries
+	// the versioned /v1 prefix used by order-services/portfolio-services, but
+	// order-notify lives on livemiddleware.indiratrade.com directly (same host
+	// as wsEndpoint above, no /v1). Joining this against baseURL previously
+	// produced .../v1/order-notify/ws/createWsToken, which doesn't route to
+	// Indira at all — it silently returned an unrelated HTML page.
+	wsTokenAPI = "https://livemiddleware.indiratrade.com/order-notify/ws/createWsToken"
 
 	// tokenRefreshPeriod refreshes the WS token proactively before the typical 1-hour expiry.
 	tokenRefreshPeriod = 50 * time.Minute

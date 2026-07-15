@@ -10,6 +10,10 @@ const (
 	ConfigDeleted ConfigEventType = "CONFIG_DELETED"
 	ConfigPaused  ConfigEventType = "CONFIG_PAUSED"
 	ConfigResumed ConfigEventType = "CONFIG_RESUMED"
+	// ConfigActivated is emitted on strategy reactivation. The rules-engine upserts
+	// the strategy (like CONFIG_UPDATED) AND re-runs the AMN backfill when the
+	// strategy is AMN-enabled — distinct from a plain edit, which never re-runs it.
+	ConfigActivated ConfigEventType = "CONFIG_ACTIVATED"
 )
 
 // ConfigEvent is the Kafka message payload published by User Config Service.

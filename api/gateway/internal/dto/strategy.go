@@ -20,6 +20,32 @@ type CreateStrategyRequest struct {
 	// When non-empty, the backfill places orders ONLY for these stocks; when empty
 	// it falls back to all affordable matches up to the trade cap.
 	AMNSelectedStocks []string `json:"amn_selected_stocks,omitempty"`
+
+	// AMNSelection is the richer per-stock AMN preview pick (bucket + pricing). It
+	// is persisted as the day-1 activation record; the backfill's ISIN filter is
+	// derived from it. Preferred over AMNSelectedStocks when both are present.
+	AMNSelection []AMNSelectedStock `json:"amn_selection,omitempty"`
+}
+
+// AMNSelectedStock is one stock the user picked in the AMN preview, carrying the
+// preview-time bucket + pricing so 'monitor' (price-watch) picks are persisted too.
+type AMNSelectedStock struct {
+	ISIN           string  `json:"isin"`
+	Symbol         string  `json:"symbol"`
+	NSECode        int64   `json:"nse_code"`
+	Bucket         string  `json:"bucket"` // "place" | "monitor"
+	TargetPrice    float64 `json:"target_price"`
+	EntryPrice     float64 `json:"entry_price"`
+	Quantity       int32   `json:"quantity"`
+	InvestedAmount float64 `json:"invested_amount"`
+}
+
+// ActivateStrategyRequest is the JSON body for POST /strategies/{id}/activate.
+// For AMN strategies AMNSelection is required (fresh preview pick submitted on the
+// reactivation popup); it is ignored for non-AMN strategies.
+type ActivateStrategyRequest struct {
+	UserID       string             `json:"user_id"`
+	AMNSelection []AMNSelectedStock `json:"amn_selection,omitempty"`
 }
 
 // UpdateStrategyRequest represents the JSON body for updating a strategy

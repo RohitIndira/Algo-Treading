@@ -16,6 +16,7 @@ func NewRouter(
 	amnPreviewHandler *handlers.AMNPreviewHandler,
 	corsConfig middleware.CORSConfig,
 	authConfig middleware.AuthConfig,
+	credsSyncer middleware.CredentialsSyncer,
 	logger *zap.Logger,
 ) http.Handler {
 
@@ -41,7 +42,7 @@ func NewRouter(
 	api := r.PathPrefix("/api/v1").Subrouter()
 	// Auth verification — runs on all /api/v1 routes; health and OPTIONS are
 	// skipped inside the middleware itself.
-	api.Use(middleware.Auth(authConfig))
+	api.Use(middleware.Auth(authConfig, credsSyncer))
 
 	// Global OPTIONS route for preflight
 	api.Methods(http.MethodOptions).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

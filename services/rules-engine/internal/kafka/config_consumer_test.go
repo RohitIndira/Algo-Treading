@@ -153,5 +153,69 @@ func TestConfigConsumer_Deleted_RemovesFromBoth(t *testing.T) {
 	}
 }
 
+func TestConfigConsumer_Activated_TriggersBackfillWithSelection(t *testing.T) {
+	store := configstore.New()
+	var triggered *models.Strategy
+	trigger := func(s *models.Strategy) { triggered = s }
+
+	// CONFIG_ACTIVATED for an AMN strategy carrying a fresh ISIN selection.
+	payload := `{"type":"CONFIG_ACTIVATED","user_id":"u1","strategy_id":"s1","version":2,"config":{"strategy_id":"s1","user_id":"u1","strategy_name":"n","active":true,"trading_mode":"LIVE","process_after_market_news":true,"amn_selected_stocks":["INE001A01001"],"conditions":{"match_all_news":true,"impact_score_min":1,"impact_score_max":2,"sentiments":[],"categories":[],"stock_codes":[]},"trade_config":{"order_type":"MARKET","quantity":1,"exchange":"NSE","order_side":"BUY"},"risk_limits":{"max_daily_trades":1}}}`
+	r := &fakeReader{msgs: []kafka.Message{{Value: []byte(payload)}}}
+	c := NewConfigConsumer(r, store, trigger)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
+	_ = c.Start(ctx)
+
+	if triggered == nil {
+		t.Fatalf("expected AMN backfill to be triggered on CONFIG_ACTIVATED")
+	}
+	if len(triggered.AMNSelectedStocks) != 1 || triggered.AMNSelectedStocks[0] != "INE001A01001" {
+		t.Fatalf("expected selection forwarded to backfill, got %v", triggered.AMNSelectedStocks)
+	}
+	if _, ok := store.GetStrategy("u1", "s1"); !ok {
+		t.Fatalf("expected strategy upserted on reactivation")
+	}
+}
+
+func TestConfigConsumer_Activated_EmptySelection_NoBackfillButUpserts(t *testing.T) {
+	store := configstore.New()
+	triggered := false
+	trigger := func(s *models.Strategy) { triggered = true }
+
+	// Reactivation with NO pick (e.g. empty AMN window) must upsert the strategy so
+	// it goes live, but must NOT run the backfill (no place-all fallback).
+	payload := `{"type":"CONFIG_ACTIVATED","user_id":"u1","strategy_id":"s1","version":2,"config":{"strategy_id":"s1","user_id":"u1","strategy_name":"n","active":true,"trading_mode":"LIVE","process_after_market_news":true,"amn_selected_stocks":[],"conditions":{"match_all_news":true,"impact_score_min":1,"impact_score_max":2,"sentiments":[],"categories":[],"stock_codes":[]},"trade_config":{"order_type":"MARKET","quantity":1,"exchange":"NSE","order_side":"BUY"},"risk_limits":{"max_daily_trades":1}}}`
+	r := &fakeReader{msgs: []kafka.Message{{Value: []byte(payload)}}}
+	c := NewConfigConsumer(r, store, trigger)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
+	_ = c.Start(ctx)
+
+	if triggered {
+		t.Fatalf("empty-selection reactivation must NOT trigger the AMN backfill")
+	}
+	if _, ok := store.GetStrategy("u1", "s1"); !ok {
+		t.Fatalf("expected strategy still upserted (goes live) on empty-selection reactivation")
+	}
+}
+
+func TestConfigConsumer_Updated_DoesNotTriggerBackfill(t *testing.T) {
+	store := configstore.New()
+	triggered := false
+	trigger := func(s *models.Strategy) { triggered = true }
+
+	// A plain edit (CONFIG_UPDATED) of an AMN strategy must NOT re-run the backfill.
+	payload := `{"type":"CONFIG_UPDATED","user_id":"u1","strategy_id":"s1","version":2,"config":{"strategy_id":"s1","user_id":"u1","strategy_name":"n","active":true,"trading_mode":"LIVE","process_after_market_news":true,"conditions":{"match_all_news":true,"impact_score_min":1,"impact_score_max":2,"sentiments":[],"categories":[],"stock_codes":[]},"trade_config":{"order_type":"MARKET","quantity":1,"exchange":"NSE","order_side":"BUY"},"risk_limits":{"max_daily_trades":1}}}`
+	r := &fakeReader{msgs: []kafka.Message{{Value: []byte(payload)}}}
+	c := NewConfigConsumer(r, store, trigger)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
+	_ = c.Start(ctx)
+
+	if triggered {
+		t.Fatalf("plain CONFIG_UPDATED must not trigger the AMN backfill")
+	}
+}
+
 // ensure configsync is linked
 var _ = configsync.ConfigEvent{}

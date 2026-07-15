@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -40,11 +42,54 @@ var publicPaths = map[string]bool{
 	"/api/v1/health": true,
 }
 
+// CredentialsSyncer pushes a freshly-verified broker bearer token to
+// user-config. Implemented by grpc_clients.UserConfigClient.
+type CredentialsSyncer interface {
+	SyncCredentials(ctx context.Context, userID, appID, source, bearerToken string) error
+}
+
+// credsSyncState remembers the last bearer token synced per user so Auth
+// doesn't write to broker_accounts on every request — only when the
+// frontend's token has actually changed since the last time we saw it.
+type credsSyncState struct {
+	mu   sync.Mutex
+	last map[string]string
+}
+
+// maybeSync fires an async credentials sync only when bearerToken differs
+// from the last one seen for userID. Every authenticated gateway request
+// already carries a verified, current token (the frontend attaches it on
+// every call) — this keeps trade-execution's broker_accounts copy fresh off
+// of that, instead of relying on a single handler (ActivateStrategy) to
+// remember to write it.
+func (s *credsSyncState) maybeSync(syncer CredentialsSyncer, userID, appID, source, bearerToken string) {
+	if syncer == nil || userID == "" || appID == "" || source == "" || bearerToken == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.last[userID] == bearerToken {
+		s.mu.Unlock()
+		return
+	}
+	s.last[userID] = bearerToken
+	s.mu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := syncer.SyncCredentials(ctx, userID, appID, source, bearerToken); err != nil {
+			log.Printf("[auth] credentials sync failed for user %s: %v", userID, err)
+		}
+	}()
+}
+
 // Auth returns middleware that verifies every request's JWT token against the
 // external Indira auth service. Requests without a valid token are rejected
-// with a 401 before they reach any handler.
-func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
+// with a 401 before they reach any handler. On success it also opportunistically
+// syncs the verified token to user-config via syncer (may be nil to disable).
+func Auth(cfg AuthConfig, syncer CredentialsSyncer) func(http.Handler) http.Handler {
 	client := &http.Client{Timeout: cfg.Timeout}
+	syncState := &credsSyncState{last: make(map[string]string)}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,6 +109,7 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 			token := extractBearerToken(r)
 			userID := r.Header.Get("userId")
 			appID := r.Header.Get("appId")
+			source := r.Header.Get("source")
 
 			if token == "" || userID == "" || appID == "" {
 				writeAuthJSON(w, http.StatusUnauthorized, "UNAUTHORIZED", "Missing required auth credentials: Authorization (Bearer token), userId, appId")
@@ -89,7 +135,9 @@ func Auth(cfg AuthConfig) func(http.Handler) http.Handler {
 				}
 			}
 
-			// Token is valid — propagate claims into context.
+			// Token is valid — opportunistically keep trade-execution's
+			// broker_accounts copy in sync, then propagate claims into context.
+			syncState.maybeSync(syncer, userID, appID, source, token)
 			ctx := context.WithValue(r.Context(), AuthUserKey, claims)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

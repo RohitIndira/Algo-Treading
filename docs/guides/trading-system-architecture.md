@@ -1,5 +1,21 @@
 # Algorithmic Trading System Architecture
 
+> ⚠️ **This is the original DESIGN document. Several parts do not match the code as built.**
+> Verified against the codebase on 2026-07-13. Key as-built corrections (authoritative source: the code, and [`docs/SERVICE_DEPENDENCIES.md`](../SERVICE_DEPENDENCIES.md)):
+>
+> | This doc says | As built (code) |
+> |---|---|
+> | Order execution consumes from **RabbitMQ** `order.execution.queue` | **Kafka** `trade-signals` topic. RabbitMQ config exists but is **not used** on the live path |
+> | Ingestion topic `market.data.news` | `news-events` |
+> | User Config stores configs in **MongoDB** + Redis hot cache | **PostgreSQL** `trading_db`; **no Redis** in user-config |
+> | Rules Engine loads strategies from **PostgreSQL (cached in Redis)** | **In-memory** config store, seeded by gRPC `BulkLoad` from user-config and kept in sync via `user-config-events` Kafka topic; PostgreSQL only for trade-signal auditing |
+> | Trade Execution does pre/post-trade risk via **Risk Management gRPC** | Trade Execution **never calls** risk-management; risk is checked in **rules-engine** (and is **fail-open**) |
+> | Risk Management uses **PostgreSQL** for history | **Redis only**; also excluded from the PM2 deployment |
+> | API Gateway exposes gRPC for order status | Gateway speaks gRPC to **user-config only**; orders/AMN are HTTP proxies |
+> | "Monitoring & Observability Service" (#7) as a service | Not a separate service; each Go service exposes Prometheus `/metrics` |
+>
+> The current, code-derived component/flow view lives in [`docs/ARCHITECTURE.drawio`](../ARCHITECTURE.drawio).
+
 ## System Overview
 
 A high-performance, event-driven microservices-based algorithmic trading system for Indian stock markets, supporting 10,000+ concurrent users with personalized trading strategies based on real-time news sentiment and impact scores.
@@ -371,32 +387,32 @@ service RiskManagementService {
 
 ## Data Flow Architecture
 
-### Flow 1: Market Data Ingestion
+### Flow 1: Market Data Ingestion  *(as built)*
 ```
-MongoDB (News Updates) 
-  -> Change Stream 
-  -> Data Ingestion Service 
-  -> Kafka Topic (market.data.news)
+MongoDB (CAG_CHATBOT.NewsImpactDashboard)
+  -> Change Stream
+  -> Data Ingestion Service (+ Redis company-master enrichment)
+  -> Kafka Topic (news-events)
   -> Rules Processing Engine
 ```
 
-### Flow 2: Strategy Matching
+### Flow 2: Strategy Matching  *(as built)*
 ```
-Kafka Consumer (Rules Engine)
-  -> Load Strategies (PostgreSQL / Redis cache)
-  -> Evaluate Conditions (in-memory matching)
+Kafka Consumer (Rules Engine: news-events)
+  -> Match against in-memory strategies (seeded via gRPC BulkLoad from user-config,
+     kept in sync via user-config-events)
+  -> Pre-trade risk check via Risk Management gRPC (fail-open)
   -> Generate Trade Signal
   -> Publish to Kafka (trade-signals)
 ```
 
-### Flow 3: Order Execution
+### Flow 3: Order Execution  *(as built — Kafka, not RabbitMQ; no risk gRPC here)*
 ```
-RabbitMQ Consumer (Trade Execution Service)
-  -> Pre-Trade Risk Check (Risk Management Service via gRPC)
-  -> Submit Order to Indira Securities API
-  -> Update Order Status (PostgreSQL)
-  -> Post-Trade Metrics (Risk Management Service via gRPC)
-  -> Send Confirmation (WebSocket/Notification)
+Kafka Consumer (Trade Execution Service: trade-signals)
+  -> Route live vs paper; live -> Indira Securities REST API
+  -> Update Order Status (PostgreSQL trading_execution)
+  -> Per-user Indira order-status WebSocket -> in-process broadcast to frontend WS
+  -> Publish execution events (trade-executions, order-updates)
 ```
 
 ### Flow 4: User Configuration Update
@@ -414,11 +430,10 @@ User Dashboard (Web/API)
 ## Message Queue Strategy
 
 ### Kafka (Data Ingestion)
-**Topic**: `market.data.news`
-- **Partitions**: 50 (partition by stock code)
-- **Replication Factor**: 3
-- **Retention**: 7 days
-- **Consumer Group**: `rules-engine-group` (50 consumers)
+**Topic**: `news-events`  *(as built — the design-time name `market.data.news` is not used)*
+- **Consumer Group**: `rule-engine-news-processor` (default; see rules-engine config)
+- Additional live topics: `user-config-events`, `trade-signals`, `trade-executions`, `order-updates`
+- Note: topics auto-create with 1 partition by default (`EnsureTopicExists(..., 1, 1)`); partition/replication targets below are aspirational
 
 **Why Kafka**:
 - High throughput for market data stream

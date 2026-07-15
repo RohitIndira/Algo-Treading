@@ -33,7 +33,7 @@ This document maps every real dependency found in the codebase, what breaks when
 | 6 | **LTP Market Data Socket** | External WSS | `wss://stockkaskwebsocket.indiratrade.com/enhanced-stream` | Real-time tick feed for SL/TP price monitoring — **binary + JSON frames** |
 | 7 | **Order Status Socket** | External WSS | `wss://livemiddleware.indiratrade.com/order-notify/websocket` | Per-user order execution confirmations from broker |
 | 8 | **Indira REST API** | External HTTPS | `INDIRA_BASE_URL` (configured) | Order place / modify / cancel / portfolio / fund limits |
-| 9 | **Auth Service** | External HTTPS | `https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token` | Bearer token verification on every API request |
+| 9 | **Auth Service** | External HTTPS | `AUTH_VERIFY_URL` — code default `https://trade.indiratrade.com/auth-services/api/auth/verify/token` | Bearer token verification on API requests. Note: when the URL contains `trade.indiratrade.com` the gateway sets `Bypass=true` (see `api/gateway/config/config.go`) |
 
 > **Note on LTP Socket vs Order Status Socket:**  
 > These are **two separate WebSocket connections to two different Indira hosts.**  
@@ -61,53 +61,49 @@ This document maps every real dependency found in the codebase, what breaks when
 ### 3.1 API Gateway
 
 **Port:** `8081` (HTTP/REST + WebSocket)  
-**Role:** Single entry point for the frontend; translates REST → gRPC; hosts client-facing WebSocket streams.
+**Role:** Single entry point for the frontend. It speaks gRPC to **user-config only**; every other backend interaction is an **HTTP reverse-proxy** or a client-facing WebSocket. It is otherwise DB-free.
+
+> **Corrected against code (`api/gateway`):** the gateway constructs exactly one gRPC client — `grpc_clients.NewUserConfigClient` (`cmd/main.go`). It does **not** hold gRPC clients for rules-engine, trade-execution, or risk-management. Paper/live order endpoints and the AMN preview are HTTP proxies (`config.go`: `TRADE_EXECUTION_PAPER_URL`, `RULES_ENGINE_URL`). Risk-management is never contacted by the gateway.
 
 #### Dependency Table
 
 | Dependency | Type | Why It's Needed | Failure Mode if Down |
 |------------|------|-----------------|----------------------|
-| **Redis** | Cache / Pub-Sub | WebSocket relay — subscribes to `orders:{userId}` and `matches:all` Redis pub/sub channels | All client order-status sockets go silent immediately |
-| **Auth Service** (`livemiddleware.indiratrade.com`) | External HTTPS | Verifies Bearer token on **every** authenticated request | All users get 401; no API access at all |
-| **User Config Service** (gRPC `:50051`) | Microservice | Strategy CRUD, credential management, activate/deactivate | All `/api/v1/strategies` endpoints return 503 |
-| **Rules Engine Service** (gRPC `:50053`) | Microservice | Match stats, active rule count endpoints | Match-stat endpoints fail; trading unaffected |
-| **Trade Execution Service** (gRPC `:50054`) | Microservice | Order status, cancel, modify, history | All order management endpoints fail |
-| **Risk Management Service** (gRPC `:50055`) | Microservice | Risk metrics dashboard, user positions | Risk dashboard endpoints fail |
+| **Auth Service** | External HTTPS | Auth middleware verifies the Bearer token on `/api/v1/*` (skipped for health/OPTIONS, and when `Bypass` is set) | All users get 401 (unless bypassed) |
+| **User Config Service** (gRPC `:50051`) | Microservice | Strategy CRUD via `UserConfigService` | All `/api/v1/strategies*` endpoints fail |
+| **Trade Execution** (HTTP proxy, `TRADE_EXECUTION_PAPER_URL`) | Microservice | Proxies `/paper-trades/*`, `/live-orders/*`, `/auto-square-off/*`, `/dashboard-stats` to trade-execution's paper WS/HTTP server | Paper & live order management endpoints fail |
+| **Rules Engine** (HTTP proxy, `RULES_ENGINE_URL`) | Microservice | Proxies `POST /amn-preview` to the rules-engine preview HTTP server (`:8082`) | AMN preview fails; trading unaffected |
+| **Redis** | Pub-Sub | Backs the **match feed** WebSockets: `/ws/matches` subscribes to `user:{userId}:matches`, `/ws/matches/all` pattern-subscribes to `user:*:matches` | Match-feed sockets go silent (order/paper feeds are unaffected — see 3.2) |
 
 ---
 
-### 3.2 Order Status WebSocket — `/api/v1/ws/orders/{userId}`
+### 3.2 Client-facing WebSockets
 
-**Role:** Pushes real-time order execution updates from the broker all the way to the frontend browser.
+**Corrected against code.** There is **no** `/api/v1/ws/orders/{userId}` route and no `orders:{userId}` Redis relay. Two distinct WebSocket surfaces exist:
 
-#### Full Data Flow
+**(a) Match feed — served by the API Gateway** (`/ws/matches`, `/ws/matches/all`):
 
 ```
-Indira Order Status Socket (livemiddleware WSS)
-    └─► Trade Execution Service
-            └─► Redis PUBLISH  orders:{userId}
-                    └─► API Gateway (sub)
-                            └─► Frontend Browser WebSocket
+rules-engine  ──PUBLISH user:{userId}:matches──►  Redis  ──►  API Gateway (SUBSCRIBE / PSUBSCRIBE)  ──►  Frontend
 ```
 
-#### Dependency Table
+**(b) Live/paper order feed — served directly by trade-execution's paper WS server** (`/ws/live-orders`, `/ws/paper-trades`), **not** the gateway and **not** via Redis pub/sub:
+
+```
+Indira Order-Status WS (per-user)  ──►  trade-execution OrderStatusService
+        └─► in-process broadcast (paper.PaperWSServer)  ──►  Frontend WebSocket
+Market-data WS ticks  ──►  live/paper monitors  ──►  pnl_update / position_exit broadcasts  ──►  Frontend
+```
 
 | Dependency | Type | Why It's Needed | Failure Mode if Down |
 |------------|------|-----------------|----------------------|
-| **Indira Order Status Socket** (`livemiddleware WSS`) | External WSS | Source of fill/rejection/modification events from broker | No execution updates reach the system; orders stuck at `SUBMITTED` |
-| **Trade Execution Service** | Microservice | Receives broker events and publishes to Redis channel | Channel goes silent; frontend sees stale order state |
-| **Redis** | Pub-Sub | Bridge between Trade Execution (publisher) and API Gateway (subscriber) | Socket connects but receives nothing; client sees stale state |
-| **API Gateway** | Self | Hosts the WebSocket handler and manages client connections | All active client sockets disconnect |
+| **Indira Order-Status Socket** (per-user WSS) | External WSS | Source of fill/rejection/status events per user | Order feed stalls; orders stuck at `SUBMITTED` |
+| **Trade Execution Service** | Microservice | Hosts the live/paper WS server; broadcasts broker events + monitor P&L in-process | Live/paper order sockets go silent |
+| **Redis** | Pub-Sub | Needed **only** for the gateway match feed, not for the order feed | Match feed silent; order feed unaffected |
 
-#### Token Lifecycle (Indira Order Status Socket)
+#### Token Lifecycle (Indira Order-Status Socket)
 
-The Indira WSS requires a **short-lived token** refreshed every 50 minutes:
-1. REST `GET /order-notify/ws/createWsToken` → get `orderToken`
-2. Connect to `wss://livemiddleware.indiratrade.com/order-notify/websocket`
-3. Send `{"userId": "...", "orderToken": "..."}` as first message
-4. Send heartbeat `{"userId": "...", "heartbeat": "h"}` every 45 seconds
-
-If the token refresh REST call fails → WebSocket disconnects → order updates stop.
+The Indira order WS uses a short-lived token (refreshed periodically). The `proxy-server.js` helper (`:3001`) fetches the WS token (`/order-notify/ws/createWsToken`) for the frontend. If token refresh fails → the socket disconnects → order updates stop.
 
 ---
 
@@ -120,31 +116,34 @@ If the token refresh REST call fails → WebSocket disconnects → order updates
 
 | Dependency | Type | Why It's Needed | Failure Mode if Down |
 |------------|------|-----------------|----------------------|
-| **PostgreSQL** | Database | Primary store for all strategies, credentials, strategy state | All strategy reads/writes fail; service cannot start without DB |
-| **Redis** | Cache | Caches active strategies for fast Rules Engine queries | Cache invalidation fails on updates; stale rules in Rules Engine until TTL expires |
-| **Kafka** (`user-config-events`) | Message Broker | Publishes strategy lifecycle events | Rules Engine and Trade Execution don't learn about config changes until restart/poll |
+| **PostgreSQL** (`trading_db`) | Database | Primary store for strategies + transactional outbox | All strategy reads/writes fail; service cannot start without DB |
+| **PostgreSQL** (`trading_execution`) | Database | Stores AES-encrypted broker credentials (written here so trade-execution can read them). Non-fatal: falls back to a no-op creds repo if unreachable | Broker credentials are not persisted |
+| **Kafka** (`user-config-events`) | Message Broker | Outbox worker publishes strategy lifecycle events | Rules Engine and Trade Execution don't learn about config changes until restart/poll |
 
-#### Built-in Scheduled Tasks
+> **Corrected against code:** user-config does **not** use Redis (no Redis client in `cmd/main.go`). Strategy state reaches rules-engine via gRPC bootstrap + the `user-config-events` Kafka topic, not a Redis cache.
 
-| Task | File | Schedule | What It Does |
-|------|------|---------|--------------|
-| **EOD Paper Deactivation** | `internal/scheduler/eod_deactivation.go` | 15:00 IST weekdays | Deactivates all paper trading strategies globally |
-| **EOD Live Deactivation** | same file | 15:30 IST weekdays | Deactivates all live trading strategies globally |
-| **Per-User Square-Off** | same file | User-configured `auto_square_off_time` | Deactivates individual user's strategies at their custom time |
+#### Built-in Scheduled Tasks (`internal/scheduler/eod_deactivation.go`)
+
+| Task | Schedule | What It Does |
+|------|---------|--------------|
+| **EOD Paper Deactivation** | `EOD_PAPER_DEACTIVATION_TIME`, default **15:00 IST** weekdays | Deactivates all active `PAPER` strategies globally |
+| **EOD Live Deactivation** | `EOD_LIVE_DEACTIVATION_TIME`, default **15:05 IST** weekdays | Deactivates all active `LIVE` strategies globally |
+| **Per-User Custom Square-Off** | Each strategy's `auto_square_off_time` | Deactivates strategies whose `enable_auto_square_off=true` when the current minute matches their time |
 
 ---
 
 ### 3.4 Data Ingestion Service
 
-**Port:** `50052` (gRPC, minimal)  
-**Role:** Watches MongoDB change streams for new market/news events and publishes them to Kafka.
+**Port:** none — this service runs **no gRPC/HTTP server** (it is a MongoDB change-stream watcher). The `:50052` in docker-compose is unused.  
+**Role:** Watches a MongoDB change stream for new news documents, enriches them from a Redis company master, and publishes to Kafka `news-events`.
 
 #### Dependency Table
 
 | Dependency | Type | Why It's Needed | Failure Mode if Down |
 |------------|------|-----------------|----------------------|
-| **MongoDB** (`trading_db` collection) | Database | Change stream source — watches for new documents | No new events detected; entire downstream pipeline stalls |
-| **Kafka** (`news-events` producer) | Message Broker | Publishes enriched market events downstream | Events accumulate in memory or drop; Rules Engine starves |
+| **MongoDB** (`MONGO_DATABASE` default `CAG_CHATBOT`, collection `NewsImpactDashboard`) | Database | Change-stream source — watches for new news inserts | No new events detected; downstream pipeline stalls |
+| **Redis** (DB0) | Cache | Company-master lookup by ISIN (`isin:{ISIN}`); a scheduler loads/refreshes the master from MongoDB. News for companies not in the master (or inactive) is skipped | Enrichment fails; matching news is dropped |
+| **Kafka** (`news-events` producer) | Message Broker | Publishes enriched news events downstream | Events drop; Rules Engine starves |
 
 > **Note:** Data Ingestion has a **replay mode** (`cmd/replay/main.go`) that can re-publish historical events from MongoDB into Kafka — useful for recovering from extended Kafka outages.
 
@@ -152,19 +151,22 @@ If the token refresh REST call fails → WebSocket disconnects → order updates
 
 ### 3.5 Rules Engine Service
 
-**Port:** `50053` (gRPC)  
-**Role:** Evaluates active strategies against incoming market events; emits trade signals if conditions match (threshold: 80% score).
+**Port:** no gRPC server runs (`cmd/main.go`: "currently none in rules-engine"). It exposes a Prometheus metrics port (`:9103`) and a lightweight **AMN preview HTTP server** (`:8082`). Runs as a set of Kafka consumers + an in-memory matching engine.  
+**Role:** Evaluates active strategies against incoming news events; emits trade signals when a strategy matches.
 
 #### Dependency Table
 
 | Dependency | Type | Why It's Needed | Failure Mode if Down |
 |------------|------|-----------------|----------------------|
-| **Kafka** (`news-events` consumer + `trade-signals` producer + `user-config-events` consumer) | Message Broker | Consumes market events; publishes matched signals; refreshes rules on config changes | No signals generated; trading pipeline stops completely |
-| **Redis** | Cache | Active strategy cache (keyed by user); LTP price lookup (`nse:2475` → `{"ltp": ..., "tick_size": ..., "prev_close": ...}`) | Cache miss → PostgreSQL fallback (10–100× slower); LTP-based conditions evaluate stale prices |
-| **PostgreSQL** | Database | Fallback for active strategy load when Redis cache is cold | If both Redis and PostgreSQL are down, service cannot evaluate any rules |
-| **MongoDB** (`OdinMasterData.HolidayMaster`) | Database | Daily holiday schedule check — skips event processing on trading holidays | Processes events on market holidays (generates false signals) |
-| **User Config Service** (gRPC `:50051`) | Microservice | Fetches initial full strategy list at startup | Startup fails to pre-warm strategy cache; first events miss all strategies |
-| **Risk Management Service** (gRPC `:50055`) | Microservice | Pre-signal risk check before publishing to `trade-signals` | Orders blocked (fail-closed) or pass unchecked depending on config |
+| **User Config Service** (gRPC `:50051`) | Microservice | **Hard startup requirement** — `BulkLoad`s all active strategies into the in-memory config store before consuming (`startup.Bootstrapper`) | Service `Fatal`s at startup; will not run |
+| **Kafka** (`news-events` consumer + `user-config-events` consumer + `trade-signals` producer) | Message Broker | Consumes news; keeps the config store in sync on strategy events; publishes matched signals | No signals generated; pipeline stops |
+| **Redis** (DB0) | Cache / Pub-Sub | LTP lookup (`nse:2475` → `{ltp, tick_size, prev_close}`); publishes matches to `user:{userId}:matches` for the gateway feed | LTP conditions evaluate stale/zero; match feed silent |
+| **Redis** (DB1 tickstore, `TICKSTORE_REDIS_DB`) | Cache | Market-price-protection (velocity) check reads the recent tick stream written by trade-execution | Velocity check disabled (fail-open) — never blocks order generation |
+| **PostgreSQL** (`trading_db`) | Database | **Trade-signal tracking only** (audit of generated signals). *Not* a strategy source | Signals aren't recorded in DB; matching/publishing continues (`signalRepo=nil`) |
+| **MongoDB** | Database | Trading-holiday check + AMN backfill/preview (reads `CAG_CHATBOT` news + `OdinMasterData`) | Non-fatal: holiday check disabled (may process on holidays); AMN backfill/preview disabled |
+| **Risk Management Service** (gRPC `:9005`) | Microservice | Pre-signal `CheckPreTradeRisk` before publishing to `trade-signals` | **Fail-open** — if the risk client can't init, `riskClient=nil` and orders are **auto-approved** |
+
+> **Corrected against code:** strategies are held **in-memory** (`configstore`), seeded by a gRPC `BulkLoad` from user-config and kept current via the `user-config-events` Kafka topic. There is **no Redis strategy cache and no PostgreSQL strategy fallback**. Risk checking is **fail-open**, not fail-closed.
 
 #### Built-in Scheduled Tasks
 
@@ -176,8 +178,10 @@ If the token refresh REST call fails → WebSocket disconnects → order updates
 
 ### 3.6 Trade Execution Service
 
-**Port:** `50054` (gRPC)  
-**Role:** Consumes trade signals, validates risk, places orders at Indira, monitors live prices for SL/TP triggers, manages full order lifecycle.
+**Port:** gRPC `:9004` (`SERVICE_PORT`); Prometheus metrics `:9090`; frontend paper/live WS server `:8081` (`PAPER_WS_PORT`). docker-compose maps `:50054`.  
+**Role:** Consumes trade signals, places orders at Indira, monitors live prices for SL/TP triggers, manages the full order lifecycle (OCO/trailing SL, multi-level SL/TP, auto square-off).
+
+> **Corrected against code:** trade-execution does **not** call risk-management. There is no risk-management gRPC client anywhere in `services/trade-execution` — pre-trade risk is enforced upstream in rules-engine. It also consumes `user-config-events` (to close positions on strategy deactivate/delete and to pre-open per-user broker WS).
 
 #### Dependency Table
 
@@ -186,10 +190,10 @@ If the token refresh REST call fails → WebSocket disconnects → order updates
 | **LTP Market Data Socket** (`stockkaskwebsocket WSS`) | External WSS | Real-time price ticks (LTP as float32, per exchange:token) for triggering SL/TP on open orders. Binary frame `0x01` = MARKET_DATA | Price Monitor falls back to Redis polling (100ms); if Redis LTP also stale, SL/TP triggers are delayed or missed entirely |
 | **Kafka** (`trade-signals` consumer + `trade-executions` + `order-updates` producers) | Message Broker | Receives trade signals; publishes execution events and notifications | Signals queue in Kafka; no orders placed; notifications not sent |
 | **PostgreSQL** | Database | Orders table, execution events, transactional outbox, fills, positions | Cannot persist orders; history/status queries fail; duplicate orders possible on restart |
-| **Redis** | Cache | LTP price cache (written by this service from WSS ticks, read by Price Monitor and Rules Engine); user credential cache; order status tracking | LTP becomes stale; SL/TP uses Redis poll fallback; every order needs PostgreSQL credential lookup |
-| **Risk Management Service** (gRPC `:50055`) | Microservice | Pre-trade risk check before every order placement | Fail-closed: orders blocked. Fail-open (misconfigured): orders bypass risk limits |
-| **Indira REST API** | External HTTPS | `POST /place-order`, `POST /cancel-order`, `POST /modify-order`, `GET /order-book`, `GET /fund-limit` | Orders queued but not submitted; all live trades blocked |
-| **Indira Order Status Socket** (`livemiddleware WSS`) | External WSS | Execution confirmations (fills, partial fills, rejections, modifications) → published to Redis `orders:{userId}` | Orders stuck at `SUBMITTED`; no fill confirmations; P&L and positions not updated |
+| **Redis** (DB0) | Cache | LTP / tick-size / DPR lookup for fill price + limit rounding; credential cache warm-up. Non-fatal: runs with hardcoded tick sizes if down | LTP-based fills degrade; every order needs a PostgreSQL credential lookup |
+| **Redis** (DB1) | Cache | Tickstore writer persists every socket tick (`ticks:{exch}:{token}`, TTL 12h) — read by rules-engine's velocity check | Tick history unavailable; algo runs unchanged |
+| **Indira REST API** | External HTTPS | Place / cancel / modify orders, position book, order/trade book | Orders queued but not submitted; all live trades blocked |
+| **Indira Order-Status Socket** (per-user WSS) | External WSS | Execution confirmations (fills, partials, rejections) → broadcast **in-process** to the paper WS server (no Redis relay) | Orders stuck at `SUBMITTED`; no fill confirmations; P&L/positions not updated |
 
 #### LTP Distribution Chain (from code)
 
@@ -223,15 +227,16 @@ Paper trading (`internal/paper/market_client.go`) connects to the **same `stockk
 
 ### 3.7 Risk Management Service
 
-**Port:** `50055` (gRPC)  
+**Port:** gRPC `:9005` (`GRPC_PORT`). docker-compose maps `:50055`.  
 **Role:** Pre-trade risk validation, post-trade metric updates, risk dashboard data.
+
+> **Corrected against code:** `cmd/main.go` wires **only** a Redis repository (`repository.NewRedisRepository`). It does **not** open a PostgreSQL connection (the `DB*` config fields exist but are unused at runtime). This service is also **excluded from the PM2 deployment** (`deploy-pm2.sh`), so in practice rules-engine runs with risk auto-approve.
 
 #### Dependency Table
 
 | Dependency | Type | Why It's Needed | Failure Mode if Down |
 |------------|------|-----------------|----------------------|
-| **PostgreSQL** | Database | Risk limits config, historical risk metrics, violation log | Cannot load limits; all pre-trade checks fail; metrics not persisted across restarts |
-| **Redis** | Cache | Real-time daily counters: trade count, daily P&L, drawdown (atomic increments for concurrency safety) | Counters reset or lost; daily trade count and loss limits may not be enforced correctly until EOD reset |
+| **Redis** | Cache | Risk limits + real-time daily counters (trade count, daily P&L, drawdown) via the Redis repository | Counters/limits unavailable; pre-trade checks cannot be evaluated |
 
 ---
 
@@ -244,21 +249,30 @@ Paper trading (`internal/paper/market_client.go`) connects to the **same `stockk
 > `LOW` — minor UX impact, non-blocking  
 > `—` — no direct dependency
 
-| Component Down | API Gateway | Order Status WS | User Config | Data Ingestion | Rules Engine | Trade Execution | Risk Mgmt |
+> Cells marked ✎ were corrected against the code (see notes below the table).
+
+| Component Down | API Gateway | Order/Match WS | User Config | Data Ingestion | Rules Engine | Trade Execution | Risk Mgmt |
 |----------------|:-----------:|:---------------:|:-----------:|:--------------:|:------------:|:---------------:|:---------:|
-| **PostgreSQL** | HIGH | — | CRITICAL | — | HIGH | CRITICAL | CRITICAL |
+| **PostgreSQL** | ✎— | — | CRITICAL | — | ✎LOW | CRITICAL | ✎— |
 | **MongoDB** | — | — | — | CRITICAL | MEDIUM | — | — |
-| **Redis** | — | CRITICAL | MEDIUM | — | HIGH | HIGH | HIGH |
+| **Redis** | ✎MEDIUM | CRITICAL | ✎— | ✎HIGH | HIGH | HIGH | HIGH |
 | **Kafka** | — | — | HIGH | CRITICAL | CRITICAL | CRITICAL | — |
 | **Zookeeper** | — | — | HIGH | CRITICAL | CRITICAL | CRITICAL | — |
-| **LTP Market Data Socket** | — | — | — | — | MEDIUM | CRITICAL | — |
-| **Order Status Socket** | — | CRITICAL | — | — | — | HIGH | MEDIUM |
+| **Market Data Socket** | — | — | — | — | MEDIUM | CRITICAL | — |
+| **Order Status Socket** | — | CRITICAL | — | — | — | HIGH | ✎— |
 | **Indira REST API** | — | — | — | — | — | CRITICAL | — |
 | **Auth Service** | CRITICAL | CRITICAL | — | — | — | — | — |
-| **User Config Svc** | HIGH | — | self | — | LOW | LOW | — |
+| **User Config Svc** | HIGH | — | self | — | ✎HIGH¹ | LOW | — |
 | **Rules Engine Svc** | LOW | — | — | — | self | CRITICAL | — |
-| **Trade Exec Svc** | HIGH | CRITICAL | — | — | — | self | MEDIUM |
-| **Risk Mgmt Svc** | LOW | — | — | — | HIGH | HIGH | self |
+| **Trade Exec Svc** | HIGH | CRITICAL | — | — | — | self | ✎— |
+| **Risk Mgmt Svc** | LOW | — | — | — | ✎LOW² | ✎— | self |
+
+**Code-verified corrections:**
+- **PostgreSQL** is not a dependency of the API Gateway (DB-free) or Risk Management (Redis-only). Rules Engine uses PG only for non-fatal trade-signal auditing → LOW.
+- **Redis**: API Gateway match feed (MEDIUM); User Config has no Redis client (—); Data Ingestion needs Redis for company-master enrichment (HIGH).
+- **Order-Status Socket → Risk Mgmt**: risk-management does not consume order-status events (—).
+- ¹ Rules Engine hard-requires User Config at **startup** (`BulkLoad`) — it `Fatal`s if unreachable; steady-state sync is via Kafka.
+- ² Risk Mgmt down → Rules Engine is **fail-open** (auto-approves) → LOW; Trade Execution has no risk dependency (—).
 
 ---
 
@@ -268,14 +282,14 @@ Paper trading (`internal/paper/market_client.go`) connects to the **same `stockk
 
 ### PostgreSQL Down
 
-**Affected:** User Config (CRITICAL), Trade Execution (CRITICAL), Risk Management (CRITICAL), Rules Engine (HIGH)
+**Affected:** User Config (CRITICAL), Trade Execution (CRITICAL), Rules Engine (LOW). **Not affected:** Risk Management (Redis-only, no PG connection in code).
 
 | Service | Exact Impact |
 |---------|-------------|
 | User Config | Strategy CRUD fails; service cannot start cold |
 | Trade Execution | Orders cannot be persisted; duplicate orders possible on restart; history/status queries fail |
-| Risk Management | Risk limits cannot be loaded; all pre-trade checks fail → orders blocked |
-| Rules Engine | Cold-start cannot load strategies; warm Redis cache keeps it running until TTL expires |
+| Rules Engine | Only trade-signal **auditing** stops (`signalRepo=nil`); strategy load is via gRPC/Kafka, so matching and signal publishing continue |
+| Risk Management | No impact — it uses Redis only |
 
 **Solution:**
 - PostgreSQL in **HA mode** (Patroni streaming replication or AWS RDS Multi-AZ) — automatic failover in < 30 seconds
@@ -401,16 +415,16 @@ Paper trading (`internal/paper/market_client.go`) connects to the **same `stockk
 
 ---
 
-### Auth Service Down (`livemiddleware.indiratrade.com/auth-services`)
+### Auth Service Down (`AUTH_VERIFY_URL`)
 
-**Affected:** API Gateway (CRITICAL), Order Status WS (CRITICAL)
+**Affected:** API Gateway (CRITICAL, unless bypassed), Order/Match WS (CRITICAL)
 
 | Service | Exact Impact |
 |---------|-------------|
-| API Gateway | All authenticated requests return 401; no user can access any REST endpoint |
-| Order Status WS | New WebSocket handshakes cannot be authenticated → new connections rejected |
+| API Gateway | All authenticated `/api/v1/*` requests return 401 (health/OPTIONS exempt); no user can access REST endpoints |
+| Order/Match WS | New WebSocket handshakes cannot be authenticated → new connections rejected |
 
-**Note:** Auth Service is on the same `livemiddleware.indiratrade.com` host as the Order Status Socket. If that host goes down, **both** Auth and Order Status Socket fail simultaneously.
+**Note:** the URL is env-driven (`AUTH_VERIFY_URL`). The code default host is `trade.indiratrade.com`, and the gateway auto-sets `Bypass=true` when the URL contains `trade.indiratrade.com` (`api/gateway/config/config.go`) — so with the default config, auth verification is effectively skipped. Confirm the deployed `.env.live` value to know the real posture.
 
 **Solution:**
 - **Cache successful token verifications in Redis** with TTL = `AUTH_TIMEOUT` (default 60 seconds) — existing sessions continue working through brief outages
@@ -456,18 +470,20 @@ Paper trading (`internal/paper/market_client.go`) connects to the **same `stockk
 
 ### Risk Management Service Down
 
-**Affected:** Trade Execution (HIGH), Rules Engine (HIGH), API Gateway (LOW)
+**Affected:** Rules Engine (LOW). **Not affected:** Trade Execution (it never calls risk-management), API Gateway (never contacts it).
+
+> **Reality check from code:** risk-management is **excluded from the PM2 deployment** entirely (`deploy-pm2.sh`), and rules-engine treats a missing/failed risk client as **fail-open** — `riskClient=nil` → orders auto-approved (`cmd/main.go`). So in the current deployment, pre-trade risk is effectively not enforced.
 
 | Service | Exact Impact |
 |---------|-------------|
-| Trade Execution | Pre-trade risk gRPC call times out; behavior is **fail-closed** (order blocked) |
-| Rules Engine | Pre-signal risk check fails; signal may be dropped or passed depending on config |
-| API Gateway | Risk metrics dashboard returns 503 |
+| Rules Engine | `CheckPreTradeRisk` fails to init/call → **auto-approve** (fail-open); signals still published |
+| Trade Execution | No impact — no risk-management client exists in the service |
+| API Gateway | No impact — the gateway has no risk-management dependency |
 
-**Solution:**
-- Configure Trade Execution to **always fail-closed** when Risk Management is unreachable — never fail-open for risk in live trading
-- Add a **fallback in-memory risk check** in Trade Execution for the most critical limits (max position size, daily loss limit) as a secondary gate when gRPC times out
-- Run Risk Management with **2 replicas** — it is stateless at the compute level (state in PostgreSQL + Redis), so Kubernetes restarts are fast
+**Solution (if risk enforcement is desired):**
+- Actually deploy risk-management (add it to `deploy-pm2.sh` / compose) — today it is not run in production
+- Decide the intended posture explicitly in rules-engine: keep **fail-open** for availability, or switch to **fail-closed** for safety when the risk client is down
+- Run Risk Management with **2 replicas** — it is stateless at the compute level (state in Redis), so restarts are fast
 
 ---
 
@@ -495,4 +511,4 @@ API Gateway             2+ replicas behind Load Balancer               <  5 s
 
 ---
 
-*Last updated: 2026-05-25 — derived from actual codebase, not assumptions.*
+*Last updated: 2026-07-13 — re-verified against the codebase. Corrections in this pass: gateway speaks gRPC to user-config only (HTTP-proxies rules-engine & trade-execution; never contacts risk-management); there is no `/api/v1/ws/orders/{userId}` route or `orders:{userId}` Redis relay (match feed uses `user:{id}:matches`; live/paper order feed is served in-process by trade-execution); data-ingestion is a change-stream watcher (no gRPC server) reading `CAG_CHATBOT.NewsImpactDashboard` and enriching from a Redis company master; rules-engine holds strategies in-memory (gRPC bootstrap + Kafka sync), not in Redis/PostgreSQL, and risk-checks fail-open; trade-execution does not call risk-management; risk-management is Redis-only and excluded from the PM2 deployment; user-config has no Redis client; EOD live deactivation is 15:05 (not 15:30).*

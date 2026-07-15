@@ -104,7 +104,9 @@ func main() {
 	log.Printf("Auth middleware configured: verify URL=%s timeout=%s", authConfig.VerifyURL, authConfig.Timeout)
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, amnPreviewHandler, corsConfig, authConfig, logger)
+	// userConfigClient doubles as the CredentialsSyncer the Auth middleware uses
+	// to keep trade-execution's broker_accounts fresh off of every verified request.
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, amnPreviewHandler, corsConfig, authConfig, userConfigClient, logger)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

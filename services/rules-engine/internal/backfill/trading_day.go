@@ -4,6 +4,13 @@ import "time"
 
 var ist = time.FixedZone("IST", 5*60*60+30*60)
 
+// startOfTodayIST returns 00:00 IST for the current day. Used to bound the
+// "already ordered today" duplicate check to the current trading date.
+func startOfTodayIST() time.Time {
+	now := time.Now().In(ist)
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, ist)
+}
+
 // PreviousTradingDay returns the most recent NSE_EQ trading day strictly before
 // today (in IST). It skips weekends and dates present in the nseHolidays set
 // ("YYYY-MM-DD" keys loaded from OdinMasterData.HolidayMaster sub_key=NSE_EQ).

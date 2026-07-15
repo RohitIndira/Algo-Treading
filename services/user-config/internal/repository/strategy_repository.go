@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/google/uuid"
@@ -139,13 +140,14 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	}
 
 	query := `
-		INSERT INTO strategies (strategy_id, user_id, strategy_name, description, active, trading_mode, version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO strategies (strategy_id, user_id, strategy_name, description, active, trading_mode, version, process_after_market_news)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING created_at, updated_at`
 
 	err = tx.QueryRowxContext(ctx, query,
 		strategy.StrategyID, strategy.UserID, strategy.StrategyName,
 		strategy.Description, strategy.Active, strategy.TradingMode, strategy.Version,
+		strategy.ProcessAfterMarketNews,
 	).Scan(&strategy.CreatedAt, &strategy.UpdatedAt)
 	if err != nil {
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
@@ -245,6 +247,18 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		req.RiskLimits.RiskLimitID = riskLimitID
 		req.RiskLimits.StrategyID = strategy.StrategyID
 		strategy.RiskLimits = req.RiskLimits
+	}
+
+	// Persist the AMN preview selection as the day-1 activation record (parent +
+	// per-stock rows) in the same transaction, and derive the ISIN filter carried
+	// in the outbox payload so the create-time backfill places only these stocks.
+	if strategy.ProcessAfterMarketNews {
+		selection := normalizeAMNSelection(req.AMNSelection, req.AMNSelectedStocks)
+		if err := r.upsertAMNActivation(ctx, tx, strategy.StrategyID, strategy.UserID,
+			strategy.Version, models.AMNSourceCreate, todayISTDate(), selection); err != nil {
+			return nil, fmt.Errorf("failed to persist AMN activation: %w", err)
+		}
+		strategy.AMNSelectedStocks = isinsOf(selection)
 	}
 
 	// Insert into Execution Outbox
@@ -417,7 +431,11 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 			return nil, fmt.Errorf("strategy not found or version mismatch")
 		}
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-			return nil, fmt.Errorf("strategy name %q already exists for this user", req.StrategyName)
+			name := ""
+			if req.StrategyName != nil {
+				name = *req.StrategyName
+			}
+			return nil, fmt.Errorf("strategy name %q already exists for this user", name)
 		}
 		return nil, fmt.Errorf("failed to update strategy: %w", err)
 	}
@@ -596,8 +614,11 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 	return tx.Commit()
 }
 
-// Activate activates a strategy
-func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID, userID string) error {
+// Activate activates a strategy. For AMN strategies the caller must pass the fresh
+// AMN preview selection; it is persisted as today's reactivation record (which the
+// outbox worker reads to scope the reactivation backfill). Passing an empty
+// selection for an AMN strategy is rejected — reactivation requires a fresh pick.
+func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID, userID string, selection []models.AMNSelectedStock) error {
 	// Re-using Update logic or similar transaction pattern
 	tx, err := r.db.BeginTxx(ctx, nil)
 	if err != nil {
@@ -605,12 +626,27 @@ func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID,
 	}
 	defer tx.Rollback()
 
-	query := `UPDATE strategies SET active = true, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version`
+	query := `UPDATE strategies SET active = true, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL RETURNING strategy_id, version, process_after_market_news`
 	var updatedID uuid.UUID
 	var currentVersion int32
-	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)
+	var processAMN bool
+	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion, &processAMN)
 	if err != nil {
 		return fmt.Errorf("failed to activate strategy: %w", err)
+	}
+
+	// AMN strategies record today's reactivation pick (source=REACTIVATE); the outbox
+	// worker reads its ISINs to scope the reactivation backfill. An EMPTY pick is
+	// allowed: when the AMN window has no matching news there is nothing to select,
+	// and the strategy must still be able to go live (it trades on live news going
+	// forward). An empty pick simply means no backfill runs — the rules-engine only
+	// triggers the reactivation backfill when the selection is non-empty.
+	if processAMN {
+		selection = normalizeAMNSelection(selection, nil)
+		if err := r.upsertAMNActivation(ctx, tx, strategyID, userID, currentVersion,
+			models.AMNSourceReactivate, todayISTDate(), selection); err != nil {
+			return fmt.Errorf("failed to persist AMN reactivation: %w", err)
+		}
 	}
 
 	// Outbox
@@ -937,4 +973,137 @@ func (r *StrategyRepository) loadMultiLevelConfig(ctx context.Context, tc *model
 	if len(raw.MultiLevelTP) > 0 {
 		_ = json.Unmarshal(raw.MultiLevelTP, &tc.MultiLevelTP)
 	}
+}
+
+// ── AMN Activation Helpers ────────────────────────────────────────────────────
+
+// istLocation is Asia/Kolkata; falls back to a fixed +5:30 offset when the tzdata
+// database is unavailable (e.g. a minimal container image without zoneinfo).
+var istLocation = func() *time.Location {
+	if loc, err := time.LoadLocation("Asia/Kolkata"); err == nil {
+		return loc
+	}
+	return time.FixedZone("IST", 5*3600+30*60)
+}()
+
+// todayISTDate returns today's date in IST as "YYYY-MM-DD" for the DATE column.
+// A plain date string avoids timezone-boundary ambiguity that a time.Time cast
+// to DATE could introduce.
+func todayISTDate() string {
+	return time.Now().In(istLocation).Format("2006-01-02")
+}
+
+// normalizeAMNSelection returns the richer per-stock selection, falling back to
+// ISIN-only stubs (bucket "place") when only a plain ISIN list was supplied. Empty
+// ISINs are dropped.
+func normalizeAMNSelection(rich []models.AMNSelectedStock, isins []string) []models.AMNSelectedStock {
+	if len(rich) > 0 {
+		out := make([]models.AMNSelectedStock, 0, len(rich))
+		for _, s := range rich {
+			if s.ISIN != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	if len(isins) == 0 {
+		return nil
+	}
+	out := make([]models.AMNSelectedStock, 0, len(isins))
+	for _, isin := range isins {
+		if isin != "" {
+			out = append(out, models.AMNSelectedStock{ISIN: isin, Bucket: "place"})
+		}
+	}
+	return out
+}
+
+// isinsOf extracts the ISIN list from a selection (for the outbox/Kafka payload
+// the rules-engine backfill filters on).
+func isinsOf(sel []models.AMNSelectedStock) []string {
+	if len(sel) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(sel))
+	for _, s := range sel {
+		if s.ISIN != "" {
+			out = append(out, s.ISIN)
+		}
+	}
+	return out
+}
+
+// upsertAMNActivation writes (or replaces) the AMN activation record for a strategy
+// on a given trading day within the caller's transaction: one amn_activations
+// parent row (upserted on the (strategy_id, trading_date) unique key) plus a full
+// replacement of its amn_activation_stocks children. Same-day re-activation
+// therefore reflects exactly the latest pick.
+func (r *StrategyRepository) upsertAMNActivation(
+	ctx context.Context,
+	tx *sqlx.Tx,
+	strategyID uuid.UUID,
+	userID string,
+	version int32,
+	source string,
+	tradingDate string,
+	stocks []models.AMNSelectedStock,
+) error {
+	var activationID uuid.UUID
+	upsert := `
+		INSERT INTO amn_activations (strategy_id, user_id, trading_date, source, strategy_version)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (strategy_id, trading_date)
+		DO UPDATE SET source = EXCLUDED.source, strategy_version = EXCLUDED.strategy_version, updated_at = NOW()
+		RETURNING activation_id`
+	if err := tx.QueryRowxContext(ctx, upsert, strategyID, userID, tradingDate, source, version).Scan(&activationID); err != nil {
+		return fmt.Errorf("upsert amn_activations: %w", err)
+	}
+
+	// Replace children so a same-day re-activation reflects the new pick exactly.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM amn_activation_stocks WHERE activation_id = $1`, activationID); err != nil {
+		return fmt.Errorf("clear amn_activation_stocks: %w", err)
+	}
+
+	insert := `
+		INSERT INTO amn_activation_stocks
+			(activation_id, isin, symbol, nse_code, bucket, target_price, entry_price, quantity, invested_amount)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (activation_id, isin) DO NOTHING`
+	for _, s := range stocks {
+		if s.ISIN == "" {
+			continue
+		}
+		bucket := s.Bucket
+		if bucket != "monitor" {
+			bucket = "place"
+		}
+		if _, err := tx.ExecContext(ctx, insert,
+			activationID, s.ISIN, s.Symbol, s.NSECode, bucket,
+			s.TargetPrice, s.EntryPrice, s.Quantity, s.InvestedAmount,
+		); err != nil {
+			return fmt.Errorf("insert amn_activation_stock %s: %w", s.ISIN, err)
+		}
+	}
+	return nil
+}
+
+// GetLatestActivationISINs returns the ISINs of the most recent AMN activation for
+// a strategy (by trading_date). Used by the outbox worker to scope the reactivation
+// backfill to the pick the user just submitted.
+func (r *StrategyRepository) GetLatestActivationISINs(ctx context.Context, strategyID uuid.UUID) ([]string, error) {
+	isins := []string{}
+	query := `
+		SELECT s.isin
+		FROM amn_activation_stocks s
+		WHERE s.activation_id = (
+			SELECT activation_id FROM amn_activations
+			WHERE strategy_id = $1
+			ORDER BY trading_date DESC
+			LIMIT 1
+		)
+		ORDER BY s.id ASC`
+	if err := r.db.SelectContext(ctx, &isins, query, strategyID); err != nil {
+		return nil, fmt.Errorf("failed to fetch latest AMN activation ISINs: %w", err)
+	}
+	return isins, nil
 }

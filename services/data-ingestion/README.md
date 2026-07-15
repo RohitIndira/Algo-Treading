@@ -12,19 +12,26 @@ The Data Ingestion Service is the entry point for all market data into the tradi
 ## 📊 Architecture
 
 ```
-External MongoDB (StockGPT) → Change Stream Watcher → Kafka Producer → news-events topic
-                                      ↓
-                              Rules Engine Consumes
+MongoDB change stream (CAG_CHATBOT.NewsImpactDashboard)
+        │
+        ▼
+  Change Stream Watcher ──► Redis company-master lookup (isin:{ISIN}, DB0)
+        │                        │  (skip if company missing / inactive)
+        │  dedupe + validate     │
+        ▼                        ▼
+   Kafka Producer ──────────► news-events topic ──► Rules Engine consumes
 ```
+
+A background scheduler also loads/refreshes the company master from MongoDB into Redis so the watcher's per-document lookup is a fast cache hit.
 
 ## 🔄 Data Flow
 
-1. **MongoDB Insert** - New news article inserted into MongoDB
-2. **Change Stream** - Watcher detects the insertion in real-time
-3. **Extract Data** - Full document extracted from change event
-4. **Transform** - Convert to Extended JSON format
-5. **Publish** - Send to Kafka `news-events` topic
-6. **Rules Engine** - Downstream services consume and process
+1. **MongoDB Insert** - New news document inserted into `CAG_CHATBOT.NewsImpactDashboard`
+2. **Change Stream** - Watcher detects the insert in real-time (INSERT ops only)
+3. **Dedupe + validate** - Duplicate document IDs are dropped; the document is validated
+4. **Enrich** - Company details looked up in Redis by ISIN (`isin:{ISIN}`); documents whose company is not in the master (or inactive) are **skipped**
+5. **Publish** - Enriched payload sent to Kafka `news-events` topic (document `_id` as key)
+6. **Rules Engine** - Consumes and matches against strategies
 
 ## 📁 Project Structure
 
@@ -54,10 +61,14 @@ services/data-ingestion/
 Create `.env` file (already configured):
 
 ```bash
-# MongoDB Configuration
+# MongoDB Configuration (defaults from config/config.go)
 MONGO_URI=mongodb://localhost:27017
-MONGO_DATABASE=trading_system
-MONGO_NEWS_COLLECTION=news_impact_dashboard
+MONGO_DATABASE=CAG_CHATBOT
+MONGO_NEWS_COLLECTION=NewsImpactDashboard
+
+# Redis Configuration (company-master enrichment cache, DB0)
+REDIS_URI=localhost:6379
+REDIS_PASSWORD=
 
 # Kafka Configuration
 KAFKA_BROKERS=localhost:9092
@@ -66,6 +77,8 @@ KAFKA_TOPIC_NEWS=news-events
 # Service Configuration
 LOG_LEVEL=INFO
 ```
+
+> The `MONGO_DATABASE=trading_system` / `news_impact_dashboard` values shown in older docs are **wrong** — the code defaults are `CAG_CHATBOT` and `NewsImpactDashboard`.
 
 ### MongoDB Collection Schema
 
@@ -113,9 +126,9 @@ go run cmd/main.go
 
 ```
 INFO    Starting data-ingestion service
-INFO    Connected to MongoDB    {"database": "trading_system", "collection": "news_impact_dashboard"}
+INFO    Connected to MongoDB    {"database": "CAG_CHATBOT", "collection": "NewsImpactDashboard"}
 INFO    Connected to Kafka      {"brokers": ["localhost:9092"], "topic": "news-events"}
-INFO    started mongo watcher   {"collection": "news_impact_dashboard"}
+INFO    started mongo watcher   {"collection": "NewsImpactDashboard"}
 ```
 
 ## 🧪 Testing the Service
@@ -124,10 +137,10 @@ INFO    started mongo watcher   {"collection": "news_impact_dashboard"}
 
 ```javascript
 // Connect to your MongoDB
-use trading_system
+use CAG_CHATBOT
 
 // Insert test news
-db.news_impact_dashboard.insertOne({
+db.NewsImpactDashboard.insertOne({
   "title": "Test: Reliance Industries announces merger",
   "content": "Reliance Industries today announced...",
   "sentiment": "positive",
@@ -154,7 +167,7 @@ docker exec -it trading-kafka kafka-console-consumer \
 
 ### Method 3: Check Kafka UI
 
-Open http://localhost:8080
+Open http://localhost:8090
 - Navigate to Topics → news-events
 - View messages in real-time
 
@@ -318,8 +331,8 @@ The service doesn't expose HTTP endpoints (it's a pure stream processor). Monito
 
 To process additional fields from MongoDB:
 
-1. Update the change stream watcher (already handles all fields)
-2. No code changes needed - passes through all data
+1. Update the change stream watcher and the enrichment step in `internal/watcher/mongo_watcher.go`
+2. Note the watcher does **not** blindly pass through all data — it enriches from the Redis company master and **skips** documents whose company is missing/inactive
 
 ### Changing Kafka Topic
 
@@ -371,7 +384,7 @@ docker exec -it trading-kafka kafka-console-consumer --bootstrap-server localhos
 
 **Check Kafka UI**:
 ```
-http://localhost:8080
+http://localhost:8090
 ```
 
 The service is ready to ingest news from your MongoDB! 🎯

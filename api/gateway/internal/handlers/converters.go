@@ -165,6 +165,28 @@ func dtoConditionsToProto(c *dto.StrategyConditions) *pb.StrategyConditions {
 	}
 }
 
+// dtoAMNSelectionToProto converts the AMN preview picks from the JSON body into
+// the proto form. Returns nil for an empty/absent selection.
+func dtoAMNSelectionToProto(sel []dto.AMNSelectedStock) []*pb.AMNSelectedStock {
+	if len(sel) == 0 {
+		return nil
+	}
+	out := make([]*pb.AMNSelectedStock, 0, len(sel))
+	for _, s := range sel {
+		out = append(out, &pb.AMNSelectedStock{
+			Isin:           s.ISIN,
+			Symbol:         s.Symbol,
+			NseCode:        s.NSECode,
+			Bucket:         s.Bucket,
+			TargetPrice:    s.TargetPrice,
+			EntryPrice:     s.EntryPrice,
+			Quantity:       s.Quantity,
+			InvestedAmount: s.InvestedAmount,
+		})
+	}
+	return out
+}
+
 func dtoTradeConfigToProto(tc *dto.TradeConfig) *pb.TradeConfig {
 	if tc == nil {
 		return nil

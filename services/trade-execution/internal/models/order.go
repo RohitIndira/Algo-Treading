@@ -167,6 +167,12 @@ type Order struct {
 	// 0 means no upper bound.
 	MaxMonitorPrice *float64 `json:"max_monitor_price,omitempty" db:"max_monitor_price"`
 
+	// MaxTradesPerStrategy is the strategy's daily trade cap, carried so the price
+	// monitor enforces the same hard ceiling when a below_min watch triggers (a
+	// monitored watch is only a real trade at that point). Persisted so the cap
+	// survives restart recovery (reloadFromDB). 0 = no limit. See pkg/tradecap.
+	MaxTradesPerStrategy int32 `json:"max_trades_per_strategy" db:"max_trades_per_strategy"`
+
 	// OCO (One-Cancels-the-Other) group tracking
 	OCOGroupID    *uuid.UUID `json:"oco_group_id,omitempty" db:"oco_group_id"`       // Links all orders in one OCO group
 	OCORole       *string    `json:"oco_role,omitempty" db:"oco_role"`               // ENTRY, SL_LEG, or TP_LEG

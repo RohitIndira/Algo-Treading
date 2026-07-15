@@ -37,6 +37,16 @@ type RedisPriceClient struct {
 	client *redis.Client
 }
 
+// Raw exposes the underlying go-redis client so shared helpers (e.g. the
+// tradecap per-strategy trade counter) can run their scripts on the same
+// connection pool. Returns nil when the client is not initialized.
+func (c *RedisPriceClient) Raw() *redis.Client {
+	if c == nil {
+		return nil
+	}
+	return c.client
+}
+
 // NewRedisPriceClient creates a Redis client for market price lookups.
 // Returns an error if the initial connection ping fails; callers should treat
 // this as non-fatal and pass nil to the monitor/executor when unavailable.

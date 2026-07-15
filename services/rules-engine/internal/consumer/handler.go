@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/tradecap"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/holiday"
@@ -186,6 +187,11 @@ type Handler struct {
 	// window so concurrent worker goroutines cannot both pass a near-limit
 	// check and over-issue trade signals. Keyed by strategy_id.
 	strategyLocks sync.Map
+	// capReserver enforces MaxTradesPerStrategy via an atomic per-strategy daily
+	// Redis counter (pkg/tradecap). Only immediate trades reserve here; below_min
+	// watches reserve later, in trade-execution, when their target triggers.
+	// nil-safe: when Redis is unavailable the cap is not enforced (fail-open).
+	capReserver *tradecap.Reserver
 }
 
 // SetTickHistory wires the tick-store reader used by the market-price-protection
@@ -204,6 +210,31 @@ func (h *Handler) lockStrategy(strategyID string) func() {
 	mu := v.(*sync.Mutex)
 	mu.Lock()
 	return mu.Unlock
+}
+
+// tradeCapSeed returns the value to seed the per-strategy daily trade counter
+// with when its Redis key is absent, so a Redis flush mid-day cannot silently
+// re-open a hard cap. It only touches the DB on a genuine miss: if the key
+// already exists (the common case) it returns 0 and skips the count entirely.
+// The seed is the strategy's committed-trade count today since its last
+// activation — the same window the old DB-count cap used.
+func (h *Handler) tradeCapSeed(ctx context.Context, strategy *models.Strategy) int64 {
+	if h.signalRepo == nil || !h.capReserver.IsEnabled() {
+		return 0
+	}
+	key := tradecap.Key(strategy.StrategyID, time.Now())
+	exists, err := h.redisCache.Raw().Exists(ctx, key).Result()
+	if err != nil || exists > 0 {
+		return 0 // present, or unknown → let the counter continue/start from 0
+	}
+	seed, err := h.signalRepo.CountCommittedTradesToday(ctx, strategy.StrategyID, strategy.UpdatedAt)
+	if err != nil {
+		h.logger.Warn("trade-cap reseed count failed; starting counter from 0",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.Error(err))
+		return 0
+	}
+	return seed
 }
 
 // NewHandler creates a new event handler
@@ -231,6 +262,7 @@ func NewHandler(
 		marketHours:    marketHours,
 		enforceHours:   enforceHours,
 		holidayChecker: holidayChecker,
+		capReserver:    tradecap.New(redisCache.Raw()),
 	}
 }
 
@@ -495,23 +527,12 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	}
 
 	// ── Per-strategy daily trade cap ──────────────────────────────────────────
-	if limit := strategy.RiskLimits.MaxTradesPerStrategy; limit > 0 && h.signalRepo != nil {
-		count, err := h.signalRepo.GetStrategyTradesToday(ctx, strategy.StrategyID, strategy.UpdatedAt)
-		if err != nil {
-			h.logger.Error("Failed to fetch strategy trade count, skipping to be safe",
-				zap.String("strategy_id", strategy.StrategyID),
-				zap.Error(err))
-			return nil
-		}
-		if int32(count) >= limit {
-			h.logger.Info("Skipping — strategy has reached its daily trade limit",
-				zap.String("strategy_id", strategy.StrategyID),
-				zap.String("user_id", strategy.UserID),
-				zap.Int("trades_today", count),
-				zap.Int32("max_trades_per_strategy", limit))
-			return nil
-		}
-	}
+	// Enforced later, at publish time, and only for *immediate* trades — see the
+	// tradecap reservation just before the DB+Kafka publish below. A below_min
+	// order is only a price-monitor watch at this point; it must not consume a
+	// slot until its target actually triggers (enforced in trade-execution).
+	// This is what makes "only traded stocks count" correct: monitoring a stock
+	// no longer eats the cap.
 
 	// When amount-based sizing is active, quantity is derived from the budget at
 	// execution time — skip the stored-qty check in that case.
@@ -919,9 +940,49 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		orderReq.RiskScore = 0.0
 	}
 
+	// ── Per-strategy daily trade cap (immediate trades only) ─────────────────
+	// Reserve a slot atomically right before publishing, and only for immediate
+	// trades. A below_min order is a price-monitor watch — it reserves its slot
+	// later, in trade-execution, at the moment its target triggers. Reserving
+	// here (after every validation/compliance gate) means a slot is consumed only
+	// by an order that is actually going out, so rejected orders never waste one.
+	//
+	// The reservation is atomic across all rules-engine replicas and the
+	// trade-execution monitor (shared Redis key), so the cap is a true hard
+	// ceiling. If Redis is unavailable the reserver is disabled and the cap is
+	// not enforced (fail-open, consistent with the other Redis-backed checks).
+	reservedSlot := false
+	if orderReq.SignalKind() == models.SignalKindImmediate &&
+		strategy.RiskLimits.MaxTradesPerStrategy > 0 && h.capReserver.IsEnabled() {
+		seed := h.tradeCapSeed(ctx, strategy)
+		n, err := h.capReserver.Reserve(ctx, strategy.StrategyID,
+			strategy.RiskLimits.MaxTradesPerStrategy, seed, time.Now())
+		if err != nil {
+			h.logger.Error("Failed to reserve trade slot, skipping to be safe",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("order_id", orderReq.OrderID),
+				zap.Error(err))
+			return nil
+		}
+		if n == tradecap.CapReached {
+			h.logger.Info("Skipping — strategy has reached its daily trade limit",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("user_id", strategy.UserID),
+				zap.Int32("max_trades_per_strategy", strategy.RiskLimits.MaxTradesPerStrategy))
+			return nil
+		}
+		reservedSlot = true
+		h.logger.Info("Reserved daily trade slot",
+			zap.String("strategy_id", strategy.StrategyID),
+			zap.String("order_id", orderReq.OrderID),
+			zap.Int64("slot", n),
+			zap.Int32("max_trades_per_strategy", strategy.RiskLimits.MaxTradesPerStrategy))
+	}
+
 	// ── Publish order (parallel: DB + Kafka, then RabbitMQ) ─────────────
 	// DB save and Kafka publish are independent, so run them concurrently.
 	var pubWg sync.WaitGroup
+	var kafkaErr error
 
 	if h.signalRepo != nil {
 		pubWg.Add(1)
@@ -944,6 +1005,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		go func() {
 			defer pubWg.Done()
 			if err := h.kafkaPubl.PublishTradeSignal(ctx, orderReq); err != nil {
+				kafkaErr = err
 				h.logger.Error("Failed to publish to Kafka trade-signals",
 					zap.Error(err),
 					zap.String("order_id", orderReq.OrderID))
@@ -956,6 +1018,18 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	}
 
 	pubWg.Wait()
+
+	// Release the reserved slot if the trade never actually went out (Kafka is the
+	// path trade-execution consumes). A DB-save failure alone does not release —
+	// the order was still published and will trade.
+	if reservedSlot && kafkaErr != nil {
+		if err := h.capReserver.Release(ctx, strategy.StrategyID, time.Now()); err != nil {
+			h.logger.Warn("Failed to release trade slot after publish failure",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("order_id", orderReq.OrderID),
+				zap.Error(err))
+		}
+	}
 
 	// Record exposure consumed by this order so the next order for this user
 	// sees the updated running total. Best-effort: a Redis error here is logged

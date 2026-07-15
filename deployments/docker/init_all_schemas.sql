@@ -219,6 +219,9 @@ CREATE TABLE IF NOT EXISTS orders (
     current_pct_change DECIMAL(10,4) DEFAULT 0,
     max_monitor_price  DECIMAL(15,2) DEFAULT 0,
 
+    -- Strategy daily trade cap, enforced at price-monitor trigger time (pkg/tradecap). 0 = no limit.
+    max_trades_per_strategy INTEGER NOT NULL DEFAULT 0,
+
     -- OCO (One-Cancels-the-Other) group
     oco_group_id    UUID,
     oco_role        VARCHAR(20),
@@ -341,6 +344,9 @@ CREATE TABLE IF NOT EXISTS trade_signals (
 
     -- Execution tracking
     status           VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    -- IMMEDIATE = real trade placed now; MONITORING = price-monitor watch (not a
+    -- trade, and not counted against the daily cap, until its target triggers).
+    signal_kind      VARCHAR(20) NOT NULL DEFAULT 'IMMEDIATE',
     execution_price  DECIMAL(15,2),
     execution_time   TIMESTAMP,
     broker_order_id  VARCHAR(255),

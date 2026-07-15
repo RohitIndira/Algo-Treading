@@ -89,6 +89,7 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		RiskLimits:             dtoRiskLimitsToProto(reqDTO.RiskLimits),
 		ProcessAfterMarketNews: reqDTO.ProcessAfterMarketNews,
 		AmnSelectedStocks:      reqDTO.AMNSelectedStocks,
+		AmnSelection:           dtoAMNSelectionToProto(reqDTO.AMNSelection),
 		IndiraAuth: &common.IndiraAuthContext{
 			UserId:      userIdHeader,
 			AppId:       appId,
@@ -280,9 +281,7 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 	vars := mux.Vars(r)
 	strategyID := vars["strategy_id"]
 
-	var reqBody struct {
-		UserID string `json:"user_id"`
-	}
+	var reqBody dto.ActivateStrategyRequest
 
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid request body")
@@ -338,8 +337,9 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 	}
 
 	req := &pb.ActivateStrategyRequest{
-		StrategyId: strategyID,
-		UserId:     reqBody.UserID,
+		StrategyId:   strategyID,
+		UserId:       reqBody.UserID,
+		AmnSelection: dtoAMNSelectionToProto(reqBody.AMNSelection),
 	}
 
 	resp, err := h.client.ActivateStrategy(r.Context(), req)

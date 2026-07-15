@@ -5,6 +5,8 @@
 **Project:** AlgoNewsWithCodifi - News-Based Algorithmic Trading Platform
 **Status:** Active Development
 
+> ⚠️ **Read alongside [`PRD.md`](PRD.md) (code-verified).** This BRD is good for UI/module detail, but some parts don't match the current build. Notably: **pre-trade risk is NOT enforced** (risk-management is not deployed → orders auto-approve, fail-open), **auth verify is bypassed by default**, the live "match" feed has no producer, and trade-execution never calls risk-management. See [`PRD.md` §8](PRD.md#8-known-limitations), [`ARCHITECTURE.md`](ARCHITECTURE.md), and [`SERVICE_DEPENDENCIES.md`](SERVICE_DEPENDENCIES.md) for the authoritative, code-derived view.
+
 ---
 
 ## Table of Contents

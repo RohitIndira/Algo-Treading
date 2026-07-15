@@ -59,13 +59,13 @@ func (r *TradeSignalRepository) SaveTradeSignal(ctx context.Context, orderReq *m
 			stock_code, symbol, exchange,
 			order_type, order_side, quantity, price, stop_loss, take_profit,
 			match_score, impact_score, sentiment, news_category,
-			status, created_at, updated_at
+			status, signal_kind, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
 			$9, 'BUY', $10, $11, $12, $13,
 			$14, $15, $16, $17,
-			'PENDING', $18, $18
+			'PENDING', $19, $18, $18
 		)
 	`
 
@@ -88,6 +88,7 @@ func (r *TradeSignalRepository) SaveTradeSignal(ctx context.Context, orderReq *m
 		orderReq.Sentiment,
 		orderReq.NewsCategory,
 		orderReq.Timestamp,
+		orderReq.SignalKind(),
 	)
 
 	if err != nil {
@@ -125,11 +126,19 @@ func (r *TradeSignalRepository) HasSignalToday(ctx context.Context, strategyID s
 	return exists, nil
 }
 
-// GetStrategyTradesToday returns the number of trade signals already emitted for
-// the given strategy on today's IST date and after sinceTime (last activation).
-// FAILED and CANCELLED signals are excluded so that broker-rejected orders do
-// not consume the daily cap.
-func (r *TradeSignalRepository) GetStrategyTradesToday(ctx context.Context, strategyID string, sinceTime time.Time) (int, error) {
+// (GetStrategyTradesToday was removed: the per-strategy daily cap is now enforced
+// by an atomic Redis reservation — pkg/tradecap — that counts only *actual
+// trades*, not price-monitor watches. The durable committed-trade count used to
+// reseed that counter lives in CountCommittedTradesToday below.)
+
+// CountCommittedTradesToday returns how many *actual trades* the strategy has
+// committed today (IST) since sinceTime — used to reseed the Redis trade counter
+// (pkg/tradecap) after a Redis flush so a hard cap is never silently re-opened.
+//
+// A committed trade is an IMMEDIATE signal (placed at signal time) or a
+// MONITORING watch whose status has advanced to EXECUTED/TRIGGERED (its target
+// fired). Waiting watches, FAILED, and CANCELLED rows never count.
+func (r *TradeSignalRepository) CountCommittedTradesToday(ctx context.Context, strategyID string, sinceTime time.Time) (int64, error) {
 	query := `
 		SELECT COUNT(*) FROM trade_signals
 		WHERE strategy_id = $1
@@ -137,10 +146,11 @@ func (r *TradeSignalRepository) GetStrategyTradesToday(ctx context.Context, stra
 		      = (NOW()    AT TIME ZONE 'Asia/Kolkata')::date
 		  AND created_at >= $2
 		  AND status NOT IN ('FAILED', 'CANCELLED')
+		  AND (signal_kind = 'IMMEDIATE' OR status IN ('EXECUTED', 'TRIGGERED', 'FILLED', 'SENT'))
 	`
-	var count int
+	var count int64
 	if err := r.db.QueryRowContext(ctx, query, strategyID, sinceTime).Scan(&count); err != nil {
-		return 0, fmt.Errorf("failed to count strategy trades: %w", err)
+		return 0, fmt.Errorf("failed to count committed strategy trades: %w", err)
 	}
 	return count, nil
 }

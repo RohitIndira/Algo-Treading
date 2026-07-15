@@ -33,17 +33,69 @@ type Strategy struct {
 	TradeConfig *TradeConfig       `db:"-" json:"trade_config,omitempty"`
 	RiskLimits  *RiskLimits        `db:"-" json:"risk_limits,omitempty"`
 
-	// ProcessAfterMarketNews is a creation-time trigger flag. It is NOT stored in
-	// the strategies table (db:"-") — it is forwarded through the outbox JSON so
-	// the rules-engine Kafka consumer can initiate the AMN backfill exactly once.
-	ProcessAfterMarketNews bool `db:"-" json:"process_after_market_news,omitempty"`
+	// ProcessAfterMarketNews marks this as an AMN strategy. It is persisted on the
+	// strategies table so reactivation and the UI can tell an AMN strategy apart
+	// (they must require a fresh AMN preview + selection), and so the reactivation
+	// backfill knows to fire. It also rides the outbox JSON for the create-time
+	// backfill trigger.
+	ProcessAfterMarketNews bool `db:"process_after_market_news" json:"process_after_market_news,omitempty"`
 
-	// AMNSelectedStocks is the user's explicit AMN preview pick (ISINs). Like
-	// ProcessAfterMarketNews it is creation-time only and NOT persisted (db:"-");
-	// it is forwarded through the outbox JSON so the rules-engine backfill places
-	// orders only for these stocks. Empty → backfill places all affordable matches.
+	// AMNSelectedStocks is the ISIN list for the current activation's AMN pick. It
+	// is NOT a strategies column (db:"-"): the authoritative record lives in the
+	// amn_activations/amn_activation_stocks tables (see AMNSelection). This slice is
+	// populated from those tables when building the outbox event so the rules-engine
+	// backfill places orders only for these stocks. Empty → all affordable matches.
 	AMNSelectedStocks []string `db:"-" json:"amn_selected_stocks,omitempty"`
 }
+
+// AMNSelectedStock is one stock the user picked in the AMN preview, with the
+// preview-time bucket + pricing snapshot. Used to persist the day-wise selection
+// (including 'monitor' price-watch picks). Mirrors the proto AMNSelectedStock.
+type AMNSelectedStock struct {
+	ISIN           string  `json:"isin"`
+	Symbol         string  `json:"symbol"`
+	NSECode        int64   `json:"nse_code"`
+	Bucket         string  `json:"bucket"` // "place" | "monitor"
+	TargetPrice    float64 `json:"target_price"`
+	EntryPrice     float64 `json:"entry_price"`
+	Quantity       int32   `json:"quantity"`
+	InvestedAmount float64 `json:"invested_amount"`
+}
+
+// AMNActivation is the parent record of one strategy's AMN selection for a single
+// trading day (created on strategy-create and on each reactivation).
+type AMNActivation struct {
+	ActivationID    uuid.UUID `db:"activation_id" json:"activation_id"`
+	StrategyID      uuid.UUID `db:"strategy_id" json:"strategy_id"`
+	UserID          string    `db:"user_id" json:"user_id"`
+	TradingDate     time.Time `db:"trading_date" json:"trading_date"`
+	Source          string    `db:"source" json:"source"` // "CREATE" | "REACTIVATE"
+	StrategyVersion int32     `db:"strategy_version" json:"strategy_version"`
+	CreatedAt       time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt       time.Time `db:"updated_at" json:"updated_at"`
+}
+
+// AMNActivationStock is one child row of an AMNActivation — the persisted form of
+// an AMNSelectedStock.
+type AMNActivationStock struct {
+	ID             int64     `db:"id" json:"id"`
+	ActivationID   uuid.UUID `db:"activation_id" json:"activation_id"`
+	ISIN           string    `db:"isin" json:"isin"`
+	Symbol         string    `db:"symbol" json:"symbol"`
+	NSECode        int64     `db:"nse_code" json:"nse_code"`
+	Bucket         string    `db:"bucket" json:"bucket"`
+	TargetPrice    float64   `db:"target_price" json:"target_price"`
+	EntryPrice     float64   `db:"entry_price" json:"entry_price"`
+	Quantity       int32     `db:"quantity" json:"quantity"`
+	InvestedAmount float64   `db:"invested_amount" json:"invested_amount"`
+	CreatedAt      time.Time `db:"created_at" json:"created_at"`
+}
+
+// AMN activation source constants.
+const (
+	AMNSourceCreate     = "CREATE"
+	AMNSourceReactivate = "REACTIVATE"
+)
 
 // StrategyCondition represents the conditions for triggering a strategy
 type StrategyCondition struct {
@@ -171,6 +223,10 @@ type CreateStrategyRequest struct {
 	TradingMode         TradingMode        `json:"trading_mode"`
 	ProcessAfterMarketNews bool            `json:"process_after_market_news"`
 	AMNSelectedStocks   []string           `json:"amn_selected_stocks,omitempty"`
+	// AMNSelection is the richer per-stock pick from the AMN preview. When set it is
+	// persisted as the day-1 activation record; the ISIN filter for the backfill is
+	// derived from it (falling back to AMNSelectedStocks when it is empty).
+	AMNSelection        []AMNSelectedStock `json:"amn_selection,omitempty"`
 
 	// Frontend authentication data
 	IndiraAuth *IndiraAuthContext `json:"indira_auth,omitempty"`

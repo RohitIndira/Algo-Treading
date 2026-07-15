@@ -140,6 +140,24 @@ func (c *UserConfigClient) UpdateUserCredentials(ctx context.Context, req *pb.Up
 	return c.client.UpdateUserCredentials(ctx, req)
 }
 
+// SyncCredentials pushes a verified Indira bearer token to user-config so
+// trade-execution's broker_accounts row stays current no matter which gateway
+// endpoint the caller hit — not just /activate.
+func (c *UserConfigClient) SyncCredentials(ctx context.Context, userID, appID, source, bearerToken string) error {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	_, err := c.client.UpdateUserCredentials(ctx, &pb.UpdateUserCredentialsRequest{
+		UserId: userID,
+		IndiraAuth: &common.IndiraAuthContext{
+			UserId:      userID,
+			AppId:       appID,
+			Source:      source,
+			BearerToken: bearerToken,
+		},
+	})
+	return err
+}
+
 func (c *UserConfigClient) HealthCheck(ctx context.Context, req *common.HealthCheckRequest) (*common.HealthCheckResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()

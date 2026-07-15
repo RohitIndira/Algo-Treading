@@ -69,7 +69,7 @@ func Load() (*Config, error) {
 			AllowedHeaders: strings.Split(getEnv("CORS_ALLOWED_HEADERS", "Content-Type,Authorization,source,appId,userId"), ","),
 		},
 		Auth: AuthConfig{
-			VerifyURL: getEnv("AUTH_VERIFY_URL", "https://trade.indiratrade.com/auth-services/api/auth/verify/token"),
+			VerifyURL: getEnv("AUTH_VERIFY_URL", "https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token"),
 			Timeout:   authTimeout,
 			Bypass:    getEnv("AUTH_BYPASS", "false") == "true" || strings.Contains(getEnv("AUTH_VERIFY_URL", ""), "trade.indiratrade.com"),
 		},

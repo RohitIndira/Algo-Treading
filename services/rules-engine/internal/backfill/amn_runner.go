@@ -231,6 +231,28 @@ func (r *AMNRunner) run(ctx context.Context, strategy *models.Strategy) error {
 			continue
 		}
 
+		// Cross-run duplicate guard: skip a stock this strategy already has a
+		// non-failed order for today. This prevents a same-day reactivation (which
+		// re-runs the backfill with a fresh pick) from double-placing stocks that
+		// were already ordered earlier today. Within-run dedup is handled by
+		// placedISIN above. On a check error we proceed (best-effort dedup) rather
+		// than block a legitimate order.
+		if r.signalRepo != nil {
+			already, err := r.signalRepo.HasSignalToday(ctx, strategy.StrategyID, company.NSECode, startOfTodayIST())
+			if err != nil {
+				r.logger.Warn("AMN backfill: duplicate-check failed, placing anyway",
+					zap.String("isin", doc.ISIN),
+					zap.String("symbol", company.Symbol),
+					zap.Error(err))
+			} else if already {
+				r.logger.Info("AMN backfill: stock already ordered today, skipping",
+					zap.String("isin", doc.ISIN),
+					zap.String("symbol", company.Symbol))
+				skipped++
+				continue
+			}
+		}
+
 		event := r.buildMarketEvent(doc, company)
 
 		// Evaluate all NON-pct conditions first (pct zeroed on a copy); the live

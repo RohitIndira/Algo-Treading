@@ -65,6 +65,16 @@ func (c *RedisCache) Close() error {
 	return c.client.Close()
 }
 
+// Raw exposes the underlying go-redis client so shared helpers (e.g. the
+// tradecap per-strategy trade counter) can run their own scripts on the same
+// connection pool. Returns nil when the cache is not initialized.
+func (c *RedisCache) Raw() *redis.Client {
+	if c == nil {
+		return nil
+	}
+	return c.client
+}
+
 func (c *RedisCache) Get(ctx context.Context, key string) (string, error) {
 	if c == nil || c.client == nil {
 		return "", fmt.Errorf("redis cache not initialized")

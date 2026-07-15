@@ -228,7 +228,8 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			is_square_off_order,
 			retry_count, created_at, updated_at,
 			oco_group_id, oco_role, parent_order_id,
-			bearer_token, app_id, source
+			bearer_token, app_id, source,
+			max_trades_per_strategy
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
 			$13, $14, $15, $16, $17, $18, $19, $20, $21,
@@ -236,7 +237,8 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 			$24,
 			$25, $26, $27,
 			$28, $29, $30,
-			$31, $32, $33
+			$31, $32, $33,
+			$34
 		) ON CONFLICT (order_id) DO NOTHING
 	`
 
@@ -251,6 +253,7 @@ func (r *orderRepository) Create(ctx context.Context, order *models.Order) error
 		order.RetryCount, order.CreatedAt, order.UpdatedAt,
 		order.OCOGroupID, order.OCORole, order.ParentOrderID,
 		order.BearerToken, order.AppId, order.Source,
+		order.MaxTradesPerStrategy,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create order: %w", err)

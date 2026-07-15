@@ -19,7 +19,6 @@ func TestToFullConfigEvent_AllFieldsMapped(t *testing.T) {
 	maxMcap := 50000.0
 	minPct := 1.5
 	maxPct := 5.0
-	minVol := int64(100000)
 
 	limit := 123.45
 	sl := 2.0
@@ -47,13 +46,11 @@ func TestToFullConfigEvent_AllFieldsMapped(t *testing.T) {
 			ImpactScoreMax:    9,
 			Sentiments:        pq.StringArray{"POSITIVE"},
 			Categories:        pq.StringArray{"EARNINGS", "MERGERS"},
-			StockCodes:        pq.Int64Array{500325, 532540},
 			MarketCapTypes:    pq.StringArray{"LARGE", "MID"},
 			MinMarketCap:      &minMcap,
 			MaxMarketCap:      &maxMcap,
 			MinPriceChangePct: &minPct,
 			MaxPriceChangePct: &maxPct,
-			MinVolume:         &minVol,
 			Exchanges:         pq.StringArray{"NSE", "BSE"},
 			CreatedAt:         now.Add(-2 * time.Hour),
 		},
@@ -127,9 +124,6 @@ func TestToFullConfigEvent_AllFieldsMapped(t *testing.T) {
 	if e.Config.Conditions.MinPriceChangePct != minPct || e.Config.Conditions.MaxPriceChangePct != maxPct {
 		t.Fatalf("pct mismatch")
 	}
-	if e.Config.Conditions.MinVolume != minVol {
-		t.Fatalf("volume mismatch")
-	}
 
 	// TradeConfig (strings as-is)
 	if e.Config.TradeConfig.OrderType != "MARKET" {
@@ -165,7 +159,7 @@ func TestToFullConfigEvent_NilPointers_DoNotPanicAndHaveEmptySlices(t *testing.T
 		t.Fatalf("expected config")
 	}
 	// Conditions should exist and slices should be non-nil for JSON stability
-	if e.Config.Conditions.Sentiments == nil || e.Config.Conditions.Categories == nil || e.Config.Conditions.StockCodes == nil || e.Config.Conditions.Exchanges == nil {
+	if e.Config.Conditions.Sentiments == nil || e.Config.Conditions.Categories == nil || e.Config.Conditions.Exchanges == nil {
 		t.Fatalf("expected non-nil slice fields")
 	}
 }
@@ -175,7 +169,6 @@ func TestToFullConfigEvent_NilSlicesBecomeEmptyArraysInJSON(t *testing.T) {
 	s.Conditions = &models.StrategyCondition{
 		Sentiments:     nil,
 		Categories:     nil,
-		StockCodes:     nil,
 		MarketCapTypes: nil,
 		Exchanges:      nil,
 	}
@@ -186,7 +179,7 @@ func TestToFullConfigEvent_NilSlicesBecomeEmptyArraysInJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	js := string(b)
-	if strings.Contains(js, `"sentiments":null`) || strings.Contains(js, `"categories":null`) || strings.Contains(js, `"stock_codes":null`) || strings.Contains(js, `"market_cap_types":null`) || strings.Contains(js, `"exchanges":null`) {
+	if strings.Contains(js, `"sentiments":null`) || strings.Contains(js, `"categories":null`) || strings.Contains(js, `"market_cap_types":null`) || strings.Contains(js, `"exchanges":null`) {
 		t.Fatalf("expected no null arrays, got: %s", js)
 	}
 }

@@ -13,6 +13,9 @@ const (
 	ConfigDeleted ConfigEventType = "CONFIG_DELETED"
 	ConfigPaused  ConfigEventType = "CONFIG_PAUSED"
 	ConfigResumed ConfigEventType = "CONFIG_RESUMED"
+	// ConfigActivated is emitted on reactivation: upsert the strategy like
+	// CONFIG_UPDATED, and additionally re-run the AMN backfill for AMN strategies.
+	ConfigActivated ConfigEventType = "CONFIG_ACTIVATED"
 )
 
 type ConfigEvent struct {

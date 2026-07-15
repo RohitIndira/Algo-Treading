@@ -124,7 +124,14 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 		reqBody = bytes.NewBuffer(jsonBody)
 	}
 
+	// path is normally relative to c.baseURL (the versioned /v1 REST surface),
+	// but a caller may pass an already-absolute URL (e.g. the order-notify WS
+	// token endpoint, which lives on a different, unversioned path than the
+	// order-services/portfolio-services APIs) to bypass baseURL entirely.
 	url := c.baseURL + path
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		url = path
+	}
 	if strings.Contains(path, "place-order") || strings.Contains(path, "modify-order") {
 		log.Printf("[indira] → %s %s  body=%s", method, path, string(jsonBody))
 	} else {

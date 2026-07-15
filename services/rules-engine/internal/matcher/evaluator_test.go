@@ -38,10 +38,8 @@ func TestMatcher_AllFiltersPass_EmitsSignal(t *testing.T) {
 	s := baseStrategy()
 	s.Conditions.Categories = []string{"policy"}
 	s.Conditions.Sentiments = []string{"positive"}
-	s.Conditions.Stocks = []int64{101}
 	s.Conditions.MinPctChange = 1
 	s.Conditions.MaxPctChange = 5
-	s.Conditions.VolumeThreshold = 100
 
 	ev := NewEvaluator(zap.NewNop())
 	res := ev.Evaluate(e, s)
@@ -103,30 +101,9 @@ func TestMatcher_WrongSentiment_Drops(t *testing.T) {
 	}
 }
 
-func TestMatcher_StockCodeNotInSet_Drops(t *testing.T) {
-	e := baseEvent()
-	e.StockData.StockCode = 999
-	s := baseStrategy()
-	s.Conditions.Stocks = []int64{101}
-
-	ev := NewEvaluator(zap.NewNop())
-	res := ev.Evaluate(e, s)
-	if res.IsFullMatch() {
-		t.Fatalf("expected not full match")
-	}
-}
-
-func TestMatcher_EmptyStockCodes_MatchesAll(t *testing.T) {
-	e := baseEvent()
-	s := baseStrategy()
-	s.Conditions.Stocks = nil
-
-	ev := NewEvaluator(zap.NewNop())
-	res := ev.Evaluate(e, s)
-	// should not fail on stock
-	for _, f := range res.FailedConditions {
-		if f == "stock" {
-			t.Fatalf("expected stock to match when empty")
-		}
-	}
-}
+// NOTE: Tests for per-stock-code and volume-threshold filtering were removed:
+// models.Conditions has no Stocks/VolumeThreshold field and Evaluator.Evaluate
+// performs no such check (it evaluates impact, sentiment, category, market cap,
+// price range, pct-change, and exchange). The strategy_conditions table does have
+// stock_codes/min_volume columns, but that filtering is not implemented in the
+// matcher — re-add these tests alongside the feature if it is built.

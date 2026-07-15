@@ -234,4 +234,9 @@ type TradeSignal struct {
 	// force-closed. Format: "HH:MM" (24-hour IST). Applies to both paper and live.
 	// Empty string = use the global default (15:05 IST live, 15:00 IST paper).
 	AutoSquareOffTime string `json:"auto_square_off_time,omitempty"`
+
+	// MaxTradesPerStrategy is the strategy's daily trade cap. Carried so the price
+	// monitor can enforce the same hard ceiling when a below_min watch triggers
+	// (a monitored watch becomes a real trade only at that point). 0 = no limit.
+	MaxTradesPerStrategy int32 `json:"max_trades_per_strategy,omitempty"`
 }

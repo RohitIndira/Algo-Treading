@@ -23,6 +23,7 @@ import (
 
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
+	"github.com/RohitIndira/Algo-Treading/pkg/tradecap"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/consumer"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/executor"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/fillprice"
@@ -480,6 +481,17 @@ func main() {
 		priceMonitorRef.SetWSClient(priceMonitorWSClient)
 		// Event-driven: WSS tick → immediate evaluation (no polling delay)
 		priceMonitorWSClient.SetOnPriceUpdate(priceMonitorRef.OnPriceUpdate)
+
+		// Enforce MaxTradesPerStrategy when a below_min watch triggers — this is the
+		// moment a monitored watch becomes a real trade. Shares the same Redis counter
+		// the rules-engine uses for immediate trades, so the cap is one hard ceiling.
+		// nil-safe: if Redis is unavailable the monitor simply doesn't enforce the cap.
+		if redisPrices != nil {
+			if reserver := tradecap.New(redisPrices.Raw()); reserver.IsEnabled() {
+				priceMonitorRef.SetCapReserver(reserver)
+				log.Println("✓ Strategy trade-cap enforcement enabled at price-monitor trigger time")
+			}
+		}
 
 		// Tick store: persist every socket tick to localhost Redis DB=1 for testing.
 		// Wired to both WebSocket clients (paper-market + price-monitor).

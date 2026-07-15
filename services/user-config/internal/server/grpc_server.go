@@ -40,6 +40,7 @@ func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStr
 		TradingMode:            protoTradingModeToModel(req.TradingMode),
 		ProcessAfterMarketNews: req.ProcessAfterMarketNews,
 		AMNSelectedStocks:      req.AmnSelectedStocks,
+		AMNSelection:           protoAMNSelectionToModel(req.AmnSelection),
 	}
 
 	// Extract Indira auth context if provided
@@ -260,7 +261,9 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 
 	// ActivateStrategyRequest has no IndiraAuth field in the proto.
 	// Credential refresh is handled by the gateway calling UpdateUserCredentials separately.
-	strategy, err := s.service.ActivateStrategy(ctx, strategyID, req.UserId, nil)
+	// amn_selection carries the fresh AMN preview pick for reactivation (required for
+	// AMN strategies; the repository rejects an empty selection there).
+	strategy, err := s.service.ActivateStrategy(ctx, strategyID, req.UserId, nil, protoAMNSelectionToModel(req.AmnSelection))
 	if err != nil {
 		return &pb.ActivateStrategyResponse{
 			Success: false,
@@ -487,6 +490,31 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 	return cond
 }
 
+// protoAMNSelectionToModel converts the proto AMN preview picks into model form.
+// Returns nil for an empty/absent selection.
+func protoAMNSelectionToModel(sel []*pb.AMNSelectedStock) []models.AMNSelectedStock {
+	if len(sel) == 0 {
+		return nil
+	}
+	out := make([]models.AMNSelectedStock, 0, len(sel))
+	for _, s := range sel {
+		if s == nil {
+			continue
+		}
+		out = append(out, models.AMNSelectedStock{
+			ISIN:           s.Isin,
+			Symbol:         s.Symbol,
+			NSECode:        s.NseCode,
+			Bucket:         s.Bucket,
+			TargetPrice:    s.TargetPrice,
+			EntryPrice:     s.EntryPrice,
+			Quantity:       s.Quantity,
+			InvestedAmount: s.InvestedAmount,
+		})
+	}
+	return out
+}
+
 func protoTradingModeToModel(mode pb.TradingMode) models.TradingMode {
 	switch mode {
 	case pb.TradingMode_PAPER:
@@ -686,15 +714,16 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 	}
 
 	strategy := &pb.Strategy{
-		StrategyId:   model.StrategyID.String(),
-		UserId:       model.UserID,
-		StrategyName: model.StrategyName,
-		Description:  model.Description,
-		Active:       model.Active,
-		TradingMode:  modelTradingModeToProto(model.TradingMode),
-		Version:      model.Version,
-		CreatedAt:    &common.Timestamp{Seconds: model.CreatedAt.Unix()},
-		UpdatedAt:    &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
+		StrategyId:             model.StrategyID.String(),
+		UserId:                 model.UserID,
+		StrategyName:           model.StrategyName,
+		Description:            model.Description,
+		Active:                 model.Active,
+		TradingMode:            modelTradingModeToProto(model.TradingMode),
+		Version:                model.Version,
+		CreatedAt:              &common.Timestamp{Seconds: model.CreatedAt.Unix()},
+		UpdatedAt:              &common.Timestamp{Seconds: model.UpdatedAt.Unix()},
+		ProcessAfterMarketNews: model.ProcessAfterMarketNews,
 	}
 	if model.DeletedAt != nil {
 		strategy.DeletedAt = &common.Timestamp{Seconds: model.DeletedAt.Unix()}

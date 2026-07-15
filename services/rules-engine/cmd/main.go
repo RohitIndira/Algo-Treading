@@ -38,6 +38,7 @@ import (
 	"go.uber.org/zap"
 
 	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
+	"github.com/RohitIndira/Algo-Treading/pkg/tradecap"
 )
 
 func main() {
@@ -326,6 +327,17 @@ func main() {
 		StartOffset:    startOffsetFor(cfg.Kafka.ConfigOffsetReset, kafka.FirstOffset),
 	})
 	configConsumer := intkafka.NewConfigConsumer(configReader, store, amnTrigger)
+	// Reset the per-strategy daily trade counter on (re)activation so the
+	// MaxTradesPerStrategy cap restarts fresh, mirroring the previous
+	// "count only signals since last activation" behaviour.
+	if capReserver := tradecap.New(redisCache.Raw()); capReserver.IsEnabled() {
+		configConsumer.SetCapReset(func(strategyID string) {
+			if err := capReserver.Reset(context.Background(), strategyID, time.Now()); err != nil {
+				logger.Warn("failed to reset strategy trade counter",
+					zap.String("strategy_id", strategyID), zap.Error(err))
+			}
+		})
+	}
 
 	// Step 6: Start news consumer AFTER config consumer
 	newsReader := kafka.NewReader(kafka.ReaderConfig{
@@ -345,6 +357,41 @@ func main() {
 	logger.Info("Config consumer started")
 	<-lc.NewsConsumerStarted
 	logger.Info("News consumer started — system is LIVE")
+
+	// Feedback loop: consume trade-execution's "order-updates" and write the
+	// execution status back onto trade_signals (revives UpdateSignalStatus). This
+	// keeps the durable committed-trade count accurate for the daily-cap reseed
+	// and releases the per-stock lock when a watch is cancelled. Best-effort and
+	// isolated: failures here never affect signal generation.
+	if signalRepo != nil {
+		orderUpdateGroup := os.Getenv("ORDER_UPDATE_CONSUMER_GROUP_ID")
+		if orderUpdateGroup == "" {
+			orderUpdateGroup = "rule-engine-order-updates"
+		}
+		orderUpdateReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:     cfg.Kafka.Brokers,
+			Topic:       "order-updates",
+			GroupID:     orderUpdateGroup,
+			MinBytes:    1,
+			MaxBytes:    cfg.Kafka.MaxBytes,
+			StartOffset: kafka.LastOffset,
+			MaxWait:     time.Second,
+		})
+		orderUpdateConsumer := intkafka.NewOrderUpdateConsumer(orderUpdateReader, signalRepo)
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					logger.Error("PANIC RECOVERED in order-update consumer",
+						zap.Any("panic", rec), zap.String("stacktrace", string(debug.Stack())))
+				}
+			}()
+			defer orderUpdateReader.Close()
+			if err := orderUpdateConsumer.Start(ctx); err != nil && ctx.Err() == nil {
+				logger.Warn("order-update consumer stopped", zap.Error(err))
+			}
+		}()
+		logger.Info("Order-update feedback consumer started (trade_signals status sync)")
+	}
 
 	// TODO: Start existing gRPC server (if any) - currently none in rules-engine.
 	// TODO: Start existing Redis Pub/Sub publisher - handled in consumer handler via redisCache.Publish.

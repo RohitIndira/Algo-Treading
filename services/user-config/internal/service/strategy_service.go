@@ -202,9 +202,11 @@ func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UU
 // ActivateStrategy activates a strategy.
 // If auth is non-nil and contains a bearer token, credentials are refreshed in
 // broker_accounts so trade-execution picks up the latest Indira session token.
-func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string, auth *models.IndiraAuthContext) (*models.Strategy, error) {
+// For AMN strategies, selection carries the fresh AMN preview pick (required — an
+// empty selection for an AMN strategy is rejected by the repository).
+func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string, auth *models.IndiraAuthContext, selection []models.AMNSelectedStock) (*models.Strategy, error) {
 	// Activate in database
-	if err := s.repo.Activate(ctx, strategyID, userID); err != nil {
+	if err := s.repo.Activate(ctx, strategyID, userID, selection); err != nil {
 		return nil, fmt.Errorf("failed to activate strategy: %w", err)
 	}
 

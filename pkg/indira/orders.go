@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"strings"
 )
 
 // ============ Order Management Methods ============
@@ -177,10 +179,15 @@ func (c *Client) GetOrderTrail(ctx context.Context, auth *AuthContext, req *Orde
 func (c *Client) GetTradeBook(ctx context.Context, auth *AuthContext, orderIds ...string) ([]TradeBook, error) {
 	path := "/portfolio-services/api/order/v1/trade-book"
 	if len(orderIds) > 0 && orderIds[0] != "" {
-		path += "?orderIds=" + orderIds[0]
-		for i := 1; i < len(orderIds); i++ {
-			path += "," + orderIds[i]
+		// Broker order IDs can contain characters that aren't valid unescaped in a
+		// URL query value (e.g. '>' in "NZVND00015>7"); QueryEscape each one so the
+		// request line stays well-formed. An unescaped '>' produces a raw HTTP 400
+		// from the servlet container before the request ever reaches Indira's API.
+		escaped := make([]string, len(orderIds))
+		for i, id := range orderIds {
+			escaped[i] = url.QueryEscape(id)
 		}
+		path += "?orderIds=" + strings.Join(escaped, ",")
 	}
 
 	resp, err := c.doRequest(ctx, auth, "POST", path, nil)

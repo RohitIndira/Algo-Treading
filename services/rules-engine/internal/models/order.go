@@ -77,6 +77,12 @@ type OrderRequest struct {
 	// SignalSource identifies the pipeline that generated this order.
 	// "BACKFILL_AMN" for after-market news backfill orders; empty for live signals.
 	SignalSource string `json:"signal_source,omitempty"`
+
+	// MaxTradesPerStrategy is the strategy's daily trade cap, forwarded so the
+	// trade-execution price monitor can enforce the same hard ceiling when a
+	// below_min watch finally triggers (a monitored watch only becomes a real
+	// trade at that point). 0 = no limit. See pkg/tradecap.
+	MaxTradesPerStrategy int32 `json:"max_trades_per_strategy,omitempty"`
 }
 
 // RuleMatch represents a successful rule match
@@ -184,7 +190,28 @@ func NewOrderRequest(match *RuleMatch, event *MarketEvent, strategy *Strategy) *
 			}
 			return ""
 		}(),
+
+		// Daily trade cap, carried so trade-execution can enforce it at watch-trigger time.
+		MaxTradesPerStrategy: strategy.RiskLimits.MaxTradesPerStrategy,
 	}
+}
+
+// Signal kinds recorded on trade_signals.signal_kind.
+const (
+	// SignalKindImmediate is a real trade placed now (within_range / default).
+	SignalKindImmediate = "IMMEDIATE"
+	// SignalKindMonitoring is a below_min watch parked in the price monitor —
+	// not a trade (and not counted against the cap) until its target triggers.
+	SignalKindMonitoring = "MONITORING"
+)
+
+// SignalKind classifies this order for the durable trade counter. A below_min
+// order is a price-monitor watch; everything else is an immediate trade.
+func (o *OrderRequest) SignalKind() string {
+	if o.PctChangeStatus == "below_min" {
+		return SignalKindMonitoring
+	}
+	return SignalKindImmediate
 }
 
 // Validate validates an order request

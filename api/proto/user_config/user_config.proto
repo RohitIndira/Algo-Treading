@@ -269,6 +269,26 @@ message Strategy {
 
   // Soft-delete timestamp (null if not deleted)
   optional common.Timestamp deleted_at = 13;
+
+  // True when this is an AMN strategy. The UI reads this to require a fresh AMN
+  // preview + selection on reactivation.
+  bool process_after_market_news = 14;
+}
+
+// AMNSelectedStock is one stock the user picked in the AMN preview. It carries
+// the preview-time bucket + pricing so the whole selection — including 'monitor'
+// (price-watch) picks — can be persisted and audited day-wise. The backfill still
+// recomputes live pricing at placement time; these fields are the snapshot the
+// user saw when they chose the stock.
+message AMNSelectedStock {
+  string isin = 1;
+  string symbol = 2;
+  int64  nse_code = 3;
+  string bucket = 4;          // "place" | "monitor"
+  double target_price = 5;    // monitor trigger level (0 for "place")
+  double entry_price = 6;     // preview-time expected fill, tick-rounded
+  int32  quantity = 7;        // preview-time qty from per-stock budget
+  double invested_amount = 8; // entry_price * quantity snapshot
 }
 
 message CreateStrategyRequest {
@@ -294,6 +314,12 @@ message CreateStrategyRequest {
     // preview. When non-empty, the backfill places orders ONLY for these stocks.
     // When empty, it falls back to all affordable matches up to the trade cap.
     repeated string amn_selected_stocks = 11;
+
+    // amn_selection is the richer form of the AMN preview pick (per-stock bucket
+    // + pricing). When set it is the source of truth for persistence; the ISIN
+    // filter for the backfill is derived from it. amn_selected_stocks is retained
+    // for backward compatibility with ISIN-only callers.
+    repeated AMNSelectedStock amn_selection = 12;
 }
 
 message CreateStrategyResponse {
@@ -372,6 +398,13 @@ message ListUserStrategiesResponse {
 message ActivateStrategyRequest {
   string strategy_id = 1;
   string user_id = 2;  // For authorization
+
+  // amn_selection carries the fresh AMN preview pick submitted at reactivation.
+  // It is persisted as that day's activation record and drives the reactivation
+  // backfill. May be empty when the AMN window has no matching news — the strategy
+  // still reactivates (for live trading) and no backfill runs. Ignored for non-AMN
+  // strategies.
+  repeated AMNSelectedStock amn_selection = 3;
 }
 
 message ActivateStrategyResponse {
