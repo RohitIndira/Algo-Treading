@@ -51,10 +51,36 @@ func New(s *store.Store, lookup OrderMetaLookup, pub EventPublisher, logger *zap
 
 // Handle routes one parsed OrderEvent per §7 of the design doc.
 //
-// Only FILLED events drive positions state transitions today. Other event
-// types (STATUS_CHANGED, MODIFIED, CANCELLED, REJECTED, TRIGGERED,
-// PARTIALLY_FILLED, EXPIRED) are logged + no-op'd. Partial-fill handling is
-// a future chunk — for now every FILLED is treated as full lifecycle event.
+// Events that drive state transitions today:
+//
+//	FILLED                        — full fill of BUY or SELL
+//	CANCELLED   (filled_qty>0)    — partial-fill-then-cancelled (2026-07-16
+//	                                CUB pattern: broker accepted qty=57 of
+//	                                intended qty=90, cancelled the remaining
+//	                                33 at 3:30 EOD). Treat filled_qty as
+//	                                a legitimate fill event.
+//	PARTIALLY_FILLED              — mid-flight partial (rare on Manthan
+//	                                DELIVERY; broker usually rolls to CANCELLED
+//	                                or FILLED). Same handling as CANCELLED
+//	                                with filled_qty>0 — accept what filled.
+//
+// Other event types (STATUS_CHANGED, MODIFIED, REJECTED, TRIGGERED,
+// EXPIRED) are logged + no-op'd. SL_MODIFY tracking (updating
+// positions.current_sl on trailing SL ratchets) is Chunk P.E — not
+// required for the position-open/exit lifecycle.
+//
+// buy_sell is normalized to handle the split wire format:
+//
+//	WSS source:            "1" (BUY) / "2" (SELL) — numeric enum from
+//	                       Codifi's WSS envelope
+//	REST_ORDERBOOK source: "BUY" / "SELL" — Indira's REST portfolio-services
+//	                       API uses full strings
+//
+// Without normalization, REST events (which is what today's post-JWT-fix
+// path emits — the WSS listener sometimes misses AMO-execute events) are
+// silently skipped, leaving positions_db empty despite broker fills.
+// Root-caused during 2026-07-16 end-to-end debug (AADHARHFC 38,
+// IPCALAB 10, CUB 57 all filled at broker; 0 rows in positions_db).
 //
 // Returns an error only when the consumer should NOT commit the offset
 // (message re-delivers). Idempotency is enforced at the DB layer via:
@@ -62,24 +88,60 @@ func New(s *store.Store, lookup OrderMetaLookup, pub EventPublisher, logger *zap
 //	positions.entry_broker_order_id UNIQUE-ish idempotency for BUY inserts
 //	position_events (position_id, source_event_id) UNIQUE for audit rows
 func (h *Handler) Handle(ctx context.Context, ev *consumer.OrderEvent) error {
-	if ev.EventType != "FILLED" {
-		h.logger.Debug("state-machine: skip non-FILLED",
+	if !isFillEvent(ev) {
+		h.logger.Debug("state-machine: skip non-fill event",
 			zap.String("event_id", ev.EventID),
 			zap.String("event_type", ev.EventType),
+			zap.Int("filled_qty", ev.FilledQty),
 			zap.String("broker_order_id", ev.BrokerOrderID))
 		return nil
 	}
 
-	switch strings.TrimSpace(ev.BuySell) {
-	case "1":
+	switch normalizeBuySell(ev.BuySell) {
+	case "BUY":
 		return h.handleBuyFill(ctx, ev)
-	case "2":
+	case "SELL":
 		return h.handleSellFill(ctx, ev)
 	default:
 		h.logger.Warn("state-machine: FILLED with unknown buy_sell — skipping",
 			zap.String("event_id", ev.EventID),
 			zap.String("buy_sell", ev.BuySell))
 		return nil
+	}
+}
+
+// isFillEvent returns true iff the event should trigger a position state
+// transition. Accepts:
+//   - event_type == "FILLED"                              — full fill
+//   - event_type == "PARTIALLY_FILLED" AND filled_qty > 0 — mid-flight partial
+//   - event_type == "CANCELLED"        AND filled_qty > 0 — partial-fill-then-
+//                                                            cancelled
+//
+// Explicitly EXCLUDES event_type in {STATUS_CHANGED, MODIFIED, REJECTED,
+// TRIGGERED, EXPIRED}. Also excludes CANCELLED events with filled_qty=0
+// (the common case — user cancelled a resting order that never touched).
+func isFillEvent(ev *consumer.OrderEvent) bool {
+	switch ev.EventType {
+	case "FILLED":
+		return true
+	case "PARTIALLY_FILLED", "CANCELLED":
+		return ev.FilledQty > 0
+	default:
+		return false
+	}
+}
+
+// normalizeBuySell maps the two wire formats to a single canonical value.
+// Case-insensitive input; canonical output is uppercase "BUY" / "SELL".
+// Empty / unknown returns "" so the Handle default branch fires.
+func normalizeBuySell(v string) string {
+	switch strings.ToUpper(strings.TrimSpace(v)) {
+	case "1", "B", "BUY":
+		return "BUY"
+	case "2", "S", "SELL":
+		return "SELL"
+	default:
+		return ""
 	}
 }
 
