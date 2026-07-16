@@ -85,8 +85,26 @@ type ClosedPosition struct {
 // SummaryFor returns the per-user portfolio rollup. "Today" boundary is
 // the current IST calendar day — computed in Go so the SQL stays portable.
 //
-// Zero rows for a user is a valid state (new user, no trading yet). The
-// returned Summary has all-zero fields and nil error.
+// SCOPE: MANTHAN-only. USER_MANUAL positions (stocks the user bought
+// via the broker's own UI outside Manthan) are EXCLUDED from every
+// number below. Rationale:
+//
+//   1. LTP feed only covers the Manthan universe — user-manual buys of
+//      out-of-universe stocks (e.g. NORTHARC, SONACOMS) have no live
+//      price, so currentValue would silently drop them and show a
+//      misleading portfolio total.
+//   2. Portfolio API is Manthan-scoped by product intent. Broker-side
+//      holdings (all origins) are surfaced via /live-orders/indira-
+//      positions which pulls straight from Indira.
+//   3. Realized P&L per strategy stays honest — a manual sell doesn't
+//      pollute the Manthan strategy's realized number.
+//
+// The manthan_invested / user_manual_invested split in the response is
+// kept for wire compatibility; user_manual_invested will always be 0
+// under the new scope.
+//
+// Zero rows for a user is a valid state (new user, no Manthan trading
+// yet). The returned Summary has all-zero fields and nil error.
 func (s *Store) SummaryFor(ctx context.Context, userID string) (*Summary, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("SummaryFor: userID is required")
@@ -95,7 +113,9 @@ func (s *Store) SummaryFor(ctx context.Context, userID string) (*Summary, error)
 	todayStartIST := startOfTodayIST()
 
 	// One-shot: FILTER clauses turn every branch into a single sequential
-	// scan of the user's rows. No indexed sort needed.
+	// scan of the user's rows. Scoped to origin='MANTHAN' at the WHERE
+	// clause (single row per active Manthan position) — no indexed sort
+	// needed on this narrow dataset.
 	row := s.db.QueryRowContext(ctx, `
 		SELECT
 		  COALESCE(SUM(invested_amount) FILTER (WHERE status = 'ACTIVE'), 0)             AS total_invested,
@@ -104,12 +124,11 @@ func (s *Store) SummaryFor(ctx context.Context, userID string) (*Summary, error)
 		                                         AND exit_time >= $2::timestamptz), 0)  AS today_realized_pnl,
 		  COUNT(*) FILTER (WHERE status = 'ACTIVE')                                       AS active_count,
 		  COUNT(*) FILTER (WHERE status = 'EXITED')                                       AS closed_count,
-		  COALESCE(SUM(invested_amount) FILTER (WHERE status = 'ACTIVE'
-		                                          AND origin = 'MANTHAN'), 0)             AS manthan_invested,
-		  COALESCE(SUM(invested_amount) FILTER (WHERE status = 'ACTIVE'
-		                                          AND origin = 'USER_MANUAL'), 0)         AS user_manual_invested
+		  COALESCE(SUM(invested_amount) FILTER (WHERE status = 'ACTIVE'), 0)             AS manthan_invested,
+		  0::numeric                                                                     AS user_manual_invested
 		FROM positions
-		WHERE user_id = $1`, userID, todayStartIST)
+		WHERE user_id = $1
+		  AND origin  = 'MANTHAN'`, userID, todayStartIST)
 
 	var out Summary
 	if err := row.Scan(
@@ -130,12 +149,16 @@ func (s *Store) SummaryFor(ctx context.Context, userID string) (*Summary, error)
 // ActiveLotsFor — every ACTIVE lot, entry_time ASC.
 // -----------------------------------------------------------------------------
 
-// ActiveLotsFor returns all ACTIVE lots (both MANTHAN and USER_MANUAL)
-// for one user. Sorted entry_time ASC = FIFO display, matches the FIFO
-// exit rule in §7.2 of positions_service_design.md.
+// ActiveLotsFor returns all ACTIVE MANTHAN lots for one user. Sorted
+// entry_time ASC = FIFO display, matches the FIFO exit rule in §7.2 of
+// positions_service_design.md.
 //
-// Nil user_id returns error; empty result is a valid state (all lots
-// exited) → returns (nil, nil) after driving through the loop 0 times.
+// SCOPE: MANTHAN-only (see SummaryFor's doc for the rationale). USER_MANUAL
+// lots are shown via /live-orders/indira-positions which pulls from
+// Indira directly.
+//
+// Nil user_id returns error; empty result is a valid state (all Manthan
+// lots exited) → returns (nil, nil) after driving through the loop 0 times.
 func (s *Store) ActiveLotsFor(ctx context.Context, userID string) ([]*ActivePosition, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("ActiveLotsFor: userID is required")
@@ -146,7 +169,9 @@ func (s *Store) ActiveLotsFor(ctx context.Context, userID string) ([]*ActivePosi
 		       entry_time, entry_price, quantity, invested_amount,
 		       COALESCE(current_sl, 0), COALESCE(high_since_entry, 0)
 		FROM positions
-		WHERE user_id = $1 AND status = 'ACTIVE'
+		WHERE user_id  = $1
+		  AND status   = 'ACTIVE'
+		  AND origin   = 'MANTHAN'
 		ORDER BY entry_time ASC, position_id ASC`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("ActiveLotsFor query: %w", err)
@@ -201,11 +226,14 @@ func (s *Store) ClosedLotsPaged(ctx context.Context, userID string, page, pageSi
 	}
 	offset := (page - 1) * pageSize
 
-	// Total count (used for UI paginator). One query, no joins, cheap.
+	// Total count (used for UI paginator). Scoped to origin='MANTHAN'
+	// per the portfolio API contract — see SummaryFor doc.
 	var total int
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM positions
-		WHERE user_id = $1 AND status = 'EXITED'`, userID).Scan(&total); err != nil {
+		WHERE user_id = $1
+		  AND status  = 'EXITED'
+		  AND origin  = 'MANTHAN'`, userID).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("ClosedLotsPaged count: %w", err)
 	}
 	if total == 0 {
@@ -219,7 +247,9 @@ func (s *Store) ClosedLotsPaged(ctx context.Context, userID string, page, pageSi
 		       COALESCE(realized_pnl, 0),
 		       invested_amount
 		FROM positions
-		WHERE user_id = $1 AND status = 'EXITED'
+		WHERE user_id = $1
+		  AND status  = 'EXITED'
+		  AND origin  = 'MANTHAN'
 		ORDER BY exit_time DESC, position_id DESC
 		LIMIT $2 OFFSET $3`, userID, pageSize, offset)
 	if err != nil {
