@@ -385,12 +385,29 @@ func (h *Handler) handleSLTrackingEvent(ctx context.Context, ev *consumer.OrderE
 		return nil
 	}
 
+	// Audit rows use the PARENT (entry) signal_id — position_events.signal_id
+	// is UUID-typed. Trade-execution stores SL rows with signal_id prefixed
+	// "sl-<uuid>" (per rules-engine's SL_MODIFY deterministic-id pattern) —
+	// that string won't parse as UUID. EntrySignalID is the plain UUID of
+	// the parent BUY signal, which IS the position's signal_id already
+	// stored on positions.signal_id. Every event on a position references
+	// the same signal_id → consistent audit trail.
+	auditSignalID := meta.EntrySignalID
+	if auditSignalID == "" {
+		// Defensive: LookupOrderMeta falls back to SL's own signal_id when
+		// EntrySignalID is empty (shouldn't happen for SL orders since
+		// they always have a parent, but if it does, better to skip the
+		// audit-row signal_id than write garbage).
+		h.logger.Debug("state-machine: SL event missing EntrySignalID — audit row will have NULL signal_id",
+			zap.String("broker_order_id", ev.BrokerOrderID))
+	}
+
 	// Route: CANCELLED (with no fill) → clear; else set/update to trigger_price.
 	if ev.EventType == "CANCELLED" && ev.FilledQty == 0 {
 		auditEvent := &store.PositionEvent{
 			EventType:      store.EventTypeSLCancelled,
 			BrokerOrderID:  ev.BrokerOrderID,
-			SignalID:       meta.SignalID,
+			SignalID:       auditSignalID,
 			Reason:         "SL cancelled at broker (filled_qty=0)",
 			RawSourceEvent: ev.RawMessage,
 			SourceEventID:  ev.EventID,
@@ -423,7 +440,7 @@ func (h *Handler) handleSLTrackingEvent(ctx context.Context, ev *consumer.OrderE
 	auditEvent := &store.PositionEvent{
 		EventType:      store.EventTypeSLModified,
 		BrokerOrderID:  ev.BrokerOrderID,
-		SignalID:       meta.SignalID,
+		SignalID:       auditSignalID,
 		FillPrice:      ev.TriggerPrice, // repurposed: SL trigger value (position_events has no dedicated column)
 		Reason:         reason,
 		RawSourceEvent: ev.RawMessage,
@@ -498,10 +515,15 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 	qtyClosed := pos.Quantity
 	realizedPnL := (exitPrice - pos.EntryPrice) * float64(qtyClosed)
 
+	// Audit row's signal_id references the POSITION's signal_id (the parent
+	// BUY's UUID), not the SL order's own signal_id (which trade-execution
+	// stores prefixed "sl-<uuid>" and won't parse as the UUID-typed column).
+	// See the note in handleSLTrackingEvent for the same fix on the modify
+	// path (2026-07-16).
 	auditEvent := &store.PositionEvent{
 		EventType:        store.EventTypeSLFilled,
 		BrokerOrderID:    ev.BrokerOrderID,
-		SignalID:         meta.SignalID,
+		SignalID:         meta.EntrySignalID,
 		DeltaQty:         -qtyClosed,
 		FillPrice:        exitPrice,
 		RealizedPnLDelta: realizedPnL,
