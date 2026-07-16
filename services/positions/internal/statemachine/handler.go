@@ -88,6 +88,19 @@ func New(s *store.Store, lookup OrderMetaLookup, pub EventPublisher, logger *zap
 //	positions.entry_broker_order_id UNIQUE-ish idempotency for BUY inserts
 //	position_events (position_id, source_event_id) UNIQUE for audit rows
 func (h *Handler) Handle(ctx context.Context, ev *consumer.OrderEvent) error {
+	// SL-tracking events (STATUS_CHANGED with an SL order type, or CANCELLED
+	// on an SL order without a fill) update positions.current_sl. Checked
+	// BEFORE the fill gate because these events have event_type=STATUS_CHANGED
+	// (not FILLED), so isFillEvent would drop them.
+	//
+	// An SL that FIRES (broker-triggered exit) arrives as event_type=FILLED
+	// with buy_sell=SELL — that goes through the fill path below and lands
+	// in handleManthanSellFill via the meta lookup. current_sl becomes moot
+	// because the position exits.
+	if isSLTrackingEvent(ev) {
+		return h.handleSLTrackingEvent(ctx, ev)
+	}
+
 	if !isFillEvent(ev) {
 		h.logger.Debug("state-machine: skip non-fill event",
 			zap.String("event_id", ev.EventID),
@@ -108,6 +121,48 @@ func (h *Handler) Handle(ctx context.Context, ev *consumer.OrderEvent) error {
 			zap.String("buy_sell", ev.BuySell))
 		return nil
 	}
+}
+
+// isSLTrackingEvent returns true iff the event should be routed to
+// handleSLTrackingEvent (which updates positions.current_sl). We match:
+//
+//   order_type contains "SL"    — broker's SL order events (REST format
+//                                 uses "SL"; WSS may use "SL-L", "SL_LIMIT")
+//   AND (
+//     event carries a real trigger_price (SL_PLACED or SL_MODIFIED)
+//     OR event_type == CANCELLED with filled_qty == 0 (SL cancelled
+//        without firing — CANCELLED-with-fill is the fill path below)
+//   )
+//
+// FILLED events on SL orders (SL triggered → position exit) are handled
+// by the fill path via handleManthanSellFill, NOT here — position exits
+// clear current_sl implicitly by leaving status=ACTIVE behind.
+func isSLTrackingEvent(ev *consumer.OrderEvent) bool {
+	if !isSLOrderTypeString(ev.OrderType) {
+		return false
+	}
+	if ev.EventType == "CANCELLED" && ev.FilledQty == 0 {
+		return true
+	}
+	if ev.TriggerPrice > 0 && ev.EventType != "FILLED" && ev.EventType != "PARTIALLY_FILLED" {
+		return true
+	}
+	return false
+}
+
+// isSLOrderTypeString accepts the string forms broker actually publishes.
+// REST_ORDERBOOK typically writes "SL"; WSS may write "SL-L" or with
+// suffixes. Case-insensitive; empty string is safe (returns false).
+func isSLOrderTypeString(ot string) bool {
+	u := strings.ToUpper(strings.TrimSpace(ot))
+	if u == "SL" {
+		return true
+	}
+	// Match "SL_", "SL-" prefixes, and " SL " embedded (unlikely but safe).
+	if strings.HasPrefix(u, "SL_") || strings.HasPrefix(u, "SL-") {
+		return true
+	}
+	return false
 }
 
 // isFillEvent returns true iff the event should trigger a position state
@@ -263,6 +318,126 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 			BrokerOrderID: ev.BrokerOrderID,
 		})
 	}
+	return nil
+}
+
+// ----------------------------------------------------------------------
+// SL tracking — §7.5 (added 2026-07-16)
+//
+// SL orders don't move a position's status (that's what fills do). They
+// mutate a single column, positions.current_sl, so mobile UI + portfolio
+// summary can render "SL @ 1512.90" and later "SL ratcheted to 1520.30".
+//
+// The link between an SL order (broker_order_id = NYMZX0021B@7) and its
+// parent position (whose entry_broker_order_id = NYMZX00219@7) lives in
+// trade-execution's manthan_orders.parent_order_id. We resolve it via
+// the existing LookupOrderMeta gRPC — one hop, cache-wrapped, no schema
+// changes.
+//
+// Edge cases handled:
+//   Meta.Found == false      → user-manual SL (not tracked in positions_db
+//                              today; deferred to future scope) — no-op.
+//   No matching ACTIVE lot   → drift or race (SL modify arrived after
+//                              position exited) — warn + no-op; drift
+//                              detector will surface if the situation
+//                              persists.
+//   TriggerPrice = 0 on non-cancel event → skip; the CANCELLED branch
+//                              is the ONLY intentional "clear" path.
+// ----------------------------------------------------------------------
+
+func (h *Handler) handleSLTrackingEvent(ctx context.Context, ev *consumer.OrderEvent) error {
+	// Look up the parent BUY via trade-execution's manthan_orders join.
+	// meta.Found == true means we know this SL — it's a Manthan-placed SL
+	// (or trade-execution knows about it via user-config-events sync).
+	// meta.EntryBrokerOrderID is the parent BUY's broker_order_id, which
+	// FindPositionByEntryBrokerOrderID uses to locate the position row.
+	meta, err := h.lookup.LookupOrderMeta(ctx, ev.BrokerOrderID)
+	if err != nil {
+		return fmt.Errorf("SL LookupOrderMeta: %w", err)
+	}
+	if !meta.Found {
+		h.logger.Debug("state-machine: SL event but not in manthan_orders (user-manual SL) — skipping",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.String("event_id", ev.EventID))
+		return nil
+	}
+	if meta.EntryBrokerOrderID == "" {
+		h.logger.Warn("state-machine: SL event missing EntryBrokerOrderID from meta — skipping",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.String("event_id", ev.EventID))
+		return nil
+	}
+
+	pos, err := h.store.FindPositionByEntryBrokerOrderID(ctx, meta.EntryBrokerOrderID)
+	if err != nil {
+		return fmt.Errorf("SL find position: %w", err)
+	}
+	if pos == nil {
+		// No ACTIVE lot for the parent BUY. Could be:
+		//   (a) drift — parent BUY never got processed by positions svc
+		//   (b) race  — position exited between fill and this event
+		// Neither is a fatal error; drift detector (Chunk P.G) will
+		// surface (a) if it persists. Log at Info to make debugging easy.
+		h.logger.Info("state-machine: SL event but no ACTIVE parent position — skipping",
+			zap.String("sl_broker_order_id", ev.BrokerOrderID),
+			zap.String("entry_broker_order_id", meta.EntryBrokerOrderID),
+			zap.String("event_id", ev.EventID))
+		return nil
+	}
+
+	// Route: CANCELLED (with no fill) → clear; else set/update to trigger_price.
+	if ev.EventType == "CANCELLED" && ev.FilledQty == 0 {
+		auditEvent := &store.PositionEvent{
+			EventType:      store.EventTypeSLCancelled,
+			BrokerOrderID:  ev.BrokerOrderID,
+			SignalID:       meta.SignalID,
+			Reason:         "SL cancelled at broker (filled_qty=0)",
+			RawSourceEvent: ev.RawMessage,
+			SourceEventID:  ev.EventID,
+		}
+		if err := h.store.ClearCurrentSLWithEvent(ctx, pos.PositionID, auditEvent); err != nil {
+			return fmt.Errorf("clear current_sl: %w", err)
+		}
+		h.logger.Info("state-machine: SL cancelled — cleared current_sl",
+			zap.String("position_id", pos.PositionID.String()),
+			zap.String("symbol", pos.Symbol),
+			zap.String("sl_broker_order_id", ev.BrokerOrderID))
+		return nil
+	}
+
+	// Set/update path — needs a real trigger_price.
+	if ev.TriggerPrice <= 0 {
+		h.logger.Debug("state-machine: SL event with no trigger_price — skipping",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.String("event_type", ev.EventType))
+		return nil
+	}
+
+	// Reason line shows the SL walk visible in position_events:
+	//   "SL @ 1512.90" (first observation, prior was null)
+	//   "SL 1512.90 → 1520.30" (ratchet up)
+	reason := fmt.Sprintf("SL @ %.4f", ev.TriggerPrice)
+	if pos.CurrentSL > 0 && pos.CurrentSL != ev.TriggerPrice {
+		reason = fmt.Sprintf("SL %.4f → %.4f", pos.CurrentSL, ev.TriggerPrice)
+	}
+	auditEvent := &store.PositionEvent{
+		EventType:      store.EventTypeSLModified,
+		BrokerOrderID:  ev.BrokerOrderID,
+		SignalID:       meta.SignalID,
+		FillPrice:      ev.TriggerPrice, // repurposed: SL trigger value (position_events has no dedicated column)
+		Reason:         reason,
+		RawSourceEvent: ev.RawMessage,
+		SourceEventID:  ev.EventID,
+	}
+	if err := h.store.UpdateCurrentSLWithEvent(ctx, pos.PositionID, ev.TriggerPrice, auditEvent); err != nil {
+		return fmt.Errorf("update current_sl: %w", err)
+	}
+	h.logger.Info("state-machine: SL trigger set",
+		zap.String("position_id", pos.PositionID.String()),
+		zap.String("symbol", pos.Symbol),
+		zap.Float64("prev_sl", pos.CurrentSL),
+		zap.Float64("new_sl", ev.TriggerPrice),
+		zap.String("sl_broker_order_id", ev.BrokerOrderID))
 	return nil
 }
 

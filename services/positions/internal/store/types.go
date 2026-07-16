@@ -40,7 +40,8 @@ const (
 const (
 	EventTypeEntryFilled        = "ENTRY_FILLED"
 	EventTypeUserManualEntry    = "USER_MANUAL_ENTRY"
-	EventTypeSLModified         = "SL_MODIFIED"
+	EventTypeSLModified         = "SL_MODIFIED"  // trigger set/updated (any observation with a real trigger_price)
+	EventTypeSLCancelled        = "SL_CANCELLED" // SL order cancelled without firing — current_sl cleared to NULL
 	EventTypeSLFilled           = "SL_FILLED"
 	EventTypeManualSellApplied  = "MANUAL_SELL_APPLIED"
 	EventTypeLiquidation        = "LIQUIDATION"

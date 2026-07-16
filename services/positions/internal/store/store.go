@@ -165,6 +165,35 @@ func (s *Store) DistinctUsersWithActive(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
+// FindPositionByEntryBrokerOrderID returns the ACTIVE lot whose BUY broker
+// order created it. Returns (nil, nil) when no match — caller decides if
+// that's a real drift or a legitimate "SL event for a position we don't
+// track" case (e.g. USER_MANUAL SL that never had a Manthan BUY row).
+//
+// Used by the SL-tracking path in the state machine: an SL_MODIFY event
+// arrives with the SL's own broker_order_id → gRPC LookupOrderMeta returns
+// the parent BUY's broker_order_id → this lookup finds the position it
+// belongs to → current_sl gets updated. See §7.5 (added 2026-07-16).
+//
+// Filter is `status='ACTIVE'` so an SL modification arriving after the
+// position already exited (broker race) doesn't accidentally reopen it.
+func (s *Store) FindPositionByEntryBrokerOrderID(ctx context.Context, entryBrokerOrderID string) (*Position, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+positionColumns+`
+		FROM positions
+		WHERE entry_broker_order_id = $1
+		  AND status = 'ACTIVE'
+		LIMIT 1`, entryBrokerOrderID)
+	pos, err := scanPosition(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("FindPositionByEntryBrokerOrderID: %w", err)
+	}
+	return pos, nil
+}
+
 // PositionExistsForEntry returns true if we've already INSERTed a position
 // row for this BUY broker_order_id — the idempotency check on the BUY path.
 // Kafka may replay the same FILLED event; without this we'd double-insert.
@@ -227,6 +256,75 @@ func (s *Store) UpdateExitWithEvent(ctx context.Context, positionID uuid.UUID, e
 			// Position wasn't ACTIVE (already exited by a prior call or race).
 			// This is a legitimate no-op — audit still records the observation.
 			s.logger.Debug("update exit: position not ACTIVE (idempotent no-op)",
+				zap.String("position_id", positionID.String()))
+		}
+		ev.PositionID = positionID
+		return insertEventTx(ctx, tx, ev)
+	})
+}
+
+// UpdateCurrentSLWithEvent atomically sets positions.current_sl to newSL +
+// appends an SL_MODIFIED audit row. Used every time the state machine
+// observes a broker SL PENDING/STATUS_CHANGED event with a real
+// trigger_price — first observation OR any subsequent ratchet.
+//
+// Only touches ACTIVE positions (RowsAffected=0 is a legitimate no-op:
+// SL observation arriving after the position already exited via SL fire).
+//
+// Idempotency: same SL event replayed via Kafka → position_events UNIQUE
+// (position_id, source_event_id) rejects the audit INSERT → transaction
+// rolls back → current_sl unchanged. Net effect: exactly-once semantics
+// even with at-least-once Kafka.
+func (s *Store) UpdateCurrentSLWithEvent(ctx context.Context, positionID uuid.UUID, newSL float64, ev *PositionEvent) error {
+	if newSL <= 0 {
+		return fmt.Errorf("UpdateCurrentSLWithEvent: newSL must be > 0 (got %f)", newSL)
+	}
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET current_sl = $1,
+			    updated_at = NOW()
+			WHERE position_id = $2
+			  AND status = 'ACTIVE'`,
+			newSL, positionID)
+		if err != nil {
+			return fmt.Errorf("update current_sl: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			s.logger.Debug("update current_sl: position not ACTIVE (idempotent no-op)",
+				zap.String("position_id", positionID.String()))
+		}
+		ev.PositionID = positionID
+		return insertEventTx(ctx, tx, ev)
+	})
+}
+
+// ClearCurrentSLWithEvent atomically sets positions.current_sl to NULL +
+// appends an SL_CANCELLED audit row. Used when the broker publishes a
+// CANCELLED event on an SL order with filled_qty=0 (broker rejected the
+// SL, rules-engine cancelled it during strategy STOP, etc.).
+//
+// Position is left ACTIVE — the user still owns the shares; only the
+// automated protection is gone. Mobile UI reads current_sl=NULL as
+// "unprotected" and can prompt the user to re-arm or exit manually.
+//
+// Same idempotency + no-op semantics as UpdateCurrentSLWithEvent.
+func (s *Store) ClearCurrentSLWithEvent(ctx context.Context, positionID uuid.UUID, ev *PositionEvent) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET current_sl = NULL,
+			    updated_at = NOW()
+			WHERE position_id = $1
+			  AND status = 'ACTIVE'`,
+			positionID)
+		if err != nil {
+			return fmt.Errorf("clear current_sl: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			s.logger.Debug("clear current_sl: position not ACTIVE (idempotent no-op)",
 				zap.String("position_id", positionID.String()))
 		}
 		ev.PositionID = positionID
