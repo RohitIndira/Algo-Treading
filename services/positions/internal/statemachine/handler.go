@@ -224,19 +224,35 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		return fmt.Errorf("BUY LookupOrderMeta: %w", err)
 	}
 
-	entryPrice := ev.TradedPrice
+	// Entry price precedence:
+	//   1. meta.AvgFillPrice — SSOT from manthan_orders (populated by
+	//      trade-execution when it processed a WSS fill event with a
+	//      real traded_price). This is the broker-authoritative value.
+	//   2. ev.TradedPrice — the current Kafka event carries a real fill
+	//      (i.e. this IS a WSS event and it beat trade-exec's writer).
+	//   3. Neither → the event is a REST_ORDERBOOK-first arrival that
+	//      has no fill-price information. SKIP rather than fall back
+	//      to ev.OrderPrice (the LIMIT price), which produced the
+	//      2026-07-16 incident where positions_db.entry_price = 518.15
+	//      (limit) while manthan_orders.avg_fill_price = 518.05 (fill).
+	//      A later WSS event on the same broker_order_id will retry
+	//      and succeed; positions svc's ordering guarantee holds
+	//      because idempotency is by broker_order_id, not event_id.
+	entryPrice := meta.AvgFillPrice
 	if entryPrice == 0 {
-		entryPrice = ev.OrderPrice
+		entryPrice = ev.TradedPrice
 	}
 	qty := ev.FilledQty
 	if qty == 0 {
 		qty = ev.Quantity
 	}
 	if entryPrice == 0 || qty == 0 {
-		h.logger.Warn("state-machine: BUY FILLED with 0 price or qty — skipping",
+		h.logger.Info("state-machine: BUY event has no fill price yet — deferring (waiting for WSS event with traded_price)",
 			zap.String("event_id", ev.EventID),
 			zap.String("broker_order_id", ev.BrokerOrderID),
-			zap.Float64("traded_price", ev.TradedPrice),
+			zap.String("source", ev.Source),
+			zap.Float64("meta_avg_fill", meta.AvgFillPrice),
+			zap.Float64("ev_traded_price", ev.TradedPrice),
 			zap.Int("filled_qty", ev.FilledQty))
 		return nil
 	}
@@ -302,6 +318,47 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		zap.Float64("entry_price", pos.EntryPrice),
 		zap.String("signal_id", pos.SignalID),
 		zap.String("broker_order_id", ev.BrokerOrderID))
+
+	// Race-close: if trade-execution already knows about an SL row for this
+	// entry (parent_order_id self-FK on manthan_orders), apply its trigger
+	// price now. Covers the Kafka partition-ordering case where the SL
+	// event arrived at positions svc BEFORE this BUY event and was silently
+	// dropped by the state machine as "no ACTIVE parent position." Without
+	// this pull, positions_db.current_sl stays NULL until a reconciler
+	// backfills — verified missed on AADHARHFC + CUB on 2026-07-16.
+	//
+	// Only ENTRY rows carry an SL child, so guard on Origin==MANTHAN
+	// (USER_MANUAL buys don't get a Manthan SL) and on meta.SLTriggerPrice
+	// being non-zero (0 = LookupOrderMeta found no SL row yet).
+	if pos.Origin == store.OriginManthan && meta.SLTriggerPrice > 0 && meta.SLBrokerOrderID != "" {
+		slAudit := &store.PositionEvent{
+			EventType:     store.EventTypeSLModified,
+			BrokerOrderID: meta.SLBrokerOrderID,
+			SignalID:      pos.SignalID, // parent BUY's signal (SL rows carry sl-<uuid> which is not a UUID)
+			FillPrice:     meta.SLTriggerPrice,
+			// SourceEventID mirrors handleSLTrackingEvent's format so a
+			// later SL Kafka event is deduped rather than double-applied.
+			SourceEventID:  "sl-pull-" + meta.SLBrokerOrderID,
+			SourceTopic:    "buy-handler-sl-pull",
+			RawSourceEvent: ev.RawMessage,
+		}
+		if err := h.store.UpdateCurrentSLWithEvent(ctx, pos.PositionID, meta.SLTriggerPrice, slAudit); err != nil {
+			// Non-fatal — the position is already inserted correctly. Log
+			// and let the SL Kafka event (or reconciler) retry.
+			h.logger.Warn("state-machine: BUY-time SL pull failed — leaving to Kafka SL event or reconciler",
+				zap.String("position_id", pos.PositionID.String()),
+				zap.String("sl_broker_order_id", meta.SLBrokerOrderID),
+				zap.Float64("sl_trigger_price", meta.SLTriggerPrice),
+				zap.Error(err))
+		} else {
+			h.logger.Info("state-machine: BUY-time SL pull applied (race-close)",
+				zap.String("position_id", pos.PositionID.String()),
+				zap.String("symbol", pos.Symbol),
+				zap.Float64("current_sl", meta.SLTriggerPrice),
+				zap.String("sl_broker_order_id", meta.SLBrokerOrderID))
+			pos.CurrentSL = meta.SLTriggerPrice
+		}
+	}
 
 	if h.pub != nil {
 		h.pub.Publish(ctx, &publisher.PositionEvent{

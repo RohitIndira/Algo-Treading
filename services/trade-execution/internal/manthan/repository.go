@@ -1116,6 +1116,21 @@ type OrderMeta struct {
 	UserID               string
 	EntrySignalID        string
 	EntryBrokerOrderID   string
+
+	// AvgFillPrice — this row's real avg fill price from manthan_orders.
+	// 0 when the fill hasn't arrived (or the order didn't fill). Positions
+	// svc uses this to avoid entry_price = limit fallback when a
+	// REST_ORDERBOOK-sourced event was the first to arrive on order.events.
+	AvgFillPrice float64
+
+	// SLTriggerPrice / SLBrokerOrderID — for ENTRY rows only, the SL
+	// currently placed at the broker for this entry (via manthan_orders
+	// parent_order_id self-FK). Positions svc's BUY handler uses these to
+	// pull an SL that arrived on Kafka BEFORE the parent BUY event (which
+	// would otherwise be dropped by the state machine as "no parent").
+	// Both are 0 / "" when no SL row exists.
+	SLTriggerPrice    float64
+	SLBrokerOrderID   string
 }
 
 // LookupOrderMeta resolves a broker_order_id to its Manthan lineage.
@@ -1136,17 +1151,25 @@ func (r *Repository) LookupOrderMeta(ctx context.Context, brokerOrderID string) 
 		return nil, fmt.Errorf("broker_order_id is required")
 	}
 
-	// LEFT JOIN self on parent_order_id so a single round-trip returns the
-	// ENTRY lineage even for SL/EXIT rows. When parent_order_id is NULL
-	// (i.e. this row IS the entry) the ent.* columns come back NULL and we
-	// fall back to mo.* below.
+	// Three-way join:
+	//   mo   → this row (always present)
+	//   ent  → the ENTRY row via mo.parent_order_id (NULL when mo IS the
+	//          entry — .Valid false and we fall back to mo.* below)
+	//   sl   → the SL row whose parent_order_id points at THIS row
+	//          (only meaningful when mo is the entry). LATERAL + LIMIT 1
+	//          so a duplicated SL row can't multiply the outer result set.
+	// Everything in one round-trip so positions svc's BUY handler doesn't
+	// pay a second network hop per fill.
 	var (
-		signalID              string
-		orderType             string
-		strategyID            sql.NullString
-		userID                string
-		entrySignalID         sql.NullString
-		entryBrokerOrderID    sql.NullString
+		signalID           string
+		orderType          string
+		strategyID         sql.NullString
+		userID             string
+		entrySignalID      sql.NullString
+		entryBrokerOrderID sql.NullString
+		avgFillPrice       sql.NullFloat64
+		slTriggerPrice     sql.NullFloat64
+		slBrokerOrderID    sql.NullString
 	)
 	err := r.db.QueryRowContext(ctx, `
 		SELECT
@@ -1155,13 +1178,28 @@ func (r *Repository) LookupOrderMeta(ctx context.Context, brokerOrderID string) 
 		  mo.strategy_id,
 		  mo.user_id,
 		  ent.signal_id        AS entry_signal_id,
-		  ent.broker_order_id  AS entry_broker_order_id
+		  ent.broker_order_id  AS entry_broker_order_id,
+		  mo.avg_fill_price,
+		  sl.trigger_price     AS sl_trigger_price,
+		  sl.broker_order_id   AS sl_broker_order_id
 		FROM manthan_orders mo
 		LEFT JOIN manthan_orders ent ON ent.id = mo.parent_order_id
+		LEFT JOIN LATERAL (
+		  SELECT trigger_price, broker_order_id
+		    FROM manthan_orders x
+		   WHERE x.parent_order_id = mo.id
+		     AND x.order_type LIKE 'SL%'
+		   ORDER BY x.created_at DESC
+		   LIMIT 1
+		) sl ON true
 		WHERE mo.broker_order_id = $1
 		LIMIT 1`,
 		brokerOrderID,
-	).Scan(&signalID, &orderType, &strategyID, &userID, &entrySignalID, &entryBrokerOrderID)
+	).Scan(
+		&signalID, &orderType, &strategyID, &userID,
+		&entrySignalID, &entryBrokerOrderID,
+		&avgFillPrice, &slTriggerPrice, &slBrokerOrderID,
+	)
 	if err == sql.ErrNoRows {
 		return &OrderMeta{Found: false}, nil
 	}
@@ -1188,5 +1226,8 @@ func (r *Repository) LookupOrderMeta(ctx context.Context, brokerOrderID string) 
 		UserID:             userID,
 		EntrySignalID:      esID,
 		EntryBrokerOrderID: ebID,
+		AvgFillPrice:       avgFillPrice.Float64,     // 0 when NULL
+		SLTriggerPrice:     slTriggerPrice.Float64,   // 0 when no SL row exists
+		SLBrokerOrderID:    slBrokerOrderID.String,   // "" when no SL row exists
 	}, nil
 }

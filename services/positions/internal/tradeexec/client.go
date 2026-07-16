@@ -25,6 +25,20 @@ type OrderMeta struct {
 	UserID             string
 	EntrySignalID      string
 	EntryBrokerOrderID string
+
+	// AvgFillPrice — the row's real avg fill from manthan_orders. 0 when
+	// the fill hasn't landed yet. Consumed by handleBuyFill so entry_price
+	// reflects the actual traded price rather than the LIMIT-price fallback
+	// that a REST_ORDERBOOK-first race would otherwise produce.
+	AvgFillPrice float64
+
+	// SLTriggerPrice / SLBrokerOrderID — for ENTRY rows only, the SL
+	// currently placed at the broker (parent_order_id self-FK on
+	// manthan_orders). Positions svc's BUY handler uses these to apply an
+	// SL that arrived on Kafka BEFORE its parent BUY event and was
+	// therefore dropped by the state machine's "no parent" branch.
+	SLTriggerPrice  float64
+	SLBrokerOrderID string
 }
 
 // Client is positions svc's gRPC client for trade-execution.LookupOrderMeta.
@@ -125,6 +139,9 @@ func (c *Client) LookupOrderMeta(ctx context.Context, brokerOrderID string) (Ord
 		UserID:             resp.GetUserId(),
 		EntrySignalID:      resp.GetEntrySignalId(),
 		EntryBrokerOrderID: resp.GetEntryBrokerOrderId(),
+		AvgFillPrice:       resp.GetAvgFillPrice(),
+		SLTriggerPrice:     resp.GetSlTriggerPrice(),
+		SLBrokerOrderID:    resp.GetSlBrokerOrderId(),
 	}
 
 	// Cache both found and not-found results — different TTLs handled inside Put.

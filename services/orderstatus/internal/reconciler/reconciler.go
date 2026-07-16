@@ -258,6 +258,24 @@ func (r *Reconciler) eventFromOrderBookRow(userID string, o *indira.OrderBook, s
 	}
 
 	status := strings.ToUpper(strings.TrimSpace(o.Status))
+	ordTypeUpper := strings.ToUpper(strings.TrimSpace(o.OrdType))
+
+	// TradedPrice sourcing from the OrderBook API:
+	//   - Market / SL-M ordTypes: broker has no user-specified LIMIT to
+	//     store in `price`, so it puts the actual traded price there once
+	//     the order fills. Confirmed live 2026-07-16 on BECTORFOOD @
+	//     ordType=Market, status=Executed, price=188.59 (avg trade).
+	//   - Limit / SL / SL-L ordTypes: `price` is the user's LIMIT — the
+	//     fill lives in TradeBook (Layer 3) only. Leave TradedPrice=0
+	//     so positions svc defers to a later WSS event that carries the
+	//     real fill (see services/positions/statemachine/handler.go
+	//     handleBuyFill precedence — meta.AvgFillPrice > ev.TradedPrice
+	//     > skip).
+	var tradedPrice float64
+	if isMarketOrdType(ordTypeUpper) && o.TradedQty > 0 && o.Price > 0 {
+		tradedPrice = o.Price
+	}
+
 	return &store.Event{
 		BrokerOrderID:   brokerOrderID,
 		ExchangeOrderID: exchOrderID,
@@ -276,12 +294,29 @@ func (r *Reconciler) eventFromOrderBookRow(userID string, o *indira.OrderBook, s
 		TriggerPrice:    o.TriggerPrice,
 		Quantity:        o.Qty,
 		FilledQty:       o.TradedQty,
-		TradedPrice:     0, // OrderBook doesn't carry avg fill — that's in TradeBook (Layer 3)
+		TradedPrice:     tradedPrice,
 		PendingQty:      o.RemainQty,
 		Reason:          strings.TrimSpace(o.RejReason),
 		RawPayload:      raw,
 		BrokerTsMs:      0, // set when we plumb exch time through
 	}
+}
+
+// isMarketOrdType returns true for Indira ordType values whose `price`
+// field on the OrderBook API carries the AVG TRADED price rather than a
+// user LIMIT. Used by the REST reconciler to opportunistically populate
+// TradedPrice for Market fills (Limit / SL / SL-L stay 0 — those need
+// TradeBook / WSS for the fill price).
+//
+// Kept as a small case-fold list rather than a regex — Indira sometimes
+// returns "Market", sometimes "MARKET", and different SDK versions have
+// used "SL-M" vs "SL_MARKET".
+func isMarketOrdType(ordType string) bool {
+	switch ordType {
+	case "MARKET", "MKT", "SL-M", "SL_M", "SL_MARKET":
+		return true
+	}
+	return false
 }
 
 // deriveEventSeq matches the WSS-side derivation used in
