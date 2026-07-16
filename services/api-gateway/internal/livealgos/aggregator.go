@@ -5,6 +5,21 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
 )
 
+// StrategyMetrics carries the live per-strategy numbers computed by the
+// handler from positions_db + LTP. `Real` is false when the handler
+// couldn't produce numbers for a given strategy (positions_db unreachable
+// or LTP feed unavailable); Build then falls back to pnlPending=true so
+// the UI shows a spinner instead of a misleading 0.
+type StrategyMetrics struct {
+	Real          bool
+	NetPnL        int64
+	NetPct        float64
+	TodayPnL      int64
+	TodayPct      float64
+	OpenPositions int32
+	WinRatePct    float64
+}
+
 // Build assembles the Response payload from the two inputs the handler
 // gathers: the list of user-config strategies (from gRPC) and the algo
 // metadata catalog (static, in-memory).
@@ -26,22 +41,29 @@ import (
 //       active=false                                → PAUSED (user hit
 //                                                    Pause on the modal)
 //
-//   - Phase 1: all P&L numbers return with pnlPending=true and
-//     amount=0/percent=0. Frontend renders a spinner over that region.
-//     Phase 2 will replace these with real reads from
-//     trading_db.manthan_positions + LTP feed.
+//   - P&L numbers come from `metricsByStrategy` keyed on strategy_id.
+//     When a strategy has no entry (positions_db unreachable at request
+//     time) OR entry.Real=false, the row falls back to pnlPending=true so
+//     the UI spins instead of showing a misleading zero.
 //
-//   - The Summary tile aggregates over ALL returned rows. If we only
-//     have real deployedCapital in Phase 1, summary.totalDeployedCapital
-//     is real, but summary.NetPnL and summary.TodayPnL are also
-//     pnlPending=true (same story as the per-algo tiles).
+//   - Summary aggregates over strategies whose metrics were real. If ANY
+//     strategy came back as pending, the summary tile also renders
+//     pnlPending=true — the aggregate is only meaningful when we have a
+//     number for every row.
 //
 // A user with zero deployments returns Summary{}+empty Algos slice —
 // the frontend then shows an empty-state card ("Deploy an algo to see
 // it here").
-func Build(strategies []*pb.Strategy, catalog algos.Catalog) Response {
+func Build(
+	strategies []*pb.Strategy,
+	catalog algos.Catalog,
+	metricsByStrategy map[string]StrategyMetrics,
+) Response {
 	rows := make([]AlgoRow, 0, len(strategies))
 	var totalDeployedCapital int64
+	var sumNet, sumToday int64
+	allReal := true
+	haveAny := false
 
 	// Only Manthan today. Cheap lookup by iterating the catalog once
 	// and putting it in a map keyed on the algo id. Kept local so we
@@ -77,27 +99,40 @@ func Build(strategies []*pb.Strategy, catalog algos.Catalog) Response {
 			StrategyID:      s.StrategyId,
 			Status:          statusFrom(s),
 			DeployedCapital: deployedCapitalFrom(s),
-
-			// Phase 1 placeholders — see file docstring.
-			NetPnL:        PnL{PnLPending: true},
-			TodayPnL:      PnL{PnLPending: true},
-			WinRatePct:    0,
-			OpenPositions: 0,
 		}
+
+		if m, ok := metricsByStrategy[s.StrategyId]; ok && m.Real {
+			row.NetPnL = PnL{Amount: m.NetPnL, Percent: m.NetPct}
+			row.TodayPnL = PnL{Amount: m.TodayPnL, Percent: m.TodayPct}
+			row.WinRatePct = m.WinRatePct
+			row.OpenPositions = m.OpenPositions
+			sumNet += m.NetPnL
+			sumToday += m.TodayPnL
+			haveAny = true
+		} else {
+			row.NetPnL = PnL{PnLPending: true}
+			row.TodayPnL = PnL{PnLPending: true}
+			allReal = false
+		}
+
 		totalDeployedCapital += row.DeployedCapital
 		rows = append(rows, row)
 	}
 
-	return Response{
-		Summary: Summary{
-			// Aggregate P&L is Phase 2 — same pending flag until real
-			// numbers are wired in.
-			NetPnL:               PnL{PnLPending: true},
-			TodayPnL:             PnL{PnLPending: true},
-			TotalDeployedCapital: totalDeployedCapital,
-		},
-		Algos: rows,
+	summary := Summary{TotalDeployedCapital: totalDeployedCapital}
+	if haveAny && allReal {
+		var netPct, todayPct float64
+		if totalDeployedCapital > 0 {
+			netPct = (float64(sumNet) / float64(totalDeployedCapital)) * 100
+			todayPct = (float64(sumToday) / float64(totalDeployedCapital)) * 100
+		}
+		summary.NetPnL = PnL{Amount: sumNet, Percent: round2(netPct)}
+		summary.TodayPnL = PnL{Amount: sumToday, Percent: round2(todayPct)}
+	} else {
+		summary.NetPnL = PnL{PnLPending: true}
+		summary.TodayPnL = PnL{PnLPending: true}
 	}
+	return Response{Summary: summary, Algos: rows}
 }
 
 // algoIDFromStrategyType maps a user-config strategy_type enum value

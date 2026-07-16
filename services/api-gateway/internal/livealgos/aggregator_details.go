@@ -273,6 +273,13 @@ func unrealisedAndToday(active []PositionRow, ltps map[string]LTPQuote) (int64, 
 // LEFT-JOINed exchange_token. Returns (zero, false) when the position
 // wasn't joined to a token OR the token has no Redis entry.
 func ltpForPosition(p PositionRow, ltps map[string]LTPQuote) (LTPQuote, bool) {
+	return LTPForPosition(p, ltps)
+}
+
+// LTPForPosition is the exported form of ltpForPosition — the handler
+// (in package handlers) needs to run the same lookup when computing
+// per-strategy metrics for the LIST endpoint.
+func LTPForPosition(p PositionRow, ltps map[string]LTPQuote) (LTPQuote, bool) {
 	if !p.ExchangeToken.Valid || p.ExchangeToken.String == "" {
 		return LTPQuote{}, false
 	}
