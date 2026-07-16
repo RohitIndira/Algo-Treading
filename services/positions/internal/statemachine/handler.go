@@ -186,11 +186,26 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		return nil
 	}
 
+	// Normalize the wire symbol (STK_AADHARHFC_EQ_NSE_23729) to the canonical
+	// short form + separate exchange. positions_db.positions is the SSOT for
+	// downstream (LTP enricher, mobile UI, portfolio API); all of them expect
+	// short symbols. Unrecognized shapes pass through — see normalizeSymbol
+	// docstring.
+	//
+	// If the wire form parsed → use its exchange. Otherwise fall back to
+	// ev.Exchange (WSS emits numeric enum "1"/"2" — trade-execution's earlier
+	// path stored these verbatim as "1"; not ideal but existing rows). Better
+	// to write SOMETHING sensible than crash the pipeline.
+	normSymbol, normExchange := normalizeSymbol(ev.Symbol)
+	if normExchange == "" {
+		normExchange = ev.Exchange
+	}
+
 	pos := &store.Position{
 		PositionID:         uuid.New(),
 		UserID:             ev.UserID,
-		Symbol:             ev.Symbol,
-		Exchange:           ev.Exchange,
+		Symbol:             normSymbol,
+		Exchange:           normExchange,
 		Status:             store.StatusActive,
 		EntryPrice:         entryPrice,
 		EntryTime:          time.Now(),
@@ -386,14 +401,23 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 		return nil
 	}
 
-	lots, err := h.store.FindActiveLotsFIFO(ctx, ev.UserID, ev.Symbol)
+	// Normalize the SELL event's symbol before FIFO lookup — positions_db.symbol
+	// is stored canonically (e.g. "AADHARHFC") but the SELL event may arrive
+	// with the raw wire form ("STK_AADHARHFC_EQ_NSE_23729"). Without this
+	// normalize step every SELL from the REST_ORDERBOOK path would fail to
+	// match its parent BUY position and log "no ACTIVE lots for user/symbol"
+	// even though the position clearly exists (verified 2026-07-16).
+	normSymbol, _ := normalizeSymbol(ev.Symbol)
+
+	lots, err := h.store.FindActiveLotsFIFO(ctx, ev.UserID, normSymbol)
 	if err != nil {
 		return fmt.Errorf("manual SELL find lots: %w", err)
 	}
 	if len(lots) == 0 {
 		h.logger.Warn("state-machine: manual SELL with no ACTIVE lots for user/symbol",
 			zap.String("user_id", ev.UserID),
-			zap.String("symbol", ev.Symbol),
+			zap.String("symbol_raw", ev.Symbol),
+			zap.String("symbol_normalized", normSymbol),
 			zap.String("event_id", ev.EventID))
 		return nil // drift; positions.drift.detected covers this in P.G
 	}
@@ -507,7 +531,7 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 		// is the right place to alert.
 		h.logger.Warn("state-machine: manual SELL exceeded ACTIVE qty (drift)",
 			zap.String("user_id", ev.UserID),
-			zap.String("symbol", ev.Symbol),
+			zap.String("symbol", normSymbol),
 			zap.Int("sell_qty", sellQty),
 			zap.Int("overshoot", remaining),
 			zap.Int("lots_touched", touched))
