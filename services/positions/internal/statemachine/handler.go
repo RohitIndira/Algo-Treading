@@ -407,9 +407,18 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 	// normalize step every SELL from the REST_ORDERBOOK path would fail to
 	// match its parent BUY position and log "no ACTIVE lots for user/symbol"
 	// even though the position clearly exists (verified 2026-07-16).
-	normSymbol, _ := normalizeSymbol(ev.Symbol)
+	//
+	// Exchange filter matters: same ticker on NSE vs BSE are separate positions
+	// (not fungible for delivery) — the FIFO query MUST scope to the exchange
+	// this SELL was placed on, else an NSE SELL could match a BSE lot.
+	// Fallback: if wire form was unrecognized, exchange=="" degrades to
+	// no exchange filter (backward compat for older WSS-only callers).
+	normSymbol, normExchange := normalizeSymbol(ev.Symbol)
+	if normExchange == "" {
+		normExchange = ev.Exchange
+	}
 
-	lots, err := h.store.FindActiveLotsFIFO(ctx, ev.UserID, normSymbol)
+	lots, err := h.store.FindActiveLotsFIFO(ctx, ev.UserID, normSymbol, normExchange)
 	if err != nil {
 		return fmt.Errorf("manual SELL find lots: %w", err)
 	}

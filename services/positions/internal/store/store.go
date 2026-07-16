@@ -52,16 +52,47 @@ func (s *Store) FindManthanLotBySignalID(ctx context.Context, signalID string) (
 // FindActiveLotsFIFO returns all ACTIVE lots for (user, symbol) ordered
 // per §7.2 manual-sell rule: USER_MANUAL first (FIFO within origin), then
 // MANTHAN (FIFO within origin). Callers iterate + decrement in returned order.
-func (s *Store) FindActiveLotsFIFO(ctx context.Context, userID, symbol string) ([]*Position, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+positionColumns+`
-		FROM positions
-		WHERE user_id = $1
-		  AND symbol  = $2
-		  AND status  = 'ACTIVE'
-		ORDER BY
-		  CASE origin WHEN 'USER_MANUAL' THEN 0 ELSE 1 END,
-		  entry_time ASC`, userID, symbol)
+// FindActiveLotsFIFO returns ACTIVE lots for a (user, symbol, exchange) tuple
+// in FIFO order for manual-SELL matching: USER_MANUAL first (entry_time ASC),
+// then MANTHAN (entry_time ASC). §7.2 manual-sell branch of the design doc.
+//
+// The exchange filter matters: a stock like SONACOMS is listed on both NSE
+// (STK_SONACOMS_EQ_NSE_4684) and BSE (STK_SONACOMS_EQ_BSE_543300). A user
+// can own shares on BOTH exchanges simultaneously and they are NOT
+// fungible — an NSE SELL cannot deliver from BSE holdings and vice versa.
+// Broker holdings track per-exchange too; positions_db must match.
+//
+// If exchange is empty (legacy WSS callers where the wire enum was "1"/"2"
+// numeric or unmapped), the filter degrades to just (user, symbol) so old
+// callers still work — but any FRESH callers going through the state
+// machine's normalizeSymbol path will always pass a real exchange.
+func (s *Store) FindActiveLotsFIFO(ctx context.Context, userID, symbol, exchange string) ([]*Position, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if exchange == "" {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+positionColumns+`
+			FROM positions
+			WHERE user_id = $1
+			  AND symbol  = $2
+			  AND status  = 'ACTIVE'
+			ORDER BY
+			  CASE origin WHEN 'USER_MANUAL' THEN 0 ELSE 1 END,
+			  entry_time ASC`, userID, symbol)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+positionColumns+`
+			FROM positions
+			WHERE user_id  = $1
+			  AND symbol   = $2
+			  AND exchange = $3
+			  AND status   = 'ACTIVE'
+			ORDER BY
+			  CASE origin WHEN 'USER_MANUAL' THEN 0 ELSE 1 END,
+			  entry_time ASC`, userID, symbol, exchange)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("FindActiveLotsFIFO query: %w", err)
 	}
