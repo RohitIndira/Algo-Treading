@@ -1231,3 +1231,42 @@ func (r *Repository) LookupOrderMeta(ctx context.Context, brokerOrderID string) 
 		SLBrokerOrderID:    slBrokerOrderID.String,   // "" when no SL row exists
 	}, nil
 }
+
+// OrderContext is the minimal per-order snapshot the WSS→Kafka bridge
+// needs to build a positions-svc-compatible `order.events` message. Kept
+// deliberately narrow (no full ManthanOrder round-trip) — this method
+// is on the WSS hot path and runs on every fill.
+type OrderContext struct {
+	UserID       string
+	IndiraSymbol string // wire form: STK_AADHARHFC_EQ_NSE_23729
+	Exchange     string
+	OrderSide    string      // BUY / SELL
+	OrderType    OrderType   // LIMIT_BUY / SL_SELL etc.
+	Qty          int
+}
+
+// GetOrderContext returns the minimal identity/routing snapshot for a
+// broker_order_id. Used by the WSS→Kafka fill publisher (wss_bridge) —
+// see PublishWSSFill for the payload shape.
+//
+// Returns (nil, nil) if broker_order_id isn't in manthan_orders — a
+// user's manual order that isn't Manthan's concern.
+func (r *Repository) GetOrderContext(ctx context.Context, brokerOrderID string) (*OrderContext, error) {
+	if brokerOrderID == "" {
+		return nil, fmt.Errorf("broker_order_id is required")
+	}
+	var oc OrderContext
+	err := r.db.QueryRowContext(ctx, `
+		SELECT user_id, indira_symbol, exchange, order_side, order_type, qty
+		  FROM manthan_orders
+		 WHERE broker_order_id = $1
+		 LIMIT 1`, brokerOrderID,
+	).Scan(&oc.UserID, &oc.IndiraSymbol, &oc.Exchange, &oc.OrderSide, &oc.OrderType, &oc.Qty)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetOrderContext scan: %w", err)
+	}
+	return &oc, nil
+}

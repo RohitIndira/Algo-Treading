@@ -104,6 +104,14 @@ func InitManthan(
 	broker := manthan.NewBrokerAdapter(indiraClient, extRedis, logger)
 	repo := manthan.NewRepository(db)
 	wssBridge := manthan.NewWSSBridge(logger)
+
+	// wssKafkaBridge closes the fill-price race documented in the
+	// 2026-07-17 postmortem. When a broker WSS fill lands, wssBridge
+	// routes it in-process (existing behavior) AND wssKafkaBridge
+	// publishes an `order.events` message with source=WSS_MANTHAN and
+	// the real avg fill price. Positions svc gets the SSOT traded_price
+	// directly, no gRPC race against manthan_orders.avg_fill_price.
+	wssKafkaBridge := manthan.NewWSSKafkaBridge(kafkaBrokers, repo, logger)
 	preCheck := manthan.NewPreChecker(repo, broker, logger)
 	slHandler := manthan.NewSLHandler(broker, repo, logger)
 	slHandler.SetAuthProvider(getAuth)
@@ -148,9 +156,18 @@ func InitManthan(
 	// Wire WSS bridge into status service — route Manthan order updates
 	if statusSvc != nil {
 		statusSvc.SetManthanBridge(func(brokerOrderID, status string, filledQty int, avgPrice, triggerPrice float64, reason string) bool {
-			return wssBridge.HandleUpdate(brokerOrderID, status, filledQty, avgPrice, triggerPrice, reason)
+			handled := wssBridge.HandleUpdate(brokerOrderID, status, filledQty, avgPrice, triggerPrice, reason)
+			// Fire-and-forget publish to Kafka order.events with the real
+			// broker fill price. Async writer inside the bridge means this
+			// doesn't block the WSS goroutine even under load. See
+			// wss_kafka_bridge.go PublishFill for the guard (only publishes
+			// when avgPrice>0 AND filledQty>0).
+			if handled {
+				go wssKafkaBridge.PublishFill(context.Background(), brokerOrderID, status, filledQty, avgPrice, triggerPrice, reason)
+			}
+			return handled
 		})
-		log.Println("[manthan] ✓ WSS bridge wired to status service")
+		log.Println("[manthan] ✓ WSS bridge wired to status service (in-process + order.events fanout)")
 
 		// Real-time manual-exit publisher: when the WSS sees an EXECUTED
 		// order we didn't place, look up our matching entry signal_id and
