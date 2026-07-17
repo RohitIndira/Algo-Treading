@@ -105,6 +105,27 @@ func InitManthan(
 	repo := manthan.NewRepository(db)
 	wssBridge := manthan.NewWSSBridge(logger)
 
+	// Boot recovery: repopulate the WSSBridge `known` set from manthan_orders.
+	// Without this, a trade-execution restart drops the pending map (in-
+	// memory) and every WSS event for a broker_order_id placed by the
+	// PREVIOUS process falls into HandleUpdate's "not Manthan" branch,
+	// silencing WSSKafkaBridge.PublishFill. See wss_bridge.go's docstring
+	// on the pending/known split. Non-fatal on error — degrades to the
+	// old race behavior but the service still boots.
+	{
+		recCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		bids, err := repo.ListActiveManthanBrokerOrderIDs(recCtx)
+		cancel()
+		if err != nil {
+			log.Printf("[manthan] WARNING: WSS bridge boot recovery failed: %v (WSS→Kafka fanout may miss orders from prior process lifetime)", err)
+		} else {
+			for _, bid := range bids {
+				wssBridge.MarkKnown(bid)
+			}
+			log.Printf("[manthan] ✓ WSS bridge recovered %d known broker orders (last 7 days, non-terminal)", wssBridge.KnownCount())
+		}
+	}
+
 	// wssKafkaBridge closes the fill-price race documented in the
 	// 2026-07-17 postmortem. When a broker WSS fill lands, wssBridge
 	// routes it in-process (existing behavior) AND wssKafkaBridge

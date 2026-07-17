@@ -478,6 +478,47 @@ func (r *Repository) ListOurBrokerOrderIDsForUser(ctx context.Context, userID st
 	return out, rows.Err()
 }
 
+// ListActiveManthanBrokerOrderIDs returns broker_order_ids for orders that
+// are still "live" from the broker's WSS perspective — i.e. the broker may
+// still emit status events for them and we want to route those to our
+// WSSKafkaBridge fanout.
+//
+// Includes entries whose fill status is PLACED / FILLED (an SL may still
+// fire), SL rows whose status is SL_PLACED / SL_DEFERRED_BAND (broker may
+// modify or trigger) and AMO rows waiting for conversion. Excludes truly
+// terminal states — CANCELLED, REJECTED, EXPIRED, SL_FILLED, or entries
+// whose position has been fully exited via manthan_exits.
+//
+// Called once at boot from wssBridge recovery in manthan_init.go.
+func (r *Repository) ListActiveManthanBrokerOrderIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT broker_order_id
+		  FROM manthan_orders
+		 WHERE broker_order_id IS NOT NULL
+		   AND broker_order_id != ''
+		   AND status NOT IN ('CANCELLED','REJECTED','EXPIRED','SL_FILLED','AMO_REJECTED')
+		   -- Keep the window bounded so long-uptime doesn't accumulate stale
+		   -- rows. Broker rarely emits WSS updates for orders older than a
+		   -- few sessions; a 7-day window covers weekends + one holiday.
+		   AND created_at >= NOW() - INTERVAL '7 days'`)
+	if err != nil {
+		return nil, fmt.Errorf("ListActiveManthanBrokerOrderIDs query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var bid string
+		if err := rows.Scan(&bid); err != nil {
+			return nil, fmt.Errorf("ListActiveManthanBrokerOrderIDs scan: %w", err)
+		}
+		if bid != "" {
+			out = append(out, bid)
+		}
+	}
+	return out, rows.Err()
+}
+
 // GetEntryFilledAt returns the broker fill timestamp of an entry order
 // identified by its signal_id. Used by the detector to time-order broker
 // SELL events relative to when we bought (only post-buy SELLs can be
