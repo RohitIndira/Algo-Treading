@@ -83,6 +83,22 @@ func NewWriter(db *sql.DB, logger *zap.Logger) *Writer {
 	return &Writer{db: db, logger: logger}
 }
 
+// LatestObservedAt returns MAX(observed_at) from broker_events. Used by the
+// reconciler at boot to build a cutoff: only Indira orders newer than this
+// timestamp get re-published to Kafka. Prevents a fresh install / DB flush
+// from re-publishing every historical order still in Indira's orderbook
+// (2026-07-17 incident: flushing DBs then rebooting orderstatus svc caused
+// the reconciler's first sweep to publish 42 morning IDEA test orders + all
+// prior strategy runs as if they were fresh events, corrupting positions_db).
+//
+// Returns (zero time, nil) when the table is empty — caller uses time.Now()
+// as the cutoff in that case.
+func (w *Writer) LatestObservedAt(ctx context.Context) (sql.NullTime, error) {
+	var t sql.NullTime
+	err := w.db.QueryRowContext(ctx, `SELECT MAX(observed_at) FROM broker_events`).Scan(&t)
+	return t, err
+}
+
 // Insert appends one event. Returns (inserted bool, error).
 //
 //	inserted = true  → new row, publish to order.events Kafka topic downstream
