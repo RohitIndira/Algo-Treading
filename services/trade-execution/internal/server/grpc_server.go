@@ -307,13 +307,16 @@ func (s *Server) LookupOrderMeta(ctx context.Context, req *pb.LookupOrderMetaReq
 		return &pb.LookupOrderMetaResponse{Found: false}, nil
 	}
 	return &pb.LookupOrderMetaResponse{
-		Found:                true,
-		SignalId:             meta.SignalID,
-		OrderType:            meta.OrderType,
-		StrategyId:           meta.StrategyID,
-		UserId:               meta.UserID,
-		EntrySignalId:        meta.EntrySignalID,
-		EntryBrokerOrderId:   meta.EntryBrokerOrderID,
+		Found:              true,
+		SignalId:           meta.SignalID,
+		OrderType:          meta.OrderType,
+		StrategyId:         meta.StrategyID,
+		UserId:             meta.UserID,
+		EntrySignalId:      meta.EntrySignalID,
+		EntryBrokerOrderId: meta.EntryBrokerOrderID,
+		AvgFillPrice:       meta.AvgFillPrice,
+		SlTriggerPrice:     meta.SLTriggerPrice,
+		SlBrokerOrderId:    meta.SLBrokerOrderID,
 	}, nil
 }
 

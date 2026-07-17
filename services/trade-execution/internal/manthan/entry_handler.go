@@ -797,20 +797,52 @@ func (h *EntryHandler) handleFill(ctx context.Context, orderID int64, result fil
 	return orderID, nil
 }
 
+// handlePartialFill: LIMIT BUY got a partial fill. Cancel the resting
+// remainder + attempt to complete the lot with a MARKET BUY topup. If the
+// topup fills (usual case — MARKET is guaranteed at the touch), the
+// combined position matches the strategy's intended allocation. If the
+// topup fails (broker rejection, session expired, timeout), we fall back
+// to the old "accept partial + place SL for what filled" behavior.
+//
+// Two manthan_orders rows on success — the original LIMIT with its 4-share
+// fill, and a NEW MARKET_BUY row (parent_order_id → LIMIT) with the topup
+// fill. Positions svc creates a position per fill; the mobile app / API
+// aggregates by symbol for display. Each fill gets its own SL (broker
+// won't attach a single SL to two entry orders); the mobile app renders
+// combined SL as the lower of the two triggers.
+//
+// See entry_handler.go docstring for the 2026-07-17 postmortem that drove
+// this — AADHARHFC + CUB only got 4 of 38/90 shares under the old
+// "cancel-and-accept" behavior; the strategy's intended sector weight
+// silently collapsed to ~10% of what rules-engine dispatched.
 func (h *EntryHandler) handlePartialFill(ctx context.Context, orderID int64, result fillResult, signal ManthanSignal, info *SymbolInfo, auth BrokerAuth, brokerID string) (int64, error) {
-	h.logger.Info("Partial fill — cancelling remainder",
-		zap.String("symbol", signal.Symbol),
-		zap.Int("filled", result.filledQty),
-		zap.Int("total", int(signal.Quantity)))
+	remainingQty := int(signal.Quantity) - result.filledQty
 
+	h.logger.Info("Partial fill — cancelling limit remainder + attempting MARKET topup",
+		zap.String("symbol", signal.Symbol),
+		zap.Int("limit_filled", result.filledQty),
+		zap.Float64("limit_avg", result.avgPrice),
+		zap.Int("remaining", remainingQty),
+		zap.Int("signal_qty", int(signal.Quantity)))
+
+	// Cancel the resting LIMIT remainder — broker won't accept a new order
+	// for the same signal while the LIMIT still holds inventory reservation.
 	_ = h.broker.CancelOrder(ctx, auth, info, brokerID)
 	_ = h.repo.UpdateOrderFilled(ctx, orderID, result.filledQty, result.avgPrice)
 	_ = h.repo.InsertEvent(ctx, orderID, "PARTIAL_FILL", "PLACED", "FILLED", "",
 		result.avgPrice, result.filledQty,
-		fmt.Sprintf("accepted %d of %d", result.filledQty, signal.Quantity))
+		fmt.Sprintf("accepted %d of %d — attempting MARKET topup for %d",
+			result.filledQty, signal.Quantity, remainingQty))
 
-	// Top-up partial fills also merge into parent SL — only the actually-filled
-	// qty is covered (the rest got cancelled with the remainder).
+	// Attempt MARKET topup — if it succeeds we get the full-lot exposure;
+	// if it fails we fall through to placing an SL on just the partial.
+	topupOK := false
+	if remainingQty > 0 {
+		topupOK = h.attemptMarketTopup(ctx, orderID, signal, info, auth, remainingQty)
+	}
+
+	// Place SL for the LIMIT partial's filled qty (SL for the MARKET topup
+	// is placed inside attemptMarketTopup so both fills are protected).
 	if signal.TopUpForSignalID != "" {
 		h.slHandler.MergeTopupSL(ctx, orderID, signal, info, result.filledQty, result.avgPrice)
 	} else {
@@ -818,7 +850,140 @@ func (h *EntryHandler) handlePartialFill(ctx context.Context, orderID int64, res
 		slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
 		h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit)
 	}
+
+	if !topupOK && remainingQty > 0 {
+		h.logger.Warn("Partial fill — MARKET topup unsuccessful, accepting partial",
+			zap.String("symbol", signal.Symbol),
+			zap.Int("filled_qty", result.filledQty),
+			zap.Int("unfilled_qty", remainingQty))
+	}
 	return orderID, nil
+}
+
+// attemptMarketTopup places a MARKET BUY for `qty` shares as a topup on
+// the parent LIMIT order (parentOrderID). Returns true if the market
+// order filled and manthan_orders was updated + SL placed. False on any
+// failure — placement error, WSS timeout, rejection, or auth issue.
+//
+// Blocks the caller for up to 5 s waiting for the WSS fill. Market
+// orders normally fill in ~200 ms; the 5 s cap covers exchange delay
+// without stalling the WSS event-loop indefinitely.
+func (h *EntryHandler) attemptMarketTopup(ctx context.Context, parentOrderID int64, signal ManthanSignal, info *SymbolInfo, auth BrokerAuth, qty int) bool {
+	if qty <= 0 || h.repo == nil || h.wssBridge == nil {
+		return false
+	}
+
+	// Insert a manthan_orders row FIRST so positions svc's LookupOrderMeta
+	// finds Manthan lineage when the WSS fill event arrives. Without this
+	// the market fill would be classified as USER_MANUAL by positions svc.
+	topupRow := &ManthanOrder{
+		// Prefix with "mkt-" so signal_id stays UNIQUE — the manthan_orders
+		// _signal_id_key constraint blocks reusing the parent LIMIT's
+		// signal_id. Mirrors the "sl-" prefix pattern already in use for
+		// SL_SELL rows. Positions svc's LookupOrderMeta ignores the prefix
+		// and uses EntrySignalID (parent BUY's plain UUID) for the audit
+		// row lineage — see 2026-07-16 commit dadff44.
+		SignalID:      "mkt-" + signal.OrderID,
+		StrategyID:    signal.StrategyID,
+		UserID:        signal.UserID,
+		Symbol:        signal.Symbol,
+		ISIN:          signal.ISIN,
+		Exchange:      info.Exchange,
+		OrderType:     OrderTypeMarketBuy,
+		OrderSide:     "BUY",
+		ProductType:   "DELIVERY",
+		Qty:           qty,
+		LimitPrice:    0, // MARKET — no limit
+		TriggerPrice:  0,
+		IndiraSymbol:  info.IndiraSymbol,
+		ExchangeToken: info.ExchangeToken,
+		Status:        StatusPending,
+		MaxRetries:    0,
+	}
+	topupOrderID, err := h.repo.InsertOrder(ctx, topupRow)
+	if err != nil {
+		h.logger.Warn("Market topup: InsertOrder failed",
+			zap.String("symbol", signal.Symbol), zap.Error(err))
+		return false
+	}
+	_ = h.repo.UpdateOrderParentID(ctx, topupOrderID, parentOrderID)
+
+	// Register the WSS channel BEFORE placing the order — otherwise a
+	// fast fill could publish before we're listening.
+	// broker_order_id isn't known yet; register a placeholder after PlaceMarketBuy.
+	topupBrokerID, err := h.broker.PlaceMarketBuy(ctx, auth, info, qty)
+	if err != nil {
+		h.logger.Warn("Market topup: PlaceMarketBuy failed",
+			zap.String("symbol", signal.Symbol), zap.Error(err))
+		_ = h.repo.UpdateOrderStatus(ctx, topupOrderID, StatusRejected, "", 0, err.Error())
+		return false
+	}
+	_ = h.repo.UpdateOrderPlaced(ctx, topupOrderID, topupBrokerID)
+
+	ch := h.wssBridge.Register(topupBrokerID)
+	defer h.wssBridge.Unregister(topupBrokerID)
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	var filledQty int
+	var avgPrice float64
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			h.logger.Warn("Market topup: WSS wait timeout",
+				zap.String("symbol", signal.Symbol),
+				zap.String("broker_id", topupBrokerID))
+			return false
+		case update, ok := <-ch:
+			if !ok {
+				return false
+			}
+			if IsFilledWSStatus(update.Status) && update.FilledQty >= qty {
+				filledQty = update.FilledQty
+				avgPrice = update.AvgFillPrice
+			} else if IsPartialWSStatus(update.Status) && update.FilledQty > 0 {
+				// Market itself only partial (rare — usually means circuit
+				// hit). Accept what we got, don't recurse.
+				filledQty = update.FilledQty
+				avgPrice = update.AvgFillPrice
+			} else {
+				// PENDING / OPEN — keep waiting.
+				continue
+			}
+		}
+		break
+	}
+	if filledQty <= 0 || avgPrice <= 0 {
+		return false
+	}
+
+	_ = h.repo.UpdateOrderFilled(ctx, topupOrderID, filledQty, avgPrice)
+	_ = h.repo.InsertEvent(ctx, topupOrderID, "MARKET_TOPUP_FILL", "PLACED", "FILLED", "",
+		avgPrice, filledQty,
+		fmt.Sprintf("market topup for LIMIT partial parent=%d: filled %d @ %.4f", parentOrderID, filledQty, avgPrice))
+
+	h.logger.Info("Market topup filled — placing SL on topup fill",
+		zap.String("symbol", signal.Symbol),
+		zap.Int("topup_filled", filledQty),
+		zap.Float64("topup_avg", avgPrice),
+		zap.Int64("topup_order_id", topupOrderID))
+
+	// Publish EntryFilled so downstream (rules-engine, notifications) sees
+	// the actual broker fill price for the topup portion.
+	if h.eventPub != nil {
+		h.eventPub.PublishEntryFilled(ctx, signal, topupBrokerID, avgPrice, int32(filledQty), 0)
+	}
+
+	// SL for the topup fill. Uses the same 20%-below-fill rule; SL sizing is
+	// per-tranche because broker won't merge SLs across parent orders and
+	// this MARKET row has its own broker_order_id lineage.
+	slTrigger := avgPrice * 0.80
+	slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
+	h.slHandler.PlaceInitialSL(ctx, topupOrderID, signal, info, filledQty, slTrigger, slLimit)
+	return true
 }
 
 // ModifyLimitRequest holds params for modifying a LIMIT BUY price.

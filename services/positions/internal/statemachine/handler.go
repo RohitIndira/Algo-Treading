@@ -51,10 +51,36 @@ func New(s *store.Store, lookup OrderMetaLookup, pub EventPublisher, logger *zap
 
 // Handle routes one parsed OrderEvent per §7 of the design doc.
 //
-// Only FILLED events drive positions state transitions today. Other event
-// types (STATUS_CHANGED, MODIFIED, CANCELLED, REJECTED, TRIGGERED,
-// PARTIALLY_FILLED, EXPIRED) are logged + no-op'd. Partial-fill handling is
-// a future chunk — for now every FILLED is treated as full lifecycle event.
+// Events that drive state transitions today:
+//
+//	FILLED                        — full fill of BUY or SELL
+//	CANCELLED   (filled_qty>0)    — partial-fill-then-cancelled (2026-07-16
+//	                                CUB pattern: broker accepted qty=57 of
+//	                                intended qty=90, cancelled the remaining
+//	                                33 at 3:30 EOD). Treat filled_qty as
+//	                                a legitimate fill event.
+//	PARTIALLY_FILLED              — mid-flight partial (rare on Manthan
+//	                                DELIVERY; broker usually rolls to CANCELLED
+//	                                or FILLED). Same handling as CANCELLED
+//	                                with filled_qty>0 — accept what filled.
+//
+// Other event types (STATUS_CHANGED, MODIFIED, REJECTED, TRIGGERED,
+// EXPIRED) are logged + no-op'd. SL_MODIFY tracking (updating
+// positions.current_sl on trailing SL ratchets) is Chunk P.E — not
+// required for the position-open/exit lifecycle.
+//
+// buy_sell is normalized to handle the split wire format:
+//
+//	WSS source:            "1" (BUY) / "2" (SELL) — numeric enum from
+//	                       Codifi's WSS envelope
+//	REST_ORDERBOOK source: "BUY" / "SELL" — Indira's REST portfolio-services
+//	                       API uses full strings
+//
+// Without normalization, REST events (which is what today's post-JWT-fix
+// path emits — the WSS listener sometimes misses AMO-execute events) are
+// silently skipped, leaving positions_db empty despite broker fills.
+// Root-caused during 2026-07-16 end-to-end debug (AADHARHFC 38,
+// IPCALAB 10, CUB 57 all filled at broker; 0 rows in positions_db).
 //
 // Returns an error only when the consumer should NOT commit the offset
 // (message re-delivers). Idempotency is enforced at the DB layer via:
@@ -62,18 +88,32 @@ func New(s *store.Store, lookup OrderMetaLookup, pub EventPublisher, logger *zap
 //	positions.entry_broker_order_id UNIQUE-ish idempotency for BUY inserts
 //	position_events (position_id, source_event_id) UNIQUE for audit rows
 func (h *Handler) Handle(ctx context.Context, ev *consumer.OrderEvent) error {
-	if ev.EventType != "FILLED" {
-		h.logger.Debug("state-machine: skip non-FILLED",
+	// SL-tracking events (STATUS_CHANGED with an SL order type, or CANCELLED
+	// on an SL order without a fill) update positions.current_sl. Checked
+	// BEFORE the fill gate because these events have event_type=STATUS_CHANGED
+	// (not FILLED), so isFillEvent would drop them.
+	//
+	// An SL that FIRES (broker-triggered exit) arrives as event_type=FILLED
+	// with buy_sell=SELL — that goes through the fill path below and lands
+	// in handleManthanSellFill via the meta lookup. current_sl becomes moot
+	// because the position exits.
+	if isSLTrackingEvent(ev) {
+		return h.handleSLTrackingEvent(ctx, ev)
+	}
+
+	if !isFillEvent(ev) {
+		h.logger.Debug("state-machine: skip non-fill event",
 			zap.String("event_id", ev.EventID),
 			zap.String("event_type", ev.EventType),
+			zap.Int("filled_qty", ev.FilledQty),
 			zap.String("broker_order_id", ev.BrokerOrderID))
 		return nil
 	}
 
-	switch strings.TrimSpace(ev.BuySell) {
-	case "1":
+	switch normalizeBuySell(ev.BuySell) {
+	case "BUY":
 		return h.handleBuyFill(ctx, ev)
-	case "2":
+	case "SELL":
 		return h.handleSellFill(ctx, ev)
 	default:
 		h.logger.Warn("state-machine: FILLED with unknown buy_sell — skipping",
@@ -83,17 +123,119 @@ func (h *Handler) Handle(ctx context.Context, ev *consumer.OrderEvent) error {
 	}
 }
 
+// isSLTrackingEvent returns true iff the event should be routed to
+// handleSLTrackingEvent (which updates positions.current_sl). We match:
+//
+//   order_type contains "SL"    — broker's SL order events (REST format
+//                                 uses "SL"; WSS may use "SL-L", "SL_LIMIT")
+//   AND (
+//     event carries a real trigger_price (SL_PLACED or SL_MODIFIED)
+//     OR event_type == CANCELLED with filled_qty == 0 (SL cancelled
+//        without firing — CANCELLED-with-fill is the fill path below)
+//   )
+//
+// FILLED events on SL orders (SL triggered → position exit) are handled
+// by the fill path via handleManthanSellFill, NOT here — position exits
+// clear current_sl implicitly by leaving status=ACTIVE behind.
+func isSLTrackingEvent(ev *consumer.OrderEvent) bool {
+	if !isSLOrderTypeString(ev.OrderType) {
+		return false
+	}
+	if ev.EventType == "CANCELLED" && ev.FilledQty == 0 {
+		return true
+	}
+	if ev.TriggerPrice > 0 && ev.EventType != "FILLED" && ev.EventType != "PARTIALLY_FILLED" {
+		return true
+	}
+	return false
+}
+
+// isSLOrderTypeString accepts the string forms broker actually publishes.
+// REST_ORDERBOOK typically writes "SL"; WSS may write "SL-L" or with
+// suffixes. Case-insensitive; empty string is safe (returns false).
+func isSLOrderTypeString(ot string) bool {
+	u := strings.ToUpper(strings.TrimSpace(ot))
+	if u == "SL" {
+		return true
+	}
+	// Match "SL_", "SL-" prefixes, and " SL " embedded (unlikely but safe).
+	if strings.HasPrefix(u, "SL_") || strings.HasPrefix(u, "SL-") {
+		return true
+	}
+	return false
+}
+
+// isFillEvent returns true iff the event should trigger a position state
+// transition. Accepts:
+//   - event_type == "FILLED"                              — full fill
+//   - event_type == "PARTIALLY_FILLED" AND filled_qty > 0 — mid-flight partial
+//   - event_type == "CANCELLED"        AND filled_qty > 0 — partial-fill-then-
+//                                                            cancelled
+//
+// Explicitly EXCLUDES event_type in {STATUS_CHANGED, MODIFIED, REJECTED,
+// TRIGGERED, EXPIRED}. Also excludes CANCELLED events with filled_qty=0
+// (the common case — user cancelled a resting order that never touched).
+func isFillEvent(ev *consumer.OrderEvent) bool {
+	switch ev.EventType {
+	case "FILLED":
+		return true
+	case "PARTIALLY_FILLED", "CANCELLED":
+		return ev.FilledQty > 0
+	default:
+		return false
+	}
+}
+
+// normalizeBuySell maps the two wire formats to a single canonical value.
+// Case-insensitive input; canonical output is uppercase "BUY" / "SELL".
+// Empty / unknown returns "" so the Handle default branch fires.
+func normalizeBuySell(v string) string {
+	switch strings.ToUpper(strings.TrimSpace(v)) {
+	case "1", "B", "BUY":
+		return "BUY"
+	case "2", "S", "SELL":
+		return "SELL"
+	default:
+		return ""
+	}
+}
+
 // ----------------------------------------------------------------------
 // BUY fills — §7.1 of the design doc
 // ----------------------------------------------------------------------
 
 func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) error {
+	// Paper-trading leak guard — paper-trading emits events with
+	// broker_order_id="PAPER-*" onto the same Kafka topic as real broker
+	// fills. Positions_db is the SSOT for LIVE holdings; paper events must
+	// never land here. Verified drift 2026-07-17: a stale MANTHAN row for
+	// SBI qty=15 with broker_order_id="PAPER-M2" was in positions_db while
+	// the real broker had no such position.
+	if strings.HasPrefix(ev.BrokerOrderID, "PAPER-") {
+		h.logger.Info("state-machine: BUY event has PAPER-* broker_order_id — skipping (paper-trading events must not reach positions_db)",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.String("event_id", ev.EventID),
+			zap.String("source", ev.Source))
+		return nil
+	}
+
 	// Idempotency short-circuit: BUY event replayed → position row already exists.
 	exists, err := h.store.PositionExistsForEntry(ctx, ev.BrokerOrderID)
 	if err != nil {
 		return fmt.Errorf("BUY idempotency check: %w", err)
 	}
 	if exists {
+		// Partial-fill correction path — see docstring at the top of the
+		// method. If this is a CANCELLED-with-fill (the broker's terminal
+		// "I filled fq shares and cancelled the rest" event), and the
+		// position we already stored has a bigger quantity than the real
+		// broker fill, downsize. Verified 2026-07-17: AADHARHFC + CUB
+		// opened with qty=38 / qty=90 from a premature WSS FILLED (fq=null,
+		// qty=order_qty) and then the follow-up CANCELLED (fq=4) was
+		// silently ignored by the plain "exists → skip" guard below.
+		if ev.EventType == "CANCELLED" && ev.FilledQty > 0 {
+			return h.correctPartialFill(ctx, ev)
+		}
 		h.logger.Debug("state-machine: BUY replay ignored (position row exists)",
 			zap.String("broker_order_id", ev.BrokerOrderID),
 			zap.String("event_id", ev.EventID))
@@ -107,28 +249,59 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		return fmt.Errorf("BUY LookupOrderMeta: %w", err)
 	}
 
-	entryPrice := ev.TradedPrice
+	// Entry price precedence:
+	//   1. meta.AvgFillPrice — SSOT from manthan_orders (populated by
+	//      trade-execution when it processed a WSS fill event with a
+	//      real traded_price). This is the broker-authoritative value.
+	//   2. ev.TradedPrice — the current Kafka event carries a real fill
+	//      (i.e. this IS a WSS event and it beat trade-exec's writer).
+	//   3. Neither → the event is a REST_ORDERBOOK-first arrival that
+	//      has no fill-price information. SKIP rather than fall back
+	//      to ev.OrderPrice (the LIMIT price), which produced the
+	//      2026-07-16 incident where positions_db.entry_price = 518.15
+	//      (limit) while manthan_orders.avg_fill_price = 518.05 (fill).
+	//      A later WSS event on the same broker_order_id will retry
+	//      and succeed; positions svc's ordering guarantee holds
+	//      because idempotency is by broker_order_id, not event_id.
+	entryPrice := meta.AvgFillPrice
 	if entryPrice == 0 {
-		entryPrice = ev.OrderPrice
+		entryPrice = ev.TradedPrice
 	}
 	qty := ev.FilledQty
 	if qty == 0 {
 		qty = ev.Quantity
 	}
 	if entryPrice == 0 || qty == 0 {
-		h.logger.Warn("state-machine: BUY FILLED with 0 price or qty — skipping",
+		h.logger.Info("state-machine: BUY event has no fill price yet — deferring (waiting for WSS event with traded_price)",
 			zap.String("event_id", ev.EventID),
 			zap.String("broker_order_id", ev.BrokerOrderID),
-			zap.Float64("traded_price", ev.TradedPrice),
+			zap.String("source", ev.Source),
+			zap.Float64("meta_avg_fill", meta.AvgFillPrice),
+			zap.Float64("ev_traded_price", ev.TradedPrice),
 			zap.Int("filled_qty", ev.FilledQty))
 		return nil
+	}
+
+	// Normalize the wire symbol (STK_AADHARHFC_EQ_NSE_23729) to the canonical
+	// short form + separate exchange. positions_db.positions is the SSOT for
+	// downstream (LTP enricher, mobile UI, portfolio API); all of them expect
+	// short symbols. Unrecognized shapes pass through — see normalizeSymbol
+	// docstring.
+	//
+	// If the wire form parsed → use its exchange. Otherwise fall back to
+	// ev.Exchange (WSS emits numeric enum "1"/"2" — trade-execution's earlier
+	// path stored these verbatim as "1"; not ideal but existing rows). Better
+	// to write SOMETHING sensible than crash the pipeline.
+	normSymbol, normExchange := normalizeSymbol(ev.Symbol)
+	if normExchange == "" {
+		normExchange = ev.Exchange
 	}
 
 	pos := &store.Position{
 		PositionID:         uuid.New(),
 		UserID:             ev.UserID,
-		Symbol:             ev.Symbol,
-		Exchange:           ev.Exchange,
+		Symbol:             normSymbol,
+		Exchange:           normExchange,
 		Status:             store.StatusActive,
 		EntryPrice:         entryPrice,
 		EntryTime:          time.Now(),
@@ -171,6 +344,47 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		zap.String("signal_id", pos.SignalID),
 		zap.String("broker_order_id", ev.BrokerOrderID))
 
+	// Race-close: if trade-execution already knows about an SL row for this
+	// entry (parent_order_id self-FK on manthan_orders), apply its trigger
+	// price now. Covers the Kafka partition-ordering case where the SL
+	// event arrived at positions svc BEFORE this BUY event and was silently
+	// dropped by the state machine as "no ACTIVE parent position." Without
+	// this pull, positions_db.current_sl stays NULL until a reconciler
+	// backfills — verified missed on AADHARHFC + CUB on 2026-07-16.
+	//
+	// Only ENTRY rows carry an SL child, so guard on Origin==MANTHAN
+	// (USER_MANUAL buys don't get a Manthan SL) and on meta.SLTriggerPrice
+	// being non-zero (0 = LookupOrderMeta found no SL row yet).
+	if pos.Origin == store.OriginManthan && meta.SLTriggerPrice > 0 && meta.SLBrokerOrderID != "" {
+		slAudit := &store.PositionEvent{
+			EventType:     store.EventTypeSLModified,
+			BrokerOrderID: meta.SLBrokerOrderID,
+			SignalID:      pos.SignalID, // parent BUY's signal (SL rows carry sl-<uuid> which is not a UUID)
+			FillPrice:     meta.SLTriggerPrice,
+			// SourceEventID mirrors handleSLTrackingEvent's format so a
+			// later SL Kafka event is deduped rather than double-applied.
+			SourceEventID:  "sl-pull-" + meta.SLBrokerOrderID,
+			SourceTopic:    "buy-handler-sl-pull",
+			RawSourceEvent: ev.RawMessage,
+		}
+		if err := h.store.UpdateCurrentSLWithEvent(ctx, pos.PositionID, meta.SLTriggerPrice, slAudit); err != nil {
+			// Non-fatal — the position is already inserted correctly. Log
+			// and let the SL Kafka event (or reconciler) retry.
+			h.logger.Warn("state-machine: BUY-time SL pull failed — leaving to Kafka SL event or reconciler",
+				zap.String("position_id", pos.PositionID.String()),
+				zap.String("sl_broker_order_id", meta.SLBrokerOrderID),
+				zap.Float64("sl_trigger_price", meta.SLTriggerPrice),
+				zap.Error(err))
+		} else {
+			h.logger.Info("state-machine: BUY-time SL pull applied (race-close)",
+				zap.String("position_id", pos.PositionID.String()),
+				zap.String("symbol", pos.Symbol),
+				zap.Float64("current_sl", meta.SLTriggerPrice),
+				zap.String("sl_broker_order_id", meta.SLBrokerOrderID))
+			pos.CurrentSL = meta.SLTriggerPrice
+		}
+	}
+
 	if h.pub != nil {
 		h.pub.Publish(ctx, &publisher.PositionEvent{
 			EventType:     publisher.EventPositionOpened,
@@ -186,6 +400,217 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 			BrokerOrderID: ev.BrokerOrderID,
 		})
 	}
+	return nil
+}
+
+// correctPartialFill downsizes an already-inserted position to reflect the
+// broker's actual final fill count. Called from handleBuyFill when a
+// CANCELLED-with-fill event arrives for a broker_order_id that already has
+// a position row.
+//
+// Why we need this: the broker's WSS occasionally emits a "FILLED EXECUTED"
+// event with filled_qty=null a few ms before it re-syncs with the exchange
+// and emits the correcting CANCELLED-with-partial-fill. Positions svc's
+// initial FILLED path falls back to ev.Quantity (the order quantity) when
+// filled_qty is 0 — and so opens the position with an inflated size. The
+// authoritative post-facto CANCELLED event carries the real fill_qty; this
+// method uses it to right-size both quantity and invested_amount.
+//
+// Verified on 2026-07-17: AADHARHFC opened with qty=38 from a premature
+// WSS FILLED (fq=null, qty=38), corrected here by the follow-up CANCELLED
+// (fq=4) that would otherwise have been dropped by the "position exists →
+// skip" guard.
+//
+// Semantic guardrails:
+//   - Never grows a position — the store method WHERE-clauses on
+//     `quantity > $newQty` so an accidental widen is a no-op.
+//   - No-op when position already matches (ev.FilledQty == pos.Quantity) —
+//     the CANCELLED event is redundant with the FILLED that came first.
+//   - Emits a PARTIAL_FILL_FIX audit row with the delta + reason so the
+//     correction is traceable in position_events.
+func (h *Handler) correctPartialFill(ctx context.Context, ev *consumer.OrderEvent) error {
+	pos, err := h.store.FindPositionByEntryBrokerOrderID(ctx, ev.BrokerOrderID)
+	if err != nil {
+		return fmt.Errorf("correctPartialFill: find position: %w", err)
+	}
+	if pos == nil {
+		// Race: PositionExistsForEntry said yes but the row has been exited
+		// between then and now. Nothing to correct.
+		return nil
+	}
+	if ev.FilledQty >= pos.Quantity {
+		// Broker's CANCELLED-with-fill matches (or exceeds — shouldn't happen)
+		// the position quantity. No correction needed.
+		h.logger.Debug("state-machine: CANCELLED-with-fill matches position quantity — no correction",
+			zap.String("position_id", pos.PositionID.String()),
+			zap.Int("pos_qty", pos.Quantity),
+			zap.Int("ev_filled_qty", ev.FilledQty))
+		return nil
+	}
+
+	newQty := ev.FilledQty
+	newInvested := pos.EntryPrice * float64(newQty)
+	deltaShares := pos.Quantity - newQty
+
+	audit := &store.PositionEvent{
+		EventType:      store.EventTypePartialFillFix,
+		BrokerOrderID:  ev.BrokerOrderID,
+		SignalID:       pos.SignalID,
+		DeltaQty:       -deltaShares, // negative = shares removed from position
+		FillPrice:      pos.EntryPrice,
+		SourceTopic:    "order.events",
+		SourceEventID:  "pf-" + ev.EventID, // "pf-" prefix so a later replay of the same CANCELLED still dedupes distinctly from the original FILLED audit row
+		RawSourceEvent: ev.RawMessage,
+	}
+
+	if err := h.store.CorrectEntryQuantityWithEvent(ctx, pos.PositionID, newQty, newInvested, audit); err != nil {
+		return fmt.Errorf("correctPartialFill: store update: %w", err)
+	}
+
+	h.logger.Info("state-machine: partial-fill correction applied — position downsized to real broker fill",
+		zap.String("position_id", pos.PositionID.String()),
+		zap.String("symbol", pos.Symbol),
+		zap.String("broker_order_id", ev.BrokerOrderID),
+		zap.Int("old_qty", pos.Quantity),
+		zap.Int("new_qty", newQty),
+		zap.Float64("new_invested", newInvested))
+	return nil
+}
+
+// ----------------------------------------------------------------------
+// SL tracking — §7.5 (added 2026-07-16)
+//
+// SL orders don't move a position's status (that's what fills do). They
+// mutate a single column, positions.current_sl, so mobile UI + portfolio
+// summary can render "SL @ 1512.90" and later "SL ratcheted to 1520.30".
+//
+// The link between an SL order (broker_order_id = NYMZX0021B@7) and its
+// parent position (whose entry_broker_order_id = NYMZX00219@7) lives in
+// trade-execution's manthan_orders.parent_order_id. We resolve it via
+// the existing LookupOrderMeta gRPC — one hop, cache-wrapped, no schema
+// changes.
+//
+// Edge cases handled:
+//   Meta.Found == false      → user-manual SL (not tracked in positions_db
+//                              today; deferred to future scope) — no-op.
+//   No matching ACTIVE lot   → drift or race (SL modify arrived after
+//                              position exited) — warn + no-op; drift
+//                              detector will surface if the situation
+//                              persists.
+//   TriggerPrice = 0 on non-cancel event → skip; the CANCELLED branch
+//                              is the ONLY intentional "clear" path.
+// ----------------------------------------------------------------------
+
+func (h *Handler) handleSLTrackingEvent(ctx context.Context, ev *consumer.OrderEvent) error {
+	// Look up the parent BUY via trade-execution's manthan_orders join.
+	// meta.Found == true means we know this SL — it's a Manthan-placed SL
+	// (or trade-execution knows about it via user-config-events sync).
+	// meta.EntryBrokerOrderID is the parent BUY's broker_order_id, which
+	// FindPositionByEntryBrokerOrderID uses to locate the position row.
+	meta, err := h.lookup.LookupOrderMeta(ctx, ev.BrokerOrderID)
+	if err != nil {
+		return fmt.Errorf("SL LookupOrderMeta: %w", err)
+	}
+	if !meta.Found {
+		h.logger.Debug("state-machine: SL event but not in manthan_orders (user-manual SL) — skipping",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.String("event_id", ev.EventID))
+		return nil
+	}
+	if meta.EntryBrokerOrderID == "" {
+		h.logger.Warn("state-machine: SL event missing EntryBrokerOrderID from meta — skipping",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.String("event_id", ev.EventID))
+		return nil
+	}
+
+	pos, err := h.store.FindPositionByEntryBrokerOrderID(ctx, meta.EntryBrokerOrderID)
+	if err != nil {
+		return fmt.Errorf("SL find position: %w", err)
+	}
+	if pos == nil {
+		// No ACTIVE lot for the parent BUY. Could be:
+		//   (a) drift — parent BUY never got processed by positions svc
+		//   (b) race  — position exited between fill and this event
+		// Neither is a fatal error; drift detector (Chunk P.G) will
+		// surface (a) if it persists. Log at Info to make debugging easy.
+		h.logger.Info("state-machine: SL event but no ACTIVE parent position — skipping",
+			zap.String("sl_broker_order_id", ev.BrokerOrderID),
+			zap.String("entry_broker_order_id", meta.EntryBrokerOrderID),
+			zap.String("event_id", ev.EventID))
+		return nil
+	}
+
+	// Audit rows use the PARENT (entry) signal_id — position_events.signal_id
+	// is UUID-typed. Trade-execution stores SL rows with signal_id prefixed
+	// "sl-<uuid>" (per rules-engine's SL_MODIFY deterministic-id pattern) —
+	// that string won't parse as UUID. EntrySignalID is the plain UUID of
+	// the parent BUY signal, which IS the position's signal_id already
+	// stored on positions.signal_id. Every event on a position references
+	// the same signal_id → consistent audit trail.
+	auditSignalID := meta.EntrySignalID
+	if auditSignalID == "" {
+		// Defensive: LookupOrderMeta falls back to SL's own signal_id when
+		// EntrySignalID is empty (shouldn't happen for SL orders since
+		// they always have a parent, but if it does, better to skip the
+		// audit-row signal_id than write garbage).
+		h.logger.Debug("state-machine: SL event missing EntrySignalID — audit row will have NULL signal_id",
+			zap.String("broker_order_id", ev.BrokerOrderID))
+	}
+
+	// Route: CANCELLED (with no fill) → clear; else set/update to trigger_price.
+	if ev.EventType == "CANCELLED" && ev.FilledQty == 0 {
+		auditEvent := &store.PositionEvent{
+			EventType:      store.EventTypeSLCancelled,
+			BrokerOrderID:  ev.BrokerOrderID,
+			SignalID:       auditSignalID,
+			Reason:         "SL cancelled at broker (filled_qty=0)",
+			RawSourceEvent: ev.RawMessage,
+			SourceEventID:  ev.EventID,
+		}
+		if err := h.store.ClearCurrentSLWithEvent(ctx, pos.PositionID, auditEvent); err != nil {
+			return fmt.Errorf("clear current_sl: %w", err)
+		}
+		h.logger.Info("state-machine: SL cancelled — cleared current_sl",
+			zap.String("position_id", pos.PositionID.String()),
+			zap.String("symbol", pos.Symbol),
+			zap.String("sl_broker_order_id", ev.BrokerOrderID))
+		return nil
+	}
+
+	// Set/update path — needs a real trigger_price.
+	if ev.TriggerPrice <= 0 {
+		h.logger.Debug("state-machine: SL event with no trigger_price — skipping",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.String("event_type", ev.EventType))
+		return nil
+	}
+
+	// Reason line shows the SL walk visible in position_events:
+	//   "SL @ 1512.90" (first observation, prior was null)
+	//   "SL 1512.90 → 1520.30" (ratchet up)
+	reason := fmt.Sprintf("SL @ %.4f", ev.TriggerPrice)
+	if pos.CurrentSL > 0 && pos.CurrentSL != ev.TriggerPrice {
+		reason = fmt.Sprintf("SL %.4f → %.4f", pos.CurrentSL, ev.TriggerPrice)
+	}
+	auditEvent := &store.PositionEvent{
+		EventType:      store.EventTypeSLModified,
+		BrokerOrderID:  ev.BrokerOrderID,
+		SignalID:       auditSignalID,
+		FillPrice:      ev.TriggerPrice, // repurposed: SL trigger value (position_events has no dedicated column)
+		Reason:         reason,
+		RawSourceEvent: ev.RawMessage,
+		SourceEventID:  ev.EventID,
+	}
+	if err := h.store.UpdateCurrentSLWithEvent(ctx, pos.PositionID, ev.TriggerPrice, auditEvent); err != nil {
+		return fmt.Errorf("update current_sl: %w", err)
+	}
+	h.logger.Info("state-machine: SL trigger set",
+		zap.String("position_id", pos.PositionID.String()),
+		zap.String("symbol", pos.Symbol),
+		zap.Float64("prev_sl", pos.CurrentSL),
+		zap.Float64("new_sl", ev.TriggerPrice),
+		zap.String("sl_broker_order_id", ev.BrokerOrderID))
 	return nil
 }
 
@@ -246,10 +671,15 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 	qtyClosed := pos.Quantity
 	realizedPnL := (exitPrice - pos.EntryPrice) * float64(qtyClosed)
 
+	// Audit row's signal_id references the POSITION's signal_id (the parent
+	// BUY's UUID), not the SL order's own signal_id (which trade-execution
+	// stores prefixed "sl-<uuid>" and won't parse as the UUID-typed column).
+	// See the note in handleSLTrackingEvent for the same fix on the modify
+	// path (2026-07-16).
 	auditEvent := &store.PositionEvent{
 		EventType:        store.EventTypeSLFilled,
 		BrokerOrderID:    ev.BrokerOrderID,
-		SignalID:         meta.SignalID,
+		SignalID:         meta.EntrySignalID,
 		DeltaQty:         -qtyClosed,
 		FillPrice:        exitPrice,
 		RealizedPnLDelta: realizedPnL,
@@ -324,14 +754,32 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 		return nil
 	}
 
-	lots, err := h.store.FindActiveLotsFIFO(ctx, ev.UserID, ev.Symbol)
+	// Normalize the SELL event's symbol before FIFO lookup — positions_db.symbol
+	// is stored canonically (e.g. "AADHARHFC") but the SELL event may arrive
+	// with the raw wire form ("STK_AADHARHFC_EQ_NSE_23729"). Without this
+	// normalize step every SELL from the REST_ORDERBOOK path would fail to
+	// match its parent BUY position and log "no ACTIVE lots for user/symbol"
+	// even though the position clearly exists (verified 2026-07-16).
+	//
+	// Exchange filter matters: same ticker on NSE vs BSE are separate positions
+	// (not fungible for delivery) — the FIFO query MUST scope to the exchange
+	// this SELL was placed on, else an NSE SELL could match a BSE lot.
+	// Fallback: if wire form was unrecognized, exchange=="" degrades to
+	// no exchange filter (backward compat for older WSS-only callers).
+	normSymbol, normExchange := normalizeSymbol(ev.Symbol)
+	if normExchange == "" {
+		normExchange = ev.Exchange
+	}
+
+	lots, err := h.store.FindActiveLotsFIFO(ctx, ev.UserID, normSymbol, normExchange)
 	if err != nil {
 		return fmt.Errorf("manual SELL find lots: %w", err)
 	}
 	if len(lots) == 0 {
 		h.logger.Warn("state-machine: manual SELL with no ACTIVE lots for user/symbol",
 			zap.String("user_id", ev.UserID),
-			zap.String("symbol", ev.Symbol),
+			zap.String("symbol_raw", ev.Symbol),
+			zap.String("symbol_normalized", normSymbol),
 			zap.String("event_id", ev.EventID))
 		return nil // drift; positions.drift.detected covers this in P.G
 	}
@@ -445,7 +893,7 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 		// is the right place to alert.
 		h.logger.Warn("state-machine: manual SELL exceeded ACTIVE qty (drift)",
 			zap.String("user_id", ev.UserID),
-			zap.String("symbol", ev.Symbol),
+			zap.String("symbol", normSymbol),
 			zap.Int("sell_qty", sellQty),
 			zap.Int("overshoot", remaining),
 			zap.Int("lots_touched", touched))

@@ -386,6 +386,26 @@ message LookupOrderMetaResponse {
   string entry_signal_id       = 6;
   string entry_broker_order_id = 7;
 
+  // Real avg fill price of this row (manthan_orders.avg_fill_price).
+  // 0 when the fill hasn't landed yet OR the row is still PENDING /
+  // REJECTED. Lets positions svc use the authoritative broker fill
+  // price instead of falling back to the LIMIT price when its own
+  // Kafka event arrived via REST_ORDERBOOK (which never carries fill
+  // price). Prevents the entry_price = limit vs fill divergence
+  // documented in the incident report on 2026-07-16.
+  double avg_fill_price        = 9;
+
+  // For ENTRY orders: the SL that's currently placed at the broker
+  // for this entry (via manthan_orders.parent_order_id self-FK).
+  // sl_trigger_price = 0 means "no SL row exists yet." Lets positions
+  // svc close the Kafka-partition-ordering race where an SL event
+  // arrives before its parent BUY event and would otherwise be
+  // silently dropped — the BUY handler can now proactively pull the
+  // SL from execution_db and apply it to the freshly-created position.
+  // For SL_SELL / EXIT rows: 0 (self-reference; caller doesn't need it).
+  double sl_trigger_price      = 10;
+  string sl_broker_order_id    = 11;
+
   // Optional error detail when found=false due to non-NOT_FOUND reason
   // (DB unreachable etc.). NOT_FOUND itself sets found=false with nil error.
   common.Error error           = 8;

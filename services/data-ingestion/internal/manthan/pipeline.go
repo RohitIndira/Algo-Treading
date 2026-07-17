@@ -124,11 +124,34 @@ func (p *Pipeline) Run(raw *ReadResult) *PipelineResult {
 	stats := &res.Stats
 
 	// --- Universe: only BuySignal rows where ATH_Entry = "Buy" ---
+	//
+	// Dedup by symbol at intake — the source sheet occasionally lists the
+	// same ScripName on multiple rows (e.g. UNIPARTS × 2, IOLCP × 2 on
+	// 2026-07-17). Without dedup we'd publish two Kafka `manthan.signals`
+	// messages per symbol, downstream would emit two BUY orders, and the
+	// portfolio caps math would over-count that symbol against the sector
+	// bucket. Keep the FIRST row (FCFS tie-break, matches the cap rule).
+	seenSym := make(map[string]struct{})
 	var buyCandidates []*BuySignalRow
+	dupSkipped := 0
 	for _, bs := range raw.BuySignals {
-		if strings.TrimSpace(bs.ATHEntry) == "Buy" {
-			buyCandidates = append(buyCandidates, bs)
+		if strings.TrimSpace(bs.ATHEntry) != "Buy" {
+			continue
 		}
+		sym := strings.TrimSpace(bs.ScripName)
+		if sym != "" {
+			if _, ok := seenSym[sym]; ok {
+				dupSkipped++
+				continue
+			}
+			seenSym[sym] = struct{}{}
+		}
+		buyCandidates = append(buyCandidates, bs)
+	}
+	if dupSkipped > 0 {
+		p.logger.Warn("BuySignal dedup: dropped duplicate ScripName rows",
+			zap.Int("skipped", dupSkipped),
+			zap.Int("kept", len(buyCandidates)))
 	}
 	stats.BuySignalTotal = len(buyCandidates)
 

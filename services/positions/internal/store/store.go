@@ -52,16 +52,47 @@ func (s *Store) FindManthanLotBySignalID(ctx context.Context, signalID string) (
 // FindActiveLotsFIFO returns all ACTIVE lots for (user, symbol) ordered
 // per §7.2 manual-sell rule: USER_MANUAL first (FIFO within origin), then
 // MANTHAN (FIFO within origin). Callers iterate + decrement in returned order.
-func (s *Store) FindActiveLotsFIFO(ctx context.Context, userID, symbol string) ([]*Position, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+positionColumns+`
-		FROM positions
-		WHERE user_id = $1
-		  AND symbol  = $2
-		  AND status  = 'ACTIVE'
-		ORDER BY
-		  CASE origin WHEN 'USER_MANUAL' THEN 0 ELSE 1 END,
-		  entry_time ASC`, userID, symbol)
+// FindActiveLotsFIFO returns ACTIVE lots for a (user, symbol, exchange) tuple
+// in FIFO order for manual-SELL matching: USER_MANUAL first (entry_time ASC),
+// then MANTHAN (entry_time ASC). §7.2 manual-sell branch of the design doc.
+//
+// The exchange filter matters: a stock like SONACOMS is listed on both NSE
+// (STK_SONACOMS_EQ_NSE_4684) and BSE (STK_SONACOMS_EQ_BSE_543300). A user
+// can own shares on BOTH exchanges simultaneously and they are NOT
+// fungible — an NSE SELL cannot deliver from BSE holdings and vice versa.
+// Broker holdings track per-exchange too; positions_db must match.
+//
+// If exchange is empty (legacy WSS callers where the wire enum was "1"/"2"
+// numeric or unmapped), the filter degrades to just (user, symbol) so old
+// callers still work — but any FRESH callers going through the state
+// machine's normalizeSymbol path will always pass a real exchange.
+func (s *Store) FindActiveLotsFIFO(ctx context.Context, userID, symbol, exchange string) ([]*Position, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if exchange == "" {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+positionColumns+`
+			FROM positions
+			WHERE user_id = $1
+			  AND symbol  = $2
+			  AND status  = 'ACTIVE'
+			ORDER BY
+			  CASE origin WHEN 'USER_MANUAL' THEN 0 ELSE 1 END,
+			  entry_time ASC`, userID, symbol)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+positionColumns+`
+			FROM positions
+			WHERE user_id  = $1
+			  AND symbol   = $2
+			  AND exchange = $3
+			  AND status   = 'ACTIVE'
+			ORDER BY
+			  CASE origin WHEN 'USER_MANUAL' THEN 0 ELSE 1 END,
+			  entry_time ASC`, userID, symbol, exchange)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("FindActiveLotsFIFO query: %w", err)
 	}
@@ -134,6 +165,35 @@ func (s *Store) DistinctUsersWithActive(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
+// FindPositionByEntryBrokerOrderID returns the ACTIVE lot whose BUY broker
+// order created it. Returns (nil, nil) when no match — caller decides if
+// that's a real drift or a legitimate "SL event for a position we don't
+// track" case (e.g. USER_MANUAL SL that never had a Manthan BUY row).
+//
+// Used by the SL-tracking path in the state machine: an SL_MODIFY event
+// arrives with the SL's own broker_order_id → gRPC LookupOrderMeta returns
+// the parent BUY's broker_order_id → this lookup finds the position it
+// belongs to → current_sl gets updated. See §7.5 (added 2026-07-16).
+//
+// Filter is `status='ACTIVE'` so an SL modification arriving after the
+// position already exited (broker race) doesn't accidentally reopen it.
+func (s *Store) FindPositionByEntryBrokerOrderID(ctx context.Context, entryBrokerOrderID string) (*Position, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+positionColumns+`
+		FROM positions
+		WHERE entry_broker_order_id = $1
+		  AND status = 'ACTIVE'
+		LIMIT 1`, entryBrokerOrderID)
+	pos, err := scanPosition(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("FindPositionByEntryBrokerOrderID: %w", err)
+	}
+	return pos, nil
+}
+
 // PositionExistsForEntry returns true if we've already INSERTed a position
 // row for this BUY broker_order_id — the idempotency check on the BUY path.
 // Kafka may replay the same FILLED event; without this we'd double-insert.
@@ -203,10 +263,117 @@ func (s *Store) UpdateExitWithEvent(ctx context.Context, positionID uuid.UUID, e
 	})
 }
 
+// UpdateCurrentSLWithEvent atomically sets positions.current_sl to newSL +
+// appends an SL_MODIFIED audit row. Used every time the state machine
+// observes a broker SL PENDING/STATUS_CHANGED event with a real
+// trigger_price — first observation OR any subsequent ratchet.
+//
+// Only touches ACTIVE positions (RowsAffected=0 is a legitimate no-op:
+// SL observation arriving after the position already exited via SL fire).
+//
+// Idempotency: same SL event replayed via Kafka → position_events UNIQUE
+// (position_id, source_event_id) rejects the audit INSERT → transaction
+// rolls back → current_sl unchanged. Net effect: exactly-once semantics
+// even with at-least-once Kafka.
+func (s *Store) UpdateCurrentSLWithEvent(ctx context.Context, positionID uuid.UUID, newSL float64, ev *PositionEvent) error {
+	if newSL <= 0 {
+		return fmt.Errorf("UpdateCurrentSLWithEvent: newSL must be > 0 (got %f)", newSL)
+	}
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET current_sl = $1,
+			    updated_at = NOW()
+			WHERE position_id = $2
+			  AND status = 'ACTIVE'`,
+			newSL, positionID)
+		if err != nil {
+			return fmt.Errorf("update current_sl: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			s.logger.Debug("update current_sl: position not ACTIVE (idempotent no-op)",
+				zap.String("position_id", positionID.String()))
+		}
+		ev.PositionID = positionID
+		return insertEventTx(ctx, tx, ev)
+	})
+}
+
+// ClearCurrentSLWithEvent atomically sets positions.current_sl to NULL +
+// appends an SL_CANCELLED audit row. Used when the broker publishes a
+// CANCELLED event on an SL order with filled_qty=0 (broker rejected the
+// SL, rules-engine cancelled it during strategy STOP, etc.).
+//
+// Position is left ACTIVE — the user still owns the shares; only the
+// automated protection is gone. Mobile UI reads current_sl=NULL as
+// "unprotected" and can prompt the user to re-arm or exit manually.
+//
+// Same idempotency + no-op semantics as UpdateCurrentSLWithEvent.
+func (s *Store) ClearCurrentSLWithEvent(ctx context.Context, positionID uuid.UUID, ev *PositionEvent) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET current_sl = NULL,
+			    updated_at = NOW()
+			WHERE position_id = $1
+			  AND status = 'ACTIVE'`,
+			positionID)
+		if err != nil {
+			return fmt.Errorf("clear current_sl: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			s.logger.Debug("clear current_sl: position not ACTIVE (idempotent no-op)",
+				zap.String("position_id", positionID.String()))
+		}
+		ev.PositionID = positionID
+		return insertEventTx(ctx, tx, ev)
+	})
+}
+
 // UpdatePartialExitWithEvent decrements quantity by delta (keeps status
 // ACTIVE) + audits. Used on manual SELL fills that partially consume a lot.
 // If the caller's math would drive quantity ≤ 0, they must call
 // UpdateExitWithEvent instead — this method does NOT flip status.
+// CorrectEntryQuantityWithEvent downsizes an ACTIVE position's quantity +
+// invested_amount to reflect the broker's actual final fill count. Used by
+// handleBuyFill's partial-fill correction path (see handler.go:handleBuyFill)
+// when a CANCELLED-with-fill event arrives for a position that was opened
+// with the ORDER quantity (because the initial WSS FILLED event had
+// filled_qty=null and the state machine fell back to ev.Quantity).
+//
+// Only downsizes — refuses to grow. If newQuantity >= current quantity the
+// UPDATE is a no-op via the WHERE clause (safer than silently accepting a
+// growth request that could paper over a real bug elsewhere).
+//
+// Emits the passed audit event atomically in the same transaction.
+func (s *Store) CorrectEntryQuantityWithEvent(ctx context.Context, positionID uuid.UUID, newQuantity int, newInvested float64, ev *PositionEvent) error {
+	if newQuantity <= 0 {
+		return fmt.Errorf("CorrectEntryQuantityWithEvent: newQuantity must be > 0, got %d", newQuantity)
+	}
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET quantity        = $1,
+			    invested_amount = $2,
+			    updated_at      = NOW()
+			WHERE position_id = $3
+			  AND status = 'ACTIVE'
+			  AND quantity > $1`,
+			newQuantity, newInvested, positionID)
+		if err != nil {
+			return fmt.Errorf("correct entry qty: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("entry qty correction not applied — position not ACTIVE or quantity <= newQuantity")
+		}
+		ev.PositionID = positionID
+		return insertEventTx(ctx, tx, ev)
+	})
+}
+
 func (s *Store) UpdatePartialExitWithEvent(ctx context.Context, positionID uuid.UUID, deltaQty int, ev *PositionEvent) error {
 	if deltaQty <= 0 {
 		return fmt.Errorf("UpdatePartialExitWithEvent: deltaQty must be > 0, got %d", deltaQty)

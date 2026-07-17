@@ -60,6 +60,13 @@ type Reconciler struct {
 	fastPoll   time.Duration
 	slowPoll   time.Duration
 	logger     *zap.Logger
+
+	// cutoff — Indira orders with ordDate STRICTLY BEFORE this timestamp are
+	// skipped by eventFromOrderBookRow. Set once in Start() from the greater
+	// of (MAX(observed_at) in broker_events, time.Now() at boot). Prevents
+	// the reconciler's startup sweep from re-emitting the entire Indira
+	// orderbook after a DB flush — the 2026-07-17 postmortem.
+	cutoff time.Time
 }
 
 func New(
@@ -92,7 +99,25 @@ func New(
 // Start launches two goroutines — one for Layer 2, one for Layer 3 — and
 // runs Layer 3 once immediately to catch up any events missed while the
 // service was down.
+//
+// Before launching, computes r.cutoff so eventFromOrderBookRow can skip
+// pre-boot Indira orders. Resume-friendly semantics:
+//
+//   - broker_events has rows (normal restart / crash recovery)  →
+//     cutoff = MAX(observed_at). Orders placed during a crash window are
+//     STILL re-observed; only orders older than our last recorded
+//     observation get skipped.
+//   - broker_events is EMPTY (fresh install / test-data flush)  →
+//     cutoff = time.Now(). Historical Indira orderbook stays out of Kafka.
+//
+// See docs/orderstatus_service_design.md § "boot cutoff" for the sequence
+// diagram + the 2026-07-17 incident that drove this.
 func (r *Reconciler) Start(ctx context.Context) {
+	r.cutoff = r.computeCutoff(ctx)
+	r.logger.Info("reconciler boot cutoff computed",
+		zap.Time("cutoff", r.cutoff),
+		zap.String("note", "Indira orders with ordDate < cutoff will NOT be re-emitted"))
+
 	// Startup catch-up: run a full sweep now, before either loop's first tick.
 	// This is the "on startup" path from the truth hierarchy — after a
 	// deploy or crash, any events missed while we were down get pulled in
@@ -108,6 +133,28 @@ func (r *Reconciler) Start(ctx context.Context) {
 
 	go r.loop(ctx, r.fastPoll, "layer2-fast", store.SourceRESTOrderbook)
 	go r.loop(ctx, r.slowPoll, "layer3-slow", store.SourceRESTReconciler)
+}
+
+// computeCutoff picks the boot cutoff — see Start() docstring.
+// Query-error fallback is time.Now(): if we can't read broker_events we
+// treat the world as fresh, which is the SAFER behavior (no re-emission).
+func (r *Reconciler) computeCutoff(ctx context.Context) time.Time {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	latest, err := r.writer.LatestObservedAt(queryCtx)
+	if err != nil {
+		r.logger.Warn("reconciler cutoff query failed — defaulting to time.Now (no historical re-emit)",
+			zap.Error(err))
+		return time.Now()
+	}
+	if !latest.Valid {
+		r.logger.Info("reconciler cutoff: broker_events is empty — fresh install; cutoff = time.Now",
+			zap.Time("cutoff", time.Now()))
+		return time.Now()
+	}
+	r.logger.Info("reconciler cutoff: resuming from last observed event",
+		zap.Time("cutoff", latest.Time))
+	return latest.Time
 }
 
 // loop runs a poll every `interval`. Skips a tick if the previous poll is
@@ -242,6 +289,18 @@ func (r *Reconciler) eventFromOrderBookRow(userID string, o *indira.OrderBook, s
 		return nil
 	}
 
+	// Boot-cutoff filter — skip Indira orders older than r.cutoff so a fresh
+	// install (empty broker_events) doesn't re-publish the entire day's
+	// history to Kafka. See Start()'s docstring for the resume semantics.
+	// Parse errors → include the row (safer to observe than to drop).
+	if !r.cutoff.IsZero() && o.OrdDate != "" {
+		if ordTime, err := parseIndiraOrdDate(o.OrdDate); err == nil {
+			if ordTime.Before(r.cutoff) {
+				return nil
+			}
+		}
+	}
+
 	raw, err := json.Marshal(o)
 	if err != nil {
 		// Should never happen — OrderBook is well-formed JSON in-memory.
@@ -258,6 +317,24 @@ func (r *Reconciler) eventFromOrderBookRow(userID string, o *indira.OrderBook, s
 	}
 
 	status := strings.ToUpper(strings.TrimSpace(o.Status))
+	ordTypeUpper := strings.ToUpper(strings.TrimSpace(o.OrdType))
+
+	// TradedPrice sourcing from the OrderBook API:
+	//   - Market / SL-M ordTypes: broker has no user-specified LIMIT to
+	//     store in `price`, so it puts the actual traded price there once
+	//     the order fills. Confirmed live 2026-07-16 on BECTORFOOD @
+	//     ordType=Market, status=Executed, price=188.59 (avg trade).
+	//   - Limit / SL / SL-L ordTypes: `price` is the user's LIMIT — the
+	//     fill lives in TradeBook (Layer 3) only. Leave TradedPrice=0
+	//     so positions svc defers to a later WSS event that carries the
+	//     real fill (see services/positions/statemachine/handler.go
+	//     handleBuyFill precedence — meta.AvgFillPrice > ev.TradedPrice
+	//     > skip).
+	var tradedPrice float64
+	if isMarketOrdType(ordTypeUpper) && o.TradedQty > 0 && o.Price > 0 {
+		tradedPrice = o.Price
+	}
+
 	return &store.Event{
 		BrokerOrderID:   brokerOrderID,
 		ExchangeOrderID: exchOrderID,
@@ -276,12 +353,48 @@ func (r *Reconciler) eventFromOrderBookRow(userID string, o *indira.OrderBook, s
 		TriggerPrice:    o.TriggerPrice,
 		Quantity:        o.Qty,
 		FilledQty:       o.TradedQty,
-		TradedPrice:     0, // OrderBook doesn't carry avg fill — that's in TradeBook (Layer 3)
+		TradedPrice:     tradedPrice,
 		PendingQty:      o.RemainQty,
 		Reason:          strings.TrimSpace(o.RejReason),
 		RawPayload:      raw,
 		BrokerTsMs:      0, // set when we plumb exch time through
 	}
+}
+
+// isMarketOrdType returns true for Indira ordType values whose `price`
+// field on the OrderBook API carries the AVG TRADED price rather than a
+// user LIMIT. Used by the REST reconciler to opportunistically populate
+// TradedPrice for Market fills (Limit / SL / SL-L stay 0 — those need
+// TradeBook / WSS for the fill price).
+//
+// Kept as a small case-fold list rather than a regex — Indira sometimes
+// returns "Market", sometimes "MARKET", and different SDK versions have
+// used "SL-M" vs "SL_MARKET".
+func isMarketOrdType(ordType string) bool {
+	switch ordType {
+	case "MARKET", "MKT", "SL-M", "SL_M", "SL_MARKET":
+		return true
+	}
+	return false
+}
+
+// parseIndiraOrdDate parses Indira's ordDate string into a time.Time.
+// Format observed live: "2026-07-17 12:07:56" — no timezone info, but
+// Indira runs India-only so we treat the wall clock as Asia/Kolkata.
+//
+// Used by the boot-cutoff filter in eventFromOrderBookRow. Falls back
+// to Asia/Kolkata via time.LoadLocation; if tzdata isn't linked into
+// the binary the parse still succeeds via time.UTC and the cutoff
+// comparison stays correct within a 5.5-hour ambiguity — sufficient
+// for a day-boundary filter (worst case: a few overnight orders
+// re-observed once — the broker_events UNIQUE dedup handles it).
+func parseIndiraOrdDate(s string) (time.Time, error) {
+	const layout = "2006-01-02 15:04:05"
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		loc = time.UTC
+	}
+	return time.ParseInLocation(layout, strings.TrimSpace(s), loc)
 }
 
 // deriveEventSeq matches the WSS-side derivation used in

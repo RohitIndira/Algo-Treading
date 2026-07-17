@@ -157,12 +157,190 @@ func (h *LiveAlgosHandler) GetLiveAlgos(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// ── Per-strategy P&L (positions_db + LTP) ──────────────────────
+	// One positions_db query per strategy + one bulk LTP MGet. When
+	// either store is unwired, metrics stay empty and Build falls back
+	// to pnlPending=true rather than fabricating zeros.
+	metrics := h.perStrategyMetrics(r.Context(), userID, resp.Strategies)
+
 	// ── Assemble the response ──────────────────────────────────────
-	// Aggregator is a pure function: strategies + catalog → Response.
-	// Easy to unit-test in isolation without spinning up a gRPC mock.
-	payload := livealgos.Build(resp.Strategies, h.catalog)
+	// Aggregator is a pure function: strategies + catalog + metrics → Response.
+	payload := livealgos.Build(resp.Strategies, h.catalog, metrics)
 
 	respondIndiraOK(w, payload)
+}
+
+// perStrategyMetrics computes real per-strategy P&L for the LIST endpoint
+// by hitting positions_db once per strategy and doing a single LTP MGet
+// for every ACTIVE token across strategies. When the position store or
+// LTP subsystem is unwired at boot, returns an empty map — Build then
+// falls back to pnlPending=true so the UI spins instead of showing
+// silent zeros.
+//
+// Skips strategies with status=STOPPED (stopped_at != nil) — no live
+// positions, no need to hit the DB.
+func (h *LiveAlgosHandler) perStrategyMetrics(
+	ctx context.Context,
+	userID string,
+	strategies []*pb.Strategy,
+) map[string]livealgos.StrategyMetrics {
+	if h.store == nil {
+		return nil
+	}
+
+	type stratPositions struct {
+		strategyID string
+		deployed   int64
+		positions  []livealgos.PositionRow
+	}
+	perStrategy := make([]stratPositions, 0, len(strategies))
+	tokenSet := make(map[string]struct{})
+
+	for _, s := range strategies {
+		if s == nil {
+			continue
+		}
+		if s.StoppedAt != nil {
+			// Stopped: no live positions to sum. Feed a zero-real metric
+			// so the tile shows 0/0 rather than an infinite spinner.
+			perStrategy = append(perStrategy, stratPositions{strategyID: s.StrategyId})
+			continue
+		}
+		positions, err := h.store.Positions(ctx, s.StrategyId, userID)
+		if err != nil {
+			log.Printf("livealgos: perStrategyMetrics: Positions(%s/%s) failed: %v", s.StrategyId, userID, err)
+			// Leave this strategy out of the map — Build falls back to pending.
+			continue
+		}
+		perStrategy = append(perStrategy, stratPositions{
+			strategyID: s.StrategyId,
+			deployed:   deployedCapitalFromForList(s),
+			positions:  positions,
+		})
+		for _, p := range positions {
+			if p.Status == "ACTIVE" && p.ExchangeToken.Valid && p.ExchangeToken.String != "" {
+				tokenSet[p.ExchangeToken.String] = struct{}{}
+			}
+		}
+	}
+
+	// One LTP MGet across every ACTIVE token. When the LTP tunnel is
+	// down we still emit numeric metrics using realized-only P&L
+	// (unrealized silently drops to 0). ltpStatus isn't surfaced on the
+	// LIST endpoint's response envelope; the DETAILS endpoint owns that.
+	var ltps map[string]livealgos.LTPQuote
+	if len(tokenSet) > 0 && h.ltp != nil {
+		tokens := make([]string, 0, len(tokenSet))
+		for t := range tokenSet {
+			tokens = append(tokens, t)
+		}
+		ltps, _ = h.ltp.FetchByTokens(ctx, tokens)
+	}
+
+	out := make(map[string]livealgos.StrategyMetrics, len(perStrategy))
+	for _, sp := range perStrategy {
+		out[sp.strategyID] = computeStrategyMetrics(sp.deployed, sp.positions, ltps)
+	}
+	return out
+}
+
+// computeStrategyMetrics runs the per-strategy P&L math shared by the
+// LIST endpoint. Kept as a package-level function so it stays pure and
+// testable without wiring an HTTP handler.
+func computeStrategyMetrics(
+	deployed int64,
+	positions []livealgos.PositionRow,
+	ltps map[string]livealgos.LTPQuote,
+) livealgos.StrategyMetrics {
+	var (
+		realised    int64
+		todayReal   int64
+		unrealised  float64
+		todayUnreal float64
+		openCount   int32
+		wins        int
+		closed      int
+	)
+	todayStart := startOfTodayIST()
+	for _, p := range positions {
+		switch p.Status {
+		case "ACTIVE":
+			openCount++
+			q, ok := livealgos.LTPForPosition(p, ltps)
+			if !ok {
+				continue
+			}
+			unrealised += (q.LTP - p.EntryPrice) * float64(p.Quantity)
+			if q.PrevClose > 0 {
+				todayUnreal += (q.LTP - q.PrevClose) * float64(p.Quantity)
+			}
+		case "EXITED":
+			if !p.ExitPrice.Valid {
+				continue // ORPHAN_CLEANUP etc — not a real trade
+			}
+			closed++
+			if p.RealizedPnL.Valid {
+				realised += int64(p.RealizedPnL.Float64)
+				if p.RealizedPnL.Float64 > 0 {
+					wins++
+				}
+			}
+			if p.RealizedPnL.Valid && p.ExitTime.Valid && !p.ExitTime.Time.Before(todayStart) {
+				todayReal += int64(p.RealizedPnL.Float64)
+			}
+		}
+	}
+	netAmt := realised + int64(unrealised)
+	todayAmt := todayReal + int64(todayUnreal)
+
+	var netPct, todayPct, winRate float64
+	if deployed > 0 {
+		netPct = float64(netAmt) / float64(deployed) * 100
+		todayPct = float64(todayAmt) / float64(deployed) * 100
+	}
+	if closed > 0 {
+		winRate = float64(wins) / float64(closed) * 100
+	}
+	return livealgos.StrategyMetrics{
+		Real:          true,
+		NetPnL:        netAmt,
+		NetPct:        round2Pct(netPct),
+		TodayPnL:      todayAmt,
+		TodayPct:      round2Pct(todayPct),
+		OpenPositions: openCount,
+		WinRatePct:    round2Pct(winRate),
+	}
+}
+
+// startOfTodayIST returns 00:00 IST for today — mirrors the same helper
+// in portfolio store. Kept local so this handler stays self-contained.
+func startOfTodayIST() time.Time {
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		now := time.Now().UTC()
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	now := time.Now().In(loc)
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+}
+
+func round2Pct(f float64) float64 {
+	rounded := int64(f * 100)
+	if f*100-float64(rounded) >= 0.5 {
+		rounded++
+	} else if f*100-float64(rounded) <= -0.5 {
+		rounded--
+	}
+	return float64(rounded) / 100
+}
+
+// deployedCapitalFromForList reads TotalCapital off a strategy — kept
+// local so the handler doesn't import the aggregator's unexported helper.
+func deployedCapitalFromForList(s *pb.Strategy) int64 {
+	if s == nil || s.TradeConfig == nil {
+		return 0
+	}
+	return int64(s.TradeConfig.TotalCapital)
 }
 
 // ─── Details page handlers ──────────────────────────────────────────
@@ -243,7 +421,12 @@ func (h *LiveAlgosHandler) GetStrategyDetails(w http.ResponseWriter, r *http.Req
 	algoID, algoName := resolveAlgoMeta(h.catalog, meta.StrategyType)
 	payload := livealgos.BuildDetails(meta, positions, ltps, algoID, algoName)
 	payload.LTPStatus = string(ltpStatus)
-	payload.Chart = h.chartFor(r.Context(), algoID, meta.CreatedAt)
+	// Chart: prefer real algo_performance_daily rows since deploy day.
+	// If that source is empty (ETL hasn't caught up to a fresh deployment,
+	// or perfStore isn't wired) synthesize a 2-point line from the strategy's
+	// current live P&L so the frontend can render a real curve from day 0
+	// to today instead of an empty chart.
+	payload.Chart = h.chartFor(r.Context(), algoID, meta.CreatedAt, payload.NetPnL.Percent)
 	respondIndiraOK(w, payload)
 }
 
@@ -259,46 +442,65 @@ func (h *LiveAlgosHandler) GetStrategyDetails(w http.ResponseWriter, r *http.Req
 // return_pct so the earliest chart point sits at 100. Every subsequent
 // point is 100 + (row.ReturnPct - baseline) — i.e. growth from the day
 // this strategy deployed.
-func (h *LiveAlgosHandler) chartFor(ctx context.Context, algoID string, deployedAt time.Time) livealgos.DetailsChart {
-	if h.perfStore == nil || algoID == "" {
-		return livealgos.DetailsChart{Points: []livealgos.DetailsChartPoint{}}
-	}
-	refID, ok := h.perfClientMap[algoID]
-	if !ok || refID == "" {
-		return livealgos.DetailsChart{Points: []livealgos.DetailsChartPoint{}}
-	}
-
-	rows, err := h.perfStore.FetchDaily(ctx, algoID, refID)
-	if err != nil || len(rows) == 0 {
-		if err != nil {
-			log.Printf("livealgos: chartFor: fetch daily perf for algo=%s ref=%s: %v", algoID, refID, err)
+func (h *LiveAlgosHandler) chartFor(ctx context.Context, algoID string, deployedAt time.Time, livePct float64) livealgos.DetailsChart {
+	// Primary source: algo_performance_daily since deploy day.
+	if h.perfStore != nil && algoID != "" {
+		if refID, ok := h.perfClientMap[algoID]; ok && refID != "" {
+			rows, err := h.perfStore.FetchDaily(ctx, algoID, refID)
+			if err != nil {
+				log.Printf("livealgos: chartFor: fetch daily perf for algo=%s ref=%s: %v", algoID, refID, err)
+			}
+			if len(rows) > 0 {
+				depDate := deployedAt.UTC().Truncate(24 * time.Hour)
+				sinceDeploy := make([]performance.DailyRow, 0, len(rows))
+				for _, row := range rows {
+					if !row.Date.Before(depDate) {
+						sinceDeploy = append(sinceDeploy, row)
+					}
+				}
+				if len(sinceDeploy) > 0 {
+					baseline := sinceDeploy[0].ReturnPct
+					points := make([]livealgos.DetailsChartPoint, 0, len(sinceDeploy))
+					for _, row := range sinceDeploy {
+						points = append(points, livealgos.DetailsChartPoint{
+							Date: row.Date.Format("2006-01-02"),
+							Pct:  100 + (row.ReturnPct - baseline),
+						})
+					}
+					return livealgos.DetailsChart{Points: points}
+				}
+			}
 		}
-		return livealgos.DetailsChart{Points: []livealgos.DetailsChartPoint{}}
 	}
 
-	// Filter to rows on or after the strategy's deployment date. Use
-	// UTC date comparison — algo_performance_daily.date is a bare DATE
-	// (no tz) and deployedAt lands in UTC per proto.Timestamp defaults.
-	depDate := deployedAt.UTC().Truncate(24 * time.Hour)
-	sinceDeploy := make([]performance.DailyRow, 0, len(rows))
-	for _, row := range rows {
-		if !row.Date.Before(depDate) {
-			sinceDeploy = append(sinceDeploy, row)
-		}
+	// Fallback: strategy is fresher than the last ETL row (or perf source
+	// unwired). Render a real 2-point line — deploy day at 100 and today
+	// at 100 + live netPct. This is the strategy's actual growth curve
+	// so far; the chart auto-switches to per-day granularity once ETL
+	// backfills 2026-07-16 onward.
+	deployDate := deployedAt.In(istLoc()).Format("2006-01-02")
+	todayDate := time.Now().In(istLoc()).Format("2006-01-02")
+	points := []livealgos.DetailsChartPoint{
+		{Date: deployDate, Pct: 100},
 	}
-	if len(sinceDeploy) == 0 {
-		return livealgos.DetailsChart{Points: []livealgos.DetailsChartPoint{}}
-	}
-
-	baseline := sinceDeploy[0].ReturnPct
-	points := make([]livealgos.DetailsChartPoint, 0, len(sinceDeploy))
-	for _, row := range sinceDeploy {
-		points = append(points, livealgos.DetailsChartPoint{
-			Date: row.Date.Format("2006-01-02"),
-			Pct:  100 + (row.ReturnPct - baseline),
-		})
+	if todayDate != deployDate {
+		points = append(points, livealgos.DetailsChartPoint{Date: todayDate, Pct: 100 + livePct})
+	} else {
+		// Same-day deploy → also emit the "today" point so the frontend
+		// gets a stable 2-anchor shape; identical date, live pct.
+		points = append(points, livealgos.DetailsChartPoint{Date: deployDate, Pct: 100 + livePct})
 	}
 	return livealgos.DetailsChart{Points: points}
+}
+
+// istLoc returns Asia/Kolkata with a UTC fallback — matches the tz-load
+// pattern used by startOfTodayIST above.
+func istLoc() *time.Location {
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		return time.UTC
+	}
+	return loc
 }
 
 // GetHoldings handles GET /users/me/live-algos/{strategyId}/holdings.

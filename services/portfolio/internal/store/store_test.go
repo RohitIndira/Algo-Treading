@@ -155,11 +155,14 @@ func TestSummary_MixedActiveAndExited(t *testing.T) {
 	yesterday := time.Now().Add(-30 * time.Hour)
 	todayNoon := time.Now()
 
-	// User has:
-	//   ACTIVE MANTHAN SBI    20 @ ₹500 = ₹10000 invested
-	//   ACTIVE USER   IDEA   100 @ ₹10  = ₹1000 invested
-	//   EXITED MANTHAN ITC   50 @ ₹200  entry, sold ₹220 → +₹1000 (yesterday)
-	//   EXITED USER   TCS   10 @ ₹3000 entry, sold ₹3200 → +₹2000 (today)
+	// User has (after 2026-07-16 Manthan-only scope change, USER_MANUAL
+	// lots are EXCLUDED from every summary number below — they still
+	// exist in positions_db but the portfolio API no longer counts them):
+	//
+	//   ACTIVE MANTHAN SBI    20 @ ₹500 = ₹10000 invested  ← counted
+	//   ACTIVE USER   IDEA   100 @ ₹10  = ₹1000 invested   ← excluded
+	//   EXITED MANTHAN ITC   50 @ ₹200 → 220 → +₹1000 (yesterday) ← counted lifetime, not today
+	//   EXITED USER   TCS    10 @ 3000 → 3200 → +₹2000 (today)  ← excluded
 	insertLot(t, db, lotRow{
 		origin: "MANTHAN", userID: "S4450",
 		strategyID: stableUUID(1), signalID: stableUUID(11),
@@ -194,24 +197,27 @@ func TestSummary_MixedActiveAndExited(t *testing.T) {
 		t.Fatalf("SummaryFor: %v", err)
 	}
 
-	if got, want := sum.TotalInvested, 11000.0; got != want {
-		t.Errorf("total_invested: got %v, want %v", got, want)
+	// Expected numbers reflect Manthan-only scope: SBI ACTIVE + ITC EXITED.
+	if got, want := sum.TotalInvested, 10000.0; got != want {
+		t.Errorf("total_invested: got %v, want %v (SBI ACTIVE Manthan only)", got, want)
 	}
-	if got, want := sum.TotalRealizedPnLLifetime, 3000.0; got != want {
-		t.Errorf("total_realized_pnl_lifetime: got %v, want %v", got, want)
+	if got, want := sum.TotalRealizedPnLLifetime, 1000.0; got != want {
+		t.Errorf("total_realized_pnl_lifetime: got %v, want %v (ITC Manthan exit only; TCS user-manual excluded)", got, want)
 	}
-	// today's realized only — TCS trade (₹2000). ITC exited yesterday.
-	if got, want := sum.TodayRealizedPnL, 2000.0; got != want {
-		t.Errorf("today_realized_pnl: got %v, want %v (only today's exits count)", got, want)
+	// Today's realized: TCS was today but is USER_MANUAL → excluded. ITC was
+	// yesterday. Manthan-only scope + today filter → 0.
+	if got, want := sum.TodayRealizedPnL, 0.0; got != want {
+		t.Errorf("today_realized_pnl: got %v, want %v (Manthan-only + today: no matches)", got, want)
 	}
-	if sum.ActiveLotCount != 2 || sum.ClosedLotCount != 2 {
-		t.Errorf("counts: got active=%d closed=%d, want 2/2", sum.ActiveLotCount, sum.ClosedLotCount)
+	if sum.ActiveLotCount != 1 || sum.ClosedLotCount != 1 {
+		t.Errorf("counts: got active=%d closed=%d, want 1/1 (Manthan-only)", sum.ActiveLotCount, sum.ClosedLotCount)
 	}
 	if got, want := sum.ManthanInvested, 10000.0; got != want {
 		t.Errorf("manthan_invested: got %v, want %v", got, want)
 	}
-	if got, want := sum.UserManualInvested, 1000.0; got != want {
-		t.Errorf("user_manual_invested: got %v, want %v", got, want)
+	// user_manual_invested stays wire-compatible but always 0 under Manthan scope.
+	if got, want := sum.UserManualInvested, 0.0; got != want {
+		t.Errorf("user_manual_invested: got %v, want %v (Manthan-only scope forces 0)", got, want)
 	}
 }
 
@@ -254,10 +260,13 @@ func TestActiveLots_OrderByEntryTime(t *testing.T) {
 	s := mkStore(t, db)
 
 	// Insert in reverse chronological order to prove the ORDER BY matters.
+	// Both MANTHAN — after the 2026-07-16 Manthan-only scope change,
+	// USER_MANUAL lots are excluded entirely (see TestActiveLots_SkipsUserManual).
 	t2 := time.Now().Add(-1 * time.Hour)
 	t1 := time.Now().Add(-3 * time.Hour)
 	insertLot(t, db, lotRow{
-		origin: "USER_MANUAL", userID: "S4450",
+		origin: "MANTHAN", userID: "S4450",
+		strategyID: stableUUID(1), signalID: stableUUID(12),
 		symbol: "LATER", exchange: "NSE", status: "ACTIVE",
 		entryPrice: 20, entryTime: t2, qty: 5, invested: 100, brokerOrderID: "B2",
 	})
@@ -285,6 +294,42 @@ func TestActiveLots_OrderByEntryTime(t *testing.T) {
 	}
 	if got[1].Symbol != "LATER" {
 		t.Errorf("order: got %s second, want LATER", got[1].Symbol)
+	}
+}
+
+// TestActiveLots_SkipsUserManual — after the 2026-07-16 Manthan-only
+// scope change, USER_MANUAL lots must be excluded from the portfolio
+// API (LTP feed doesn't cover the arbitrary user-manual universe, and
+// portfolio numbers are meant to reflect Manthan strategy P&L only).
+func TestActiveLots_SkipsUserManual(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	s := mkStore(t, db)
+
+	insertLot(t, db, lotRow{
+		origin: "MANTHAN", userID: "S4450",
+		strategyID: stableUUID(1), signalID: stableUUID(11),
+		symbol: "MANTHAN_LOT", exchange: "NSE", status: "ACTIVE",
+		entryPrice: 100, entryTime: time.Now(), qty: 10, invested: 1000, brokerOrderID: "B1",
+	})
+	insertLot(t, db, lotRow{
+		origin: "USER_MANUAL", userID: "S4450",
+		symbol: "MANUAL_LOT", exchange: "NSE", status: "ACTIVE",
+		entryPrice: 100, entryTime: time.Now(), qty: 10, invested: 1000, brokerOrderID: "B2",
+	})
+
+	got, err := s.ActiveLotsFor(context.Background(), "S4450")
+	if err != nil {
+		t.Fatalf("ActiveLotsFor: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 row (MANTHAN only), got %d", len(got))
+	}
+	if got[0].Symbol != "MANTHAN_LOT" {
+		t.Errorf("wrong lot returned: got %s, want MANTHAN_LOT", got[0].Symbol)
+	}
+	if got[0].Origin != "MANTHAN" {
+		t.Errorf("wrong origin: got %s, want MANTHAN", got[0].Origin)
 	}
 }
 
@@ -346,10 +391,12 @@ func TestClosedLotsPaged_ExitTimeDescOrder(t *testing.T) {
 		exitPrice: 95, exitTime: t1, exitReason: "SL_TRIGGER", realized: -25, brokerOrderID: "B2",
 	})
 	insertLot(t, db, lotRow{
-		origin: "USER_MANUAL", userID: "S4450",
+		// MANTHAN (was USER_MANUAL before the 2026-07-16 scope change).
+		origin: "MANTHAN", userID: "S4450",
+		strategyID: stableUUID(1), signalID: stableUUID(13),
 		symbol: "NEWEST", exchange: "NSE", status: "EXITED",
 		entryPrice: 100, entryTime: t2.Add(-time.Hour), qty: 3, invested: 300,
-		exitPrice: 120, exitTime: t2, exitReason: "MANUAL_EXIT", realized: 60, brokerOrderID: "B3",
+		exitPrice: 120, exitTime: t2, exitReason: "STRATEGY_EXIT", realized: 60, brokerOrderID: "B3",
 	})
 
 	rows, total, err := s.ClosedLotsPaged(context.Background(), "S4450", 1, 50)
@@ -363,8 +410,8 @@ func TestClosedLotsPaged_ExitTimeDescOrder(t *testing.T) {
 		t.Errorf("order: got %s, %s, %s, want NEWEST, MID, OLDEST",
 			rows[0].Symbol, rows[1].Symbol, rows[2].Symbol)
 	}
-	if rows[0].RealizedPnL != 60 || rows[0].ExitReason != "MANUAL_EXIT" {
-		t.Errorf("first row projections: got realized=%v reason=%q, want 60/MANUAL_EXIT",
+	if rows[0].RealizedPnL != 60 || rows[0].ExitReason != "STRATEGY_EXIT" {
+		t.Errorf("first row projections: got realized=%v reason=%q, want 60/STRATEGY_EXIT",
 			rows[0].RealizedPnL, rows[0].ExitReason)
 	}
 }
@@ -418,12 +465,14 @@ func TestClosedLotsPaged_ClampsBadInput(t *testing.T) {
 	defer db.Close()
 	s := mkStore(t, db)
 
-	// One EXITED row
+	// One EXITED row (MANTHAN — post 2026-07-16 scope change portfolio API
+	// is Manthan-only; USER_MANUAL wouldn't be returned).
 	insertLot(t, db, lotRow{
-		origin: "USER_MANUAL", userID: "S4450",
+		origin: "MANTHAN", userID: "S4450",
+		strategyID: stableUUID(1), signalID: stableUUID(11),
 		symbol: "SYM", exchange: "NSE", status: "EXITED",
 		entryPrice: 100, entryTime: time.Now().Add(-time.Hour), qty: 1, invested: 100,
-		exitPrice: 110, exitTime: time.Now(), exitReason: "MANUAL_EXIT", realized: 10,
+		exitPrice: 110, exitTime: time.Now(), exitReason: "SL_TRIGGER", realized: 10,
 		brokerOrderID: "B1",
 	})
 
