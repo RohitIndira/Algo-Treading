@@ -1,14 +1,14 @@
 module github.com/RohitIndira/Algo-Treading/services/trade-execution
 
-go 1.23.0
+go 1.25.0
 
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jmoiron/sqlx v1.3.5
 	github.com/lib/pq v1.10.9
 	github.com/rabbitmq/amqp091-go v1.9.0
-	google.golang.org/grpc v1.68.1
-	google.golang.org/protobuf v1.36.8 // indirect
+	google.golang.org/grpc v1.82.1
+	google.golang.org/protobuf v1.36.11 // indirect
 )
 
 require (
@@ -43,10 +43,10 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.19 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/net v0.43.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20240903143218-8af14fe29dc1 // indirect
+	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 )
 
 replace github.com/RohitIndira/Algo-Treading/api/proto/common => ../../api/proto/common
