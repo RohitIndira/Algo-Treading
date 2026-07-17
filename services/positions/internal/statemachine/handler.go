@@ -205,6 +205,20 @@ func normalizeBuySell(v string) string {
 // ----------------------------------------------------------------------
 
 func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) error {
+	// Paper-trading leak guard — paper-trading emits events with
+	// broker_order_id="PAPER-*" onto the same Kafka topic as real broker
+	// fills. Positions_db is the SSOT for LIVE holdings; paper events must
+	// never land here. Verified drift 2026-07-17: a stale MANTHAN row for
+	// SBI qty=15 with broker_order_id="PAPER-M2" was in positions_db while
+	// the real broker had no such position.
+	if strings.HasPrefix(ev.BrokerOrderID, "PAPER-") {
+		h.logger.Info("state-machine: BUY event has PAPER-* broker_order_id — skipping (paper-trading events must not reach positions_db)",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.String("event_id", ev.EventID),
+			zap.String("source", ev.Source))
+		return nil
+	}
+
 	// Idempotency short-circuit: BUY event replayed → position row already exists.
 	exists, err := h.store.PositionExistsForEntry(ctx, ev.BrokerOrderID)
 	if err != nil {
