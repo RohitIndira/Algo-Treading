@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // ErrStrategyNotFound is returned by StrategyMeta when the strategy id
@@ -337,7 +339,11 @@ func (s *PostgresStore) symbolMetadata(ctx context.Context, symbols []string) (m
 		FROM public.manthan_signals
 		WHERE symbol = ANY($1)
 		ORDER BY symbol, run_date DESC`
-	rows, err := s.signalsDB.QueryContext(ctx, q, symbols)
+	// pq.Array is required to marshal []string as PostgreSQL text[] for the
+	// `symbol = ANY($1)` clause. Passing the slice raw silently returns
+	// zero rows — the DETAILS response's "Uncategorised 100%" allocation
+	// bug on 2026-07-17 traced to exactly this missing wrapper.
+	rows, err := s.signalsDB.QueryContext(ctx, q, pq.Array(symbols))
 	if err != nil {
 		return nil, fmt.Errorf("livealgos: symbolMetadata query: %w", err)
 	}
