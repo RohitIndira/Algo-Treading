@@ -256,15 +256,42 @@ func (p *ProtectiveReplay) planEODTrigger(
 		return 0, 0, nil, "could not resolve symbol info (no indira_symbol / exchange_token)"
 	}
 
-	sellableTomorrow, hasHolding := freeQtyByUserSym[strings.ToUpper(pos.Symbol)]
-	if !hasHolding {
-		return 0, 0, info, "position not in broker holdings — likely manually exited, reconcile via detector"
-	}
-	if sellableTomorrow < pos.NetQty {
-		// Subtraction is holdingQty - usedQty - pledgeQty, so a shortfall
-		// here means shares are pledged or locked against margin — those
-		// won't free up overnight either and the AMO would correctly fail.
-		return 0, 0, info, fmt.Sprintf("sellable_after_settle=%d < required=%d — shares pledged or used as margin", sellableTomorrow, pos.NetQty)
+	// SSOT is manthan_orders — ListPositionsNeedingProtection already
+	// computed pos.NetQty as SUM(FILLED BUY qty) − SUM(FILLED SELL qty).
+	// Broker's /v2/holdings is NOT reliable as an AMO gate because it
+	// silently drops any symbol whose shares are locked in an active
+	// broker SL order (verified live 2026-07-17: 6 of our 11 positions
+	// with intraday SLs placed at 15:12 were completely absent from
+	// /v2/holdings, causing Phase A to skip them with "position not in
+	// broker holdings" and leaving them unprotected overnight).
+	//
+	// Two failure modes we're intentionally NOT guarding against here:
+	//
+	//  1. User manually exited via mobile app AND our WSS+REST both
+	//     missed the SELL event — the AMO we place tonight fires at
+	//     09:15 tomorrow, broker rejects it with "no position," and the
+	//     reconciler picks up the drift on its next sweep. No shares are
+	//     mis-sold; no market damage.
+	//
+	//  2. Shares are pledged to broker for margin — same 09:15 rejection
+	//     path. Pledging is a manual user action, rare enough that
+	//     gating every position against it (with an unreliable API) is a
+	//     bad trade-off vs missing SL protection on 6+ positions
+	//     nightly.
+	//
+	// The holdings map is still populated (fetchEODSellableQtyMap runs
+	// upstream) and logged for observability so ops can see divergence
+	// between broker's view and ours — but nothing here BLOCKS on it.
+	if sellableTomorrow, hasHolding := freeQtyByUserSym[strings.ToUpper(pos.Symbol)]; hasHolding && sellableTomorrow < pos.NetQty {
+		// Broker DID return the symbol, but with less sellable qty than
+		// we hold — suggests a real pledge/margin situation. LOG loudly
+		// but don't block; the 09:15 conversion rejection is the correct
+		// backstop and this observability trail lets ops spot the pattern.
+		p.logger.Warn("EOD Phase A: broker holdings shows less sellable qty than our net — AMO may reject at 09:15",
+			zap.String("user_id", pos.UserID),
+			zap.String("symbol", pos.Symbol),
+			zap.Int("net_qty_ours", pos.NetQty),
+			zap.Int("broker_sellable", sellableTomorrow))
 	}
 
 	// Trigger preference, in order:
