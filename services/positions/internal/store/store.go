@@ -336,6 +336,44 @@ func (s *Store) ClearCurrentSLWithEvent(ctx context.Context, positionID uuid.UUI
 // ACTIVE) + audits. Used on manual SELL fills that partially consume a lot.
 // If the caller's math would drive quantity ≤ 0, they must call
 // UpdateExitWithEvent instead — this method does NOT flip status.
+// CorrectEntryQuantityWithEvent downsizes an ACTIVE position's quantity +
+// invested_amount to reflect the broker's actual final fill count. Used by
+// handleBuyFill's partial-fill correction path (see handler.go:handleBuyFill)
+// when a CANCELLED-with-fill event arrives for a position that was opened
+// with the ORDER quantity (because the initial WSS FILLED event had
+// filled_qty=null and the state machine fell back to ev.Quantity).
+//
+// Only downsizes — refuses to grow. If newQuantity >= current quantity the
+// UPDATE is a no-op via the WHERE clause (safer than silently accepting a
+// growth request that could paper over a real bug elsewhere).
+//
+// Emits the passed audit event atomically in the same transaction.
+func (s *Store) CorrectEntryQuantityWithEvent(ctx context.Context, positionID uuid.UUID, newQuantity int, newInvested float64, ev *PositionEvent) error {
+	if newQuantity <= 0 {
+		return fmt.Errorf("CorrectEntryQuantityWithEvent: newQuantity must be > 0, got %d", newQuantity)
+	}
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET quantity        = $1,
+			    invested_amount = $2,
+			    updated_at      = NOW()
+			WHERE position_id = $3
+			  AND status = 'ACTIVE'
+			  AND quantity > $1`,
+			newQuantity, newInvested, positionID)
+		if err != nil {
+			return fmt.Errorf("correct entry qty: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("entry qty correction not applied — position not ACTIVE or quantity <= newQuantity")
+		}
+		ev.PositionID = positionID
+		return insertEventTx(ctx, tx, ev)
+	})
+}
+
 func (s *Store) UpdatePartialExitWithEvent(ctx context.Context, positionID uuid.UUID, deltaQty int, ev *PositionEvent) error {
 	if deltaQty <= 0 {
 		return fmt.Errorf("UpdatePartialExitWithEvent: deltaQty must be > 0, got %d", deltaQty)

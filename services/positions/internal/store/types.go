@@ -46,6 +46,7 @@ const (
 	EventTypeManualSellApplied  = "MANUAL_SELL_APPLIED"
 	EventTypeLiquidation        = "LIQUIDATION"
 	EventTypeReconcilerDriftFix = "RECONCILER_DRIFT_FIX"
+	EventTypePartialFillFix     = "PARTIAL_FILL_FIX" // downsize when broker CANCELLED-with-fill reveals the real fill_qty
 )
 
 // Position is the in-Go shape of a positions row. Field types match the

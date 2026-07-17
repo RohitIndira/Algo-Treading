@@ -211,6 +211,17 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		return fmt.Errorf("BUY idempotency check: %w", err)
 	}
 	if exists {
+		// Partial-fill correction path — see docstring at the top of the
+		// method. If this is a CANCELLED-with-fill (the broker's terminal
+		// "I filled fq shares and cancelled the rest" event), and the
+		// position we already stored has a bigger quantity than the real
+		// broker fill, downsize. Verified 2026-07-17: AADHARHFC + CUB
+		// opened with qty=38 / qty=90 from a premature WSS FILLED (fq=null,
+		// qty=order_qty) and then the follow-up CANCELLED (fq=4) was
+		// silently ignored by the plain "exists → skip" guard below.
+		if ev.EventType == "CANCELLED" && ev.FilledQty > 0 {
+			return h.correctPartialFill(ctx, ev)
+		}
 		h.logger.Debug("state-machine: BUY replay ignored (position row exists)",
 			zap.String("broker_order_id", ev.BrokerOrderID),
 			zap.String("event_id", ev.EventID))
@@ -375,6 +386,80 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 			BrokerOrderID: ev.BrokerOrderID,
 		})
 	}
+	return nil
+}
+
+// correctPartialFill downsizes an already-inserted position to reflect the
+// broker's actual final fill count. Called from handleBuyFill when a
+// CANCELLED-with-fill event arrives for a broker_order_id that already has
+// a position row.
+//
+// Why we need this: the broker's WSS occasionally emits a "FILLED EXECUTED"
+// event with filled_qty=null a few ms before it re-syncs with the exchange
+// and emits the correcting CANCELLED-with-partial-fill. Positions svc's
+// initial FILLED path falls back to ev.Quantity (the order quantity) when
+// filled_qty is 0 — and so opens the position with an inflated size. The
+// authoritative post-facto CANCELLED event carries the real fill_qty; this
+// method uses it to right-size both quantity and invested_amount.
+//
+// Verified on 2026-07-17: AADHARHFC opened with qty=38 from a premature
+// WSS FILLED (fq=null, qty=38), corrected here by the follow-up CANCELLED
+// (fq=4) that would otherwise have been dropped by the "position exists →
+// skip" guard.
+//
+// Semantic guardrails:
+//   - Never grows a position — the store method WHERE-clauses on
+//     `quantity > $newQty` so an accidental widen is a no-op.
+//   - No-op when position already matches (ev.FilledQty == pos.Quantity) —
+//     the CANCELLED event is redundant with the FILLED that came first.
+//   - Emits a PARTIAL_FILL_FIX audit row with the delta + reason so the
+//     correction is traceable in position_events.
+func (h *Handler) correctPartialFill(ctx context.Context, ev *consumer.OrderEvent) error {
+	pos, err := h.store.FindPositionByEntryBrokerOrderID(ctx, ev.BrokerOrderID)
+	if err != nil {
+		return fmt.Errorf("correctPartialFill: find position: %w", err)
+	}
+	if pos == nil {
+		// Race: PositionExistsForEntry said yes but the row has been exited
+		// between then and now. Nothing to correct.
+		return nil
+	}
+	if ev.FilledQty >= pos.Quantity {
+		// Broker's CANCELLED-with-fill matches (or exceeds — shouldn't happen)
+		// the position quantity. No correction needed.
+		h.logger.Debug("state-machine: CANCELLED-with-fill matches position quantity — no correction",
+			zap.String("position_id", pos.PositionID.String()),
+			zap.Int("pos_qty", pos.Quantity),
+			zap.Int("ev_filled_qty", ev.FilledQty))
+		return nil
+	}
+
+	newQty := ev.FilledQty
+	newInvested := pos.EntryPrice * float64(newQty)
+	deltaShares := pos.Quantity - newQty
+
+	audit := &store.PositionEvent{
+		EventType:      store.EventTypePartialFillFix,
+		BrokerOrderID:  ev.BrokerOrderID,
+		SignalID:       pos.SignalID,
+		DeltaQty:       -deltaShares, // negative = shares removed from position
+		FillPrice:      pos.EntryPrice,
+		SourceTopic:    "order.events",
+		SourceEventID:  "pf-" + ev.EventID, // "pf-" prefix so a later replay of the same CANCELLED still dedupes distinctly from the original FILLED audit row
+		RawSourceEvent: ev.RawMessage,
+	}
+
+	if err := h.store.CorrectEntryQuantityWithEvent(ctx, pos.PositionID, newQty, newInvested, audit); err != nil {
+		return fmt.Errorf("correctPartialFill: store update: %w", err)
+	}
+
+	h.logger.Info("state-machine: partial-fill correction applied — position downsized to real broker fill",
+		zap.String("position_id", pos.PositionID.String()),
+		zap.String("symbol", pos.Symbol),
+		zap.String("broker_order_id", ev.BrokerOrderID),
+		zap.Int("old_qty", pos.Quantity),
+		zap.Int("new_qty", newQty),
+		zap.Float64("new_invested", newInvested))
 	return nil
 }
 
