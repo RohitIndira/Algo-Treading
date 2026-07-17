@@ -877,7 +877,13 @@ func (h *EntryHandler) attemptMarketTopup(ctx context.Context, parentOrderID int
 	// finds Manthan lineage when the WSS fill event arrives. Without this
 	// the market fill would be classified as USER_MANUAL by positions svc.
 	topupRow := &ManthanOrder{
-		SignalID:      signal.OrderID, // same signal — this is a topup, not a new decision
+		// Prefix with "mkt-" so signal_id stays UNIQUE — the manthan_orders
+		// _signal_id_key constraint blocks reusing the parent LIMIT's
+		// signal_id. Mirrors the "sl-" prefix pattern already in use for
+		// SL_SELL rows. Positions svc's LookupOrderMeta ignores the prefix
+		// and uses EntrySignalID (parent BUY's plain UUID) for the audit
+		// row lineage — see 2026-07-16 commit dadff44.
+		SignalID:      "mkt-" + signal.OrderID,
 		StrategyID:    signal.StrategyID,
 		UserID:        signal.UserID,
 		Symbol:        signal.Symbol,
