@@ -87,6 +87,18 @@ func (r *Repository) InsertOrder(ctx context.Context, o *ManthanOrder) (int64, e
 	return id, nil
 }
 
+// UpdateOrderParentID sets manthan_orders.parent_order_id for an existing
+// row. Used by the market-topup flow in entry_handler.go: when a LIMIT BUY
+// partially fills, we place a MARKET BUY for the remainder and link the
+// new row to the parent LIMIT so downstream (positions svc via
+// LookupOrderMeta, reconciler, mobile-app aggregation) can trace lineage.
+func (r *Repository) UpdateOrderParentID(ctx context.Context, id, parentID int64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders SET parent_order_id=$1, updated_at=NOW()
+		 WHERE id=$2`, parentID, id)
+	return err
+}
+
 // UpdateOrderPlaced marks an order as placed with broker.
 func (r *Repository) UpdateOrderPlaced(ctx context.Context, id int64, brokerOrderID string) error {
 	now := time.Now()

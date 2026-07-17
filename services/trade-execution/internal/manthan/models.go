@@ -7,6 +7,7 @@ type OrderType string
 
 const (
 	OrderTypeLimitBuy   OrderType = "LIMIT_BUY"
+	OrderTypeMarketBuy  OrderType = "MARKET_BUY" // guaranteed-fill topup emitted by entry_handler.handlePartialFill
 	OrderTypeSLSell     OrderType = "SL_SELL"
 	OrderTypeSLSellAMO  OrderType = "SL_SELL_AMO" // pending AMO+SL row from protective replayer; promoted to SL_SELL after Phase C conversion swap
 	OrderTypeMarketSell OrderType = "MARKET_SELL"
