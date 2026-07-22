@@ -25,8 +25,9 @@ then lost.
 
 This change makes the selection a **first-class, day-wise, persisted record** and
 turns **reactivation** into a repeatable daily flow: each time a user reactivates
-an AMN strategy they must submit a **fresh preview pick**, which is stored and used
-to **re-run the backfill for that day**.
+an AMN strategy they submit a **fresh preview pick**, which is stored and used to
+**re-run the backfill for that day**. A pick is not mandatory — an empty selection
+activates the strategy for live news with no backfill.
 
 ---
 
@@ -38,7 +39,7 @@ to **re-run the backfill for that day**.
 | Selected stocks (ISINs) rode the Kafka event once, never stored | Stored in normalized `amn_activations` + `amn_activation_stocks` tables, one record per strategy per trading day |
 | Only `place`-bucket picks were meaningful | `monitor` (price-watch) picks are persisted too, with their `target_price` |
 | Backfill fired only on `CONFIG_CREATED` | Fires on create **and** reactivation (`CONFIG_ACTIVATED`); never on a plain edit |
-| Reactivation carried no selection | Reactivation **requires** a fresh pick (rejected if empty for AMN strategies) |
+| Reactivation carried no selection | Reactivation accepts a fresh pick and stores it day-wise. An **empty** pick is allowed (no matching news in the AMN window): the strategy still activates for live news, and no backfill runs |
 | Re-running could double-place orders | Cross-run guard skips stocks already ordered today |
 
 ---
@@ -153,9 +154,151 @@ The `StrategyPayload` already carries `process_after_market_news` and
 
 ## Public API contract (for frontend)
 
-**Read strategy** (`GET /api/v1/strategies/{id}`) now returns
+**Read strategy** (`GET /api/v1/strategies/{id}?user_id=...`) returns
 `process_after_market_news` — use it to decide whether to show the AMN preview
-popup on reactivate.
+popup on reactivate — plus `amn_activations`: the day-wise history of what the
+user picked, newest trading day first.
+
+Notes for the frontend:
+- `amn_activations` is populated **only** on this single-strategy read. The list
+  endpoint (`GET /api/v1/users/{user_id}/strategies`) always returns it as `[]`.
+- It is `[]` for non-AMN strategies, and also for AMN strategies created before
+  the day-wise selection tables existed — those only gain history from their next
+  activation. An empty list is normal, not an error.
+- One entry per trading day. `source` is `CREATE` (the day the strategy was made)
+  or `REACTIVATE` (a later day the user re-picked).
+- A day can legitimately have `"stocks": []` — the user reactivated on a day when
+  the AMN window had no matching news, so nothing was picked and no backfill ran.
+- `bucket` is `place` (ordered immediately at live LTP) or `monitor` (price-watch
+  that fires at `target_price`). `target_price` is `0` for `place` picks.
+- Prices/quantities are the **preview-time snapshot** the user saw when choosing.
+  The backfill recomputes live pricing at placement, so these will not always
+  equal the executed order.
+- `nse_code` is an int64 and therefore serialized as a **string** by protojson
+  (`"1333"`), while `quantity` and `strategy_version` are int32 and serialize as
+  numbers. This is protojson's standard behaviour — not a bug.
+
+<details>
+<summary><b>Sample response</b> — <code>GET /api/v1/strategies/ed756418-f4b8-4c35-b328-d48d7424ce25?user_id=ISPL19027</code></summary>
+
+```json
+{
+  "success": true,
+  "strategy": {
+    "strategy_id": "ed756418-f4b8-4c35-b328-d48d7424ce25",
+    "user_id": "ISPL19027",
+    "strategy_name": "Contact 3",
+    "description": "",
+    "active": false,
+    "trading_mode": "LIVE",
+    "conditions": {
+      "match_all_news": false,
+      "impact_score_min": 1,
+      "impact_score_max": 10,
+      "sentiments": ["SENTIMENT_POSITIVE", "SENTIMENT_NEGATIVE", "SENTIMENT_NEUTRAL"],
+      "categories": [],
+      "price_range": null,
+      "market_cap_types": [],
+      "market_cap_range": { "min_mcap": 0, "max_mcap": 0 },
+      "pct_change_range": { "min_pct_change": 0, "max_pct_change": 0 },
+      "exchanges": ["EXCHANGE_NSE"]
+    },
+    "trade_config": {
+      "order_type": "ORDER_TYPE_MARKET",
+      "product_type": "PRODUCT_TYPE_BRACKET",
+      "validity": "DAY",
+      "quantity": 1,
+      "exchange": "EXCHANGE_NSE",
+      "order_side": "ORDER_SIDE_BUY",
+      "stop_loss_pct": 2,
+      "take_profit_pct": 5,
+      "stop_loss_type": "FIXED",
+      "trailing_sl_pct": 0,
+      "limit_price": 0,
+      "take_profit_type": "TAKE_PROFIT_FIXED",
+      "multi_level_sl": [],
+      "multi_level_tp": [],
+      "trade_window_start": "09:15",
+      "trade_window_end": "15:00",
+      "instrument": "",
+      "lot_size": 0,
+      "disclosed_qty": 0,
+      "amo": false,
+      "bracket_order_stop_loss": 0,
+      "bracket_order_target": 0,
+      "max_position_size": 0
+    },
+    "risk_limits": {
+      "strategy_id": "",
+      "max_daily_trades": 10,
+      "max_per_trade_risk": 1000,
+      "max_portfolio_exposure_pct": 25,
+      "max_loss_per_day": 10000,
+      "enable_risk_checks": true,
+      "enable_auto_square_off": false,
+      "auto_square_off_time": "",
+      "position_sizing": "POSITION_SIZING_UNSPECIFIED",
+      "max_amount_per_stock": 1000,
+      "max_trades_per_strategy": 2
+    },
+    "created_at": { "seconds": "1783585884", "nanos": 0 },
+    "updated_at": { "seconds": "1783589740", "nanos": 0 },
+    "version": 2,
+    "process_after_market_news": true,
+    "amn_activations": [
+      {
+        "trading_date": "2026-07-16",
+        "source": "REACTIVATE",
+        "strategy_version": 2,
+        "stocks": [
+          {
+            "isin": "INE040A01034",
+            "symbol": "HDFCBANK",
+            "nse_code": "1333",
+            "bucket": "place",
+            "target_price": 0,
+            "entry_price": 1650.25,
+            "quantity": 3,
+            "invested_amount": 4950.75
+          }
+        ]
+      },
+      {
+        "trading_date": "2026-07-15",
+        "source": "CREATE",
+        "strategy_version": 1,
+        "stocks": [
+          {
+            "isin": "INE467B01029",
+            "symbol": "TCS",
+            "nse_code": "11536",
+            "bucket": "place",
+            "target_price": 0,
+            "entry_price": 3120.5,
+            "quantity": 2,
+            "invested_amount": 6241
+          },
+          {
+            "isin": "INE002A01018",
+            "symbol": "RELIANCE",
+            "nse_code": "2885",
+            "bucket": "monitor",
+            "target_price": 1400,
+            "entry_price": 1425,
+            "quantity": 1,
+            "invested_amount": 1425
+          }
+        ]
+      }
+    ]
+  },
+  "error": null
+}
+```
+</details>
+
+A non-AMN strategy (or an AMN strategy with no recorded history) returns the same
+shape with `"process_after_market_news": false` and `"amn_activations": []`.
 
 **Create** (`POST /api/v1/strategies`):
 ```json
@@ -173,10 +316,12 @@ popup on reactivate.
 
 **Reactivate** (`POST /api/v1/strategies/{id}/activate`):
 ```json
-{ "user_id": "IS...", "amn_selection": [ /* same shape; REQUIRED for AMN strategies */ ] }
+{ "user_id": "IS...", "amn_selection": [ /* same shape as create */ ] }
 ```
-An AMN strategy activated with an empty selection returns
-`400 "AMN strategy requires a stock selection to reactivate"`.
+An empty `amn_selection` is **accepted**, not rejected: when the AMN window has no
+matching news there is nothing to pick, and the strategy must still be able to go
+live for news going forward. The activation is recorded for the day with no stocks
+and no backfill runs.
 
 ---
 

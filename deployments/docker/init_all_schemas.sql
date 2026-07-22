@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS strategies (
     active         BOOLEAN      DEFAULT false,
     trading_mode   VARCHAR(20)  DEFAULT 'PAPER' CHECK (trading_mode IN ('PAPER', 'LIVE')),
     version        INTEGER      DEFAULT 1,
+
+    -- True when this strategy runs the After-Market-News backfill. Drives the
+    -- reactivation AMN-preview requirement and the reactivation backfill trigger.
+    process_after_market_news BOOLEAN NOT NULL DEFAULT false,
+
     created_at     TIMESTAMPTZ  DEFAULT NOW(),
     updated_at     TIMESTAMPTZ  DEFAULT NOW(),
     deleted_at     TIMESTAMPTZ  DEFAULT NULL
@@ -124,6 +129,53 @@ CREATE TABLE IF NOT EXISTS execution_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_execution_outbox_processed ON execution_outbox(processed) WHERE processed = false;
 
+-- AMN activations (parent: one row per strategy per activation-day)
+CREATE TABLE IF NOT EXISTS amn_activations (
+    activation_id    UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id      UUID         NOT NULL REFERENCES strategies(strategy_id) ON DELETE CASCADE,
+    user_id          VARCHAR(255) NOT NULL,
+    trading_date     DATE         NOT NULL,
+    source           VARCHAR(16)  NOT NULL DEFAULT 'CREATE' CHECK (source IN ('CREATE', 'REACTIVATE')),
+    strategy_version INTEGER      NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ  DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ  DEFAULT NOW()
+);
+
+-- One activation record per strategy per trading day. Re-activating the same day
+-- upserts this row (and replaces its child stocks) rather than duplicating.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_amn_activations_strategy_date
+    ON amn_activations(strategy_id, trading_date);
+
+CREATE INDEX IF NOT EXISTS idx_amn_activations_strategy_date
+    ON amn_activations(strategy_id, trading_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_amn_activations_user
+    ON amn_activations(user_id);
+
+-- AMN activation stocks (child: one row per user-selected stock)
+CREATE TABLE IF NOT EXISTS amn_activation_stocks (
+    id              BIGSERIAL   PRIMARY KEY,
+    activation_id   UUID        NOT NULL REFERENCES amn_activations(activation_id) ON DELETE CASCADE,
+    isin            VARCHAR(20) NOT NULL,
+    symbol          VARCHAR(64) NOT NULL DEFAULT '',
+    nse_code        BIGINT      NOT NULL DEFAULT 0,
+    -- bucket: 'place'   → order fired immediately at live LTP.
+    --         'monitor' → price-watch selection at target_price.
+    bucket          VARCHAR(8)  NOT NULL DEFAULT 'place' CHECK (bucket IN ('place', 'monitor')),
+    target_price    DECIMAL     NOT NULL DEFAULT 0,   -- monitor trigger level (0 for 'place')
+    entry_price     DECIMAL     NOT NULL DEFAULT 0,   -- preview-time expected fill, tick-rounded
+    quantity        INTEGER     NOT NULL DEFAULT 0,   -- preview-time qty from per-stock budget
+    invested_amount DECIMAL     NOT NULL DEFAULT 0,   -- entry_price * quantity snapshot
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_amn_activation_stocks_activation
+    ON amn_activation_stocks(activation_id);
+
+-- The same stock appears once per activation record.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_amn_activation_stocks_activation_isin
+    ON amn_activation_stocks(activation_id, isin);
+
 -- ============================================================================
 -- TRADE EXECUTION SERVICE
 -- ============================================================================
@@ -210,10 +262,15 @@ CREATE TABLE IF NOT EXISTS orders (
     trading_mode      VARCHAR(10)  DEFAULT 'LIVE',
     paper_exit_price  DECIMAL(15,2),
     paper_pnl         DECIMAL(15,2),
+    paper_exit_time   TIMESTAMPTZ,
 
     -- Live trading exit
     live_exit_price   DECIMAL(15,2),
     live_pnl          DECIMAL(15,2),
+    live_exit_time    TIMESTAMPTZ,
+    -- Why a live position was closed: STOP_LOSS | TAKE_PROFIT | FORCE_EXIT |
+    -- SQUARE_OFF | MANUAL. rejection_reason stays for genuine broker rejections.
+    live_exit_reason  TEXT,
 
     -- Price context at order creation
     current_pct_change DECIMAL(10,4) DEFAULT 0,
@@ -278,10 +335,12 @@ CREATE INDEX IF NOT EXISTS idx_orders_paper_trade  ON orders(user_id, is_paper_t
 CREATE INDEX IF NOT EXISTS idx_orders_paper_symbol ON orders(symbol, is_paper_trade, status)          WHERE is_paper_trade = true;
 CREATE INDEX IF NOT EXISTS idx_orders_paper_closed ON orders(user_id, is_paper_trade, paper_exit_price) WHERE is_paper_trade = true AND paper_exit_price IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_paper_open   ON orders(user_id, is_paper_trade, status)        WHERE is_paper_trade = true AND status = 'FILLED';
+CREATE INDEX IF NOT EXISTS idx_orders_paper_exit_time ON orders(user_id, paper_exit_time) WHERE is_paper_trade = true AND paper_exit_time IS NOT NULL;
 
 -- Live trading indexes
 CREATE INDEX IF NOT EXISTS idx_orders_live_closed  ON orders(user_id, is_paper_trade, live_exit_price) WHERE is_paper_trade = false AND live_exit_price IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_live_open    ON orders(user_id, is_paper_trade, status)         WHERE is_paper_trade = false AND status IN ('FILLED', 'PARTIALLY_FILLED');
+CREATE INDEX IF NOT EXISTS idx_orders_live_exit_time ON orders(user_id, live_exit_time) WHERE is_paper_trade = false AND live_exit_time IS NOT NULL;
 
 -- OCO indexes
 CREATE INDEX IF NOT EXISTS idx_orders_oco_group    ON orders(oco_group_id)          WHERE oco_group_id IS NOT NULL;

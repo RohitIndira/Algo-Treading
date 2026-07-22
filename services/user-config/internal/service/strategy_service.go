@@ -139,7 +139,26 @@ func (s *StrategyService) CreateStrategy(ctx context.Context, req *models.Create
 
 // GetStrategy retrieves a strategy by ID
 func (s *StrategyService) GetStrategy(ctx context.Context, strategyID uuid.UUID, userID string) (*models.Strategy, error) {
-	return s.repo.GetByID(ctx, strategyID, userID)
+	strategy, err := s.repo.GetByID(ctx, strategyID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Attach the day-wise AMN selection history for the detail view. Only AMN
+	// strategies have activations, so skip the query entirely for the rest.
+	//
+	// A history failure must not fail the whole strategy read: the core strategy
+	// is already loaded and is what the page needs. Log and return it without the
+	// history rather than 500-ing the detail view.
+	if strategy.ProcessAfterMarketNews {
+		activations, err := s.repo.GetAMNActivations(ctx, strategyID)
+		if err != nil {
+			log.Printf("[StrategyService] GetStrategy strategy_id=%s: AMN activation history unavailable: %v", strategyID, err)
+		} else {
+			strategy.AMNActivations = activations
+		}
+	}
+	return strategy, nil
 }
 
 // ListUserStrategies lists all strategies for a user

@@ -98,7 +98,6 @@ func main() {
 	authConfig := middleware.AuthConfig{
 		VerifyURL: cfg.Auth.VerifyURL,
 		Timeout:   cfg.Auth.Timeout,
-		Bypass:    cfg.Auth.Bypass,
 	}
 
 	log.Printf("Auth middleware configured: verify URL=%s timeout=%s", authConfig.VerifyURL, authConfig.Timeout)

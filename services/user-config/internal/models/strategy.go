@@ -46,6 +46,15 @@ type Strategy struct {
 	// populated from those tables when building the outbox event so the rules-engine
 	// backfill places orders only for these stocks. Empty → all affordable matches.
 	AMNSelectedStocks []string `db:"-" json:"amn_selected_stocks,omitempty"`
+
+	// AMNActivations is the strategy's day-wise AMN selection history, newest day
+	// first, for the UI's strategy-detail view. Not a strategies column (db:"-").
+	//
+	// Populated ONLY by StrategyService.GetStrategy (the single-strategy detail
+	// read). The list endpoints and the outbox worker's GetByID deliberately leave
+	// it nil: filling it per row would add a query per strategy (N+1), and it would
+	// bloat every CONFIG_* Kafka event with history the rules-engine never reads.
+	AMNActivations []AMNActivationDetail `db:"-" json:"amn_activations,omitempty"`
 }
 
 // AMNSelectedStock is one stock the user picked in the AMN preview, with the
@@ -89,6 +98,21 @@ type AMNActivationStock struct {
 	Quantity       int32     `db:"quantity" json:"quantity"`
 	InvestedAmount float64   `db:"invested_amount" json:"invested_amount"`
 	CreatedAt      time.Time `db:"created_at" json:"created_at"`
+}
+
+// AMNActivationDetail is one trading day's AMN selection: the activation record
+// joined with the stocks the user picked that day. It is the read-side shape the
+// strategy-detail API returns, so a user can see what was selected on each day.
+type AMNActivationDetail struct {
+	// TradingDate is the IST trading day this selection belongs to ("2006-01-02").
+	// A plain date string, not a timestamp — the UI groups by it verbatim.
+	TradingDate string `json:"trading_date"`
+	// Source is how the selection was made: "CREATE" or "REACTIVATE".
+	Source string `json:"source"`
+	// StrategyVersion is the strategy version current when the pick was submitted.
+	StrategyVersion int32 `json:"strategy_version"`
+	// Stocks are the picks for this day, in the order the user submitted them.
+	Stocks []AMNSelectedStock `json:"stocks"`
 }
 
 // AMN activation source constants.

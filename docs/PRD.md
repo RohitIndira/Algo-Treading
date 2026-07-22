@@ -38,7 +38,7 @@ A **news-driven algorithmic trading platform** for Indian equities (NSE/BSE). Tr
 ### 4.1 Authentication & session
 | ID | Requirement | Status |
 |---|---|---|
-| FR-A1 | All `/api/v1/*` calls carry a bearer token verified by the gateway auth middleware. | ⚠️ Bypassed by default when `AUTH_VERIFY_URL` host = `trade.indiratrade.com` (§8) |
+| FR-A1 | All `/api/v1/*` calls carry a bearer token verified by the gateway auth middleware. | ✅ Always verified — no bypass. Auth service unreachable → 503 (fail closed) |
 | FR-A2 | Requests are rate-limited (100 req/s per IP, burst 200) and size-limited (1 MB). | ✅ |
 | FR-A3 | Every request gets a correlation ID propagated through gRPC and logs. | ✅ |
 
@@ -107,7 +107,7 @@ A **news-driven algorithmic trading platform** for Indian equities (NSE/BSE). Tr
 | NFR-2 | **Scalability:** stateless consumers scale by adding instances to the same Kafka group (rules-engine & trade-execution run 2 instances). | ✅ |
 | NFR-3 | **Availability/recovery:** panic isolation, graceful shutdown, offset-based catch-up, startup recovery. | ✅ |
 | NFR-4 | **Observability:** Prometheus `/metrics`, `/healthz` + `/readyz`, structured logs + correlation IDs. | ✅ |
-| NFR-5 | **Security:** bearer auth (see §8), AES creds, rate/size limits, security headers, optional gRPC TLS. | ⚠️ auth bypass default |
+| NFR-5 | **Security:** bearer auth (always verified), AES creds, rate/size limits, security headers, optional gRPC TLS. | ✅ |
 | NFR-6 | **Data integrity:** ACID Postgres, transactional outbox, idempotency keys, DB constraints. | ✅ |
 | NFR-7 | **Compliance:** market-hours + holiday gate, LTP-based limit pricing, velocity protection. | ✅ |
 
@@ -128,11 +128,10 @@ A **news-driven algorithmic trading platform** for Indian equities (NSE/BSE). Tr
 ## 8. Known limitations
 
 1. **Pre-trade risk is not enforced** (FR-R1). `risk-management` is excluded from `deploy-pm2.sh`; rules-engine runs `riskClient=nil` → auto-approve (fail-open). trade-execution never calls risk-management.
-2. **Auth verify bypassed by default** (FR-A1) when the configured verify URL host is `trade.indiratrade.com`.
-3. **Match feed has no producer** (FR-F3): `RedisCache.Publish` is defined but never called.
-4. **`trade-executions` / `order-updates` have no in-repo consumer** (published for downstream/audit only).
-5. **RabbitMQ configured but unused**; Kafka is the live bus.
-6. Older doc drift: the detailed BRD and some KT/guide docs describe risk/gRPC/topology that the code does not match — see [`SERVICE_DEPENDENCIES.md`](SERVICE_DEPENDENCIES.md) and [`ARCHITECTURE.md`](ARCHITECTURE.md) for corrections.
+2. **Match feed has no producer** (FR-F3): `RedisCache.Publish` is defined but never called.
+3. **`trade-executions` / `order-updates` have no in-repo consumer** (published for downstream/audit only).
+4. **RabbitMQ configured but unused**; Kafka is the live bus.
+5. Older doc drift: the detailed BRD and some KT/guide docs describe risk/gRPC/topology that the code does not match — see [`SERVICE_DEPENDENCIES.md`](SERVICE_DEPENDENCIES.md) and [`ARCHITECTURE.md`](ARCHITECTURE.md) for corrections.
 
 ## 9. Acceptance criteria (samples)
 

@@ -273,6 +273,24 @@ message Strategy {
   // True when this is an AMN strategy. The UI reads this to require a fresh AMN
   // preview + selection on reactivation.
   bool process_after_market_news = 14;
+
+  // amn_activations is the strategy's day-wise AMN selection history, newest
+  // trading day first, so the UI can show what the user picked on each day.
+  //
+  // Populated only by GetStrategy (the single-strategy detail read). The list
+  // RPCs leave it empty to avoid a per-strategy history query.
+  repeated AMNActivation amn_activations = 15;
+}
+
+// AMNActivation is one trading day's AMN selection for a strategy: the day, how
+// the pick was made, and the stocks chosen. A day with an empty stocks list is a
+// real, meaningful record — the user reactivated on a day when the AMN window had
+// no matching news, so nothing was picked and no backfill ran.
+message AMNActivation {
+  string trading_date = 1;              // IST trading day, "YYYY-MM-DD"
+  string source = 2;                    // "CREATE" | "REACTIVATE"
+  int32  strategy_version = 3;          // strategy version when the pick was made
+  repeated AMNSelectedStock stocks = 4; // in the order the user submitted them
 }
 
 // AMNSelectedStock is one stock the user picked in the AMN preview. It carries

@@ -37,7 +37,6 @@ type CORSConfig struct {
 type AuthConfig struct {
 	VerifyURL string
 	Timeout   time.Duration
-	Bypass    bool // skip external verify call (UAT / dev)
 }
 
 type LoggingConfig struct {
@@ -71,7 +70,6 @@ func Load() (*Config, error) {
 		Auth: AuthConfig{
 			VerifyURL: getEnv("AUTH_VERIFY_URL", "https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token"),
 			Timeout:   authTimeout,
-			Bypass:    getEnv("AUTH_BYPASS", "false") == "true" || strings.Contains(getEnv("AUTH_VERIFY_URL", ""), "trade.indiratrade.com"),
 		},
 		Logging: LoggingConfig{
 			Level: getEnv("LOG_LEVEL", "INFO"),

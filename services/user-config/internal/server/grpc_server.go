@@ -261,8 +261,10 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 
 	// ActivateStrategyRequest has no IndiraAuth field in the proto.
 	// Credential refresh is handled by the gateway calling UpdateUserCredentials separately.
-	// amn_selection carries the fresh AMN preview pick for reactivation (required for
-	// AMN strategies; the repository rejects an empty selection there).
+	// amn_selection carries the fresh AMN preview pick for reactivation. An empty
+	// selection is allowed: when the AMN window has no matching news there is nothing
+	// to pick, and the strategy must still be able to go live for news going forward.
+	// An empty pick simply means no reactivation backfill runs.
 	strategy, err := s.service.ActivateStrategy(ctx, strategyID, req.UserId, nil, protoAMNSelectionToModel(req.AmnSelection))
 	if err != nil {
 		return &pb.ActivateStrategyResponse{
@@ -738,8 +740,41 @@ func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
 	if model.RiskLimits != nil {
 		strategy.RiskLimits = modelRiskLimitsToProto(model.RiskLimits)
 	}
+	strategy.AmnActivations = modelAMNActivationsToProto(model.AMNActivations)
 
 	return strategy
+}
+
+// modelAMNActivationsToProto maps the day-wise AMN selection history to proto.
+// Only GetStrategy populates the model field, so every other RPC passes nil here
+// and the response simply carries an empty list.
+func modelAMNActivationsToProto(acts []models.AMNActivationDetail) []*pb.AMNActivation {
+	if len(acts) == 0 {
+		return nil
+	}
+	out := make([]*pb.AMNActivation, 0, len(acts))
+	for _, a := range acts {
+		stocks := make([]*pb.AMNSelectedStock, 0, len(a.Stocks))
+		for _, s := range a.Stocks {
+			stocks = append(stocks, &pb.AMNSelectedStock{
+				Isin:           s.ISIN,
+				Symbol:         s.Symbol,
+				NseCode:        s.NSECode,
+				Bucket:         s.Bucket,
+				TargetPrice:    s.TargetPrice,
+				EntryPrice:     s.EntryPrice,
+				Quantity:       s.Quantity,
+				InvestedAmount: s.InvestedAmount,
+			})
+		}
+		out = append(out, &pb.AMNActivation{
+			TradingDate:     a.TradingDate,
+			Source:          a.Source,
+			StrategyVersion: a.StrategyVersion,
+			Stocks:          stocks,
+		})
+	}
+	return out
 }
 
 // Helper functions for sentiments and exchanges (short codes)

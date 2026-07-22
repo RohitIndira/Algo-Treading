@@ -549,7 +549,7 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		}
 
 		rl := &models.RiskLimits{}
-		if err2 := tx.GetContext(ctx, rl, `SELECT ` + riskLimitsColumns + ` FROM risk_limits WHERE strategy_id = $1`, strategy.StrategyID); err2 == nil {
+		if err2 := tx.GetContext(ctx, rl, `SELECT `+riskLimitsColumns+` FROM risk_limits WHERE strategy_id = $1`, strategy.StrategyID); err2 == nil {
 			outboxStrategy.RiskLimits = rl
 		}
 	}
@@ -1106,4 +1106,71 @@ func (r *StrategyRepository) GetLatestActivationISINs(ctx context.Context, strat
 		return nil, fmt.Errorf("failed to fetch latest AMN activation ISINs: %w", err)
 	}
 	return isins, nil
+}
+
+// GetAMNActivations returns a strategy's full day-wise AMN selection history,
+// newest trading day first, with each day's stocks in submission order.
+//
+// One LEFT JOIN rather than a query per day: an activation day with no stocks
+// (an empty reactivation pick — allowed when the AMN window had no matching news)
+// still yields its day row, with an empty Stocks list. Returns an empty slice,
+// never nil, so the caller can attach it unconditionally.
+func (r *StrategyRepository) GetAMNActivations(ctx context.Context, strategyID uuid.UUID) ([]models.AMNActivationDetail, error) {
+	type row struct {
+		TradingDate     time.Time       `db:"trading_date"`
+		Source          string          `db:"source"`
+		StrategyVersion int32           `db:"strategy_version"`
+		ISIN            sql.NullString  `db:"isin"`
+		Symbol          sql.NullString  `db:"symbol"`
+		NSECode         sql.NullInt64   `db:"nse_code"`
+		Bucket          sql.NullString  `db:"bucket"`
+		TargetPrice     sql.NullFloat64 `db:"target_price"`
+		EntryPrice      sql.NullFloat64 `db:"entry_price"`
+		Quantity        sql.NullInt32   `db:"quantity"`
+		InvestedAmount  sql.NullFloat64 `db:"invested_amount"`
+	}
+
+	query := `
+		SELECT a.trading_date, a.source, a.strategy_version,
+		       s.isin, s.symbol, s.nse_code, s.bucket,
+		       s.target_price, s.entry_price, s.quantity, s.invested_amount
+		FROM   amn_activations a
+		LEFT JOIN amn_activation_stocks s ON s.activation_id = a.activation_id
+		WHERE  a.strategy_id = $1
+		ORDER BY a.trading_date DESC, s.id ASC`
+
+	var rows []row
+	if err := r.db.SelectContext(ctx, &rows, query, strategyID); err != nil {
+		return nil, fmt.Errorf("failed to fetch AMN activations: %w", err)
+	}
+
+	// Rows arrive grouped by day (ORDER BY trading_date DESC), so fold them into
+	// one entry per day, preserving both day order and per-day stock order.
+	out := []models.AMNActivationDetail{}
+	for _, rw := range rows {
+		date := rw.TradingDate.Format("2006-01-02")
+		if len(out) == 0 || out[len(out)-1].TradingDate != date {
+			out = append(out, models.AMNActivationDetail{
+				TradingDate:     date,
+				Source:          rw.Source,
+				StrategyVersion: rw.StrategyVersion,
+				Stocks:          []models.AMNSelectedStock{},
+			})
+		}
+		if !rw.ISIN.Valid {
+			continue // LEFT JOIN miss: activation day with no stocks
+		}
+		cur := &out[len(out)-1]
+		cur.Stocks = append(cur.Stocks, models.AMNSelectedStock{
+			ISIN:           rw.ISIN.String,
+			Symbol:         rw.Symbol.String,
+			NSECode:        rw.NSECode.Int64,
+			Bucket:         rw.Bucket.String,
+			TargetPrice:    rw.TargetPrice.Float64,
+			EntryPrice:     rw.EntryPrice.Float64,
+			Quantity:       rw.Quantity.Int32,
+			InvestedAmount: rw.InvestedAmount.Float64,
+		})
+	}
+	return out, nil
 }

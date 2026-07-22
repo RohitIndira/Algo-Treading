@@ -56,7 +56,7 @@ Legend of arrow types used throughout: **Kafka** (async event), **gRPC** (sync R
 
 | System | What it is |
 |---|---|
-| **Auth Service** | `AUTH_VERIFY_URL` (default `trade.indiratrade.com/auth/verify/token`) — bearer-token verification. **Bypassed by default** (see §4). |
+| **Auth Service** | `AUTH_VERIFY_URL` (default `livemiddleware.indiratrade.com/auth-services/api/auth/verify/token`) — bearer-token verification. **Always called; there is no bypass.** |
 | **Indira Broker REST API** | Order place/cancel/modify, position book, order & trade book. |
 | **Indira Order-Status WS** | Per-user stream of fills / rejections / status changes. |
 | **Indira Market Data WS** | `enhanced-stream` binary feed of LTP ticks; drives SL/TP price monitoring and the tickstore. |
@@ -79,7 +79,7 @@ Each arrow in the diagram is listed below with its **protocol**, **why it exists
 
 | → To | Protocol | Why it exists | What depends on it |
 |---|---|---|---|
-| **Auth Service** | HTTPS | The `Auth` middleware verifies the bearer token on `/api/v1/*` (health & OPTIONS exempt). | Request authentication — **when not bypassed** (it is bypassed by default, see §4). |
+| **Auth Service** | HTTPS | The `Auth` middleware verifies the bearer token on `/api/v1/*` (health & OPTIONS exempt). | Request authentication — verified on **every** request; unreachable auth service → 503 (fail closed). |
 | **user-config** | **gRPC** `:50051` | The gateway's *only* gRPC client. Powers strategy CRUD (`/api/v1/strategies*`). | All strategy create/read/update/delete/activate endpoints. |
 | **rules-engine** | HTTP proxy → `:8082` | `POST /api/v1/amn-preview` is proxied to the rules-engine preview server so the gateway stays MongoDB-free. | The AMN backfill preview screen only. Trading is unaffected if it's down. |
 | **trade-execution** | HTTP proxy (`TRADE_EXECUTION_PAPER_URL`) | The gateway forwards `/paper-trades/*`, `/live-orders/*`, `/auto-square-off/*`, `/dashboard-stats` to trade-execution's HTTP/paper server. | Paper & live order **REST** endpoints (lists, force-exit, config). |
@@ -192,7 +192,7 @@ The gateway subscribes, but no producer publishes yet, so this feed does nothing
 These are the non-obvious, code-verified facts that a reader (or the diagram) must know:
 
 - **⚠ Risk management is bypassed.** `risk-management` is **excluded from the PM2 deployment** (`deploy-pm2.sh`), and if the rules-engine can't reach it, it sets `riskClient = nil` and **auto-approves every order (fail-open)** — see `services/rules-engine/cmd/main.go`. So in the current deployment pre-trade risk is effectively **not enforced**. **trade-execution never calls risk-management at all** (risk is only ever a rules-engine concern).
-- **⚠ Auth verify is bypassed by default.** The gateway sets `Bypass = true` when `AUTH_VERIFY_URL` contains `trade.indiratrade.com` (the code default) — see `api/gateway/config/config.go`. Confirm the deployed `.env.live` to know the real posture.
+- **Auth verify is always enforced.** Every `/api/v1/*` request (health & OPTIONS exempt) is verified against `AUTH_VERIFY_URL` — there is no bypass flag. `userId`/`appId` are client-supplied headers, so they are never trusted unverified. If the auth service cannot be reached the gateway fails **closed** with a 503 rather than letting the request through.
 - **Match feed has no producer.** `rules-engine/internal/cache/redis_cache.go` defines `Publish`, but it is **never called** anywhere in the repo. The gateway's `/ws/matches` subscription therefore has nothing to relay yet.
 - **Redis `market:` price keys are external.** No service in this repo writes `market:{exch}:{token}`; they're populated by the external market-data feed. rules-engine and trade-execution only **read** them.
 - **data-ingestion runs no server.** It's a change-stream watcher; the `:50052` in docker-compose is unused.
