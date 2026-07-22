@@ -49,35 +49,25 @@ type ConfigEvent struct {
 // StrategyPayload is the full strategy configuration.
 // Values are published exactly as stored in the User Config DB model (no enum conversion here).
 type StrategyPayload struct {
-	StrategyID   string              `json:"strategy_id"`
-	UserID       string              `json:"user_id"`
-	StrategyName string              `json:"strategy_name"`
-	StrategyType string              `json:"strategy_type,omitempty"`
-	Active       bool                `json:"active"`
-	TradingMode  string              `json:"trading_mode"`
-	Conditions   *ConditionsPayload  `json:"conditions,omitempty"`
-	TradeConfig  TradeConfigPayload  `json:"trade_config"`
-	RiskLimits   *RiskLimitsPayload  `json:"risk_limits,omitempty"`
-	Version      uint64              `json:"version"`
-	CreatedAt    int64               `json:"created_at,omitempty"` // UnixNano
-	UpdatedAt    int64               `json:"updated_at,omitempty"` // UnixNano
+	StrategyID   string             `json:"strategy_id"`
+	UserID       string             `json:"user_id"`
+	StrategyName string             `json:"strategy_name"`
+	StrategyType string             `json:"strategy_type,omitempty"`
+	Active       bool               `json:"active"`
+	TradingMode  string             `json:"trading_mode"`
+	Conditions   *ConditionsPayload `json:"conditions,omitempty"`
+	TradeConfig  TradeConfigPayload `json:"trade_config"`
+	// RiskLimits   *RiskLimitsPayload  `json:"risk_limits,omitempty"`
+	Version   uint64 `json:"version"`
+	CreatedAt int64  `json:"created_at,omitempty"` // UnixNano
+	UpdatedAt int64  `json:"updated_at,omitempty"` // UnixNano
 }
 
+// ConditionsPayload is a placeholder — the 13 news-specific fields were
+// dropped 2026-07-20 (MANTHAN is the only live strategy type; it uses none).
+// Kept in the envelope for compat; only carries the row's created_at now.
 type ConditionsPayload struct {
-	MatchAllNews      bool     `json:"match_all_news"`
-	ImpactScoreMin    int32    `json:"impact_score_min"`
-	ImpactScoreMax    int32    `json:"impact_score_max"`
-	Sentiments        []string `json:"sentiments"`
-	Categories        []string `json:"categories"`
-	StockCodes        []int64  `json:"stock_codes"`
-	MarketCapTypes    []string `json:"market_cap_types"`
-	MinMarketCap      float64  `json:"min_market_cap"`
-	MaxMarketCap      float64  `json:"max_market_cap"`
-	MinPriceChangePct float64  `json:"min_price_change_pct"`
-	MaxPriceChangePct float64  `json:"max_price_change_pct"`
-	MinVolume         int64    `json:"min_volume"`
-	Exchanges         []string `json:"exchanges"`
-	CreatedAt         int64    `json:"created_at"` // UnixNano
+	CreatedAt int64 `json:"created_at,omitempty"` // UnixNano
 }
 
 type TradeConfigPayload struct {
@@ -98,13 +88,13 @@ type TradeConfigPayload struct {
 	CreatedAt      int64   `json:"created_at,omitempty"` // UnixNano
 }
 
-type RiskLimitsPayload struct {
-	MaxDailyTrades          int32   `json:"max_daily_trades"`
-	MaxPerTradeRisk         float64 `json:"max_per_trade_risk"`
-	MaxPortfolioExposurePct float64 `json:"max_portfolio_exposure_pct"`
-	MaxLossPerDay           float64 `json:"max_loss_per_day"`
-	EnableRiskChecks        bool    `json:"enable_risk_checks"`
-	EnableAutoSquareOff     bool    `json:"enable_auto_square_off"`
-	AutoSquareOffTime       string  `json:"auto_square_off_time"`
-	CreatedAt               int64   `json:"created_at"` // UnixNano
-}
+// type RiskLimitsPayload struct {
+// 	MaxDailyTrades          int32   `json:"max_daily_trades"`
+// 	MaxPerTradeRisk         float64 `json:"max_per_trade_risk"`
+// 	MaxPortfolioExposurePct float64 `json:"max_portfolio_exposure_pct"`
+// 	MaxLossPerDay           float64 `json:"max_loss_per_day"`
+// 	EnableRiskChecks        bool    `json:"enable_risk_checks"`
+// 	EnableAutoSquareOff     bool    `json:"enable_auto_square_off"`
+// 	AutoSquareOffTime       string  `json:"auto_square_off_time"`
+// 	CreatedAt               int64   `json:"created_at"` // UnixNano
+// }

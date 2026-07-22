@@ -82,7 +82,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	// Insert strategy
 	strategyType := req.StrategyType
 	if strategyType == "" {
-		strategyType = models.StrategyTypeNews
+		strategyType = models.StrategyTypeManthan
 	}
 
 	strategy := &models.Strategy{
@@ -109,25 +109,16 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		return nil, fmt.Errorf("failed to insert strategy: %w", err)
 	}
 
-	// Insert conditions
+	// Insert conditions — placeholder row only (news-specific fields dropped 2026-07-20)
 	if req.Conditions != nil {
 		conditionID := uuid.New()
 		condQuery := `
-			INSERT INTO strategy_conditions (
-				condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max,
-				sentiments, news_categories, stock_codes, min_market_cap, max_market_cap,
-				market_cap_types, min_price_change_pct, max_price_change_pct, min_volume, exchanges
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			INSERT INTO strategy_conditions (condition_id, strategy_id)
+			VALUES ($1, $2)
 			RETURNING created_at`
 
-		err = tx.QueryRowxContext(ctx, condQuery,
-			conditionID, strategy.StrategyID, req.Conditions.MatchAllNews,
-			req.Conditions.ImpactScoreMin, req.Conditions.ImpactScoreMax,
-			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
-			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap, req.Conditions.MarketCapTypes,
-			req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
-			req.Conditions.MinVolume, req.Conditions.Exchanges,
-		).Scan(&req.Conditions.CreatedAt)
+		err = tx.QueryRowxContext(ctx, condQuery, conditionID, strategy.StrategyID).
+			Scan(&req.Conditions.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert conditions: %w", err)
 		}
@@ -354,28 +345,9 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		return nil, fmt.Errorf("failed to update strategy: %w", err)
 	}
 
-	// Update conditions if provided
-	if req.Conditions != nil {
-		condQuery := `
-			UPDATE strategy_conditions
-			SET match_all_news = $1, impact_score_min = $2, impact_score_max = $3,
-			    sentiments = $4, news_categories = $5, stock_codes = $6,
-			    min_market_cap = $7, max_market_cap = $8, market_cap_types = $9,
-			    min_price_change_pct = $10, max_price_change_pct = $11,
-			    min_volume = $12, exchanges = $13
-			WHERE strategy_id = $14`
-
-		_, err = tx.ExecContext(ctx, condQuery,
-			req.Conditions.MatchAllNews, req.Conditions.ImpactScoreMin, req.Conditions.ImpactScoreMax,
-			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
-			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap, req.Conditions.MarketCapTypes,
-			req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
-			req.Conditions.MinVolume, req.Conditions.Exchanges, req.StrategyID,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to update conditions: %w", err)
-		}
-	}
+	// Update conditions — no-op after 2026-07-20 (only placeholder row remains,
+	// nothing to modify). Kept the req.Conditions guard so callers can still
+	// pass a non-nil Conditions without breaking anything.
 
 	// Update trade config if provided
 	if req.TradeConfig != nil {

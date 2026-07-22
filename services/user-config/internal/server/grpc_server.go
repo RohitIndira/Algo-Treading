@@ -13,7 +13,6 @@ import (
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
 )
 
 // UserConfigServer implements the gRPC UserConfigService
@@ -532,73 +531,19 @@ func (s *UserConfigServer) GetUserCredentials(ctx context.Context, req *pb.GetUs
 
 // Helper functions to convert between proto and model types
 
+// protoConditionsToModel constructs an empty StrategyCondition placeholder.
+// The 13 news-specific fields were removed 2026-07-20 because MANTHAN doesn't
+// use them; incoming proto fields are silently ignored.
 func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondition {
 	if proto == nil {
 		return nil
 	}
-
-	sentiments := make(pq.StringArray, len(proto.Sentiments))
-	for i, s := range proto.Sentiments {
-		sentiments[i] = sentimentToString(s)
-	}
-
-	exchanges := make(pq.StringArray, len(proto.Exchanges))
-	for i, e := range proto.Exchanges {
-		exchanges[i] = exchangeToString(e)
-	}
-
-	stockCodes := make(pq.Int64Array, len(proto.StockCodes))
-	for i, code := range proto.StockCodes {
-		stockCodes[i] = code
-	}
-
-	marketCapTypes := make(pq.StringArray, len(proto.MarketCapTypes))
-	copy(marketCapTypes, proto.MarketCapTypes)
-
-	cond := &models.StrategyCondition{
-		MatchAllNews:   proto.MatchAllNews,
-		ImpactScoreMin: proto.ImpactScoreMin,
-		ImpactScoreMax: proto.ImpactScoreMax,
-		Sentiments:     sentiments,
-		Categories:     pq.StringArray(proto.Categories),
-		StockCodes:     stockCodes,
-		MinVolume:      &proto.VolumeThreshold, // Mapped from VolumeThreshold
-		Exchanges:      exchanges,
-		MarketCapTypes: marketCapTypes,
-	}
-
-	// PriceRange fields not present in DB/Model yet.
-	/*
-		if proto.PriceRange != nil {
-			cond.PriceRangeMin = &proto.PriceRange.MinPrice
-			cond.PriceRangeMax = &proto.PriceRange.MaxPrice
-		}
-	*/
-
-	if proto.MarketCapRange != nil {
-		cond.MinMarketCap = &proto.MarketCapRange.MinMcap
-		cond.MaxMarketCap = &proto.MarketCapRange.MaxMcap
-	}
-
-	if proto.PctChangeRange != nil {
-		cond.MinPriceChangePct = &proto.PctChangeRange.MinPctChange
-		cond.MaxPriceChangePct = &proto.PctChangeRange.MaxPctChange
-	}
-
-	return cond
+	return &models.StrategyCondition{}
 }
 
 func modelStrategyTypeToProto(t models.StrategyType) pb.StrategyType {
-	switch t {
-	case models.StrategyType52WBreakout:
-		return pb.StrategyType_WEEK52_BREAKOUT
-	case models.StrategyTypeManthan:
-		return pb.StrategyType_MANTHAN
-	case models.StrategyTypeNews:
-		return pb.StrategyType_NEWS
-	default:
-		return pb.StrategyType_NEWS
-	}
+	// Only MANTHAN survives after 2026-07-20 cleanup; everything else maps to it.
+	return pb.StrategyType_MANTHAN
 }
 
 func positionSizingModeToString(m pb.PositionSizingMode) string {
@@ -613,16 +558,8 @@ func positionSizingModeToString(m pb.PositionSizingMode) string {
 }
 
 func protoStrategyTypeToModel(t pb.StrategyType) models.StrategyType {
-	switch t {
-	case pb.StrategyType_WEEK52_BREAKOUT:
-		return models.StrategyType52WBreakout
-	case pb.StrategyType_MANTHAN:
-		return models.StrategyTypeManthan
-	case pb.StrategyType_NEWS:
-		return models.StrategyTypeNews
-	default:
-		return models.StrategyTypeNews
-	}
+	// Only MANTHAN survives after 2026-07-20 cleanup; everything else maps to it.
+	return models.StrategyTypeManthan
 }
 
 func protoTradingModeToModel(mode pb.TradingMode) models.TradingMode {
@@ -861,59 +798,13 @@ func stringToSentiment(s string) common.Sentiment {
 	}
 }
 
+// modelConditionsToProto returns an empty StrategyConditions envelope.
+// News-specific fields dropped 2026-07-20 (MANTHAN doesn't use them).
 func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditions {
 	if model == nil {
 		return nil
 	}
-
-	sentiments := make([]common.Sentiment, len(model.Sentiments))
-	for i, s := range model.Sentiments {
-		sentiments[i] = stringToSentiment(s)
-	}
-
-	exchanges := make([]common.Exchange, len(model.Exchanges))
-	for i, e := range model.Exchanges {
-		exchanges[i] = stringToExchange(e)
-	}
-
-	stockCodes := make([]int64, len(model.StockCodes))
-	for i, code := range model.StockCodes {
-		stockCodes[i] = code
-	}
-
-	marketCapTypes := make([]string, len(model.MarketCapTypes))
-	copy(marketCapTypes, model.MarketCapTypes)
-
-	cond := &pb.StrategyConditions{
-		MatchAllNews:   model.MatchAllNews,
-		ImpactScoreMin: model.ImpactScoreMin,
-		ImpactScoreMax: model.ImpactScoreMax,
-		Sentiments:     sentiments,
-		Categories:     []string(model.Categories),
-		StockCodes:     stockCodes,
-		Exchanges:      exchanges,
-		MarketCapTypes: marketCapTypes,
-	}
-
-	if model.MinMarketCap != nil && model.MaxMarketCap != nil {
-		cond.MarketCapRange = &pb.StrategyConditions_MarketCapRange{
-			MinMcap: *model.MinMarketCap,
-			MaxMcap: *model.MaxMarketCap,
-		}
-	}
-
-	if model.MinPriceChangePct != nil && model.MaxPriceChangePct != nil {
-		cond.PctChangeRange = &pb.StrategyConditions_PctChangeRange{
-			MinPctChange: *model.MinPriceChangePct,
-			MaxPctChange: *model.MaxPriceChangePct,
-		}
-	}
-
-	if model.MinVolume != nil {
-		cond.VolumeThreshold = *model.MinVolume
-	}
-
-	return cond
+	return &pb.StrategyConditions{}
 }
 
 func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
