@@ -51,6 +51,16 @@ func NewTradeSignalRepository(dbHost, dbPort, dbUser, dbPassword, dbName, dbSSLM
 	}, nil
 }
 
+// DB exposes the underlying connection pool so sibling components that write to
+// the same database (e.g. the signal-decisions recorder) can reuse it instead of
+// opening a second pool against the same server. Returns nil on a nil receiver.
+func (r *TradeSignalRepository) DB() *sql.DB {
+	if r == nil {
+		return nil
+	}
+	return r.db
+}
+
 // SaveTradeSignal saves a trade signal to the database
 func (r *TradeSignalRepository) SaveTradeSignal(ctx context.Context, orderReq *models.OrderRequest) error {
 	query := `

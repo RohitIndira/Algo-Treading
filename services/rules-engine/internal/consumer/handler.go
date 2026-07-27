@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/decisions"
 	"github.com/RohitIndira/Algo-Treading/pkg/tradecap"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/engine"
@@ -27,12 +28,23 @@ import (
 // ── Pre-trade compliance caps (firm-wide SEBI algo safety ceilings) ──────────
 // Hard limits applied to EVERY order before it is published, regardless of the
 // per-strategy config. Overridable via env for ops tuning without a redeploy.
+//
+// Each ceiling can be switched OFF by setting its env var to 0, which skips that
+// check entirely. That is a deliberate config toggle rather than a code change,
+// so re-enabling a guard later is an env edit and a restart — nothing to rebuild
+// and no risk of a "temporary" bypass being forgotten in the source. Leaving a
+// var unset keeps its built-in default, so an existing deployment is unaffected.
+//
+// Disabling these removes the last backstop between a bad quantity/price
+// calculation and the broker: per-strategy max_amount_per_stock still caps
+// amount-sized orders, but a strategy using a fixed quantity has no ceiling at
+// all. Whatever is switched off is logged loudly at startup for that reason.
 var (
-	// maxOrderQuantity is the absolute share-count ceiling per order.
-	maxOrderQuantity = envInt32("MAX_ORDER_QUANTITY", 50000)
+	// maxOrderQuantity is the absolute share-count ceiling per order. 0 = no limit.
+	maxOrderQuantity = envLimitInt32("MAX_ORDER_QUANTITY", 50000)
 	// maxOrderValueINR is the absolute order-value (quantity × price) ceiling,
-	// in rupees. Default ₹2,00,00,000 (2 crore).
-	maxOrderValueINR = envFloat("MAX_ORDER_VALUE", 20000000)
+	// in rupees. Default ₹2,00,00,000 (2 crore). 0 = no limit.
+	maxOrderValueINR = envLimitFloat("MAX_ORDER_VALUE", 20000000)
 
 	// velocityPct is the market-price-protection threshold: if a stock's
 	// peak-to-trough move within velocityWindow ≥ this %, the order is rejected.
@@ -42,7 +54,7 @@ var (
 
 	// maxExposureLimitINR is the per-user total submitted-order value ceiling.
 	// 0 = disabled. Set MAX_EXPOSURE_LIMIT env var (e.g. 10000000 = ₹1 crore).
-	maxExposureLimitINR = envFloat("MAX_EXPOSURE_LIMIT", 0)
+	maxExposureLimitINR = envLimitFloat("MAX_EXPOSURE_LIMIT", 0)
 
 	// bannedTokens is the set of NSE token codes that must never be traded.
 	// Populated once at startup from BANNED_TOKENS env var (comma-separated).
@@ -67,6 +79,43 @@ func envFloat(key string, def float64) float64 {
 	return def
 }
 
+// envLimitInt32 reads a compliance ceiling that operators may switch off.
+//
+// It differs from envInt32 in one way that matters: an explicit "0" is honoured
+// and means NO LIMIT, whereas envInt32 treats 0 as invalid and silently restores
+// the default. Without this distinction there is no way to disable a ceiling
+// from config at all.
+//
+//	unset / empty → def (built-in ceiling stays in force)
+//	"0"           → 0   (check skipped entirely)
+//	> 0           → that value
+//	malformed / negative → def, never 0 — a typo must not disable a safety check.
+func envLimitInt32(key string, def int32) int32 {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
+	if err != nil || n < 0 {
+		return def
+	}
+	return int32(n)
+}
+
+// envLimitFloat is envLimitInt32 for rupee-valued ceilings. Same rules: explicit
+// 0 disables, malformed input falls back to the default rather than disabling.
+func envLimitFloat(key string, def float64) float64 {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil || f < 0 {
+		return def
+	}
+	return f
+}
+
 func loadBannedTokens() map[int64]struct{} {
 	m := make(map[int64]struct{})
 	for _, s := range strings.Split(os.Getenv("BANNED_TOKENS"), ",") {
@@ -88,14 +137,48 @@ func loadBannedTokens() map[int64]struct{} {
 // MAX_ORDER_QUANTITY / MAX_ORDER_VALUE / MAX_EXPOSURE_LIMIT / VELOCITY_* /
 // BANNED_TOKENS are silently ignored and the compiled defaults win.
 func LoadComplianceLimitsFromEnv() {
-	maxOrderQuantity = envInt32("MAX_ORDER_QUANTITY", 50000)
-	maxOrderValueINR = envFloat("MAX_ORDER_VALUE", 20000000)
+	maxOrderQuantity = envLimitInt32("MAX_ORDER_QUANTITY", 50000)
+	maxOrderValueINR = envLimitFloat("MAX_ORDER_VALUE", 20000000)
 	velocityPct = envFloat("VELOCITY_PCT", 1.0)
 	velocityWindowMs = envInt32("VELOCITY_WINDOW_MS", 1000)
-	maxExposureLimitINR = envFloat("MAX_EXPOSURE_LIMIT", 0)
+	maxExposureLimitINR = envLimitFloat("MAX_EXPOSURE_LIMIT", 0)
 	bannedTokens = loadBannedTokens()
-	log.Printf("compliance limits loaded: MAX_ORDER_QUANTITY=%d MAX_ORDER_VALUE=%.0f MAX_EXPOSURE_LIMIT=%.0f VELOCITY_PCT=%.2f VELOCITY_WINDOW_MS=%d BANNED_TOKENS=%d",
-		maxOrderQuantity, maxOrderValueINR, maxExposureLimitINR, velocityPct, velocityWindowMs, len(bannedTokens))
+
+	log.Printf("compliance limits loaded: MAX_ORDER_QUANTITY=%s MAX_ORDER_VALUE=%s MAX_EXPOSURE_LIMIT=%s VELOCITY_PCT=%.2f VELOCITY_WINDOW_MS=%d BANNED_TOKENS=%d",
+		limitLabelInt(maxOrderQuantity), limitLabelFloat(maxOrderValueINR),
+		limitLabelFloat(maxExposureLimitINR), velocityPct, velocityWindowMs, len(bannedTokens))
+
+	// A disabled ceiling is a deliberate operational choice, but it must never be
+	// a quiet one — this is the last check between a bad order and the broker.
+	var off []string
+	if maxOrderQuantity <= 0 {
+		off = append(off, "MAX_ORDER_QUANTITY (per-order share count)")
+	}
+	if maxOrderValueINR <= 0 {
+		off = append(off, "MAX_ORDER_VALUE (per-order rupee value)")
+	}
+	if maxExposureLimitINR <= 0 {
+		off = append(off, "MAX_EXPOSURE_LIMIT (per-user cumulative exposure)")
+	}
+	if len(off) > 0 {
+		log.Printf("WARNING: pre-trade compliance ceilings DISABLED (set the env var > 0 to re-enable): %s",
+			strings.Join(off, ", "))
+	}
+}
+
+// limitLabelInt renders a ceiling for logs, making "off" unmistakable.
+func limitLabelInt(v int32) string {
+	if v <= 0 {
+		return "DISABLED"
+	}
+	return strconv.FormatInt(int64(v), 10)
+}
+
+func limitLabelFloat(v float64) string {
+	if v <= 0 {
+		return "DISABLED"
+	}
+	return strconv.FormatFloat(v, 'f', 0, 64)
 }
 
 // auditOrderReceived emits one structured audit record for every order request
@@ -140,6 +223,9 @@ func (h *Handler) rejectForCompliance(o *models.OrderRequest, ltp float64, reaso
 		zap.String("order_type", o.OrderType),
 		zap.String("product_type", o.ProductType),
 	)
+	h.recordDecision(o, decisions.OutcomeRejected, decisions.StageCompliance,
+		reason, complianceDetail(reason, limit, actual),
+		&limit, &actual, ltp)
 }
 
 // rejectForDPR logs ORDER_REJECTED for DPR band breaches and includes both the
@@ -165,6 +251,23 @@ func (h *Handler) rejectForDPR(o *models.OrderRequest, ltp float64, reason strin
 		zap.String("order_type", o.OrderType),
 		zap.String("product_type", o.ProductType),
 	)
+	h.recordDecision(o, decisions.OutcomeRejected, decisions.StageCompliance,
+		reason,
+		fmt.Sprintf("order price %.2f is outside the DPR band %.2f–%.2f", actual, dprLower, dprUpper),
+		&limit, &actual, ltp)
+}
+
+// complianceDetail renders a compliance breach as a sentence for the admin UI.
+// Kept generic so a new reason code needs no change here.
+func complianceDetail(reason string, limit, actual float64) string {
+	switch reason {
+	case decisions.ReasonBannedToken:
+		return fmt.Sprintf("token %.0f is on the ban list", actual)
+	case decisions.ReasonVelocity:
+		return fmt.Sprintf("stock moved %.2f%% within the protection window (limit %.2f%%)", actual, limit)
+	default:
+		return fmt.Sprintf("%s: limit %.2f, actual %.2f", reason, limit, actual)
+	}
 }
 
 // Handler handles market events
@@ -192,6 +295,97 @@ type Handler struct {
 	// watches reserve later, in trade-execution, when their target triggers.
 	// nil-safe: when Redis is unavailable the cap is not enforced (fail-open).
 	capReserver *tradecap.Reserver
+	// decisions persists the terminal outcome of every order the handler builds —
+	// published, or rejected with the reason. The engine records match-stage
+	// rejections; everything downstream of a match is recorded here.
+	// nil-safe: when unset (feature disabled) recording is a no-op.
+	decisions *decisions.Recorder
+}
+
+// SetDecisionRecorder wires the audit-trail writer. Pass nil to disable.
+// Call before Start().
+func (h *Handler) SetDecisionRecorder(r *decisions.Recorder) {
+	h.decisions = r
+}
+
+// recordDecision writes one terminal audit row for an order the handler built.
+// Everything the row needs already lives on the OrderRequest, so call sites do
+// not have to thread the event and strategy through.
+//
+// limit/actual are optional; pass nil when the reason has no numeric comparison.
+func (h *Handler) recordDecision(
+	o *models.OrderRequest,
+	outcome decisions.Outcome,
+	stage decisions.Stage,
+	reasonCode, reasonDetail string,
+	limit, actual *float64,
+	ltp float64,
+) {
+	if h.decisions == nil || o == nil {
+		return
+	}
+	rec := &decisions.Record{
+		EventID:      o.EventID,
+		UserID:       o.UserID,
+		StrategyID:   o.StrategyID,
+		StrategyName: o.StrategyName,
+		Symbol:       o.Symbol,
+		StockCode:    o.StockCode,
+		Exchange:     o.Exchange,
+		Outcome:      outcome,
+		Stage:        stage,
+		ReasonCode:   reasonCode,
+		ReasonDetail: reasonDetail,
+		LimitValue:   limit,
+		ActualValue:  actual,
+		MatchScore:   decisions.F(o.MatchScore),
+		ImpactScore:  decisions.I(int(o.ImpactScore)),
+		Sentiment:    o.Sentiment,
+		NewsCategory: o.NewsCategory,
+		PctChange:    decisions.F(o.CurrentPctChange),
+		LTP:          decisions.F(ltp),
+	}
+	// Only a published order has a meaningful order id; a rejected one was never
+	// sent anywhere, and storing its provisional id would imply otherwise.
+	if outcome == decisions.OutcomeMatched {
+		rec.OrderID = o.OrderID
+	}
+	h.decisions.Record(rec)
+}
+
+// recordEventDecision writes an audit row for a rejection that happens before an
+// OrderRequest exists (the duplicate-stock and trade-window gates run on the raw
+// event). Same row shape as recordDecision, sourced from the event and strategy.
+func (h *Handler) recordEventDecision(
+	event *models.MarketEvent,
+	strategy *models.Strategy,
+	stage decisions.Stage,
+	reasonCode, reasonDetail string,
+	limit, actual *float64,
+) {
+	if h.decisions == nil || event == nil || strategy == nil {
+		return
+	}
+	h.decisions.Record(&decisions.Record{
+		EventID:      event.EventID,
+		UserID:       strategy.UserID,
+		StrategyID:   strategy.StrategyID,
+		StrategyName: strategy.StrategyName,
+		Symbol:       event.StockData.Symbol,
+		StockCode:    event.StockData.StockCode,
+		Exchange:     event.StockData.Exchange,
+		Outcome:      decisions.OutcomeRejected,
+		Stage:        stage,
+		ReasonCode:   reasonCode,
+		ReasonDetail: reasonDetail,
+		LimitValue:   limit,
+		ActualValue:  actual,
+		ImpactScore:  decisions.I(int(event.Analysis.ImpactScore)),
+		Sentiment:    event.Analysis.Sentiment,
+		NewsCategory: event.NewsData.Category,
+		PctChange:    decisions.F(event.MarketData.PctChange),
+		LTP:          decisions.F(event.MarketData.LastTradedPrice),
+	})
 }
 
 // SetTickHistory wires the tick-store reader used by the market-price-protection
@@ -523,6 +717,10 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			zap.String("strategy_id", strategy.StrategyID),
 			zap.String("symbol", event.StockData.Symbol),
 			zap.Int64("stock_code", event.StockData.StockCode))
+		h.recordEventDecision(event, strategy, decisions.StageCap,
+			decisions.ReasonDuplicateStock,
+			fmt.Sprintf("%s was already entered by this strategy today", event.StockData.Symbol),
+			nil, nil)
 		return nil
 	}
 
@@ -791,6 +989,10 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 				zap.String("strategy_id", strategy.StrategyID),
 				zap.String("symbol", event.StockData.Symbol),
 				zap.Float64("sizing_price", sizingPrice))
+			h.recordDecision(orderReq, decisions.OutcomeRejected, decisions.StageSizing,
+				decisions.ReasonInvalidSizingPrice,
+				fmt.Sprintf("sizing price resolved to %.2f — cannot size an order", sizingPrice),
+				nil, decisions.F(sizingPrice), ltp)
 			return nil
 		}
 		effectiveBudget := maxAmt * 0.98
@@ -803,6 +1005,11 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 				zap.Float64("max_amount_per_stock", maxAmt),
 				zap.Float64("effective_budget_98pct", effectiveBudget),
 				zap.Float64("sizing_price", sizingPrice))
+			h.recordDecision(orderReq, decisions.OutcomeRejected, decisions.StageSizing,
+				decisions.ReasonBudgetTooSmall,
+				fmt.Sprintf("1 share costs %.2f but the 98%% budget is only %.2f (max_amount_per_stock %.2f)",
+					sizingPrice, effectiveBudget, maxAmt),
+				decisions.F(effectiveBudget), decisions.F(sizingPrice), ltp)
 			return nil
 		}
 		orderReq.Quantity = computedQty
@@ -837,14 +1044,15 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 
 	// (1) Ban list — reject tokens that are prohibited from trading.
 	if _, banned := bannedTokens[orderReq.StockCode]; banned {
-		h.rejectForCompliance(orderReq, ltp, "BANNED_TOKEN",
+		h.rejectForCompliance(orderReq, ltp, decisions.ReasonBannedToken,
 			float64(orderReq.StockCode), float64(orderReq.StockCode))
 		return nil
 	}
 
 	// (2) Quantity ceiling — never place an order above the share-count cap.
-	if orderReq.Quantity > maxOrderQuantity {
-		h.rejectForCompliance(orderReq, ltp, "QTY_LIMIT_EXCEEDED",
+	// Skipped entirely when MAX_ORDER_QUANTITY=0 (see the var block).
+	if maxOrderQuantity > 0 && orderReq.Quantity > maxOrderQuantity {
+		h.rejectForCompliance(orderReq, ltp, decisions.ReasonQtyLimit,
 			float64(maxOrderQuantity), float64(orderReq.Quantity))
 		return nil
 	}
@@ -857,9 +1065,12 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	if effPrice <= 0 {
 		effPrice = ltp
 	}
+	// orderValue is still computed when the ceiling is off — the exposure wallet
+	// and the post-publish exposure update both consume it.
 	orderValue := float64(orderReq.Quantity) * effPrice
-	if orderValue > maxOrderValueINR {
-		h.rejectForCompliance(orderReq, ltp, "ORDER_VALUE_LIMIT_EXCEEDED",
+	// Skipped entirely when MAX_ORDER_VALUE=0 (see the var block).
+	if maxOrderValueINR > 0 && orderValue > maxOrderValueINR {
+		h.rejectForCompliance(orderReq, ltp, decisions.ReasonOrderValueLimit,
 			maxOrderValueINR, orderValue)
 		return nil
 	}
@@ -871,7 +1082,7 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		exposureKey := fmt.Sprintf("exposure:%s", orderReq.UserID)
 		currentExposure, _ := h.redisCache.GetFloat(ctx, exposureKey) // 0 if key absent
 		if currentExposure+orderValue > maxExposureLimitINR {
-			h.rejectForCompliance(orderReq, ltp, "EXPOSURE_LIMIT_EXCEEDED",
+			h.rejectForCompliance(orderReq, ltp, decisions.ReasonExposureLimit,
 				maxExposureLimitINR, currentExposure+orderValue)
 			return nil
 		}
@@ -881,12 +1092,12 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	// daily price range. Both bounds are logged for full audit context.
 	if orderReq.Price > 0 {
 		if md.DPRLower > 0 && orderReq.Price < md.DPRLower {
-			h.rejectForDPR(orderReq, ltp, "DPR_LOWER_BREACH",
+			h.rejectForDPR(orderReq, ltp, decisions.ReasonDPRLower,
 				md.DPRLower, orderReq.Price, md.DPRLower, md.DPRUpper)
 			return nil
 		}
 		if md.DPRUpper > 0 && orderReq.Price > md.DPRUpper {
-			h.rejectForDPR(orderReq, ltp, "DPR_UPPER_BREACH",
+			h.rejectForDPR(orderReq, ltp, decisions.ReasonDPRUpper,
 				md.DPRUpper, orderReq.Price, md.DPRLower, md.DPRUpper)
 			return nil
 		}
@@ -899,13 +1110,14 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 	if h.tickHistory != nil {
 		window := time.Duration(velocityWindowMs) * time.Millisecond
 		if movePct, ok := h.tickHistory.MaxMovePct(ctx, md.Exchange, md.Token, window); ok && movePct >= velocityPct {
-			h.rejectForCompliance(orderReq, ltp, "VELOCITY_BREACH", velocityPct, movePct)
+			h.rejectForCompliance(orderReq, ltp, decisions.ReasonVelocity, velocityPct, movePct)
 			return nil
 		}
 	}
 
 	// ── Risk management check ───────────────────────────────────────────
 	// TODO: TEMPORARILY BYPASSED FOR TESTING - REMOVE THIS BEFORE PRODUCTION
+	riskBypassed := false
 	if false && h.riskClient != nil {
 		riskResp, err := h.riskClient.CheckPreTradeRisk(ctx, orderReq, strategy)
 		if err != nil {
@@ -924,12 +1136,18 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 					zap.String("user_id", orderReq.UserID),
 					zap.Float64("risk_score", riskResp.RiskScore),
 					zap.Int("violations", len(riskResp.Violations)))
+				violations := make([]string, 0, len(riskResp.Violations))
 				for _, violation := range riskResp.Violations {
 					h.logger.Debug("Risk violation",
 						zap.String("order_id", orderReq.OrderID),
 						zap.String("type", violation.Type.String()),
 						zap.String("message", violation.Message))
+					violations = append(violations, violation.Message)
 				}
+				h.recordDecision(orderReq, decisions.OutcomeRejected, decisions.StageRisk,
+					decisions.ReasonRiskRejected,
+					"risk management rejected the order: "+strings.Join(violations, "; "),
+					nil, decisions.F(riskResp.RiskScore), ltp)
 				return nil
 			}
 		}
@@ -938,6 +1156,10 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 			zap.String("order_id", orderReq.OrderID))
 		orderReq.RiskApproved = true
 		orderReq.RiskScore = 0.0
+		// Deliberately recorded as an attribute of the published order rather than
+		// only a log line: a bypass that shows up on every row in the admin UI is
+		// much harder to leave switched on by accident.
+		riskBypassed = true
 	}
 
 	// ── Per-strategy daily trade cap (immediate trades only) ─────────────────
@@ -969,6 +1191,11 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 				zap.String("strategy_id", strategy.StrategyID),
 				zap.String("user_id", strategy.UserID),
 				zap.Int32("max_trades_per_strategy", strategy.RiskLimits.MaxTradesPerStrategy))
+			h.recordDecision(orderReq, decisions.OutcomeRejected, decisions.StageCap,
+				decisions.ReasonStrategyCapReached,
+				fmt.Sprintf("strategy already used all %d of its daily trades",
+					strategy.RiskLimits.MaxTradesPerStrategy),
+				decisions.F(float64(strategy.RiskLimits.MaxTradesPerStrategy)), nil, ltp)
 			return nil
 		}
 		reservedSlot = true
@@ -1061,6 +1288,16 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		zap.Float64("take_profit_pct", tpPct),
 		zap.Float64("tick_size", tickSize),
 		zap.Float64("match_score", orderReq.MatchScore))
+
+	// Terminal MATCHED row. Carries the order id so the admin timeline can join
+	// straight through to trade_signals, orders, fills and the position.
+	reasonCode, reasonDetail := "", "order published"
+	if riskBypassed {
+		reasonCode = decisions.ReasonRiskBypassed
+		reasonDetail = "order published — RISK CHECKS ARE BYPASSED IN CODE"
+	}
+	h.recordDecision(orderReq, decisions.OutcomeMatched, decisions.StageRisk,
+		reasonCode, reasonDetail, nil, nil, ltp)
 
 	return nil
 }

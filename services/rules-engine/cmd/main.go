@@ -14,6 +14,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/decisions"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/config"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/backfill"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
@@ -214,6 +215,25 @@ func main() {
 	eng := engine.New(store, engine.Config{Workers: cfg.Performance.WorkerCount}, logger)
 	eng.Start(ctx)
 	handler := consumer.NewHandler(eng, kafkaPub, signalRepo, riskClient, redisCache, stats, logger, marketHours, cfg.MarketHours.EnforceHours, holidayChecker)
+
+	// ── Signal-decision audit trail ─────────────────────────────────────────
+	// Persists why every strategy did or did not act on each news event, so the
+	// admin panel can answer "why didn't my strategy fire?" from data instead of
+	// from masked log lines. Flag-gated because it is the only component on this
+	// path that writes to Postgres during evaluation; the writer itself is
+	// asynchronous and drops rather than blocking, so enabling it cannot add
+	// latency to order placement. Off unless SIGNAL_DECISIONS_ENABLED=true.
+	if os.Getenv("SIGNAL_DECISIONS_ENABLED") == "true" {
+		if db := signalRepo.DB(); db != nil {
+			decisionRecorder := decisions.New(db, logger)
+			eng.SetDecisionRecorder(decisionRecorder)
+			handler.SetDecisionRecorder(decisionRecorder)
+			defer decisionRecorder.Close()
+			logger.Info("✓ Signal-decision audit trail enabled")
+		} else {
+			logger.Warn("SIGNAL_DECISIONS_ENABLED=true but no database connection — audit trail disabled")
+		}
+	}
 
 	// Market-price-protection (velocity) check reads the recent tick stream that
 	// trade-execution's tickstore writes to Redis DB=TickstoreDB. Non-fatal: if

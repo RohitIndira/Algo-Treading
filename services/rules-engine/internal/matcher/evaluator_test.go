@@ -101,6 +101,46 @@ func TestMatcher_WrongSentiment_Drops(t *testing.T) {
 	}
 }
 
+// Regression: the news feed labels caps as "Small Cap"/"Mid Cap"/"Large Cap"
+// while strategy conditions store "SMALL"/"MID"/"LARGE". A plain EqualFold never
+// matched, so any strategy with a market_cap_types filter silently placed zero
+// orders. The evaluator must canonicalize both forms before comparing.
+func TestMatcher_MarketCap_SuffixedFeedForm_Matches(t *testing.T) {
+	cases := []struct {
+		eventMCap string
+		filter    []string
+	}{
+		{"Small Cap", []string{"SMALL"}},
+		{"Mid Cap", []string{"MID", "SMALL"}},
+		{"Large Cap", []string{"LARGE"}},
+		{"small cap", []string{"Small"}}, // case-insensitive on both sides
+	}
+	for _, tc := range cases {
+		e := baseEvent()
+		e.StockData.MCapType = tc.eventMCap
+		s := baseStrategy()
+		s.Conditions.MarketCapTypes = tc.filter
+
+		res := NewEvaluator(zap.NewNop()).Evaluate(e, s)
+		if !res.IsFullMatch() {
+			t.Fatalf("event mcap %q vs filter %v: expected full match, failed: %v",
+				tc.eventMCap, tc.filter, res.FailedConditions)
+		}
+	}
+}
+
+func TestMatcher_MarketCap_WrongBucket_Drops(t *testing.T) {
+	e := baseEvent()
+	e.StockData.MCapType = "Large Cap"
+	s := baseStrategy()
+	s.Conditions.MarketCapTypes = []string{"MID", "SMALL"}
+
+	res := NewEvaluator(zap.NewNop()).Evaluate(e, s)
+	if res.IsFullMatch() {
+		t.Fatalf("expected drop: Large Cap event should not match {MID,SMALL} filter")
+	}
+}
+
 // NOTE: Tests for per-stock-code and volume-threshold filtering were removed:
 // models.Conditions has no Stocks/VolumeThreshold field and Evaluator.Evaluate
 // performs no such check (it evaluates impact, sentiment, category, market cap,

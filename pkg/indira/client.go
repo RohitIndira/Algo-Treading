@@ -19,9 +19,14 @@ const (
 
 	// Environment variable names
 	EnvIndiraBaseURL = "INDIRA_BASE_URL"
+	EnvIndiraAPIKey  = "INDIRA_API_KEY"
 
 	// Fallback base URL if environment variable is not set
 	FallbackBaseURL = "https://localhost:8000"
+
+	// FallbackAPIKey is the shared api-key sent for every client/user if
+	// INDIRA_API_KEY is not set in the environment.
+	FallbackAPIKey = "b2b_ak_e25c9c6726a905dc1027a8f7bde41559"
 )
 
 // getDefaultBaseURL returns the base URL from environment or uses fallback
@@ -32,10 +37,19 @@ func getDefaultBaseURL() string {
 	return FallbackBaseURL
 }
 
+// getDefaultAPIKey returns the Indira api-key from environment or uses fallback
+func getDefaultAPIKey() string {
+	if key := os.Getenv(EnvIndiraAPIKey); key != "" {
+		return key
+	}
+	return FallbackAPIKey
+}
+
 // Client represents an Indira Securities API client
 // This client is stateless and thread-safe for concurrent use by multiple users
 type Client struct {
 	baseURL    string
+	apiKey     string
 	httpClient *http.Client
 }
 
@@ -53,6 +67,7 @@ type AuthContext struct {
 // Config holds client configuration
 type Config struct {
 	BaseURL string
+	APIKey  string
 	Timeout time.Duration
 }
 
@@ -61,6 +76,9 @@ type Config struct {
 func NewClient(config Config) *Client {
 	if config.BaseURL == "" {
 		config.BaseURL = getDefaultBaseURL()
+	}
+	if config.APIKey == "" {
+		config.APIKey = getDefaultAPIKey()
 	}
 
 	timeout := config.Timeout
@@ -80,6 +98,7 @@ func NewClient(config Config) *Client {
 
 	return &Client{
 		baseURL: config.BaseURL,
+		apiKey:  config.APIKey,
 		httpClient: &http.Client{
 			Transport: t,
 			Timeout:   timeout,
@@ -144,6 +163,8 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 
 	// Set standard headers
 	req.Header.Set("Content-Type", "application/json")
+	// Shared api-key sent on every request for every client (same value for all users)
+	req.Header.Set("api-key", c.apiKey)
 
 	// Set per-request authentication headers (from frontend)
 	if auth.UserId != "" {

@@ -69,6 +69,48 @@ func TestWrapHidesIDAndForcesName(t *testing.T) {
 	}
 }
 
+// Masking OFF is the normal production configuration (STRATEGY_NAME_LOG_OVERRIDE
+// empty), and it is what makes logs traceable: real strategy_id and real
+// strategy_name must both survive untouched, including on child loggers built
+// with .With(). Without this, an operator grepping for a strategy would silently
+// get the placeholder instead — which is exactly what happened while masking was
+// left switched on.
+func TestWrapDisabledPreservesRealIdentity(t *testing.T) {
+	core, logs := observer.New(zapcore.InfoLevel)
+	base := zap.New(core)
+
+	lg := Wrap(base, "") // disabled
+	if lg != base {
+		t.Fatalf("empty name must return the very same logger, got a wrapper")
+	}
+
+	lg.Info("match",
+		zap.String("strategy_id", "2d0bc80a-e9a8-4106-9fbd-217530b5dc66"),
+		zap.String("strategy_name", "July 22 Fin"))
+
+	// Child loggers must not start masking either.
+	lg.With(zap.String("strategy_id", "REAL-ID")).
+		Info("child", zap.String("strategy_name", "Real Name"))
+
+	entries := logs.All()
+	if len(entries) != 2 {
+		t.Fatalf("want 2 entries, got %d", len(entries))
+	}
+
+	m0 := entries[0].ContextMap()
+	if m0["strategy_id"] != "2d0bc80a-e9a8-4106-9fbd-217530b5dc66" {
+		t.Errorf("strategy_id = %v, want the real id", m0["strategy_id"])
+	}
+	if m0["strategy_name"] != "July 22 Fin" {
+		t.Errorf("strategy_name = %v, want the real name", m0["strategy_name"])
+	}
+
+	m1 := entries[1].ContextMap()
+	if m1["strategy_id"] != "REAL-ID" || m1["strategy_name"] != "Real Name" {
+		t.Errorf("child logger masked identity: id=%v name=%v", m1["strategy_id"], m1["strategy_name"])
+	}
+}
+
 func countKey(e observer.LoggedEntry, key string) int {
 	n := 0
 	for _, f := range e.Context {

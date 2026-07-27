@@ -3,10 +3,12 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/decisions"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/matcher"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/models"
@@ -20,15 +22,26 @@ import (
 //   - Strict deterministic strategy evaluation order per event
 //   - Fail-fast ordering semantics within an event (stop early on fatal errors)
 type Engine struct {
-	store      *configstore.ConfigStore
-	evaluator  *matcher.Evaluator
-	scorer     *matcher.Scorer
-	workers    int
-	logger     *zap.Logger
-	dedup      *Deduper
-	pool       *WorkerPool
-	closeOnce  sync.Once
+	store     *configstore.ConfigStore
+	evaluator *matcher.Evaluator
+	scorer    *matcher.Scorer
+	workers   int
+	logger    *zap.Logger
+	dedup     *Deduper
+	pool      *WorkerPool
+	closeOnce sync.Once
+	// decisions persists why each strategy did or did not match an event. The
+	// engine is the only place that sees non-matching strategies at all, so
+	// without this a "no match" leaves no durable trace. nil-safe: when unset
+	// (feature disabled) recording is a no-op.
+	decisions  *decisions.Recorder
 	closedChan chan struct{}
+}
+
+// SetDecisionRecorder wires the audit-trail writer for match-stage decisions.
+// Pass nil to disable. Call before Start().
+func (e *Engine) SetDecisionRecorder(r *decisions.Recorder) {
+	e.decisions = r
 }
 
 type Config struct {
@@ -159,6 +172,11 @@ func (e *Engine) evaluateOne(ctx context.Context, event *models.MarketEvent, str
 	if err := strategy.Validate(); err != nil {
 		// treat invalid strategy as non-fatal; skip.
 		e.logger.Warn("Skipping invalid strategy", zap.String("strategy_id", strategy.StrategyID), zap.Error(err))
+		// Recorded rather than only logged: a strategy skipped here evaluates no
+		// conditions, so without this it produces no audit row and looks exactly
+		// like "no news arrived" in the admin UI.
+		e.recordDecision(event, strategy, nil, decisions.OutcomeRejected,
+			decisions.ReasonStrategyInvalid, "strategy failed validation: "+err.Error(), nil)
 		return nil, nil
 	}
 
@@ -174,6 +192,9 @@ func (e *Engine) evaluateOne(ctx context.Context, event *models.MarketEvent, str
 			zap.Strings("matched_conditions", res.MatchedConditions),
 			zap.Strings("failed_conditions", res.FailedConditions),
 		)
+		reasonCode, reasonDetail := matchRejectReason(res, strategy)
+		e.recordDecision(event, strategy, res, decisions.OutcomeRejected,
+			reasonCode, reasonDetail, nil)
 		return nil, nil
 	}
 
@@ -194,4 +215,72 @@ func (e *Engine) evaluateOne(ctx context.Context, event *models.MarketEvent, str
 	}
 	_ = ctx
 	return match, nil
+}
+
+// recordDecision writes one audit row for a (event, strategy) evaluation.
+//
+// The engine records only MATCH-stage *rejections*. A strategy that matches here
+// is still subject to compliance, sizing, risk and cap gates in the consumer
+// handler, and the handler records the terminal outcome. Recording a MATCHED row
+// here as well would produce two rows per evaluation and make the funnel in the
+// admin UI double-count.
+func (e *Engine) recordDecision(
+	event *models.MarketEvent,
+	strategy *models.Strategy,
+	res *matcher.EvaluationResult,
+	outcome decisions.Outcome,
+	reasonCode, reasonDetail string,
+	score *float64,
+) {
+	if e.decisions == nil {
+		return
+	}
+
+	rec := &decisions.Record{
+		EventID:      event.EventID,
+		UserID:       strategy.UserID,
+		StrategyID:   strategy.StrategyID,
+		StrategyName: strategy.StrategyName,
+		Symbol:       event.StockData.Symbol,
+		StockCode:    event.StockData.StockCode,
+		Exchange:     event.StockData.Exchange,
+		Outcome:      outcome,
+		Stage:        decisions.StageMatch,
+		ReasonCode:   reasonCode,
+		ReasonDetail: reasonDetail,
+		MatchScore:   score,
+		ImpactScore:  decisions.I(int(event.Analysis.ImpactScore)),
+		Sentiment:    event.Analysis.Sentiment,
+		NewsCategory: event.NewsData.Category,
+		PctChange:    decisions.F(event.MarketData.PctChange),
+		LTP:          decisions.F(event.MarketData.LastTradedPrice),
+	}
+	if res != nil {
+		rec.MatchedCond = res.MatchedConditions
+		rec.FailedCond = res.FailedConditions
+		rec.CondScores = res.ConditionScores
+	}
+	e.decisions.Record(rec)
+}
+
+// matchRejectReason picks the reason code and sentence for a match-stage
+// rejection. An above-max pct_change gets its own code because it is a distinct,
+// actionable condition — the stock had already run too far to chase — rather than
+// a plain "some condition didn't match".
+func matchRejectReason(res *matcher.EvaluationResult, strategy *models.Strategy) (string, string) {
+	if res.PctChangeStatus == matcher.PctChangeAboveMax {
+		return decisions.ReasonPctChangeAboveMax,
+			fmt.Sprintf("stock had already moved beyond the %.2f%% ceiling before entry",
+				strategy.Conditions.MaxPctChange)
+	}
+	return decisions.ReasonConditionsNotMet, failedConditionsDetail(res.FailedConditions)
+}
+
+// failedConditionsDetail renders the failed condition list as a sentence for the
+// admin UI, e.g. "failed on: pct_change, impact_score".
+func failedConditionsDetail(failed []string) string {
+	if len(failed) == 0 {
+		return "no conditions matched"
+	}
+	return "failed on: " + strings.Join(failed, ", ")
 }

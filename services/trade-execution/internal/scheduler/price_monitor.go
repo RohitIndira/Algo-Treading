@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/decisions"
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/pkg/tradecap"
 	"github.com/RohitIndira/Algo-Treading/services/trade-execution/internal/models"
@@ -141,6 +142,10 @@ type PriceMonitor struct {
 	// counter the rules-engine uses for immediate trades. nil-safe: when unset or
 	// Redis is unavailable the cap is not enforced here (fail-open).
 	capReserver *tradecap.Reserver
+	// decisions records a cap-reached cancellation into the shared audit trail so
+	// the admin panel shows one consistent rejection history regardless of which
+	// service made the call. nil-safe: unset means no recording.
+	decisions *decisions.Recorder
 	// strategyReserveLocks serializes trade-cap reservations per strategy so
 	// concurrent same-strategy triggers don't interleave. Keyed by strategy_id.
 	strategyReserveLocks sync.Map
@@ -233,6 +238,13 @@ func (pm *PriceMonitor) SetOCOAdopter(a OCOAdopter) {
 	pm.ocoAdopter = a
 }
 
+// SetDecisionRecorder wires the signal-decision audit writer so a watch that is
+// cancelled at trigger time for hitting the strategy's daily cap leaves the same
+// durable trace as a rejection made in the rules-engine. Pass nil to disable.
+func (pm *PriceMonitor) SetDecisionRecorder(r *decisions.Recorder) {
+	pm.decisions = r
+}
+
 // SetCapReserver wires the shared per-strategy daily trade counter so the
 // monitor enforces MaxTradesPerStrategy when a watch triggers. Pass nil (or an
 // unavailable reserver) to leave cap enforcement disabled at trigger time.
@@ -304,6 +316,25 @@ func (pm *PriceMonitor) cancelForCapReached(ctx context.Context, entry *watchEnt
 			"triggered_at":            entry.triggeredAt,
 		})
 	}
+
+	pm.decisions.Record(&decisions.Record{
+		EventID:      order.EventID.String(),
+		UserID:       order.UserID,
+		StrategyID:   order.StrategyID,
+		StrategyName: order.StrategyName,
+		Symbol:       order.Symbol,
+		StockCode:    order.StockCode,
+		Exchange:     string(order.Exchange),
+		Outcome:      decisions.OutcomeRejected,
+		Stage:        decisions.StageCap,
+		ReasonCode:   decisions.ReasonStrategyCapReached,
+		ReasonDetail: fmt.Sprintf(
+			"%s reached its %.2f target but the strategy had already used all %d daily trades",
+			order.Symbol, entry.targetPrice, order.MaxTradesPerStrategy),
+		LimitValue: decisions.F(float64(order.MaxTradesPerStrategy)),
+		LTP:        decisions.F(ltp),
+		OrderID:    order.OrderID.String(),
+	})
 
 	if pm.kafkaPub != nil {
 		now := time.Now()
@@ -1029,12 +1060,37 @@ type WatchSnapshot struct {
 	Triggered   bool    `json:"triggered"`
 	Attempts    int32   `json:"attempts"`
 	CreatedAt   string  `json:"created_at"`
+	// CurrentLTP is the last price seen for this symbol, from the WSS cache when
+	// healthy and the Redis fallback otherwise. 0 when neither has a price yet —
+	// which is itself the signal that this watch is flying blind.
+	CurrentLTP float64 `json:"current_ltp"`
+	// DistancePct is how far CurrentLTP is from TargetPrice, as a percentage of
+	// the target. Positive means the stock still has to rise to trigger. It is
+	// the one number that says whether a watch is close to firing.
+	DistancePct float64 `json:"distance_pct"`
+	// PriceSource records where CurrentLTP came from: "wss", "redis" or "none".
+	// A watch showing "redis" while the WSS is meant to be primary is a degraded
+	// tick feed, which silently weakens every trailing stop too.
+	PriceSource string `json:"price_source"`
 }
 
 // GetWatchSnapshot returns a snapshot of all currently watched orders for a given user.
 // If userID is empty, returns watches for all users.
+//
+// Each entry carries the live price and its distance from the trigger, resolved
+// from the WSS cache first and Redis second, and is best-effort: a missing price
+// yields 0 with PriceSource "none" rather than failing the snapshot.
+//
+// Price lookups happen strictly AFTER every shard lock is released. Doing them
+// inline would hold a read lock across a Redis round-trip per watch, and Watch /
+// Unwatch / UnwatchByStrategy all need the write lock — so a slow Redis would
+// stall new order registration during market hours. This is a read-only
+// observability call; it must never be able to interfere with trading.
 func (pm *PriceMonitor) GetWatchSnapshot(userID string) []WatchSnapshot {
 	result := make([]WatchSnapshot, 0, 64)
+	// stockKeys[i] is the key for result[i]; kept parallel so prices can be
+	// filled in after the locks are gone.
+	stockKeys := make([]string, 0, 64)
 
 	for _, shard := range pm.shards {
 		shard.mu.RLock()
@@ -1066,10 +1122,80 @@ func (pm *PriceMonitor) GetWatchSnapshot(userID string) []WatchSnapshot {
 				snap.TakeProfit = *e.order.TakeProfit
 			}
 			result = append(result, snap)
+			stockKeys = append(stockKeys, e.stockKey)
 		}
 		shard.mu.RUnlock()
 	}
+
+	pm.fillSnapshotPrices(result, stockKeys)
 	return result
+}
+
+// fillSnapshotPrices resolves prices for an already-built snapshot. Runs with no
+// locks held and issues at most two lookups in total (one WSS cache read, one
+// batched Redis MGET for whatever the cache missed) regardless of how many
+// watches there are.
+//
+// Entirely best-effort: any failure leaves CurrentLTP at 0 and PriceSource
+// "none", which the admin UI renders as "no price" — itself a useful signal that
+// the tick feed is degraded.
+func (pm *PriceMonitor) fillSnapshotPrices(snaps []WatchSnapshot, stockKeys []string) {
+	if len(snaps) == 0 {
+		return
+	}
+
+	// Unique keys only — several watches commonly share one stock.
+	unique := make([]string, 0, len(stockKeys))
+	seen := make(map[string]struct{}, len(stockKeys))
+	for _, k := range stockKeys {
+		if _, dup := seen[k]; dup || k == "" {
+			continue
+		}
+		seen[k] = struct{}{}
+		unique = append(unique, k)
+	}
+	if len(unique) == 0 {
+		return
+	}
+
+	fromWSS := map[string]float64{}
+	if pm.wsClient != nil && pm.wsClient.IsHealthy() {
+		if m := pm.wsClient.GetLTPs(unique); m != nil {
+			fromWSS = m
+		}
+	}
+
+	// Only ask Redis for what the WSS cache did not answer.
+	missing := make([]string, 0, len(unique))
+	for _, k := range unique {
+		if v, ok := fromWSS[k]; !ok || v <= 0 {
+			missing = append(missing, k)
+		}
+	}
+
+	fromRedis := map[string]float64{}
+	if len(missing) > 0 && pm.ltpProvider != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if m, err := pm.ltpProvider.GetLTPs(ctx, missing); err == nil && m != nil {
+			fromRedis = m
+		}
+	}
+
+	for i := range snaps {
+		key := stockKeys[i]
+		ltp, source := 0.0, "none"
+		if v, ok := fromWSS[key]; ok && v > 0 {
+			ltp, source = v, "wss"
+		} else if v, ok := fromRedis[key]; ok && v > 0 {
+			ltp, source = v, "redis"
+		}
+		snaps[i].CurrentLTP = ltp
+		snaps[i].PriceSource = source
+		if ltp > 0 && snaps[i].TargetPrice > 0 {
+			snaps[i].DistancePct = (snaps[i].TargetPrice - ltp) / snaps[i].TargetPrice * 100
+		}
+	}
 }
 
 // reloadFromDB loads pending STOP_LOSS+BRACKET orders from the DB and re-registers

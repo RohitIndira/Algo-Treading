@@ -174,9 +174,12 @@ func (e *Evaluator) evaluateCategory(event *models.MarketEvent, strategy *models
 }
 
 // evaluateMarketCap evaluates market cap type condition.
-// Strategy stores market_cap_types as uppercase: "SMALL", "MID", "LARGE".
-// Event carries mcaptype as title-case: "Small", "Mid", "Large".
-// Comparison is case-insensitive.
+// Strategy conditions store the bare bucket ("SMALL", "MID", "LARGE"), while
+// Kafka news events carry the feed's suffixed form ("Small Cap", "Mid Cap",
+// "Large Cap"). A plain case-insensitive compare therefore never matched, so
+// any strategy with a market_cap_types filter silently produced zero signals.
+// normMCap canonicalizes both sides (uppercase, spaces removed, trailing "CAP"
+// dropped) so "SMALL" and "Small Cap" both reduce to "SMALL" before comparing.
 func (e *Evaluator) evaluateMarketCap(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
 	condition := "market_cap"
 
@@ -187,10 +190,14 @@ func (e *Evaluator) evaluateMarketCap(event *models.MarketEvent, strategy *model
 		return
 	}
 
-	eventMCapType := event.StockData.MCapType
+	normMCap := func(s string) string {
+		up := strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(s)), " ", "")
+		return strings.TrimSuffix(up, "CAP")
+	}
+	eventMCapType := normMCap(event.StockData.MCapType)
 
 	for _, mcapType := range strategy.Conditions.MarketCapTypes {
-		if strings.EqualFold(mcapType, eventMCapType) {
+		if normMCap(mcapType) == eventMCapType {
 			result.MatchedConditions = append(result.MatchedConditions, condition)
 			result.ConditionScores[condition] = 100.0
 			return

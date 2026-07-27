@@ -21,6 +21,7 @@ import (
 
 	"sync"
 
+	"github.com/RohitIndira/Algo-Treading/pkg/decisions"
 	indiraPkg "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	pkglogger "github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/pkg/tradecap"
@@ -491,6 +492,17 @@ func main() {
 				priceMonitorRef.SetCapReserver(reserver)
 				log.Println("✓ Strategy trade-cap enforcement enabled at price-monitor trigger time")
 			}
+		}
+
+		// A watch cancelled here for hitting the daily cap is a rejection just like
+		// one made in the rules-engine, so it goes into the same audit table (which
+		// lives in trading_db). Same flag as the rules-engine so both halves of the
+		// trail switch on together; nil-safe when trading_db is unreachable.
+		if os.Getenv("SIGNAL_DECISIONS_ENABLED") == "true" && tradingDB != nil {
+			decisionRecorder := decisions.New(tradingDB.DB, nil)
+			priceMonitorRef.SetDecisionRecorder(decisionRecorder)
+			defer decisionRecorder.Close()
+			log.Println("✓ Signal-decision audit trail enabled (price-monitor cap rejections)")
 		}
 
 		// Tick store: persist every socket tick to localhost Redis DB=1 for testing.
