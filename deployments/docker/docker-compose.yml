@@ -1,3 +1,19 @@
+# ============================================================================
+# SUPERSEDED — use the root ../../docker-compose.yml instead.
+#
+# That file is the maintained stack: it runs Kafka in KRaft mode (no
+# ZooKeeper), bootstraps BOTH databases (trading_db + trading_execution) with
+# all migrations, and gates optional pieces behind compose profiles.
+#
+# Do NOT run this file at the same time as the root compose. Both declare
+# container_name: trading-postgres / trading-redis / trading-kafka /
+# trading-rabbitmq / trading-kafka-ui / trading-redis-ui, so the second one
+# up will fail with "container name already in use".
+#
+# Kept only for the pgbouncer definition below, which the root compose does
+# not (yet) include. Copy that service across if you need connection pooling.
+# ============================================================================
+
 services:
   # ===== DATABASE =====
 

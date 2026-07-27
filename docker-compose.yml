@@ -1,12 +1,65 @@
-version: '3.9'
+# ============================================================================
+# Algo Trading System — local development stack
+#
+#   docker compose up -d                     infrastructure only (default)
+#   docker compose --profile ui up -d        + Kafka UI, Redis UI, pgAdmin
+#   docker compose --profile apps up -d      + the six Go services
+#   docker compose --profile mongo up -d     + local MongoDB (Atlas is default)
+#
+# The default (no profile) is what you want for day-to-day work: it starts
+# Postgres, Redis, Kafka and RabbitMQ, and you run the Go services on the host
+# with `go run`. That matches the localhost:* addresses already in the
+# services' .env files, so nothing needs editing.
+#
+# Host-facing ports (what your .env files point at):
+#   Postgres  5432     Redis 6379     Kafka 9092     RabbitMQ 5672 / UI 15672
+# UI profile ports are 8085+ to stay clear of the app's own 8080/8081/8092.
+# ============================================================================
+
+name: algo-trading
+
+# ---------------------------------------------------------------------------
+# Shared anchors
+# ---------------------------------------------------------------------------
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# Every app service builds from the REPO ROOT. The service go.mod files use
+# relative `replace` directives (../.. -> pkg/, api/proto/), so a per-service
+# build context cannot resolve them. Do not narrow this context.
+x-go-build: &go-build
+  context: .
 
 services:
-  # ===== INFRASTRUCTURE SERVICES =====
-  
+
+  # =========================================================================
+  # INFRASTRUCTURE  (default profile — always started)
+  # =========================================================================
+
+  # NOT started by default — this machine uses the native Windows PostgreSQL
+  # service (postgresql-x64-18), which owns the real trading_db /
+  # trading_execution data.
+  #
+  # Both cannot share port 5432. On Windows each appears to bind successfully,
+  # but localhost:5432 resolves to the native server — so the container looks
+  # "healthy" while receiving no traffic at all. That is exactly what happened
+  # before this was gated.
+  #
+  # Kept here, fully working, for a machine without a local Postgres:
+  #   docker compose --profile pgdocker up -d
+  # Stop the native service first, or change the host port below to 5433.
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: trading-postgres
     hostname: postgres
+    profiles: [pgdocker]
     ports:
       - "5432:5432"
     environment:
@@ -14,22 +67,133 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: trading_db
       PGDATA: /var/lib/postgresql/data/pgdata
+      # Fresh volumes only: skips the slow default fsync-heavy init.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command: >
+      postgres
+        -c max_connections=500
+        -c shared_buffers=256MB
+        -c work_mem=4MB
+        -c timezone=Asia/Kolkata
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./deployments/docker/init_all_schemas.sql:/docker-entrypoint-initdb.d/init.sql
-    networks:
-      - trading-network
+      # Bootstrap scripts — run once, only when postgres-data is empty.
+      - ./deployments/docker/init:/docker-entrypoint-initdb.d:ro
+      # SQL mounted read-only so the repo files stay the source of truth.
+      - ./deployments/docker/init_all_schemas.sql:/sql/init_all_schemas.sql:ro
+      - ./services/user-config/migrations:/sql/migrations/user-config:ro
+      - ./services/rules-engine/migrations:/sql/migrations/rules-engine:ro
+      - ./services/trade-execution/migrations:/sql/migrations/trade-execution:ro
+    networks: [trading-network]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_db"]
+      # Waits for BOTH databases, so dependents never start against a
+      # half-initialised instance.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_db && pg_isready -U postgres -d trading_execution"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    <<: [*restart, *logging]
+
+  redis:
+    image: redis:7-alpine
+    container_name: trading-redis
+    hostname: redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --appendonly yes
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --tcp-backlog 511
+        --tcp-keepalive 300
+    volumes:
+      - redis-data:/data
+    networks: [trading-network]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
+      start_period: 10s
+    <<: [*restart, *logging]
 
+  # Kafka in KRaft mode — no ZooKeeper. One less container, faster startup.
+  #
+  # Two listeners, and which one you use depends on where you are:
+  #   from the HOST (go run ...)      -> localhost:9092
+  #   from ANOTHER CONTAINER          -> kafka:29092
+  # This is why the advertised listeners differ; changing them will break one
+  # side or the other.
+  kafka:
+    image: confluentinc/cp-kafka:7.8.0
+    container_name: trading-kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # --- KRaft ---
+      CLUSTER_ID: algo-trading-kraft-cluster
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # --- Listeners ---
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # --- Single-node sizing ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks: [trading-network]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    <<: [*restart, *logging]
+
+  # Credentials match RABBITMQ_URL in trade-execution/.env and rules-engine/.env
+  # (amqp://admin:admin123@localhost:5672/). Change both sides together.
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: trading-rabbitmq
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks: [trading-network]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    <<: [*restart, *logging]
+
+  # Local MongoDB. Off by default — data-ingestion and rules-engine point at
+  # MongoDB Atlas (mongodb+srv://...) in their .env files. Start with
+  # `--profile mongo` only if you want to work fully offline.
   mongodb:
-    image: mongo:7-alpine
+    image: mongo:7
     container_name: trading-mongodb
     hostname: mongodb
+    profiles: [mongo]
     ports:
       - "27017:27017"
     environment:
@@ -39,239 +203,259 @@ services:
     volumes:
       - mongodb-data:/data/db
       - mongodb-config:/data/configdb
-    networks:
-      - trading-network
+    networks: [trading-network]
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
+      start_period: 20s
+    <<: [*restart, *logging]
 
-  redis:
-    image: redis:7-alpine
-    container_name: trading-redis
-    hostname: redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - trading-network
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-  kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    container_name: trading-kafka
-    hostname: kafka
-    ports:
-      - "9092:9092"
-      - "29092:29092"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-    depends_on:
-      - zookeeper
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    restart: unless-stopped
-
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    container_name: trading-zookeeper
-    hostname: zookeeper
-    ports:
-      - "2181:2181"
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-    volumes:
-      - zookeeper-data:/var/lib/zookeeper/data
-      - zookeeper-logs:/var/lib/zookeeper/log
-    networks:
-      - trading-network
-    restart: unless-stopped
+  # =========================================================================
+  # MANAGEMENT UIs  (--profile ui)
+  # Ports start at 8085 to avoid the app's 8080/8081 and rules-engine's 8092.
+  # =========================================================================
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: trading-kafka-ui
-    hostname: kafka-ui
+    profiles: [ui]
     ports:
-      - "8090:8080"
+      - "8085:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: trading-local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
     depends_on:
       kafka:
         condition: service_healthy
-    networks:
-      - trading-network
-    restart: unless-stopped
+    networks: [trading-network]
+    <<: [*restart, *logging]
 
-  # ===== APPLICATION SERVICES =====
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: trading-redis-ui
+    profiles: [ui]
+    ports:
+      - "8086:8081"
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [trading-network]
+    <<: [*restart, *logging]
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: trading-pgadmin
+    profiles: [ui]
+    ports:
+      - "8087:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@algotrading.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    # Register the native Windows Postgres as host.docker.internal:5432
+    # (user postgres). There is no depends_on: it lives outside compose.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [trading-network]
+    <<: [*restart, *logging]
+
+  # =========================================================================
+  # APPLICATION SERVICES  (--profile apps)
+  #
+  # The .env files are written for host-based `go run` and point at
+  # localhost. Inside a container "localhost" is the container itself, so
+  # every service below overrides the infra addresses with container
+  # hostnames via `environment:` (which wins over `env_file:`).
+  # =========================================================================
 
   api-gateway:
     build:
-      context: ./api/gateway
-      dockerfile: Dockerfile
+      <<: *go-build
+      dockerfile: api/gateway/Dockerfile
+    image: algo-trading/api-gateway:local
     container_name: trading-api-gateway
     hostname: api-gateway
+    profiles: [apps]
+    # 8080, matching HTTP_PORT in the .env loaded below. Not 8081: when
+    # trade-execution runs on the host it binds 8081 for its paper-trading
+    # WebSocket server, and the two would collide.
     ports:
-      - "8081:8081"
+      - "8080:8080"
     env_file:
-      - ./api/gateway/.env.live
+      - ./api/gateway/.env
     environment:
-      ENVIRONMENT: production
+      HTTP_PORT: 8080
+      USER_CONFIG_GRPC_ADDR: user-config:50051
+      RULES_ENGINE_URL: http://rules-engine:8092
+      KAFKA_BROKERS: kafka:29092
       LOG_LEVEL: info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
       user-config:
         condition: service_started
-    networks:
-      - trading-network
-    restart: unless-stopped
+    networks: [trading-network]
+    <<: [*restart, *logging]
 
   user-config:
     build:
-      context: ./services/user-config
-      dockerfile: Dockerfile
+      <<: *go-build
+      dockerfile: services/user-config/Dockerfile
+    image: algo-trading/user-config:local
     container_name: trading-user-config
     hostname: user-config
+    profiles: [apps]
     ports:
       - "50051:50051"
     env_file:
-      - ./services/user-config/.env.live
+      - ./services/user-config/.env
     environment:
-      ENVIRONMENT: production
       GRPC_PORT: 50051
+      # Postgres runs natively on the host, not in compose.
+      DB_HOST: host.docker.internal
+      DB_PORT: 5432
+      EXECUTION_DB_HOST: host.docker.internal
+      EXECUTION_DB_PORT: 5432
+      KAFKA_BROKERS: kafka:29092
+      LOG_LEVEL: INFO
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      postgres:
+      kafka:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - trading-network
-    restart: unless-stopped
+    networks: [trading-network]
+    <<: [*restart, *logging]
 
   data-ingestion:
     build:
-      context: ./services/data-ingestion
-      dockerfile: Dockerfile
+      <<: *go-build
+      dockerfile: services/data-ingestion/Dockerfile
+    image: algo-trading/data-ingestion:local
     container_name: trading-data-ingestion
     hostname: data-ingestion
-    ports:
-      - "50052:50052"
+    profiles: [apps]
     env_file:
-      - ./services/data-ingestion/.env.live
+      - ./services/data-ingestion/.env
     environment:
-      ENVIRONMENT: production
-      GRPC_PORT: 50052
+      KAFKA_BROKERS: kafka:29092
+      LOG_LEVEL: INFO
     depends_on:
-      mongodb:
-        condition: service_healthy
       kafka:
         condition: service_healthy
-    networks:
-      - trading-network
-    restart: unless-stopped
+    networks: [trading-network]
+    <<: [*restart, *logging]
 
   rules-engine:
     build:
-      context: ./services/rules-engine
-      dockerfile: Dockerfile
+      <<: *go-build
+      dockerfile: services/rules-engine/Dockerfile
+    image: algo-trading/rules-engine:local
     container_name: trading-rules-engine
     hostname: rules-engine
+    profiles: [apps]
     ports:
-      - "50053:50053"
+      - "9003:9003"   # gRPC
+      - "8092:8092"   # AMN preview HTTP
     env_file:
-      - ./services/rules-engine/.env.live
+      - ./services/rules-engine/.env
     environment:
-      ENVIRONMENT: production
-      GRPC_PORT: 50053
+      GRPC_PORT: 9003
+      PREVIEW_HTTP_PORT: 8092
+      KAFKA_BROKERS: kafka:29092
+      # Postgres runs natively on the host, not in compose.
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: 5432
+      USER_CONFIG_GRPC_ADDR: user-config:50051
+      USER_CONFIG_SERVICE_ADDR: user-config:50051
+      RISK_MANAGEMENT_SERVICE_ADDR: risk-management:9005
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       kafka:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - trading-network
-    restart: unless-stopped
+      user-config:
+        condition: service_started
+    networks: [trading-network]
+    <<: [*restart, *logging]
 
   trade-execution:
     build:
-      context: ./services/trade-execution
-      dockerfile: Dockerfile
+      <<: *go-build
+      dockerfile: services/trade-execution/Dockerfile
+    image: algo-trading/trade-execution:local
     container_name: trading-trade-execution
     hostname: trade-execution
+    profiles: [apps]
     ports:
-      - "50054:50054"
+      - "9004:9004"
     env_file:
-      - ./services/trade-execution/.env.live
+      - ./services/trade-execution/.env
     environment:
-      ENVIRONMENT: production
-      SERVICE_PORT: 50054
+      SERVICE_PORT: 9004
+      # Postgres runs natively on the host, not in compose. This service also
+      # opens a second connection to trading_db on the same host for startup
+      # strategy hydration.
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: trading_execution
+      KAFKA_BROKERS: kafka:29092
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      postgres:
-        condition: service_healthy
       kafka:
         condition: service_healthy
-    networks:
-      - trading-network
-    restart: unless-stopped
+      rabbitmq:
+        condition: service_healthy
+    networks: [trading-network]
+    <<: [*restart, *logging]
 
   risk-management:
     build:
-      context: ./services/risk-management
-      dockerfile: Dockerfile
+      <<: *go-build
+      dockerfile: services/risk-management/Dockerfile
+    image: algo-trading/risk-management:local
     container_name: trading-risk-management
     hostname: risk-management
+    profiles: [apps]
     ports:
-      - "50055:50055"
+      - "9005:9005"
     env_file:
-      - ./services/risk-management/.env.live
+      - ./services/risk-management/.env
     environment:
-      ENVIRONMENT: production
-      SERVICE_PORT: 50055
+      GRPC_PORT: 9005
+      # Postgres runs natively on the host, not in compose.
+      DB_HOST: host.docker.internal
+      DB_PORT: 5432
+      DB_NAME: trading_db
+      DB_PASSWORD: postgres
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
-    networks:
-      - trading-network
-    restart: unless-stopped
+    networks: [trading-network]
+    <<: [*restart, *logging]
 
 volumes:
   postgres-data:
-    driver: local
-  mongodb-data:
-    driver: local
-  mongodb-config:
-    driver: local
   redis-data:
-    driver: local
-  zookeeper-data:
-    driver: local
-  zookeeper-logs:
-    driver: local
+  kafka-data:
+  rabbitmq-data:
+  mongodb-data:
+  mongodb-config:
+  pgadmin-data:
 
 networks:
   trading-network:

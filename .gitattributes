@@ -1,0 +1,25 @@
+# Normalise line endings.
+#
+# Shell scripts and SQL in this repo are executed *inside Linux containers*
+# (Postgres runs deployments/docker/init/*.sh at bootstrap; the Kafka topic
+# script runs in the broker). A CRLF checkout on Windows makes bash fail with
+# "$'\r': command not found", so these must stay LF regardless of platform.
+
+* text=auto
+
+*.sh   text eol=lf
+*.sql  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+Dockerfile   text eol=lf
+Makefile     text eol=lf
+.dockerignore text eol=lf
+
+# Windows-only scripts keep CRLF.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary — never touch.
+*.pdf binary
+*.exe binary
+*.db  binary

@@ -19,7 +19,10 @@ build: ## Build all services
 
 build-service: ## Build specific service (usage: make build-service SERVICE=user-config)
 	@echo "Building $(SERVICE)..."
-	@cd services/$(SERVICE) && go build -o ../../$(BIN_DIR)/$(SERVICE) ./cmd/main.go
+	@# ./cmd (the package), not ./cmd/main.go — rules-engine splits its main
+	@# package across main.go and lifecycle.go, and a single-file build fails
+	@# with "undefined: StartLive".
+	@cd services/$(SERVICE) && go build -o ../../$(BIN_DIR)/$(SERVICE) ./cmd
 
 test: ## Run unit tests
 	@echo "Running unit tests..."

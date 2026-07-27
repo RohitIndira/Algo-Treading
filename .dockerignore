@@ -38,14 +38,26 @@ coverage.html
 Thumbs.db
 
 # Docker
-docker-compose.yml
+docker-compose*.yml
 Dockerfile
 .dockerignore
+deployments/
 
 # Documentation
 docs/
 README.md
 *.md
+*.pdf
+
+# Local databases / data dumps
+*.db
+*.sqlite
+*.sqlite3
+
+# Non-Go assets that never belong in a Go build context
+b2c-api-python/
+*.html
+proxy-server.js
 
 # CI/CD
 .github/
