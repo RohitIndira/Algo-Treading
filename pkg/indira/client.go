@@ -20,6 +20,7 @@ const (
 	// Environment variable names
 	EnvIndiraBaseURL = "INDIRA_BASE_URL"
 	EnvIndiraAPIKey  = "INDIRA_API_KEY"
+	EnvIndiraAlgoID  = "INDIRA_ALGO_ID"
 
 	// Fallback base URL if environment variable is not set
 	FallbackBaseURL = "https://localhost:8000"
@@ -50,6 +51,7 @@ func getDefaultAPIKey() string {
 type Client struct {
 	baseURL    string
 	apiKey     string
+	algoID     string
 	httpClient *http.Client
 }
 
@@ -68,6 +70,7 @@ type AuthContext struct {
 type Config struct {
 	BaseURL string
 	APIKey  string
+	AlgoID  string
 	Timeout time.Duration
 }
 
@@ -79,6 +82,9 @@ func NewClient(config Config) *Client {
 	}
 	if config.APIKey == "" {
 		config.APIKey = getDefaultAPIKey()
+	}
+	if config.AlgoID == "" {
+		config.AlgoID = os.Getenv(EnvIndiraAlgoID)
 	}
 
 	timeout := config.Timeout
@@ -99,6 +105,7 @@ func NewClient(config Config) *Client {
 	return &Client{
 		baseURL: config.BaseURL,
 		apiKey:  config.APIKey,
+		algoID:  config.AlgoID,
 		httpClient: &http.Client{
 			Transport: t,
 			Timeout:   timeout,

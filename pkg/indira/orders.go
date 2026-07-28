@@ -13,6 +13,10 @@ import (
 // PlaceOrder places a new order
 // auth parameter contains user-specific authentication from frontend
 func (c *Client) PlaceOrder(ctx context.Context, auth *AuthContext, req *PlaceOrderRequest) (*PlaceOrderResponse, error) {
+	if req.AlgoID == "" {
+		req.AlgoID = c.algoID
+	}
+
 	resp, err := c.doRequest(ctx, auth, "POST", "/order-services/api/order/v1/place-order", req)
 	if err != nil {
 		return nil, fmt.Errorf("place order request failed: %w", err)

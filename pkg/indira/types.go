@@ -57,6 +57,7 @@ type PlaceOrderRequest struct {
 	Amo          bool      `json:"amo"`          // After Market Order
 	BoStpLoss    *Price2DP `json:"boStpLoss,omitempty"`    // Bracket order stop loss
 	BoTgtPrice   *Price2DP `json:"boTgtPrice,omitempty"`   // Bracket order target price
+	AlgoID       string    `json:"algoId,omitempty"`       // Algo tag, same for all users; set from INDIRA_ALGO_ID. Place-order only.
 }
 
 // PlaceOrderResponse represents the response from placing an order
