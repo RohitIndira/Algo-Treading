@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS strategy_conditions (
     min_price_change_pct DECIMAL,
     max_price_change_pct DECIMAL,
     min_volume         BIGINT,
+    -- Trade value (turnover = volume x LTP) filter, in INR crore.
+    -- Mode: NULL/'' = off | 'ABOVE' | 'BELOW' | 'RANGE'. See migration 004.
+    trade_value_mode   TEXT,
+    min_trade_value    NUMERIC(20, 4),
+    max_trade_value    NUMERIC(20, 4),
     exchanges          TEXT[],
     created_at         TIMESTAMPTZ DEFAULT NOW()
 );

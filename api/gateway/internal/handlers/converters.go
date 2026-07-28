@@ -146,7 +146,7 @@ func dtoConditionsToProto(c *dto.StrategyConditions) *pb.StrategyConditions {
 		exchanges[i] = mapExchange(e)
 	}
 
-	return &pb.StrategyConditions{
+	out := &pb.StrategyConditions{
 		MatchAllNews:   c.MatchAllNews,
 		ImpactScoreMin: c.ImpactScoreMin,
 		ImpactScoreMax: c.ImpactScoreMax,
@@ -163,6 +163,19 @@ func dtoConditionsToProto(c *dto.StrategyConditions) *pb.StrategyConditions {
 		},
 		Exchanges: exchanges,
 	}
+
+	// Trade value filter is only sent when a mode is set. Leaving the message nil
+	// for the off case keeps "filter absent" distinguishable from "mode empty
+	// with stale bounds" all the way down to the rules-engine.
+	if c.TradeValueMode != "" {
+		out.TradeValueFilter = &pb.StrategyConditions_TradeValueFilter{
+			Mode:          c.TradeValueMode,
+			MinTradeValue: c.MinTradeValue,
+			MaxTradeValue: c.MaxTradeValue,
+		}
+	}
+
+	return out
 }
 
 // dtoAMNSelectionToProto converts the AMN preview picks from the JSON body into

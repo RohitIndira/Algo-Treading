@@ -46,6 +46,11 @@ func ToModelStrategy(p *StrategyPayload) (*models.Strategy, error) {
 		MinMcap: p.Conditions.MinMarketCap,
 		MaxMcap: p.Conditions.MaxMarketCap,
 	}
+	s.Conditions.TradeValueFilter = models.TradeValueFilter{
+		Mode: p.Conditions.TradeValueMode,
+		Min:  p.Conditions.MinTradeValue,
+		Max:  p.Conditions.MaxTradeValue,
+	}
 
 	// Trade config
 	s.TradeConfig = models.TradeConfig{

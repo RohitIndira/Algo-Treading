@@ -62,6 +62,14 @@ type ConditionsPayload struct {
 	MaxMarketCap      float64  `json:"max_market_cap"`
 	MinPriceChangePct float64  `json:"min_price_change_pct"`
 	MaxPriceChangePct float64  `json:"max_price_change_pct"`
+	// Trade value (turnover = day volume × current LTP) filter, in ₹ crore.
+	// Mode: "" = off | "ABOVE" | "BELOW" | "RANGE".
+	// CONTRACT: these three keys must stay in sync with the rules-engine's
+	// configsync.ConditionsPayload — nothing but the JSON names ties them
+	// together, and a rename would silently disable the filter.
+	TradeValueMode    string   `json:"trade_value_mode"`
+	MinTradeValue     float64  `json:"min_trade_value"`
+	MaxTradeValue     float64  `json:"max_trade_value"`
 	Exchanges         []string `json:"exchanges"`
 	CreatedAt         int64    `json:"created_at"` // UnixNano
 }

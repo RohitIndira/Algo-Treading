@@ -135,6 +135,12 @@ type StrategyCondition struct {
 	MarketCapTypes     pq.StringArray `db:"market_cap_types" json:"market_cap_types"`
 	MinPriceChangePct  *float64       `db:"min_price_change_pct" json:"min_price_change_pct,omitempty"`
 	MaxPriceChangePct  *float64       `db:"max_price_change_pct" json:"max_price_change_pct,omitempty"`
+	// Trade value (turnover = day volume × current LTP) filter, in ₹ crore.
+	// TradeValueMode: nil/"" = off, "ABOVE", "BELOW", "RANGE". Computed from the
+	// Redis market snapshot at evaluation time, not carried on the news event.
+	TradeValueMode     *string        `db:"trade_value_mode" json:"trade_value_mode,omitempty"`
+	MinTradeValue      *float64       `db:"min_trade_value" json:"min_trade_value,omitempty"`
+	MaxTradeValue      *float64       `db:"max_trade_value" json:"max_trade_value,omitempty"`
 	Exchanges          pq.StringArray `db:"exchanges" json:"exchanges"`
 	CreatedAt          time.Time      `db:"created_at" json:"created_at"`
 }

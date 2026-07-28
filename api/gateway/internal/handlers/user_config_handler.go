@@ -69,12 +69,9 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 		respondWithError(w, http.StatusBadRequest, "Strategy name is required")
 		return
 	}
-	if reqDTO.Conditions != nil {
-		if reqDTO.Conditions.MinMarketCap > reqDTO.Conditions.MaxMarketCap && reqDTO.Conditions.MaxMarketCap > 0 {
-			respondWithError(w, http.StatusBadRequest, "Min Market Cap cannot be greater than Max Market Cap")
-			return
-		}
-		// Add more range checks here
+	if msg := validateConditions(reqDTO.Conditions); msg != "" {
+		respondWithError(w, http.StatusBadRequest, msg)
+		return
 	}
 
 	// Map DTO to Proto
@@ -137,6 +134,12 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	reqDTO.UserID = userIdHeader
+
+	// Logic Validation — same rules as create; update must not be a bypass.
+	if msg := validateConditions(reqDTO.Conditions); msg != "" {
+		respondWithError(w, http.StatusBadRequest, msg)
+		return
+	}
 
 	// Map DTO to Proto
 	pbReq := dtoUpdateStrategyToProto(&reqDTO)
@@ -413,6 +416,78 @@ func (h *UserConfigHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 	}
 
 	respondWithJSON(w, http.StatusOK, resp)
+}
+
+// validateConditions enforces cross-field rules on strategy conditions that the
+// proto and DB layers cannot express. Returns a user-facing message, or "" when
+// valid. Called from BOTH CreateStrategy and UpdateStrategy — update previously
+// had no validation at all, which made every rule here bypassable.
+//
+// Market cap range (₹ crore, from OdinMasterData.CompanyMaster.mcap) is a STRICT
+// bounded range. Both zero means the filter is unset; otherwise a complete
+// min<=max pair is required. There is deliberately no open-ended form: a min with
+// no max is a user error, not "and above".
+func validateConditions(c *dto.StrategyConditions) string {
+	if c == nil {
+		return ""
+	}
+
+	if c.MinMarketCap < 0 || c.MaxMarketCap < 0 {
+		return "Market cap values cannot be negative"
+	}
+	// Both zero → filter not set. Anything else must be a complete range.
+	if c.MinMarketCap > 0 || c.MaxMarketCap > 0 {
+		if c.MaxMarketCap == 0 {
+			return "Maximum market cap is required when a minimum is set"
+		}
+		if c.MaxMarketCap < c.MinMarketCap {
+			return "Maximum market cap must be greater than or equal to minimum market cap"
+		}
+	}
+
+	if msg := validateTradeValue(c); msg != "" {
+		return msg
+	}
+
+	return ""
+}
+
+// validateTradeValue checks the trade value (turnover) filter. Unlike market cap,
+// this filter carries an explicit mode, so an open-ended bound is a deliberate
+// choice rather than an ambiguous zero. Each mode requires exactly the bounds it
+// uses; the unused bound is ignored rather than rejected, so a user switching
+// RANGE → ABOVE does not have to clear the stale max first.
+func validateTradeValue(c *dto.StrategyConditions) string {
+	mode := c.TradeValueMode
+	if mode == "" {
+		return "" // filter off — bounds are irrelevant
+	}
+	if mode != "ABOVE" && mode != "BELOW" && mode != "RANGE" {
+		return "Trade value mode must be one of: ABOVE, BELOW, RANGE"
+	}
+	if c.MinTradeValue < 0 || c.MaxTradeValue < 0 {
+		return "Trade value cannot be negative"
+	}
+
+	switch mode {
+	case "ABOVE":
+		if c.MinTradeValue <= 0 {
+			return "Minimum trade value is required when mode is ABOVE"
+		}
+	case "BELOW":
+		if c.MaxTradeValue <= 0 {
+			return "Maximum trade value is required when mode is BELOW"
+		}
+	case "RANGE":
+		if c.MinTradeValue <= 0 || c.MaxTradeValue <= 0 {
+			return "Both minimum and maximum trade value are required when mode is RANGE"
+		}
+		if c.MaxTradeValue < c.MinTradeValue {
+			return "Maximum trade value must be greater than or equal to minimum trade value"
+		}
+	}
+
+	return ""
 }
 
 // Helper functions

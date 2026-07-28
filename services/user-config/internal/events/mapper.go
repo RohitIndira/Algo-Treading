@@ -75,6 +75,9 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 			MaxMarketCap:      valueOrZeroFloat64(s.Conditions.MaxMarketCap),
 			MinPriceChangePct: valueOrZeroFloat64(s.Conditions.MinPriceChangePct),
 			MaxPriceChangePct: valueOrZeroFloat64(s.Conditions.MaxPriceChangePct),
+			TradeValueMode:    valueOrEmptyString(s.Conditions.TradeValueMode),
+			MinTradeValue:     valueOrZeroFloat64(s.Conditions.MinTradeValue),
+			MaxTradeValue:     valueOrZeroFloat64(s.Conditions.MaxTradeValue),
 			Exchanges:         nilSafeStringSlice([]string(s.Conditions.Exchanges)),
 			CreatedAt:         s.Conditions.CreatedAt.UnixNano(),
 		}
@@ -149,6 +152,13 @@ func nilSafeStringSlice(in []string) []string {
 func valueOrZeroFloat64(v *float64) float64 {
 	if v == nil {
 		return 0
+	}
+	return *v
+}
+
+func valueOrEmptyString(v *string) string {
+	if v == nil {
+		return ""
 	}
 	return *v
 }

@@ -293,6 +293,21 @@ func (r *AMNRunner) run(ctx context.Context, strategy *models.Strategy) error {
 			continue
 		}
 
+		// ── Trade value (liquidity) gate against live Redis data ──────────────
+		// Same helper the live handler and the preview use, so the backfill places
+		// exactly the set its own preview showed.
+		if tvf := strategy.Conditions.TradeValueFilter; tvf.IsActive() {
+			if ok, tv := consumer.PassesTradeValue(tvf, md.Volume, md.LTP); !ok {
+				r.logger.Debug("AMN backfill: trade value outside filter, skipping stock",
+					zap.String("isin", doc.ISIN),
+					zap.String("symbol", company.Symbol),
+					zap.Float64("trade_value_cr", tv),
+					zap.String("mode", tvf.Mode))
+				skipped++
+				continue
+			}
+		}
+
 		// ── Classify by live current-day price change % ───────────────────────
 		bucket, target := classifyPctChange(
 			strategy.Conditions.MinPctChange, strategy.Conditions.MaxPctChange,

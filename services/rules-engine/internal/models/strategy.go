@@ -45,17 +45,18 @@ type StrategyConfig = Strategy
 
 // Conditions represents the conditions for a strategy
 type Conditions struct {
-	MatchAllNews   bool           `json:"match_all_news" bson:"match_all_news"`
-	ImpactScoreMin int32          `json:"impact_score_min" bson:"impact_score_min"`
-	ImpactScoreMax int32          `json:"impact_score_max" bson:"impact_score_max"`
-	Sentiments     []string       `json:"sentiments" bson:"sentiments"`
-	Categories     []string       `json:"categories" bson:"categories"`
-	PriceRange     PriceRange     `json:"price_range" bson:"price_range"` // legacy; may be unset
-	MinPctChange   float64        `json:"min_pct_change" bson:"min_pct_change"`
-	MaxPctChange   float64        `json:"max_pct_change" bson:"max_pct_change"`
-	Exchanges      []string       `json:"exchanges" bson:"exchanges"`
-	MarketCapTypes []string       `json:"market_cap_types" bson:"market_cap_types"` // "SMALL", "MID", "LARGE"
-	MarketCapRange MarketCapRange `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
+	MatchAllNews     bool             `json:"match_all_news" bson:"match_all_news"`
+	ImpactScoreMin   int32            `json:"impact_score_min" bson:"impact_score_min"`
+	ImpactScoreMax   int32            `json:"impact_score_max" bson:"impact_score_max"`
+	Sentiments       []string         `json:"sentiments" bson:"sentiments"`
+	Categories       []string         `json:"categories" bson:"categories"`
+	PriceRange       PriceRange       `json:"price_range" bson:"price_range"` // legacy; may be unset
+	MinPctChange     float64          `json:"min_pct_change" bson:"min_pct_change"`
+	MaxPctChange     float64          `json:"max_pct_change" bson:"max_pct_change"`
+	Exchanges        []string         `json:"exchanges" bson:"exchanges"`
+	MarketCapTypes   []string         `json:"market_cap_types" bson:"market_cap_types"` // "SMALL", "MID", "LARGE"
+	MarketCapRange   MarketCapRange   `json:"market_cap_range" bson:"market_cap_range"` // Market cap filter
+	TradeValueFilter TradeValueFilter `json:"trade_value_filter" bson:"trade_value_filter"`
 }
 
 // PriceRange represents price range filter
@@ -68,6 +69,38 @@ type PriceRange struct {
 type MarketCapRange struct {
 	MinMcap float64 `json:"min_mcap" bson:"min_mcap"` // Minimum market cap in crores
 	MaxMcap float64 `json:"max_mcap" bson:"max_mcap"` // Maximum market cap in crores
+}
+
+// Trade value filter modes. Mode is explicit (rather than inferred from a zero
+// bound) so an open-ended filter is unambiguous.
+const (
+	TradeValueModeOff   = ""      // filter disabled
+	TradeValueModeAbove = "ABOVE" // tradeValue >= Min
+	TradeValueModeBelow = "BELOW" // tradeValue <= Max
+	TradeValueModeRange = "RANGE" // Min <= tradeValue <= Max
+)
+
+// TradeValueFilter filters on trade value (turnover) = day-cumulative volume ×
+// current LTP, expressed in ₹ crore.
+//
+// IMPORTANT: unlike every other condition, this is NOT evaluated by
+// matcher.Evaluator. Neither volume nor LTP is carried on the news event
+// (data-ingestion's NewsPayload has no price fields), so at match time both are
+// zero. It is enforced against live Redis market data instead — see
+// consumer.PassesTradeValue and its three call sites (live handler, AMN preview,
+// AMN backfill).
+//
+// Because volume is day-cumulative, trade value only grows during a session: a
+// stock failing ABOVE at 09:20 may pass it by 14:00.
+type TradeValueFilter struct {
+	Mode string  `json:"mode" bson:"mode"`
+	Min  float64 `json:"min_trade_value" bson:"min_trade_value"` // ₹ crore; ABOVE, RANGE
+	Max  float64 `json:"max_trade_value" bson:"max_trade_value"` // ₹ crore; BELOW, RANGE
+}
+
+// IsActive reports whether the filter should be applied at all.
+func (f TradeValueFilter) IsActive() bool {
+	return f.Mode != TradeValueModeOff
 }
 
 // MultiLevelExitLevel defines one partial-exit level for multi-level SL or TP.
@@ -87,13 +120,13 @@ type TradeConfig struct {
 	StopLossPct     float64 `json:"stop_loss_pct" bson:"stop_loss_pct"`
 	TakeProfitPct   float64 `json:"take_profit_pct" bson:"take_profit_pct"`
 	Exchange        string  `json:"exchange" bson:"exchange"`
-	OrderSide       string  `json:"order_side" bson:"order_side"`           // BUY/SELL
-	Validity        string  `json:"validity" bson:"validity"`               // DAY/IOC
-	LimitPrice      float64 `json:"limit_price" bson:"limit_price"`         // LIMIT only
-	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`   // FIXED, TRAILING, MULTI_LEVEL
+	OrderSide       string  `json:"order_side" bson:"order_side"`             // BUY/SELL
+	Validity        string  `json:"validity" bson:"validity"`                 // DAY/IOC
+	LimitPrice      float64 `json:"limit_price" bson:"limit_price"`           // LIMIT only
+	StopLossType    string  `json:"stop_loss_type" bson:"stop_loss_type"`     // FIXED, TRAILING, MULTI_LEVEL
 	TakeProfitType  string  `json:"take_profit_type" bson:"take_profit_type"` // FIXED, MULTI_LEVEL
-	TrailingSLPct   float64 `json:"trailing_sl_pct" bson:"trailing_sl_pct"` // Trailing SL percentage
-	ProductType     string  `json:"product_type" bson:"product_type"`       // INTRADAY, DELIVERY, CASH
+	TrailingSLPct   float64 `json:"trailing_sl_pct" bson:"trailing_sl_pct"`   // Trailing SL percentage
+	ProductType     string  `json:"product_type" bson:"product_type"`         // INTRADAY, DELIVERY, CASH
 
 	// Multi-level exit levels (non-nil only when respective type == "MULTI_LEVEL")
 	MultiLevelSL []MultiLevelExitLevel `json:"multi_level_sl,omitempty" bson:"multi_level_sl,omitempty"`
@@ -107,17 +140,17 @@ type TradeConfig struct {
 
 // RiskLimits represents risk limits
 type RiskLimits struct {
-	MaxDailyTrades       int32   `json:"max_daily_trades" bson:"max_daily_trades"`
-	MaxLossPerDay        float64 `json:"max_loss_per_day" bson:"max_loss_per_day"`
-	MaxPositionSize      float64 `json:"max_position_size" bson:"max_position_size"`
-	MaxPerTradeRisk      float64 `json:"max_per_trade_risk" bson:"max_per_trade_risk"`
-	PositionSizing       string  `json:"position_sizing" bson:"position_sizing"` // FIXED, PERCENTAGE
-	EnableAutoSquareOff  bool    `json:"enable_auto_square_off" bson:"enable_auto_square_off"`
-	AutoSquareOffTime    string  `json:"auto_square_off_time" bson:"auto_square_off_time"` // "15:05" format
+	MaxDailyTrades      int32   `json:"max_daily_trades" bson:"max_daily_trades"`
+	MaxLossPerDay       float64 `json:"max_loss_per_day" bson:"max_loss_per_day"`
+	MaxPositionSize     float64 `json:"max_position_size" bson:"max_position_size"`
+	MaxPerTradeRisk     float64 `json:"max_per_trade_risk" bson:"max_per_trade_risk"`
+	PositionSizing      string  `json:"position_sizing" bson:"position_sizing"` // FIXED, PERCENTAGE
+	EnableAutoSquareOff bool    `json:"enable_auto_square_off" bson:"enable_auto_square_off"`
+	AutoSquareOffTime   string  `json:"auto_square_off_time" bson:"auto_square_off_time"` // "15:05" format
 	// MaxAmountPerStock caps total order value (quantity × price) per stock. 0 = no limit.
-	MaxAmountPerStock    float64 `json:"max_amount_per_stock" bson:"max_amount_per_stock"`
+	MaxAmountPerStock float64 `json:"max_amount_per_stock" bson:"max_amount_per_stock"`
 	// MaxTradesPerStrategy caps how many trades this strategy may fire per day. 0 = no limit.
-	MaxTradesPerStrategy int32   `json:"max_trades_per_strategy" bson:"max_trades_per_strategy"`
+	MaxTradesPerStrategy int32 `json:"max_trades_per_strategy" bson:"max_trades_per_strategy"`
 }
 
 // NOTE: ElasticsearchStrategy + ToElasticsearchStrategy removed.

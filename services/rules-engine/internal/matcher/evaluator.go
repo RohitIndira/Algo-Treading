@@ -62,6 +62,7 @@ func (e *Evaluator) Evaluate(event *models.MarketEvent, strategy *models.Strateg
 	e.evaluateSentiment(event, strategy, result)
 	e.evaluateCategory(event, strategy, result)
 	e.evaluateMarketCap(event, strategy, result)
+	e.evaluateMarketCapRange(event, strategy, result)
 	e.evaluatePriceRange(event, strategy, result)
 	e.evaluatePctChange(event, strategy, result)
 	e.evaluateExchange(event, strategy, result)
@@ -85,6 +86,7 @@ func (e *Evaluator) evaluateMatchAllStrategy(event *models.MarketEvent, strategy
 		"sentiment",
 		"category",
 		"market_cap",
+		"market_cap_range",
 		"price_range",
 		"pct_change",
 		"exchange",
@@ -95,6 +97,7 @@ func (e *Evaluator) evaluateMatchAllStrategy(event *models.MarketEvent, strategy
 	result.ConditionScores["sentiment"] = 100.0
 	result.ConditionScores["category"] = 100.0
 	result.ConditionScores["market_cap"] = 100.0
+	result.ConditionScores["market_cap_range"] = 100.0
 	result.ConditionScores["price_range"] = 100.0
 	result.ConditionScores["pct_change"] = 100.0
 	result.ConditionScores["exchange"] = 100.0
@@ -206,6 +209,65 @@ func (e *Evaluator) evaluateMarketCap(event *models.MarketEvent, strategy *model
 
 	result.FailedConditions = append(result.FailedConditions, condition)
 	result.ConditionScores[condition] = 0
+}
+
+// evaluateMarketCapRange evaluates the numeric market-cap range filter (₹ crore),
+// sourced from OdinMasterData.CompanyMaster.mcap and carried on StockData.MCap.
+//
+// This is a STRICT bounded range — there is no open-ended form:
+//   - min == 0 && max == 0 → filter not set, auto-pass
+//   - otherwise            → min <= mcap <= max (both bounds inclusive)
+//
+// The gateway rejects max < min (and a min with no max) with HTTP 400, so no
+// swap or +Inf fallback is done here; an out-of-order range can only mean
+// corrupt config and is failed closed.
+//
+// This condition is independent of evaluateMarketCap (the SMALL/MID/LARGE bucket
+// filter). A strategy may set both, in which case a stock must satisfy both —
+// IsFullMatch() requires every condition to pass.
+//
+// A stock whose CompanyMaster doc has no mcap decodes to 0.0 and fails any active
+// filter: an unknown cap cannot be proven to be inside the requested band.
+func (e *Evaluator) evaluateMarketCapRange(event *models.MarketEvent, strategy *models.Strategy, result *EvaluationResult) {
+	condition := "market_cap_range"
+
+	mcap := event.StockData.MCap
+	min := strategy.Conditions.MarketCapRange.MinMcap
+	max := strategy.Conditions.MarketCapRange.MaxMcap
+
+	// Both zero → filter not configured.
+	if min == 0 && max == 0 {
+		result.MatchedConditions = append(result.MatchedConditions, condition)
+		result.ConditionScores[condition] = 100.0
+		return
+	}
+
+	// Defensive: validation rejects this at the API boundary, so it should be
+	// unreachable. Fail closed and log loudly rather than trade on bad config.
+	if max < min {
+		result.FailedConditions = append(result.FailedConditions, condition)
+		result.ConditionScores[condition] = 0
+		e.logger.Warn("market_cap_range has max < min — rejecting; strategy config is corrupt",
+			zap.Float64("min_mcap", min),
+			zap.Float64("max_mcap", max),
+			zap.String("strategy_id", strategy.StrategyID))
+		return
+	}
+
+	if mcap >= min && mcap <= max {
+		result.MatchedConditions = append(result.MatchedConditions, condition)
+		result.ConditionScores[condition] = 100.0
+		return
+	}
+
+	result.FailedConditions = append(result.FailedConditions, condition)
+	result.ConditionScores[condition] = 0
+	e.logger.Debug("market_cap_range filter excluded stock",
+		zap.String("isin", event.StockData.ISIN),
+		zap.Float64("mcap", mcap),
+		zap.Float64("min_mcap", min),
+		zap.Float64("max_mcap", max),
+		zap.String("strategy_id", strategy.StrategyID))
 }
 
 // evaluatePriceRange evaluates price range condition

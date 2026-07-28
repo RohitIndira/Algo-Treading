@@ -105,6 +105,22 @@ message StrategyConditions {
       double max_pct_change = 2;
   }
   PctChangeRange pct_change_range = 11;
+
+  // Trade value (turnover = day volume x current LTP) filter, in crores.
+  //
+  // The value is computed from the Redis market-data snapshot at evaluation
+  // time; it is NOT carried on the news event. mode makes an open-ended filter
+  // explicit instead of inferring it from a zero bound:
+  //   ""      -> filter off
+  //   "ABOVE" -> trade_value >= min_trade_value
+  //   "BELOW" -> trade_value <= max_trade_value
+  //   "RANGE" -> min_trade_value <= trade_value <= max_trade_value
+  message TradeValueFilter {
+    string mode = 1;
+    double min_trade_value = 2; // crores; ABOVE and RANGE
+    double max_trade_value = 3; // crores; BELOW and RANGE
+  }
+  TradeValueFilter trade_value_filter = 13;
   
   // Exchanges to monitor
   repeated common.Exchange exchanges = 12;

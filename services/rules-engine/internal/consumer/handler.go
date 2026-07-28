@@ -792,6 +792,30 @@ func (h *Handler) processMatch(ctx context.Context, match *models.RuleMatch, eve
 		}
 	}
 
+	// ── Trade value (liquidity) gate against live Redis data ─────────────
+	// Trade value = day volume × LTP. Neither is on the news event, so unlike
+	// every other condition this cannot be checked by matcher.Evaluator — this
+	// is the only place it can be applied on the streaming path.
+	if tvf := strategy.Conditions.TradeValueFilter; tvf.IsActive() {
+		if !IsKnownTradeValueMode(tvf.Mode) {
+			h.logger.Warn("Unknown trade_value mode — filter ignored (failing open)",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("mode", tvf.Mode))
+		}
+		if ok, tv := PassesTradeValue(tvf, md.Volume, ltp); !ok {
+			h.logger.Info("Skipping order — trade value outside configured filter",
+				zap.String("strategy_id", strategy.StrategyID),
+				zap.String("symbol", event.StockData.Symbol),
+				zap.Float64("trade_value_cr", tv),
+				zap.String("mode", tvf.Mode),
+				zap.Float64("min_trade_value_cr", tvf.Min),
+				zap.Float64("max_trade_value_cr", tvf.Max),
+				zap.Int64("volume", md.Volume),
+				zap.Float64("ltp", ltp))
+			return nil
+		}
+	}
+
 	// ── Resolve prev_close ──────────────────────────────────────────────
 	prevClose := event.MarketData.PriceMap.PrevClose
 	if prevClose <= 0 && md != nil {

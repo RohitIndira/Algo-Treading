@@ -21,10 +21,13 @@ type MarketDataResult struct {
 	PrevClose     float64
 	TickSize      float64
 	PercentChange float64
-	DPRLower      float64 // exchange daily price range lower band (0 = unavailable)
-	DPRUpper      float64 // exchange daily price range upper band (0 = unavailable)
-	Exchange      string  // which exchange the data came from ("nse" or "bse")
-	Token         int64   // the token used for the Redis key
+	// Volume is the day-cumulative traded quantity from the same Redis payload.
+	// Used with LTP to derive trade value (turnover) for the trade-value filter.
+	Volume   int64
+	DPRLower float64 // exchange daily price range lower band (0 = unavailable)
+	DPRUpper float64 // exchange daily price range upper band (0 = unavailable)
+	Exchange string  // which exchange the data came from ("nse" or "bse")
+	Token    int64   // the token used for the Redis key
 }
 
 // TickSizeCache is a concurrency-safe in-memory cache for per-stock tick sizes.
@@ -106,6 +109,7 @@ func getMarketDataFromRedis(
 			PrevClose     float64 `json:"prev_close"`
 			TickSize      float64 `json:"tick_size"`
 			PercentChange float64 `json:"percent_change"`
+			Volume        int64   `json:"volume"`
 			DPRLower      float64 `json:"dpr_lower"`
 			DPRUpper      float64 `json:"dpr_upper"`
 		}
@@ -135,6 +139,7 @@ func getMarketDataFromRedis(
 			PrevClose:     raw.PrevClose,
 			TickSize:      raw.TickSize,
 			PercentChange: raw.PercentChange,
+			Volume:        raw.Volume,
 			DPRLower:      raw.DPRLower,
 			DPRUpper:      raw.DPRUpper,
 			Exchange:      exch,

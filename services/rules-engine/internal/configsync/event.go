@@ -59,8 +59,14 @@ type ConditionsPayload struct {
 	MaxMarketCap      float64  `json:"max_market_cap"`
 	MinPriceChangePct float64  `json:"min_price_change_pct"`
 	MaxPriceChangePct float64  `json:"max_price_change_pct"`
-	Exchanges         []string `json:"exchanges"`
-	CreatedAt         int64    `json:"created_at"`
+	// Trade value (turnover) filter, ₹ crore. Mode: "" | ABOVE | BELOW | RANGE.
+	// CONTRACT: keys must match user-config's events.ConditionsPayload exactly —
+	// only the JSON names connect the two structs. Covered by mapper_test.go.
+	TradeValueMode string   `json:"trade_value_mode"`
+	MinTradeValue  float64  `json:"min_trade_value"`
+	MaxTradeValue  float64  `json:"max_trade_value"`
+	Exchanges      []string `json:"exchanges"`
+	CreatedAt      int64    `json:"created_at"`
 }
 
 // MultiLevelExitLevelPayload is the Kafka-serialised form of one exit level.

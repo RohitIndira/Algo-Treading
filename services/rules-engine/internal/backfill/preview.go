@@ -66,6 +66,17 @@ type PreviewConditions struct {
 	Categories     []string `json:"categories"`
 	MarketCapTypes []string `json:"market_cap_types"`
 	Exchanges      []string `json:"exchanges"`
+	// MinMarketCap / MaxMarketCap are the numeric market-cap band in ₹ crore
+	// (OdinMasterData.CompanyMaster.mcap). Strict bounded range: both 0 = no
+	// filter, otherwise min <= mcap <= max. Independent of MarketCapTypes —
+	// when both are set a stock must satisfy both.
+	MinMarketCap float64 `json:"min_market_cap"`
+	MaxMarketCap float64 `json:"max_market_cap"`
+	// Trade value (turnover = volume × LTP) filter, ₹ crore.
+	// Mode: "" = off | "ABOVE" | "BELOW" | "RANGE".
+	TradeValueMode string  `json:"trade_value_mode"`
+	MinTradeValue  float64 `json:"min_trade_value"`
+	MaxTradeValue  float64 `json:"max_trade_value"`
 	// MinPriceChangePct / MaxPriceChangePct filter on the live (current-day) price
 	// change %. In [min,max] → place now; below min → price-monitoring candidate;
 	// above max (when max>0) → excluded. Both 0 → no filter (everything places now).
@@ -86,17 +97,25 @@ type previewRequest struct {
 
 // PreviewItem is one matched, affordable, deduped stock priced at live LTP.
 type PreviewItem struct {
-	CompanyName    string  `json:"company_name"`
-	Symbol         string  `json:"symbol,omitempty"`
-	NSECode        int64   `json:"nse_code,omitempty"`
-	ISIN           string  `json:"isin"`
-	Sentiment      string  `json:"sentiment"`
-	NewsCategory   string  `json:"category"` // news category (e.g. "Order Wins")
-	ImpactScore    float64 `json:"impact_score"`
-	Timestamp      string  `json:"timestamp"`
-	ShortSummary   string  `json:"short_summary,omitempty"`
-	LTP            float64 `json:"ltp"`
-	PctChange      float64 `json:"pct_change"` // live current-day price change %
+	CompanyName  string  `json:"company_name"`
+	Symbol       string  `json:"symbol,omitempty"`
+	NSECode      int64   `json:"nse_code,omitempty"`
+	ISIN         string  `json:"isin"`
+	Sentiment    string  `json:"sentiment"`
+	NewsCategory string  `json:"category"` // news category (e.g. "Order Wins")
+	ImpactScore  float64 `json:"impact_score"`
+	Timestamp    string  `json:"timestamp"`
+	ShortSummary string  `json:"short_summary,omitempty"`
+	// MCap is the company's market cap in ₹ crore (CompanyMaster.mcap), shown so
+	// the user can see why a stock passed the market-cap filters.
+	MCap     float64 `json:"mcap"`
+	MCapType string  `json:"mcaptype,omitempty"`
+	// TradeValue is turnover (day volume × LTP) in ₹ crore, shown so the user can
+	// see the liquidity behind each row.
+	TradeValue float64 `json:"trade_value"`
+	Volume     int64   `json:"volume"`
+	LTP        float64 `json:"ltp"`
+	PctChange  float64 `json:"pct_change"` // live current-day price change %
 	// Bucket is "place" (order fires now at live LTP) or "monitor" (below the Min%
 	// range — a price watch that triggers at TargetPrice when the move reaches Min%).
 	Bucket         string  `json:"bucket"`
@@ -130,7 +149,7 @@ type amnSnapshot struct {
 	builtAt time.Time
 	fromStr string
 	toStr   string
-	cands   []snapCandidate            // NSE-resolved news in dt_tm order
+	cands   []snapCandidate                      // NSE-resolved news in dt_tm order
 	md      map[int64]*consumer.MarketDataResult // live market data keyed by NSE token
 }
 
@@ -328,6 +347,7 @@ func (pr *PreviewRunner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	seen := make(map[string]struct{}, len(snap.cands)) // dedupe per stock (first match wins)
 	var totalInvested float64
 	matched, noPrice, aboveMax, unaffordable := 0, 0, 0, 0
+	tradeValueFiltered := 0
 
 	for _, c := range snap.cands {
 		if _, dup := seen[c.doc.ISIN]; dup {
@@ -345,6 +365,18 @@ func (pr *PreviewRunner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if md == nil {
 			noPrice++
 			continue
+		}
+
+		// Trade value (liquidity) gate. Applied here — before the tick-rounding and
+		// affordability math below — because it is a single multiply-and-compare and
+		// rejecting early skips the per-row work. Uses the same helper as the live
+		// handler and the real backfill so the preview cannot disagree with them.
+		tradeValueCr := consumer.TradeValueCr(md.Volume, md.LTP)
+		if tvf := evalStrategy.Conditions.TradeValueFilter; tvf.IsActive() {
+			if ok, _ := consumer.PassesTradeValue(tvf, md.Volume, md.LTP); !ok {
+				tradeValueFiltered++
+				continue
+			}
 		}
 
 		bucket, target := classifyPctChange(req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
@@ -381,6 +413,10 @@ func (pr *PreviewRunner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ImpactScore:    float64(c.doc.ImpactScoreInt32()),
 			Timestamp:      c.doc.DtTm.UTC().Format("02 Jan 15:04"),
 			ShortSummary:   c.doc.ShortSummary,
+			MCap:           c.co.MCap,
+			MCapType:       c.co.MCapType,
+			TradeValue:     tradeValueCr,
+			Volume:         md.Volume,
 			LTP:            md.LTP,
 			PctChange:      md.PercentChange,
 			Bucket:         bucket,
@@ -401,6 +437,7 @@ func (pr *PreviewRunner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		zap.Int("matched", matched),
 		zap.Int("no_price", noPrice),
 		zap.Int("above_max", aboveMax),
+		zap.Int("trade_value_filtered", tradeValueFiltered),
 		zap.Int("unaffordable", unaffordable),
 		zap.Int("returned", len(items)),
 		zap.Float64("snapshot_age_sec", time.Since(snap.builtAt).Seconds()))
@@ -428,6 +465,17 @@ func (pr *PreviewRunner) buildEvalStrategy(c PreviewConditions) *models.Strategy
 			Categories:     c.Categories,
 			MarketCapTypes: c.MarketCapTypes,
 			Exchanges:      c.Exchanges,
+			MarketCapRange: models.MarketCapRange{
+				MinMcap: c.MinMarketCap,
+				MaxMcap: c.MaxMarketCap,
+			},
+			// Not read by the matcher (volume/LTP are absent from the event) —
+			// the preview loop applies it directly from live snapshot data.
+			TradeValueFilter: models.TradeValueFilter{
+				Mode: c.TradeValueMode,
+				Min:  c.MinTradeValue,
+				Max:  c.MaxTradeValue,
+			},
 		},
 	}
 }

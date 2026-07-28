@@ -489,6 +489,14 @@ func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondit
 		cond.MaxPriceChangePct = &proto.PctChangeRange.MaxPctChange
 	}
 
+	// Trade value filter. Mode carries the operator, so all three fields are set
+	// together and read back together (see modelConditionsToProto).
+	if proto.TradeValueFilter != nil {
+		cond.TradeValueMode = &proto.TradeValueFilter.Mode
+		cond.MinTradeValue = &proto.TradeValueFilter.MinTradeValue
+		cond.MaxTradeValue = &proto.TradeValueFilter.MaxTradeValue
+	}
+
 	return cond
 }
 
@@ -846,7 +854,26 @@ func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditi
 		}
 	}
 
+	// Trade value filter. Keyed off mode rather than requiring all three pointers:
+	// ABOVE only populates min and BELOW only populates max, so an
+	// all-non-nil guard would silently drop those two modes.
+	if model.TradeValueMode != nil && *model.TradeValueMode != "" {
+		cond.TradeValueFilter = &pb.StrategyConditions_TradeValueFilter{
+			Mode:          *model.TradeValueMode,
+			MinTradeValue: derefFloat64(model.MinTradeValue),
+			MaxTradeValue: derefFloat64(model.MaxTradeValue),
+		}
+	}
+
 	return cond
+}
+
+// derefFloat64 returns the pointed-to value, or 0 when nil.
+func derefFloat64(v *float64) float64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {

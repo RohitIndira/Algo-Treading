@@ -142,6 +142,13 @@ func protoToModel(ps *proto.Strategy) (*models.StrategyConfig, error) {
 		if ps.Conditions.MarketCapRange != nil {
 			m.Conditions.MarketCapRange = models.MarketCapRange{MinMcap: ps.Conditions.MarketCapRange.MinMcap, MaxMcap: ps.Conditions.MarketCapRange.MaxMcap}
 		}
+		if tv := ps.Conditions.TradeValueFilter; tv != nil {
+			m.Conditions.TradeValueFilter = models.TradeValueFilter{
+				Mode: tv.Mode,
+				Min:  tv.MinTradeValue,
+				Max:  tv.MaxTradeValue,
+			}
+		}
 	}
 
 	if ps.TradeConfig != nil {

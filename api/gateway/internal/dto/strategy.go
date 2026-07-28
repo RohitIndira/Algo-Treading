@@ -72,6 +72,12 @@ type StrategyConditions struct {
 	MaxMarketCap      float64  `json:"max_market_cap"`
 	MinPriceChangePct float64  `json:"min_price_change_pct"`
 	MaxPriceChangePct float64  `json:"max_price_change_pct"`
+	// Trade value (turnover = day volume × current LTP) filter, in ₹ crore.
+	// TradeValueMode: "" = off | "ABOVE" (uses min) | "BELOW" (uses max) |
+	// "RANGE" (uses both). Validated by validateConditions.
+	TradeValueMode    string   `json:"trade_value_mode"`
+	MinTradeValue     float64  `json:"min_trade_value"`
+	MaxTradeValue     float64  `json:"max_trade_value"`
 	Exchanges         []string `json:"exchanges"`
 }
 
