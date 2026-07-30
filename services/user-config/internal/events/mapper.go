@@ -104,34 +104,15 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 		Version:      uint64(s.Version),
 		CreatedAt:    s.CreatedAt.UnixNano(),
 		UpdatedAt:    s.UpdatedAt.UnixNano(),
-		Conditions: &ConditionsPayload{
-			Sentiments:     []string{},
-			Categories:     []string{},
-			StockCodes:     []int64{},
-			MarketCapTypes: []string{},
-			Exchanges:      []string{},
-		},
-		TradeConfig: TradeConfigPayload{},
-		RiskLimits:  &RiskLimitsPayload{},
+		Conditions:   &ConditionsPayload{},
+		TradeConfig:  TradeConfigPayload{},
+		// RiskLimits:  &RiskLimitsPayload{},
 	}
 
-	// Conditions
+	// Conditions — news-specific fields dropped 2026-07-20; only timestamp survives.
 	if s.Conditions != nil {
 		p.Conditions = &ConditionsPayload{
-			MatchAllNews:      s.Conditions.MatchAllNews,
-			ImpactScoreMin:    s.Conditions.ImpactScoreMin,
-			ImpactScoreMax:    s.Conditions.ImpactScoreMax,
-			Sentiments:        nilSafeStringSlice([]string(s.Conditions.Sentiments)),
-			Categories:        nilSafeStringSlice([]string(s.Conditions.Categories)),
-			StockCodes:        nilSafeInt64Slice([]int64(s.Conditions.StockCodes)),
-			MarketCapTypes:    nilSafeStringSlice([]string(s.Conditions.MarketCapTypes)),
-			MinMarketCap:      valueOrZeroFloat64(s.Conditions.MinMarketCap),
-			MaxMarketCap:      valueOrZeroFloat64(s.Conditions.MaxMarketCap),
-			MinPriceChangePct: valueOrZeroFloat64(s.Conditions.MinPriceChangePct),
-			MaxPriceChangePct: valueOrZeroFloat64(s.Conditions.MaxPriceChangePct),
-			MinVolume:         valueOrZeroInt64(s.Conditions.MinVolume),
-			Exchanges:         nilSafeStringSlice([]string(s.Conditions.Exchanges)),
-			CreatedAt:         s.Conditions.CreatedAt.UnixNano(),
+			CreatedAt: s.Conditions.CreatedAt.UnixNano(),
 		}
 	}
 
@@ -154,44 +135,23 @@ func toPayload(s *models.Strategy) *StrategyPayload {
 	}
 
 	// Risk limits
-	if s.RiskLimits != nil {
-		p.RiskLimits = &RiskLimitsPayload{
-			MaxDailyTrades:          valueOrZeroInt32(s.RiskLimits.MaxDailyTrades),
-			MaxPerTradeRisk:         valueOrZeroFloat64(s.RiskLimits.MaxPerTradeRisk),
-			MaxPortfolioExposurePct: valueOrZeroFloat64(s.RiskLimits.MaxPortfolioExposurePct),
-			MaxLossPerDay:           valueOrZeroFloat64(s.RiskLimits.MaxLossPerDay),
-			EnableRiskChecks:        s.RiskLimits.EnableRiskChecks,
-			EnableAutoSquareOff:     s.RiskLimits.EnableAutoSquareOff,
-			AutoSquareOffTime:       s.RiskLimits.AutoSquareOffTime,
-			CreatedAt:               s.RiskLimits.CreatedAt.UnixNano(),
-		}
-	}
+	// if s.RiskLimits != nil {
+	// 	p.RiskLimits = &RiskLimitsPayload{
+	// 		MaxDailyTrades:          valueOrZeroInt32(s.RiskLimits.MaxDailyTrades),
+	// 		MaxPerTradeRisk:         valueOrZeroFloat64(s.RiskLimits.MaxPerTradeRisk),
+	// 		MaxPortfolioExposurePct: valueOrZeroFloat64(s.RiskLimits.MaxPortfolioExposurePct),
+	// 		MaxLossPerDay:           valueOrZeroFloat64(s.RiskLimits.MaxLossPerDay),
+	// 		EnableRiskChecks:        s.RiskLimits.EnableRiskChecks,
+	// 		EnableAutoSquareOff:     s.RiskLimits.EnableAutoSquareOff,
+	// 		AutoSquareOffTime:       s.RiskLimits.AutoSquareOffTime,
+	// 		CreatedAt:               s.RiskLimits.CreatedAt.UnixNano(),
+	// 	}
+	// }
 
 	return p
 }
 
-func nilSafeStringSlice(in []string) []string {
-	if in == nil {
-		return []string{}
-	}
-	return in
-}
-
-func nilSafeInt64Slice(in []int64) []int64 {
-	if in == nil {
-		return []int64{}
-	}
-	return in
-}
-
 func valueOrZeroFloat64(v *float64) float64 {
-	if v == nil {
-		return 0
-	}
-	return *v
-}
-
-func valueOrZeroInt64(v *int64) int64 {
 	if v == nil {
 		return 0
 	}

@@ -34,14 +34,14 @@ func mapPositionSizingMode(m string) pb.PositionSizingMode {
 
 func mapStrategyType(t string) pb.StrategyType {
 	switch strings.ToUpper(t) {
-	case "52W_BREAKOUT":
-		return pb.StrategyType_WEEK52_BREAKOUT
 	case "MANTHAN":
 		return pb.StrategyType_MANTHAN
-	case "NEWS":
-		return pb.StrategyType_NEWS
 	default:
-		return pb.StrategyType_NEWS
+		// MANTHAN is the only live strategy type; an empty or unknown
+		// strategy_type defaults to it (user-config coerces everything to
+		// MANTHAN downstream anyway). NEWS / 52W_BREAKOUT were retired
+		// 2026-07-20 — do not default to them.
+		return pb.StrategyType_MANTHAN
 	}
 }
 

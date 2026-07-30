@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/apperr"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/tradeexec"
@@ -286,9 +287,11 @@ func min(a, b int) int {
 
 // CreateStrategy creates a new strategy
 func (s *StrategyService) CreateStrategy(ctx context.Context, req *models.CreateStrategyRequest) (*models.Strategy, error) {
-	// Validate request
+	// Validate request. validateCreateRequest already wraps failures with
+	// apperr.ErrValidation (message begins "validation failed: …"), so return
+	// it as-is rather than double-prefixing.
 	if err := s.validateCreateRequest(ctx, req); err != nil {
-		return nil, fmt.Errorf("validation failed: %w", err)
+		return nil, err
 	}
 
 	// Create strategy in database (includes Outbox insertion)
@@ -337,15 +340,18 @@ func (s *StrategyService) ListUserStrategies(ctx context.Context, userID string,
 
 // UpdateStrategy updates a strategy
 func (s *StrategyService) UpdateStrategy(ctx context.Context, req *models.UpdateStrategyRequest) (*models.Strategy, error) {
-	// Validate request
+	// Validate request. validateUpdateRequest wraps failures with
+	// apperr.ErrValidation; return as-is rather than double-prefixing.
 	if err := s.validateUpdateRequest(req); err != nil {
-		return nil, fmt.Errorf("validation failed: %w", err)
+		return nil, err
 	}
 
-	// Update strategy in database (includes Outbox insertion)
+	// Update strategy in database (includes Outbox insertion). Pass the repo
+	// error up unwrapped — it already carries a clean typed sentinel
+	// (apperr.ErrNotFound / ErrVersionConflict) or a repo-prefixed DB error.
 	strategy, err := s.repo.Update(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update strategy: %w", err)
+		return nil, err
 	}
 
 	return strategy, nil
@@ -428,7 +434,7 @@ func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UU
 	// position_handling on the outbox so downstream consumers know
 	// whether we already placed exit orders.
 	if err := s.repo.Delete(ctx, strategyID, userID, positionHandlingWireValue(params)); err != nil {
-		return positionsExited, fmt.Errorf("failed to delete strategy: %w", err)
+		return positionsExited, err
 	}
 
 	return positionsExited, nil
@@ -438,7 +444,7 @@ func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UU
 func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.UUID, userID string) (*models.Strategy, error) {
 	// Activate in database
 	if err := s.repo.Activate(ctx, strategyID, userID); err != nil {
-		return nil, fmt.Errorf("failed to activate strategy: %w", err)
+		return nil, err
 	}
 
 	// Get updated strategy
@@ -466,7 +472,7 @@ func (s *StrategyService) DeactivateStrategy(ctx context.Context, strategyID uui
 	// Deactivate in database. Stamp position_handling on the outbox
 	// so trade-execution's consumer branches correctly.
 	if err := s.repo.Deactivate(ctx, strategyID, userID, positionHandlingWireValue(params)); err != nil {
-		return nil, positionsExited, fmt.Errorf("failed to deactivate strategy: %w", err)
+		return nil, positionsExited, err
 	}
 
 	// Get updated strategy
@@ -488,25 +494,19 @@ func (s *StrategyService) ListAllActiveStrategies(ctx context.Context, limit, of
 	return s.repo.ListAllActive(ctx, limit, offset)
 }
 
-// DeactivateAllActiveStrategies deactivates every active strategy (used by the
-// end-of-day scheduler at market close). Returns the count of strategies deactivated.
-func (s *StrategyService) DeactivateAllActiveStrategies(ctx context.Context) (int, error) {
-	return s.repo.DeactivateAllActive(ctx)
-}
-
 // validateCreateRequest validates a create strategy request.
 // Takes ctx because HFT_BIDDING may do an ext-Redis lookup to resolve
 // symbol → ISIN when the caller supplies only a symbol.
 func (s *StrategyService) validateCreateRequest(ctx context.Context, req *models.CreateStrategyRequest) error {
 	if req.UserID == "" {
-		return fmt.Errorf("user_id is required")
+		return fmt.Errorf("%w: user_id is required", apperr.ErrValidation)
 	}
 	if req.StrategyName == "" {
-		return fmt.Errorf("strategy_name is required")
+		return fmt.Errorf("%w: strategy_name is required", apperr.ErrValidation)
 	}
 	// Default strategy type
 	if req.StrategyType == "" {
-		req.StrategyType = models.StrategyTypeNews
+		req.StrategyType = models.StrategyTypeManthan
 	}
 
 	// Default trading mode
@@ -514,118 +514,20 @@ func (s *StrategyService) validateCreateRequest(ctx context.Context, req *models
 		req.TradingMode = models.TradingModePaper
 	}
 	if req.TradingMode != models.TradingModePaper && req.TradingMode != models.TradingModeLive {
-		return fmt.Errorf("invalid trading_mode: %s", req.TradingMode)
+		return fmt.Errorf("%w: invalid trading_mode: %s", apperr.ErrValidation, req.TradingMode)
 	}
 
 	if req.TradeConfig == nil {
-		return fmt.Errorf("trade_config is required")
-	}
-
-	// --- 52W_BREAKOUT strategy: production-grade validation ---
-	if req.StrategyType == models.StrategyType52WBreakout {
-
-		// Strategy name: 3-100 chars, no SQL injection
-		if len(req.StrategyName) < 3 {
-			return fmt.Errorf("strategy_name must be at least 3 characters")
-		}
-		if len(req.StrategyName) > 100 {
-			return fmt.Errorf("strategy_name must be less than 100 characters")
-		}
-
-		// Total capital: min ₹10,000, max ₹10 crore
-		if req.TradeConfig.TotalCapital != nil {
-			cap := *req.TradeConfig.TotalCapital
-			if cap < 10000 {
-				return fmt.Errorf("total_capital must be at least ₹10,000")
-			}
-			if cap > 100000000 { // 10 crore
-				return fmt.Errorf("total_capital cannot exceed ₹10,00,00,000")
-			}
-		}
-
-		// Max positions: 1-100
-		if req.TradeConfig.MaxPositions != nil {
-			pos := *req.TradeConfig.MaxPositions
-			if pos < 1 || pos > 100 {
-				return fmt.Errorf("max_positions must be between 1 and 100")
-			}
-		}
-
-		// Stop loss: 0.1% - 50%
-		if req.TradeConfig.StopLossPct != nil {
-			sl := *req.TradeConfig.StopLossPct
-			if sl < 0.1 || sl > 50 {
-				return fmt.Errorf("stop_loss_pct must be between 0.1%% and 50%%")
-			}
-		} else {
-			return fmt.Errorf("stop_loss_pct is required")
-		}
-
-		// Take profit: 0.1% - 100%
-		if req.TradeConfig.TakeProfitPct != nil {
-			tp := *req.TradeConfig.TakeProfitPct
-			if tp < 0.1 || tp > 100 {
-				return fmt.Errorf("take_profit_pct must be between 0.1%% and 100%%")
-			}
-		} else {
-			return fmt.Errorf("take_profit_pct is required")
-		}
-
-		// Per stock amount must be meaningful (at least ₹100)
-		// Set defaults
-		if req.TradeConfig.PositionSizingMode == "" {
-			req.TradeConfig.PositionSizingMode = "EMA_ALLOCATION"
-		}
-		if req.TradeConfig.TotalCapital == nil {
-			defaultCap := 100000.0
-			req.TradeConfig.TotalCapital = &defaultCap
-		}
-		if req.TradeConfig.MaxPositions == nil {
-			defaultPos := int32(25)
-			req.TradeConfig.MaxPositions = &defaultPos
-		}
-
-		// Auto-calculate per_stock_amount
-		perStock := *req.TradeConfig.TotalCapital / float64(*req.TradeConfig.MaxPositions)
-		if perStock < 100 {
-			return fmt.Errorf("per_stock_amount too low (₹%.0f). Increase total_capital or reduce max_positions", perStock)
-		}
-		req.TradeConfig.PerStockAmount = &perStock
-
-		// Fixed system defaults (user doesn't control these for 52W)
-		req.TradeConfig.OrderType = "MARKET"
-		req.TradeConfig.ProductType = "INTRADAY"
-		req.TradeConfig.Validity = "DAY"
-		req.TradeConfig.Exchange = "NSE"
-		req.TradeConfig.OrderSide = "BUY"
-		req.TradeConfig.StopLossType = "FIXED"
-		if req.TradeConfig.Quantity <= 0 {
-			req.TradeConfig.Quantity = 1
-		}
-
-		// Empty conditions (52W doesn't use news conditions)
-		if req.Conditions == nil {
-			req.Conditions = &models.StrategyCondition{}
-		}
-
-		// Default risk limits for 52W (no EOD square-off for positional)
-		if req.RiskLimits == nil {
-			req.RiskLimits = &models.RiskLimits{
-				EnableRiskChecks:    true,
-				EnableAutoSquareOff: false, // Positional — no auto square-off
-			}
-		}
-
-		return nil
+		return fmt.Errorf("%w: trade_config is required", apperr.ErrValidation)
 	}
 
 	// --- MANTHAN strategy: minimal user input, backend fills everything ---
 	if req.StrategyType == models.StrategyTypeManthan {
 		if len(req.StrategyName) < 3 {
-			return fmt.Errorf("strategy_name must be at least 3 characters")
+			return fmt.Errorf("%w: strategy_name must be at least 3 characters", apperr.ErrValidation)
 		}
 		if len(req.StrategyName) > 100 {
-			return fmt.Errorf("strategy_name must be less than 100 characters")
+			return fmt.Errorf("%w: strategy_name must be less than 100 characters", apperr.ErrValidation)
 		}
 
 		// Total capital: min ₹5,00,000 (5 lakh), no upper limit
@@ -633,11 +535,11 @@ func (s *StrategyService) validateCreateRequest(ctx context.Context, req *models
 			req.TradeConfig = &models.TradeConfig{}
 		}
 		if req.TradeConfig.TotalCapital == nil {
-			return fmt.Errorf("total_capital is required (minimum ₹5,00,000)")
+			return fmt.Errorf("%w: total_capital is required (minimum ₹5,00,000)", apperr.ErrValidation)
 		}
 		cap := *req.TradeConfig.TotalCapital
 		if cap < 500000 {
-			return fmt.Errorf("total_capital must be at least ₹5,00,000 for Manthan strategy")
+			return fmt.Errorf("%w: total_capital must be at least ₹5,00,000 for Manthan strategy", apperr.ErrValidation)
 		}
 
 		// Max positions: ≤25L → 25 stocks, >25L → 50 stocks
@@ -671,101 +573,47 @@ func (s *StrategyService) validateCreateRequest(ctx context.Context, req *models
 			req.Conditions = &models.StrategyCondition{}
 		}
 
-		// Risk limits — positional, no auto square-off
+		// Risk limits — placeholder row only (risk fields dropped 2026-07-30).
 		if req.RiskLimits == nil {
-			req.RiskLimits = &models.RiskLimits{
-				EnableRiskChecks:    true,
-				EnableAutoSquareOff: false,
-			}
+			req.RiskLimits = &models.RiskLimits{}
 		}
 
 		return nil
 	}
 
-	// --- NEWS strategy: existing validation ---
-	if req.Conditions == nil {
-		return fmt.Errorf("conditions are required")
-	}
-	if req.RiskLimits == nil {
-		return fmt.Errorf("risk_limits are required")
-	}
-
-	// Validate conditions
-	if req.Conditions.ImpactScoreMin < 0 || req.Conditions.ImpactScoreMin > 10 {
-		return fmt.Errorf("impact_score_min must be between 0 and 10")
-	}
-	if req.Conditions.ImpactScoreMax < 0 || req.Conditions.ImpactScoreMax > 10 {
-		return fmt.Errorf("impact_score_max must be between 0 and 10")
-	}
-	if req.Conditions.ImpactScoreMin > req.Conditions.ImpactScoreMax {
-		return fmt.Errorf("impact_score_min cannot be greater than impact_score_max")
-	}
-
-	// Validate trade config
-	if req.TradeConfig.Quantity <= 0 {
-		return fmt.Errorf("quantity must be greater than 0")
-	}
-	if req.TradeConfig.OrderType == "" {
-		return fmt.Errorf("order_type is required")
-	}
-	if req.TradeConfig.Exchange == "" {
-		return fmt.Errorf("exchange is required")
-	}
-	if req.TradeConfig.OrderSide != "BUY" && req.TradeConfig.OrderSide != "SELL" {
-		return fmt.Errorf("order_side must be BUY or SELL")
-	}
-
-	// Validate stop loss / take profit
-	if req.TradeConfig.StopLossPct != nil && *req.TradeConfig.StopLossPct < 0 {
-		return fmt.Errorf("stop_loss_pct must be non-negative")
-	}
-	if req.TradeConfig.TakeProfitPct != nil && *req.TradeConfig.TakeProfitPct < 0 {
-		return fmt.Errorf("take_profit_pct must be non-negative")
-	}
-
-	return nil
+	// Unknown strategy type — MANTHAN is the only supported type after 2026-07-20.
+	return fmt.Errorf("%w: unsupported strategy_type: %s (only MANTHAN is supported)", apperr.ErrValidation, req.StrategyType)
 }
 
 // validateUpdateRequest validates an update strategy request
 func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyRequest) error {
 	if req.StrategyID == uuid.Nil {
-		return fmt.Errorf("strategy_id is required")
+		return fmt.Errorf("%w: strategy_id is required", apperr.ErrValidation)
 	}
 	if req.UserID == "" {
-		return fmt.Errorf("user_id is required")
+		return fmt.Errorf("%w: user_id is required", apperr.ErrValidation)
 	}
 	if req.Version < 1 {
-		return fmt.Errorf("version must be greater than 0")
+		return fmt.Errorf("%w: version must be greater than 0", apperr.ErrValidation)
 	}
 
-	// Validate optional fields if provided
-	if req.Conditions != nil {
-		if req.Conditions.ImpactScoreMin < 0 || req.Conditions.ImpactScoreMin > 10 {
-			return fmt.Errorf("impact_score_min must be between 0 and 10")
-		}
-		if req.Conditions.ImpactScoreMax < 0 || req.Conditions.ImpactScoreMax > 10 {
-			return fmt.Errorf("impact_score_max must be between 0 and 10")
-		}
-		if req.Conditions.ImpactScoreMin > req.Conditions.ImpactScoreMax {
-			return fmt.Errorf("impact_score_min cannot be greater than impact_score_max")
-		}
-	}
+	// Conditions has no user-facing fields after 2026-07-20 cleanup — nothing to validate.
 
 	if req.TradeConfig != nil {
 		if req.TradeConfig.Quantity <= 0 {
-			return fmt.Errorf("quantity must be greater than 0")
+			return fmt.Errorf("%w: quantity must be greater than 0", apperr.ErrValidation)
 		}
 		if req.TradeConfig.StopLossPct != nil && *req.TradeConfig.StopLossPct < 0 {
-			return fmt.Errorf("stop_loss_pct must be non-negative")
+			return fmt.Errorf("%w: stop_loss_pct must be non-negative", apperr.ErrValidation)
 		}
 		if req.TradeConfig.TakeProfitPct != nil && *req.TradeConfig.TakeProfitPct < 0 {
-			return fmt.Errorf("take_profit_pct must be non-negative")
+			return fmt.Errorf("%w: take_profit_pct must be non-negative", apperr.ErrValidation)
 		}
 	}
 
 	if req.TradingMode != nil {
 		if *req.TradingMode != models.TradingModePaper && *req.TradingMode != models.TradingModeLive {
-			return fmt.Errorf("invalid trading_mode: %s", *req.TradingMode)
+			return fmt.Errorf("%w: invalid trading_mode: %s", apperr.ErrValidation, *req.TradingMode)
 		}
 	}
 

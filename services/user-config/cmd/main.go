@@ -16,7 +16,6 @@ import (
 	"github.com/RohitIndira/Algo-Treading/pkg/logger"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/config"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
-	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/scheduler"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/server"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/tradeexec"
@@ -154,12 +153,9 @@ func main() {
 		lgr.Info("Outbox worker started")
 	}
 
-	// Start EOD deactivation scheduler (deactivates all active strategies at 15:30 IST)
-	eodScheduler := scheduler.NewEODDeactivationScheduler(svc)
-	eodCtx, eodCancel := context.WithCancel(context.Background())
-	defer eodCancel()
-	go eodScheduler.Start(eodCtx)
-	lgr.Info("EOD deactivation scheduler started")
+	// NOTE: the old EOD deactivation scheduler was removed 2026-07-30 — it only
+	// targeted the retired 'NEWS' strategy_type (dead for MANTHAN), and the live
+	// auto-square-off runs in trade-execution's own scheduler.
 
 	// Initialize gRPC server
 	grpcServer := grpc.NewServer(

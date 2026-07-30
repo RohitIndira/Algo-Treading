@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/apperr"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -28,10 +29,18 @@ func (r *StrategyRepository) ListAllActive(ctx context.Context, limit int, offse
 	}
 
 	strategies := []*models.Strategy{}
+	// stopped_at IS NULL is critical: a STOPPED strategy (terminal) must NOT be
+	// returned here. rules-engine's bulk-load forces Active=true on every row it
+	// receives (startup/bootstrap.go), so without this guard a strategy the user
+	// explicitly Stopped would resurrect and start trading again on the next
+	// rules-engine restart. See docs/known_issues_user_config.md for the still-open
+	// PAUSED-resurrection case, which needs a coordinated rules-engine change.
 	query := `
 		SELECT *
 		FROM strategies
-		WHERE (active = true OR strategy_type = 'MANTHAN') AND deleted_at IS NULL
+		WHERE (active = true OR strategy_type = 'MANTHAN')
+		  AND deleted_at IS NULL
+		  AND stopped_at IS NULL
 		ORDER BY updated_at DESC
 		LIMIT $1 OFFSET $2`
 
@@ -82,7 +91,7 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 	// Insert strategy
 	strategyType := req.StrategyType
 	if strategyType == "" {
-		strategyType = models.StrategyTypeNews
+		strategyType = models.StrategyTypeManthan
 	}
 
 	strategy := &models.Strategy{
@@ -109,25 +118,16 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		return nil, fmt.Errorf("failed to insert strategy: %w", err)
 	}
 
-	// Insert conditions
+	// Insert conditions — placeholder row only (news-specific fields dropped 2026-07-20)
 	if req.Conditions != nil {
 		conditionID := uuid.New()
 		condQuery := `
-			INSERT INTO strategy_conditions (
-				condition_id, strategy_id, match_all_news, impact_score_min, impact_score_max,
-				sentiments, news_categories, stock_codes, min_market_cap, max_market_cap,
-				market_cap_types, min_price_change_pct, max_price_change_pct, min_volume, exchanges
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			INSERT INTO strategy_conditions (condition_id, strategy_id)
+			VALUES ($1, $2)
 			RETURNING created_at`
 
-		err = tx.QueryRowxContext(ctx, condQuery,
-			conditionID, strategy.StrategyID, req.Conditions.MatchAllNews,
-			req.Conditions.ImpactScoreMin, req.Conditions.ImpactScoreMax,
-			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
-			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap, req.Conditions.MarketCapTypes,
-			req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
-			req.Conditions.MinVolume, req.Conditions.Exchanges,
-		).Scan(&req.Conditions.CreatedAt)
+		err = tx.QueryRowxContext(ctx, condQuery, conditionID, strategy.StrategyID).
+			Scan(&req.Conditions.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert conditions: %w", err)
 		}
@@ -164,23 +164,17 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		strategy.TradeConfig = req.TradeConfig
 	}
 
-	// Insert risk limits
+	// Insert risk limits — placeholder row only (7 risk fields dropped 2026-07-30,
+	// migration 017). Kept one row per strategy for envelope/read parity.
 	if req.RiskLimits != nil {
 		riskLimitID := uuid.New()
 		riskQuery := `
-			INSERT INTO risk_limits (
-				risk_limit_id, strategy_id, max_daily_trades, max_per_trade_risk,
-				max_portfolio_exposure_pct, max_loss_per_day, enable_risk_checks,
-				enable_auto_square_off, auto_square_off_time
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			INSERT INTO risk_limits (risk_limit_id, strategy_id)
+			VALUES ($1, $2)
 			RETURNING created_at`
 
-		err = tx.QueryRowxContext(ctx, riskQuery,
-			riskLimitID, strategy.StrategyID, req.RiskLimits.MaxDailyTrades,
-			req.RiskLimits.MaxPerTradeRisk, req.RiskLimits.MaxPortfolioExposurePct,
-			req.RiskLimits.MaxLossPerDay, req.RiskLimits.EnableRiskChecks,
-			req.RiskLimits.EnableAutoSquareOff, req.RiskLimits.AutoSquareOffTime,
-		).Scan(&req.RiskLimits.CreatedAt)
+		err = tx.QueryRowxContext(ctx, riskQuery, riskLimitID, strategy.StrategyID).
+			Scan(&req.RiskLimits.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert risk limits: %w", err)
 		}
@@ -220,7 +214,7 @@ func (r *StrategyRepository) GetByID(ctx context.Context, strategyID uuid.UUID, 
 	err := r.db.GetContext(ctx, strategy, query, strategyID, userID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("strategy not found")
+			return nil, fmt.Errorf("%w (id=%s)", apperr.ErrNotFound, strategyID)
 		}
 		return nil, fmt.Errorf("failed to get strategy: %w", err)
 	}
@@ -332,7 +326,13 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 	}
 	defer tx.Rollback()
 
-	// Update strategy with optimistic locking
+	// Update strategy with optimistic locking. RETURNING carries the FULL
+	// strategies row — including the already-incremented version (N+1) and
+	// strategy_type — so we can build the outbox payload + response entirely
+	// from in-transaction state. Do NOT reload via r.GetByID afterwards: that
+	// uses a separate, non-transactional connection which under READ COMMITTED
+	// can't see this uncommitted UPDATE, so it would publish stale data at the
+	// OLD version N (which rules-engine's version dedup then silently drops).
 	query := `
 		UPDATE strategies
 		SET strategy_name = COALESCE($1, strategy_name),
@@ -341,7 +341,7 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		    version = version + 1,
 		    updated_at = CURRENT_TIMESTAMP
 		WHERE strategy_id = $4 AND user_id = $5 AND version = $6 AND deleted_at IS NULL
-		RETURNING strategy_id, user_id, strategy_name, description, active, trading_mode, version, created_at, updated_at`
+		RETURNING strategy_id, user_id, strategy_name, description, active, strategy_type, trading_mode, version, created_at, updated_at, deleted_at, stopped_at`
 
 	strategy := &models.Strategy{}
 	err = tx.QueryRowxContext(ctx, query,
@@ -349,33 +349,30 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 	).StructScan(strategy)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("strategy not found or version mismatch")
+			// 0 rows updated: either the strategy doesn't exist for this user
+			// (404) or the optimistic-lock version didn't match (412). Split
+			// them with a same-tx read so the caller gets the right status.
+			exists, exErr := r.existsForUserTx(ctx, tx, req.StrategyID, req.UserID)
+			if exErr != nil {
+				return nil, fmt.Errorf("failed to update strategy: %w", exErr)
+			}
+			if !exists {
+				return nil, apperr.ErrNotFound
+			}
+			var currentVersion int32
+			if vErr := tx.GetContext(ctx, &currentVersion,
+				`SELECT version FROM strategies WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+				req.StrategyID, req.UserID); vErr != nil {
+				return nil, fmt.Errorf("failed to update strategy: %w", vErr)
+			}
+			return nil, fmt.Errorf("%w: current version is %d, request sent %d", apperr.ErrVersionConflict, currentVersion, req.Version)
 		}
 		return nil, fmt.Errorf("failed to update strategy: %w", err)
 	}
 
-	// Update conditions if provided
-	if req.Conditions != nil {
-		condQuery := `
-			UPDATE strategy_conditions
-			SET match_all_news = $1, impact_score_min = $2, impact_score_max = $3,
-			    sentiments = $4, news_categories = $5, stock_codes = $6,
-			    min_market_cap = $7, max_market_cap = $8, market_cap_types = $9,
-			    min_price_change_pct = $10, max_price_change_pct = $11,
-			    min_volume = $12, exchanges = $13
-			WHERE strategy_id = $14`
-
-		_, err = tx.ExecContext(ctx, condQuery,
-			req.Conditions.MatchAllNews, req.Conditions.ImpactScoreMin, req.Conditions.ImpactScoreMax,
-			req.Conditions.Sentiments, req.Conditions.Categories, req.Conditions.StockCodes,
-			req.Conditions.MinMarketCap, req.Conditions.MaxMarketCap, req.Conditions.MarketCapTypes,
-			req.Conditions.MinPriceChangePct, req.Conditions.MaxPriceChangePct,
-			req.Conditions.MinVolume, req.Conditions.Exchanges, req.StrategyID,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to update conditions: %w", err)
-		}
-	}
+	// Update conditions — no-op after 2026-07-20 (only placeholder row remains,
+	// nothing to modify). Kept the req.Conditions guard so callers can still
+	// pass a non-nil Conditions without breaking anything.
 
 	// Update trade config if provided
 	if req.TradeConfig != nil {
@@ -397,48 +394,88 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 		}
 	}
 
-	// Update risk limits if provided
-	if req.RiskLimits != nil {
-		riskQuery := `
-			UPDATE risk_limits
-			SET max_daily_trades = $1, max_per_trade_risk = $2, max_portfolio_exposure_pct = $3,
-			    max_loss_per_day = $4, enable_risk_checks = $5, enable_auto_square_off = $6,
-			    auto_square_off_time = $7
-			WHERE strategy_id = $8`
+	// Risk limits — no updatable fields after the 2026-07-30 cleanup (only the
+	// placeholder row remains). Nothing to write here.
 
-		_, err = tx.ExecContext(ctx, riskQuery,
-			req.RiskLimits.MaxDailyTrades, req.RiskLimits.MaxPerTradeRisk,
-			req.RiskLimits.MaxPortfolioExposurePct, req.RiskLimits.MaxLossPerDay,
-			req.RiskLimits.EnableRiskChecks, req.RiskLimits.EnableAutoSquareOff,
-			req.RiskLimits.AutoSquareOffTime, req.StrategyID,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to update risk limits: %w", err)
-		}
+	// Load the child rows (conditions / trade config / risk limits) via the
+	// SAME transaction so the outbox payload + response reflect the values
+	// just written in this tx — not a stale non-transactional snapshot. The
+	// MANTHAN Kafka mapper reads TradeConfig (capital, SL) off this payload,
+	// so it must be present and current.
+	if err := r.loadRelatedTx(ctx, tx, strategy); err != nil {
+		return nil, fmt.Errorf("failed to load strategy relations for outbox: %w", err)
 	}
 
-	// Reload full strategy for Outbox
-	fullStrategy, err := r.GetByID(ctx, req.StrategyID, req.UserID)
-	if err == nil {
-		// Insert into Execution Outbox
-		payload, err := json.Marshal(fullStrategy)
-		if err == nil {
-			outboxQuery := `
-				INSERT INTO execution_outbox (aggregate_id, event_type, payload)
-				VALUES ($1, $2, $3)`
-
-			_, ctxErr := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", payload)
-			if ctxErr != nil {
-				return nil, fmt.Errorf("failed to insert into execution outbox: %w", ctxErr)
-			}
-		}
+	// Insert into Execution Outbox — UNCONDITIONAL inside the tx. If the
+	// marshal or insert fails we return an error, the deferred Rollback fires,
+	// and neither the strategy update nor the event is persisted. This closes
+	// the old "commit the update but emit no event" divergence.
+	payload, err := json.Marshal(strategy)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal strategy for outbox: %w", err)
+	}
+	outboxQuery := `
+		INSERT INTO execution_outbox (aggregate_id, event_type, payload)
+		VALUES ($1, $2, $3)`
+	if _, err := tx.ExecContext(ctx, outboxQuery, req.StrategyID, "STRATEGY_UPDATED", payload); err != nil {
+		return nil, fmt.Errorf("failed to insert into execution outbox: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return fullStrategy, nil
+	return strategy, nil
+}
+
+// existsForUserTx reports whether a non-deleted strategy row exists for
+// (strategyID, userID), using the given transaction so it sees this tx's own
+// uncommitted writes and can't race a concurrent create. Used to split a
+// lifecycle UPDATE that affected 0 rows into "row genuinely missing"
+// (apperr.ErrNotFound → 404) vs "row exists but precondition failed" (version
+// mismatch / already stopped → 412).
+func (r *StrategyRepository) existsForUserTx(ctx context.Context, tx *sqlx.Tx, strategyID uuid.UUID, userID string) (bool, error) {
+	var exists bool
+	err := tx.GetContext(ctx, &exists,
+		`SELECT EXISTS(SELECT 1 FROM strategies WHERE strategy_id = $1 AND user_id = $2 AND deleted_at IS NULL)`,
+		strategyID, userID)
+	return exists, err
+}
+
+// loadRelatedTx hydrates a strategy's conditions / trade config / risk limits
+// using the provided transaction, so callers inside an open write-tx see the
+// rows as modified within that same tx (unlike r.GetByID, which reads on a
+// separate connection and cannot see uncommitted changes). A missing child row
+// (sql.ErrNoRows) is not an error — the field is simply left nil.
+func (r *StrategyRepository) loadRelatedTx(ctx context.Context, tx *sqlx.Tx, strategy *models.Strategy) error {
+	condition := &models.StrategyCondition{}
+	if err := tx.GetContext(ctx, condition, `SELECT * FROM strategy_conditions WHERE strategy_id = $1`, strategy.StrategyID); err != nil {
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("load conditions: %w", err)
+		}
+	} else {
+		strategy.Conditions = condition
+	}
+
+	tradeConfig := &models.TradeConfig{}
+	if err := tx.GetContext(ctx, tradeConfig, `SELECT * FROM trade_configs WHERE strategy_id = $1`, strategy.StrategyID); err != nil {
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("load trade config: %w", err)
+		}
+	} else {
+		strategy.TradeConfig = tradeConfig
+	}
+
+	riskLimits := &models.RiskLimits{}
+	if err := tx.GetContext(ctx, riskLimits, `SELECT * FROM risk_limits WHERE strategy_id = $1`, strategy.StrategyID); err != nil {
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("load risk limits: %w", err)
+		}
+	} else {
+		strategy.RiskLimits = riskLimits
+	}
+
+	return nil
 }
 
 // Delete deletes a strategy.
@@ -472,7 +509,15 @@ func (r *StrategyRepository) Delete(ctx context.Context, strategyID uuid.UUID, u
 	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&deletedID, &currentVersion)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return fmt.Errorf("strategy not found or already stopped")
+			// 0 rows: missing (404) vs already stopped/deleted (412).
+			exists, exErr := r.existsForUserTx(ctx, tx, strategyID, userID)
+			if exErr != nil {
+				return fmt.Errorf("failed to stop strategy: %w", exErr)
+			}
+			if !exists {
+				return apperr.ErrNotFound
+			}
+			return fmt.Errorf("%w: strategy already stopped", apperr.ErrTerminalState)
 		}
 		return fmt.Errorf("failed to stop strategy: %w", err)
 	}
@@ -519,7 +564,15 @@ func (r *StrategyRepository) Activate(ctx context.Context, strategyID uuid.UUID,
 	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return fmt.Errorf("strategy not found or already stopped (cannot resume a stopped strategy)")
+			// 0 rows: missing (404) vs stopped/deleted — cannot resume (412).
+			exists, exErr := r.existsForUserTx(ctx, tx, strategyID, userID)
+			if exErr != nil {
+				return fmt.Errorf("failed to activate strategy: %w", exErr)
+			}
+			if !exists {
+				return apperr.ErrNotFound
+			}
+			return fmt.Errorf("%w: cannot resume a stopped strategy", apperr.ErrTerminalState)
 		}
 		return fmt.Errorf("failed to activate strategy: %w", err)
 	}
@@ -563,7 +616,15 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 	err = tx.QueryRowxContext(ctx, query, strategyID, userID).Scan(&updatedID, &currentVersion)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return fmt.Errorf("strategy not found or already stopped (cannot pause a stopped strategy)")
+			// 0 rows: missing (404) vs stopped/deleted — cannot pause (412).
+			exists, exErr := r.existsForUserTx(ctx, tx, strategyID, userID)
+			if exErr != nil {
+				return fmt.Errorf("failed to deactivate strategy: %w", exErr)
+			}
+			if !exists {
+				return apperr.ErrNotFound
+			}
+			return fmt.Errorf("%w: cannot pause a stopped strategy", apperr.ErrTerminalState)
 		}
 		return fmt.Errorf("failed to deactivate strategy: %w", err)
 	}
@@ -584,62 +645,6 @@ func (r *StrategyRepository) Deactivate(ctx context.Context, strategyID uuid.UUI
 	}
 
 	return tx.Commit()
-}
-
-// DeactivateAllActive deactivates every active, non-deleted strategy in a single
-// transaction and writes one STRATEGY_DEACTIVATED outbox entry per strategy.
-// Returns the number of strategies that were deactivated.
-func (r *StrategyRepository) DeactivateAllActive(ctx context.Context) (int, error) {
-	tx, err := r.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	// Bulk-deactivate all active strategies and capture their IDs/user/version.
-	type deactivatedRow struct {
-		StrategyID uuid.UUID `db:"strategy_id"`
-		UserID     string    `db:"user_id"`
-		Version    int64     `db:"version"`
-	}
-
-	// Only deactivate NEWS strategies at EOD. 52W_BREAKOUT strategies are positional
-	// and should stay active across trading days.
-	updateQuery := `
-		UPDATE strategies
-		SET active = false, updated_at = CURRENT_TIMESTAMP, version = version + 1
-		WHERE active = true AND deleted_at IS NULL
-		  AND (strategy_type IS NULL OR strategy_type = 'NEWS')
-		RETURNING strategy_id, user_id, version`
-
-	rows := []deactivatedRow{}
-	if err := tx.SelectContext(ctx, &rows, updateQuery); err != nil {
-		return 0, fmt.Errorf("failed to bulk-deactivate strategies: %w", err)
-	}
-
-	if len(rows) == 0 {
-		return 0, tx.Commit()
-	}
-
-	// Insert one outbox event per deactivated strategy.
-	outboxQuery := `INSERT INTO execution_outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`
-	for _, row := range rows {
-		payload, _ := json.Marshal(map[string]interface{}{
-			"strategy_id": row.StrategyID,
-			"user_id":     row.UserID,
-			"version":     row.Version,
-			"active":      false,
-		})
-		if _, err := tx.ExecContext(ctx, outboxQuery, row.StrategyID, "STRATEGY_DEACTIVATED", payload); err != nil {
-			return 0, fmt.Errorf("failed to insert outbox entry for strategy %s: %w", row.StrategyID, err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit bulk deactivation: %w", err)
-	}
-
-	return len(rows), nil
 }
 
 // GetByIDs retrieves multiple strategies by their IDs

@@ -9,12 +9,40 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/api/proto/common"
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
+	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/apperr"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/models"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/repository"
 	"github.com/RohitIndira/Algo-Treading/services/user-config/internal/service"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
 )
+
+// errorCodeFor classifies a service/repository error into the semantic code
+// string that api-gateway maps to an HTTP status (see the api-gateway
+// handlers' mapErrorCodeToHTTPStatus). It is the single place that turns the
+// apperr sentinels into the cross-service error contract:
+//
+//	ErrValidation                         → INVALID_ARGUMENT    (400)
+//	ErrNotFound                           → NOT_FOUND           (404)
+//	ErrVersionConflict / ErrTerminalState → FAILED_PRECONDITION (412)
+//	ErrDuplicate                          → ALREADY_EXISTS      (409)
+//	ErrUnauthorized                       → PERMISSION_DENIED   (403)
+//	anything else                         → INTERNAL            (500)
+func errorCodeFor(err error) string {
+	switch {
+	case errors.Is(err, apperr.ErrValidation):
+		return "INVALID_ARGUMENT"
+	case errors.Is(err, apperr.ErrNotFound):
+		return "NOT_FOUND"
+	case errors.Is(err, apperr.ErrVersionConflict), errors.Is(err, apperr.ErrTerminalState):
+		return "FAILED_PRECONDITION"
+	case errors.Is(err, apperr.ErrDuplicate):
+		return "ALREADY_EXISTS"
+	case errors.Is(err, apperr.ErrUnauthorized):
+		return "PERMISSION_DENIED"
+	default:
+		return "INTERNAL"
+	}
+}
 
 // UserConfigServer implements the gRPC UserConfigService
 type UserConfigServer struct {
@@ -60,7 +88,7 @@ func (s *UserConfigServer) CreateStrategy(ctx context.Context, req *pb.CreateStr
 		return &pb.CreateStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "CREATION_FAILED",
+				Code:    errorCodeFor(err),
 				Message: err.Error(),
 			},
 		}, nil
@@ -79,7 +107,7 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 		return &pb.UpdateStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "INVALID_STRATEGY_ID",
+				Code:    "INVALID_ARGUMENT",
 				Message: "Invalid strategy ID format",
 			},
 		}, nil
@@ -116,7 +144,7 @@ func (s *UserConfigServer) UpdateStrategy(ctx context.Context, req *pb.UpdateStr
 		return &pb.UpdateStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "UPDATE_FAILED",
+				Code:    errorCodeFor(err),
 				Message: err.Error(),
 			},
 		}, nil
@@ -139,7 +167,7 @@ func (s *UserConfigServer) DeleteStrategy(ctx context.Context, req *pb.DeleteStr
 		return &pb.DeleteStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "INVALID_STRATEGY_ID",
+				Code:    "INVALID_ARGUMENT",
 				Message: "Invalid strategy ID format",
 			},
 		}, nil
@@ -152,7 +180,7 @@ func (s *UserConfigServer) DeleteStrategy(ctx context.Context, req *pb.DeleteStr
 			Success: false,
 			Message: "",
 			Error: &common.Error{
-				Code:    "DELETION_FAILED",
+				Code:    errorCodeFor(err),
 				Message: err.Error(),
 			},
 			PositionsExited: int32(positionsExited),
@@ -173,7 +201,7 @@ func (s *UserConfigServer) GetStrategy(ctx context.Context, req *pb.GetStrategyR
 		return &pb.GetStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "INVALID_STRATEGY_ID",
+				Code:    "INVALID_ARGUMENT",
 				Message: "Invalid strategy ID format",
 			},
 		}, nil
@@ -184,7 +212,7 @@ func (s *UserConfigServer) GetStrategy(ctx context.Context, req *pb.GetStrategyR
 		return &pb.GetStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "NOT_FOUND",
+				Code:    errorCodeFor(err),
 				Message: err.Error(),
 			},
 		}, nil
@@ -215,7 +243,7 @@ func (s *UserConfigServer) ListUserStrategies(ctx context.Context, req *pb.ListU
 		return &pb.ListUserStrategiesResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "LIST_FAILED",
+				Code:    errorCodeFor(err),
 				Message: err.Error(),
 			},
 		}, nil
@@ -253,7 +281,7 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 		return &pb.ActivateStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "INVALID_STRATEGY_ID",
+				Code:    "INVALID_ARGUMENT",
 				Message: "Invalid strategy ID format",
 			},
 		}, nil
@@ -264,7 +292,7 @@ func (s *UserConfigServer) ActivateStrategy(ctx context.Context, req *pb.Activat
 		return &pb.ActivateStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "ACTIVATION_FAILED",
+				Code:    errorCodeFor(err),
 				Message: err.Error(),
 			},
 		}, nil
@@ -288,7 +316,7 @@ func (s *UserConfigServer) DeactivateStrategy(ctx context.Context, req *pb.Deact
 		return &pb.DeactivateStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "INVALID_STRATEGY_ID",
+				Code:    "INVALID_ARGUMENT",
 				Message: "Invalid strategy ID format",
 			},
 		}, nil
@@ -300,7 +328,7 @@ func (s *UserConfigServer) DeactivateStrategy(ctx context.Context, req *pb.Deact
 		return &pb.DeactivateStrategyResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "DEACTIVATION_FAILED",
+				Code:    errorCodeFor(err),
 				Message: err.Error(),
 			},
 			PositionsExited: int32(positionsExited),
@@ -339,7 +367,7 @@ func (s *UserConfigServer) GetStrategiesByIDs(ctx context.Context, req *pb.GetSt
 			return &pb.GetStrategiesByIDsResponse{
 				Success: false,
 				Error: &common.Error{
-					Code:    "INVALID_STRATEGY_ID",
+					Code:    "INVALID_ARGUMENT",
 					Message: fmt.Sprintf("Invalid strategy ID at index %d", i),
 				},
 			}, nil
@@ -352,7 +380,7 @@ func (s *UserConfigServer) GetStrategiesByIDs(ctx context.Context, req *pb.GetSt
 		return &pb.GetStrategiesByIDsResponse{
 			Success: false,
 			Error: &common.Error{
-				Code:    "FETCH_FAILED",
+				Code:    errorCodeFor(err),
 				Message: err.Error(),
 			},
 		}, nil
@@ -532,73 +560,19 @@ func (s *UserConfigServer) GetUserCredentials(ctx context.Context, req *pb.GetUs
 
 // Helper functions to convert between proto and model types
 
+// protoConditionsToModel constructs an empty StrategyCondition placeholder.
+// The 13 news-specific fields were removed 2026-07-20 because MANTHAN doesn't
+// use them; incoming proto fields are silently ignored.
 func protoConditionsToModel(proto *pb.StrategyConditions) *models.StrategyCondition {
 	if proto == nil {
 		return nil
 	}
-
-	sentiments := make(pq.StringArray, len(proto.Sentiments))
-	for i, s := range proto.Sentiments {
-		sentiments[i] = sentimentToString(s)
-	}
-
-	exchanges := make(pq.StringArray, len(proto.Exchanges))
-	for i, e := range proto.Exchanges {
-		exchanges[i] = exchangeToString(e)
-	}
-
-	stockCodes := make(pq.Int64Array, len(proto.StockCodes))
-	for i, code := range proto.StockCodes {
-		stockCodes[i] = code
-	}
-
-	marketCapTypes := make(pq.StringArray, len(proto.MarketCapTypes))
-	copy(marketCapTypes, proto.MarketCapTypes)
-
-	cond := &models.StrategyCondition{
-		MatchAllNews:   proto.MatchAllNews,
-		ImpactScoreMin: proto.ImpactScoreMin,
-		ImpactScoreMax: proto.ImpactScoreMax,
-		Sentiments:     sentiments,
-		Categories:     pq.StringArray(proto.Categories),
-		StockCodes:     stockCodes,
-		MinVolume:      &proto.VolumeThreshold, // Mapped from VolumeThreshold
-		Exchanges:      exchanges,
-		MarketCapTypes: marketCapTypes,
-	}
-
-	// PriceRange fields not present in DB/Model yet.
-	/*
-		if proto.PriceRange != nil {
-			cond.PriceRangeMin = &proto.PriceRange.MinPrice
-			cond.PriceRangeMax = &proto.PriceRange.MaxPrice
-		}
-	*/
-
-	if proto.MarketCapRange != nil {
-		cond.MinMarketCap = &proto.MarketCapRange.MinMcap
-		cond.MaxMarketCap = &proto.MarketCapRange.MaxMcap
-	}
-
-	if proto.PctChangeRange != nil {
-		cond.MinPriceChangePct = &proto.PctChangeRange.MinPctChange
-		cond.MaxPriceChangePct = &proto.PctChangeRange.MaxPctChange
-	}
-
-	return cond
+	return &models.StrategyCondition{}
 }
 
 func modelStrategyTypeToProto(t models.StrategyType) pb.StrategyType {
-	switch t {
-	case models.StrategyType52WBreakout:
-		return pb.StrategyType_WEEK52_BREAKOUT
-	case models.StrategyTypeManthan:
-		return pb.StrategyType_MANTHAN
-	case models.StrategyTypeNews:
-		return pb.StrategyType_NEWS
-	default:
-		return pb.StrategyType_NEWS
-	}
+	// Only MANTHAN survives after 2026-07-20 cleanup; everything else maps to it.
+	return pb.StrategyType_MANTHAN
 }
 
 func positionSizingModeToString(m pb.PositionSizingMode) string {
@@ -613,16 +587,8 @@ func positionSizingModeToString(m pb.PositionSizingMode) string {
 }
 
 func protoStrategyTypeToModel(t pb.StrategyType) models.StrategyType {
-	switch t {
-	case pb.StrategyType_WEEK52_BREAKOUT:
-		return models.StrategyType52WBreakout
-	case pb.StrategyType_MANTHAN:
-		return models.StrategyTypeManthan
-	case pb.StrategyType_NEWS:
-		return models.StrategyTypeNews
-	default:
-		return models.StrategyTypeNews
-	}
+	// Only MANTHAN survives after 2026-07-20 cleanup; everything else maps to it.
+	return models.StrategyTypeManthan
 }
 
 func protoTradingModeToModel(mode pb.TradingMode) models.TradingMode {
@@ -754,46 +720,15 @@ func protoTradeConfigToModel(proto *pb.TradeConfig) *models.TradeConfig {
 	return config
 }
 
+// protoRiskLimitsToModel returns an empty RiskLimits placeholder. The 7 risk
+// fields were dropped 2026-07-30 (migration 017); incoming proto fields are
+// silently ignored (proto keeps them for wire compat). Same pattern as
+// protoConditionsToModel.
 func protoRiskLimitsToModel(proto *pb.RiskLimits) *models.RiskLimits {
 	if proto == nil {
 		return nil
 	}
-
-	limits := &models.RiskLimits{
-		MaxDailyTrades: &proto.MaxDailyTrades,
-		MaxLossPerDay:  &proto.MaxLossPerDay,
-		// PositionSizing:          positionSizingToString(proto.PositionSizing), // Check if model has this field. Yes it does.
-		// Wait, did I keep PositionSizing in model?
-		// Let's check step 91. RiskLimits struct:
-		/*
-			type RiskLimits struct {
-				// ...
-				// PositionSizing string // I removed it in Step 91?
-				// Checking Step 91 content for RiskLimits...
-				// In Step 91, RiskLimits does NOT have PositionSizing!
-				// Creating RiskLimits struct in step 91:
-				// RiskLimits struct {
-				// 	RiskLimitID             uuid.UUID `db:"risk_limit_id" json:"risk_limit_id"`
-				// 	StrategyID              uuid.UUID `db:"strategy_id" json:"strategy_id"`
-				// 	MaxDailyTrades          *int32    `db:"max_daily_trades" json:"max_daily_trades,omitempty"`
-				// 	MaxPerTradeRisk         *float64  `db:"max_per_trade_risk" json:"max_per_trade_risk,omitempty"`
-				// 	MaxPortfolioExposurePct *float64  `db:"max_portfolio_exposure_pct" json:"max_portfolio_exposure_pct,omitempty"`
-				// 	MaxLossPerDay           *float64  `db:"max_loss_per_day" json:"max_loss_per_day,omitempty"`
-				// 	EnableRiskChecks        bool      `db:"enable_risk_checks" json:"enable_risk_checks"`
-				// 	EnableAutoSquareOff     bool      `db:"enable_auto_square_off" json:"enable_auto_square_off"`
-				// 	AutoSquareOffTime       string    `db:"auto_square_off_time" json:"auto_square_off_time"`
-				// 	CreatedAt               time.Time `db:"created_at" json:"created_at"`
-				// }
-				// So PositionSizing is NOT in model.
-		*/
-		MaxPortfolioExposurePct: &proto.MaxPortfolioExposurePct,
-		MaxPerTradeRisk:         &proto.MaxPerTradeRisk,
-		EnableRiskChecks:        proto.EnableRiskChecks,
-		EnableAutoSquareOff:     proto.EnableAutoSquareOff,
-		AutoSquareOffTime:       proto.AutoSquareOffTime,
-	}
-
-	return limits
+	return &models.RiskLimits{}
 }
 
 func modelStrategyToProto(model *models.Strategy) *pb.Strategy {
@@ -861,59 +796,13 @@ func stringToSentiment(s string) common.Sentiment {
 	}
 }
 
+// modelConditionsToProto returns an empty StrategyConditions envelope.
+// News-specific fields dropped 2026-07-20 (MANTHAN doesn't use them).
 func modelConditionsToProto(model *models.StrategyCondition) *pb.StrategyConditions {
 	if model == nil {
 		return nil
 	}
-
-	sentiments := make([]common.Sentiment, len(model.Sentiments))
-	for i, s := range model.Sentiments {
-		sentiments[i] = stringToSentiment(s)
-	}
-
-	exchanges := make([]common.Exchange, len(model.Exchanges))
-	for i, e := range model.Exchanges {
-		exchanges[i] = stringToExchange(e)
-	}
-
-	stockCodes := make([]int64, len(model.StockCodes))
-	for i, code := range model.StockCodes {
-		stockCodes[i] = code
-	}
-
-	marketCapTypes := make([]string, len(model.MarketCapTypes))
-	copy(marketCapTypes, model.MarketCapTypes)
-
-	cond := &pb.StrategyConditions{
-		MatchAllNews:   model.MatchAllNews,
-		ImpactScoreMin: model.ImpactScoreMin,
-		ImpactScoreMax: model.ImpactScoreMax,
-		Sentiments:     sentiments,
-		Categories:     []string(model.Categories),
-		StockCodes:     stockCodes,
-		Exchanges:      exchanges,
-		MarketCapTypes: marketCapTypes,
-	}
-
-	if model.MinMarketCap != nil && model.MaxMarketCap != nil {
-		cond.MarketCapRange = &pb.StrategyConditions_MarketCapRange{
-			MinMcap: *model.MinMarketCap,
-			MaxMcap: *model.MaxMarketCap,
-		}
-	}
-
-	if model.MinPriceChangePct != nil && model.MaxPriceChangePct != nil {
-		cond.PctChangeRange = &pb.StrategyConditions_PctChangeRange{
-			MinPctChange: *model.MinPriceChangePct,
-			MaxPctChange: *model.MaxPriceChangePct,
-		}
-	}
-
-	if model.MinVolume != nil {
-		cond.VolumeThreshold = *model.MinVolume
-	}
-
-	return cond
+	return &pb.StrategyConditions{}
 }
 
 func modelTradeConfigToProto(model *models.TradeConfig) *pb.TradeConfig {
@@ -972,30 +861,13 @@ func stringToPositionSizingMode(s string) pb.PositionSizingMode {
 	}
 }
 
+// modelRiskLimitsToProto returns an empty RiskLimits envelope. The 7 risk
+// fields were dropped 2026-07-30 (migration 017); the proto message is kept for
+// wire compat but user-config produces empty values. Same pattern as
+// modelConditionsToProto.
 func modelRiskLimitsToProto(model *models.RiskLimits) *pb.RiskLimits {
 	if model == nil {
 		return nil
 	}
-
-	limits := &pb.RiskLimits{
-		// PositionSizing:      stringToPositionSizing(model.PositionSizing), // Removed from model
-		EnableRiskChecks:    model.EnableRiskChecks,
-		EnableAutoSquareOff: model.EnableAutoSquareOff,
-		AutoSquareOffTime:   model.AutoSquareOffTime,
-	}
-
-	if model.MaxDailyTrades != nil {
-		limits.MaxDailyTrades = *model.MaxDailyTrades
-	}
-	if model.MaxLossPerDay != nil {
-		limits.MaxLossPerDay = *model.MaxLossPerDay
-	}
-	if model.MaxPortfolioExposurePct != nil {
-		limits.MaxPortfolioExposurePct = *model.MaxPortfolioExposurePct
-	}
-	if model.MaxPerTradeRisk != nil {
-		limits.MaxPerTradeRisk = *model.MaxPerTradeRisk
-	}
-
-	return limits
+	return &pb.RiskLimits{}
 }
