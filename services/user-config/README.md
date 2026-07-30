@@ -163,9 +163,20 @@ KAFKA_ENABLED=true
 KAFKA_BROKERS=localhost:9092
 KAFKA_TOPIC=user-config-events
 
+# Credential encryption (AES-128/192/256 — must be 16, 24, or 32 bytes)
+ENCRYPTION_KEY=change-me-to-a-real-32-byte-secret
+# ALLOW_INSECURE_ENCRYPTION_KEY=true  # local dev only (see note below)
+
 # Logging
 LOG_LEVEL=INFO  # DEBUG, INFO, WARN, ERROR
 ```
+
+> **⚠️ ENCRYPTION_KEY is mandatory and validated at boot.** The service
+> **refuses to start** if `ENCRYPTION_KEY` is not exactly 16, 24, or 32 bytes,
+> or if it is left as the built-in placeholder `0123456789abcdef0123456789abcdef`.
+> For local development you may keep the placeholder by explicitly setting
+> `ALLOW_INSECURE_ENCRYPTION_KEY=true` — the service then boots but logs a loud
+> `WARN` on every start. **Never set that flag in staging or production.**
 
 ### Configuration Options
 
@@ -178,9 +189,12 @@ LOG_LEVEL=INFO  # DEBUG, INFO, WARN, ERROR
 | `DB_PASSWORD` | Database password | - | Yes |
 | `DB_NAME` | Database name | trading_db | Yes |
 | `DB_SSLMODE` | SSL mode | disable | No |
+| `EXECUTION_DB_*` | execution_db connection (broker credentials) | localhost/execution_db | For credentials |
 | `KAFKA_ENABLED` | Enable Kafka publishing | true | No |
 | `KAFKA_BROKERS` | Kafka broker addresses | localhost:9092 | If Kafka enabled |
 | `KAFKA_TOPIC` | Kafka topic name | user-config-events | If Kafka enabled |
+| `ENCRYPTION_KEY` | AES key for broker tokens (16/24/32 bytes; placeholder rejected at boot) | _(placeholder — rejected)_ | **Yes** |
+| `ALLOW_INSECURE_ENCRYPTION_KEY` | Permit the placeholder key (local dev only; WARNs on boot) | false | No |
 | `LOG_LEVEL` | Logging level | INFO | No |
 
 ## 🏃 Running the Service

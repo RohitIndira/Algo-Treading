@@ -18,8 +18,6 @@ const (
 type StrategyType string
 
 const (
-	// StrategyTypeNews        StrategyType = "NEWS"
-	// StrategyType52WBreakout StrategyType = "52W_BREAKOUT"
 	StrategyTypeManthan StrategyType = "MANTHAN"
 )
 
@@ -42,11 +40,6 @@ type Strategy struct {
 	RiskLimits   *RiskLimits        `db:"-" json:"risk_limits,omitempty"`
 }
 
-// StrategyCondition is a placeholder — the 13 news-specific fields
-// (MatchAllNews, Sentiments, MarketCap ranges, etc.) were removed
-// 2026-07-20 because MANTHAN is the only live strategy type and it
-// uses none of them. The row still exists per strategy for FK integrity;
-// meaningful strategy filters live on TradeConfig now.
 type StrategyCondition struct {
 	ConditionID uuid.UUID `db:"condition_id" json:"condition_id"`
 	StrategyID  uuid.UUID `db:"strategy_id" json:"strategy_id"`
@@ -71,26 +64,24 @@ type TradeConfig struct {
 	StopLossType    string    `db:"stop_loss_type" json:"stop_loss_type"`
 
 	// 52W Breakout strategy fields (Manthan)
-	PositionSizingMode string   `db:"position_sizing_mode" json:"position_sizing_mode"`   // FIXED_QTY or EMA_ALLOCATION
-	TotalCapital       *float64 `db:"total_capital" json:"total_capital,omitempty"`       // Total investment (default ₹1,00,000)
-	MaxPositions       *int32   `db:"max_positions" json:"max_positions,omitempty"`       // Max stocks to hold (default 25)
-	PerStockAmount     *float64 `db:"per_stock_amount" json:"per_stock_amount,omitempty"` // Auto: total_capital / max_positions
-
-	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	PositionSizingMode string    `db:"position_sizing_mode" json:"position_sizing_mode"`   // FIXED_QTY or EMA_ALLOCATION
+	TotalCapital       *float64  `db:"total_capital" json:"total_capital,omitempty"`       // Total investment (default ₹1,00,000)
+	MaxPositions       *int32    `db:"max_positions" json:"max_positions,omitempty"`       // Max stocks to hold (default 25)
+	PerStockAmount     *float64  `db:"per_stock_amount" json:"per_stock_amount,omitempty"` // Auto: total_capital / max_positions
+	CreatedAt          time.Time `db:"created_at" json:"created_at"`
 }
 
-// RiskLimits represents risk management limits
+// RiskLimits is a placeholder — the 7 risk fields (MaxDailyTrades,
+// MaxPerTradeRisk, MaxPortfolioExposurePct, MaxLossPerDay, EnableRiskChecks,
+// EnableAutoSquareOff, AutoSquareOffTime) were dropped 2026-07-30 (migration
+// 017). MANTHAN uses none of them; rules-engine stopped reading them 2026-06-25
+// and the auto-square-off lives in trade-execution's own scheduler. The row is
+// kept (one per strategy) so the outbox/proto envelope and existing SELECT *
+// reads stay valid — same pattern as StrategyCondition.
 type RiskLimits struct {
-	RiskLimitID             uuid.UUID `db:"risk_limit_id" json:"risk_limit_id"`
-	StrategyID              uuid.UUID `db:"strategy_id" json:"strategy_id"`
-	MaxDailyTrades          *int32    `db:"max_daily_trades" json:"max_daily_trades,omitempty"`
-	MaxPerTradeRisk         *float64  `db:"max_per_trade_risk" json:"max_per_trade_risk,omitempty"`
-	MaxPortfolioExposurePct *float64  `db:"max_portfolio_exposure_pct" json:"max_portfolio_exposure_pct,omitempty"`
-	MaxLossPerDay           *float64  `db:"max_loss_per_day" json:"max_loss_per_day,omitempty"`
-	EnableRiskChecks        bool      `db:"enable_risk_checks" json:"enable_risk_checks"`
-	EnableAutoSquareOff     bool      `db:"enable_auto_square_off" json:"enable_auto_square_off"`
-	AutoSquareOffTime       string    `db:"auto_square_off_time" json:"auto_square_off_time"`
-	CreatedAt               time.Time `db:"created_at" json:"created_at"`
+	RiskLimitID uuid.UUID `db:"risk_limit_id" json:"risk_limit_id"`
+	StrategyID  uuid.UUID `db:"strategy_id" json:"strategy_id"`
+	CreatedAt   time.Time `db:"created_at" json:"created_at"`
 }
 
 // ExecutionOutbox represents the outbox table for transactional messaging

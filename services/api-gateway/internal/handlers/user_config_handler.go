@@ -117,8 +117,7 @@ func (h *UserConfigHandler) CreateStrategy(w http.ResponseWriter, r *http.Reques
 	}
 
 	if !resp.Success {
-		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST",
-			resp.Error.Message)
+		respondBackendError(w, resp.Error)
 		return
 	}
 
@@ -176,7 +175,7 @@ func (h *UserConfigHandler) UpdateStrategy(w http.ResponseWriter, r *http.Reques
 	}
 
 	if !resp.Success {
-		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
+		respondBackendError(w, resp.Error)
 		return
 	}
 
@@ -231,8 +230,7 @@ func (h *UserConfigHandler) DeleteStrategy(w http.ResponseWriter, r *http.Reques
 	}
 
 	if !resp.Success {
-		statusCode := mapErrorCodeToHTTPStatus(resp.Error.Code)
-		respondIndiraError(w, statusCode, resp.Error.Code, resp.Error.Message)
+		respondBackendError(w, resp.Error)
 		return
 	}
 
@@ -265,8 +263,7 @@ func (h *UserConfigHandler) GetStrategy(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if !resp.Success {
-		statusCode := mapErrorCodeToHTTPStatus(resp.Error.Code)
-		respondIndiraError(w, statusCode, resp.Error.Code, resp.Error.Message)
+		respondBackendError(w, resp.Error)
 		return
 	}
 
@@ -315,7 +312,7 @@ func (h *UserConfigHandler) ListUserStrategies(w http.ResponseWriter, r *http.Re
 	}
 
 	if !resp.Success {
-		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
+		respondBackendError(w, resp.Error)
 		return
 	}
 
@@ -366,7 +363,7 @@ func (h *UserConfigHandler) ActivateStrategy(w http.ResponseWriter, r *http.Requ
 	}
 
 	if !resp.Success {
-		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
+		respondBackendError(w, resp.Error)
 		return
 	}
 
@@ -417,7 +414,7 @@ func (h *UserConfigHandler) DeactivateStrategy(w http.ResponseWriter, r *http.Re
 	}
 
 	if !resp.Success {
-		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", resp.Error.Message)
+		respondBackendError(w, resp.Error)
 		return
 	}
 
