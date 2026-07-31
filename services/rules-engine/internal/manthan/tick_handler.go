@@ -78,6 +78,10 @@ func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float6
 					zap.Error(err),
 				)
 			}
+			// FIX F: persist the ratcheted trail so a restart resumes at this
+			// exact level. posSnap holds the just-updated CurrentSL/High/LastTrail.
+			// Best-effort + safe-if-stale (SL only moves up).
+			_ = h.publisher.PersistTrail(ctx, strategyID, posSnap)
 
 		case SLTriggered:
 			pnl := h.portfolioMgr.ExitPosition(strategyID, symbol, update.ExitPrice)
@@ -88,6 +92,8 @@ func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float6
 					zap.Error(err),
 				)
 			}
+			// FIX F: mark EXITED so rehydrate doesn't restore a closed position.
+			_ = h.publisher.PersistExit(ctx, strategyID, symbol, update.ExitPrice, pnl)
 
 			// Capital was just updated inside ExitPosition; re-read under
 			// RLock for the log so the printed value reflects the new state.

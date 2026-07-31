@@ -49,11 +49,20 @@ var ErrDuplicateDecision = errors.New("manthan: signal_id already dispatched (du
 //   - Write manthan_position_events (positions svc)
 //   - Update Redis :position: keys (positions svc will own)
 //   - Notify users (moves to notification svc)
+// kafkaMessageWriter is the slice of *kafka.Writer the publisher needs. Keeping
+// it as an interface (rather than the concrete *kafka.Writer) lets the recovery
+// worker's re-publish path be unit-tested with a fake that can inject failures.
+// *kafka.Writer satisfies this exactly.
+type kafkaMessageWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+	Close() error
+}
+
 type ManthanPublisher struct {
 	db              *sql.DB
 	rdb             *redis.Client
-	tradeWriter     *kafka.Writer // trade-signals topic
-	portfolioWriter *kafka.Writer // portfolio.allocations topic
+	tradeWriter     kafkaMessageWriter // trade-signals topic
+	portfolioWriter kafkaMessageWriter // portfolio.allocations topic
 	logger          *zap.Logger
 }
 
@@ -74,14 +83,14 @@ func NewManthanPublisher(cfg ManthanPublisherConfig, logger *zap.Logger) *Mantha
 		p.tradeWriter = &kafka.Writer{
 			Addr:         kafka.TCP(cfg.KafkaBrokers...),
 			Topic:        "trade-signals",
-			Balancer:     &kafka.LeastBytes{},
+			Balancer:     &kafka.Hash{}, // FIX A: hash the key → all of a position's signals share a partition (per-position FIFO)
 			BatchTimeout: 1 * time.Millisecond,
 			RequiredAcks: kafka.RequireAll,
 		}
 		p.portfolioWriter = &kafka.Writer{
 			Addr:         kafka.TCP(cfg.KafkaBrokers...),
 			Topic:        "portfolio.allocations",
-			Balancer:     &kafka.LeastBytes{},
+			Balancer:     &kafka.Hash{}, // FIX A: hash the key → all of a position's signals share a partition (per-position FIFO)
 			BatchTimeout: 1 * time.Millisecond,
 			RequiredAcks: kafka.RequireAll,
 		}
@@ -142,7 +151,11 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 	if p.tradeWriter != nil {
 		body, _ := json.Marshal(order)
 		if err := p.tradeWriter.WriteMessages(ctx, kafka.Message{
-			Key:   []byte(order.OrderID),
+			// FIX A: key by position identity (strategy:symbol), NOT the unique
+			// signal_id, so ENTRY→SL_MODIFY→…→EXIT for one position share a
+			// partition and stay in emit order. Precondition for the inbox-worker
+			// per-position serialization (separate trade-execution PR).
+			Key:   []byte(fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)),
 			Value: body,
 			Headers: []kafka.Header{
 				{Key: "order_type", Value: []byte("MANTHAN_ENTRY")},
@@ -234,7 +247,11 @@ func (p *ManthanPublisher) PublishSLModify(ctx context.Context, order SLModifyOr
 	if p.tradeWriter != nil {
 		body, _ := json.Marshal(order)
 		if err := p.tradeWriter.WriteMessages(ctx, kafka.Message{
-			Key:   []byte(order.OrderID),
+			// FIX A: key by position identity (strategy:symbol), NOT the unique
+			// signal_id, so ENTRY→SL_MODIFY→…→EXIT for one position share a
+			// partition and stay in emit order. Precondition for the inbox-worker
+			// per-position serialization (separate trade-execution PR).
+			Key:   []byte(fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)),
 			Value: body,
 			Headers: []kafka.Header{
 				{Key: "order_type", Value: []byte("MANTHAN_SL_MODIFY")},
@@ -323,7 +340,11 @@ func (p *ManthanPublisher) PublishSLExit(ctx context.Context, order SLExitOrder)
 	if p.tradeWriter != nil {
 		body, _ := json.Marshal(order)
 		if err := p.tradeWriter.WriteMessages(ctx, kafka.Message{
-			Key:   []byte(order.OrderID),
+			// FIX A: key by position identity (strategy:symbol), NOT the unique
+			// signal_id, so ENTRY→SL_MODIFY→…→EXIT for one position share a
+			// partition and stay in emit order. Precondition for the inbox-worker
+			// per-position serialization (separate trade-execution PR).
+			Key:   []byte(fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)),
 			Value: body,
 			Headers: []kafka.Header{
 				{Key: "order_type", Value: []byte("MANTHAN_SL_EXIT")},
@@ -458,19 +479,28 @@ func (p *ManthanPublisher) UpdatePortfolioState(ctx context.Context, portfolio *
 // the OrderID layer (see order.go deterministicSignalID) and this dedup
 // path is the safety net that catches any residual replay.
 func (p *ManthanPublisher) dbInsertEntryDecision(ctx context.Context, order ManthanOrder) error {
+	// Store the EXACT bytes we publish to trade-signals (same json.Marshal used
+	// at the Kafka WriteMessages call) so the recovery worker re-publishes
+	// verbatim — no strategy-config reconstruction, no PAPER/LIVE mismatch risk.
+	payload, err := json.Marshal(order)
+	if err != nil {
+		return fmt.Errorf("marshal entry outbox payload: %w", err)
+	}
 	var returnedID string
-	err := p.db.QueryRowContext(ctx, `
+	err = p.db.QueryRowContext(ctx, `
 		INSERT INTO manthan_signal_decisions (
 			signal_id, user_id, strategy_id, symbol, isin,
 			signal_type,
 			ltp_at_decision, ema_alloc_pct, intended_qty, intended_invested,
-			initial_sl_target, industry, mcap_bucket, index_name, status
-		) VALUES ($1,$2,$3,$4,$5,'ENTRY_BUY',$6,$7,$8,$9,$10,$11,$12,$13,'PROPOSED')
+			initial_sl_target, industry, mcap_bucket, index_name, status,
+			kafka_payload
+		) VALUES ($1,$2,$3,$4,$5,'ENTRY_BUY',$6,$7,$8,$9,$10,$11,$12,$13,'PROPOSED',$14)
 		ON CONFLICT (signal_id) DO NOTHING
 		RETURNING signal_id`,
 		order.OrderID, order.UserID, order.StrategyID, order.Symbol, order.ISIN,
 		order.EntryPrice, order.EMAAllocPct/100, order.Quantity, order.InvestedAmt,
 		order.StopLoss, order.Industry, order.MCapBucket, order.IndexName,
+		payload,
 	).Scan(&returnedID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrDuplicateDecision
@@ -497,18 +527,26 @@ func (p *ManthanPublisher) dbInsertSLModifyDecision(ctx context.Context, order S
 		"new_high": order.NewHigh,
 	})
 
+	// Exact Kafka value for verbatim re-publish by the recovery worker.
+	kafkaPayload, merr := json.Marshal(order)
+	if merr != nil {
+		return fmt.Errorf("marshal SL_MODIFY outbox payload: %w", merr)
+	}
+
 	// Same dedup pattern as dbInsertEntryDecision — see its docstring for
 	// why RETURNING + sql.ErrNoRows → ErrDuplicateDecision.
 	var returnedID string
 	err = p.db.QueryRowContext(ctx, `
 		INSERT INTO manthan_signal_decisions (
 			signal_id, user_id, strategy_id, symbol,
-			signal_type, parent_signal_id, payload, status
-		) VALUES ($1,$2,$3,$4,'SL_MODIFY',$5,$6,'PROPOSED')
+			signal_type, parent_signal_id, payload, status,
+			kafka_payload, ltp_at_decision
+		) VALUES ($1,$2,$3,$4,'SL_MODIFY',$5,$6,'PROPOSED',$7,$8)
 		ON CONFLICT (signal_id) DO NOTHING
 		RETURNING signal_id`,
 		order.OrderID, order.UserID, order.StrategyID, order.Symbol,
-		nullableID(parentID), payload,
+		nullableID(parentID), payload, kafkaPayload,
+		order.NewHigh, // FIX C: uniform "market price when the signal fired" — the high that triggered this ratchet
 	).Scan(&returnedID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrDuplicateDecision
@@ -532,16 +570,24 @@ func (p *ManthanPublisher) dbInsertExitDecision(ctx context.Context, order SLExi
 		"quantity":   order.Quantity,
 	})
 
+	// Exact Kafka value for verbatim re-publish by the recovery worker.
+	kafkaPayload, merr := json.Marshal(order)
+	if merr != nil {
+		return fmt.Errorf("marshal EXIT_TSL outbox payload: %w", merr)
+	}
+
 	var returnedID string
 	err = p.db.QueryRowContext(ctx, `
 		INSERT INTO manthan_signal_decisions (
 			signal_id, user_id, strategy_id, symbol,
-			signal_type, parent_signal_id, payload, status
-		) VALUES ($1,$2,$3,$4,'EXIT_TSL',$5,$6,'PROPOSED')
+			signal_type, parent_signal_id, payload, status,
+			kafka_payload, ltp_at_decision
+		) VALUES ($1,$2,$3,$4,'EXIT_TSL',$5,$6,'PROPOSED',$7,$8)
 		ON CONFLICT (signal_id) DO NOTHING
 		RETURNING signal_id`,
 		order.OrderID, order.UserID, order.StrategyID, order.Symbol,
-		nullableID(parentID), payload,
+		nullableID(parentID), payload, kafkaPayload,
+		order.ExitPrice, // FIX C: uniform "market price when the signal fired" — the LTP that crossed the SL
 	).Scan(&returnedID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrDuplicateDecision

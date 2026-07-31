@@ -47,11 +47,17 @@ type Consumer struct {
 	logger       *zap.Logger
 }
 
-// OrderPublisher is the interface for publishing trade signals.
+// OrderPublisher is the interface for publishing trade signals + persisting the
+// in-memory position/trail to manthan_positions for restart recovery (FIX F).
 type OrderPublisher interface {
 	PublishEntryOrder(ctx context.Context, order ManthanOrder) error
 	PublishSLModify(ctx context.Context, order SLModifyOrder) error
 	PublishSLExit(ctx context.Context, order SLExitOrder) error
+
+	// FIX F — persist trail state so a restart resumes it (see positions_persist.go).
+	PersistPositionOpen(ctx context.Context, order ManthanOrder) error
+	PersistTrail(ctx context.Context, strategyID string, pos types.Position) error
+	PersistExit(ctx context.Context, strategyID, symbol string, exitPrice, pnl float64) error
 }
 
 // ConsumerConfig configures the manthan signal consumer.
@@ -258,6 +264,8 @@ func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy types.UserSt
 			continue
 		}
 		c.portfolioMgr.AddPosition(strategy.StrategyID, result.Allocations[i])
+		// FIX F: persist for restart-recovery of the trail (best-effort, logged inside).
+		_ = c.publisher.PersistPositionOpen(ctx, order)
 		c.logger.Info("Catch-up entry order published",
 			zap.String("user", strategy.UserID),
 			zap.String("symbol", order.Symbol),
@@ -530,6 +538,9 @@ func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal
 				strategy.StrategyID,
 				result.Allocations[i],
 			)
+			// FIX F: mirror the in-memory add to manthan_positions so a restart
+			// resumes this position's trail. Best-effort (logged inside).
+			_ = c.publisher.PersistPositionOpen(ctx, order)
 			published++
 
 			c.logger.Info("Manthan entry order published",
