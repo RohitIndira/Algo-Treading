@@ -2,7 +2,7 @@
 // pre-emptive SESSION_EXPIRED alerts.
 //
 // Why this exists:
-//   EOD Phase A submits AMO+SL at 15:35 IST. If a user's broker JWT is
+//   EOD Phase A submits AMO+SL at 16:35 IST. If a user's broker JWT is
 //   expired at that moment, Phase A skips them and Layer 4's retry queue
 //   takes over — but only after the user re-logs in. Without a nudge, users
 //   may not notice they need to re-login until the next morning, leaving
@@ -22,7 +22,7 @@
 //     (credentials cache + the AuthExpiryNotifier gate); the live JWT_EXPIRING
 //     poll loop in jwt_expiry_notifier.go handles broker-side validation on
 //     a separate 30-minute cadence with an 8-hour pre-warn window.
-//   - Place orders. EOD Phase A at 15:35 IST does that.
+//   - Place orders. EOD Phase A at 16:35 IST does that.
 package manthan
 
 import (
@@ -83,9 +83,9 @@ func (p *ProtectiveReplay) runEODPreFlight(ctx context.Context) {
 		}
 
 		atRisk++
-		reason := "EOD AMO at 15:35 IST — re-login required to enable overnight SL protection"
+		reason := "EOD AMO at 16:35 IST — re-login required to enable overnight SL protection"
 		if missingCreds {
-			reason = "EOD AMO at 15:35 IST — no broker credentials on file; please log in to enable overnight SL protection"
+			reason = "EOD AMO at 16:35 IST — no broker credentials on file; please log in to enable overnight SL protection"
 		}
 		if p.authNotif != nil {
 			p.authNotif.PublishSessionExpired(cycleCtx, pos.UserID, reason)

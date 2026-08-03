@@ -655,7 +655,7 @@ func (r *Repository) GetLiveEntriesByUser(ctx context.Context, userID string) ([
 
 // PositionNeedingProtection is one open Manthan position that requires an
 // SL on the broker for tomorrow's session. Returned by
-// ListPositionsNeedingProtection at 15:35 IST.
+// ListPositionsNeedingProtection at 16:35 IST.
 type PositionNeedingProtection struct {
 	EntryOrderID    int64
 	EntrySignalID   string
@@ -673,7 +673,7 @@ type PositionNeedingProtection struct {
 }
 
 // ListPositionsNeedingProtection enumerates every position that has a filled
-// entry and no terminal exit. Used by the replayer's Phase A (15:35 IST) to
+// entry and no terminal exit. Used by the replayer's Phase A (16:35 IST) to
 // know which positions need an AMO+SL for the next session. Aggregates qty
 // across top-ups; carries the latest trigger price from the most recent SL
 // row so the replayer can preserve TSL trail state.
@@ -1028,7 +1028,7 @@ func (r *Repository) HasActiveProtectionForToday(ctx context.Context, entryOrder
 // InsertAMOOrder writes a new SL_SELL_AMO row for the given position+trade_date
 // and returns its id. Returns (0, sql.ErrNoRows) if a row already exists for
 // the same (parent_order_id, trade_date) — the partial UNIQUE index from
-// migration 011 makes this crash-safe: the 15:35 cron can be re-run safely.
+// migration 011 makes this crash-safe: the 16:35 cron can be re-run safely.
 //
 // alreadyExists==true means the caller should skip rather than treat the
 // conflict as an error.

@@ -164,7 +164,7 @@ func NewJWTExpiryNotifier(
 //
 // Quiet hours: alerts are suppressed between 21:00 and 06:00 IST so we don't
 // wake the operator at midnight; the morning run picks up anything from
-// overnight. The 15:35 EOD cron tolerates 1 expired JWT per user — Phase A
+// overnight. The 16:35 EOD cron tolerates 1 expired JWT per user — Phase A
 // will skip that user and log a warning.
 func (n *JWTExpiryNotifier) Start(ctx context.Context) {
 	if n == nil {

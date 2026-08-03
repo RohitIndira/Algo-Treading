@@ -499,7 +499,7 @@ func (b *BrokerAdapter) PlaceMarketSell(ctx context.Context, auth BrokerAuth, in
 }
 
 // PlaceAMOSLSell submits an After-Market Order with SL-Limit type for overnight
-// protection. Used by the protective replayer's Phase A (15:35 IST EOD cron).
+// protection. Used by the protective replayer's Phase A (16:35 IST EOD cron).
 //
 // Trigger handling:
 //   - The caller passes the algorithmic trigger (e.g. TSL trigger at -8%).

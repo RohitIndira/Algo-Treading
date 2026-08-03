@@ -99,7 +99,7 @@ func main() {
 	// user-config's gRPC API (single-writer principle, see
 	// docs/architecture/data-ownership.md). The local DB-backed repo stays
 	// alive as a fallback so a brief user-config outage doesn't stall the
-	// 09:14 / 15:35 crons. When the env var is empty we fall back to direct
+	// 09:14 / 16:35 crons. When the env var is empty we fall back to direct
 	// DB reads, preserving the pre-refactor behaviour.
 	orderRepo := repository.NewOrderRepository(db)
 	dbCredsRepo := repository.NewCredentialsRepository(db, cfg.EncryptionKey)
@@ -180,7 +180,7 @@ func main() {
 	strategyEventsConsumer := consumer.NewStrategyEventsConsumer(cfg.KafkaBrokers, orderRepo, orderExecutor, logger)
 	// Wire credentials cache so USER_CREDENTIALS_UPDATED events from the
 	// /api/v1/auth/credentials login flow invalidate the cached JWT — keeps
-	// the protective replayer's 15:35 IST cron and the live order path on
+	// the protective replayer's 16:35 IST cron and the live order path on
 	// the freshest token without waiting for the 5-min TTL.
 	strategyEventsConsumer.SetCredentialsCache(orderExecutor.CredentialsCache())
 	log.Println("✓ Strategy events consumer initialized")
@@ -671,9 +671,9 @@ func main() {
 		})
 
 		// POST /manthan/replay/runEODNow — manually trigger Layer 1
-		// EOD Phase A AMO+SL submission outside the 15:35 IST cron window.
+		// EOD Phase A AMO+SL submission outside the 16:35 IST cron window.
 		//
-		// Used for ops re-runs: e.g. when the 15:35 cycle skipped due to a
+		// Used for ops re-runs: e.g. when the 16:35 cycle skipped due to a
 		// transient bug (over-strict freeQty gate on T+0 buys) and an
 		// operator wants to re-arm after a hot fix. Idempotent — runs the
 		// same body the cron runs, InsertAMOOrder dedups already-armed
