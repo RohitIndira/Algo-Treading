@@ -1,0 +1,237 @@
+# Separate-namespace deployment of the CURRENT dev-branch CQRS stack.
+#
+# Runs ALONGSIDE the existing `algo-trading` stack on the same host, touching
+# nothing it owns: distinct project name (algo-dev), network, container names,
+# host ports, and volumes. Nothing here maps onto a port/volume the running
+# stack uses.
+#
+#   cd deployments/separate-namespace
+#   docker compose --env-file .env up -d postgres zookeeper kafka redis   # infra first
+#   ./apply-migrations.sh                                                  # then schema
+#   docker compose --env-file .env up -d                                  # then services
+#
+# All service builds use context = REPO ROOT (../../) so the go.work workspace
+# and every `replace => ../../` sibling module resolve. See ./Dockerfile.
+name: algo-dev
+
+x-build: &svc-build
+  context: ../..
+  dockerfile: deployments/separate-namespace/Dockerfile
+
+networks:
+  algo-dev_net:
+    driver: bridge
+
+volumes:
+  algo-dev-pgdata:
+  algo-dev-kafka:
+  algo-dev-zk:
+
+services:
+  # ── infra ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: algo-dev-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trading_db
+    ports:
+      - "5442:5432"          # host 5442 (5432/5433 taken by other stacks)
+    volumes:
+      - algo-dev-pgdata:/var/lib/postgresql/data
+      # Creates the other canonical DBs (execution_db/signals_db/positions_db/
+      # order_status_db) on first boot. Idempotent.
+      - ../docker/init_databases.sh:/docker-entrypoint-initdb.d/10-init_databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [algo-dev_net]
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: algo-dev-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - algo-dev-zk:/var/lib/zookeeper/data
+    networks: [algo-dev_net]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: algo-dev-kafka
+    restart: unless-stopped
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # In-network clients use kafka:9092; host tools use localhost:9192.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9192
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    ports:
+      - "9192:9192"
+    volumes:
+      - algo-dev-kafka:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    networks: [algo-dev_net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: algo-dev-redis
+    restart: unless-stopped
+    ports:
+      - "6389:6379"
+    networks: [algo-dev_net]
+
+  # ── core CQRS services (build from repo root) ─────────────────────────────
+  user-config:
+    build:
+      <<: *svc-build
+      args: {SERVICE: user-config, CMD_PATH: cmd}
+    image: algo-dev/user-config:local
+    container_name: algo-dev-user-config
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+    environment:
+      GRPC_PORT: "9003"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: trading_db
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      EXECUTION_DB_HOST: postgres
+      EXECUTION_DB_PORT: "5432"
+      EXECUTION_DB_NAME: execution_db
+      EXECUTION_DB_USER: postgres
+      EXECUTION_DB_PASSWORD: postgres
+      EXECUTION_DB_SSLMODE: disable
+      KAFKA_ENABLED: "true"
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: user-config-events
+      EXT_REDIS_ADDR: redis:6379
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ALLOW_INSECURE_ENCRYPTION_KEY: ${ALLOW_INSECURE_ENCRYPTION_KEY:-false}
+      LOG_LEVEL: info
+    networks: [algo-dev_net]
+
+  rules-engine:
+    build:
+      <<: *svc-build
+      args: {SERVICE: rules-engine, CMD_PATH: cmd}
+    image: algo-dev/rules-engine:local
+    container_name: algo-dev-rules-engine
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      user-config: {condition: service_started}
+    environment:
+      GRPC_PORT: "9005"
+      METRICS_PORT: "9091"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: trading_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_SSLMODE: disable
+      MANTHAN_SIGNALS_DB: signals_db
+      KAFKA_BROKERS: kafka:9092
+      USER_CONFIG_GRPC_ADDR: user-config:9003
+      USER_CONFIG_SERVICE_ADDR: user-config:9003
+      REDIS_ADDRS: redis:6379          # cache (LTP + manthan pub/sub)
+      EXT_REDIS_ADDR: redis:6379        # external LTP feed
+      ENVIRONMENT: production
+    networks: [algo-dev_net]
+
+  trade-execution:
+    build:
+      <<: *svc-build
+      args: {SERVICE: trade-execution, CMD_PATH: cmd}
+    image: algo-dev/trade-execution:local
+    container_name: algo-dev-trade-execution
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      user-config: {condition: service_started}
+    environment:
+      SERVICE_PORT: "9004"
+      METRICS_PORT: "9090"
+      PAPER_WS_PORT: "8091"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: execution_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_SSL_MODE: disable
+      KAFKA_BROKERS: kafka:9092
+      USER_CONFIG_GRPC_ADDR: user-config:9003
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      EXT_REDIS_ADDR: redis:6379
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ALLOW_INSECURE_ENCRYPTION_KEY: ${ALLOW_INSECURE_ENCRYPTION_KEY:-false}
+    networks: [algo-dev_net]
+
+  orderstatus:
+    build:
+      <<: *svc-build
+      args: {SERVICE: orderstatus, CMD_PATH: cmd}
+    image: algo-dev/orderstatus:local
+    container_name: algo-dev-orderstatus
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      user-config: {condition: service_started}
+    environment:
+      HTTP_PORT: "9006"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      ORDER_STATUS_DB: order_status_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_SSL_MODE: disable
+      KAFKA_BROKERS: kafka:9092
+      USER_CONFIG_GRPC_ADDR: user-config:9003
+    networks: [algo-dev_net]
+
+  positions:
+    build:
+      <<: *svc-build
+      args: {SERVICE: positions, CMD_PATH: cmd}
+    image: algo-dev/positions:local
+    container_name: algo-dev-positions
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      trade-execution: {condition: service_started}
+    environment:
+      HTTP_PORT: "9007"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSITIONS_DB: positions_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_SSL_MODE: disable
+      KAFKA_BROKERS: kafka:9092
+      TRADE_EXEC_GRPC_ADDR: trade-execution:9004
+      RECONCILER_ENABLED: "false"
+      RECONCILER_INTERVAL_SEC: "300"
+    networks: [algo-dev_net]
