@@ -1,6 +1,7 @@
 module github.com/RohitIndira/Algo-Treading/api/proto/common
 
 go 1.21
+toolchain go1.25.12
 
 require google.golang.org/protobuf v1.34.2
 

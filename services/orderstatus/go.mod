@@ -1,6 +1,7 @@
 module github.com/RohitIndira/Algo-Treading/services/orderstatus
 
 go 1.25.0
+toolchain go1.25.12
 
 require (
 	github.com/RohitIndira/Algo-Treading/api/proto/user_config v0.0.0

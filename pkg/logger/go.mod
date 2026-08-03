@@ -1,6 +1,7 @@
 module github.com/RohitIndira/Algo-Treading/pkg/logger
 
 go 1.21
+toolchain go1.25.12
 
 require go.uber.org/zap v1.27.0
 

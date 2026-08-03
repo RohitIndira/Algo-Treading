@@ -1,0 +1,66 @@
+Bracket Order curl:
+
+curl --location 'https://livemiddleware.indiratrade.com/order-services/api/order/v1/place-order' \
+--header 'userId: ISPL19122' \
+--header 'source: IOS' \
+--header 'appId: 3eb9e7a74940ce4199b14345d84b70f61768289267144' \
+--header 'sso: true' \
+--header 'Content-Type: application/json' \
+--header 'Authorization: Bearer eyJhbGciOiJIUzUxMiJ9.eyJhcHBJZCI6IjQ2ZjkyNzBjMzgwY2NjZTgxNmYwNDM2NmE1OTVjNDQwMTc2ODIxNTE1ODM2MSIsInN1YiI6IklTUEwxOTEyMiIsImlhdCI6MTc2ODQ1MjgwNywiZXhwIjoxNzY4NTM5MjA3fQ.KGZuEWo309BwfmmQOrq9YL9OKszT06mcbM29l-flqTA1bWDfZc9q_z-cl3OeX6ZjjJWfYQzHjB0JHiqJXB96rA' \
+--data '{
+    "symbol": "STK_IDEA_EQ_NSE_14366",
+    "excToken": "14366",
+    "exc": "NSE",
+    "ordAction": "BUY",
+    "ordValidity": "DAY",
+    "ordType": "Market",
+    "prdType": "BRACKET_ORDER",
+    "limitPrice": 0.0,
+    "triggerPrice": 11.05,
+    "qty": 1,
+    "disQty": 0,
+    "lotSize": 1,
+    "instrument": "STK",
+    "amo": false,
+    "boStpLoss": 0.0,
+    "boTgtPrice": 12.0
+}'
+
+Comments:
+{
+  "symbol": "STK_IDEA_EQ_NSE_14366",          // (Internal usage format: Instrument_Symbol_Segment_Exchange)
+
+  "excToken": 14366,                  // Exchange token used internally by the exchange
+
+  "exc": "NSE",                       // Exchange where the order will be placed (NSE / BSE)
+
+  "ordAction": "BUY",                 // Order action: BUY or SELL
+
+  "ordValidity": "DAY",               // Order validity (DAY = valid for the trading day)
+
+  "ordType": "Market",                // Order type:
+                                      // Market  - Execute at market price
+                                      // Limit   - Execute at specified price
+
+  "prdType": "BRACKET_ORDER",          // Product type (Bracket Order with target & stop loss)
+
+  "limitPrice": 0.0,              // Limit price at which the order should be placed (limitPrice only if the order type is Limit)
+
+  "triggerPrice": 11.5,             // Trigger price (used for SL / SL-M orders)
+
+  "qty": 1,                           // Total quantity to buy or sell
+
+  "disQty": 0,                        // Disclosed quantity (0 = not used)
+
+  "lotSize": 1,                       // Lot size of the instrument
+
+  "instrument": "STK",                // Instrument type (STK = Equity Stock)
+
+  "amo": false,                       // After Market Order:
+                                      // true  = Place order after market hours
+                                      // false = Place during market hours
+
+  "boStpLoss": 0.0,                   // Bracket Order Stop Loss price (0.0 = not used)
+
+  "boTgtPrice": 12.0                // Bracket Order Target price
+}

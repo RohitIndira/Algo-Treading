@@ -1,0 +1,168 @@
+### User-Config Service API — REST Client collection
+### For VS Code "REST Client" extension (humao.rest-client) or JetBrains HTTP Client.
+### All strategy routes go through api-gateway (/api/v1) and require the JWT + userId/appId/source headers.
+###
+### Fill these in, then click "Send Request" above each block.
+### The appId MUST match the appId claim inside the JWT (loginSource=SSO -> source=WEB).
+
+@base = http://localhost:8080/api/v1
+@jwt = PASTE_FRESH_JWT_HERE
+@user_id = S4450
+@app_id = PASTE_APPID_FROM_JWT
+@source = WEB
+
+### After Create, copy the returned strategy_id into here:
+@strategy_id = PASTE_STRATEGY_ID_AFTER_CREATE
+
+
+### 1. CREATE  (WARNING: LIVE + activate_immediately arms a real strategy — use PAPER/false for testing)
+POST {{base}}/strategies
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{
+  "user_id": "{{user_id}}",
+  "strategy_name": "My Manthan Test",
+  "description": "test strategy",
+  "strategy_type": "MANTHAN",
+  "trading_mode": "PAPER",
+  "activate_immediately": false,
+  "trade_config": {
+    "total_capital": 500000,
+    "stop_loss_pct": 20,
+    "trailing_sl_pct": 2
+  }
+}
+
+
+### 2. READ ONE  (user_id is a REQUIRED query param, not just the header)
+GET {{base}}/strategies/{{strategy_id}}?user_id={{user_id}}
+Authorization: Bearer {{jwt}}
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+
+### 3. LIST  (pagination optional; active_only optional)
+GET {{base}}/users/{{user_id}}/strategies?page=1&page_size=20&active_only=false
+Authorization: Bearer {{jwt}}
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+
+### 4. UPDATE  (version must match current; increments on success; wrong version -> 412)
+PUT {{base}}/strategies/{{strategy_id}}
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{
+  "strategy_name": "Renamed Manthan",
+  "version": 1
+}
+
+
+### 5. ACTIVATE
+POST {{base}}/strategies/{{strategy_id}}/activate
+Authorization: Bearer {{jwt}}
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+
+### 6. DEACTIVATE  (KEEP_POSITIONS_OPEN is safe; SQUARE_OFF_AT_MARKET places REAL exits)
+POST {{base}}/strategies/{{strategy_id}}/deactivate
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{
+  "position_handling": "KEEP_POSITIONS_OPEN"
+}
+
+
+### 7. DELETE  (soft STOP: sets stopped_at, row STAYS GET-able as history -> a later Read returns 200 not 404)
+DELETE {{base}}/strategies/{{strategy_id}}
+Authorization: Bearer {{jwt}}
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+
+### 8. UPDATE BROKER CREDENTIALS  (encrypts + upserts execution_db.user_credentials, publishes USER_CREDENTIALS_UPDATED)
+POST {{base}}/auth/credentials
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{
+  "user_id": "{{user_id}}",
+  "bearer_token": "{{jwt}}"
+}
+
+
+### ─────────────── NEGATIVE TESTS (prove error-code mapping) ───────────────
+
+### N1. Empty name -> 400 INVALID_ARGUMENT
+POST {{base}}/strategies
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{ "user_id": "{{user_id}}", "strategy_name": "", "strategy_type": "MANTHAN", "trade_config": { "total_capital": 500000 } }
+
+
+### N2. Under-capital (<5L) -> 400
+POST {{base}}/strategies
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{ "user_id": "{{user_id}}", "strategy_name": "LowCap", "strategy_type": "MANTHAN", "trade_config": { "total_capital": 100000 } }
+
+
+### N3. Stale version -> 412 FAILED_PRECONDITION
+PUT {{base}}/strategies/{{strategy_id}}
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{ "strategy_name": "X", "version": 999 }
+
+
+### N4. Non-existent id -> 404 NOT_FOUND  (use a VALID non-nil UUID; the all-zeros UUID is a 400, not 404)
+PUT {{base}}/strategies/11111111-2222-3333-4444-555555555555
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{ "strategy_name": "X", "version": 1 }
+
+
+### N5. IDOR (body user_id != header userId) -> 403 FORBIDDEN
+POST {{base}}/strategies
+Authorization: Bearer {{jwt}}
+Content-Type: application/json
+userId: {{user_id}}
+appId: {{app_id}}
+source: {{source}}
+
+{ "user_id": "SOMEONE_ELSE", "strategy_name": "Hack", "strategy_type": "MANTHAN", "trade_config": { "total_capital": 500000 } }
