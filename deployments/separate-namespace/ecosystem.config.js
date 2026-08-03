@@ -76,9 +76,23 @@ module.exports = {
     //    logs are visible. Expect errors until creds are supplied. ──
     { name: 'api-gateway', script: './bin/api-gateway', ...common, env: {
         ...BASE, HTTP_PORT: '8099', CODIFI_JWT_SECRET: 'dev-secret-change-me',
+        USER_CONFIG_GRPC_ADDR: 'localhost:9003',          // was defaulting to :50051
+        TRADE_EXECUTION_PAPER_URL: 'http://localhost:8091',
+        CORS_ALLOWED_ORIGINS: 'https://manthan-dev.stockk.trade',
+        REDIS_LOCAL_ADDR: 'localhost:6389',               // ws pub/sub redis (algo-dev)
     }},
-    { name: 'data-ingestion', script: './bin/data-ingestion', ...common, env: {
-        ...BASE, MANTHAN_SHEET_ID: '', MANTHAN_CREDS: '',
+    // manthan-live is a BATCH job (reads sheet → publishes signals → exits), not
+    // a daemon. Don't keep-alive it; run it once daily pre-open via cron_restart.
+    { name: 'data-ingestion', script: './bin/data-ingestion', ...common,
+      autorestart: false, cron_restart: '0 9 * * 1-5', env: {
+        ...BASE,
+        MANTHAN_SHEET_ID: '1E_MzQNQFNvnmR8wMZMCyzPKc-SjOei4wwQp4QAey5sc',
+        MANTHAN_CREDS: '/home/ubuntu/Algo-Treading/services/data-ingestion/credentials/manthan-sheet.json',
+        // manthan-live writes signals via MARKET_DATA_DB_* (default port 5432 =
+        // the OTHER stack's postgres). Point it at algo-dev's signals_db.
+        MARKET_DATA_DB_HOST: 'localhost', MARKET_DATA_DB_PORT: '5442',
+        MARKET_DATA_DB_USER: 'postgres', MARKET_DATA_DB_PASSWORD: 'postgres',
+        MARKET_DATA_DB_NAME: 'signals_db', MARKET_DATA_DB_SSLMODE: 'disable',
     }},
   ],
 };

@@ -52,10 +52,15 @@ func main() {
 
 	userConfigHandler := handlers.NewUserConfigHandler(userConfigClient)
 
-	// Initialize Redis client for WebSocket pub/sub
+	// Initialize Redis client for WebSocket pub/sub. Address is env-configurable
+	// (REDIS_LOCAL_ADDR) so non-default deployments aren't pinned to :6379.
+	localRedisAddr := os.Getenv("REDIS_LOCAL_ADDR")
+	if localRedisAddr == "" {
+		localRedisAddr = "localhost:6379"
+	}
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
+		Addr:     localRedisAddr,
+		Password: os.Getenv("REDIS_LOCAL_PASSWORD"),
 		DB:       0,
 	})
 
