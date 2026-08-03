@@ -108,6 +108,11 @@ func (m *SafetyMonitor) Start(ctx context.Context) {
 }
 
 func (m *SafetyMonitor) check(ctx context.Context) {
+	// FIX 3: enforce "every OPEN filled BUY position has exactly one active SL".
+	// Runs first so a naked position (fill whose SL never landed) gets protected
+	// within one 2s cycle — before we even look at existing SL orders.
+	m.checkNakedPositions(ctx)
+
 	// Get all active SL orders
 	slOrders, err := m.repo.GetActiveSLOrders(ctx)
 	if err != nil {
@@ -121,6 +126,55 @@ func (m *SafetyMonitor) check(ctx context.Context) {
 
 	for _, sl := range slOrders {
 		m.checkPosition(ctx, sl)
+	}
+}
+
+// checkNakedPositions places the initial SL for every OPEN filled BUY position
+// that currently has no active stop-loss (FIX 3). Idempotent: PlaceInitialSL
+// reuses any prior terminal SL row (never a duplicate broker SL), and a
+// position already protected won't appear in the query. Liquidation-hazard-safe
+// — it only PLACES stops, never cancels or exits.
+func (m *SafetyMonitor) checkNakedPositions(ctx context.Context) {
+	naked, err := m.repo.ListNakedOpenBuyPositions(ctx)
+	if err != nil {
+		m.logger.Error("Safety monitor: naked-position query failed", zap.Error(err))
+		return
+	}
+	for _, pos := range naked {
+		// Skip users whose JWT is known-dead this cycle (avoid AU004 spam); the
+		// next cycle retries once creds refresh.
+		if authGated(m.authNotif, pos.UserID) {
+			continue
+		}
+		info, rerr := m.broker.ResolveSymbol(ctx, pos.Symbol, pos.ISIN)
+		if rerr != nil || info == nil {
+			m.logger.Warn("Safety monitor: naked position — symbol resolve failed, will retry next cycle",
+				zap.String("symbol", pos.Symbol), zap.Error(rerr))
+			continue
+		}
+		// Baseline protection: 20% below the entry fill. If rules-engine has
+		// trailed higher, its next SL_MODIFY ratchets up (the ratchet guard
+		// prevents lowering), so this can never over-tighten a trailed stop.
+		trigger := pos.EntryFillPrice * 0.80
+		limit := trigger - SLLimitGap(trigger, info.TickSize)
+
+		signal := ManthanSignal{
+			OrderID:     pos.EntrySignalID,
+			UserID:      pos.UserID,
+			StrategyID:  pos.StrategyID,
+			Symbol:      pos.Symbol,
+			ISIN:        pos.ISIN,
+			TradingMode: "LIVE", // query already excludes PAPER-% broker orders
+		}
+		m.logger.Warn("Safety monitor: NAKED position detected — placing initial SL",
+			zap.String("symbol", pos.Symbol),
+			zap.Int("net_qty", pos.NetQty),
+			zap.Float64("entry_fill", pos.EntryFillPrice),
+			zap.Float64("trigger", trigger))
+		if slErr := m.slHandler.PlaceInitialSL(ctx, pos.EntryOrderID, signal, info, pos.NetQty, trigger, limit); slErr != nil {
+			m.logger.Error("Safety monitor: naked-position SL placement failed — will retry next cycle",
+				zap.String("symbol", pos.Symbol), zap.Error(slErr))
+		}
 	}
 }
 
@@ -202,6 +256,9 @@ func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
 				} else {
 					_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL", "SL_PLACED", "EMERGENCY_SELL",
 						"", 0, sl.Qty, "no entry row — MARKET broker_id="+mkBrokerID)
+					// FIX 5: record the emergency exit as a FILLED SELL so the
+					// position nets to 0 downstream (was event-only → state divergence).
+					_ = m.repo.InsertEmergencySellFilled(ctx, sl, mkBrokerID, sl.Qty)
 				}
 				return
 			}
@@ -227,6 +284,8 @@ func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
 				} else {
 					_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL", "SL_PLACED", "EMERGENCY_SELL",
 						"", 0, sl.Qty, "SL re-place failed — MARKET broker_id="+mkBrokerID)
+					// FIX 5: record the emergency exit as a FILLED SELL (nets position to 0).
+					_ = m.repo.InsertEmergencySellFilled(ctx, sl, mkBrokerID, sl.Qty)
 				}
 				return
 			}

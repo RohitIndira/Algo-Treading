@@ -96,6 +96,10 @@ func FromStoreEvent(ev *store.Event) OrderEvent {
 type Publisher struct {
 	writer *kafka.Writer
 	logger *zap.Logger
+
+	// workerStore is the broker_events writer the durability worker scans for
+	// unpublished rows. Set by RunWorker; nil on the inline-only publish path.
+	workerStore *store.Writer
 }
 
 // NewPublisher wraps an existing *kafka.Writer configured for the
@@ -105,15 +109,16 @@ func NewPublisher(w *kafka.Writer, logger *zap.Logger) *Publisher {
 }
 
 // Publish serializes ev to JSON and produces to Kafka with broker_order_id
-// as the partition key. Non-blocking on the caller's timeline — errors are
-// logged but never returned, because losing a Kafka publish is less bad
-// than blocking WSS event processing behind a broker Kafka outage.
+// as the partition key. Returns true iff the message was accepted by Kafka.
 //
-// If durability matters more than availability later, we can add an outbox
-// table + background retryer. For now, best-effort with visible error logs.
-func (p *Publisher) Publish(ctx context.Context, ev *store.Event) {
+// Best-effort on the caller's timeline: a false return is logged, not fatal,
+// because losing a single inline publish is less bad than blocking WSS event
+// processing behind a Kafka outage. Durability is the worker's job — the
+// caller stamps broker_events.published_at only on a true return, so a false
+// leaves the row for RunWorker to retry.
+func (p *Publisher) Publish(ctx context.Context, ev *store.Event) bool {
 	if p == nil || p.writer == nil || ev == nil {
-		return
+		return false
 	}
 	envelope := FromStoreEvent(ev)
 	body, err := json.Marshal(envelope)
@@ -121,7 +126,7 @@ func (p *Publisher) Publish(ctx context.Context, ev *store.Event) {
 		p.logger.Warn("order.events marshal failed",
 			zap.String("broker_order_id", ev.BrokerOrderID),
 			zap.Error(err))
-		return
+		return false
 	}
 
 	msg := kafka.Message{
@@ -136,14 +141,91 @@ func (p *Publisher) Publish(ctx context.Context, ev *store.Event) {
 		},
 	}
 	if err := p.writer.WriteMessages(ctx, msg); err != nil {
-		p.logger.Warn("order.events publish failed — event is safe in broker_events, just not fanned out",
+		p.logger.Warn("order.events publish failed — event is safe in broker_events, worker will retry",
 			zap.String("broker_order_id", ev.BrokerOrderID),
 			zap.Int64("event_seq", envelope.EventSeq),
 			zap.Error(err))
-		return
+		return false
 	}
 	p.logger.Debug("order.events published",
 		zap.String("broker_order_id", envelope.BrokerOrderID),
 		zap.String("event_type", envelope.EventType),
 		zap.Int64("event_seq", envelope.EventSeq))
+	return true
+}
+
+// durabilityGracePeriod is the single source of truth for how long the inline
+// publish path exclusively owns a freshly-inserted broker_events row. The
+// worker ignores rows younger than this. Tune here.
+const durabilityGracePeriod = 5 * time.Second
+
+// RunWorker is the durability backstop for broker_events → order.events.
+// Invariant: inline publishers own rows for the first durabilityGracePeriod
+// after INSERT. The worker only touches rows that have been published_at IS
+// NULL for longer than that — meaning the inline path genuinely failed (Kafka
+// unreachable, marshal error, etc.). There is NO window where both the inline
+// path and the worker publish the same row.
+//
+// Every `interval`, it republishes those genuinely-failed rows and stamps them
+// once Kafka confirms. Blocks until ctx is cancelled.
+//
+// Ordering: FetchUnpublished returns rows in id order, so per-broker_order_id
+// FIFO is preserved. On the FIRST publish failure in a drain pass we stop and
+// retry the whole pass next tick — this keeps a stuck row from letting later
+// rows for the same order jump ahead of it.
+func (p *Publisher) RunWorker(ctx context.Context, w *store.Writer, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	p.workerStore = w
+	p.logger.Info("order.events durability worker started",
+		zap.Duration("interval", interval))
+	defer p.logger.Info("order.events durability worker stopped")
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.drainOnce(ctx)
+		}
+	}
+}
+
+// drainOnce publishes as many pending rows as it can in id order, stopping at
+// the first failure. Uses p.workerStore (set by RunWorker) — kept as a field so
+// the signature stays clean.
+func (p *Publisher) drainOnce(ctx context.Context) {
+	if p.workerStore == nil {
+		return
+	}
+	rows, err := p.workerStore.FetchUnpublished(ctx, 500, durabilityGracePeriod.Seconds())
+	if err != nil {
+		p.logger.Warn("durability worker: fetch unpublished failed", zap.Error(err))
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	published := 0
+	for _, r := range rows {
+		if !p.Publish(ctx, &r.Event) {
+			// Kafka still unhappy — stop; retry the rest next tick so ordering
+			// per broker_order_id is preserved.
+			break
+		}
+		if err := p.workerStore.MarkPublished(ctx, r.ID); err != nil {
+			p.logger.Warn("durability worker: mark published failed — will retry",
+				zap.Int64("id", r.ID), zap.Error(err))
+			break
+		}
+		published++
+	}
+	if published > 0 {
+		p.logger.Info("durability worker: republished pending events",
+			zap.Int("count", published),
+			zap.Int("pending_this_pass", len(rows)))
+	}
 }

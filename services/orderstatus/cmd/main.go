@@ -71,9 +71,15 @@ func main() {
 	// ── Kafka producer: order.events topic ─────────────────────────────
 	brokers := splitCsv(getEnv("KAFKA_BROKERS", "localhost:9092"))
 	kafkaWriter := &kafka.Writer{
-		Addr:         kafka.TCP(brokers...),
-		Topic:        "order.events",
-		Balancer:     &kafka.LeastBytes{},
+		Addr:  kafka.TCP(brokers...),
+		Topic: "order.events",
+		// Hash (not LeastBytes): partition is chosen by hashing Message.Key
+		// (= broker_order_id), so every event for one order lands on the SAME
+		// partition and keeps strict per-order FIFO ordering. LeastBytes routes
+		// by partition load and IGNORES the key, which would scatter one order's
+		// events across partitions and let positions svc see an exit before its
+		// entry. Per-order ordering is the only ordering any consumer needs.
+		Balancer:     &kafka.Hash{},
 		BatchTimeout: 1 * time.Millisecond,
 		RequiredAcks: kafka.RequireAll,
 	}
@@ -195,6 +201,12 @@ func main() {
 	recCtx, recCancel := context.WithCancel(context.Background())
 	defer recCancel()
 	rec.Start(recCtx)
+
+	// Durability backstop: republish any broker_events rows whose inline
+	// publish failed (published_at IS NULL) so a transient Kafka outage never
+	// permanently drops an event from order.events. Scans in id order every 1s.
+	go orderEventsPub.RunWorker(recCtx, brokerEvents, 1*time.Second)
+	logger.Info("order.events durability worker started")
 
 	logger.Info("orderstatus svc ready",
 		zap.String("chunk", "D"),

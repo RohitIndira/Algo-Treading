@@ -1,5 +1,5 @@
 // EOD Phase A Retry (Layer 4) — background worker that re-attempts EOD
-// Phase A for users whose first try at 15:35 IST was skipped because their
+// Phase A for users whose first try at 16:35 IST was skipped because their
 // broker JWT was expired or absent.
 //
 // Why this exists:

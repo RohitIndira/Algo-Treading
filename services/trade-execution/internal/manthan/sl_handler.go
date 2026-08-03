@@ -87,13 +87,19 @@ func (h *SLHandler) resolveAuth(userID, symbol, op string) (BrokerAuth, bool) {
 	return *a, true
 }
 
-func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, signal ManthanSignal, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) {
+// PlaceInitialSL places the initial 20%-below-fill SL for an entry. Returns an
+// error on any failure so the caller (handleFill) can surface a naked position
+// loudly; the safety-monitor's naked-position scan (FIX 3) is the actual
+// recovery — it re-drives this every 2s until an active SL exists. A nil return
+// means the SL is placed OR deliberately deferred (SL_DEFERRED_BAND) — both are
+// "protected" states, not naked.
+func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, signal ManthanSignal, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) error {
 	// Resolve auth at-edge via authProvider — token no longer rides the Kafka
 	// signal. If creds are unavailable we'd 401 against the broker anyway, so
 	// fail fast with a clear log instead.
 	auth, ok := h.resolveAuth(signal.UserID, signal.Symbol, "PlaceInitialSL")
 	if !ok {
-		return
+		return fmt.Errorf("PlaceInitialSL: auth unavailable for user %s symbol %s", signal.UserID, signal.Symbol)
 	}
 
 	// NOTE: the DPR clamp deliberately does NOT happen here. The incoming
@@ -125,8 +131,20 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 	}
 	slOrderID, err := h.repo.InsertOrder(ctx, slOrder)
 	if err != nil {
-		h.logger.Error("Failed to insert SL order record", zap.Error(err))
-		return
+		// FIX 3 idempotency: a prior attempt may have left a terminal
+		// (REJECTED/CANCELLED/EXPIRED) SL row with this deterministic signal_id,
+		// so UNIQUE(signal_id) blocks a fresh insert. Reset that row to PENDING
+		// and reuse it — this lets the safety-monitor naked scan re-drive
+		// placement WITHOUT creating a duplicate broker SL (enforces "exactly
+		// one SL per entry"). If no terminal row matched, it's a real failure.
+		resetID, found, resetErr := h.repo.ResetTerminalSLToPending(ctx, slOrder.SignalID, triggerPrice, limitPrice)
+		if resetErr != nil || !found {
+			h.logger.Error("Failed to insert SL order record", zap.Error(err))
+			return fmt.Errorf("PlaceInitialSL: insert SL order: %w", err)
+		}
+		slOrderID = resetID
+		h.logger.Info("PlaceInitialSL: reusing prior terminal SL row (idempotent re-drive)",
+			zap.String("symbol", signal.Symbol), zap.Int64("sl_order_id", slOrderID))
 	}
 
 	// PAPER mode — just record it, no broker call
@@ -143,7 +161,7 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 		if h.eventPub != nil {
 			h.eventPub.PublishSLPlaced(ctx, signal, paperBrokerID, triggerPrice, limitPrice)
 		}
-		return
+		return nil
 	}
 
 	// Option B — DEFER instead of placing a premature band-floor stop. If the
@@ -165,7 +183,7 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 			zap.String("symbol", signal.Symbol),
 			zap.Float64("intended_trigger", triggerPrice),
 			zap.Float64("dpr_lower", info.DPRLower))
-		return
+		return nil // deferred is a deliberate protected state, not naked
 	}
 
 	// LIVE mode — place with broker, retry on failure (includes one auth-refresh
@@ -204,7 +222,7 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 			}
 			h.emergencySell(ctx, signal, info, auth, qty, "SL placement failed")
 		}
-		return
+		return fmt.Errorf("PlaceInitialSL: broker place SL for %s: %w", signal.Symbol, err)
 	}
 
 	// Store intended trigger (trigger_price, set at InsertOrder) + broker-real
@@ -225,6 +243,7 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 	if h.eventPub != nil {
 		h.eventPub.PublishSLPlaced(ctx, signal, brokerID, triggerPrice, limitPrice)
 	}
+	return nil
 }
 
 // MergeTopupSL extends the PARENT SL to cover the combined position after a

@@ -77,6 +77,14 @@ func main() {
 	// Load configuration
 	cfg := loadConfig()
 
+	// Hard-fail on a missing/weak/placeholder ENCRYPTION_KEY before we touch
+	// any broker credentials — trade-execution decrypts real funded-account
+	// tokens, so silently booting with the built-in default gives zero at-rest
+	// protection. Mirrors user-config's boot guard.
+	if err := validateEncryptionKey(cfg.EncryptionKey); err != nil {
+		log.Fatalf("ENCRYPTION_KEY validation failed: %v", err)
+	}
+
 	// Initialize PostgreSQL
 	log.Println("Connecting to PostgreSQL...")
 	db, err := initPostgres(cfg)
@@ -91,7 +99,7 @@ func main() {
 	// user-config's gRPC API (single-writer principle, see
 	// docs/architecture/data-ownership.md). The local DB-backed repo stays
 	// alive as a fallback so a brief user-config outage doesn't stall the
-	// 09:14 / 15:35 crons. When the env var is empty we fall back to direct
+	// 09:14 / 16:35 crons. When the env var is empty we fall back to direct
 	// DB reads, preserving the pre-refactor behaviour.
 	orderRepo := repository.NewOrderRepository(db)
 	dbCredsRepo := repository.NewCredentialsRepository(db, cfg.EncryptionKey)
@@ -172,7 +180,7 @@ func main() {
 	strategyEventsConsumer := consumer.NewStrategyEventsConsumer(cfg.KafkaBrokers, orderRepo, orderExecutor, logger)
 	// Wire credentials cache so USER_CREDENTIALS_UPDATED events from the
 	// /api/v1/auth/credentials login flow invalidate the cached JWT — keeps
-	// the protective replayer's 15:35 IST cron and the live order path on
+	// the protective replayer's 16:35 IST cron and the live order path on
 	// the freshest token without waiting for the 5-min TTL.
 	strategyEventsConsumer.SetCredentialsCache(orderExecutor.CredentialsCache())
 	log.Println("✓ Strategy events consumer initialized")
@@ -663,9 +671,9 @@ func main() {
 		})
 
 		// POST /manthan/replay/runEODNow — manually trigger Layer 1
-		// EOD Phase A AMO+SL submission outside the 15:35 IST cron window.
+		// EOD Phase A AMO+SL submission outside the 16:35 IST cron window.
 		//
-		// Used for ops re-runs: e.g. when the 15:35 cycle skipped due to a
+		// Used for ops re-runs: e.g. when the 16:35 cycle skipped due to a
 		// transient bug (over-strict freeQty gate on T+0 buys) and an
 		// operator wants to re-arm after a hot fix. Idempotent — runs the
 		// same body the cron runs, InsertAMOOrder dedups already-armed
@@ -834,6 +842,39 @@ type Config struct {
 	UserConfigGRPCTimeout time.Duration
 }
 
+// insecureDefaultEncryptionKey is the built-in placeholder AES key. A real
+// deployment MUST override ENCRYPTION_KEY; validateEncryptionKey rejects this
+// value unless ALLOW_INSECURE_ENCRYPTION_KEY=true is set (local dev only).
+const insecureDefaultEncryptionKey = "0123456789abcdef0123456789abcdef"
+
+// validateEncryptionKey enforces a usable, non-placeholder AES key at boot so
+// trade-execution hard-fails rather than silently decrypting real broker
+// tokens with a weak/known key. Mirrors the user-config guard.
+func validateEncryptionKey(key string) error {
+	// 1) Length first — AES-128/192/256 require exactly 16/24/32 bytes. A
+	//    short or empty key can never encrypt, so reject it regardless of the
+	//    escape-hatch flag.
+	switch len(key) {
+	case 16, 24, 32:
+		// ok
+	default:
+		return fmt.Errorf("ENCRYPTION_KEY must be 16, 24, or 32 bytes (AES-128/192/256); got %d bytes", len(key))
+	}
+
+	// 2) Reject the built-in placeholder unless explicitly allowed for local
+	//    dev. In production the key is public, so this would give zero at-rest
+	//    protection.
+	if key == insecureDefaultEncryptionKey {
+		if getEnvAsBool("ALLOW_INSECURE_ENCRYPTION_KEY", false) {
+			log.Printf("[trade-execution] WARN: insecure encryption key allowed via ALLOW_INSECURE_ENCRYPTION_KEY flag — DO NOT USE IN PRODUCTION")
+			return nil
+		}
+		return fmt.Errorf("ENCRYPTION_KEY is the insecure built-in default; set a real 16/24/32-byte key, or set ALLOW_INSECURE_ENCRYPTION_KEY=true for local dev")
+	}
+
+	return nil
+}
+
 func loadConfig() Config {
 	kafkaBrokersStr := getEnv("KAFKA_BROKERS", "localhost:9092")
 	kafkaBrokers := []string{}
@@ -857,7 +898,7 @@ func loadConfig() Config {
 		MaxRetries:       getEnvInt("MAX_RETRIES", 3),
 		RetryDelay:       time.Duration(getEnvInt("RETRY_DELAY_SEC", 1)) * time.Second,
 		PostgresURL:      buildPostgresURL(),
-		EncryptionKey:    getEnv("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef"),
+		EncryptionKey:    getEnv("ENCRYPTION_KEY", insecureDefaultEncryptionKey),
 		PaperWSPort:      getEnvInt("PAPER_WS_PORT", 8081),
 		PaperMarketWSURL: getEnv("PAPER_MARKET_WS_URL", "wss://stockkaskwebsocket.indiratrade.com/enhanced-stream"),
 		RedisAddr:        getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
@@ -913,6 +954,17 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func getEnvAsBool(key string, defaultValue bool) bool {
+	switch trim(os.Getenv(key)) {
+	case "1", "true", "TRUE", "True", "yes", "YES", "on", "ON":
+		return true
+	case "0", "false", "FALSE", "False", "no", "NO", "off", "OFF":
+		return false
+	default:
+		return defaultValue
+	}
 }
 
 func getEnvInt(key string, defaultValue int) int {

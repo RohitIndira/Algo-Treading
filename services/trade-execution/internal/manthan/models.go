@@ -41,7 +41,7 @@ const (
 	StatusSLDeferredBand OrderStatus = "SL_DEFERRED_BAND"
 
 	// AMO replayer-specific lifecycle states.
-	// AMO_PENDING:        submitted to broker AMO queue at 15:35; awaits 08:50 conversion
+	// AMO_PENDING:        submitted to broker AMO queue at 16:35; awaits 08:50 conversion
 	// AMO_REJECTED:       converted but exchange rejected (typically DPR breach)
 	// (Successful conversion ⇒ row is promoted to OrderTypeSLSell + StatusSLPlaced
 	// with a fresh broker_order_id, indistinguishable from a regular in-session SL.)

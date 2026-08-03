@@ -3,6 +3,8 @@ package indira
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // StandardResponse represents the standard API response format
@@ -197,9 +199,12 @@ type OrderTrailRequest struct {
 // TradeBook represents a trade in the trade book.
 // Field names match the Indira broker API response (data.trades[]).
 type TradeBook struct {
-	OrdId      string      `json:"ordId,omitempty"`
-	ExchTrdId  interface{} `json:"exchTrdId,omitempty"`
-	ExchOrdId  string      `json:"exchOrdId,omitempty"`
+	OrdId string `json:"ordId,omitempty"`
+	// ExchTrdId is the exchange trade id — unique per fill. Kept as raw JSON so
+	// a large (15-16 digit) numeric id isn't silently truncated by float64
+	// decoding; parse it with ExchTradeID() which fails loudly on overflow.
+	ExchTrdId json.RawMessage `json:"exchTrdId,omitempty"`
+	ExchOrdId string          `json:"exchOrdId,omitempty"`
 	PrdType    string      `json:"prdType,omitempty"`
 	OrdAction  string      `json:"ordAction,omitempty"`
 	OrdType    string      `json:"ordType,omitempty"`
@@ -211,6 +216,32 @@ type TradeBook struct {
 	Qty         int     `json:"qty,omitempty"`
 	Symbol      interface{} `json:"symbol,omitempty"` // complex object from broker
 	UndAsset    string  `json:"undAsset,omitempty"`
+}
+
+// ExchTradeID parses the raw exchTrdId into an int64. The broker sends it as a
+// JSON number or a quoted string; either way we parse the exact digits so a
+// 15-16 digit exchange trade id keeps full precision (used as event_seq).
+//
+// Returns an error — never a truncated/rounded value — when the id is absent,
+// non-numeric, or wider than int64. Callers MUST treat the error as "skip this
+// trade + log loudly", not fall back to 0.
+func (t *TradeBook) ExchTradeID() (int64, error) {
+	raw := strings.TrimSpace(string(t.ExchTrdId))
+	if raw == "" || raw == "null" {
+		return 0, fmt.Errorf("exchTrdId is empty")
+	}
+	// Strip surrounding quotes if the broker sent it as a JSON string.
+	raw = strings.Trim(raw, `"`)
+	if raw == "" {
+		return 0, fmt.Errorf("exchTrdId is empty")
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		// ParseInt returns ErrRange on overflow and ErrSyntax on non-numeric —
+		// both surface here so the caller skips rather than truncates.
+		return 0, fmt.Errorf("exchTrdId %q not a valid int64: %w", raw, err)
+	}
+	return id, nil
 }
 
 // HoldingSymbol is one row of the `symbol` array inside a holding. Indira

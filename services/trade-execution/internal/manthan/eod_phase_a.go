@@ -1,4 +1,4 @@
-// EOD Phase A — daily 15:35 IST scheduler that pre-stages a protective SL
+// EOD Phase A — daily 16:35 IST scheduler that pre-stages a protective SL
 // for every open Manthan position as an AMO (After-Market Order) on Indira.
 //
 // Why this exists:
@@ -11,7 +11,7 @@
 //   cron has a chance to react.
 //
 // What this does:
-//   At 15:35 IST (5 minutes after broker auto-cancel) we walk every OPEN
+//   At 16:35 IST (comfortably after the 15:30 broker auto-cancel) we walk every OPEN
 //   position from manthan_positions, compute the SL trigger from the
 //   carried TSL trail (falling back to entry_fill_price × 0.92 when no
 //   trail exists yet), DPR-clamp and tick-align it, then submit to Indira
@@ -21,7 +21,7 @@
 //   opens, not from 09:14 onward.
 //
 // What this does NOT do (deferred to next commit):
-//   - Layer 4 retry queue for users whose JWT was expired at 15:35
+//   - Layer 4 retry queue for users whose JWT was expired at 16:35
 //   - Earlier JWT-expiry alert at 14:30 IST so users can re-login in time
 //   The 09:14 cron remains the per-day fallback for any positions this
 //   cycle couldn't arm — see protective_replay.go for the modification
@@ -48,33 +48,33 @@ import (
 
 // EODFallbackSLPct is the SL distance used when a position has no carried
 // TSL trail yet (e.g. entry filled less than one TSL-tick window before
-// 15:35 IST). Kept in sync with the 09:14 cron's `* 0.92` magic so both
+// 16:35 IST). Kept in sync with the 09:14 cron's `* 0.92` magic so both
 // paths produce the same trigger for the same entry — tomorrow's morning
 // cron won't see a mismatch between what EOD pre-staged and what it would
 // have placed.
 const EODFallbackSLPct = 0.92
 
-// StartEODPhaseA registers the 15:35 IST daily cron. Idempotent if Start()
+// StartEODPhaseA registers the 16:35 IST daily cron. Idempotent if Start()
 // already started the 09:14 cron — both use scheduleDaily under the hood.
 //
-// Catch-up: if the service boots between 15:35 and 16:30 IST on a trading
+// Catch-up: if the service boots between 16:35 and 17:30 IST on a trading
 // day, runs once immediately. The broker accepts AMO submissions until
-// ~08:55 IST the next morning; 16:30 IST is a conservative startup window
+// ~08:55 IST the next morning; 17:30 IST is a conservative startup window
 // that still leaves comfortable broker-side processing margin.
 func (p *ProtectiveReplay) StartEODPhaseA(ctx context.Context) {
 	p.logger.Info("EOD Phase A scheduler started",
-		zap.String("schedule", "15:35 IST · AMO+SL submission for every OPEN position"))
+		zap.String("schedule", "16:35 IST · AMO+SL submission for every OPEN position"))
 
 	now := p.now()
 	if indiraClient.IsTradingDay(now) {
 		minute := now.Hour()*60 + now.Minute()
-		if minute >= 15*60+35 && minute < 16*60+30 {
+		if minute >= 16*60+35 && minute < 17*60+30 {
 			p.logger.Info("Startup-recovery: running missed EOD Phase A cycle")
 			go p.runEODPhaseA(ctx)
 		}
 	}
 
-	go p.scheduleDaily(ctx, 15, 35, p.runEODPhaseA)
+	go p.scheduleDaily(ctx, 16, 35, p.runEODPhaseA)
 }
 
 // runEODPhaseA is the EOD entry-point.
@@ -134,7 +134,7 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 				SkipReason: "EOD: no broker auth — re-login required (queued for Layer-4 retry)",
 			})
 			if err := p.repo.EnqueueArmRetry(cycleCtx, pos.UserID, pos.EntryOrderID, tradeDate,
-				"no broker auth at 15:35 IST"); err != nil {
+				"no broker auth at 16:35 IST"); err != nil {
 				p.logger.Warn("EOD Phase A: enqueue arm-retry failed",
 					zap.String("user_id", pos.UserID),
 					zap.Int64("entry_order_id", pos.EntryOrderID),
@@ -145,7 +145,7 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 		}
 
 		// Lazy-load EOD-sellable qty once per user. NOT freeQty — Indian T+1
-		// settlement means today's CNC buys have freeQty=0 at 15:35 even
+		// settlement means today's CNC buys have freeQty=0 at 16:35 even
 		// though the AMO will execute fine tomorrow morning post-settle.
 		// See fetchEODSellableQtyMap docstring for the full rationale.
 		if !uc.fetched {
@@ -298,7 +298,7 @@ func (p *ProtectiveReplay) planEODTrigger(
 	//   1. Carried TSL trail from prior SL rows (pos.LatestTrigger)
 	//   2. Entry fill price × EODFallbackSLPct
 	//
-	// We deliberately do NOT use LTP as a fallback — at 15:35 IST the
+	// We deliberately do NOT use LTP as a fallback — at 16:35 IST the
 	// LTP is the day's close, which has nothing to do with our entry
 	// basis. A drifted close would either tighten the SL well above
 	// entry (cutting position prematurely) or loosen it (giving up the
@@ -332,7 +332,7 @@ func (p *ProtectiveReplay) planEODTrigger(
 }
 
 // RunEODPhaseANow runs one EOD Phase A cycle synchronously, bypassing the
-// 15:35 cron schedule. Used by ArmRetryWorker when a user re-logs in and
+// 16:35 cron schedule. Used by ArmRetryWorker when a user re-logs in and
 // has PENDING retry rows queued: re-running the full cycle is idempotent
 // (InsertAMOOrder dedups already-armed positions via the partial UNIQUE
 // index on (parent_order_id, trade_date)), so already-protected positions

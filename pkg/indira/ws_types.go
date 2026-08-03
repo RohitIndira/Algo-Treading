@@ -1,5 +1,7 @@
 package indira
 
+import "strconv"
+
 // WebSocketTokenResponse represents the response from the REST API to get a WebSocket token
 type WebSocketTokenResponse struct {
 	Status  string `json:"status"`
@@ -37,6 +39,41 @@ func (f *FlexInt) UnmarshalJSON(data []byte) error {
 
 func (f FlexInt) String() string { return string(f) }
 
+func atoiFlex(f FlexInt) int { n, _ := strconv.Atoi(string(f)); return n }
+
+// FilledQty returns the PER-TRADE executed quantity for THIS frame. The broker's
+// EXECUTED trade message (MessageType=TRD_MSG, verified live 2026-08-03) carries
+// the fill in TradeQty, NOT TradedQTY (which is 0 on the ORD_NRML ack). Prefer
+// TradeQty, then QuantityTradedToday, then legacy TradedQTY. NEVER derive from
+// OrderOriginalQty — that's the ORDER size and over-states a partial.
+//
+// Use this for the append-only per-event broker_events log (each TRD_MSG = one
+// trade). For "is the whole ORDER filled?" comparisons use CumulativeFilledQty.
+func (w *WSOrderStatus) FilledQty() int {
+	if v := atoiFlex(w.TradeQty); v > 0 {
+		return v
+	}
+	if v := atoiFlex(w.QuantityTradedToday); v > 0 {
+		return v
+	}
+	return atoiFlex(w.TradedQTY)
+}
+
+// CumulativeFilledQty returns the TOTAL filled quantity for the order so far.
+// Prefer QuantityTradedToday (the running total across trades); fall back to
+// legacy TradedQTY. Deliberately does NOT use TradeQty — a single trade's qty
+// would under-state a multi-trade fill and make the partial-fill check
+// (filledQty < orderQty) fire a SPURIOUS topup on a completing trade.
+//
+// Use this for order state (order.FilledQuantity) and every "is the order
+// complete?" comparison in the execution path.
+func (w *WSOrderStatus) CumulativeFilledQty() int {
+	if v := atoiFlex(w.QuantityTradedToday); v > 0 {
+		return v
+	}
+	return atoiFlex(w.TradedQTY)
+}
+
 // WSOrderStatus represents the main live order status structure from the WebSocket.
 // Many fields use FlexInt because the broker inconsistently sends them as
 // either JSON numbers or JSON strings across different message types.
@@ -64,6 +101,8 @@ type WSOrderStatus struct {
 	DQRemaining           FlexInt `json:"DQRemaining"`
 	ProCli                string  `json:"ProCli"`
 	TradedQTY             FlexInt `json:"TradedQTY"`
+	TradeQty              FlexInt `json:"TradeQty"`            // per-trade fill qty on TRD_MSG frames (0/absent on ORD_NRML)
+	QuantityTradedToday   FlexInt `json:"QuantityTradedToday"` // cumulative fill qty on TRD_MSG frames
 	MessageSequenceNumber FlexInt `json:"MessageSequenceNumber"`
 	Exchange              FlexInt `json:"Exchange"`
 	TradedPrice           string  `json:"TradedPrice"`

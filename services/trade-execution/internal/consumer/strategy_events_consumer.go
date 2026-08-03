@@ -152,7 +152,7 @@ func (c *StrategyEventsConsumer) SetPriceMonitor(pm OrderUnwatcher) {
 // SetCredentialsCache wires the in-memory JWT cache so we can invalidate a
 // user's cached credentials when their broker JWT is refreshed via the
 // /api/v1/auth/credentials endpoint. Without this, the cache's 5-min TTL
-// could serve a stale JWT to the protective replayer's 15:35 IST cron for
+// could serve a stale JWT to the protective replayer's 16:35 IST cron for
 // up to 5 minutes after a fresh login.
 func (c *StrategyEventsConsumer) SetCredentialsCache(cc CredentialsCacheInvalidator) {
 	c.credsCache = cc
@@ -224,7 +224,7 @@ func (c *StrategyEventsConsumer) processMessage(ctx context.Context, msg kafka.M
 		}
 		// Layer 4: wake the EOD-arm retry queue. If the user logged in
 		// because they got the 14:30 IST pre-flight alert (Layer 3) or the
-		// 15:35 IST EOD-skip notification, this drains their PENDING rows
+		// 16:35 IST EOD-skip notification, this drains their PENDING rows
 		// in seconds rather than waiting for the 5-min ticker.
 		if c.credsObserver != nil {
 			c.credsObserver.OnCredentialsUpdated(ev.UserID)

@@ -353,6 +353,14 @@ func (m *Manthan) Start(ctx context.Context) {
 	}()
 	m.logger.Info("Manthan signal consumer started")
 
+	// Outbox recovery worker — re-publishes signal_decisions stuck at PROPOSED
+	// after an inline Kafka failure (FIX B). Verbatim re-publish from
+	// kafka_payload; idempotent via downstream UNIQUE(signal_id).
+	if m.publisher != nil {
+		go m.publisher.RunRecoveryWorker(ctx, recoveryInterval)
+		m.logger.Info("Manthan outbox recovery worker started")
+	}
+
 	// Fill consumer + stale-decision reaper removed 2026-07-10. Both depended
 	// on the projector, which is gone. Signal decisions stay at PROPOSED /
 	// DISPATCHED forever until positions svc takes over the outcome updates.

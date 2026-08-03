@@ -18,7 +18,7 @@ import (
 //
 // Why we abandoned broker-side AMO+SL
 // ───────────────────────────────────
-// The previous design pushed AMO+SL to the broker queue at 15:35 IST and
+// The previous design pushed AMO+SL to the broker queue at 16:35 IST and
 // relied on Indira to convert it to a live SL the next morning. That hit
 // three reject conditions that the doc describes but only a server-side
 // engine can react to:
@@ -131,7 +131,7 @@ func (p *ProtectiveReplay) SetEventPublisher(ep *ManthanEventPublisher) {
 
 // Start runs the daily protective-replay scheduling. Two crons fire:
 //
-//   1. 15:35 IST — EOD Phase A (this file: eod_phase_a.go). For every open
+//   1. 16:35 IST — EOD Phase A (this file: eod_phase_a.go). For every open
 //      position, place an AMO+SL on Indira's overnight queue so the
 //      position is protected the moment the market reopens.
 //
@@ -144,7 +144,7 @@ func (p *ProtectiveReplay) SetEventPublisher(ep *ManthanEventPublisher) {
 // startup-catch-up window so a deploy mid-window doesn't skip a day.
 func (p *ProtectiveReplay) Start(ctx context.Context) {
 	p.logger.Info("Protective replayer started (server-side trigger engine)",
-		zap.String("schedule", "14:30 IST · JWT pre-flight  +  15:35 IST · EOD AMO pre-stage  +  09:14 IST · morning hot-SL fallback"))
+		zap.String("schedule", "14:30 IST · JWT pre-flight  +  16:35 IST · EOD AMO pre-stage  +  09:14 IST · morning hot-SL fallback"))
 
 	// 09:14 morning hot-SL fallback.
 	now := p.now()
@@ -160,7 +160,7 @@ func (p *ProtectiveReplay) Start(ctx context.Context) {
 	// 14:30 EOD pre-flight — Layer 3 (defined in eod_phase_pre.go).
 	p.StartEODPreFlight(ctx)
 
-	// 15:35 EOD Phase A — Layer 1/2 (defined in eod_phase_a.go).
+	// 16:35 EOD Phase A — Layer 1/2 (defined in eod_phase_a.go).
 	p.StartEODPhaseA(ctx)
 }
 
@@ -485,7 +485,7 @@ func (p *ProtectiveReplay) resolveInfo(ctx context.Context, pos PositionNeedingP
 // (safer than firing blind).
 //
 // Used by the 09:14 IST morning hot-SL cron, where shares are already T+1
-// settled and freeQty is the right gate. For EOD Phase A (15:35 IST), use
+// settled and freeQty is the right gate. For EOD Phase A (16:35 IST), use
 // fetchEODSellableQtyMap instead — freeQty is 0 for the day's own T+0 buys
 // even though the AMO will execute tomorrow morning post-settlement.
 func (p *ProtectiveReplay) fetchFreeQtyMap(ctx context.Context, auth BrokerAuth, userID string) map[string]int {
@@ -517,7 +517,7 @@ func (p *ProtectiveReplay) fetchFreeQtyMap(ctx context.Context, auth BrokerAuth,
 }
 
 // fetchEODSellableQtyMap returns dispSym → sellableTomorrow map for the EOD
-// Phase A 15:35 IST path. Computed as holdingQty - usedQty - pledgeQty.
+// Phase A 16:35 IST path. Computed as holdingQty - usedQty - pledgeQty.
 //
 // Why not freeQty?
 //   freeQty is 0 for any position bought TODAY (T+0) because Indian markets

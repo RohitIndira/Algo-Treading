@@ -655,7 +655,7 @@ func (r *Repository) GetLiveEntriesByUser(ctx context.Context, userID string) ([
 
 // PositionNeedingProtection is one open Manthan position that requires an
 // SL on the broker for tomorrow's session. Returned by
-// ListPositionsNeedingProtection at 15:35 IST.
+// ListPositionsNeedingProtection at 16:35 IST.
 type PositionNeedingProtection struct {
 	EntryOrderID    int64
 	EntrySignalID   string
@@ -673,13 +673,19 @@ type PositionNeedingProtection struct {
 }
 
 // ListPositionsNeedingProtection enumerates every position that has a filled
-// entry and no terminal exit. Used by the replayer's Phase A (15:35 IST) to
+// entry and no terminal exit. Used by the replayer's Phase A (16:35 IST) to
 // know which positions need an AMO+SL for the next session. Aggregates qty
 // across top-ups; carries the latest trigger price from the most recent SL
 // row so the replayer can preserve TSL trail state.
 func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]PositionNeedingProtection, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		WITH live_buys AS (
+		    -- FIX 4: anchor on the ORIGINAL entry, not the latest BUY. With a
+		    -- MARKET top-up, the previous "created_at DESC" picked the top-up as
+		    -- the entry and keyed the SL off it, so the SL placed on the original
+		    -- entry was missed and Phase A used the wrong (fallback) trigger
+		    -- (UNIPARTS got 8% instead of 20%). Prefer the root (parent_order_id
+		    -- IS NULL), then the earliest — that is the strategy's reference entry.
 		    SELECT DISTINCT ON (e.strategy_id, e.symbol)
 		           e.id AS entry_order_id, e.signal_id, e.strategy_id, e.user_id,
 		           e.symbol, e.isin, e.indira_symbol, e.exchange_token, e.exchange,
@@ -696,7 +702,8 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		            AND x.status = 'FILLED'
 		            AND x.created_at > e.filled_at
 		      )
-		    ORDER BY e.strategy_id, e.symbol, e.created_at DESC
+		    ORDER BY e.strategy_id, e.symbol,
+		             (e.parent_order_id IS NOT NULL), e.created_at ASC
 		),
 		net_qty AS (
 		    SELECT strategy_id, symbol,
@@ -707,13 +714,16 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		    GROUP BY strategy_id, symbol
 		),
 		latest_sl AS (
-		    SELECT DISTINCT ON (sl.parent_order_id)
-		           sl.parent_order_id,
+		    -- FIX 4: the position's most recent SL across the WHOLE lineage
+		    -- (original entry + any top-up SLs), keyed by (strategy,symbol) — not
+		    -- parent_order_id — so a top-up's SL or the original's SL both count.
+		    SELECT DISTINCT ON (sl.strategy_id, sl.symbol)
+		           sl.strategy_id, sl.symbol,
 		           sl.trigger_price,
 		           sl.limit_price
 		    FROM manthan_orders sl
 		    WHERE sl.order_type IN ('SL_SELL','SL_SELL_AMO')
-		    ORDER BY sl.parent_order_id, sl.created_at DESC
+		    ORDER BY sl.strategy_id, sl.symbol, sl.created_at DESC
 		)
 		SELECT b.entry_order_id, b.signal_id, b.strategy_id, b.user_id,
 		       b.symbol, COALESCE(b.isin,''), COALESCE(b.indira_symbol,''),
@@ -723,7 +733,7 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		       b.entry_fill_price
 		FROM   live_buys b
 		JOIN   net_qty   n ON n.strategy_id = b.strategy_id AND n.symbol = b.symbol
-		LEFT JOIN latest_sl l ON l.parent_order_id = b.entry_order_id
+		LEFT JOIN latest_sl l ON l.strategy_id = b.strategy_id AND l.symbol = b.symbol
 		WHERE  n.net > 0`)
 	if err != nil {
 		return nil, err
@@ -741,6 +751,151 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// InsertEmergencySellFilled records the safety-monitor's emergency MARKET SELL
+// as a FILLED SELL row in manthan_orders (FIX 5). Without this, an emergency
+// exit only wrote a position-event, so the net-qty view (naked scan, Phase A,
+// positions svc) still saw the position as OPEN — a state divergence from
+// broker reality. The FILLED SELL nets the (strategy,symbol) position to 0.
+// Idempotent via signal_id = 'emsell-'+brokerID (ON CONFLICT DO NOTHING).
+// avg_fill_price is left NULL — the true fill price arrives later via WSS/
+// tradebook and is reconciled; the qty is what closes the lot.
+func (r *Repository) InsertEmergencySellFilled(ctx context.Context, sl *ManthanOrder, brokerID string, qty int) error {
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO manthan_orders
+			(signal_id, strategy_id, user_id, symbol, isin, order_type, order_side,
+			 qty, filled_qty, status, broker_order_id,
+			 indira_symbol, exchange_token, exchange, filled_at)
+		VALUES ($1,$2,$3,$4,$5,'MARKET_SELL','SELL',$6,$6,'FILLED',$7,$8,$9,'NSE',now())
+		ON CONFLICT (signal_id) DO NOTHING`,
+		"emsell-"+brokerID, sl.StrategyID, sl.UserID, sl.Symbol, sl.ISIN,
+		qty, brokerID, sl.IndiraSymbol, sl.ExchangeToken)
+	return err
+}
+
+// WithPositionLock runs fn while holding a Postgres advisory lock keyed by
+// (strategy_id, symbol), serializing concurrent operations for the SAME position
+// across every inbox-worker goroutine AND every trade-execution replica (the lock
+// lives in Postgres, not process memory). Blocks until the lock is free.
+//
+// FIX 1 (SL-regress race): two SL_MODIFY signals for one position could be
+// processed concurrently by two inbox-worker goroutines (ClaimDueInboxRows has no
+// per-position grouping). Both read the pre-update broker trigger, both pass the
+// ratchet guard (sl_handler.go), and the later broker modify wins → the SL moves
+// DOWN. Serializing the read→guard→broker-modify→update sequence per position
+// makes the SECOND goroutine block until the first commits its new trigger; it
+// then re-reads the higher trigger and the existing guard refuses the lower modify.
+//
+// The lock is session-scoped on a dedicated pooled connection and released in
+// defer (and again by conn.Close as a backstop), so a panic or early return can
+// never leak it. fn's own DB writes go through the pool as usual — the lock is a
+// pure mutex, it does not need to share fn's connection. Liquidation-hazard-safe:
+// it changes ordering only, never cancels or places anything itself.
+func (r *Repository) WithPositionLock(ctx context.Context, strategyID, symbol string, fn func(context.Context) error) error {
+	key := strategyID + ":" + symbol
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("WithPositionLock: acquire conn for %s: %w", key, err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(hashtext($1))`, key); err != nil {
+		return fmt.Errorf("WithPositionLock: acquire lock for %s: %w", key, err)
+	}
+	// Release on the SAME connection. Use a background context so the unlock still
+	// runs even if ctx was cancelled mid-fn. conn.Close() is the final backstop —
+	// closing a connection releases all its session advisory locks.
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(hashtext($1))`, key)
+	}()
+
+	return fn(ctx)
+}
+
+// ListNakedOpenBuyPositions returns every position that violates the FIX 3
+// invariant "every OPEN filled BUY position has exactly one ACTIVE stop-loss":
+//
+//	order_side='BUY' AND status='FILLED'      (1,2: filled BUY)
+//	AND net_qty(strategy,symbol) > 0          (3: still OPEN — not sold/exited)
+//	AND broker_order_id NOT LIKE 'PAPER-%'    (LIVE only — paper needs no broker SL)
+//	AND NO active SL row for the entry        (4: unprotected)
+//
+// "Active SL" is matched by the deterministic SL signal_id ('sl-'||entry.signal_id)
+// with a non-terminal status (PENDING / SL_PLACED / SL_DEFERRED_BAND). A REJECTED
+// SL has parent_order_id=NULL (the parent link is only set on successful
+// placement), so signal_id matching — not parent_order_id — is the reliable key.
+// SL_DEFERRED_BAND counts as protected (deliberate defer + Phase A backstop).
+//
+// The safety-monitor's naked scan drives PlaceInitialSL for each row every 2s
+// until an active SL exists. Never cancels/exits — liquidation-hazard-safe.
+func (r *Repository) ListNakedOpenBuyPositions(ctx context.Context) ([]PositionNeedingProtection, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		WITH net_qty AS (
+		    SELECT strategy_id, symbol,
+		           COALESCE(SUM(CASE WHEN order_side='BUY'  AND status='FILLED' THEN filled_qty
+		                             WHEN order_side='SELL' AND status='FILLED' THEN -filled_qty
+		                             ELSE 0 END), 0) AS net
+		    FROM manthan_orders
+		    GROUP BY strategy_id, symbol
+		)
+		SELECT e.id, COALESCE(e.signal_id,''), e.strategy_id, e.user_id, e.symbol,
+		       COALESCE(e.isin,''), COALESCE(e.indira_symbol,''),
+		       COALESCE(e.exchange_token,''), COALESCE(e.exchange,'NSE'),
+		       n.net, COALESCE(e.avg_fill_price, 0)
+		FROM   manthan_orders e
+		JOIN   net_qty n ON n.strategy_id = e.strategy_id AND n.symbol = e.symbol
+		WHERE  e.order_side = 'BUY'
+		  AND  e.order_type IN ('LIMIT_BUY','MARKET_BUY')
+		  AND  e.status = 'FILLED'
+		  AND  e.signal_id IS NOT NULL
+		  AND  COALESCE(e.broker_order_id,'') NOT LIKE 'PAPER-%'
+		  AND  n.net > 0
+		  AND  NOT EXISTS (
+		        SELECT 1 FROM manthan_orders sl
+		        WHERE sl.signal_id = 'sl-' || e.signal_id
+		          AND sl.status IN ('PENDING','SL_PLACED','SL_DEFERRED_BAND'))`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PositionNeedingProtection
+	for rows.Next() {
+		var p PositionNeedingProtection
+		if err := rows.Scan(&p.EntryOrderID, &p.EntrySignalID, &p.StrategyID, &p.UserID,
+			&p.Symbol, &p.ISIN, &p.IndiraSymbol, &p.ExchangeToken, &p.Exchange,
+			&p.NetQty, &p.EntryFillPrice); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ResetTerminalSLToPending resets a terminally-failed SL row (REJECTED /
+// CANCELLED / EXPIRED) back to PENDING so PlaceInitialSL can re-drive it in
+// place — preserving the deterministic signal_id and avoiding a duplicate
+// broker SL. Returns (id, true, nil) if a terminal row was reset, or
+// (0, false, nil) if none matched (caller then treats the original insert
+// error as a real failure). Enforces "exactly one SL row per entry".
+func (r *Repository) ResetTerminalSLToPending(ctx context.Context, slSignalID string, trigger, limit float64) (int64, bool, error) {
+	var id int64
+	err := r.db.QueryRowContext(ctx, `
+		UPDATE manthan_orders
+		SET status='PENDING', broker_order_id=NULL, broker_status=NULL,
+		    trigger_price=$2, limit_price=$3, updated_at=now()
+		WHERE signal_id=$1
+		  AND status IN ('REJECTED','CANCELLED','EXPIRED')
+		RETURNING id`,
+		slSignalID, trigger, limit).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
 }
 
 // ArmRetryRow is one entry in the manthan_arm_retries queue (Layer 4).
@@ -873,7 +1028,7 @@ func (r *Repository) HasActiveProtectionForToday(ctx context.Context, entryOrder
 // InsertAMOOrder writes a new SL_SELL_AMO row for the given position+trade_date
 // and returns its id. Returns (0, sql.ErrNoRows) if a row already exists for
 // the same (parent_order_id, trade_date) — the partial UNIQUE index from
-// migration 011 makes this crash-safe: the 15:35 cron can be re-run safely.
+// migration 011 makes this crash-safe: the 16:35 cron can be re-run safely.
 //
 // alreadyExists==true means the caller should skip rather than treat the
 // conflict as an error.

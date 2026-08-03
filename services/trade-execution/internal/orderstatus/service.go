@@ -400,9 +400,10 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 	// Extract fill details using DecimalLocator for correct price
 	dl := decimalLocator(string(wsStatus.DecimalLocator))
 
-	// Always update traded qty and price from broker
-	if qty, err := strconv.Atoi(string(wsStatus.TradedQTY)); err == nil {
-		order.FilledQuantity = int32(qty)
+	// Always update traded qty and price from broker.
+	// FIX 7: cumulative fill qty (TradedQTY is 0 on a real TRD_MSG fill).
+	if q := wsStatus.CumulativeFilledQty(); q > 0 {
+		order.FilledQuantity = int32(q)
 	}
 	if price, err := strconv.ParseFloat(wsStatus.TradedPrice, 64); err == nil && price > 0 {
 		order.FilledPrice = &price
@@ -483,7 +484,12 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		if indiraID == "" {
 			indiraID = wsStatus.OrderNumber
 		}
-		filledQty, _ := strconv.Atoi(string(wsStatus.TradedQTY))
+		// FIX 7: cumulative fill qty (QuantityTradedToday on TRD_MSG). Parsing
+		// TradedQTY here returned 0 on a real fill → the manthan bridge's
+		// filledQty<=0 path dropped the WSS fast-fill entirely, forcing the slow
+		// REST poll. Must be CUMULATIVE so waitForFill's `FilledQty >= order.Qty`
+		// recognizes a full fill (per-trade TradeQty would spuriously read partial).
+		filledQty := wsStatus.CumulativeFilledQty()
 		var avgPrice float64
 		if order != nil && order.FilledPrice != nil && *order.FilledPrice > 0 {
 			avgPrice = *order.FilledPrice
@@ -493,7 +499,25 @@ func (s *OrderStatusService) handleStatusUpdate(ctx context.Context, wsStatus *i
 		if decLoc > 0 {
 			trigPrice = wsStatus.TriggerPrice / float64(decLoc)
 		}
-		s.manthanBridge(indiraID, brokerStatusUpper, filledQty, avgPrice, trigPrice, wsStatus.Reason)
+		// FIX 2: a FILLED/EXECUTED event with no real traded price would open a
+		// position at price 0 AND a stop-loss at 0×0.80=0 (a naked position — the
+		// SL never fires). The WSS reliably carries the price on real fills
+		// (proven from captured live frames), so a zero here is a premature/
+		// malformed frame — suppress it and wait for the priced event (the WSS
+		// retry, REST orderbook, tradebook, or reconciler will land the real
+		// price). Mirrors the Kafka order.events guard in order_events_consumer.go.
+		// Non-fill statuses (PENDING/OPEN/CANCELLED/REJECTED/trigger updates) are
+		// unaffected — they carry no fill price and downstream derives nothing
+		// price-dependent from them.
+		isFill := brokerStatusUpper == "EXECUTED" || brokerStatusUpper == "TRADED"
+		if isFill && avgPrice <= 0 {
+			s.logger.Warn("WSS fill event has no traded_price — suppressing bridge route (waiting for priced event)",
+				zap.String("broker_order_id", indiraID),
+				zap.String("status", brokerStatusUpper),
+				zap.Int("filled_qty", filledQty))
+		} else {
+			s.manthanBridge(indiraID, brokerStatusUpper, filledQty, avgPrice, trigPrice, wsStatus.Reason)
+		}
 	}
 
 	s.publishNotification(ctx, order, wsStatus)
@@ -587,11 +611,9 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 
 	dl := decimalLocator(string(wsStatus.DecimalLocator))
 
-	// Parse WS numeric fields
-	tradedQty := 0
-	if qty, err := strconv.Atoi(string(wsStatus.TradedQTY)); err == nil {
-		tradedQty = qty
-	}
+	// Parse WS numeric fields.
+	// FIX 7: cumulative fill qty (TradedQTY is 0 on a real TRD_MSG fill).
+	tradedQty := wsStatus.CumulativeFilledQty()
 	tradedPriceStr := ""
 	if wsStatus.TradedPrice != "" && wsStatus.TradedPrice != "0" {
 		if p, err := strconv.ParseFloat(wsStatus.TradedPrice, 64); err == nil && p > 0 {

@@ -20,6 +20,7 @@ package reconciler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,15 @@ import (
 
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/store"
+)
+
+// Tradebook sweep fires once per trading day at this IST wall-clock time
+// (Layer 3b — post-market fill-price truth). 15:31 IST is just after the 15:30
+// close so the exchange tradebook is settled for the day.
+const (
+	tradebookHour   = 15
+	tradebookMinute = 31
+	istTimezone     = "Asia/Kolkata"
 )
 
 // UserAuthProvider returns the current auth for a userID. Backed by the
@@ -133,6 +143,9 @@ func (r *Reconciler) Start(ctx context.Context) {
 
 	go r.loop(ctx, r.fastPoll, "layer2-fast", store.SourceRESTOrderbook)
 	go r.loop(ctx, r.slowPoll, "layer3-slow", store.SourceRESTReconciler)
+
+	// Layer 3b — post-market tradebook sweep at 15:31 IST on trading days.
+	go r.tradebookLoop(ctx)
 }
 
 // computeCutoff picks the boot cutoff — see Start() docstring.
@@ -237,8 +250,17 @@ func (r *Reconciler) pollAll(ctx context.Context, source store.Source) {
 func (r *Reconciler) pollUser(ctx context.Context, userID string, auth *indira.AuthContext, source store.Source) (int, int, int, int) {
 	orders, err := r.broker.GetOrderBook(ctx, auth)
 	if err != nil {
-		r.logger.Warn("reconciler GetOrderBook failed",
-			zap.String("user_id", userID), zap.Error(err))
+		// Distinguish AU004 (surfaced as ErrAuthExpired by pkg/indira's
+		// doRequest, both 200-body and 401) from other failures, matching the
+		// tradebook path so a log grep for "auth expired" catches both REST
+		// poll paths.
+		if errors.Is(err, indira.ErrAuthExpired) {
+			r.logger.Warn("orderbook poll: broker auth expired — skipping user",
+				zap.String("user_id", userID))
+		} else {
+			r.logger.Warn("reconciler GetOrderBook failed",
+				zap.String("user_id", userID), zap.Error(err))
+		}
 		return 0, 0, 0, 1
 	}
 	observed := len(orders)
@@ -252,7 +274,7 @@ func (r *Reconciler) pollUser(ctx context.Context, userID string, auth *indira.A
 		if ev == nil {
 			continue
 		}
-		wasInserted, err := r.writer.Insert(ctx, ev)
+		id, wasInserted, err := r.writer.Insert(ctx, ev)
 		if err != nil {
 			r.logger.Warn("reconciler insert failed",
 				zap.String("user_id", userID),
@@ -265,8 +287,14 @@ func (r *Reconciler) pollUser(ctx context.Context, userID string, auth *indira.A
 			continue
 		}
 		inserted++
-		if r.pub != nil {
-			r.pub.Publish(ctx, ev)
+		// Stamp published_at only on a confirmed publish; a failed inline
+		// publish leaves the row for the durability worker to retry.
+		if r.pub != nil && r.pub.Publish(ctx, ev) {
+			if err := r.writer.MarkPublished(ctx, id); err != nil {
+				r.logger.Warn("reconciler mark published failed — durability worker will retry",
+					zap.String("broker_order_id", ev.BrokerOrderID),
+					zap.Int64("id", id), zap.Error(err))
+			}
 			published++
 		}
 	}
@@ -420,6 +448,272 @@ func deriveEventSeq(o *indira.OrderBook, exchOrderID string) int64 {
 		return n*1000 + int64(o.TradedQty)
 	}
 	return int64(len(o.OrdId))*1000 + int64(o.TradedQty)
+}
+
+// ── Layer 3b: post-market tradebook sweep ──────────────────────────────────
+//
+// The tradebook is the ONLY source that carries the authoritative fill price
+// for every trade — the orderbook reports TradedPrice=0 for LIMIT/SL fills and
+// WSS drops AMO/manual fills entirely. Each tradebook row becomes a FILLED
+// broker_event keyed on ExchTrdId (the exchange trade id).
+//
+// event_seq = ExchTrdId (per-trade, distinct). This deliberately does NOT
+// dedup with the WSS/orderbook FILLED for the same fill — cross-source seq
+// unification is a follow-up PR. The accepted consequence (multi-fill manual
+// sells double-counting) is documented in services/orderstatus/docs/known_issues.md.
+
+// tradebookLoop fires the sweep once per trading day at 15:31 IST. It uses a
+// 1-minute ticker + a lastFiredDate guard so it runs exactly once even though
+// the target minute is hit by multiple ticks.
+func (r *Reconciler) tradebookLoop(ctx context.Context) {
+	loc, err := time.LoadLocation(istTimezone)
+	if err != nil {
+		r.logger.Warn("tradebook loop: could not load IST — using fixed +5:30 offset", zap.Error(err))
+		loc = time.FixedZone("IST", 5*60*60+30*60)
+	}
+
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	var lastFiredDate string
+	r.logger.Info("tradebook loop started",
+		zap.Int("hour", tradebookHour), zap.Int("minute", tradebookMinute))
+	defer r.logger.Info("tradebook loop stopped")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case t := <-ticker.C:
+			now := t.In(loc)
+			if now.Hour() != tradebookHour || now.Minute() != tradebookMinute {
+				continue
+			}
+			today := now.Format("2006-01-02")
+			if lastFiredDate == today {
+				continue
+			}
+			lastFiredDate = today
+
+			if !indira.IsTradingDay(now) {
+				r.logger.Info("tradebook sweep skipped — non-trading day", zap.String("date", today))
+				continue
+			}
+
+			sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			r.tradebookSweep(sweepCtx)
+			cancel()
+		}
+	}
+}
+
+// RunTradebookSweepOnce computes the boot cutoff and runs a single tradebook
+// sweep immediately, bypassing the 15:31 IST schedule. For ops/verification
+// (trigger a sweep on demand) — the scheduled path uses tradebookLoop.
+func (r *Reconciler) RunTradebookSweepOnce(ctx context.Context) {
+	if r.cutoff.IsZero() {
+		r.cutoff = r.computeCutoff(ctx)
+	}
+	r.tradebookSweep(ctx)
+}
+
+// tradebookSweep pulls each active user's tradebook and appends any new FILLED
+// events. One user's auth failure never aborts the sweep.
+func (r *Reconciler) tradebookSweep(ctx context.Context) {
+	users, err := r.listUsers(ctx)
+	if err != nil {
+		r.logger.Warn("tradebook sweep: user list failed", zap.Error(err))
+		return
+	}
+
+	var observed, inserted, published, collided, preCutoff, skipped, usersFailed int
+	for _, userID := range users {
+		auth, err := r.authFor(ctx, userID)
+		if err != nil || auth == nil {
+			continue
+		}
+		trades, err := r.broker.GetTradeBook(ctx, auth)
+		if err != nil {
+			// Fix 4 (AU004 read-path visibility) will make this louder + add
+			// refresh; for now, distinguish auth-expiry and skip the user
+			// without killing the sweep.
+			if errors.Is(err, indira.ErrAuthExpired) {
+				r.logger.Warn("tradebook sweep: broker auth expired — skipping user (Fix 4 will add refresh)",
+					zap.String("user_id", userID))
+			} else {
+				r.logger.Warn("tradebook GetTradeBook failed",
+					zap.String("user_id", userID), zap.Error(err))
+			}
+			usersFailed++
+			continue
+		}
+		o, i, p, c, pc, s := r.tradebookSweepForTrades(ctx, userID, trades)
+		observed += o
+		inserted += i
+		published += p
+		collided += c
+		preCutoff += pc
+		skipped += s
+	}
+
+	r.logger.Info("tradebook sweep complete",
+		zap.Int("users", len(users)),
+		zap.Int("trades_observed", observed),
+		zap.Int("events_inserted", inserted),
+		zap.Int("events_published", published),
+		zap.Int("cross_source_collisions", collided),
+		zap.Int("pre_cutoff_filtered", preCutoff),
+		zap.Int("other_skipped", skipped),
+		zap.Int("users_failed", usersFailed))
+}
+
+// tradebookSweepForTrades processes one user's tradebook rows. Split out from
+// the broker call so it's unit-testable with a fabricated []TradeBook.
+// Returns (observed, inserted, published, collided, preCutoff, otherSkipped).
+func (r *Reconciler) tradebookSweepForTrades(ctx context.Context, userID string, trades []indira.TradeBook) (int, int, int, int, int, int) {
+	var observed, inserted, published, collided, preCutoff, skipped int
+	for i := range trades {
+		observed++
+		ev, seq, reason := r.eventFromTradeBookRow(userID, &trades[i])
+		if ev == nil {
+			switch reason {
+			case "pre_cutoff":
+				preCutoff++
+			default:
+				skipped++
+			}
+			continue
+		}
+		ins, coll, pub := r.observeTradeEvent(ctx, ev, seq)
+		if coll {
+			collided++
+		}
+		if ins {
+			inserted++
+		}
+		if pub {
+			published++
+		}
+	}
+	if preCutoff > 0 {
+		r.logger.Debug("tradebook: pre-cutoff trades filtered",
+			zap.String("user_id", userID), zap.Int("count", preCutoff))
+	}
+	return observed, inserted, published, collided, preCutoff, skipped
+}
+
+// eventFromTradeBookRow maps one tradebook row into a store.Event. Returns
+// (nil, seq, reason) to skip: reason is "empty_order_id", "bad_exch_trd_id",
+// "pre_cutoff", or "marshal_failed".
+func (r *Reconciler) eventFromTradeBookRow(userID string, t *indira.TradeBook) (*store.Event, int64, string) {
+	brokerOrderID := strings.TrimSpace(t.OrdId)
+	if brokerOrderID == "" || brokerOrderID == "0" {
+		return nil, 0, "empty_order_id"
+	}
+
+	// event_seq = ExchTrdId, parsed exactly (fails loudly on overflow/garbage
+	// rather than truncating — see pkg/indira TradeBook.ExchTradeID).
+	seq, err := t.ExchTradeID()
+	if err != nil {
+		r.logger.Warn("tradebook row has unusable exchTrdId — skipping trade",
+			zap.String("user_id", userID),
+			zap.String("broker_order_id", brokerOrderID),
+			zap.Error(err))
+		return nil, 0, "bad_exch_trd_id"
+	}
+
+	// Boot-cutoff guard — reuse the SAME r.cutoff computed in Start() so a
+	// fresh install / DB flush never re-emits the whole day's tradebook. Parse
+	// TradeTime as IST (verified: broker portfolio-services naive timestamps
+	// are IST, matching observed_at within poll latency). BrokerTsMs is stamped
+	// from the same value — the tradebook is the first path to populate it.
+	var brokerTsMs int64
+	if t.TradeTime != "" {
+		if tt, perr := parseIndiraOrdDate(t.TradeTime); perr == nil {
+			brokerTsMs = tt.UnixMilli()
+			if !r.cutoff.IsZero() && tt.Before(r.cutoff) {
+				return nil, seq, "pre_cutoff"
+			}
+		}
+	}
+
+	raw, err := json.Marshal(t)
+	if err != nil {
+		r.logger.Error("tradebook marshal row failed", zap.Error(err))
+		return nil, seq, "marshal_failed"
+	}
+
+	return &store.Event{
+		BrokerOrderID:   brokerOrderID,
+		ExchangeOrderID: strings.TrimSpace(t.ExchOrdId),
+		EventSeq:        seq,
+		Source:          store.SourceRESTTradebook,
+		EventType:       store.EventFilled,
+		Status:          "EXECUTED",
+		UserID:          userID,
+		// Symbol/Exchange intentionally left empty: the tradebook Symbol is a
+		// complex broker object with no confirmed shape, and inventing a parse
+		// is disallowed. Manthan dedup is by broker_order_id / signal_id, which
+		// don't need symbol; only manual-sell FIFO does — the documented
+		// known-issue path. Symbol enrichment is deferred until we capture a
+		// real tradebook Symbol sample.
+		BuySell:     strings.TrimSpace(t.OrdAction),
+		OrderType:   strings.TrimSpace(t.OrdType),
+		Product:     strings.TrimSpace(t.PrdType),
+		Quantity:    t.Qty,
+		FilledQty:   t.TradedQty,
+		TradedPrice: t.TradedPrice,
+		PendingQty:  t.RemainQty,
+		RawPayload:  raw,
+		BrokerTsMs:  brokerTsMs,
+	}, seq, ""
+}
+
+// observeTradeEvent inserts one tradebook event, publishes inline on a fresh
+// insert (durability worker retries failures), and emits the loud
+// cross-source-collision WARN when the ExchTrdId seq already exists.
+// Returns (inserted, collided, published).
+func (r *Reconciler) observeTradeEvent(ctx context.Context, ev *store.Event, proposedSeq int64) (bool, bool, bool) {
+	id, inserted, err := r.writer.Insert(ctx, ev)
+	if err != nil {
+		r.logger.Warn("tradebook insert failed",
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.Int64("event_seq", proposedSeq), zap.Error(err))
+		return false, false, false
+	}
+
+	if !inserted {
+		// Cross-source collision: ExchTrdId equalled an existing WSS
+		// (MessageSequenceNumber) or orderbook (exchOrdId*1000+qty) event_seq
+		// at this broker_order_id — the "negligible coincidence" we accepted in
+		// the design. NEVER silent: a silent no-op is what corrupted data in the
+		// 2026-07-17 incident. Surface the existing row so ops can tell a
+		// harmless coincidence from a real seq-scheme bug.
+		fields := []zap.Field{
+			zap.String("source", string(store.SourceRESTTradebook)),
+			zap.String("broker_order_id", ev.BrokerOrderID),
+			zap.Int64("tradebook_event_seq", proposedSeq),
+		}
+		if existing, lerr := r.writer.LookupConflictSource(ctx, ev.BrokerOrderID, proposedSeq); lerr == nil && existing != nil {
+			fields = append(fields,
+				zap.String("existing_source", existing.Source),
+				zap.Int64("existing_event_seq", existing.EventSeq),
+				zap.String("existing_event_type", existing.EventTyp))
+		}
+		r.logger.Warn("tradebook event_seq collided with an existing broker_events row — dropped as duplicate (expected-rare cross-source coincidence; investigate if frequent — see docs/known_issues.md)", fields...)
+		return false, true, false
+	}
+
+	published := false
+	if r.pub != nil && r.pub.Publish(ctx, ev) {
+		if err := r.writer.MarkPublished(ctx, id); err != nil {
+			r.logger.Warn("tradebook mark published failed — durability worker will retry",
+				zap.String("broker_order_id", ev.BrokerOrderID),
+				zap.Int64("id", id), zap.Error(err))
+		}
+		published = true
+	}
+	return true, false, published
 }
 
 // eventTypeFromStatus maps REST orderbook Status → store.EventType, matching
