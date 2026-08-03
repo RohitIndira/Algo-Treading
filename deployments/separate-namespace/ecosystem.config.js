@@ -32,8 +32,16 @@ const REDIS = { REDIS_ADDRS: 'localhost:6389', REDIS_HOST: 'localhost', REDIS_PO
 const LTP = {
   EXT_REDIS_ADDR:     ENV.EXT_REDIS_ADDR     || 'localhost:6389',
   EXT_REDIS_PASSWORD: ENV.EXT_REDIS_PASSWORD || '',
+  // api-gateway's livealgos LTP store reads its OWN addr var — point external too.
+  LIVEALGOS_LTP_REDIS_ADDR:     ENV.EXT_REDIS_ADDR     || 'localhost:6389',
   LIVEALGOS_LTP_REDIS_PASSWORD: ENV.EXT_REDIS_PASSWORD || '',
 };
+// External feed split into host/port for services (trade-execution's price
+// client) that take REDIS_HOST + REDIS_PORT separately — so every LTP /
+// market:nse:{token} / NSE-token read hits the real feed, never the empty local.
+const EXT_HOST = (ENV.EXT_REDIS_ADDR || 'localhost:6389').split(':')[0];
+const EXT_PORT = (ENV.EXT_REDIS_ADDR || 'localhost:6389').split(':')[1] || '6379';
+const EXT_PW   = ENV.EXT_REDIS_PASSWORD || '';
 const KEY = { ENCRYPTION_KEY: ENV.ENCRYPTION_KEY, ALLOW_INSECURE_ENCRYPTION_KEY: 'false' };
 const BASE = { ...PG, ...KAFKA, ...REDIS, ...LTP };
 
@@ -63,6 +71,11 @@ module.exports = {
     { name: 'trade-execution', script: './bin/trade-execution', ...common, env: {
         ...BASE, ...KEY, SERVICE_PORT: '9004', METRICS_PORT: '9090', PAPER_WS_PORT: '8091',
         POSTGRES_DB: 'execution_db', USER_CONFIG_GRPC_ADDR: 'localhost:9003',
+        // Price client (paper monitor, OCO trailing SL, price-monitor fallback)
+        // reads market:nse:{token} LTP — point REDIS_HOST/PORT at the external
+        // market feed, NOT the empty local redis. EXT_REDIS_ADDR (broker adapter)
+        // is already external via BASE.
+        REDIS_HOST: EXT_HOST, REDIS_PORT: EXT_PORT, REDIS_PASSWORD: EXT_PW,
     }},
     { name: 'orderstatus', script: './bin/orderstatus', ...common, env: {
         ...BASE, HTTP_PORT: '9006', ORDER_STATUS_DB: 'order_status_db',
