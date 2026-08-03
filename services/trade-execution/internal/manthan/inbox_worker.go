@@ -283,7 +283,7 @@ func (w *InboxWorker) dispatch(ctx context.Context, row *InboxRow) error {
 	case "MANTHAN_ENTRY", "MANTHAN_TOPUP":
 		var sig ManthanSignal
 		if err := json.Unmarshal(row.Payload, &sig); err != nil {
-			return poisonErr("unmarshal MANTHAN_ENTRY: %w", err)
+			return poisonErr("unmarshal MANTHAN_ENTRY: %v", err)
 		}
 		// Idempotency: the entry handler already dedups by signal_id via
 		// repo.GetOrderBySignalID. A redelivered MANTHAN_ENTRY hits that
@@ -303,13 +303,20 @@ func (w *InboxWorker) dispatch(ctx context.Context, row *InboxRow) error {
 	case "MANTHAN_SL_MODIFY":
 		var sig SLModifySignal
 		if err := json.Unmarshal(row.Payload, &sig); err != nil {
-			return poisonErr("unmarshal MANTHAN_SL_MODIFY: %w", err)
+			return poisonErr("unmarshal MANTHAN_SL_MODIFY: %v", err)
 		}
-		return w.sl.ModifyTrail(ctx, sig)
+		// FIX 1: serialize per-position SL modifications so two concurrent
+		// SL_MODIFYs for the same (strategy,symbol) can't both read the stale
+		// broker trigger and race the ratchet guard → the SL can never regress
+		// down. The second goroutine blocks until the first commits its new
+		// trigger, then the guard refuses the lower modify.
+		return w.repo.WithPositionLock(ctx, sig.StrategyID, sig.Symbol, func(ctx context.Context) error {
+			return w.sl.ModifyTrail(ctx, sig)
+		})
 	case "MANTHAN_SL_EXIT":
 		var sig SLExitSignal
 		if err := json.Unmarshal(row.Payload, &sig); err != nil {
-			return poisonErr("unmarshal MANTHAN_SL_EXIT: %w", err)
+			return poisonErr("unmarshal MANTHAN_SL_EXIT: %v", err)
 		}
 		return w.sl.EmergencySell(ctx, sig)
 	default:

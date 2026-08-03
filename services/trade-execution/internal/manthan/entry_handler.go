@@ -786,7 +786,17 @@ func (h *EntryHandler) handleFill(ctx context.Context, orderID int64, result fil
 		// First-time entry — fresh SL at 20% below actual fill price.
 		slTrigger := result.avgPrice * 0.80
 		slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
-		h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit)
+		if slErr := h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit); slErr != nil {
+			// FIX 3: the position is FILLED but its SL did not land — it is NAKED.
+			// Log loudly; the safety-monitor's naked-position scan (every 2s)
+			// is the recovery and will re-drive PlaceInitialSL until an active
+			// SL exists. Do NOT cancel/exit here (liquidation-hazard-safe).
+			h.logger.Error("NAKED POSITION — entry FILLED but initial SL not placed; safety-monitor will recover",
+				zap.String("symbol", signal.Symbol),
+				zap.Int("qty", result.filledQty),
+				zap.Float64("avg_price", result.avgPrice),
+				zap.Error(slErr))
+		}
 	}
 
 	// Publish FILL_CONFIRMED to Kafka — rules-engine overwrites entry with real price
