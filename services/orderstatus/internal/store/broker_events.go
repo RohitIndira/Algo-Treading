@@ -99,31 +99,34 @@ func (w *Writer) LatestObservedAt(ctx context.Context) (sql.NullTime, error) {
 	return t, err
 }
 
-// Insert appends one event. Returns (inserted bool, error).
+// Insert appends one event. Returns (id, inserted, error).
 //
-//	inserted = true  → new row, publish to order.events Kafka topic downstream
-//	inserted = false → duplicate (WSS + REST race), silently swallow — the
-//	                    original writer already handled downstream fan-out
+//	inserted = true  → new row (id is its primary key), publish to order.events
+//	inserted = false → duplicate (WSS + REST race), id = 0; silently swallow —
+//	                   the original writer already handled downstream fan-out
 //
 // Never UPDATE existing rows; new events always mean a new row keyed by
-// (broker_order_id, event_seq).
-func (w *Writer) Insert(ctx context.Context, ev *Event) (bool, error) {
+// (broker_order_id, event_seq). The returned id lets the caller stamp
+// published_at after a successful inline publish; rows left unstamped are
+// retried by publisher.RunWorker.
+func (w *Writer) Insert(ctx context.Context, ev *Event) (int64, bool, error) {
 	if ev.BrokerOrderID == "" {
-		return false, fmt.Errorf("broker_order_id is required")
+		return 0, false, fmt.Errorf("broker_order_id is required")
 	}
 	if ev.EventSeq == 0 {
-		return false, fmt.Errorf("event_seq is required (deterministic dedup key)")
+		return 0, false, fmt.Errorf("event_seq is required (deterministic dedup key)")
 	}
 	if ev.RawPayload == nil {
 		// Empty JSON object is a valid payload — but let's not silently persist
 		// nothing. Force callers to think about it.
-		return false, fmt.Errorf("raw_payload is required")
+		return 0, false, fmt.Errorf("raw_payload is required")
 	}
 	if !json.Valid(ev.RawPayload) {
-		return false, fmt.Errorf("raw_payload is not valid JSON")
+		return 0, false, fmt.Errorf("raw_payload is not valid JSON")
 	}
 
-	res, err := w.db.ExecContext(ctx, `
+	var id int64
+	err := w.db.QueryRowContext(ctx, `
 		INSERT INTO broker_events (
 			broker_order_id, exchange_order_id, event_seq,
 			source, event_type, status, oms_status_code,
@@ -139,7 +142,8 @@ func (w *Writer) Insert(ctx context.Context, ev *Event) (bool, error) {
 			$18, $19, $20,
 			$21::jsonb, $22
 		)
-		ON CONFLICT (broker_order_id, event_seq) DO NOTHING`,
+		ON CONFLICT (broker_order_id, event_seq) DO NOTHING
+		RETURNING id`,
 		ev.BrokerOrderID, nullStr(ev.ExchangeOrderID), ev.EventSeq,
 		string(ev.Source), string(ev.EventType), nullStr(ev.Status), ev.OMSStatusCode,
 		ev.UserID, nullStr(ev.Symbol), nullStr(ev.Exchange),
@@ -148,17 +152,137 @@ func (w *Writer) Insert(ctx context.Context, ev *Event) (bool, error) {
 		nullInt(ev.Quantity), nullInt(ev.FilledQty),
 		nullFloat(ev.TradedPrice), nullInt(ev.PendingQty), nullStr(ev.Reason),
 		ev.RawPayload, ev.BrokerTsMs,
-	)
-	if err != nil {
-		return false, fmt.Errorf("insert broker_events: %w", err)
+	).Scan(&id)
+	if err == sql.ErrNoRows {
+		// ON CONFLICT DO NOTHING produced no row → duplicate.
+		return 0, false, nil
 	}
+	if err != nil {
+		return 0, false, fmt.Errorf("insert broker_events: %w", err)
+	}
+	return id, true, nil
+}
 
-	rows, err := res.RowsAffected()
-	if err != nil {
-		// Postgres always reports RowsAffected — if this fails, something is off.
-		return false, fmt.Errorf("rows affected: %w", err)
+// ConflictRow describes the pre-existing broker_events row that a would-be
+// insert collided with on (broker_order_id, event_seq). Used only for the
+// tradebook cross-source-collision WARN.
+type ConflictRow struct {
+	Source   string
+	EventSeq int64
+	EventTyp string
+}
+
+// LookupConflictSource returns the existing row at (brokerOrderID, eventSeq)
+// so a caller whose Insert was deduped (inserted=false) can log which source
+// already owned that key. Returns (nil, nil) if no such row (race — already
+// gone). Read-only.
+func (w *Writer) LookupConflictSource(ctx context.Context, brokerOrderID string, eventSeq int64) (*ConflictRow, error) {
+	var c ConflictRow
+	err := w.db.QueryRowContext(ctx,
+		`SELECT source, event_seq, event_type FROM broker_events
+		 WHERE broker_order_id = $1 AND event_seq = $2`,
+		brokerOrderID, eventSeq).Scan(&c.Source, &c.EventSeq, &c.EventTyp)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
-	return rows == 1, nil
+	if err != nil {
+		return nil, fmt.Errorf("lookup conflict row: %w", err)
+	}
+	return &c, nil
+}
+
+// MarkPublished stamps published_at=NOW() on a row after it has been produced
+// to order.events. Called on the inline happy path and by RunWorker. Idempotent
+// — re-stamping an already-published row is harmless.
+func (w *Writer) MarkPublished(ctx context.Context, id int64) error {
+	_, err := w.db.ExecContext(ctx,
+		`UPDATE broker_events SET published_at = NOW() WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("mark published id=%d: %w", id, err)
+	}
+	return nil
+}
+
+// PersistedEvent is a broker_events row plus its primary key, used by the
+// durability worker to republish and then stamp rows that never reached Kafka.
+type PersistedEvent struct {
+	ID int64
+	Event
+}
+
+// FetchUnpublished returns up to `limit` rows that were never confirmed on
+// order.events (published_at IS NULL) AND are older than graceSeconds, oldest
+// first. Publishing in id order preserves per-broker_order_id FIFO.
+//
+// The graceSeconds floor is what makes the inline-publish path and the worker
+// non-overlapping: fresh rows (younger than the grace period) are owned by the
+// inline publisher, so the worker only ever republishes rows old enough that
+// the inline publish must have genuinely failed. Pass 0 to disable (tests).
+func (w *Writer) FetchUnpublished(ctx context.Context, limit int, graceSeconds float64) ([]*PersistedEvent, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := w.db.QueryContext(ctx, `
+		SELECT id, broker_order_id, exchange_order_id, event_seq,
+		       source, event_type, status, oms_status_code,
+		       user_id, symbol, exchange, buy_sell, order_type, product,
+		       order_price, trigger_price, quantity, filled_qty,
+		       traded_price, pending_qty, reason,
+		       raw_payload, broker_ts_ms
+		FROM broker_events
+		WHERE published_at IS NULL
+		  AND observed_at < NOW() - make_interval(secs => $2)
+		ORDER BY id ASC
+		LIMIT $1`, limit, graceSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("fetch unpublished: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*PersistedEvent
+	for rows.Next() {
+		var (
+			pe                                    PersistedEvent
+			exchangeOrderID, status, symbol       sql.NullString
+			exchange, buySell, orderType, product sql.NullString
+			reason                                sql.NullString
+			orderPrice, triggerPrice, tradedPrice sql.NullFloat64
+			quantity, filledQty, pendingQty       sql.NullInt64
+			omsStatusCode                         sql.NullInt64
+			brokerTsMs                            sql.NullInt64
+			source, eventType                     string
+		)
+		if err := rows.Scan(
+			&pe.ID, &pe.BrokerOrderID, &exchangeOrderID, &pe.EventSeq,
+			&source, &eventType, &status, &omsStatusCode,
+			&pe.UserID, &symbol, &exchange, &buySell, &orderType, &product,
+			&orderPrice, &triggerPrice, &quantity, &filledQty,
+			&tradedPrice, &pendingQty, &reason,
+			&pe.RawPayload, &brokerTsMs,
+		); err != nil {
+			return nil, fmt.Errorf("scan unpublished row: %w", err)
+		}
+		pe.Source = Source(source)
+		pe.EventType = EventType(eventType)
+		pe.ExchangeOrderID = exchangeOrderID.String
+		pe.Status = status.String
+		pe.OMSStatusCode = int(omsStatusCode.Int64)
+		pe.Symbol = symbol.String
+		pe.Exchange = exchange.String
+		pe.BuySell = buySell.String
+		pe.OrderType = orderType.String
+		pe.Product = product.String
+		pe.OrderPrice = orderPrice.Float64
+		pe.TriggerPrice = triggerPrice.Float64
+		pe.Quantity = int(quantity.Int64)
+		pe.FilledQty = int(filledQty.Int64)
+		pe.TradedPrice = tradedPrice.Float64
+		pe.PendingQty = int(pendingQty.Int64)
+		pe.Reason = reason.String
+		pe.BrokerTsMs = brokerTsMs.Int64
+		out = append(out, &pe)
+	}
+	return out, rows.Err()
 }
 
 // nullStr converts empty string to sql.NullString.

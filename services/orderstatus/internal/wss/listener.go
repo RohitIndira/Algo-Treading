@@ -186,7 +186,7 @@ func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) 
 		OrderPrice:      parseFloat(ws.OrderPrice),
 		TriggerPrice:    ws.TriggerPrice,
 		Quantity:        ws.OrderOriginalQty,
-		FilledQty:       flexInt(ws.TradedQTY),
+		FilledQty:       ws.FilledQty(), // FIX 7: per-trade qty (TradeQty on TRD_MSG); TradedQTY is 0 on real fills
 		TradedPrice:     parseFloat(ws.TradedPrice),
 		PendingQty:      flexInt(ws.PendingQty),
 		Reason:          strings.TrimSpace(ws.Reason),
@@ -194,7 +194,7 @@ func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) 
 		BrokerTsMs:      0, // WSS doesn't include a millis stamp; broker_ts_ms stays 0 for WSS path
 	}
 
-	inserted, err := l.writer.Insert(ctx, ev)
+	id, inserted, err := l.writer.Insert(ctx, ev)
 	if err != nil {
 		l.logger.Error("broker_events insert failed",
 			zap.String("broker_order_id", brokerOrderID),
@@ -216,9 +216,15 @@ func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) 
 
 	// Fan out to Kafka order.events. Only new events (inserted=true) go here —
 	// dedup at the source means downstream consumers each see every event
-	// exactly once regardless of WSS/REST race conditions.
-	if l.pub != nil {
-		l.pub.Publish(ctx, ev)
+	// exactly once regardless of WSS/REST race conditions. Stamp published_at
+	// only on a confirmed publish; a failed inline publish leaves the row for
+	// the durability worker to retry.
+	if l.pub != nil && l.pub.Publish(ctx, ev) {
+		if err := l.writer.MarkPublished(ctx, id); err != nil {
+			l.logger.Warn("mark published failed — durability worker will retry",
+				zap.String("broker_order_id", brokerOrderID),
+				zap.Int64("id", id), zap.Error(err))
+		}
 	}
 }
 
