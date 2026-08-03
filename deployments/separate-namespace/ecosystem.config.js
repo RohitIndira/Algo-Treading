@@ -25,10 +25,17 @@ const ENV = Object.fromEntries(
 const PG = { POSTGRES_HOST: 'localhost', POSTGRES_PORT: '5442', POSTGRES_USER: 'postgres',
              POSTGRES_PASSWORD: 'postgres', POSTGRES_SSL_MODE: 'disable', POSTGRES_SSLMODE: 'disable' };
 const KAFKA = { KAFKA_BROKERS: 'localhost:9192' };
-const REDIS = { REDIS_ADDRS: 'localhost:6389', EXT_REDIS_ADDR: 'localhost:6389',
-                REDIS_HOST: 'localhost', REDIS_PORT: '6389' };
+// Local cache / ws-pubsub redis = the algo-dev docker redis (6389).
+const REDIS = { REDIS_ADDRS: 'localhost:6389', REDIS_HOST: 'localhost', REDIS_PORT: '6389' };
+// External LTP (live-price) feed = the real market-data redis. Address +
+// password come from .env (uncommitted); falls back to local (no live prices).
+const LTP = {
+  EXT_REDIS_ADDR:     ENV.EXT_REDIS_ADDR     || 'localhost:6389',
+  EXT_REDIS_PASSWORD: ENV.EXT_REDIS_PASSWORD || '',
+  LIVEALGOS_LTP_REDIS_PASSWORD: ENV.EXT_REDIS_PASSWORD || '',
+};
 const KEY = { ENCRYPTION_KEY: ENV.ENCRYPTION_KEY, ALLOW_INSECURE_ENCRYPTION_KEY: 'false' };
-const BASE = { ...PG, ...KAFKA, ...REDIS };
+const BASE = { ...PG, ...KAFKA, ...REDIS, ...LTP };
 
 const common = {
   cwd: __dirname,
