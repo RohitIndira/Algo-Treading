@@ -1,6 +1,7 @@
 module github.com/RohitIndira/Algo-Treading
 
 go 1.25.0
+toolchain go1.25.12
 
 require (
 	github.com/go-redis/redis/v8 v8.11.5

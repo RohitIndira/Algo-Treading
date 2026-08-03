@@ -1,6 +1,7 @@
 module github.com/RohitIndira/Algo-Treading/services/api-gateway
 
 go 1.25.0
+toolchain go1.25.12
 
 require (
 	github.com/RohitIndira/Algo-Treading/api/proto/common v0.0.0

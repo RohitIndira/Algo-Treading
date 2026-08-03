@@ -1,6 +1,7 @@
 module github.com/RohitIndira/Algo-Treading/services/positions
 
 go 1.25.0
+toolchain go1.25.12
 
 require (
 	github.com/RohitIndira/Algo-Treading/api/proto/trade_execution v0.0.0
