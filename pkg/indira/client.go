@@ -133,6 +133,14 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 	// Set standard headers
 	req.Header.Set("Content-Type", "application/json")
 
+	// Indira b2b api-key. Order-services endpoints (place-order / modify-order /
+	// cancel-order) reject requests that lack it with 403 "unknown_client:
+	// Requests without api-key must come from the app or a browser". Static
+	// per-partner key, supplied via INDIRA_API_KEY. Harmless on other endpoints.
+	if apiKey := os.Getenv("INDIRA_API_KEY"); apiKey != "" {
+		req.Header.Set("api-key", apiKey)
+	}
+
 	// Set per-request authentication headers (from frontend)
 	if auth.UserId != "" {
 		req.Header.Set("userId", auth.UserId)

@@ -186,6 +186,22 @@ func (p *Publisher) Publish(ctx context.Context, result *PipelineResult) (*Publi
 		stats.DroppedWritten++
 	}
 
+	// Capture which symbols are ALREADY on the Kafka topic for today BEFORE the
+	// DELETE below wipes the published_to_kafka_at flag — this is what makes a
+	// re-run idempotent (skip re-publishing them → topic holds exactly one
+	// message per symbol per day even if this runs twice).
+	alreadyPublished := map[string]bool{}
+	if prows, err := tx.QueryContext(ctx,
+		`SELECT symbol FROM manthan_signals WHERE run_date = CURRENT_DATE AND published_to_kafka_at IS NOT NULL`); err == nil {
+		for prows.Next() {
+			var sym string
+			if prows.Scan(&sym) == nil {
+				alreadyPublished[sym] = true
+			}
+		}
+		prows.Close()
+	}
+
 	// 2. Insert ELIGIBLE stocks into manthan_signals (clear today's first to avoid dupes)
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM manthan_signals WHERE run_date = CURRENT_DATE`); err != nil {
@@ -205,8 +221,13 @@ func (p *Publisher) Publish(ctx context.Context, result *PipelineResult) (*Publi
 	// 3. Publish ELIGIBLE stocks to Kafka (post-commit, so consumers only see
 	// durable messages). Failures here are logged — DB is source of truth.
 	if p.kafkaEnabled && len(result.Eligible) > 0 {
+		// Only publish symbols NOT already on the topic for today (captured
+		// pre-DELETE above) — idempotent across re-runs.
 		msgs := make([]kafka.Message, 0, len(result.Eligible))
 		for _, s := range result.Eligible {
+			if alreadyPublished[s.Symbol] {
+				continue // already on the topic for today — don't duplicate
+			}
 			payload := map[string]any{
 				"run_date":     runDate.Format("2006-01-02"),
 				"symbol":       s.Symbol,
@@ -233,13 +254,22 @@ func (p *Publisher) Publish(ctx context.Context, result *PipelineResult) (*Publi
 				Value: body,
 			})
 		}
-		if err := p.kafkaWriter.WriteMessages(ctx, msgs...); err != nil {
-			p.logger.Error("Kafka publish failed (DB already committed)",
-				zap.Int("messages", len(msgs)), zap.Error(err))
-			stats.KafkaError = err
-		} else {
-			stats.KafkaPublished = len(msgs)
-			// Mark rows as published
+		publishOK := true
+		if len(msgs) > 0 {
+			if err := p.kafkaWriter.WriteMessages(ctx, msgs...); err != nil {
+				p.logger.Error("Kafka publish failed (DB already committed)",
+					zap.Int("messages", len(msgs)), zap.Error(err))
+				stats.KafkaError = err
+				publishOK = false
+			} else {
+				stats.KafkaPublished = len(msgs)
+			}
+		}
+		// Always re-mark today's rows as published (the DELETE above wiped the
+		// flag). This covers BOTH the symbols we just published and the ones we
+		// skipped because they were already on the topic — so the next run sees
+		// them as published and stays idempotent. Only skip on a publish error.
+		if publishOK {
 			_, _ = p.db.ExecContext(ctx,
 				`UPDATE manthan_signals SET published_to_kafka_at = NOW() WHERE run_date = CURRENT_DATE`)
 		}
