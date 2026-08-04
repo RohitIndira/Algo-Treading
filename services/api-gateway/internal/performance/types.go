@@ -62,20 +62,22 @@ type ChartPoint struct {
 	BenchmarkPct *float64 `json:"benchmarkPct,omitempty"` // indexed at 100
 }
 
-// Returns is the 4-tile summary row at the bottom of the screen —
-// 1M / 6M / 1Y / Since Deployment. Each entry has both the absolute
-// rupee P&L and the percentage.
+// Returns is the summary tile row — 1M / 3M / 6M / 1Y / Since Deployment.
+// Each entry carries the algo's rupee P&L + %, and the benchmark's % over the
+// SAME window (so "Nifty" varies per timeframe, not a single static number).
 type Returns struct {
 	Month1          ReturnEntry `json:"1M"`
+	Month3          ReturnEntry `json:"3M"`
 	Month6          ReturnEntry `json:"6M"`
 	Year1           ReturnEntry `json:"1Y"`
 	SinceDeployment ReturnEntry `json:"sinceDeployment"`
 }
 
-// ReturnEntry is one tile — "1M RETURN: ₹1,05,300 (-3.2%)".
+// ReturnEntry is one tile — "1M RETURN: ₹1,05,300 (-3.2%)  vs NIFTY +1.1%".
 type ReturnEntry struct {
-	Amount  int64   `json:"amount"`  // rupees, can be negative
-	Percent float64 `json:"percent"` // e.g. -3.2
+	Amount           int64   `json:"amount"`           // algo rupees, can be negative
+	Percent          float64 `json:"percent"`          // algo %, e.g. -3.2
+	BenchmarkPercent float64 `json:"benchmarkPercent"` // benchmark % over the SAME window
 }
 
 // DailyPoint is one cell in the "Day wise P&L" heat-map calendar.

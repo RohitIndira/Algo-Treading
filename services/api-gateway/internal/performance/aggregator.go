@@ -61,12 +61,15 @@ func Build(
 		Benchmark: Series{Label: benchmarkLabel, ReturnPct: round2(benchmarkLatestPct)},
 	}
 
-	// ── Returns tiles (1M / 6M / 1Y / since deployment) ──────────────
+	// ── Returns tiles (1M / 3M / 6M / 1Y / since deployment) ─────────
+	// Each tile carries the benchmark's return over the SAME window, so the
+	// "Nifty" number differs per timeframe instead of showing one static value.
 	returns := Returns{
-		Month1:          buildReturn(daily, 30, capitalBase),
-		Month6:          buildReturn(daily, 180, capitalBase),
-		Year1:           buildReturn(daily, 365, capitalBase),
-		SinceDeployment: sinceDeployment(daily, capitalBase),
+		Month1:          buildReturn(daily, bench, 30, capitalBase),
+		Month3:          buildReturn(daily, bench, 90, capitalBase),
+		Month6:          buildReturn(daily, bench, 180, capitalBase),
+		Year1:           buildReturn(daily, bench, 365, capitalBase),
+		SinceDeployment: sinceDeployment(daily, bench, capitalBase),
 	}
 
 	// ── DailyPnL (heat-map calendar) ─────────────────────────────────
@@ -80,8 +83,8 @@ func Build(
 		})
 	}
 
-	// ── MonthlyPnL — bucket daily into (year, month) ────────────────
-	monthlyPnL := buildMonthlyPnL(daily)
+	// ── MonthlyPnL — cumulative-return delta per month ──────────────
+	monthlyPnL := buildMonthlyPnL(daily, capitalBase)
 
 	return Response{
 		AlgoID:            algoID,
@@ -157,7 +160,7 @@ func latestBenchmarkPct(pts []ChartPoint) float64 {
 // buildReturn computes the return over the trailing `days`-day window
 // using return_pct AS OF (last) minus AS OF (~days ago). If we don't
 // have `days` days of data, returns the same as sinceDeployment.
-func buildReturn(daily []DailyRow, days int, capital int64) ReturnEntry {
+func buildReturn(daily []DailyRow, bench []BenchmarkRow, days int, capital int64) ReturnEntry {
 	if len(daily) == 0 {
 		return ReturnEntry{}
 	}
@@ -165,7 +168,7 @@ func buildReturn(daily []DailyRow, days int, capital int64) ReturnEntry {
 	// Find the row closest to (latest.Date - days days), NOT going past.
 	target := latest.Date.AddDate(0, 0, -days)
 	if target.Before(daily[0].Date) {
-		return sinceDeployment(daily, capital)
+		return sinceDeployment(daily, bench, capital)
 	}
 	// Binary-ish search: linear is fine for ~150 rows.
 	startIdx := 0
@@ -178,11 +181,15 @@ func buildReturn(daily []DailyRow, days int, capital int64) ReturnEntry {
 	windowStart := daily[startIdx]
 	pct := latest.ReturnPct - windowStart.ReturnPct
 	amount := int64(float64(capital) * pct / 100.0)
-	return ReturnEntry{Amount: amount, Percent: round2(pct)}
+	return ReturnEntry{
+		Amount:           amount,
+		Percent:          round2(pct),
+		BenchmarkPercent: benchmarkReturnPct(bench, windowStart.Date, latest.Date),
+	}
 }
 
 // sinceDeployment is the return from first row to last row.
-func sinceDeployment(daily []DailyRow, capital int64) ReturnEntry {
+func sinceDeployment(daily []DailyRow, bench []BenchmarkRow, capital int64) ReturnEntry {
 	if len(daily) == 0 {
 		return ReturnEntry{}
 	}
@@ -190,32 +197,63 @@ func sinceDeployment(daily []DailyRow, capital int64) ReturnEntry {
 	// Since deployment, the return AS OF latest date IS the total return.
 	pct := latest.ReturnPct
 	amount := int64(float64(capital) * pct / 100.0)
-	return ReturnEntry{Amount: amount, Percent: round2(pct)}
+	return ReturnEntry{
+		Amount:           amount,
+		Percent:          round2(pct),
+		BenchmarkPercent: benchmarkReturnPct(bench, daily[0].Date, latest.Date),
+	}
 }
 
-// buildMonthlyPnL buckets daily rows by (year, month), summing the daily
-// P&L amounts. The percent is the sum of daily percents (approximation —
-// consistent with how the daily heat map colors the calendar).
-func buildMonthlyPnL(daily []DailyRow) []MonthlyPoint {
+// benchmarkReturnPct is the benchmark's % change over [from, to], using the
+// last close on/before each bound (bench is date-ascending). Returns 0 when the
+// window can't be bracketed — the frontend then just shows the algo line. This
+// is what makes the "Nifty" number differ per 1M/3M/6M/1Y window instead of a
+// single static value.
+func benchmarkReturnPct(bench []BenchmarkRow, from, to time.Time) float64 {
+	var fromClose, toClose float64
+	for _, b := range bench {
+		if !b.Date.After(from) {
+			fromClose = b.CloseValue // last close on/before `from`
+		}
+		if !b.Date.After(to) {
+			toClose = b.CloseValue // last close on/before `to`
+		}
+	}
+	if fromClose <= 0 || toClose <= 0 {
+		return 0
+	}
+	return round2((toClose/fromClose - 1) * 100)
+}
+
+// buildMonthlyPnL computes each month's P&L as the CHANGE in cumulative return
+// over that month — (last row of the month) minus (last row of the previous
+// month). return_pct is a cumulative "as of" value (see Build's doc), so the
+// old code that SUMMED daily pnl_amount / return_pct double-counted massively
+// and produced nonsense month totals. With the delta approach the months sum
+// exactly to the since-deployment return (e.g. months add up to +34.9%).
+func buildMonthlyPnL(daily []DailyRow, capital int64) []MonthlyPoint {
 	type key struct{ y, m int }
-	agg := make(map[key]MonthlyPoint)
+	lastOfMonth := make(map[key]DailyRow)
 	order := make([]key, 0)
 	for _, r := range daily {
 		k := key{r.Date.Year(), int(r.Date.Month())}
-		mp, seen := agg[k]
-		if !seen {
-			mp = MonthlyPoint{Year: k.y, Month: k.m}
+		if _, seen := lastOfMonth[k]; !seen {
 			order = append(order, k)
 		}
-		mp.Amount += int64(r.PnLAmount)
-		mp.Percent += r.ReturnPct
-		agg[k] = mp
+		lastOfMonth[k] = r // daily is date-ascending → last write is the month-end row
 	}
 	out := make([]MonthlyPoint, 0, len(order))
+	prevCum := 0.0 // cumulative return at the end of the previous month
 	for _, k := range order {
-		mp := agg[k]
-		mp.Percent = round2(mp.Percent)
-		out = append(out, mp)
+		cum := lastOfMonth[k].ReturnPct
+		delta := cum - prevCum
+		prevCum = cum
+		out = append(out, MonthlyPoint{
+			Year:    k.y,
+			Month:   k.m,
+			Amount:  int64(float64(capital) * delta / 100.0),
+			Percent: round2(delta),
+		})
 	}
 	return out
 }

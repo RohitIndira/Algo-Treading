@@ -110,7 +110,7 @@ type KeyStats struct {
 	TotalTradesPct float64 `json:"totalTradesPct"`
 	AvgHoldingDays float64 `json:"avgHoldingDays"`
 	Sortino        float64 `json:"sortino"`
-	VolatilityDays int     `json:"volatilityDays"`
+	VolatilityDays int     `json:"volatilityDays,omitempty"` // omitted when 0 (removed from UI)
 }
 
 // WhatYouGetItem is one row of the "What you get" bullet list on the

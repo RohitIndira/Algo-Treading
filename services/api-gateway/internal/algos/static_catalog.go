@@ -153,11 +153,11 @@ func manthanDetail() AlgoDetail {
 		},
 		KeyStats: KeyStats{
 			WinRatePct:     62,
-			ProfitFactor:   24.1,
+			ProfitFactor:   2.38,
 			TotalTradesPct: 68,
 			AvgHoldingDays: -7.4,
 			Sortino:        1.84,
-			VolatilityDays: 12,
+			VolatilityDays: 0, // removed from the UI — omitted via json:omitempty
 		},
 		WhatYouGet: []WhatYouGetItem{
 			{Icon: "automation", Title: "Automated execution", Description: "Trades placed by us — no manual orders"},
