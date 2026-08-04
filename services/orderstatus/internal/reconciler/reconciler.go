@@ -352,14 +352,23 @@ func (r *Reconciler) eventFromOrderBookRow(userID string, o *indira.OrderBook, s
 	//     store in `price`, so it puts the actual traded price there once
 	//     the order fills. Confirmed live 2026-07-16 on BECTORFOOD @
 	//     ordType=Market, status=Executed, price=188.59 (avg trade).
-	//   - Limit / SL / SL-L ordTypes: `price` is the user's LIMIT — the
-	//     fill lives in TradeBook (Layer 3) only. Leave TradedPrice=0
-	//     so positions svc defers to a later WSS event that carries the
-	//     real fill (see services/positions/statemachine/handler.go
-	//     handleBuyFill precedence — meta.AvgFillPrice > ev.TradedPrice
-	//     > skip).
+	//   - Limit / SL / SL-L ordTypes: while the order is RESTING, `price` is
+	//     the user's LIMIT and must NOT be treated as a fill price. BUT once
+	//     the order is FULLY EXECUTED (status=Executed, RemainQty=0) the broker
+	//     overwrites `price` with the avg traded price — verified live
+	//     2026-08-04: NRBBEARING sent limit 428.75, orderbook reported
+	//     price=429.35 (the fill, not the limit). So a fully-filled limit DOES
+	//     carry a usable price here.
+	//
+	// This is a FALLBACK, not the source of truth: positions svc precedence is
+	// meta.AvgFillPrice (exact VWAP from trade-execution) > ev.TradedPrice, so
+	// the precise price still wins whenever it's available. The fallback exists
+	// so a fill NEVER gets stuck "deferred (price=0)" forever when the WSS/meta
+	// price is missed mid-settlement — the root cause of positions stranded at
+	// 5/8 on 2026-08-04. Partial fills (RemainQty>0) still defer to TradeBook.
 	var tradedPrice float64
-	if isMarketOrdType(ordTypeUpper) && o.TradedQty > 0 && o.Price > 0 {
+	fullyExecuted := status == "EXECUTED" && o.RemainQty == 0
+	if o.TradedQty > 0 && o.Price > 0 && (isMarketOrdType(ordTypeUpper) || fullyExecuted) {
 		tradedPrice = o.Price
 	}
 
