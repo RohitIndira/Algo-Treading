@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -142,7 +143,25 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 	// parent linkage on the fill event and adds qty + invested onto the
 	// parent manthan_positions row.
 	if signal.TopUpForSignalID == "" {
-		existingEntry, _ := h.repo.GetActiveEntryBySymbol(ctx, signal.StrategyID, signal.Symbol)
+		existingEntry, lookupErr := h.repo.GetActiveEntryBySymbol(ctx, signal.StrategyID, signal.Symbol)
+		if errors.Is(lookupErr, sql.ErrNoRows) {
+			lookupErr = nil // no matching row = genuinely no duplicate — proceed
+		}
+		if lookupErr != nil {
+			// FAIL CLOSED. Swallowing this error is how the 2026-08-05
+			// double-buy happened: under the 09:00 signal-burst the lookup
+			// errored for 7 of 8 symbols, existingEntry came back nil, the
+			// guard silently passed, and 7 duplicate entries were placed with
+			// real money (only NRBBEARING — whose retries ran after the burst
+			// — was caught). If we cannot PROVE the signal isn't a duplicate,
+			// we must not place the order. Message deliberately avoids the
+			// "pre-check:"/"rejected" classifier tokens → InboxErrTransient →
+			// the inbox retries with backoff, when the DB is healthy again.
+			h.logger.Error("Entry guard lookup FAILED — refusing to place (fail-closed)",
+				zap.String("symbol", signal.Symbol),
+				zap.Error(lookupErr))
+			return 0, fmt.Errorf("entry-guard lookup failed (fail-closed): %w", lookupErr)
+		}
 		if existingEntry != nil {
 			h.logger.Info("Skipping duplicate entry — already have position",
 				zap.String("symbol", signal.Symbol),

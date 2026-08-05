@@ -1250,19 +1250,15 @@ func scanOrders(rows *sql.Rows) ([]*ManthanOrder, error) {
 }
 
 func scanOrder(row *sql.Row) (*ManthanOrder, error) {
-	o := &ManthanOrder{}
-	err := row.Scan(
-		&o.ID, &o.SignalID, &o.StrategyID, &o.UserID, &o.Symbol, &o.ISIN, &o.Exchange,
-		&o.OrderType, &o.OrderSide, &o.ProductType, &o.Qty, &o.FilledQty,
-		&o.LimitPrice, &o.TriggerPrice, &o.AvgFillPrice,
-		&o.BrokerOrderID, &o.BrokerStatus, &o.IndiraSymbol, &o.ExchangeToken,
-		&o.Status, &o.RetryCount, &o.MaxRetries, &o.LastError, &o.ParentOrderID,
-		&o.CreatedAt, &o.PlacedAt, &o.FilledAt, &o.CancelledAt, &o.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return o, nil
+	// Delegate to the NULL-safe scanner. The old direct-Scan version put
+	// nullable columns (broker_status, last_error, …) straight into string
+	// fields — any NULL made Scan error, and callers that swallowed the error
+	// treated it as "row not found". That is how the 2026-08-05 double-buy
+	// slipped past GetActiveEntryBySymbol: 7 of 8 held entries had NULL
+	// broker_status/last_error, so the duplicate-guard lookup "found nothing"
+	// and re-entries were placed with real money. *sql.Row satisfies the
+	// scannable interface, so the multi-row scanner works here unchanged.
+	return scanOrderRow(row)
 }
 
 type scannable interface {
@@ -1274,6 +1270,8 @@ func scanOrderRow(row scannable) (*ManthanOrder, error) {
 	var (
 		signalID      sql.NullString
 		isin          sql.NullString
+		limitPrice    sql.NullFloat64
+		triggerPrice  sql.NullFloat64
 		avgFillPrice  sql.NullFloat64
 		brokerOrderID sql.NullString
 		brokerStatus  sql.NullString
@@ -1284,7 +1282,7 @@ func scanOrderRow(row scannable) (*ManthanOrder, error) {
 	err := row.Scan(
 		&o.ID, &signalID, &o.StrategyID, &o.UserID, &o.Symbol, &isin, &o.Exchange,
 		&o.OrderType, &o.OrderSide, &o.ProductType, &o.Qty, &o.FilledQty,
-		&o.LimitPrice, &o.TriggerPrice, &avgFillPrice,
+		&limitPrice, &triggerPrice, &avgFillPrice,
 		&brokerOrderID, &brokerStatus, &indiraSymbol, &exchangeToken,
 		&o.Status, &o.RetryCount, &o.MaxRetries, &lastError, &o.ParentOrderID,
 		&o.CreatedAt, &o.PlacedAt, &o.FilledAt, &o.CancelledAt, &o.UpdatedAt,
@@ -1294,6 +1292,8 @@ func scanOrderRow(row scannable) (*ManthanOrder, error) {
 	}
 	o.SignalID = signalID.String
 	o.ISIN = isin.String
+	o.LimitPrice = limitPrice.Float64
+	o.TriggerPrice = triggerPrice.Float64
 	o.AvgFillPrice = avgFillPrice.Float64
 	o.BrokerOrderID = brokerOrderID.String
 	o.BrokerStatus = brokerStatus.String
