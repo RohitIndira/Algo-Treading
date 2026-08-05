@@ -101,21 +101,36 @@ func Build(
 			DeployedCapital: deployedCapitalFrom(s),
 		}
 
+		// Summary aggregates count only strategies whose capital is CURRENTLY
+		// deployed (LIVE / PAUSED). STOPPED strategies stay visible as history
+		// cards but must not inflate totalDeployedCapital or dilute the summary
+		// percentages — 2026-08-05: one stopped test strategy doubled the
+		// denominator, showing 0.1% instead of the real 0.19%. A stopped
+		// strategy with missing metrics must also not flip the whole summary
+		// to "pending".
+		counted := row.Status != StatusStopped
+
 		if m, ok := metricsByStrategy[s.StrategyId]; ok && m.Real {
 			row.NetPnL = PnL{Amount: m.NetPnL, Percent: m.NetPct}
 			row.TodayPnL = PnL{Amount: m.TodayPnL, Percent: m.TodayPct}
 			row.WinRatePct = m.WinRatePct
 			row.OpenPositions = m.OpenPositions
-			sumNet += m.NetPnL
-			sumToday += m.TodayPnL
-			haveAny = true
+			if counted {
+				sumNet += m.NetPnL
+				sumToday += m.TodayPnL
+				haveAny = true
+			}
 		} else {
 			row.NetPnL = PnL{PnLPending: true}
 			row.TodayPnL = PnL{PnLPending: true}
-			allReal = false
+			if counted {
+				allReal = false
+			}
 		}
 
-		totalDeployedCapital += row.DeployedCapital
+		if counted {
+			totalDeployedCapital += row.DeployedCapital
+		}
 		rows = append(rows, row)
 	}
 
