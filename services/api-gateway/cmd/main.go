@@ -411,20 +411,34 @@ func main() {
 	//
 	// CODIFI_VERIFY_URL env var lets ops point at a staging Codifi
 	// without a code change. Default is production Codifi.
-	verifier := auth.NewIntrospectionVerifier(auth.IntrospectionConfig{
-		// SSO tokens (web login via SSO gateway):
-		VerifyURL: envOr("CODIFI_VERIFY_URL",
-			"https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token"),
-		// APP tokens (mobile mPin / biometric login) — piggybacks on the
-		// /AccountInfo data endpoint because Codifi's dedicated
-		// /auth/v1/verify/token is over-strict (rejects tokens the
-		// mobile app itself uses successfully). See introspection_verifier.go
-		// for the full write-up.
-		AppVerifyURL: envOr("CODIFI_APP_VERIFY_URL",
-			"https://livemiddleware.indiratrade.com/user-services/api/user/v1/AccountInfo"),
-		// HTTPTimeout, CacheTTL, NegativeTTL, CleanupPeriod all use
-		// defaults defined in NewIntrospectionVerifier — 3s / 5m / 30s / 1m.
-	})
+	// AUTH_MODE=noop bypasses Codifi introspection and accepts ANY well-formed
+	// JWT carrying a userId claim — TESTING ONLY (e.g. eyeballing protected
+	// endpoints without a live SSO login). Default is real introspection.
+	var verifier auth.Verifier
+	if envOr("AUTH_MODE", "introspection") == "noop" {
+		log.Println("⚠ AUTH_MODE=noop — accepting any well-formed JWT with a userId claim (TESTING ONLY, NOT FOR PRODUCTION)")
+		verifier = auth.NewNoopVerifier()
+	} else {
+		verifier = auth.NewIntrospectionVerifier(auth.IntrospectionConfig{
+			// PRIMARY (2026-08-05): unified session verify — validates BOTH
+			// web-SSO and mobile-APP tokens with Authorization: Bearer +
+			// source header. Same response envelope as the legacy SSO verify.
+			UnifiedVerifyURL: envOr("CODIFI_UNIFIED_VERIFY_URL",
+				"https://livemiddleware.indiratrade.com/auth-services/api/auth/v1/verify/token"),
+			// LEGACY SSO endpoint (rollback path only):
+			VerifyURL: envOr("CODIFI_VERIFY_URL",
+				"https://livemiddleware.indiratrade.com/auth-services/api/auth/verify/token"),
+			// APP tokens (mobile mPin / biometric login) — piggybacks on the
+			// /AccountInfo data endpoint because Codifi's dedicated
+			// /auth/v1/verify/token is over-strict (rejects tokens the
+			// mobile app itself uses successfully). See introspection_verifier.go
+			// for the full write-up.
+			AppVerifyURL: envOr("CODIFI_APP_VERIFY_URL",
+				"https://livemiddleware.indiratrade.com/user-services/api/user/v1/AccountInfo"),
+			// HTTPTimeout, CacheTTL, NegativeTTL, CleanupPeriod all use
+			// defaults defined in NewIntrospectionVerifier — 3s / 5m / 30s / 1m.
+		})
+	}
 
 	// Router
 	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, corsConfig)

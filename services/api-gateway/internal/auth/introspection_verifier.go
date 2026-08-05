@@ -75,6 +75,17 @@ type IntrospectionConfig struct {
 	// Example: https://livemiddleware.indiratrade.com/user-services/api/user/v1/AccountInfo
 	AppVerifyURL string
 
+	// UnifiedVerifyURL is Codifi's session-validation endpoint that accepts
+	// BOTH web-SSO and mobile-APP tokens (2026-08-05, per Codifi guidance):
+	//   GET  Authorization: Bearer <jwt>   source: API
+	// Response envelope matches the legacy SSO verify endpoint
+	// ({"code":"200","message":"Valid Token",...}), so
+	// parseSSOVerifyResponse applies. This is now the PRIMARY verify path
+	// for every token; AppVerifyURL remains the defensive fallback for APP
+	// tokens (see Verify step 5). Defaulted when empty:
+	//   https://livemiddleware.indiratrade.com/auth-services/api/auth/v1/verify/token
+	UnifiedVerifyURL string
+
 	// HTTPTimeout is the per-request timeout when calling Codifi.
 	// Default 3s. If set to 0, defaults are applied.
 	HTTPTimeout time.Duration
@@ -132,6 +143,11 @@ func NewIntrospectionVerifier(cfg IntrospectionConfig) *IntrospectionVerifier {
 	}
 	if cfg.AppVerifyURL == "" {
 		panic("auth.NewIntrospectionVerifier: cfg.AppVerifyURL is required")
+	}
+	if cfg.UnifiedVerifyURL == "" {
+		// Safe default: the unified endpoint is environment-stable (prod
+		// Codifi); callers can still override via CODIFI_UNIFIED_VERIFY_URL.
+		cfg.UnifiedVerifyURL = "https://livemiddleware.indiratrade.com/auth-services/api/auth/v1/verify/token"
 	}
 	if cfg.HTTPTimeout == 0 {
 		cfg.HTTPTimeout = 3 * time.Second
@@ -206,46 +222,41 @@ func (iv *IntrospectionVerifier) Verify(ctx context.Context, jwt string) (*Claim
 		// Cache expired — fall through to Codifi. Sweep will evict.
 	}
 
-	// ── Step 4 ── Pick the correct Codifi endpoint by loginSource ─
-	// SSO tokens (web login) verify against /auth/verify/token,
-	// APP tokens (mobile mPin/biometric) verify against
-	// /auth/v1/verify/token. They use DIFFERENT signing secrets
-	// AND DIFFERENT response shapes on Codifi's side. Fail-closed
-	// on any unknown loginSource — if Codifi ever adds a new flow
-	// (PARTNER, API_KEY, etc), tokens from that flow return 401
-	// until we teach our verifier about it. Safer than silently
-	// picking a default endpoint that would reject anyway.
-	var verifyURL string
-	var parseVerdict func(body []byte) error
-	switch loginSource {
-	case "SSO":
-		verifyURL = iv.cfg.VerifyURL
-		parseVerdict = parseSSOVerifyResponse
-	case "APP":
-		verifyURL = iv.cfg.AppVerifyURL
-		parseVerdict = parseAPPVerifyResponse
-	default:
+	// ── Step 4 ── Fail-closed on unknown loginSource ─────────────
+	// If Codifi ever adds a new flow (PARTNER, API_KEY, etc), tokens
+	// from that flow return 401 until we teach our verifier about it.
+	if loginSource != "SSO" && loginSource != "APP" {
 		return nil, fmt.Errorf("%w: unknown loginSource %q",
 			ErrTokenInvalid, loginSource)
 	}
 
-	// ── Step 5 ── Call the picked endpoint ───────────────────────
-	// SSO uses ?token= query param; APP uses Authorization: Bearer
-	// header (because we piggyback on the /AccountInfo data endpoint
-	// which follows the mobile app's usual header contract).
-	var body []byte
-	var err2 error
-	if loginSource == "SSO" {
-		body, err2 = iv.callSSOVerify(ctx, verifyURL, jwt, userID, appID)
-	} else { // APP (default branch guarded by the switch above)
-		body, err2 = iv.callAPPVerify(ctx, verifyURL, jwt, userID, appID)
-	}
+	// ── Step 5 ── Unified verify (2026-08-05 switch) ─────────────
+	// Codifi's /auth-services/api/auth/v1/verify/token now validates
+	// BOTH web-SSO and mobile-APP sessions with one call shape:
+	// Authorization: Bearer <jwt> + source header. Response envelope
+	// is the same {"code","message","plain-message"} as the legacy
+	// SSO endpoint, so parseSSOVerifyResponse applies to both.
+	body, err2 := iv.callUnifiedVerify(ctx, iv.cfg.UnifiedVerifyURL, jwt)
 	if err2 != nil {
 		return nil, err2 // already wrapped with ErrTokenInvalid
 	}
+	verdictErr := parseSSOVerifyResponse(body)
 
-	// ── Step 6 ── Interpret response with the shape-appropriate parser
-	if verdictErr := parseVerdict(body); verdictErr != nil {
+	// APP fallback: the dedicated verify endpoint has HISTORICALLY been
+	// over-strict for mobile tokens (rejected JWTs the app itself used
+	// successfully — the reason the AccountInfo piggyback exists). If
+	// the unified endpoint rejects an APP token, double-check against
+	// the AccountInfo probe before treating the session as dead.
+	if verdictErr != nil && loginSource == "APP" {
+		if body2, err3 := iv.callAPPVerify(ctx, iv.cfg.AppVerifyURL, jwt, userID, appID); err3 == nil {
+			if appErr := parseAPPVerifyResponse(body2); appErr == nil {
+				verdictErr = nil // AccountInfo accepts the token — session is live
+			}
+		}
+	}
+
+	// ── Step 6 ── Verdict ────────────────────────────────────────
+	if verdictErr != nil {
 		// Negative-cache the rejection so brute-force garbage tokens
 		// don't hammer Codifi on every attempt.
 		iv.cache.Store(jwt, cacheEntry{
@@ -283,10 +294,30 @@ func (iv *IntrospectionVerifier) Verify(ctx context.Context, jwt string) (*Claim
 	return claims, nil
 }
 
+// callUnifiedVerify makes the HTTP GET to Codifi's unified session-verify
+// endpoint (/auth-services/api/auth/v1/verify/token). Contract (verified
+// live 2026-08-05 with a fresh SSO token → {"code":"200","message":"Valid
+// Token"}):
+//   - JWT in `Authorization: Bearer` header (NOT ?token= query param)
+//   - `source: API` header identifies a server-side verification call
+// Works for both loginSource=SSO and loginSource=APP tokens.
+func (iv *IntrospectionVerifier) callUnifiedVerify(ctx context.Context, verifyURL, jwt string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, verifyURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: unified request build: %v", ErrTokenInvalid, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("source", "API")
+	return iv.doAndReadBody(req, verifyURL)
+}
+
 // callSSOVerify makes the HTTP GET to Codifi's SSO verify endpoint
 // (/auth-services/api/auth/verify/token). The SSO endpoint takes the
 // JWT as the `?token=` QUERY PARAMETER — NOT an Authorization header.
 // That's a Codifi choice; passing the JWT the other way returns 404.
+//
+// LEGACY (2026-08-05): superseded by callUnifiedVerify as the primary
+// path; kept for rollback via CODIFI_VERIFY_URL if ever needed.
 func (iv *IntrospectionVerifier) callSSOVerify(ctx context.Context, verifyURL, jwt, userID, appID string) ([]byte, error) {
 	reqURL, err := url.Parse(verifyURL)
 	if err != nil {
