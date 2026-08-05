@@ -460,11 +460,29 @@ func (h *LiveAlgosHandler) chartFor(ctx context.Context, algoID string, deployed
 				}
 				if len(sinceDeploy) > 0 {
 					baseline := sinceDeploy[0].ReturnPct
-					points := make([]livealgos.DetailsChartPoint, 0, len(sinceDeploy))
+					points := make([]livealgos.DetailsChartPoint, 0, len(sinceDeploy)+1)
 					for _, row := range sinceDeploy {
 						points = append(points, livealgos.DetailsChartPoint{
 							Date: row.Date.Format("2006-01-02"),
 							Pct:  100 + (row.ReturnPct - baseline),
+						})
+					}
+					// Extend to TODAY with the strategy's live P&L whenever the
+					// nightly ETL hasn't caught up yet. Two jobs:
+					//   1. A strategy deployed yesterday has exactly ONE perf
+					//      row — a single dot renders as "no equity curve" in
+					//      the app (2026-08-05: chart was [{08-04, 100}]).
+					//   2. Every chart stays current intraday instead of ending
+					//      at the last ETL row. Once the evening sync lands
+					//      today's row, the perf source wins and this no-ops.
+					// livePct (NetPnL.Percent) is % since deployment — the same
+					// baseline the rebased perf points use, so 100+livePct is
+					// consistent with the curve.
+					todayDate := time.Now().In(istLoc()).Format("2006-01-02")
+					if points[len(points)-1].Date < todayDate {
+						points = append(points, livealgos.DetailsChartPoint{
+							Date: todayDate,
+							Pct:  100 + livePct,
 						})
 					}
 					return livealgos.DetailsChart{Points: points}
