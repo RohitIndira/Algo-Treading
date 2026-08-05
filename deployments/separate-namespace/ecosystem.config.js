@@ -43,7 +43,10 @@ const EXT_HOST = (ENV.EXT_REDIS_ADDR || 'localhost:6389').split(':')[0];
 const EXT_PORT = (ENV.EXT_REDIS_ADDR || 'localhost:6389').split(':')[1] || '6379';
 const EXT_PW   = ENV.EXT_REDIS_PASSWORD || '';
 const KEY = { ENCRYPTION_KEY: ENV.ENCRYPTION_KEY, ALLOW_INSECURE_ENCRYPTION_KEY: 'false' };
-const BASE = { ...PG, ...KAFKA, ...REDIS, ...LTP };
+// Indira b2b api-key — order-services (place/modify/cancel) 403 "unknown_client"
+// without it. From .env (uncommitted).
+const BROKER = { INDIRA_API_KEY: ENV.INDIRA_API_KEY || '' };
+const BASE = { ...PG, ...KAFKA, ...REDIS, ...LTP, ...BROKER };
 
 const common = {
   cwd: __dirname,
@@ -71,6 +74,12 @@ module.exports = {
     { name: 'trade-execution', script: './bin/trade-execution', ...common, env: {
         ...BASE, ...KEY, SERVICE_PORT: '9004', METRICS_PORT: '9090', PAPER_WS_PORT: '8091',
         POSTGRES_DB: 'execution_db', USER_CONFIG_GRPC_ADDR: 'localhost:9003',
+        // Protective replayer: 09:14 morning arm (re-checks DEFERRED SLs vs
+        // today's DPR band) + 16:35 EOD Phase A (AMO for open positions) +
+        // Phase C conversion check + ArmRetryWorker (wakes on fresh login via
+        // USER_CREDENTIALS_UPDATED, 5-min poll fallback). Without this flag
+        // deferred SLs are never re-armed (2026-08-05: 5/8 unprotected).
+        MANTHAN_PROTECTIVE_REPLAY_ENABLED: 'true',
         // Price client (paper monitor, OCO trailing SL, price-monitor fallback)
         // reads market:nse:{token} LTP — point REDIS_HOST/PORT at the external
         // market feed, NOT the empty local redis. EXT_REDIS_ADDR (broker adapter)
