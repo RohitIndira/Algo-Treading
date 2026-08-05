@@ -30,6 +30,12 @@ type CooldownConsumer struct {
 	reader *kafka.Reader
 	db     *sql.DB
 	logger *zap.Logger
+	// confirmFill (optional) — invoked on MANTHAN POSITION_OPENED so the
+	// in-memory portfolio flips the position PENDING_ENTRY→ACTIVE. This is
+	// the fill-confirmation feed the allocator's "already holding" guard
+	// depends on; it was never wired before 2026-08-05 (positions stayed
+	// pending forever and day-2 signals re-bought held symbols).
+	confirmFill func(strategyID, symbol string, price float64, qty int32)
 }
 
 // CooldownConsumerConfig — Kafka wiring for the position.events subscription.
@@ -37,6 +43,8 @@ type CooldownConsumerConfig struct {
 	KafkaBrokers []string
 	Topic        string // default: position.events
 	GroupID      string // default: rules-engine-cooldown
+	// ConfirmFill — see CooldownConsumer.confirmFill. Nil-safe.
+	ConfirmFill func(strategyID, symbol string, price float64, qty int32)
 }
 
 // positionEventEnvelope mirrors the JSON published by positions svc's
@@ -81,9 +89,10 @@ func NewCooldownConsumer(cfg CooldownConsumerConfig, db *sql.DB, logger *zap.Log
 		StartOffset: kafka.LastOffset,
 	})
 	return &CooldownConsumer{
-		reader: reader,
-		db:     db,
-		logger: logger,
+		reader:      reader,
+		db:          db,
+		logger:      logger,
+		confirmFill: cfg.ConfirmFill,
 	}
 }
 
@@ -152,8 +161,25 @@ func (c *CooldownConsumer) handleMessage(ctx context.Context, msg kafka.Message)
 	if !strings.EqualFold(ev.Origin, "MANTHAN") {
 		return nil // USER_MANUAL cooldown isn't a thing
 	}
+
+	// POSITION_OPENED → fill confirmation into the in-memory portfolio.
+	// This arms the allocator's "already holding" re-entry guard with the
+	// broker-confirmed price/qty (positions svc publishes OPENED only after
+	// a real priced fill). Idempotent: ProcessFillEvent no-ops when the
+	// position is already ACTIVE with >= qty.
+	if strings.EqualFold(ev.EventType, "POSITION_OPENED") {
+		if c.confirmFill != nil && ev.StrategyID != "" && ev.Symbol != "" && ev.Price > 0 && ev.Quantity > 0 {
+			c.confirmFill(ev.StrategyID, ev.Symbol, ev.Price, int32(ev.Quantity))
+			c.logger.Info("fill confirmed from position.events — re-entry guard armed",
+				zap.String("strategy_id", ev.StrategyID),
+				zap.String("symbol", ev.Symbol),
+				zap.Float64("price", ev.Price),
+				zap.Int("qty", ev.Quantity))
+		}
+		return nil
+	}
 	if !strings.EqualFold(ev.EventType, "POSITION_EXITED") {
-		return nil // OPENED / MODIFIED / etc — not our concern
+		return nil // MODIFIED / etc — not our concern
 	}
 	if !strings.EqualFold(ev.ExitReason, "SL_TRIGGER") {
 		// MANUAL_EXIT / STRATEGY_EXIT / LIQUIDATION — no cooldown per Manthan spec

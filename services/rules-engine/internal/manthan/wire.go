@@ -263,7 +263,17 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 	// per §5.3 of docs/positions_service_design.md. Manthan re-entry gate
 	// (ATH × 0.80) is enforced by the allocator's cooldown lookup.
 	m.cooldownConsumer = NewCooldownConsumer(
-		CooldownConsumerConfig{KafkaBrokers: deps.KafkaBrokers},
+		CooldownConsumerConfig{
+			KafkaBrokers: deps.KafkaBrokers,
+			// Fill-confirmation feed (2026-08-05): flips PENDING_ENTRY→ACTIVE
+			// in the in-memory portfolio when positions svc confirms a priced
+			// fill, arming the allocator's re-entry guard. TrailingSLPct uses
+			// the Manthan spec default — this only seeds rules-engine's OWN SL
+			// bookkeeping (trade-execution owns the real broker SLs).
+			ConfirmFill: func(strategyID, symbol string, price float64, qty int32) {
+				m.portfolioMgr.ConfirmFill(strategyID, symbol, price, qty, slMgr, 20)
+			},
+		},
 		deps.ManthanDB,
 		logger,
 	)

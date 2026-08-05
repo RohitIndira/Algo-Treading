@@ -127,10 +127,20 @@ func (a *Allocator) Allocate(
 			break
 		}
 
-		// Skip if already holding
-		if pos, ok := portfolio.Positions[sig.Symbol]; ok && pos.Active {
+		// Skip if this strategy already tracks the symbol in ANY non-exited
+		// state. Requiring pos.Active alone re-bought held symbols every
+		// morning: fill confirmations were never wired (2026-08-05), so every
+		// position sat PENDING_ENTRY/Active=false forever, the guard never
+		// fired, and day-2 signals doubled 7 live positions (~₹44k extra).
+		// PENDING_ENTRY / PARTIALLY_FILLED must block re-entry just as hard
+		// as ACTIVE — an unconfirmed entry is still deployed capital.
+		if pos, ok := portfolio.Positions[sig.Symbol]; ok && pos.State != types.StateExited {
+			reason := "already holding"
+			if !pos.Active {
+				reason = "already holding (" + string(pos.State) + ")"
+			}
 			result.Skipped = append(result.Skipped, SkipReason{
-				Symbol: sig.Symbol, Reason: "already holding",
+				Symbol: sig.Symbol, Reason: reason,
 			})
 			continue
 		}
