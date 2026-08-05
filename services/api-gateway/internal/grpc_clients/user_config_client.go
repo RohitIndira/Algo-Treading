@@ -86,3 +86,9 @@ func (c *UserConfigClient) UpdateUserCredentials(ctx context.Context, req *pb.Up
 	defer cancel()
 	return c.client.UpdateUserCredentials(ctx, req)
 }
+
+func (c *UserConfigClient) GetUserCredentials(ctx context.Context, req *pb.GetUserCredentialsRequest) (*pb.GetUserCredentialsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetUserCredentials(ctx, req)
+}

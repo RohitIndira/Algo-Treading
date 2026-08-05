@@ -441,7 +441,13 @@ func main() {
 	}
 
 	// Router
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, corsConfig)
+	// Auto-capture: any request whose token passes verification AND is newer
+	// than the stored broker session refreshes user_credentials automatically
+	// (store -> USER_CREDENTIALS_UPDATED -> trade-execution wake -> SL re-arm).
+	// Kills the daily "app validated but never pushed the fresh token" gap.
+	tokenCapture := middleware.NewTokenCapture(userConfigClient)
+
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, tokenCapture, corsConfig)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {

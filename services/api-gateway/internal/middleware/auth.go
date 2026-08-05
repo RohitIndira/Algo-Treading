@@ -37,7 +37,11 @@ import (
 // method accepts. We don't import gorilla/mux here — the raw
 // function shape keeps this middleware framework-agnostic (would
 // work identically with net/http, chi, gin, echo, etc.).
-func AuthRequired(v auth.Verifier) func(next http.Handler) http.Handler {
+//
+// capture (optional, may be nil): TokenCapture auto-refreshes the STORED
+// broker credentials whenever a request carries a token newer than the one
+// on file — see token_capture.go for why this is production-critical.
+func AuthRequired(v auth.Verifier, capture *TokenCapture) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -124,6 +128,13 @@ func AuthRequired(v auth.Verifier) func(next http.Handler) http.Handler {
 			// mislogs them.
 			ctx := auth.WithClaims(r.Context(), claims)
 			ctx = auth.WithRawJWT(ctx, token)
+
+			// ── Step 5 ── Auto-capture (non-blocking, nil-safe) ─────
+			// The token just passed Codifi verification. If it's newer
+			// than the stored broker session, push it so server-side
+			// order/SL placement stays authenticated all day.
+			capture.MaybeCapture(claims, token)
+
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

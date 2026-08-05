@@ -23,6 +23,7 @@ func NewRouter(
 	liveAlgosHandler *handlers.LiveAlgosHandler,
 	portfolioHandler *handlers.PortfolioHandler,
 	verifier auth.Verifier,
+	tokenCapture *middleware.TokenCapture, // nil-safe: auto-refresh stored broker creds from validated headers
 	corsConfig middleware.CORSConfig,
 ) http.Handler {
 
@@ -127,7 +128,7 @@ func NewRouter(
 	// will migrate here in follow-up sessions once frontend adds the
 	// Authorization header for each.
 	protected := api.PathPrefix("").Subrouter()
-	protected.Use(middleware.AuthRequired(verifier))
+	protected.Use(middleware.AuthRequired(verifier, tokenCapture))
 
 	// GET /api/v1/whoami — echoes the authenticated userID.
 	// Zero side effects. Purpose: smoke-testing the auth middleware
