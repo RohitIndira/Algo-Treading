@@ -122,6 +122,12 @@ module.exports = {
         MARKET_DATA_DB_HOST: 'localhost', MARKET_DATA_DB_PORT: '5442',
         MARKET_DATA_DB_USER: 'postgres', MARKET_DATA_DB_PASSWORD: 'postgres',
         MARKET_DATA_DB_NAME: 'signals_db', MARKET_DATA_DB_SSLMODE: 'disable',
+        // EMA allocations (manthan:ema:allocations) must land on the SAME
+        // redis rules-engine's allocator reads (its REDIS_ADDRS = the local
+        // algo-dev redis). Unset REDIS_URI meant manthan-live pinged a dead
+        // localhost:6379, logged "EMA allocations not cached", and the
+        // allocator fell back to the hardcoded 0.30 split every day.
+        REDIS_URI: 'localhost:6389', REDIS_PASSWORD: '',
     }},
   ],
 };

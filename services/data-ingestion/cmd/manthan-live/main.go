@@ -138,6 +138,15 @@ func main() {
 		DB:       cfg.RedisDB,
 	})
 	if emaRdb.Ping(ctx).Err() == nil {
+		// Defensive unit normalization: the allocator consumes FRACTIONS
+		// (0.0–1.0). If the sheet's Allocation column ever carries percent
+		// values (30 instead of 0.30), publishing raw would inflate every
+		// per-stock allocation 100x. Normalize and say so.
+		for k, v := range result.IndexAllocation {
+			if v > 1.0 {
+				result.IndexAllocation[k] = v / 100.0
+			}
+		}
 		emaJSON, _ := json.Marshal(result.IndexAllocation)
 		emaRdb.Set(ctx, "manthan:ema:allocations", string(emaJSON), 24*time.Hour)
 		logger.Info("EMA allocations published to Redis",
