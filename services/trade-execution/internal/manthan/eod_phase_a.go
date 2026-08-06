@@ -149,7 +149,10 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 		// though the AMO will execute fine tomorrow morning post-settle.
 		// See fetchEODSellableQtyMap docstring for the full rationale.
 		if !uc.fetched {
-			uc.freeQty = p.fetchEODSellableQtyMap(cycleCtx, *uc.auth, pos.UserID)
+			// EOD stays lenient on a failed fetch (ok=false → nil map): the
+			// 08:50 AMO conversion is the authoritative validator, and the
+			// freeQty gate below only warns. Morning fire is the strict path.
+			uc.freeQty, _ = p.fetchEODSellableQtyMap(cycleCtx, *uc.auth, pos.UserID)
 			uc.fetched = true
 		}
 

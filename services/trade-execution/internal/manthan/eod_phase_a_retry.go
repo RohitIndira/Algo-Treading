@@ -154,10 +154,17 @@ func (w *ArmRetryWorker) tick(ctx context.Context, userHint string) {
 			zap.String("user_id", uid),
 			zap.Int("queued_rows", len(queued)))
 
-		// Re-run the full EOD cycle once per tick. Multiple ready users in
-		// the same tick share one cycle — InsertAMOOrder idempotency makes
-		// it safe but wasteful to call repeatedly.
-		if !cycleFired {
+		// Re-arm mode depends on the clock (2026-08-06 fix — "user logs in
+		// at 11am" must protect THIS session, not tomorrow's):
+		//   market OPEN  → RunOnceForUser: places live SLs for this user now.
+		//   market closed → RunEODPhaseANow: queues AMO for the next session
+		//                   (full-cycle, idempotent, shared across users).
+		if w.replay.MarketOpenNow() {
+			if err := w.replay.RunOnceForUser(ctx, uid); err != nil {
+				w.logger.Warn("Arm-retry worker: RunOnceForUser failed",
+					zap.String("user_id", uid), zap.Error(err))
+			}
+		} else if !cycleFired {
 			w.replay.RunEODPhaseANow(ctx)
 			cycleFired = true
 		}

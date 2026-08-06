@@ -199,6 +199,26 @@ func (p *ProtectiveReplay) nextWeekdayAt(hour, minute int) time.Time {
 
 func (p *ProtectiveReplay) now() time.Time { return time.Now().In(p.ist) }
 
+// todayTradeDateIST is today's session date (midnight IST) — the trade_date
+// used for morning-cycle arm-retries (protect THIS session, not tomorrow's).
+func (p *ProtectiveReplay) todayTradeDateIST() time.Time {
+	n := p.now()
+	return time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, p.ist)
+}
+
+// MarketOpenNow reports whether NSE is in its regular session right now
+// (trading day, 09:15–15:30 IST). Used by the ArmRetryWorker to pick the
+// re-arm mode on a late login: live SLs while the market is open, EOD AMO
+// otherwise.
+func (p *ProtectiveReplay) MarketOpenNow() bool {
+	n := p.now()
+	if !indiraClient.IsTradingDay(n) {
+		return false
+	}
+	m := n.Hour()*60 + n.Minute()
+	return m >= 9*60+15 && m < 15*60+30
+}
+
 // isWeekend kept for readability only; logic is now subsumed by
 // indiraClient.IsTradingDay which also handles the holiday list.
 func isWeekend(t time.Time) bool {
@@ -282,6 +302,7 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 		auth    *BrokerAuth
 		freeQty map[string]int
 		fetched bool
+		fetchOK bool // false = holdings API errored (auth/network) — data absent, not "no holdings"
 	}
 	cache := map[string]*userCache{}
 
@@ -342,7 +363,7 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 		// locked against margin (where the broker would actually reject)
 		// but stops blocking on the misleading freeQty=0 cache state.
 		if !uc.fetched {
-			uc.freeQty = p.fetchEODSellableQtyMap(ctx, *auth, pos.UserID)
+			uc.freeQty, uc.fetchOK = p.fetchEODSellableQtyMap(ctx, *auth, pos.UserID)
 			uc.fetched = true
 		}
 
@@ -354,6 +375,30 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 				Action:     FireSkip,
 				SkipReason: "couldn't resolve symbol info (no indira_symbol / exchange_token)",
 			})
+			continue
+		}
+
+		// EDGE: holdings fetch FAILED (expired session / network). We know
+		// nothing about the broker book — fail CLOSED: skip with the true
+		// reason and queue a Layer-4 arm-retry so the moment the user logs
+		// in (USER_CREDENTIALS_UPDATED wake, e.g. an 11am login) the cycle
+		// re-runs and places the SLs. Never conclude "manually exited"
+		// from an auth error.
+		if !uc.fetchOK {
+			reason := "holdings unavailable (session expired?) — queued for on-login re-arm"
+			plans = append(plans, FirePlan{
+				Pos:        pos,
+				Auth:       *auth,
+				Info:       info,
+				Action:     FireSkip,
+				SkipReason: reason,
+			})
+			if err := p.repo.EnqueueArmRetry(ctx, pos.UserID, pos.EntryOrderID, p.todayTradeDateIST(), reason); err != nil {
+				p.logger.Warn("buildPlans: enqueue arm-retry failed",
+					zap.String("user_id", pos.UserID),
+					zap.Int64("entry_order_id", pos.EntryOrderID),
+					zap.Error(err))
+			}
 			continue
 		}
 
@@ -533,12 +578,17 @@ func (p *ProtectiveReplay) fetchFreeQtyMap(ctx context.Context, auth BrokerAuth,
 // settlement clears". usedQty/pledgeQty subtractions cover shares pledged
 // to the broker or locked against margin obligations — those won't free
 // overnight and the AMO would correctly reject.
-func (p *ProtectiveReplay) fetchEODSellableQtyMap(ctx context.Context, auth BrokerAuth, userID string) map[string]int {
+// The bool result distinguishes "holdings fetched" from "holdings API FAILED"
+// (AU004 / network). Callers must NOT treat a failed fetch as an empty book:
+// on 2026-08-06 the 09:14 arm ran while the overnight session was expired,
+// the empty map made every position look "not in broker holdings — likely
+// manually exited", and all 8 SLs were silently skipped.
+func (p *ProtectiveReplay) fetchEODSellableQtyMap(ctx context.Context, auth BrokerAuth, userID string) (map[string]int, bool) {
 	holdings, err := p.broker.client.GetHoldings(ctx, p.broker.toIndiraAuth(auth))
 	if err != nil {
 		p.logger.Warn("fetchEODSellableQtyMap: holdings API failed",
 			zap.String("user", userID), zap.Error(err))
-		return map[string]int{}
+		return nil, false
 	}
 	out := make(map[string]int, len(holdings))
 	for _, h := range holdings {
@@ -563,7 +613,7 @@ func (p *ProtectiveReplay) fetchEODSellableQtyMap(ctx context.Context, auth Brok
 	}
 	p.logger.Info("fetchEODSellableQtyMap: holdings snapshot (T+1 sellable)",
 		zap.String("user", userID), zap.Int("symbols", len(out)))
-	return out
+	return out, true
 }
 
 // fetchLTP returns the latest market price for a symbol with a fallback chain:
