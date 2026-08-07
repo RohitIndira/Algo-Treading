@@ -192,6 +192,22 @@ func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy types.UserSt
 		return
 	}
 
+	// Market-hours guard (2026-08-07): catch-up exists to fill a strategy that
+	// was created MID-SESSION, after that morning's signals were published. If
+	// the strategy is created OUTSIDE the tradeable window, generating live
+	// MARKET entries is pointless — trade-execution's identical pre-check
+	// rejects each one ("market not open yet" / "too close to market close" /
+	// weekend) and they land in the DLQ marked "operator attention required",
+	// a false alarm (a user creating a strategy after 15:20 is normal, not an
+	// incident). Defer instead: the next 09:00 IST signal batch allocates to
+	// every active strategy, so this one fires cleanly at the next open.
+	if !canPlaceEntriesNowIST() {
+		c.logger.Info("Strategy created outside market hours — deferring entries to next open (no catch-up now)",
+			zap.String("user", strategy.UserID),
+			zap.String("strategy", strategy.StrategyID))
+		return
+	}
+
 	today := todayIST()
 	signals := c.loadSignalsForDate(ctx, today)
 	if len(signals) == 0 {
@@ -410,6 +426,26 @@ func todayIST() string {
 		loc = time.FixedZone("IST", 5*60*60+30*60)
 	}
 	return time.Now().In(loc).Format("2006-01-02")
+}
+
+// canPlaceEntriesNowIST reports whether an entry MARKET order can actually be
+// placed right now — trading day (Mon–Fri) AND 09:15 ≤ now < 15:20 IST. This
+// MUST match trade-execution's PreChecker.checkMarketHours window; if the two
+// drift, catch-up will emit entries that the pre-check then DLQs. Used to
+// defer catch-up when a strategy is created outside the tradeable window.
+func canPlaceEntriesNowIST() bool {
+	loc, _ := time.LoadLocation("Asia/Kolkata")
+	if loc == nil {
+		loc = time.FixedZone("IST", 5*60*60+30*60)
+	}
+	now := time.Now().In(loc)
+	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+		return false
+	}
+	minuteOfDay := now.Hour()*60 + now.Minute()
+	const marketOpen = 9*60 + 15  // 09:15
+	const marketClose = 15*60 + 20 // 15:20 (matches pre_check.go buffer)
+	return minuteOfDay >= marketOpen && minuteOfDay < marketClose
 }
 
 // SetLTPFeed sets the LTP feed after construction (needed because of init order).
