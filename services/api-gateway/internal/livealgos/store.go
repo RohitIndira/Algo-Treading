@@ -1,6 +1,7 @@
 package livealgos
 
 import (
+	"sort"
 	"context"
 	"database/sql"
 	"errors"
@@ -114,6 +115,24 @@ type Store interface {
 	// Orders returns every FILLED order for a strategy+symbol, most-recent
 	// first — powers the trade-history table on the Stock P&L drilldown.
 	OrdersForSymbol(ctx context.Context, strategyID, userID, symbol string) ([]OrderRow, error)
+
+	// Timeline returns the merged activity feed for a strategy — lifecycle
+	// events (deployed/paused/resumed/capital/deleted from trading_db) UNION
+	// order activity (entries filled, SLs armed, positions closed from
+	// execution_db) — most-recent first. Powers the mobile "Algo Timeline".
+	Timeline(ctx context.Context, strategyID, userID string) ([]TimelineRow, error)
+}
+
+// TimelineRow is one raw timeline entry from the store, before the handler
+// formats titles + IST timestamps.
+type TimelineRow struct {
+	Kind      string    // event_type: DEPLOYED/PAUSED/RESUMED/CAPITAL_INCREASED/CAPITAL_DECREASED/DELETED/ORDER_FILLED/SL_ARMED/POSITION_CLOSED
+	At        time.Time // UTC; handler renders IST
+	Symbol    string    // order events only
+	Side      string    // BUY / SELL (order events)
+	Qty       int       // order events
+	Price     float64   // fill / trigger price
+	DetailsJS string    // JSON blob for lifecycle events (capital, from/to, positions_exited)
 }
 
 // PostgresStore implements Store using four DB pools.
@@ -452,3 +471,78 @@ func (s *PostgresStore) OrdersForSymbol(ctx context.Context, strategyID, userID,
 
 // Compile-time assertion: *PostgresStore satisfies Store.
 var _ Store = (*PostgresStore)(nil)
+
+// Timeline merges lifecycle events (trading_db.strategy_lifecycle_events) with
+// order activity (execution_db.manthan_orders) into one time-ordered feed for
+// the mobile "Algo Timeline". User-scoped on BOTH sources so a UUID alone
+// can't reveal another user's strategy. Either source being nil/empty just
+// yields fewer rows — never an error.
+func (s *PostgresStore) Timeline(ctx context.Context, strategyID, userID string) ([]TimelineRow, error) {
+	out := make([]TimelineRow, 0, 32)
+
+	// 1. Lifecycle events from trading_db. Table is created by user-config
+	//    migration 018; guard against its absence on an un-migrated box so
+	//    the order half still renders.
+	if s.strategiesDB != nil {
+		const lq = `
+			SELECT event_type, created_at, COALESCE(details::text,'{}')
+			FROM public.strategy_lifecycle_events
+			WHERE strategy_id::text = $1 AND user_id = $2
+			ORDER BY created_at DESC`
+		if rows, err := s.strategiesDB.QueryContext(ctx, lq, strategyID, userID); err == nil {
+			for rows.Next() {
+				var r TimelineRow
+				if err := rows.Scan(&r.Kind, &r.At, &r.DetailsJS); err == nil {
+					out = append(out, r)
+				}
+			}
+			rows.Close()
+		}
+	}
+
+	// 2. Order activity from execution_db. One event per meaningful order
+	//    state: an entry that FILLED, an SL that got PLACED, and any exit
+	//    (SELL) that FILLED. Skips still-pending / rejected noise.
+	if s.ordersDB != nil {
+		const oq = `
+			SELECT symbol, order_side, order_type, status,
+			       COALESCE(filled_qty, qty), COALESCE(avg_fill_price, COALESCE(trigger_price,0)),
+			       COALESCE(filled_at, placed_at, created_at)
+			FROM public.manthan_orders
+			WHERE strategy_id::text = $1 AND user_id = $2
+			  AND (
+			        (order_side='BUY'  AND status='FILLED')
+			     OR (order_type LIKE '%SL%' AND status IN ('SL_PLACED','SL_FILLED'))
+			     OR (order_side='SELL' AND order_type NOT LIKE '%SL%' AND status='FILLED')
+			  )
+			ORDER BY COALESCE(filled_at, placed_at, created_at) DESC`
+		if rows, err := s.ordersDB.QueryContext(ctx, oq, strategyID, userID); err == nil {
+			for rows.Next() {
+				var symbol, side, otype, status string
+				var qty int
+				var price float64
+				var at time.Time
+				if err := rows.Scan(&symbol, &side, &otype, &status, &qty, &price, &at); err != nil {
+					continue
+				}
+				r := TimelineRow{At: at, Symbol: symbol, Side: side, Qty: qty, Price: price}
+				switch {
+				case status == "SL_FILLED":
+					r.Kind = "POSITION_CLOSED"
+				case otype != "" && (status == "SL_PLACED"):
+					r.Kind = "SL_ARMED"
+				case side == "SELL":
+					r.Kind = "POSITION_CLOSED"
+				default:
+					r.Kind = "ORDER_FILLED"
+				}
+				out = append(out, r)
+			}
+			rows.Close()
+		}
+	}
+
+	// Merge-sort by time DESC (each source was already sorted; combined is not).
+	sort.Slice(out, func(i, j int) bool { return out[i].At.After(out[j].At) })
+	return out, nil
+}

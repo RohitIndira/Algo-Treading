@@ -2,9 +2,12 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	common "github.com/RohitIndira/Algo-Treading/api/proto/common"
@@ -737,4 +740,131 @@ func filterBySymbol(positions []livealgos.PositionRow, symbol string) []livealgo
 		}
 	}
 	return out
+}
+
+// TimelineEvent is one card in the mobile "Algo Timeline" screen. Server
+// formats the title/subtitle + IST timestamp so the app renders directly.
+type TimelineEvent struct {
+	Type     string `json:"type"`     // machine kind (DEPLOYED, ORDER_FILLED, …)
+	Icon     string `json:"icon"`     // deployed|paused|resumed|capital_up|capital_down|deleted|order|sl|closed
+	Title    string `json:"title"`    // "Algo deployed"
+	Subtitle string `json:"subtitle"` // human sentence
+	TS       string `json:"ts"`       // IST ISO-8601, e.g. 2026-08-07T09:00:00+05:30
+	TSMillis int64  `json:"tsMillis"` // epoch millis for client-side sorting
+}
+
+// GetTimeline handles GET /users/me/live-algos/{strategyId}/timeline —
+// the lifecycle + order activity feed. Newest first, IST timestamps.
+func (h *LiveAlgosHandler) GetTimeline(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		respondIndiraError(w, http.StatusUnauthorized, "E_AUTH", "authenticated user not found")
+		return
+	}
+	strategyID := mux.Vars(r)["strategyId"]
+	if strategyID == "" {
+		respondIndiraError(w, http.StatusBadRequest, "E_BAD_REQUEST", "strategyId is required")
+		return
+	}
+	// Ownership check (404 on cross-user UUID guessing, same as siblings).
+	if _, err := h.store.StrategyMeta(r.Context(), strategyID, userID); err != nil {
+		if errors.Is(err, livealgos.ErrStrategyNotFound) {
+			respondIndiraError(w, http.StatusNotFound, "E_NOT_FOUND", "strategy not found")
+			return
+		}
+		log.Printf("livealgos: timeline meta %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load timeline")
+		return
+	}
+
+	rows, err := h.store.Timeline(r.Context(), strategyID, userID)
+	if err != nil {
+		log.Printf("livealgos: timeline %s/%s: %v", strategyID, userID, err)
+		respondIndiraError(w, http.StatusInternalServerError, "E500", "failed to load timeline")
+		return
+	}
+
+	ist := istLoc()
+	events := make([]TimelineEvent, 0, len(rows))
+	for _, row := range rows {
+		icon, title, subtitle := formatTimeline(row)
+		t := row.At.In(ist)
+		events = append(events, TimelineEvent{
+			Type:     row.Kind,
+			Icon:     icon,
+			Title:    title,
+			Subtitle: subtitle,
+			TS:       t.Format("2006-01-02T15:04:05-07:00"),
+			TSMillis: row.At.UnixMilli(),
+		})
+	}
+	respondIndiraOK(w, map[string]any{"events": events})
+}
+
+// formatTimeline maps a raw row to (icon, title, subtitle). Kept as a pure
+// function so it's unit-testable without a DB.
+func formatTimeline(row livealgos.TimelineRow) (icon, title, subtitle string) {
+	num := func(key string) float64 {
+		if row.DetailsJS == "" {
+			return 0
+		}
+		var m map[string]float64
+		_ = json.Unmarshal([]byte(row.DetailsJS), &m)
+		return m[key]
+	}
+	switch row.Kind {
+	case "DEPLOYED":
+		return "deployed", "Algo deployed",
+			fmt.Sprintf("Algo was made live with capital deployment of %s", rupees(num("capital")))
+	case "PAUSED":
+		return "paused", "Paused", "You paused the algo. It won't place any new entries."
+	case "RESUMED":
+		return "resumed", "Resumed", "You resumed the algo. It's scanning for entries again."
+	case "CAPITAL_INCREASED":
+		return "capital_up", "Capital increased",
+			fmt.Sprintf("Deployed capital increased from %s to %s", rupees(num("from")), rupees(num("to")))
+	case "CAPITAL_DECREASED":
+		return "capital_down", "Capital decreased",
+			fmt.Sprintf("Deployed capital decreased from %s to %s", rupees(num("from")), rupees(num("to")))
+	case "DELETED":
+		return "deleted", "Algo removed", "You removed this algo deployment."
+	case "SL_ARMED":
+		return "sl", "Stop-loss set",
+			fmt.Sprintf("Protective SL armed for %s at %s", row.Symbol, rupees(row.Price))
+	case "POSITION_CLOSED":
+		return "closed", "Position closed",
+			fmt.Sprintf("Sold %d %s at %s", row.Qty, row.Symbol, rupees(row.Price))
+	case "ORDER_FILLED":
+		return "order", "Order filled",
+			fmt.Sprintf("Bought %d %s at %s", row.Qty, row.Symbol, rupees(row.Price))
+	default:
+		return "order", row.Kind, ""
+	}
+}
+
+// rupees formats an amount as ₹1,00,000 (Indian grouping, no paise).
+func rupees(v float64) string {
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	n := int64(v + 0.5) // round magnitude, then re-apply sign — never round toward zero on negatives
+	s := fmt.Sprintf("%d", n)
+	// Indian grouping: last 3 digits, then pairs.
+	if len(s) > 3 {
+		head, tail := s[:len(s)-3], s[len(s)-3:]
+		var parts []string
+		for len(head) > 2 {
+			parts = append([]string{head[len(head)-2:]}, parts...)
+			head = head[:len(head)-2]
+		}
+		if head != "" {
+			parts = append([]string{head}, parts...)
+		}
+		s = strings.Join(parts, ",") + "," + tail
+	}
+	if neg {
+		return "-₹" + s
+	}
+	return "₹" + s
 }

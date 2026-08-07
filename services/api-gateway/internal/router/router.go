@@ -211,6 +211,7 @@ func NewRouter(
 			protected.HandleFunc("/users/me/live-algos/{strategyId}", liveAlgosHandler.GetStrategyDetails).Methods("GET")
 			protected.HandleFunc("/users/me/live-algos/{strategyId}/holdings", liveAlgosHandler.GetHoldings).Methods("GET")
 			protected.HandleFunc("/users/me/live-algos/{strategyId}/trades", liveAlgosHandler.GetTrades).Methods("GET")
+			protected.HandleFunc("/users/me/live-algos/{strategyId}/timeline", liveAlgosHandler.GetTimeline).Methods("GET")
 			protected.HandleFunc("/users/me/live-algos/{strategyId}/holdings/{symbol}", liveAlgosHandler.GetStockPnL).Methods("GET")
 		}
 	}

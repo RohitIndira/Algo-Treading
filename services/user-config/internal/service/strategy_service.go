@@ -300,6 +300,9 @@ func (s *StrategyService) CreateStrategy(ctx context.Context, req *models.Create
 		return nil, fmt.Errorf("failed to create strategy: %w", err)
 	}
 
+	s.recordLifecycle(ctx, strategy.StrategyID, strategy.UserID, "DEPLOYED",
+		map[string]any{"capital": capitalOf(strategy)})
+
 	// Persist Indira broker credentials so trade-execution can authenticate orders.
 	// This is best-effort: a failure here does NOT abort the strategy creation.
 	if req.IndiraAuth != nil && req.IndiraAuth.BearerToken != "" {
@@ -346,12 +349,29 @@ func (s *StrategyService) UpdateStrategy(ctx context.Context, req *models.Update
 		return nil, err
 	}
 
+	// Snapshot the pre-update capital so we can classify a change as an
+	// increase/decrease for the timeline. Best-effort — a lookup miss just
+	// means no capital event is emitted.
+	var oldCapital float64
+	if prev, perr := s.repo.GetByID(ctx, req.StrategyID, req.UserID); perr == nil {
+		oldCapital = capitalOf(prev)
+	}
+
 	// Update strategy in database (includes Outbox insertion). Pass the repo
 	// error up unwrapped — it already carries a clean typed sentinel
 	// (apperr.ErrNotFound / ErrVersionConflict) or a repo-prefixed DB error.
 	strategy, err := s.repo.Update(ctx, req)
 	if err != nil {
 		return nil, err
+	}
+
+	if newCapital := capitalOf(strategy); oldCapital > 0 && newCapital != oldCapital {
+		evt := "CAPITAL_INCREASED"
+		if newCapital < oldCapital {
+			evt = "CAPITAL_DECREASED"
+		}
+		s.recordLifecycle(ctx, strategy.StrategyID, strategy.UserID, evt,
+			map[string]any{"from": oldCapital, "to": newCapital})
 	}
 
 	return strategy, nil
@@ -437,6 +457,8 @@ func (s *StrategyService) DeleteStrategy(ctx context.Context, strategyID uuid.UU
 		return positionsExited, err
 	}
 
+	s.recordLifecycle(ctx, strategyID, userID, "DELETED",
+		map[string]any{"positions_exited": positionsExited})
 	return positionsExited, nil
 }
 
@@ -453,6 +475,7 @@ func (s *StrategyService) ActivateStrategy(ctx context.Context, strategyID uuid.
 		return nil, fmt.Errorf("failed to get strategy: %w", err)
 	}
 
+	s.recordLifecycle(ctx, strategyID, userID, "RESUMED", nil)
 	return strategy, nil
 }
 
@@ -481,6 +504,8 @@ func (s *StrategyService) DeactivateStrategy(ctx context.Context, strategyID uui
 		return nil, positionsExited, fmt.Errorf("failed to get strategy: %w", err)
 	}
 
+	s.recordLifecycle(ctx, strategyID, userID, "PAUSED",
+		map[string]any{"positions_exited": positionsExited})
 	return strategy, positionsExited, nil
 }
 
@@ -618,4 +643,28 @@ func (s *StrategyService) validateUpdateRequest(req *models.UpdateStrategyReques
 	}
 
 	return nil
+}
+
+// recordLifecycle appends one row to the strategy timeline (the mobile
+// "Algo Timeline" screen). Best-effort: a failure is logged and never
+// propagated — the timeline is observability, not source of truth, and must
+// never fail the user's create/pause/resume/delete action.
+func (s *StrategyService) recordLifecycle(ctx context.Context, strategyID uuid.UUID, userID, eventType string, details map[string]any) {
+	var detailsJSON string
+	if len(details) > 0 {
+		if b, err := json.Marshal(details); err == nil {
+			detailsJSON = string(b)
+		}
+	}
+	if err := s.repo.RecordLifecycleEvent(ctx, strategyID, userID, eventType, detailsJSON); err != nil {
+		log.Printf("[WARN] user-config: timeline event %s for %s not recorded: %v", eventType, strategyID, err)
+	}
+}
+
+// capitalOf returns the strategy's configured total capital, 0 when absent.
+func capitalOf(st *models.Strategy) float64 {
+	if st != nil && st.TradeConfig != nil && st.TradeConfig.TotalCapital != nil {
+		return *st.TradeConfig.TotalCapital
+	}
+	return 0
 }

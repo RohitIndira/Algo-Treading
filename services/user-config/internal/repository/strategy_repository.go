@@ -719,3 +719,19 @@ func (r *StrategyRepository) MarkOutboxEventsProcessed(ctx context.Context, even
 	}
 	return nil
 }
+
+// RecordLifecycleEvent appends one row to strategy_lifecycle_events — the
+// feed behind the mobile "Algo Timeline" screen. Best-effort by contract:
+// callers log the returned error and NEVER fail the user's action on it
+// (the timeline is observability, not source of truth). detailsJSON must be
+// valid JSON ("{}" when there's nothing to attach).
+func (r *StrategyRepository) RecordLifecycleEvent(ctx context.Context, strategyID uuid.UUID, userID, eventType, detailsJSON string) error {
+	if detailsJSON == "" {
+		detailsJSON = "{}"
+	}
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO strategy_lifecycle_events (strategy_id, user_id, event_type, details)
+		VALUES ($1, $2, $3, $4::jsonb)`,
+		strategyID, userID, eventType, detailsJSON)
+	return err
+}
