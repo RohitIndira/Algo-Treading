@@ -112,8 +112,11 @@ module.exports = {
     }},
     // manthan-live is a BATCH job (reads sheet → publishes signals → exits), not
     // a daemon. Don't keep-alive it; run it once daily pre-open via cron_restart.
+    // cron is in BOX TIME = UTC. '30 3' = 09:00 IST — signals must exist
+    // BEFORE market open; the earlier '0 9' (=14:30 IST!) left every morning
+    // strategy-creation staring at an empty signal day (2026-08-07 incident).
     { name: 'data-ingestion', script: './bin/data-ingestion', ...common,
-      autorestart: false, cron_restart: '0 9 * * 1-5', env: {
+      autorestart: false, cron_restart: '30 3 * * 1-5', env: {
         ...BASE,
         MANTHAN_SHEET_ID: '1E_MzQNQFNvnmR8wMZMCyzPKc-SjOei4wwQp4QAey5sc',
         MANTHAN_CREDS: '/home/ubuntu/Algo-Treading/services/data-ingestion/credentials/manthan-sheet.json',
