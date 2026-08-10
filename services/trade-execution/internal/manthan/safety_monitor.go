@@ -107,7 +107,40 @@ func (m *SafetyMonitor) Start(ctx context.Context) {
 	}
 }
 
+// marketOpenForSL reports whether a LIVE stop-loss order can be placed/modified
+// right now: an exchange trading day (IsTradingDay handles weekends AND holidays)
+// AND within the regular session, 09:15–15:30 IST. Outside this window Indira
+// rejects SL placement and DAY SLs are auto-cancelled at 15:30 — overnight
+// protection is the EOD Phase A AMO cron's responsibility, so the safety
+// monitor must not attempt anything.
+func (m *SafetyMonitor) marketOpenForSL() bool {
+	loc, _ := time.LoadLocation("Asia/Kolkata")
+	if loc == nil {
+		loc = time.FixedZone("IST", 5*60*60+30*60)
+	}
+	now := time.Now().In(loc)
+	if !indiraClient.IsTradingDay(now) {
+		return false // Saturday / Sunday / exchange holiday
+	}
+	mod := now.Hour()*60 + now.Minute()
+	const open = 9*60 + 15  // 09:15
+	const close = 15*60 + 30 // 15:30 (broker auto-cancels DAY SLs at close)
+	return mod >= open && mod <= close
+}
+
 func (m *SafetyMonitor) check(ctx context.Context) {
+	// Market-hours guard (2026-08-08 incident): stand down entirely when the
+	// exchange is closed. Every action this monitor takes — placing a naked
+	// position's SL, re-placing a vanished SL, MARKET-selling on a breach —
+	// requires a LIVE session and an OPEN market; none can succeed after
+	// 15:30, before 09:15, or on a weekend/holiday. With no guard the 15s
+	// ticker hammered the broker with 7,464 place-order attempts across a
+	// single Saturday, each returning AU004. Overnight/weekend protection is
+	// the EOD Phase A AMO cron's job, not this monitor's.
+	if !m.marketOpenForSL() {
+		return
+	}
+
 	// FIX 3: enforce "every OPEN filled BUY position has exactly one active SL".
 	// Runs first so a naked position (fill whose SL never landed) gets protected
 	// within one 2s cycle — before we even look at existing SL orders.
