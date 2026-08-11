@@ -174,6 +174,14 @@ func (m *SafetyMonitor) checkNakedPositions(ctx context.Context) {
 		return
 	}
 	for _, pos := range naked {
+		// Defensive: the query returns the UNCOVERED share count (net − active
+		// SL coverage). If it's ≤ 0 the position is already fully protected —
+		// never place a stop for zero/negative qty (that would over-commit or
+		// error at the broker). Belt-and-suspenders alongside the query's own
+		// `n.net > covered` guard (2026-08-11 PICCADIL over-commit fix).
+		if pos.NetQty <= 0 {
+			continue
+		}
 		// Skip users whose JWT is known-dead this cycle (avoid AU004 spam); the
 		// next cycle retries once creds refresh.
 		if authGated(m.authNotif, pos.UserID) {

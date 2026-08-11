@@ -830,6 +830,17 @@ func (r *Repository) WithPositionLock(ctx context.Context, strategyID, symbol st
 // The safety-monitor's naked scan drives PlaceInitialSL for each row every 2s
 // until an active SL exists. Never cancels/exits — liquidation-hazard-safe.
 func (r *Repository) ListNakedOpenBuyPositions(ctx context.Context) ([]PositionNeedingProtection, error) {
+	// Coverage-aware naked detection. Two aggregates per (strategy, symbol):
+	//   net       = filled BUY − filled SELL  (shares actually held)
+	//   sl_cover  = Σ qty of ACTIVE SL orders  (shares already protected)
+	// A position is naked only for (net − sl_cover) shares. Returning the FULL
+	// net here was the 2026-08-11 PICCADIL bug: a partial LIMIT fill (7) got a
+	// 7-qty SL, the MARKET top-up (17) tranche looked "naked", and the monitor
+	// placed a SECOND SL for the whole net (24) → 7+24=31 SL qty on a 24-share
+	// holding → broker rejected the over-commit, and the 15s loop re-placed it
+	// forever. The protect qty is now LEAST(this tranche's own fill, remaining
+	// uncovered gap) so total SL coverage can never exceed the holding, and a
+	// partial exit can never leave us trying to protect more than we hold.
 	rows, err := r.db.QueryContext(ctx, `
 		WITH net_qty AS (
 		    SELECT strategy_id, symbol,
@@ -838,19 +849,32 @@ func (r *Repository) ListNakedOpenBuyPositions(ctx context.Context) ([]PositionN
 		                             ELSE 0 END), 0) AS net
 		    FROM manthan_orders
 		    GROUP BY strategy_id, symbol
+		),
+		sl_cover AS (
+		    SELECT strategy_id, symbol, COALESCE(SUM(qty), 0) AS covered
+		    FROM manthan_orders
+		    WHERE order_side = 'SELL'
+		      AND order_type LIKE '%SL%'
+		      AND status IN ('PENDING','SL_PLACED','SL_DEFERRED_BAND')
+		    GROUP BY strategy_id, symbol
 		)
 		SELECT e.id, COALESCE(e.signal_id,''), e.strategy_id, e.user_id, e.symbol,
 		       COALESCE(e.isin,''), COALESCE(e.indira_symbol,''),
 		       COALESCE(e.exchange_token,''), COALESCE(e.exchange,'NSE'),
-		       n.net, COALESCE(e.avg_fill_price, 0)
+		       LEAST(COALESCE(e.filled_qty, e.qty), n.net - COALESCE(s.covered, 0)) AS protect_qty,
+		       COALESCE(e.avg_fill_price, 0)
 		FROM   manthan_orders e
 		JOIN   net_qty n ON n.strategy_id = e.strategy_id AND n.symbol = e.symbol
+		LEFT JOIN sl_cover s ON s.strategy_id = e.strategy_id AND s.symbol = e.symbol
 		WHERE  e.order_side = 'BUY'
 		  AND  e.order_type IN ('LIMIT_BUY','MARKET_BUY')
 		  AND  e.status = 'FILLED'
 		  AND  e.signal_id IS NOT NULL
 		  AND  COALESCE(e.broker_order_id,'') NOT LIKE 'PAPER-%'
 		  AND  n.net > 0
+		  -- position is UNDER-covered: uncovered shares still exist
+		  AND  n.net > COALESCE(s.covered, 0)
+		  -- ...and THIS tranche has no active SL of its own
 		  AND  NOT EXISTS (
 		        SELECT 1 FROM manthan_orders sl
 		        WHERE sl.signal_id = 'sl-' || e.signal_id
