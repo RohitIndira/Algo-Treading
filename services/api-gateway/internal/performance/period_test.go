@@ -82,3 +82,38 @@ func TestBuild_UnknownPeriodFallsBackToAll(t *testing.T) {
 		}
 	}
 }
+
+// The returns tiles (1M/3M/6M/1Y/since) are FIXED windows shown as a card row.
+// They must be identical no matter which chart period is selected. Regression:
+// slicing leaked into them, so ?period=1M returned "1M": 42.37 (the since-
+// inception value) instead of the real 1M figure.
+func TestBuild_ReturnsTilesAreIndependentOfPeriod(t *testing.T) {
+	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	var daily []DailyRow
+	var bench []BenchmarkRow
+	for i := -400; i <= 0; i++ {
+		frac := float64(400+i) / 400
+		daily = append(daily, DailyRow{Date: base.AddDate(0, 0, i), ReturnPct: 40 * frac, InvestmentAmount: 500000})
+		bench = append(bench, BenchmarkRow{Date: base.AddDate(0, 0, i), CloseValue: 100 * (1 + 0.40*frac)})
+	}
+
+	all := Build("a", "A844", "NIFTY 50", daily, bench, "All")
+	for _, p := range []string{"1M", "3M", "6M", "1Y"} {
+		got := Build("a", "A844", "NIFTY 50", daily, bench, p)
+		if got.Returns != all.Returns {
+			t.Errorf("period=%s changed the returns tiles:\n  got %+v\n  want %+v", p, got.Returns, all.Returns)
+		}
+		// Calendars must stay full-span too.
+		if len(got.DailyPnL) != len(all.DailyPnL) {
+			t.Errorf("period=%s sliced dailyPnL: %d vs %d", p, len(got.DailyPnL), len(all.DailyPnL))
+		}
+		if len(got.MonthlyPnL) != len(all.MonthlyPnL) {
+			t.Errorf("period=%s sliced monthlyPnL: %d vs %d", p, len(got.MonthlyPnL), len(all.MonthlyPnL))
+		}
+	}
+	// And the 1M tile must be a real 1M number, not the since-inception total.
+	if all.Returns.Month1.Percent >= all.Returns.SinceDeployment.Percent {
+		t.Errorf("1M tile (%v) should be well below since-inception (%v)",
+			all.Returns.Month1.Percent, all.Returns.SinceDeployment.Percent)
+	}
+}

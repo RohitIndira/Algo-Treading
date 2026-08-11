@@ -47,6 +47,7 @@ func Build(
 	// slicing the algo line client-side but reading the static benchmark
 	// number). Now BOTH series are sliced to the window and re-indexed to the
 	// same baseline, so both numbers move together with the toggle.
+	fullDaily, fullBench := daily, bench
 	fullFirst := daily[0]
 	resolvedPeriod, windowStart := resolvePeriod(period, daily[len(daily)-1].Date)
 	daily = sliceDailyFrom(daily, windowStart)
@@ -96,18 +97,25 @@ func Build(
 	// ── Returns tiles (1M / 3M / 6M / 1Y / since deployment) ─────────
 	// Each tile carries the benchmark's return over the SAME window, so the
 	// "Nifty" number differs per timeframe instead of showing one static value.
+	// NOTE: these tiles are FIXED windows (1M/3M/6M/1Y/since) shown as a row of
+	// cards — they must NOT follow the chart's period toggle. They are always
+	// computed from the FULL series. Computing them from the sliced series made
+	// every tile collapse to the window's own total (e.g. ?period=1M returned
+	// "1M": 42.37, the since-inception value) — caught 2026-08-11.
 	returns := Returns{
-		Month1:          buildReturn(daily, bench, 30, capitalBase),
-		Month3:          buildReturn(daily, bench, 90, capitalBase),
-		Month6:          buildReturn(daily, bench, 180, capitalBase),
-		Year1:           buildReturn(daily, bench, 365, capitalBase),
-		SinceDeployment: sinceDeployment(daily, bench, capitalBase),
+		Month1:          buildReturn(fullDaily, fullBench, 30, capitalBase),
+		Month3:          buildReturn(fullDaily, fullBench, 90, capitalBase),
+		Month6:          buildReturn(fullDaily, fullBench, 180, capitalBase),
+		Year1:           buildReturn(fullDaily, fullBench, 365, capitalBase),
+		SinceDeployment: sinceDeployment(fullDaily, fullBench, capitalBase),
 	}
 
 	// ── DailyPnL (heat-map calendar) ─────────────────────────────────
 	// Pass the raw daily rows through with %/₹.
-	dailyPnL := make([]DailyPoint, 0, len(daily))
-	for _, r := range daily {
+	// Calendar views stay full-span (unchanged by the period toggle) — the
+	// day/month grids have their own date navigation.
+	dailyPnL := make([]DailyPoint, 0, len(fullDaily))
+	for _, r := range fullDaily {
 		dailyPnL = append(dailyPnL, DailyPoint{
 			Date:    r.Date.Format("2006-01-02"),
 			Amount:  int64(r.PnLAmount),
@@ -116,7 +124,7 @@ func Build(
 	}
 
 	// ── MonthlyPnL — cumulative-return delta per month ──────────────
-	monthlyPnL := buildMonthlyPnL(daily, capitalBase)
+	monthlyPnL := buildMonthlyPnL(fullDaily, capitalBase)
 
 	return Response{
 		AlgoID:            algoID,
