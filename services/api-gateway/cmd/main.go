@@ -291,6 +291,15 @@ func main() {
 	// Manthan). When the catalog grows or moves to a DB, only the NewStaticCatalog
 	// call below changes; the handler + router wiring stay identical.
 	algosCatalog := algos.NewStaticCatalog()
+	// Overlay REAL computed performance onto the catalog cards (primaryReturn
+	// windows, maxDrawdown, sortino) instead of hardcoded constants. Nil-safe:
+	// if the perf store isn't wired the catalog keeps its defaults.
+	if sc, ok := algosCatalog.(*algos.StaticCatalog); ok && liveAlgosPerfStore != nil {
+		sc.SetStatsProvider(newAlgoStatsProvider(liveAlgosPerfStore, liveAlgosPerfClientMap, algoStatsTTL))
+		log.Println("Algo catalog: live performance stats enabled (algo_performance_daily)")
+	} else {
+		log.Println("Algo catalog: perf store unavailable — serving catalog default stats")
+	}
 	algosHandler := handlers.NewAlgosHandler(algosCatalog)
 
 	// Live Algos — user's deployed strategies dashboard AND the Details

@@ -38,6 +38,48 @@ type StaticCatalog struct {
 	// Storing details in a map keyed by ID (not a slice + linear scan)
 	// keeps ByID O(1) regardless of how many algos we add later.
 	detailsByID map[string]AlgoDetail
+
+	// stats, when set, supplies REAL computed performance figures
+	// (primaryReturn windows, maxDrawdown, sortino) derived from
+	// algo_performance_daily. Nil-safe: without it the catalog serves its
+	// baked-in defaults. See SetStatsProvider — added 2026-08-11 after the
+	// hardcoded "3Y Return 28.4 / 2Y Return 32.9 / maxDrawdown -12.6" values
+	// were found to be unbacked by data (only 1.49y of history existed, and
+	// the true drawdown was -5.68%).
+	stats StatsProvider
+}
+
+// LiveStats is the computed overlay applied to catalog entries at read time.
+type LiveStats struct {
+	PrimaryReturn  map[string]float64
+	MaxDrawdownPct float64
+	SortinoRatio   float64
+}
+
+// StatsProvider returns computed stats for an algo. ok=false → keep defaults.
+type StatsProvider func(ctx context.Context, algoID string) (LiveStats, bool)
+
+// SetStatsProvider installs the live-stats overlay. Call once at boot.
+func (s *StaticCatalog) SetStatsProvider(p StatsProvider) { s.stats = p }
+
+// applyStats overlays computed figures onto a copy of the base Algo. Only
+// non-empty values override, so a provider that can compute drawdown but not
+// returns (or vice-versa) degrades gracefully instead of zeroing the card.
+func (s *StaticCatalog) applyStats(ctx context.Context, a *Algo) LiveStats {
+	if s.stats == nil {
+		return LiveStats{}
+	}
+	live, ok := s.stats(ctx, a.ID)
+	if !ok {
+		return LiveStats{}
+	}
+	if len(live.PrimaryReturn) > 0 {
+		a.PrimaryReturn = live.PrimaryReturn
+	}
+	if live.MaxDrawdownPct != 0 {
+		a.MaxDrawdown = live.MaxDrawdownPct
+	}
+	return live
 }
 
 // NewStaticCatalog returns a Catalog populated with the algos we ship by
@@ -88,8 +130,10 @@ func NewStaticCatalog() Catalog {
 // almost nothing here (one algo, ~200 bytes) and makes the catalog
 // genuinely read-only from the outside.
 func (s *StaticCatalog) All(ctx context.Context) ([]Algo, error) {
-	_ = ctx
 	out := append([]Algo(nil), s.items...)
+	for i := range out {
+		s.applyStats(ctx, &out[i])
+	}
 	return out, nil
 }
 
@@ -107,10 +151,13 @@ func (s *StaticCatalog) All(ctx context.Context) ([]Algo, error) {
 // ctx is currently unused (no IO in a map lookup). Kept on the
 // signature because the Catalog interface promises it.
 func (s *StaticCatalog) ByID(ctx context.Context, id string) (*AlgoDetail, error) {
-	_ = ctx
 	detail, ok := s.detailsByID[id]
 	if !ok {
 		return nil, ErrAlgoNotFound
+	}
+	live := s.applyStats(ctx, &detail.Algo)
+	if live.SortinoRatio != 0 {
+		detail.KeyStats.Sortino = live.SortinoRatio
 	}
 	return &detail, nil
 }
