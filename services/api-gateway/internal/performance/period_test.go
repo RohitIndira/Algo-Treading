@@ -117,3 +117,39 @@ func TestBuild_ReturnsTilesAreIndependentOfPeriod(t *testing.T) {
 			all.Returns.Month1.Percent, all.Returns.SinceDeployment.Percent)
 	}
 }
+
+// Day-wise P&L cells must be that DAY's change, not the running total, and
+// must telescope to the since-inception figure. Regression 2026-08-11: the
+// August cells each read ~₹1.7-2.1 lakh (the cumulative book P&L).
+func TestBuild_DailyPnLIsPerDayNotCumulative(t *testing.T) {
+	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	// Cumulative series mirroring the real Aug rows.
+	daily := []DailyRow{
+		{Date: base.AddDate(0, 0, -10), ReturnPct: 31.87, PnLAmount: 159360, InvestmentAmount: 500000},
+		{Date: base.AddDate(0, 0, -7), ReturnPct: 34.06, PnLAmount: 170321, InvestmentAmount: 500000},
+		{Date: base.AddDate(0, 0, -6), ReturnPct: 34.88, PnLAmount: 174409, InvestmentAmount: 500000},
+		{Date: base, ReturnPct: 42.37, PnLAmount: 211846, InvestmentAmount: 500000},
+	}
+	got := Build("a", "A844", "NIFTY 50", daily, nil, "All")
+
+	wantAmt := []int64{159360, 10961, 4088, 37437} // first = from deployment, then deltas
+	var sum int64
+	for i, p := range got.DailyPnL {
+		if p.Amount != wantAmt[i] {
+			t.Errorf("day %s amount = %d, want %d", p.Date, p.Amount, wantAmt[i])
+		}
+		sum += p.Amount
+		if p.Amount > 100000 && i > 0 {
+			t.Errorf("day %s amount %d looks cumulative (lakh-scale), not a daily change", p.Date, p.Amount)
+		}
+	}
+	// Telescoping: the cells must sum to the since-inception total.
+	if sum != 211846 {
+		t.Errorf("daily cells sum to %d, want 211846 (must reconcile to since-inception)", sum)
+	}
+	// And the last day's % must be the day's move, not the running 42.37.
+	last := got.DailyPnL[len(got.DailyPnL)-1]
+	if last.Percent != round2(42.37-34.88) {
+		t.Errorf("last day percent = %v, want %v", last.Percent, round2(42.37-34.88))
+	}
+}

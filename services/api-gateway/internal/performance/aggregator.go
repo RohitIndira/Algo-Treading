@@ -114,13 +114,34 @@ func Build(
 	// Pass the raw daily rows through with %/₹.
 	// Calendar views stay full-span (unchanged by the period toggle) — the
 	// day/month grids have their own date navigation.
+	//
+	// Each cell is the CHANGE on that day, not the running total. return_pct /
+	// pnl_amount are cumulative-to-date, so passing them through made every
+	// August 2026 cell read ~₹1.7–2.1 LAKH (the whole book's P&L) instead of
+	// that day's few thousand — reported 2026-08-11. Same delta basis as
+	// buildMonthlyPnL, so the day cells sum to the month cells and the months
+	// sum to since-inception.
+	//
+	// Deliberately NOT using the sheet's own daily_mtm_amount column: it does
+	// not reconcile (its 363 values sum to ₹2,73,056 against an actual
+	// cumulative P&L of ₹2,11,846 — a ₹61,210 gap, with 7 rows disagreeing
+	// with the cumulative delta). The delta telescopes to the exact total by
+	// construction, so the calendar can never contradict the headline.
 	dailyPnL := make([]DailyPoint, 0, len(fullDaily))
+	useMoney := hasPnLAmounts(fullDaily)
+	prevAmt, prevPct := 0.0, 0.0
 	for _, r := range fullDaily {
+		pctDelta := r.ReturnPct - prevPct
+		amt := float64(capitalBase) * pctDelta / 100.0
+		if useMoney {
+			amt = r.PnLAmount - prevAmt
+		}
 		dailyPnL = append(dailyPnL, DailyPoint{
 			Date:    r.Date.Format("2006-01-02"),
-			Amount:  int64(r.PnLAmount),
-			Percent: round2(r.ReturnPct),
+			Amount:  int64(amt),
+			Percent: round2(pctDelta),
 		})
+		prevAmt, prevPct = r.PnLAmount, r.ReturnPct
 	}
 
 	// ── MonthlyPnL — cumulative-return delta per month ──────────────
@@ -283,20 +304,43 @@ func buildMonthlyPnL(daily []DailyRow, capital int64) []MonthlyPoint {
 		}
 		lastOfMonth[k] = r // daily is date-ascending → last write is the month-end row
 	}
+	useMoney := hasPnLAmounts(daily)
 	out := make([]MonthlyPoint, 0, len(order))
-	prevCum := 0.0 // cumulative return at the end of the previous month
+	prevCum := 0.0    // cumulative return % at the end of the previous month
+	prevCumAmt := 0.0 // cumulative P&L ₹ at the end of the previous month
 	for _, k := range order {
-		cum := lastOfMonth[k].ReturnPct
-		delta := cum - prevCum
-		prevCum = cum
+		row := lastOfMonth[k]
+		delta := row.ReturnPct - prevCum
+		// Amount comes from the pnl_amount delta — the SAME basis the daily
+		// cells use — so a month cell always equals the sum of its day cells.
+		// Deriving it from capital × percent instead left a small mismatch
+		// (₹13 on August 2026) that a user adding up the calendar would see.
+		deltaAmt := float64(capital) * delta / 100.0
+		if useMoney {
+			deltaAmt = row.PnLAmount - prevCumAmt
+		}
+		prevCum, prevCumAmt = row.ReturnPct, row.PnLAmount
 		out = append(out, MonthlyPoint{
 			Year:    k.y,
 			Month:   k.m,
-			Amount:  int64(float64(capital) * delta / 100.0),
+			Amount:  int64(deltaAmt),
 			Percent: round2(delta),
 		})
 	}
 	return out
+}
+
+// hasPnLAmounts reports whether the series actually carries pnl_amount values.
+// Production rows always do (363/363 for A844), and money deltas are exact
+// there. When the column is absent/zero we fall back to capital × percent so
+// the calendars still render sane numbers instead of a column of zeros.
+func hasPnLAmounts(rows []DailyRow) bool {
+	for _, r := range rows {
+		if r.PnLAmount != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // round2 rounds to 2 decimal places (money / percentages don't need more).
