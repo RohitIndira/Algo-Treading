@@ -107,6 +107,8 @@ type ListResponse struct {
 type KeyStats struct {
 	WinRatePct     float64 `json:"winRatePct"`
 	ProfitFactor   float64 `json:"profitFactor"`
+	// TotalTradesPct is a COUNT of trades (e.g. 205), not a percentage —
+	// the json name is legacy and kept for frontend compatibility.
 	TotalTradesPct float64 `json:"totalTradesPct"`
 	AvgHoldingDays float64 `json:"avgHoldingDays"`
 	Sortino        float64 `json:"sortino"`

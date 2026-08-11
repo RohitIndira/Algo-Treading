@@ -76,9 +76,12 @@ func (s *StaticCatalog) applyStats(ctx context.Context, a *Algo) LiveStats {
 	if len(live.PrimaryReturn) > 0 {
 		a.PrimaryReturn = live.PrimaryReturn
 	}
-	if live.MaxDrawdownPct != 0 {
-		a.MaxDrawdown = live.MaxDrawdownPct
-	}
+	// NOTE: MaxDrawdown and Sortino are intentionally NOT overwritten here.
+	// They are quoted from the strategy's full track record (operator-supplied),
+	// whereas ComputeAlgoStats can only see the 1.49y A844 daily series — which
+	// yields a shallower -5.68% / 4.15. Overlaying the short-window figures
+	// would replace a conservative, whole-history number with an optimistic
+	// partial one. Only primaryReturn (real, live, from the sheet) is applied.
 	return live
 }
 
@@ -155,10 +158,7 @@ func (s *StaticCatalog) ByID(ctx context.Context, id string) (*AlgoDetail, error
 	if !ok {
 		return nil, ErrAlgoNotFound
 	}
-	live := s.applyStats(ctx, &detail.Algo)
-	if live.SortinoRatio != 0 {
-		detail.KeyStats.Sortino = live.SortinoRatio
-	}
+	s.applyStats(ctx, &detail.Algo) // primaryReturn only — see applyStats
 	return &detail, nil
 }
 
@@ -192,18 +192,26 @@ func manthanDetail() AlgoDetail {
 			// Values MUST match manthan() to stay consistent
 			// between the Explore card and the detail page.
 			MinInvestment: 500_000,
-			MaxDrawdown:   -12.6,
+			MaxDrawdown:   -17, // operator-supplied track-record drawdown
 			PrimaryReturn: map[string]float64{
 				"3Y Return": 28.4,
 				"2Y Return": 32.9,
 			},
 		},
+		// Operator-supplied track-record statistics (2026-08-11). These come
+		// from the strategy's full trade history — 205 trades with an 87-day
+		// average hold — which is NOT in algo_performance_daily (that table
+		// holds daily P&L only, no trade-level rows), so they cannot be
+		// derived here. Sortino + max drawdown are quoted from the same
+		// track record and therefore also stay operator-supplied; see
+		// applyStats, which deliberately does NOT overwrite them with the
+		// figures computed off the 1.49y A844 daily series.
 		KeyStats: KeyStats{
-			WinRatePct:     62,
-			ProfitFactor:   2.38,
-			TotalTradesPct: 68,
-			AvgHoldingDays: -7.4,
-			Sortino:        1.84,
+			WinRatePct:     54.63,
+			ProfitFactor:   2.60,
+			TotalTradesPct: 205, // a COUNT despite the field name — see types.go
+			AvgHoldingDays: 87,
+			Sortino:        2.12,
 			VolatilityDays: 0, // removed from the UI — omitted via json:omitempty
 		},
 		WhatYouGet: []WhatYouGetItem{
@@ -243,7 +251,7 @@ func manthan() Algo {
 		// format ("15 Lac" / "15 Lakhs" / "₹15,00,000").
 		MinInvestment: 500_000,
 		// −12.6%. Stored as a plain number; the frontend adds the "%" suffix.
-		MaxDrawdown: -12.6,
+		MaxDrawdown: -17, // operator-supplied track-record drawdown
 		// Map keys exactly match what the frontend expects to render.
 		// Adding "5Y Return" later means one new key here, nothing else.
 		PrimaryReturn: map[string]float64{
