@@ -23,6 +23,7 @@ package performance
 type Response struct {
 	AlgoID            string         `json:"algoId"`
 	ReferenceClientID string         `json:"referenceClientId"`
+	Period            string         `json:"period"`      // resolved window: 1M/3M/6M/1Y/2Y/3Y/5Y/All
 	AsOf              string         `json:"asOf"`        // ISO date of most recent row
 	CapitalBase       int64          `json:"capitalBase"` // rupees — matches the reference client's actual investment
 	VsBenchmark       VsBenchmark    `json:"vsBenchmark"`

@@ -87,7 +87,7 @@ func (h *PerformanceHandler) GetPerformance(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	resp := performance.Build(algoID, refClientID, "NIFTY 50", daily, bench)
+	resp := performance.Build(algoID, refClientID, "NIFTY 50", daily, bench, r.URL.Query().Get("period"))
 	respondIndiraOK(w, resp)
 }
 

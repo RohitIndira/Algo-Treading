@@ -1,6 +1,7 @@
 package performance
 
 import (
+	"strings"
 	"time"
 )
 
@@ -28,6 +29,7 @@ func Build(
 	algoID, referenceClientID, benchmarkLabel string,
 	daily []DailyRow,
 	bench []BenchmarkRow,
+	period string,
 ) Response {
 	if len(daily) == 0 {
 		return Response{
@@ -35,6 +37,36 @@ func Build(
 			ReferenceClientID: referenceClientID,
 			Disclaimer:        defaultDisclaimer(),
 		}
+	}
+
+	// ── Period toggle (1M/3M/6M/1Y/3Y/5Y/All) ────────────────────────
+	// 2026-08-11: the handler used to ignore ?period= entirely, so the chart
+	// and the "Manthan vs NIFTY 50" headline were always computed over the
+	// FULL span. Toggling the timeframe changed nothing server-side, which is
+	// why NIFTY appeared frozen while Manthan seemed to move (the app was
+	// slicing the algo line client-side but reading the static benchmark
+	// number). Now BOTH series are sliced to the window and re-indexed to the
+	// same baseline, so both numbers move together with the toggle.
+	fullFirst := daily[0]
+	resolvedPeriod, windowStart := resolvePeriod(period, daily[len(daily)-1].Date)
+	daily = sliceDailyFrom(daily, windowStart)
+	bench = sliceBenchFrom(bench, windowStart)
+	if len(daily) == 0 {
+		return Response{
+			AlgoID:            algoID,
+			ReferenceClientID: referenceClientID,
+			Period:            resolvedPeriod,
+			Disclaimer:        defaultDisclaimer(),
+		}
+	}
+
+	// Baseline for the algo series. return_pct is cumulative-since-DEPLOYMENT,
+	// so for the full span the baseline is 0 (deployment), not the first row's
+	// value — that keeps "All" equal to total P&L / capital. For a trailing
+	// window the baseline is the window's opening cumulative value.
+	algoBase := 0.0
+	if !daily[0].Date.Equal(fullFirst.Date) {
+		algoBase = daily[0].ReturnPct
 	}
 
 	latest := daily[len(daily)-1]
@@ -48,12 +80,12 @@ func Build(
 	// Overlay algo + benchmark on the same date range. We index BOTH
 	// series at 100 as of the algo's first date so the "vs benchmark"
 	// visual comparison starts from the same baseline.
-	chartPoints := buildChartPoints(daily, bench)
+	chartPoints := buildChartPoints(daily, bench, algoBase)
 
 	// ── VsBenchmark headline (latest day) ─────────────────────────────
 	// The +8.26% vs +1.37% row above the chart. Uses the last available
 	// value for each series over the algo's date span.
-	algoLatestPct := latest.ReturnPct
+	algoLatestPct := latest.ReturnPct - algoBase
 	benchmarkLatestPct := latestBenchmarkPct(chartPoints)
 
 	vsBenchmark := VsBenchmark{
@@ -89,6 +121,7 @@ func Build(
 	return Response{
 		AlgoID:            algoID,
 		ReferenceClientID: referenceClientID,
+		Period:            resolvedPeriod,
 		AsOf:              latest.Date.Format("2006-01-02"),
 		CapitalBase:       capitalBase,
 		VsBenchmark:       vsBenchmark,
@@ -103,7 +136,7 @@ func Build(
 // buildChartPoints creates one ChartPoint per algo date, overlaying the
 // nearest benchmark close from `bench`. Both series are indexed at 100
 // at the algo's first date — the natural "since deployment" baseline.
-func buildChartPoints(daily []DailyRow, bench []BenchmarkRow) []ChartPoint {
+func buildChartPoints(daily []DailyRow, bench []BenchmarkRow, algoBase float64) []ChartPoint {
 	if len(daily) == 0 {
 		return nil
 	}
@@ -129,7 +162,7 @@ func buildChartPoints(daily []DailyRow, bench []BenchmarkRow) []ChartPoint {
 			Date: d.Date.Format("2006-01-02"),
 		}
 		// Algo: 100 + return_pct — the "growth from ₹100 base" curve.
-		algoIdx := round2(100 + d.ReturnPct)
+		algoIdx := round2(100 + (d.ReturnPct - algoBase))
 		p.AlgoPct = &algoIdx
 
 		// Benchmark: index against the first close on/after algo start.
@@ -273,3 +306,51 @@ func defaultDisclaimer() string {
 
 // helper for future-proofing — currently unused
 var _ = time.Duration(0)
+
+// periodDays maps the API's ?period= toggle to a trailing window length.
+// "All" (and anything unrecognised) means the full available history.
+var periodDays = map[string]int{
+	"1M": 30, "3M": 90, "6M": 180,
+	"1Y": 365, "2Y": 730, "3Y": 3 * 365, "5Y": 5 * 365,
+}
+
+// resolvePeriod normalises the requested period and returns the window start.
+// A zero start time means "no slicing" (full history).
+func resolvePeriod(period string, last time.Time) (string, time.Time) {
+	p := strings.ToUpper(strings.TrimSpace(period))
+	if p == "" || p == "ALL" {
+		return "All", time.Time{}
+	}
+	days, ok := periodDays[p]
+	if !ok {
+		return "All", time.Time{} // unknown value → safest is the full series
+	}
+	return p, last.AddDate(0, 0, -days)
+}
+
+// sliceDailyFrom returns the rows on/after `start` (all rows when start is zero).
+// Input is assumed date-ascending, as returned by the store.
+func sliceDailyFrom(rows []DailyRow, start time.Time) []DailyRow {
+	if start.IsZero() {
+		return rows
+	}
+	for i, r := range rows {
+		if !r.Date.Before(start) {
+			return rows[i:]
+		}
+	}
+	return nil
+}
+
+// sliceBenchFrom is sliceDailyFrom for the benchmark series.
+func sliceBenchFrom(rows []BenchmarkRow, start time.Time) []BenchmarkRow {
+	if start.IsZero() {
+		return rows
+	}
+	for i, r := range rows {
+		if !r.Date.Before(start) {
+			return rows[i:]
+		}
+	}
+	return nil
+}
