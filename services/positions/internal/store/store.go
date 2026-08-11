@@ -231,6 +231,64 @@ func (s *Store) InsertEntryWithEvent(ctx context.Context, pos *Position, ev *Pos
 	})
 }
 
+// MergeTopupWithEvent merges a MARKET top-up fill into an existing partial-fill
+// parent lot: quantity += addQty, entry_price becomes the VWAP, invested_amount
+// is recomputed. Used when a LIMIT entry partially fills and the remainder is
+// topped up with a separate MARKET order (different broker_order_id, SAME
+// signal) — so positions_db shows ONE lot at the true combined qty, not a
+// stale partial (2026-08-11 PICCADIL: positions_db held 7 while the broker
+// held 24).
+//
+// Idempotency is by (position_id, topup broker_order_id): the same top-up fill
+// can arrive twice (WSS + REST reconciler) with DIFFERENT source_event_ids, so
+// dedup on source_event_id alone would double-count the qty. We check for an
+// existing TOPUP_MERGED audit row for this broker order first and no-op if
+// present. Returns true when the merge was applied (false = idempotent replay).
+func (s *Store) MergeTopupWithEvent(ctx context.Context, positionID uuid.UUID, addQty int, fillPrice float64, topupBrokerOrderID string, ev *PositionEvent) (bool, error) {
+	merged := false
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		var already bool
+		if err := tx.QueryRowContext(ctx, `
+			SELECT EXISTS (
+			  SELECT 1 FROM position_events
+			  WHERE position_id = $1 AND broker_order_id = $2 AND event_type = $3)`,
+			positionID, topupBrokerOrderID, EventTypeTopupMerged).Scan(&already); err != nil {
+			return fmt.Errorf("topup merge idempotency check: %w", err)
+		}
+		if already {
+			return nil // this top-up broker order was already merged — replay
+		}
+
+		// VWAP merge. All RHS reference the pre-update row values, so
+		// entry_price/invested use the OLD quantity — correct for a weighted avg.
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET quantity        = quantity + $2,
+			    entry_price     = (quantity * entry_price + $2 * $3::numeric) / (quantity + $2),
+			    invested_amount = quantity * entry_price + $2 * $3::numeric,
+			    updated_at      = NOW()
+			WHERE position_id = $1 AND status = 'ACTIVE'`,
+			positionID, addQty, fillPrice)
+		if err != nil {
+			return fmt.Errorf("topup merge update: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			// Parent not ACTIVE (already exited/raced) — record the audit as an
+			// observation but do not resurrect the lot.
+			s.logger.Warn("topup merge: parent position not ACTIVE — audit only",
+				zap.String("position_id", positionID.String()),
+				zap.String("topup_broker_order_id", topupBrokerOrderID))
+		}
+		ev.PositionID = positionID
+		if err := insertEventTx(ctx, tx, ev); err != nil {
+			return fmt.Errorf("topup merge audit: %w", err)
+		}
+		merged = true
+		return nil
+	})
+	return merged, err
+}
+
 // UpdateExitWithEvent atomically marks a lot EXITED (full close) + audits.
 // Used on Manthan-driven SELL fills where a specific position row is the
 // target and it fully closes.

@@ -310,6 +310,40 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		EntryBrokerOrderID: ev.BrokerOrderID,
 	}
 
+	// Top-up merge: a MANTHAN entry that partially filled on a LIMIT and was
+	// completed with a separate MARKET order produces a SECOND fill on a
+	// different broker_order_id but the SAME signal. If a lot already exists
+	// for this signal, merge this fill into it (VWAP) rather than opening a
+	// second row — positions_db must show ONE lot at the true combined qty
+	// (2026-08-11 PICCADIL: held 7 in positions_db while the broker had 24).
+	if meta.Found && meta.SignalID != "" {
+		if existing, ferr := h.store.FindManthanLotBySignalID(ctx, meta.SignalID); ferr == nil &&
+			existing != nil && existing.EntryBrokerOrderID != ev.BrokerOrderID {
+			mergeEvent := &store.PositionEvent{
+				EventType:      store.EventTypeTopupMerged,
+				BrokerOrderID:  ev.BrokerOrderID,
+				SignalID:       meta.SignalID,
+				DeltaQty:       qty,
+				FillPrice:      entryPrice,
+				RawSourceEvent: ev.RawMessage,
+				SourceEventID:  ev.EventID,
+			}
+			merged, mErr := h.store.MergeTopupWithEvent(ctx, existing.PositionID, qty, entryPrice, ev.BrokerOrderID, mergeEvent)
+			if mErr != nil {
+				return fmt.Errorf("BUY top-up merge: %w", mErr)
+			}
+			h.logger.Info("state-machine: BUY top-up merged into existing lot",
+				zap.String("position_id", existing.PositionID.String()),
+				zap.String("symbol", existing.Symbol),
+				zap.String("signal_id", meta.SignalID),
+				zap.Int("add_qty", qty),
+				zap.Float64("fill_price", entryPrice),
+				zap.String("topup_broker_order_id", ev.BrokerOrderID),
+				zap.Bool("applied", merged))
+			return nil
+		}
+	}
+
 	eventType := store.EventTypeUserManualEntry
 	if meta.Found {
 		pos.Origin = store.OriginManthan
