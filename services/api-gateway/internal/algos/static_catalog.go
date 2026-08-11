@@ -137,10 +137,10 @@ func manthanDetail() AlgoDetail {
 			Type:  "Equity",
 			Style: "Positional",
 			Logo:  "https://stockk-assets.s3.ap-south-1.amazonaws.com/algos/manthan.png",
-			// Longer version of the description for the About Algo
-			// section on the detail page. The list card uses the
-			// shorter version from manthan() above.
-			Description: "Manthan screens the Nifty 500 every Monday using a weighted blend of momentum, quality, low-volatility and value signals. It builds a concentrated book of 10-15 stocks and rebalances when factor scores decay or stop-loss bands are breached.",
+			// About Algo copy shown on the detail page. Kept identical to
+			// the manthan() list-card description so Explore and Detail
+			// never disagree about what the strategy does.
+			Description: "The Manthan strategy involves an integrated techno-funda approach for stock analysis. In the realm of technical analysis, the emphasis is on identifying stocks that exhibit superior relative strength compared to both the index and peers.",
 			Badge:       "Most Subscribed",
 			// Values MUST match manthan() to stay consistent
 			// between the Explore card and the detail page.
@@ -189,7 +189,7 @@ func manthan() Algo {
 		Type:        "Equity",
 		Style:       "Positional",
 		Logo:        "https://stockk-assets.s3.ap-south-1.amazonaws.com/algos/manthan.png",
-		Description: "Manthan screens the Nifty 500 every Monday using a weighted blend of momentum, quality, low-volatility and value signals.",
+		Description: "The Manthan strategy involves an integrated techno-funda approach for stock analysis. In the realm of technical analysis, the emphasis is on identifying stocks that exhibit superior relative strength compared to both the index and peers.",
 		Badge:       "Most subscribed",
 		// 15,00,000 rupees = ₹15 Lakhs. We send raw rupees as an int64
 		// so the API stays stable when the frontend changes its display
