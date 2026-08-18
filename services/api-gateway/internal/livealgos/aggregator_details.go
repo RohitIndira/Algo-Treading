@@ -388,7 +388,7 @@ func buildTradesList(exited []PositionRow) []TradeRow {
 
 // allocationBy groups active positions by a string key (extractor
 // closure — usually industry or mcap_bucket), sums invested_amt per
-// bucket, and returns the top-N buckets by %.
+// bucket, and returns every bucket (no truncation) by %.
 func allocationBy(active []PositionRow, extract func(PositionRow) string) []AllocationEntry {
 	type bucket struct {
 		Label    string
