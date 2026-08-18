@@ -28,6 +28,9 @@ import (
 //   BROKER_REJECT  exp      — 1 s, 2 s, 4 s … capped at 5 min, max 50.
 //   TRANSIENT      exp      — same as BROKER_REJECT.
 //   POISON         DLQ      — never retry; operator pages.
+//   UPPER_CIRCUIT  retry    — flat 3min, attempts NOT counted; entry is
+//                             placeable the moment the band releases. Ends
+//                             via the 15:20 market-close pre-check (POISON).
 type InboxWorker struct {
 	repo      *Repository
 	entry     *EntryHandler
@@ -220,6 +223,17 @@ func (w *InboxWorker) processRow(ctx context.Context, row *InboxRow) {
 	// Pre-flight gate: if the user is mid-AU004 window, fail fast with
 	// AUTH_EXPIRED so we don't waste a broker call we know will return AU0xx.
 	if authGated(w.authNotif, row.UserID) {
+		// A row that was HOLDING for upper-circuit relief keeps its hold
+		// class through an auth outage: re-marking it AUTH_EXPIRED would
+		// burn an attempt every 30s (review finding: a >25-min AU004 spell
+		// would DLQ the hold mid-session). Keeping UPPER_CIRCUIT preserves
+		// the no-burn policy and the 3-min cadence; the on-login wake plus
+		// that cadence resumes the hold within ~3 min of re-login.
+		if row.LastErrorClass == InboxErrUpperCircuit {
+			w.markFailed(ctx, row, InboxErrUpperCircuit,
+				"auth gate while at upper-circuit hold — session expired")
+			return
+		}
 		w.markFailed(ctx, row, InboxErrAuthExpired,
 			"auth gate set — broker session expired")
 		return
@@ -329,6 +343,15 @@ func (w *InboxWorker) dispatch(ctx context.Context, row *InboxRow) error {
 
 func (w *InboxWorker) markFailed(ctx context.Context, row *InboxRow, class, msg string) {
 	attempts := row.Attempts + 1
+	// UPPER_CIRCUIT holds do not burn attempts: a stock can sit at its band
+	// for hours, and 50 x 3min would DLQ a perfectly good signal mid-session.
+	// The hold is bounded by the market-hours pre-check instead — after
+	// 15:20 IST the same row fails "too close to market close" (POISON) and
+	// dead-letters cleanly at end of session. The computed value is passed
+	// to MarkInboxFailed verbatim (the SQL no longer increments on its own).
+	if class == InboxErrUpperCircuit {
+		attempts = row.Attempts
+	}
 	if attempts >= w.maxAttempts {
 		w.markDLQ(ctx, row, class,
 			fmt.Sprintf("attempts %d >= max %d: %s", attempts, w.maxAttempts, msg))
@@ -336,7 +359,7 @@ func (w *InboxWorker) markFailed(ctx context.Context, row *InboxRow, class, msg 
 	}
 	delay := backoffFor(class, attempts)
 	next := time.Now().Add(delay)
-	if err := w.repo.MarkInboxFailed(ctx, row.ID, class, msg, next); err != nil {
+	if err := w.repo.MarkInboxFailed(ctx, row.ID, class, msg, next, attempts); err != nil {
 		w.logger.Warn("Inbox mark FAILED failed (will be reaped)",
 			zap.Int64("id", row.ID), zap.Error(err))
 		return
@@ -373,6 +396,13 @@ func classifyHandlerErr(err error) string {
 	if errors.Is(err, indiraClient.ErrAuthExpired) {
 		return InboxErrAuthExpired
 	}
+	// Upper-circuit holds are checked BEFORE the generic "pre-check:" POISON
+	// rule — the reason text ("stock at upper circuit — skip entry") is a
+	// pre-check reason, but unlike the others it self-resolves the moment
+	// the band releases, so it must retry, not DLQ.
+	if errors.Is(err, ErrUpperCircuitHold) {
+		return InboxErrUpperCircuit
+	}
 	var pe poisonError
 	if errors.As(err, &pe) {
 		return InboxErrPoison
@@ -408,6 +438,14 @@ func classifyHandlerErr(err error) string {
 func backoffFor(class string, attempts int) time.Duration {
 	if class == InboxErrAuthExpired {
 		return 30 * time.Second
+	}
+	// Upper-circuit holds: flat 3-minute cadence. Exponential backoff is
+	// wrong here — the band can release at any moment and we want to catch
+	// it promptly for the whole session, not probe frantically for the
+	// first minute and then nap. Each re-check reads FRESH LTP/DPR from
+	// the market feed (CheckCircuit does a live Redis GET per call).
+	if class == InboxErrUpperCircuit {
+		return 3 * time.Minute
 	}
 	const cap = 5 * time.Minute
 	exp := attempts

@@ -15,6 +15,13 @@ import (
 	"go.uber.org/zap"
 )
 
+// ErrUpperCircuitHold marks an entry that is blocked ONLY because the stock is
+// at its upper price band. The inbox classifier maps it to the UPPER_CIRCUIT
+// retry class (flat re-check cadence, no attempt burn) instead of POISON/DLQ.
+// The message deliberately never contains the "pre-check:"/"rejected"/"DPR"
+// classifier tokens.
+var ErrUpperCircuitHold = errors.New("upper-circuit hold")
+
 // EntryHandler manages LIMIT BUY order placement with WSS-based fill detection.
 //
 // LIVE mode flow:
@@ -177,6 +184,21 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 	// 3. Pre-checks
 	check := h.preCheck.CheckEntry(ctx, signal, info)
 	if !check.CanProceed {
+		// UPPER-CIRCUIT HOLD (2026-08-18): a stock pinned at its upper band
+		// has no sellers — the entry cannot fill NOW but becomes placeable
+		// the moment the band releases. That is a wait state, not a
+		// rejection: do NOT publish EntryRejected (one hold can re-check
+		// dozens of times — each publish would spam the user's feed), and
+		// return the typed sentinel so the inbox classifier parks the row
+		// in the UPPER_CIRCUIT retry class instead of DLQ-ing it as POISON.
+		// Lower circuit never blocks entries (see PreChecker.CheckEntry) —
+		// this branch is upper-band only by construction.
+		if strings.Contains(check.Reason, ReasonUpperCircuit) {
+			h.logger.Info("Entry on hold — stock at upper circuit, will retry until relieved",
+				zap.String("symbol", signal.Symbol),
+				zap.String("user", signal.UserID))
+			return 0, fmt.Errorf("%w: %s", ErrUpperCircuitHold, check.Reason)
+		}
 		h.logger.Info("Entry pre-check failed",
 			zap.String("symbol", signal.Symbol),
 			zap.String("reason", check.Reason))
@@ -197,6 +219,38 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 
 	// 4. Calculate entry price = LTP + 2 ticks
 	entryPrice := ltp + (info.TickSize * 2)
+
+	// 4b. Late-entry sizing clamp. qty was sized by the allocator at
+	// signal time (allocation ÷ sheet/live price THEN). If we execute much
+	// later at a higher price — the designed common case for an
+	// upper-circuit hold, which by definition fills near band-release
+	// price — buying the ORIGINAL qty can over-deploy up to the full band
+	// width past the allocation the caps were checked against (review
+	// finding, 2026-08-18). Clamp qty so invested never exceeds the
+	// signal's budget at the actual entry price.
+	if signal.InvestedAmt > 0 && entryPrice > 0 {
+		if maxQty := int(signal.InvestedAmt / entryPrice); maxQty < int(signal.Quantity) {
+			if maxQty <= 0 {
+				h.logger.Warn("Entry skipped — price moved above the entire sizing budget",
+					zap.String("symbol", signal.Symbol),
+					zap.Float64("budget", signal.InvestedAmt),
+					zap.Float64("entry_price", entryPrice))
+				if h.eventPub != nil {
+					h.eventPub.PublishEntryRejected(ctx, signal, "",
+						"sizing: price moved above allocation budget", "TRADE_EXEC")
+				}
+				return 0, poisonErr("sizing: price %.2f exceeds entire budget %.2f for %s",
+					entryPrice, signal.InvestedAmt, signal.Symbol)
+			}
+			h.logger.Info("Late-entry sizing clamp applied",
+				zap.String("symbol", signal.Symbol),
+				zap.Int32("signal_qty", signal.Quantity),
+				zap.Int("clamped_qty", maxQty),
+				zap.Float64("budget", signal.InvestedAmt),
+				zap.Float64("entry_price", entryPrice))
+			signal.Quantity = int32(maxQty)
+		}
+	}
 
 	// 5. Override qty if test mode (MANTHAN_TEST_QTY env var)
 	qty := int(signal.Quantity)

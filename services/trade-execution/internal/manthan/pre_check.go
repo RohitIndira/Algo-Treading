@@ -51,7 +51,7 @@ func (p *PreChecker) CheckEntry(ctx context.Context, signal ManthanSignal, info 
 	if err != nil {
 		p.logger.Warn("Circuit check failed — proceeding", zap.Error(err))
 	} else if atUpper {
-		return fail("stock at upper circuit — skip entry")
+		return fail(ReasonUpperCircuit)
 	}
 
 	// 4. Paper mode — skip margin check
@@ -119,6 +119,12 @@ func (p *PreChecker) CheckSLModify(ctx context.Context, signal SLModifySignal, i
 
 	return pass()
 }
+
+// ReasonUpperCircuit is the pre-check reason for an entry blocked ONLY by the
+// upper price band. entry_handler matches on THIS constant to route the block
+// into the UPPER_CIRCUIT retry class instead of POISON/DLQ — a reworded
+// literal here would silently revert to the DLQ behavior, so keep them tied.
+const ReasonUpperCircuit = "stock at upper circuit — skip entry"
 
 // checkMarketHours validates we're within trading hours.
 // Entry orders rejected before 9:15 and after 15:20 (last 10 min buffer).

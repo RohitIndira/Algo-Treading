@@ -25,6 +25,15 @@ const (
 	InboxErrBrokerReject = "BROKER_REJECT"
 	InboxErrPoison       = "POISON"
 	InboxErrTransient    = "TRANSIENT"
+	// UPPER_CIRCUIT — entry blocked only because the stock is pinned at its
+	// upper price band. Not a failure: no sellers exist at the band, so the
+	// order CANNOT fill right now but becomes placeable the moment the price
+	// comes off the band. The worker re-checks on a flat cadence with fresh
+	// LTP/DPR and does NOT burn attempts while holding; the 15:20 IST
+	// market-close pre-check is the natural terminator (→ POISON → DLQ at
+	// end of session). 2026-08-18: MODISONLTD spent the morning at UC and
+	// the old "pre-check:"→POISON rule DLQ'd it with zero retries.
+	InboxErrUpperCircuit = "UPPER_CIRCUIT"
 )
 
 // InboxRow mirrors a row of signal_inbox. Payload is kept as []byte so
@@ -133,19 +142,25 @@ func (r *Repository) MarkInboxDone(ctx context.Context, id int64) error {
 	return err
 }
 
-// MarkInboxFailed bumps attempts, records the failure, and schedules the
-// next attempt. The worker picks the backoff per err class.
+// MarkInboxFailed records the failure, stores the WORKER-COMPUTED attempts
+// value, and schedules the next attempt. The attempts count is passed in
+// explicitly — NOT incremented in SQL — because the worker owns the policy:
+// UPPER_CIRCUIT holds (and auth gates on a holding row) deliberately do not
+// burn attempts. The previous `attempts=attempts+1` here silently overrode
+// that policy (2026-08-18 review blocker: a stock pinned at its band all
+// morning would have DLQ'd after ~2.5h despite the worker "not counting"
+// the holds — the DB counted them anyway).
 func (r *Repository) MarkInboxFailed(
-	ctx context.Context, id int64, errClass, errMsg string, nextAttempt time.Time,
+	ctx context.Context, id int64, errClass, errMsg string, nextAttempt time.Time, attempts int,
 ) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE signal_inbox
          SET status='FAILED',
-             attempts=attempts+1,
+             attempts=$5,
              last_error=$2,
              last_error_class=$3,
              next_attempt_at=$4
-         WHERE id=$1`, id, errMsg, errClass, nextAttempt)
+         WHERE id=$1`, id, errMsg, errClass, nextAttempt, attempts)
 	return err
 }
 

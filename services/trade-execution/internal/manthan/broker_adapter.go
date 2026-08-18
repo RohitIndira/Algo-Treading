@@ -768,7 +768,21 @@ func (b *BrokerAdapter) CheckCircuit(ctx context.Context, token string) (atUpper
 	if err := json.Unmarshal([]byte(raw), &mkt); err != nil {
 		return false, false, err
 	}
-	return mkt.LTP >= mkt.DPRUpper, mkt.LTP <= mkt.DPRLower, nil
+	return evalCircuit(mkt.LTP, mkt.DPRUpper, mkt.DPRLower)
+}
+
+// evalCircuit decides band state from a market snapshot. Pure — unit-tested.
+// Zero-guards matter: a feed row with a missing dpr_upper (0) and any LTP>0
+// previously reported a SPURIOUS upper circuit (LTP >= 0 is always true),
+// which under the UPPER_CIRCUIT retry class would hold an entry all session
+// on garbage data. Missing LTP (0) likewise must never report lower circuit.
+func evalCircuit(ltp, dprUpper, dprLower float64) (atUpper, atLower bool, err error) {
+	if ltp <= 0 {
+		return false, false, fmt.Errorf("circuit eval: no usable LTP in feed (ltp=%v)", ltp)
+	}
+	atUpper = dprUpper > 0 && ltp >= dprUpper
+	atLower = dprLower > 0 && ltp <= dprLower
+	return atUpper, atLower, nil
 }
 
 // --- Helpers ---

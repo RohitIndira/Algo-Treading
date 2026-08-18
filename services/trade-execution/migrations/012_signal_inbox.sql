@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS signal_inbox (
     --   BROKER_REJECT  → exp backoff, capped 5 min
     --   POISON         → DLQ immediately (parse failure, no signal_id)
     --   TRANSIENT      → exp backoff
-    last_error_class TEXT,
+    last_error_class TEXT,  -- AUTH_EXPIRED | BROKER_REJECT | POISON | TRANSIENT | UPPER_CIRCUIT (hold: attempts not counted)
     next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at       TIMESTAMPTZ,
