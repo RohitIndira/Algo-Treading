@@ -37,11 +37,16 @@ type CapCheck struct {
 
 // NewCapCheck creates a fresh cap checker for a user's portfolio.
 func NewCapCheck(maxPositions int32, existing map[string]*Position) *CapCheck {
+	// Caps are HARD ceilings on the COMPLETE book (max_positions slots):
+	// sector ≤ 25%, mcap bucket ≤ 50% — so the per-sector/bucket limits are
+	// the FLOOR of the percentage. The previous ceiling math (+0.9999)
+	// allowed 7/25 sector positions (28%) and 13/25 bucket positions (52%),
+	// silently breaching the stated ≤25%/≤50% rule (corrected 2026-08-18).
 	c := &CapCheck{
 		SectorCount:  make(map[string]int),
 		BucketCount:  make(map[string]int),
-		MaxPerSector: int(float64(maxPositions)*0.25 + 0.9999),
-		MaxPerBucket: int(float64(maxPositions)*0.50 + 0.9999),
+		MaxPerSector: int(float64(maxPositions) * 0.25),
+		MaxPerBucket: int(float64(maxPositions) * 0.50),
 	}
 	if c.MaxPerSector < 1 {
 		c.MaxPerSector = 1

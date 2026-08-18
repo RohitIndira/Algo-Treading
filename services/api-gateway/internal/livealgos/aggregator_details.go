@@ -104,8 +104,8 @@ func BuildDetails(
 		Chart:           DetailsChart{Points: []DetailsChartPoint{}}, // filled by nav.go later
 		Metrics:         computeMetrics(exited, deployed),
 		TopHoldings:     topHoldings,
-		AllocationSector:  allocationBy(active, func(p PositionRow) string { return nullStr(p.Industry) }),
-		AllocationMCap:    allocationBy(active, func(p PositionRow) string { return nullStr(p.MCapBucket) }),
+		AllocationSector:  allocationBy(active, float64(deployed), func(p PositionRow) string { return nullStr(p.Industry) }),
+		AllocationMCap:    allocationBy(active, float64(deployed), func(p PositionRow) string { return nullStr(p.MCapBucket) }),
 		TopPastTrades:     trades,
 	}
 }
@@ -389,13 +389,13 @@ func buildTradesList(exited []PositionRow) []TradeRow {
 // allocationBy groups active positions by a string key (extractor
 // closure — usually industry or mcap_bucket), sums invested_amt per
 // bucket, and returns every bucket (no truncation) by %.
-func allocationBy(active []PositionRow, extract func(PositionRow) string) []AllocationEntry {
+func allocationBy(active []PositionRow, totalCapital float64, extract func(PositionRow) string) []AllocationEntry {
 	type bucket struct {
 		Label    string
 		Invested float64
 	}
 	byLabel := make(map[string]*bucket)
-	var total float64
+	var invested float64
 	for _, p := range active {
 		lbl := extract(p)
 		if lbl == "" {
@@ -407,18 +407,35 @@ func allocationBy(active []PositionRow, extract func(PositionRow) string) []Allo
 			byLabel[lbl] = b
 		}
 		b.Invested += p.InvestedAmt
-		total += p.InvestedAmt
+		invested += p.InvestedAmt
 	}
-	out := make([]AllocationEntry, 0, len(byLabel))
+
+	// Denominator = the strategy's TOTAL capital (the complete max_positions
+	// book), NOT the currently-invested sum. The Manthan caps are defined on
+	// the complete book — sector ≤25%, mcap bucket ≤50% of max_positions —
+	// so with 14 of 25 slots filled, dividing by invested showed a sector at
+	// 35.88% and users read it as a cap breach; on the full-capital basis the
+	// same sector is 19.4% and correctly inside the rule (2026-08-18).
+	// Fallback to invested when capital is unknown (0) so old rows render.
+	denom := totalCapital
+	if denom <= 0 {
+		denom = invested
+	}
+	out := make([]AllocationEntry, 0, len(byLabel)+1)
 	for _, b := range byLabel {
 		var pct float64
-		if total > 0 {
-			pct = (b.Invested / total) * 100
+		if denom > 0 {
+			pct = (b.Invested / denom) * 100
 		}
 		out = append(out, AllocationEntry{Label: b.Label, Pct: round2(pct)})
 	}
 	// Largest bucket first
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Pct > out[j].Pct })
+	// Undeployed remainder LAST, so the pie still sums to 100 and the user
+	// sees how much of the book is actually deployed.
+	if denom > invested {
+		out = append(out, AllocationEntry{Label: "Unallocated", Pct: round2((denom - invested) / denom * 100)})
+	}
 	return out
 }
 
