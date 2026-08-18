@@ -111,14 +111,18 @@ module.exports = {
         REDIS_LOCAL_ADDR: 'localhost:6389',               // ws pub/sub redis (algo-dev)
         PORTFOLIO_GRPC_ADDR: 'localhost:9008',            // portfolio svc gRPC (NOT 9005 = rules-engine)
     }},
-    // manthan-live is a BATCH job (reads sheet → publishes signals → exits), not
-    // a daemon. Don't keep-alive it; run it once daily pre-open via cron_restart.
-    // cron is in BOX TIME = UTC. '30 3' = 09:00 IST — signals must exist
-    // BEFORE market open; the earlier '0 9' (=14:30 IST!) left every morning
-    // strategy-creation staring at an empty signal day (2026-08-07 incident).
+    // manthan-live now runs as a WATCH DAEMON (2026-08-18): after the initial
+    // run it fingerprints the BuySignal tab every MANTHAN_WATCH_INTERVAL secs
+    // (Mon–Fri 08:45–15:25 IST) and re-runs the pipeline automatically when
+    // the operator edits the sheet — no manual re-runs. Publisher idempotency
+    // means only NEW symbols publish; rules-engine fans them to every active
+    // strategy. cron_restart (BOX TIME = UTC; '30 3' = 09:00 IST) restarts the
+    // daemon daily pre-open — the restart's initial run IS the morning load,
+    // and doubles as a watchdog if the loop ever wedges.
     { name: 'data-ingestion', script: './bin/data-ingestion', ...common,
-      autorestart: false, cron_restart: '30 3 * * 1-5', env: {
+      autorestart: true, cron_restart: '30 3 * * 1-5', env: {
         ...BASE,
+        MANTHAN_WATCH: '1', MANTHAN_WATCH_INTERVAL: '120',
         MANTHAN_SHEET_ID: '1E_MzQNQFNvnmR8wMZMCyzPKc-SjOei4wwQp4QAey5sc',
         MANTHAN_CREDS: '/home/ubuntu/Algo-Treading/services/data-ingestion/credentials/manthan-sheet.json',
         // manthan-live writes signals via MARKET_DATA_DB_* (default port 5432 =

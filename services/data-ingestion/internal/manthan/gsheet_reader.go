@@ -1,6 +1,9 @@
 package manthan
 
 import (
+	"encoding/json"
+	"encoding/hex"
+	"crypto/sha256"
 	"context"
 	"fmt"
 	"strings"
@@ -222,4 +225,24 @@ func interfaceGridToStrings(grid [][]interface{}) [][]string {
 		out = append(out, r)
 	}
 	return out
+}
+
+
+// FingerprintTab returns a SHA-256 over the raw values of one tab — the
+// change-detection primitive for manthan-live's watch mode. One Values.Get
+// per call; requires only the Sheets-readonly scope (no Drive metadata).
+func (r *GSheetReader) FingerprintTab(ctx context.Context, tab string) (string, error) {
+	if r.svc == nil {
+		return "", fmt.Errorf("sheets service not connected")
+	}
+	resp, err := r.svc.Spreadsheets.Values.Get(r.sheetID, tab+"!A:AZ").Context(ctx).Do()
+	if err != nil {
+		return "", fmt.Errorf("fingerprint %s: %w", tab, err)
+	}
+	raw, err := json.Marshal(resp.Values)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
 }

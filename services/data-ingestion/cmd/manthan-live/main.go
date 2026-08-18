@@ -6,6 +6,20 @@
 //   export MANTHAN_CREDS=...     (default: local service-account JSON)
 //   export KAFKA_BROKERS=localhost:9092  (optional; skip Kafka if unset)
 //   go run ./services/data-ingestion/cmd/manthan-live/
+//
+// WATCH MODE (event-driven ingestion, 2026-08-18):
+//   MANTHAN_WATCH=1            → after the initial run, stay alive and poll a
+//                                fingerprint of the BuySignal tab; when the
+//                                operator edits the sheet, the pipeline re-runs
+//                                AUTOMATICALLY within one poll interval. The
+//                                publisher's per-day idempotency guarantees
+//                                only NEW symbols reach Kafka, and rules-engine
+//                                fans every new signal out to ALL active
+//                                strategies — no manual re-run needed.
+//   MANTHAN_WATCH_INTERVAL=120 → poll seconds (default 120)
+//   Watch polls only Mon–Fri 08:45–15:25 IST (outside the window edits wait
+//   for the window; the daily 09:00 IST pm2 cron_restart still guarantees the
+//   fresh-morning load).
 package main
 
 import (
@@ -38,6 +52,19 @@ func main() {
 	logger, _ := zap.NewDevelopment()
 	defer logger.Sync()
 
+	if os.Getenv("MANTHAN_WATCH") == "1" {
+		watchLoop(logger)
+		return
+	}
+	if err := runPipelineOnce(logger); err != nil {
+		logger.Fatal("pipeline run failed", zap.Error(err))
+	}
+}
+
+// runPipelineOnce executes one full sheet→pipeline→DB/Kafka/EMA cycle.
+// Errors are returned (not Fatal'd) so watch mode survives a bad cycle —
+// a transient Sheets/DB error just waits for the next trigger.
+func runPipelineOnce(logger *zap.Logger) error {
 	sheetID := os.Getenv("MANTHAN_SHEET_ID")
 	if sheetID == "" {
 		sheetID = defaultSheetID
@@ -53,11 +80,11 @@ func main() {
 	// --- Sheets ---
 	reader := manthan.NewGSheetReader(sheetID, creds, logger)
 	if err := reader.Connect(ctx); err != nil {
-		logger.Fatal("Sheets connect failed", zap.Error(err))
+		return fmt.Errorf("sheets connect: %w", err)
 	}
 	raw, err := reader.ReadAll(ctx)
 	if err != nil {
-		logger.Fatal("Sheets read failed", zap.Error(err))
+		return fmt.Errorf("sheets read: %w", err)
 	}
 
 	pipeline := manthan.NewPipeline(logger)
@@ -69,11 +96,11 @@ func main() {
 		cfg.PGHost, cfg.PGPort, cfg.PGUser, cfg.PGPassword, cfg.PGDatabase, cfg.PGSSLMode)
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		logger.Fatal("DB open failed", zap.Error(err))
+		return fmt.Errorf("db open: %w", err)
 	}
 	defer db.Close()
 	if err := db.Ping(); err != nil {
-		logger.Fatal("DB ping failed", zap.Error(err))
+		return fmt.Errorf("db ping: %w", err)
 	}
 
 	var brokers []string
@@ -160,7 +187,7 @@ func main() {
 
 	pubStats, err := pub.Publish(ctx, result)
 	if err != nil {
-		logger.Fatal("Publish failed", zap.Error(err))
+		return fmt.Errorf("publish: %w", err)
 	}
 	fmt.Printf("\n=== PUBLISH SUMMARY ===\n")
 	fmt.Printf("DB wrote — eligible:        %d\n", pubStats.EligibleWritten)
@@ -231,4 +258,88 @@ func main() {
 	for _, item := range list {
 		fmt.Printf("  %-15s %.1f%%\n", item.K, item.V*100)
 	}
+	return nil
+}
+
+// watchLoop is the event-driven mode: run once, then re-run automatically
+// whenever the BuySignal tab changes. Change detection is a SHA-256 over the
+// tab's raw values (one Sheets API read per poll — well inside quota); the
+// Sheets-readonly scope has no Drive metadata access, so hashing content is
+// the reliable signal. A cycle failure never kills the loop.
+func watchLoop(logger *zap.Logger) {
+	interval := 120 * time.Second
+	if v := os.Getenv("MANTHAN_WATCH_INTERVAL"); v != "" {
+		if n, err := time.ParseDuration(v + "s"); err == nil && n >= 30*time.Second {
+			interval = n
+		}
+	}
+	sheetID := os.Getenv("MANTHAN_SHEET_ID")
+	if sheetID == "" {
+		sheetID = defaultSheetID
+	}
+	creds := os.Getenv("MANTHAN_CREDS")
+	if creds == "" {
+		creds = defaultCreds
+	}
+
+	logger.Info("manthan-live WATCH mode — sheet edits trigger the pipeline automatically",
+		zap.Duration("poll", interval), zap.String("sheet", sheetID))
+
+	var lastFP string
+	fingerprint := func() (string, bool) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		r := manthan.NewGSheetReader(sheetID, creds, logger)
+		if err := r.Connect(ctx); err != nil {
+			logger.Warn("watch: sheets connect failed — will retry", zap.Error(err))
+			return "", false
+		}
+		fp, err := r.FingerprintTab(ctx, manthan.SheetBuySignal)
+		if err != nil {
+			logger.Warn("watch: fingerprint failed — will retry", zap.Error(err))
+			return "", false
+		}
+		return fp, true
+	}
+
+	// Initial run + baseline fingerprint.
+	if err := runPipelineOnce(logger); err != nil {
+		logger.Error("watch: initial run failed — will retry on next change/tick", zap.Error(err))
+	} else if fp, ok := fingerprint(); ok {
+		lastFP = fp
+	}
+
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	if ist == nil {
+		ist = time.FixedZone("IST", 5*3600+1800)
+	}
+	for {
+		time.Sleep(interval)
+		now := time.Now().In(ist)
+		if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+			continue
+		}
+		mod := now.Hour()*60 + now.Minute()
+		if mod < 8*60+45 || mod > 15*60+25 {
+			continue // outside the tradeable window — edits wait for the window
+		}
+		fp, ok := fingerprint()
+		if !ok || fp == lastFP {
+			continue
+		}
+		logger.Info("watch: BuySignal tab CHANGED — running pipeline",
+			zap.String("old_fp", short(lastFP)), zap.String("new_fp", short(fp)))
+		if err := runPipelineOnce(logger); err != nil {
+			logger.Error("watch: pipeline run failed — fingerprint kept, will retry next tick", zap.Error(err))
+			continue // lastFP unchanged → next tick sees the same change and retries
+		}
+		lastFP = fp
+	}
+}
+
+func short(fp string) string {
+	if len(fp) > 12 {
+		return fp[:12]
+	}
+	return fp
 }
