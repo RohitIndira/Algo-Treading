@@ -12,7 +12,8 @@ const (
 	StatePendingEntry    PositionState = "PENDING_ENTRY"    // order placed, awaiting fill
 	StatePartiallyFilled PositionState = "PARTIALLY_FILLED" // partial fill received, waiting for rest
 	StateActive          PositionState = "ACTIVE"           // fill confirmed, SL + trailing enabled
-	StateExited          PositionState = "EXITED"           // SL hit or manual exit
+	StateExitPending     PositionState = "EXIT_PENDING"     // trail crossed, exit ORDERED, awaiting broker confirmation
+	StateExited          PositionState = "EXITED"           // broker-confirmed exit
 )
 
 // Position tracks a live holding for a user.

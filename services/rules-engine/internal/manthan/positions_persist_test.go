@@ -101,6 +101,11 @@ func TestPersist_TrailPersists(t *testing.T) {
 	defer cleanPersist(t, db)
 	p := &ManthanPublisher{db: db, logger: zap.NewNop()}
 	_ = p.PersistPositionOpen(context.Background(), testEntryOrder())
+	// New lifecycle: rows are born PENDING_ENTRY; the fill confirmation
+	// promotes to ACTIVE — only then do trails apply.
+	if err := p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
 
 	// ratchet: high 110, sl 88, last_trail 110
 	pos := types.Position{Symbol: persistSymbol, CurrentSL: 88.00, HighSinceEntry: 110.00, LastTrailLevel: 110.00}
@@ -122,6 +127,7 @@ func TestRestart_ResumesTrailAtExactLevel(t *testing.T) {
 	p := &ManthanPublisher{db: db, logger: zap.NewNop()}
 
 	_ = p.PersistPositionOpen(context.Background(), testEntryOrder())
+	_ = p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10)
 	// two ratchets: 80 -> 83.20 -> 88.00 (high 104 -> 110)
 	_ = p.PersistTrail(context.Background(), persistStrategyID,
 		types.Position{Symbol: persistSymbol, CurrentSL: 83.20, HighSinceEntry: 104.00, LastTrailLevel: 104.00})
@@ -175,8 +181,9 @@ func TestPersist_ExitMarksExited(t *testing.T) {
 	defer cleanPersist(t, db)
 	p := &ManthanPublisher{db: db, logger: zap.NewNop()}
 	_ = p.PersistPositionOpen(context.Background(), testEntryOrder())
+	_ = p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10)
 
-	if err := p.PersistExit(context.Background(), persistStrategyID, persistSymbol, 88.00, -120.00); err != nil {
+	if err := p.PersistExit(context.Background(), persistStrategyID, persistSymbol, 88.00, -120.00, "SL_TRIGGER"); err != nil {
 		t.Fatalf("exit: %v", err)
 	}
 	_, _, _, status := rowTrail(t, db)
@@ -194,5 +201,37 @@ func TestPersist_ExitMarksExited(t *testing.T) {
 	}
 	if restored != 0 {
 		t.Fatalf("EXITED position must not be restored; got restored=%d", restored)
+	}
+}
+
+// 2026-08-18 phantom fix: a dispatch is born PENDING_ENTRY and becomes ACTIVE
+// only on a confirmed fill. An unconfirmed dispatch must never look held.
+func TestPersist_DispatchIsPendingUntilFillConfirmed(t *testing.T) {
+	db := openPersistTestDB(t)
+	defer cleanPersist(t, db)
+	p := &ManthanPublisher{db: db, logger: zap.NewNop()}
+
+	_ = p.PersistPositionOpen(context.Background(), testEntryOrder())
+	var status string
+	if err := db.QueryRow(`SELECT status FROM manthan_positions WHERE strategy_id=$1 AND symbol=$2`,
+		persistStrategyID, persistSymbol).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "PENDING_ENTRY" {
+		t.Fatalf("dispatch persisted as %q, want PENDING_ENTRY (ACTIVE-at-dispatch was the phantom bug)", status)
+	}
+
+	// Fill confirmation promotes with the REAL fill price/qty.
+	if err := p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 101.50, 9); err != nil {
+		t.Fatal(err)
+	}
+	var qty int
+	var entry float64
+	if err := db.QueryRow(`SELECT status, quantity, entry_price FROM manthan_positions WHERE strategy_id=$1 AND symbol=$2`,
+		persistStrategyID, persistSymbol).Scan(&status, &qty, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if status != "ACTIVE" || qty != 9 || entry != 101.50 {
+		t.Fatalf("promotion wrong: status=%s qty=%d entry=%.2f (want ACTIVE/9/101.50)", status, qty, entry)
 	}
 }

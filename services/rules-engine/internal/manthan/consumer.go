@@ -57,7 +57,8 @@ type OrderPublisher interface {
 	// FIX F — persist trail state so a restart resumes it (see positions_persist.go).
 	PersistPositionOpen(ctx context.Context, order ManthanOrder) error
 	PersistTrail(ctx context.Context, strategyID string, pos types.Position) error
-	PersistExit(ctx context.Context, strategyID, symbol string, exitPrice, pnl float64) error
+	PersistExit(ctx context.Context, strategyID, symbol string, exitPrice, pnl float64, reason string) error
+	PersistFillConfirmed(ctx context.Context, strategyID, symbol string, fillPrice float64, qty int32) error
 }
 
 // ConsumerConfig configures the manthan signal consumer.

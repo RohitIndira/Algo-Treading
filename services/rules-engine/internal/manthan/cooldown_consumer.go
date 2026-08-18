@@ -36,6 +36,7 @@ type CooldownConsumer struct {
 	// depends on; it was never wired before 2026-08-05 (positions stayed
 	// pending forever and day-2 signals re-bought held symbols).
 	confirmFill func(strategyID, symbol string, price float64, qty int32)
+	exitConfirmed func(strategyID, symbol string, exitPrice float64, reason string)
 }
 
 // CooldownConsumerConfig — Kafka wiring for the position.events subscription.
@@ -45,6 +46,12 @@ type CooldownConsumerConfig struct {
 	GroupID      string // default: rules-engine-cooldown
 	// ConfirmFill — see CooldownConsumer.confirmFill. Nil-safe.
 	ConfirmFill func(strategyID, symbol string, price float64, qty int32)
+	// ExitConfirmed — invoked on every MANTHAN POSITION_EXITED (any exit
+	// reason) BEFORE the cooldown filter. This is the broker-confirmed exit
+	// feed: it releases the in-memory position/capital and books the DB exit.
+	// The trail-cross in tick_handler only ORDERS the exit; this confirms it
+	// (2026-08-18: cross-time booking exited 4 positions that never sold).
+	ExitConfirmed func(strategyID, symbol string, exitPrice float64, reason string)
 }
 
 // positionEventEnvelope mirrors the JSON published by positions svc's
@@ -92,7 +99,8 @@ func NewCooldownConsumer(cfg CooldownConsumerConfig, db *sql.DB, logger *zap.Log
 		reader:      reader,
 		db:          db,
 		logger:      logger,
-		confirmFill: cfg.ConfirmFill,
+		confirmFill:   cfg.ConfirmFill,
+		exitConfirmed: cfg.ExitConfirmed,
 	}
 }
 
@@ -180,6 +188,12 @@ func (c *CooldownConsumer) handleMessage(ctx context.Context, msg kafka.Message)
 	}
 	if !strings.EqualFold(ev.EventType, "POSITION_EXITED") {
 		return nil // MODIFIED / etc — not our concern
+	}
+
+	// Broker-confirmed exit → release the book (ALL exit reasons, before the
+	// cooldown-specific SL_TRIGGER filter below).
+	if c.exitConfirmed != nil && ev.StrategyID != "" && ev.Symbol != "" {
+		c.exitConfirmed(ev.StrategyID, ev.Symbol, ev.Price, ev.ExitReason)
 	}
 	if !strings.EqualFold(ev.ExitReason, "SL_TRIGGER") {
 		// MANUAL_EXIT / STRATEGY_EXIT / LIQUIDATION — no cooldown per Manthan spec

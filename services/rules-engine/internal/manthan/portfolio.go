@@ -223,6 +223,25 @@ func (pm *PortfolioManager) UpdateSLFromBroker(strategyID, symbol string, broker
 
 // ExitPosition marks a position as exited after SL triggered.
 // Adds to cooldown for re-entry logic. Returns realized P&L.
+// MarkExitPending freezes a position at trail-cross: State=EXIT_PENDING stops
+// further tick processing (the loop gates on StateActive) so the SL_EXIT
+// command fires exactly once, while Active stays TRUE — the position still
+// counts as held for the allocator guard and the sector/mcap caps until the
+// broker CONFIRMS the sell (position.events POSITION_EXITED → ExitPosition).
+func (pm *PortfolioManager) MarkExitPending(strategyID, symbol string) {
+	pm.mu.RLock()
+	p, ok := pm.portfolios[strategyID]
+	pm.mu.RUnlock()
+	if !ok {
+		return
+	}
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
+	if pos, ok := p.Positions[symbol]; ok && pos.State == types.StateActive {
+		pos.State = types.StateExitPending
+	}
+}
+
 func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice float64) float64 {
 	pm.mu.RLock()
 	p, ok := pm.portfolios[strategyID]
@@ -240,6 +259,7 @@ func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice fl
 	}
 
 	pos.Active = false
+	pos.State = types.StateExited
 	realizedPnL := (exitPrice - pos.EntryPrice) * float64(pos.Quantity)
 
 	// Adjust current capital for reinvestment

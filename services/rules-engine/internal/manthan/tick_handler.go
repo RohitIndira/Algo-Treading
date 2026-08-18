@@ -84,24 +84,36 @@ func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float6
 			_ = h.publisher.PersistTrail(ctx, strategyID, posSnap)
 
 		case SLTriggered:
-			pnl := h.portfolioMgr.ExitPosition(strategyID, symbol, update.ExitPrice)
-			order := h.orderGen.GenerateSLExit(*strategy, &posSnap, update.ExitPrice, pnl)
+			// Trail crossed → command the exit, but do NOT book it. The
+			// position stays on the books (EXIT_PENDING) until the
+			// position.events POSITION_EXITED confirmation arrives from the
+			// positions service — i.e. until the sell REALLY filled at the
+			// broker. Booking at trail-cross (the old behavior) exited 4
+			// positions on 2026-08-18 whose SL_EXIT orders died at
+			// trade-execution (dead auth / DLQ) — the book said gone, the
+			// broker still held them, and rehydrate+caps worked off fiction.
+			// EXIT_PENDING stops further ticking (the loop gates on
+			// StateActive) so the exit command fires exactly once per cross;
+			// capital/slot release and PersistExit now happen only in the
+			// confirmed-exit callback (wire.go / cooldown consumer).
+			h.portfolioMgr.MarkExitPending(strategyID, symbol)
+			pnlEstimate := (update.ExitPrice - posSnap.EntryPrice) * float64(posSnap.Quantity)
+			order := h.orderGen.GenerateSLExit(*strategy, &posSnap, update.ExitPrice, pnlEstimate)
 			if err := h.publisher.PublishSLExit(ctx, order); err != nil {
 				h.logger.Error("Failed to publish SL exit",
 					zap.String("symbol", symbol),
 					zap.Error(err),
 				)
 			}
-			// FIX F: mark EXITED so rehydrate doesn't restore a closed position.
-			_ = h.publisher.PersistExit(ctx, strategyID, symbol, update.ExitPrice, pnl)
+			pnl := pnlEstimate
 
-			// Capital was just updated inside ExitPosition; re-read under
-			// RLock for the log so the printed value reflects the new state.
+			// Capital is NOT yet released — that happens on the confirmed
+			// exit. Log the current (unchanged) figure for context.
 			portfolio.Mu.RLock()
 			newCapital := portfolio.CurrentCapital
 			portfolio.Mu.RUnlock()
 
-			h.logger.Info("MANTHAN SL triggered — position exited",
+			h.logger.Info("MANTHAN SL triggered — exit ORDERED (pending broker confirmation)",
 				zap.String("user", strategy.UserID),
 				zap.String("symbol", symbol),
 				zap.Float64("entry", posSnap.EntryPrice),

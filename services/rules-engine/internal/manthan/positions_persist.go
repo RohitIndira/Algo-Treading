@@ -1,6 +1,8 @@
 package manthan
 
 import (
+	"time"
+	"fmt"
 	"context"
 
 	"go.uber.org/zap"
@@ -39,9 +41,14 @@ import (
 //   - A failed EXIT update = an EXITED position may re-appear on restart; the
 //     orphan scanner / next tick reconcile it (it's already gone at the broker).
 
-// PersistPositionOpen inserts the ACTIVE position row that mirrors the in-memory
-// AddPosition. Idempotent via ON CONFLICT (signal_id) — the deterministic entry
-// OrderID is the replay key, so a Kafka replay / re-fire is a clean no-op.
+// PersistPositionOpen inserts the position row at entry-DISPATCH as
+// PENDING_ENTRY — NOT ACTIVE. A dispatch is optimistic: the entry can die at
+// trade-execution (dead auth, upper circuit, DLQ) without ever filling, and
+// persisting ACTIVE here created phantom rows that polluted the sector/mcap
+// cap counters and were resurrected by every rehydrate (2026-08-18: 29
+// phantoms had both users' SMALL bucket "full" and blocked all entries).
+// Promotion to ACTIVE happens ONLY in PersistFillConfirmed, driven by the
+// position.events fill confirmation. Idempotent via ON CONFLICT (signal_id).
 func (p *ManthanPublisher) PersistPositionOpen(ctx context.Context, order ManthanOrder) error {
 	if p.db == nil {
 		return nil
@@ -52,7 +59,7 @@ func (p *ManthanPublisher) PersistPositionOpen(ctx context.Context, order Mantha
 			entry_price, quantity, invested_amt, ema_alloc_pct,
 			high_since_entry, current_sl, last_trail_level,
 			status, signal_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'ACTIVE',$15)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'PENDING_ENTRY',$15)
 		ON CONFLICT (signal_id) WHERE signal_id IS NOT NULL DO NOTHING`,
 		order.StrategyID, order.UserID, order.Symbol, order.ISIN,
 		order.Industry, order.MCapBucket, order.IndexName,
@@ -89,21 +96,76 @@ func (p *ManthanPublisher) PersistTrail(ctx context.Context, strategyID string, 
 	return err
 }
 
-// PersistExit marks the position EXITED so rehydrate does not restore a closed
-// position after restart. Best-effort.
-func (p *ManthanPublisher) PersistExit(ctx context.Context, strategyID, symbol string, exitPrice, pnl float64) error {
+// PersistFillConfirmed promotes a PENDING_ENTRY row to ACTIVE with the
+// broker-confirmed fill price/qty. Called from the position.events
+// POSITION_OPENED consumer — the same confirmation that arms the in-memory
+// re-entry guard — so the DB can never hold an ACTIVE row for an entry that
+// did not really fill. Also idempotently upgrades legacy ACTIVE rows'
+// price/qty when the confirmation arrives late.
+func (p *ManthanPublisher) PersistFillConfirmed(ctx context.Context, strategyID, symbol string, fillPrice float64, qty int32) error {
 	if p.db == nil {
 		return nil
 	}
 	_, err := p.db.ExecContext(ctx, `
 		UPDATE manthan_positions
+		SET status = 'ACTIVE',
+		    entry_price = $1,
+		    quantity = $2,
+		    invested_amt = $5,
+		    high_since_entry = GREATEST(COALESCE(high_since_entry, 0), $1),
+		    updated_at = now()
+		WHERE strategy_id = $3 AND symbol = $4
+		  AND status IN ('PENDING_ENTRY','ACTIVE')`,
+		fillPrice, qty, strategyID, symbol, fillPrice*float64(qty))
+	if err != nil {
+		p.logger.Warn("PersistFillConfirmed failed — row stays PENDING_ENTRY until next confirmation/restart",
+			zap.String("symbol", symbol), zap.Error(err))
+	}
+	return err
+}
+
+// PersistExit marks the position EXITED so rehydrate does not restore a closed
+// position after restart. reason is the CONFIRMED exit reason from
+// position.events (SL_TRIGGER → recorded as TSL_HIT for continuity). This is
+// only called on a broker-confirmed exit — never at trail-cross (2026-08-18:
+// trail-cross exits booked 4 positions as TSL_HIT that never sold; the SL_EXIT
+// orders had died at trade-execution while the book showed them gone).
+func (p *ManthanPublisher) PersistExit(ctx context.Context, strategyID, symbol string, exitPrice, pnl float64, reason string) error {
+	if p.db == nil {
+		return nil
+	}
+	if reason == "" || reason == "SL_TRIGGER" {
+		reason = "TSL_HIT"
+	}
+	_, err := p.db.ExecContext(ctx, `
+		UPDATE manthan_positions
 		SET status = 'EXITED', exit_price = $1, realized_pnl = $2,
-		    exit_reason = 'TSL_HIT', exit_time = now(), updated_at = now()
-		WHERE strategy_id = $3 AND symbol = $4 AND status = 'ACTIVE'`,
-		exitPrice, pnl, strategyID, symbol)
+		    exit_reason = $5, exit_time = now(), updated_at = now()
+		WHERE strategy_id = $3 AND symbol = $4 AND status IN ('ACTIVE','PENDING_ENTRY')`,
+		exitPrice, pnl, strategyID, symbol, reason)
 	if err != nil {
 		p.logger.Warn("PersistExit failed — EXITED position may re-appear on restart (reconciled by orphan scanner / next tick)",
 			zap.String("symbol", symbol), zap.Error(err))
 	}
 	return err
+}
+
+// ExpireStalePendingEntries EXPIREs PENDING_ENTRY rows older than maxAge —
+// dispatches whose fills never confirmed (DLQ'd, rejected, upper-circuit
+// holds that died at close). Called by the orphan scanner so failed
+// dispatches cannot accumulate as clutter. Returns rows expired.
+func (p *ManthanPublisher) ExpireStalePendingEntries(ctx context.Context, maxAge time.Duration) (int64, error) {
+	if p.db == nil {
+		return 0, nil
+	}
+	res, err := p.db.ExecContext(ctx, `
+		UPDATE manthan_positions
+		SET status = 'EXPIRED', exit_reason = 'ENTRY_NEVER_FILLED', updated_at = now()
+		WHERE status = 'PENDING_ENTRY' AND entry_time < now() - $1::interval`,
+		fmt.Sprintf("%d seconds", int(maxAge.Seconds())))
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }

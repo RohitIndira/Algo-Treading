@@ -272,6 +272,20 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			// bookkeeping (trade-execution owns the real broker SLs).
 			ConfirmFill: func(strategyID, symbol string, price float64, qty int32) {
 				m.portfolioMgr.ConfirmFill(strategyID, symbol, price, qty, slMgr, 20)
+				// Promote the DB row PENDING_ENTRY → ACTIVE with the real fill
+				// (the row is born PENDING at dispatch; only a confirmed fill
+				// makes it ACTIVE — the 2026-08-18 phantom-row fix).
+				_ = m.publisher.PersistFillConfirmed(context.Background(), strategyID, symbol, price, qty)
+			},
+			// Broker-confirmed exits release memory + book the DB exit with
+			// the REAL reason. tick_handler no longer books at trail-cross.
+			ExitConfirmed: func(strategyID, symbol string, exitPrice float64, reason string) {
+				pnl := m.portfolioMgr.ExitPosition(strategyID, symbol, exitPrice)
+				_ = m.publisher.PersistExit(context.Background(), strategyID, symbol, exitPrice, pnl, reason)
+				logger.Info("Confirmed exit booked",
+					zap.String("strategy", strategyID), zap.String("symbol", symbol),
+					zap.Float64("exit_price", exitPrice), zap.Float64("pnl", pnl),
+					zap.String("reason", reason))
 			},
 		},
 		deps.ManthanDB,

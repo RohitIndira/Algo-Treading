@@ -422,6 +422,19 @@ func (pm *PortfolioManager) StartOrphanScanner(
 			} else if cleaned > 0 {
 				pm.logger.Info("Orphan scanner pass", zap.Int("cleaned", cleaned))
 			}
+			// Expire PENDING_ENTRY rows whose fill never confirmed within a
+			// session (dispatches that died at trade-execution). Keeps the
+			// book free of stale dispatch clutter (2026-08-18 phantom fix).
+			if db != nil {
+				if res, err := db.ExecContext(ctx, `
+					UPDATE manthan_positions
+					SET status='EXPIRED', exit_reason='ENTRY_NEVER_FILLED', updated_at=now()
+					WHERE status='PENDING_ENTRY' AND entry_time < now() - interval '24 hours'`); err == nil {
+					if n, _ := res.RowsAffected(); n > 0 {
+						pm.logger.Info("Orphan scanner: expired stale PENDING_ENTRY rows", zap.Int64("expired", n))
+					}
+				}
+			}
 		}
 	}
 }
