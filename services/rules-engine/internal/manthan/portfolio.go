@@ -269,6 +269,11 @@ func (pm *PortfolioManager) MarkExitPending(strategyID, symbol string) {
 	if pos, ok := p.Positions[symbol]; ok && pos.State == types.StateActive {
 		pos.State = types.StateExitPending
 		pos.ExitPendingSince = time.Now()
+		// TrailingSLManager.ProcessTick clears Active at the trigger tick.
+		// Restore it: the position IS still held (exit merely ordered) — the
+		// LTP feed keeps subscribing it, the TTL revert can see it, and the
+		// tick loop is gated on State (not Active) so it does not tick.
+		pos.Active = true
 	}
 }
 
@@ -296,12 +301,20 @@ func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice fl
 	defer p.Mu.Unlock()
 
 	pos, ok := p.Positions[symbol]
-	if !ok || !pos.Active {
+	// Idempotent on State, NOT on Active: ProcessTick clears Active at the
+	// trigger tick, and the old "!pos.Active → return" guard then made every
+	// SL exit a silent no-op here (no cooldown, no capital release, position
+	// left in the map as Active=false/ACTIVE → "already holding" until a
+	// restart). Latent since before the confirmation-driven lifecycle;
+	// fatal with it, because an EXIT_PENDING position still Occupies() a
+	// slot until this function books the confirmed exit.
+	if !ok || pos.State == types.StateExited {
 		return 0
 	}
 
 	pos.Active = false
 	pos.State = types.StateExited
+	pos.ExitPendingSince = time.Time{}
 	realizedPnL := (exitPrice - pos.EntryPrice) * float64(pos.Quantity)
 
 	// Adjust current capital for reinvestment

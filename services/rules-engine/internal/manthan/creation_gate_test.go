@@ -27,7 +27,7 @@ func TestCreationGate_FIV99MondayScenario(t *testing.T) {
 	monday := "2026-08-17T03:30:13Z" // the republish instant — NOT the anchor
 
 	cases := []struct {
-		symbol, firstSeen string
+		symbol, firstSeen    string
 		fiv99Skip, s4450Skip bool
 	}{
 		{"GNA", "2026-08-10T07:57:53Z", true, true},        // old cohort: predates both (S4450 already holds it anyway)

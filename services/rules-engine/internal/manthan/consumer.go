@@ -607,6 +607,11 @@ func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal
 	emaByIndex := c.emaFn()
 
 	for _, strategy := range strategies {
+		// Portfolio object first (as before the gate existed) so a new
+		// strategy is registered in the manager on its first signal even
+		// when that signal is skipped below.
+		portfolio := c.portfolioMgr.GetOrCreate(strategy)
+
 		// Creation-time gate — see signalPredatesStrategy. A strategy created
 		// after this stock entered the list never trades it, however many
 		// times the daily publish re-emits it.
@@ -621,7 +626,6 @@ func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal
 			c.logger.Warn("Strategy has no CreatedAt — creation-time gate open for this strategy (check user-config created_at)",
 				zap.String("user", strategy.UserID), zap.String("strategy", strategy.StrategyID))
 		}
-		portfolio := c.portfolioMgr.GetOrCreate(strategy)
 
 		result := c.allocator.Allocate(
 			[]types.ManthanSignal{signal},

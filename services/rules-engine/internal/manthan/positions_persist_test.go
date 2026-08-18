@@ -54,9 +54,9 @@ func testEntryOrder() ManthanOrder {
 		StrategyID:  persistStrategyID,
 		Symbol:      persistSymbol,
 		ISIN:        "INE000TEST01",
-		Industry:    "IT",       // chk_active_has_classification requires non-empty
-		MCapBucket:  "LARGE",    // "
-		IndexName:   "NIFTY50",  // "
+		Industry:    "IT",      // chk_active_has_classification requires non-empty
+		MCapBucket:  "LARGE",   // "
+		IndexName:   "NIFTY50", // "
 		EntryPrice:  100.00,
 		Quantity:    10,
 		InvestedAmt: 1000.00,
