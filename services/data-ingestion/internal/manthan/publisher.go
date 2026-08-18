@@ -32,10 +32,10 @@ type CompanyResolver interface {
 //
 // Storage split:
 //   - Postgres `manthan_stocks`   — EVERY candidate we processed (ELIGIBLE,
-//                                   FILTER_REJECTED, DATA_DROPPED). Full audit.
+//     FILTER_REJECTED, DATA_DROPPED). Full audit.
 //   - Postgres `manthan_signals`  — ONLY eligible stocks (downstream-ready).
 //   - Kafka topic (default `manthan.signals`) — ONLY eligible stocks, one
-//                                   message per symbol. Consumed by allocators.
+//     message per symbol. Consumed by allocators.
 //
 // Pre-flight gate (when Resolver is set): each ELIGIBLE stock is checked
 // against the company-master via Resolver.ResolveCompany BEFORE Kafka
@@ -202,13 +202,46 @@ func (p *Publisher) Publish(ctx context.Context, result *PipelineResult) (*Publi
 		prows.Close()
 	}
 
+	// first_seen_at carry-forward (2026-08-18): a signal keeps the instant it
+	// FIRST entered its current contiguous run in the list. Capture BEFORE
+	// the DELETE below wipes today's rows: today's own value (a stock added
+	// at 12:00 must not drift to 14:00 on the next re-run) and the previous
+	// publish day's value (contiguity: present on the last publish → same
+	// run). Anything else is a brand-new signal stamped now. rules-engine
+	// compares this against strategy created_at so a strategy created after
+	// a stock appeared never acts on that stock.
+	firstSeen := map[string]time.Time{}
+	if frows, err := tx.QueryContext(ctx, `
+		SELECT symbol, first_seen_at FROM manthan_signals
+		WHERE first_seen_at IS NOT NULL
+		  AND (run_date = CURRENT_DATE
+		       OR run_date = (SELECT MAX(run_date) FROM manthan_signals WHERE run_date < CURRENT_DATE))
+		ORDER BY run_date ASC`); err == nil { // ASC: today's row (later) wins over yesterday's
+		for frows.Next() {
+			var sym string
+			var ts time.Time
+			if frows.Scan(&sym, &ts) == nil {
+				firstSeen[sym] = ts
+			}
+		}
+		frows.Close()
+	} else {
+		p.logger.Warn("first_seen_at lookup failed — new symbols will be stamped now (carry-forward degraded this run)", zap.Error(err))
+	}
+	now := time.Now().UTC()
+	for _, s := range result.Eligible {
+		if _, ok := firstSeen[s.Symbol]; !ok {
+			firstSeen[s.Symbol] = now
+		}
+	}
+
 	// 2. Insert ELIGIBLE stocks into manthan_signals (clear today's first to avoid dupes)
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM manthan_signals WHERE run_date = CURRENT_DATE`); err != nil {
 		return stats, fmt.Errorf("clear signals: %w", err)
 	}
 	for _, s := range result.Eligible {
-		if err := insertSignal(ctx, tx, runDate, s); err != nil {
+		if err := insertSignal(ctx, tx, runDate, s, firstSeen[s.Symbol]); err != nil {
 			return stats, fmt.Errorf("insert signal %s: %w", s.Symbol, err)
 		}
 	}
@@ -243,6 +276,10 @@ func (p *Publisher) Publish(ctx context.Context, result *PipelineResult) (*Publi
 				"ath_close":    s.ATHClose,
 				"week52_high":  s.Week52High,
 				"emitted_at":   time.Now().UTC().Format(time.RFC3339),
+				// When this stock FIRST entered its current run in the list
+				// (see carry-forward above). rules-engine: a strategy created
+				// AFTER this instant never acts on this signal.
+				"first_seen_at": firstSeen[s.Symbol].UTC().Format(time.RFC3339),
 			}
 			body, err := json.Marshal(payload)
 			if err != nil {
@@ -358,13 +395,16 @@ ON CONFLICT (run_date, symbol) DO UPDATE SET
 	return err
 }
 
-func insertSignal(ctx context.Context, tx *sql.Tx, runDate time.Time, s *ManthanStock) error {
+func insertSignal(ctx context.Context, tx *sql.Tx, runDate time.Time, s *ManthanStock, firstSeen time.Time) error {
+	if firstSeen.IsZero() {
+		firstSeen = time.Now().UTC()
+	}
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO manthan_signals (
     run_date, symbol, isin, industry, mcap_bucket, index_name,
     market_cap, pe, fscore, pat,
-    latest_price, ath_close, week52_high
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    latest_price, ath_close, week52_high, first_seen_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 ON CONFLICT (run_date, symbol) DO UPDATE SET
     industry    = EXCLUDED.industry,
     market_cap  = EXCLUDED.market_cap,
@@ -373,10 +413,11 @@ ON CONFLICT (run_date, symbol) DO UPDATE SET
     pat         = EXCLUDED.pat,
     latest_price= EXCLUDED.latest_price,
     ath_close   = EXCLUDED.ath_close,
-    week52_high = EXCLUDED.week52_high`,
+    week52_high = EXCLUDED.week52_high,
+    first_seen_at = LEAST(COALESCE(manthan_signals.first_seen_at, EXCLUDED.first_seen_at), EXCLUDED.first_seen_at)`,
 		runDate, s.Symbol, nullIfEmpty(s.ISIN), s.Industry, s.MCapBucket, s.IndexName,
 		s.MarketCap, s.PE, s.FScore, s.PAT,
-		s.LatestPrice, s.ATHClose, s.Week52High,
+		s.LatestPrice, s.ATHClose, s.Week52High, firstSeen,
 	)
 	return err
 }

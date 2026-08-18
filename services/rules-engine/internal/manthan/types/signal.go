@@ -6,10 +6,13 @@
 // and positions/ sub-packages to both import types/ without cycles.
 //
 // Types are grouped by domain across a few files:
-//   signal.go     — inputs to the signal engine
-//   position.go   — position lifecycle state
-//   allocation.go — allocator inputs, outputs, and cap-check helpers
+//
+//	signal.go     — inputs to the signal engine
+//	position.go   — position lifecycle state
+//	allocation.go — allocator inputs, outputs, and cap-check helpers
 package types
+
+import "time"
 
 // ManthanSignal represents one eligible stock from the data-ingestion pipeline
 // (consumed from manthan.signals Kafka topic).
@@ -28,6 +31,12 @@ type ManthanSignal struct {
 	ATHClose    float64 `json:"ath_close"`
 	Week52High  float64 `json:"week52_high"`
 	EmittedAt   string  `json:"emitted_at"`
+	// FirstSeenAt (RFC3339, UTC) — when this stock FIRST entered its current
+	// contiguous run in the Buy list. Every publish re-emits the whole list
+	// (EmittedAt is always "today"), so THIS is the signal's true birth time
+	// and what a strategy's CreatedAt is compared against. Empty on legacy
+	// payloads → consumer falls back to EmittedAt.
+	FirstSeenAt string `json:"first_seen_at"`
 }
 
 // UserStrategy holds a user's MANTHAN strategy config (from user-config-events).
@@ -45,4 +54,11 @@ type UserStrategy struct {
 	PerStockBase  float64 // TotalCapital / MaxPositions
 	StopLossPct   float64 // 20
 	TrailingSLPct float64 // 2
+	// CreatedAt — when the user created/subscribed this strategy. A strategy
+	// acts ONLY on signals whose FirstSeenAt is after this instant; anything
+	// already in the Buy list at creation time is not this strategy's signal
+	// (2026-08-18 rule: "signal was there yesterday, strategy created today →
+	// not processed; only what comes after"). Zero = unknown → gate is open
+	// (logged once per strategy).
+	CreatedAt time.Time
 }

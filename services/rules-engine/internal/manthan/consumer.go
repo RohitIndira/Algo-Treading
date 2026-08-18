@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -188,6 +189,43 @@ func (c *Consumer) Start(ctx context.Context) {
 //
 // Reads Redis first (fast path); if cold, falls back to the authoritative
 // Postgres `manthan_signals` table and repopulates Redis for future lookups.
+// signalFirstSeen returns the signal's birth instant: first_seen_at when the
+// publisher stamped it, else emitted_at (legacy payloads), else zero.
+func signalFirstSeen(sig types.ManthanSignal) time.Time {
+	for _, raw := range []string{sig.FirstSeenAt, sig.EmittedAt} {
+		if raw == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, raw); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// signalPredatesStrategy is the "only signals that come AFTER the strategy
+// was created" rule (2026-08-18). A stock already in the Buy list when the
+// user created the strategy is not this strategy's signal — not on the day
+// of creation (catch-up), and not on any later day's republish of the same
+// list either. Returns (true, reason) when the signal must be skipped.
+// Fail-open when either instant is unknown: an unknown strategy CreatedAt or
+// an unstampable signal never silently blocks a real user's flow — it is
+// logged by the caller instead.
+func signalPredatesStrategy(sig types.ManthanSignal, strategy types.UserStrategy) (bool, string) {
+	if strategy.CreatedAt.IsZero() {
+		return false, ""
+	}
+	fs := signalFirstSeen(sig)
+	if fs.IsZero() {
+		return false, ""
+	}
+	if fs.Before(strategy.CreatedAt) {
+		return true, fmt.Sprintf("signal predates strategy (first seen %s, strategy created %s)",
+			fs.UTC().Format(time.RFC3339), strategy.CreatedAt.UTC().Format(time.RFC3339))
+	}
+	return false, ""
+}
+
 func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy types.UserStrategy) {
 	if c.rdb == nil {
 		return
@@ -248,6 +286,31 @@ func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy types.UserSt
 				zap.Float64("live", ltp))
 			signals[i].LatestPrice = ltp
 		}
+	}
+
+	// Creation-time gate: by construction every signal already published
+	// today was first seen BEFORE this strategy existed, so this normally
+	// filters everything — the strategy starts fresh and takes only what
+	// arrives from now on. Kept as a filter (not a hard return) so a
+	// same-instant edge or an unstamped legacy signal is handled by the
+	// single rule rather than a special case.
+	eligible := signals[:0:0]
+	for _, sig := range signals {
+		if predates, why := signalPredatesStrategy(sig, strategy); predates {
+			c.logger.Info("Catch-up skipped signal",
+				zap.String("user", strategy.UserID),
+				zap.String("strategy", strategy.StrategyID),
+				zap.String("symbol", sig.Symbol),
+				zap.String("reason", why))
+			continue
+		}
+		eligible = append(eligible, sig)
+	}
+	signals = eligible
+	if len(signals) == 0 {
+		c.logger.Info("Catch-up: no signals newer than the strategy — nothing to do (strategy takes only signals that arrive after its creation)",
+			zap.String("user", strategy.UserID), zap.String("strategy", strategy.StrategyID))
+		return
 	}
 
 	portfolio := c.portfolioMgr.GetOrCreate(strategy)
@@ -362,7 +425,8 @@ func (c *Consumer) loadSignalsFromDB(ctx context.Context, date string) ([]types.
 		       COALESCE(mcap_bucket,''), COALESCE(index_name,''),
 		       COALESCE(market_cap,0), COALESCE(pe,0), COALESCE(fscore,0),
 		       COALESCE(pat,0), COALESCE(latest_price,0),
-		       COALESCE(ath_close,0), COALESCE(week52_high,0), created_at
+		       COALESCE(ath_close,0), COALESCE(week52_high,0), created_at,
+		       first_seen_at
 		FROM manthan_signals
 		WHERE run_date = $1
 		ORDER BY symbol
@@ -376,18 +440,22 @@ func (c *Consumer) loadSignalsFromDB(ctx context.Context, date string) ([]types.
 	for rows.Next() {
 		var sig types.ManthanSignal
 		var runDate, createdAt time.Time
+		var firstSeen sql.NullTime
 		if err := rows.Scan(
 			&runDate, &sig.Symbol, &sig.ISIN, &sig.Industry,
 			&sig.MCapBucket, &sig.IndexName,
 			&sig.MarketCap, &sig.PE, &sig.FScore,
 			&sig.PAT, &sig.LatestPrice,
-			&sig.ATHClose, &sig.Week52High, &createdAt,
+			&sig.ATHClose, &sig.Week52High, &createdAt, &firstSeen,
 		); err != nil {
 			c.logger.Warn("Failed to scan manthan_signals row", zap.Error(err))
 			continue
 		}
 		sig.RunDate = runDate.Format("2006-01-02")
 		sig.EmittedAt = createdAt.UTC().Format(time.RFC3339)
+		if firstSeen.Valid {
+			sig.FirstSeenAt = firstSeen.Time.UTC().Format(time.RFC3339)
+		}
 		signals = append(signals, sig)
 	}
 	return signals, rows.Err()
@@ -444,7 +512,7 @@ func canPlaceEntriesNowIST() bool {
 		return false
 	}
 	minuteOfDay := now.Hour()*60 + now.Minute()
-	const marketOpen = 9*60 + 15  // 09:15
+	const marketOpen = 9*60 + 15   // 09:15
 	const marketClose = 15*60 + 20 // 15:20 (matches pre_check.go buffer)
 	return minuteOfDay >= marketOpen && minuteOfDay < marketClose
 }
@@ -539,6 +607,20 @@ func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal
 	emaByIndex := c.emaFn()
 
 	for _, strategy := range strategies {
+		// Creation-time gate — see signalPredatesStrategy. A strategy created
+		// after this stock entered the list never trades it, however many
+		// times the daily publish re-emits it.
+		if predates, why := signalPredatesStrategy(signal, strategy); predates {
+			c.logger.Info("Signal skipped",
+				zap.String("user", strategy.UserID),
+				zap.String("symbol", signal.Symbol),
+				zap.String("reason", why))
+			continue
+		}
+		if strategy.CreatedAt.IsZero() {
+			c.logger.Warn("Strategy has no CreatedAt — creation-time gate open for this strategy (check user-config created_at)",
+				zap.String("user", strategy.UserID), zap.String("strategy", strategy.StrategyID))
+		}
 		portfolio := c.portfolioMgr.GetOrCreate(strategy)
 
 		result := c.allocator.Allocate(

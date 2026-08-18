@@ -87,6 +87,19 @@ func (c *ConfigConsumer) Start(ctx context.Context) error {
 			}
 			m.Version = ev.Version
 			m.Active = true
+			// CreatedAt must survive the event path: the payload's created_at is
+			// 0 on the events user-config emits today, so (a) CONFIG_CREATED
+			// takes the event timestamp — the creation instant — and (b) any
+			// later event keeps the value already in the store (from the gRPC
+			// bulk load or an earlier CREATED). rules-engine's creation-time
+			// signal gate depends on this never regressing to zero.
+			if m.CreatedAt.IsZero() {
+				if existing, ok := c.configStore.GetStrategy(ev.UserID, ev.StrategyID); ok && !existing.CreatedAt.IsZero() {
+					m.CreatedAt = existing.CreatedAt
+				} else if string(ev.Type) == "CONFIG_CREATED" && ev.Timestamp > 0 {
+					m.CreatedAt = time.Unix(0, ev.Timestamp)
+				}
+			}
 			if err := c.configStore.Upsert((*models.StrategyConfig)(m)); err != nil {
 				c.errors.Add(1)
 				log.Printf("config consumer: upsert failed: %v", err)

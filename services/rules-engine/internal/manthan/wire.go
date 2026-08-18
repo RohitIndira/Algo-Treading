@@ -193,6 +193,7 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 					PerStockBase:  st.TradeConfig.PerStockAmount,
 					StopLossPct:   st.TradeConfig.StopLossPct,
 					TrailingSLPct: st.TradeConfig.TrailingSLPct,
+					CreatedAt:     st.CreatedAt,
 				})
 			}
 		}
@@ -345,6 +346,20 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			zap.Int("redis_stale_evicted", stale))
 	}
 
+	// Startup audit of the creation-time gate inputs: a strategy whose
+	// CreatedAt did not make it here (zero) has an OPEN gate — it would take
+	// every republished stock. Log each so ops can see it at boot.
+	for _, us := range m.getStrategies() {
+		if us.CreatedAt.IsZero() {
+			logger.Warn("Manthan strategy loaded WITHOUT CreatedAt — creation-time signal gate is OPEN for it",
+				zap.String("user", us.UserID), zap.String("strategy", us.StrategyID))
+			continue
+		}
+		logger.Info("Manthan strategy loaded — creation-time signal gate armed",
+			zap.String("user", us.UserID), zap.String("strategy", us.StrategyID),
+			zap.Time("created_at", us.CreatedAt.UTC()))
+	}
+
 	// Wire the strategy-events catch-up callback. A freshly created
 	// MANTHAN strategy is back-filled with today's eligible signals
 	// immediately via the consumer.
@@ -359,6 +374,7 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			PerStockBase:  strategy.TradeConfig.PerStockAmount,
 			StopLossPct:   strategy.TradeConfig.StopLossPct,
 			TrailingSLPct: strategy.TradeConfig.TrailingSLPct,
+			CreatedAt:     strategy.CreatedAt,
 		}
 		m.consumer.CatchUpNewStrategy(ctx, us)
 	})
