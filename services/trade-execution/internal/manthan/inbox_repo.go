@@ -34,6 +34,11 @@ const (
 	// end of session). 2026-08-18: MODISONLTD spent the morning at UC and
 	// the old "pre-check:"→POISON rule DLQ'd it with zero retries.
 	InboxErrUpperCircuit = "UPPER_CIRCUIT"
+	// PRE_OPEN — entry arrived before the 09:15 IST open (the daily 09:00
+	// publish does this EVERY morning). Held with a precise wake at
+	// 09:15:10 IST, no attempt burn. 2026-08-17: 26 FIV99 entries were
+	// DLQ'd on attempt 1 by the generic "pre-check:"→POISON rule.
+	InboxErrPreOpen = "PRE_OPEN"
 )
 
 // InboxRow mirrors a row of signal_inbox. Payload is kept as []byte so

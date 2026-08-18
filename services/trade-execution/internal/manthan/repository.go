@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/lib/pq"
 )
 
@@ -255,7 +256,6 @@ func (r *Repository) UpdateDeferredIntended(ctx context.Context, id int64, inten
 		 WHERE id=$3 AND status='SL_DEFERRED_BAND'`, intendedTrigger, intendedLimit, id)
 	return err
 }
-
 
 // UpdateSLAfterTopupMerge bumps an existing SL_SELL row's qty + trigger/limit
 // after a top-up fill merged into the parent SL via ModifyOrder. Without this
@@ -657,19 +657,19 @@ func (r *Repository) GetLiveEntriesByUser(ctx context.Context, userID string) ([
 // SL on the broker for tomorrow's session. Returned by
 // ListPositionsNeedingProtection at 16:35 IST.
 type PositionNeedingProtection struct {
-	EntryOrderID    int64
-	EntrySignalID   string
-	StrategyID      string
-	UserID          string
-	Symbol          string
-	ISIN            string
-	IndiraSymbol    string
-	ExchangeToken   string
-	Exchange        string
-	NetQty          int     // sum(filled BUY) − sum(filled SELL); always > 0 here
-	LatestTrigger   float64 // most recent trail trigger from any prior SL row (0 if no prior SL)
-	LatestLimit     float64
-	EntryFillPrice  float64 // avg_fill_price of the entry BUY order — used as SL fallback when LatestTrigger==0 (e.g. EOD Phase A on entry-same-day positions with no tick-handler trail yet)
+	EntryOrderID   int64
+	EntrySignalID  string
+	StrategyID     string
+	UserID         string
+	Symbol         string
+	ISIN           string
+	IndiraSymbol   string
+	ExchangeToken  string
+	Exchange       string
+	NetQty         int     // sum(filled BUY) − sum(filled SELL); always > 0 here
+	LatestTrigger  float64 // most recent trail trigger from any prior SL row (0 if no prior SL)
+	LatestLimit    float64
+	EntryFillPrice float64 // avg_fill_price of the entry BUY order — used as SL fallback when LatestTrigger==0 (e.g. EOD Phase A on entry-same-day positions with no tick-handler trail yet)
 }
 
 // ListPositionsNeedingProtection enumerates every position that has a filled
@@ -1035,6 +1035,16 @@ func (r *Repository) MarkArmRetriesGivenUpBefore(ctx context.Context, cutoffTrad
 // (a filled SL means the position is already exited; nothing to re-arm).
 // Trade_date must match today's IST date so an AMO row stamped for an
 // earlier session doesn't cause a false positive.
+//
+// A row only counts if it was CREATED after the close of the last session
+// before tradeDate (armedWindowStart). Anything older cannot be a live order
+// for that session — it was placed for an earlier session and either
+// converted+swept or rejected — however its status column reads. 2026-08-18:
+// ten SL_PLACED rows stamped 2026-08-19 but created 00:03 IST on the 18th
+// (a mislabelled arm-retry cycle; the orders were live on the 18th and
+// swept at 15:30) would otherwise have told BOTH the evening Phase A and
+// the 09:14 cron "already protected" for the 19th, leaving ten positions
+// with no broker-side stop.
 func (r *Repository) HasActiveProtectionForToday(ctx context.Context, entryOrderID int64, tradeDate time.Time) (bool, error) {
 	var exists bool
 	err := r.db.QueryRowContext(ctx, `
@@ -1044,9 +1054,29 @@ func (r *Repository) HasActiveProtectionForToday(ctx context.Context, entryOrder
 		      AND  trade_date = $2
 		      AND  order_type IN ('SL_SELL','SL_SELL_AMO')
 		      AND  status NOT IN ('CANCELLED','REJECTED','EXPIRED','FILLED','SL_FILLED','SL_SELL_AMO_REJECTED','AMO_REJECTED')
-		)`, entryOrderID, tradeDate,
+		      AND  created_at >= $3
+		)`, entryOrderID, tradeDate, armedWindowStart(tradeDate),
 	).Scan(&exists)
 	return exists, err
+}
+
+// armedWindowStart is the earliest instant at which a protective order for
+// `tradeDate` can legitimately have been created: 15:30 IST on the last
+// trading day strictly before tradeDate (the previous session's close, when
+// the exchange sweeps DAY orders and brokers open the AMO queue). Used by
+// HasActiveProtectionForToday and InsertAMOOrder so a stale row can never
+// masquerade as live protection for a later session.
+func armedWindowStart(tradeDate time.Time) time.Time {
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	if ist == nil {
+		ist = time.FixedZone("IST", 5*60*60+30*60)
+	}
+	t := tradeDate.In(ist)
+	d := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, ist).Add(-24 * time.Hour)
+	for !indiraClient.IsTradingDay(d) {
+		d = d.Add(-24 * time.Hour)
+	}
+	return d.Add(15*time.Hour + 30*time.Minute)
 }
 
 // InsertAMOOrder writes a new SL_SELL_AMO row for the given position+trade_date
@@ -1079,6 +1109,9 @@ func (r *Repository) InsertAMOOrder(
 		}
 	}()
 
+	// Same window rule as HasActiveProtectionForToday: a row created before
+	// the previous session's close cannot be live protection for tradeDate,
+	// whatever its status says (mislabelled arm-retry rows, 2026-08-18).
 	var existingID int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT id FROM manthan_orders
@@ -1086,8 +1119,9 @@ func (r *Repository) InsertAMOOrder(
 		  AND  trade_date = $2
 		  AND  order_type IN ('SL_SELL','SL_SELL_AMO')
 		  AND  status NOT IN ('CANCELLED','REJECTED','FILLED','EXPIRED','SL_SELL_AMO_REJECTED')
+		  AND  created_at >= $3
 		LIMIT 1`,
-		parentEntryOrderID, tradeDate,
+		parentEntryOrderID, tradeDate, armedWindowStart(tradeDate),
 	).Scan(&existingID)
 	if err == nil {
 		_ = tx.Commit()
@@ -1095,6 +1129,49 @@ func (r *Repository) InsertAMOOrder(
 	}
 	if err != sql.ErrNoRows {
 		return 0, false, fmt.Errorf("check existing: %w", err)
+	}
+
+	// Retire any PRE-WINDOW non-terminal row for this (entry, date) so the
+	// partial UNIQUE index uniq_active_sl_per_day lets the real re-arm in.
+	// Such a row was created before the previous session's close: whatever
+	// its status column says, its broker order (if any) belonged to an
+	// earlier session and was swept/rejected — it is not, and cannot become,
+	// live protection for tradeDate. This is a DB-only status change; no
+	// broker call, nothing cancelled. (2026-08-18: ten such rows.)
+	if _, err = tx.ExecContext(ctx, `
+		UPDATE manthan_orders
+		SET    status = 'EXPIRED',
+		       last_error = COALESCE(NULLIF(last_error, ''), '') ||
+		                    ' | superseded: created before previous session close — cannot be live for trade_date',
+		       updated_at = now()
+		WHERE  parent_order_id = $1
+		  AND  trade_date = $2
+		  AND  order_type IN ('SL_SELL','SL_SELL_AMO')
+		  AND  status NOT IN ('CANCELLED','REJECTED','FILLED','EXPIRED','SL_SELL_AMO_REJECTED')
+		  AND  created_at < $3`,
+		parentEntryOrderID, tradeDate, armedWindowStart(tradeDate),
+	); err != nil {
+		return 0, false, fmt.Errorf("retire stale rows: %w", err)
+	}
+
+	// signal_id must be unique per ATTEMPT, not per (entry, date): the table
+	// has UNIQUE(signal_id), so a REJECTED/CANCELLED sibling for the same
+	// date (dead token at 16:35, exchange sweep, mislabel) would otherwise
+	// block every later re-arm for that session with "duplicate key". That
+	// is exactly how 2026-08-17's ten correctly-dated evening attempts died
+	// every 5 min until midnight. First attempt keeps the historical
+	// "<entry>-amo-<date>" id; retries append "-r<n>".
+	var priorAttempts int
+	if err = tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM manthan_orders
+		WHERE  parent_order_id = $1 AND trade_date = $2 AND order_type = 'SL_SELL_AMO'`,
+		parentEntryOrderID, tradeDate,
+	).Scan(&priorAttempts); err != nil {
+		return 0, false, fmt.Errorf("count prior attempts: %w", err)
+	}
+	amoSignalID := p.EntrySignalID + "-amo-" + tradeDate.Format("20060102")
+	if priorAttempts > 0 {
+		amoSignalID = fmt.Sprintf("%s-r%d", amoSignalID, priorAttempts)
 	}
 
 	err = tx.QueryRowContext(ctx, `
@@ -1107,7 +1184,7 @@ func (r *Repository) InsertAMOOrder(
 		)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,'SELL','CNC',$8,$9,$10,$11,$12,$13,$14,$15,3)
 		RETURNING id`,
-		nullStr(p.EntrySignalID+"-amo-"+tradeDate.Format("20060102")), p.StrategyID, p.UserID,
+		nullStr(amoSignalID), p.StrategyID, p.UserID,
 		p.Symbol, nullStr(p.ISIN), p.Exchange,
 		string(OrderTypeSLSellAMO), p.NetQty, limit, trigger,
 		p.IndiraSymbol, p.ExchangeToken, string(StatusAMOPending),
@@ -1166,8 +1243,8 @@ func (r *Repository) ListPendingAMOForDate(ctx context.Context, tradeDate time.T
 	var out []*AMOReplayRow
 	for rows.Next() {
 		var (
-			row   AMOReplayRow
-			pid   sql.NullInt64
+			row AMOReplayRow
+			pid sql.NullInt64
 		)
 		if err := rows.Scan(&row.ID, &pid, &row.EntrySignalID, &row.StrategyID, &row.UserID,
 			&row.Symbol, &row.IndiraSymbol, &row.ExchangeToken, &row.Exchange,
@@ -1341,13 +1418,13 @@ func nullStr(s string) interface{} {
 // equals the row's own broker_order_id. For SL_SELL / EXIT orders those
 // point at the parent ENTRY row.
 type OrderMeta struct {
-	Found                bool
-	SignalID             string
-	OrderType            string
-	StrategyID           string
-	UserID               string
-	EntrySignalID        string
-	EntryBrokerOrderID   string
+	Found              bool
+	SignalID           string
+	OrderType          string
+	StrategyID         string
+	UserID             string
+	EntrySignalID      string
+	EntryBrokerOrderID string
 
 	// AvgFillPrice — this row's real avg fill price from manthan_orders.
 	// 0 when the fill hasn't arrived (or the order didn't fill). Positions
@@ -1361,8 +1438,8 @@ type OrderMeta struct {
 	// pull an SL that arrived on Kafka BEFORE the parent BUY event (which
 	// would otherwise be dropped by the state machine as "no parent").
 	// Both are 0 / "" when no SL row exists.
-	SLTriggerPrice    float64
-	SLBrokerOrderID   string
+	SLTriggerPrice  float64
+	SLBrokerOrderID string
 }
 
 // LookupOrderMeta resolves a broker_order_id to its Manthan lineage.
@@ -1458,9 +1535,9 @@ func (r *Repository) LookupOrderMeta(ctx context.Context, brokerOrderID string) 
 		UserID:             userID,
 		EntrySignalID:      esID,
 		EntryBrokerOrderID: ebID,
-		AvgFillPrice:       avgFillPrice.Float64,     // 0 when NULL
-		SLTriggerPrice:     slTriggerPrice.Float64,   // 0 when no SL row exists
-		SLBrokerOrderID:    slBrokerOrderID.String,   // "" when no SL row exists
+		AvgFillPrice:       avgFillPrice.Float64,   // 0 when NULL
+		SLTriggerPrice:     slTriggerPrice.Float64, // 0 when no SL row exists
+		SLBrokerOrderID:    slBrokerOrderID.String, // "" when no SL row exists
 	}, nil
 }
 
@@ -1472,8 +1549,8 @@ type OrderContext struct {
 	UserID       string
 	IndiraSymbol string // wire form: STK_AADHARHFC_EQ_NSE_23729
 	Exchange     string
-	OrderSide    string      // BUY / SELL
-	OrderType    OrderType   // LIMIT_BUY / SL_SELL etc.
+	OrderSide    string    // BUY / SELL
+	OrderType    OrderType // LIMIT_BUY / SL_SELL etc.
 	Qty          int
 }
 

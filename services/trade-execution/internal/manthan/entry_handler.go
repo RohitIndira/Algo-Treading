@@ -22,6 +22,12 @@ import (
 // classifier tokens.
 var ErrUpperCircuitHold = errors.New("upper-circuit hold")
 
+// ErrPreOpenHold marks an entry that arrived before the 09:15 IST open. Same
+// contract as ErrUpperCircuitHold: a wait state the classifier parks in the
+// PRE_OPEN retry class (precise wake at 09:15:10, no attempt burn) rather
+// than DLQ-ing as POISON. Message never contains classifier tokens.
+var ErrPreOpenHold = errors.New("pre-open hold")
+
 // EntryHandler manages LIMIT BUY order placement with WSS-based fill detection.
 //
 // LIVE mode flow:
@@ -34,7 +40,8 @@ var ErrUpperCircuitHold = errors.New("upper-circuit hold")
 //  7. After fill: trigger SL placement immediately
 //
 // PAPER mode:
-//  - Instant fill at live LTP (no broker call, no WSS)
+//   - Instant fill at live LTP (no broker call, no WSS)
+//
 // AuthProvider fetches fresh broker auth credentials for a user.
 type AuthProvider func(userID string) *BrokerAuth
 
@@ -42,12 +49,12 @@ type AuthProvider func(userID string) *BrokerAuth
 type WSSSubscriber func(userID, bearerToken, appID, source string) error
 
 type EntryHandler struct {
-	broker        *BrokerAdapter
-	repo          *Repository
-	preCheck      *PreChecker
-	slHandler     *SLHandler
-	wssBridge     *WSSBridge
-	authProvider  AuthProvider
+	broker       *BrokerAdapter
+	repo         *Repository
+	preCheck     *PreChecker
+	slHandler    *SLHandler
+	wssBridge    *WSSBridge
+	authProvider AuthProvider
 	// refreshAuth invalidates the credentials cache for a user and returns
 	// fresh credentials from DB. Called when a broker call returns
 	// AU004/401 — the cached bearer may be stale (browser re-login kills
@@ -60,8 +67,8 @@ type EntryHandler struct {
 	// FILL_CONFIRMED/FILL_UPDATE types alongside the canonical ENTRY_FILLED/
 	// ENTRY_PARTIAL_FILL — so existing rules-engine consumers keep working
 	// during the cutover.
-	eventPub      *ManthanEventPublisher
-	logger        *zap.Logger
+	eventPub *ManthanEventPublisher
+	logger   *zap.Logger
 
 	// Optional SESSION_EXPIRED publisher — nil-safe.
 	authNotif AuthExpiryNotifier
@@ -198,6 +205,15 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 				zap.String("symbol", signal.Symbol),
 				zap.String("user", signal.UserID))
 			return 0, fmt.Errorf("%w: %s", ErrUpperCircuitHold, check.Reason)
+		}
+		// PRE-OPEN HOLD: the daily 09:00 IST publish (and 08:45–09:15 sheet
+		// edits) always arrive before the bell. Park the row until 09:15 —
+		// it is the same signal, just early. No EntryRejected publish.
+		if strings.Contains(check.Reason, ReasonPreOpen) {
+			h.logger.Info("Entry on hold — market not open yet, will place at 09:15 IST",
+				zap.String("symbol", signal.Symbol),
+				zap.String("user", signal.UserID))
+			return 0, fmt.Errorf("%w: %s", ErrPreOpenHold, check.Reason)
 		}
 		h.logger.Info("Entry pre-check failed",
 			zap.String("symbol", signal.Symbol),
@@ -627,7 +643,7 @@ func (h *EntryHandler) marketFallback(ctx context.Context, auth BrokerAuth, sign
 type fillAction int
 
 const (
-	actionRetry         fillAction = iota
+	actionRetry fillAction = iota
 	actionFilled
 	actionPartialFilled
 	actionRejected

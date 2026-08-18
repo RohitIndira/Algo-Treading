@@ -2,37 +2,40 @@
 // for every open Manthan position as an AMO (After-Market Order) on Indira.
 //
 // Why this exists:
-//   Indira auto-cancels DAY-validity SL orders at 15:30 IST every trading
-//   day (no GTT/GTC support). Without action, every open position sits
-//   unprotected from 15:30 until the next morning's 09:14 cron re-arms a
-//   fresh SL. That 17-hour gap is the worst-case exposure for an overnight
-//   Manthan position; a gap-down at open with no SL queued can blow
-//   through the original entry by an arbitrary amount before our morning
-//   cron has a chance to react.
+//
+//	Indira auto-cancels DAY-validity SL orders at 15:30 IST every trading
+//	day (no GTT/GTC support). Without action, every open position sits
+//	unprotected from 15:30 until the next morning's 09:14 cron re-arms a
+//	fresh SL. That 17-hour gap is the worst-case exposure for an overnight
+//	Manthan position; a gap-down at open with no SL queued can blow
+//	through the original entry by an arbitrary amount before our morning
+//	cron has a chance to react.
 //
 // What this does:
-//   At 16:35 IST (comfortably after the 15:30 broker auto-cancel) we walk every OPEN
-//   position from manthan_positions, compute the SL trigger from the
-//   carried TSL trail (falling back to entry_fill_price × 0.92 when no
-//   trail exists yet), DPR-clamp and tick-align it, then submit to Indira
-//   as an AMO+SL via BrokerAdapter.PlaceAMOSLSell. The AMO sits in
-//   Indira's overnight queue and is released at 09:00 IST the next trading
-//   day — meaning the position is protected from the moment the market
-//   opens, not from 09:14 onward.
+//
+//	At 16:35 IST (comfortably after the 15:30 broker auto-cancel) we walk every OPEN
+//	position from manthan_positions, compute the SL trigger from the
+//	carried TSL trail (falling back to entry_fill_price × 0.92 when no
+//	trail exists yet), DPR-clamp and tick-align it, then submit to Indira
+//	as an AMO+SL via BrokerAdapter.PlaceAMOSLSell. The AMO sits in
+//	Indira's overnight queue and is released at 09:00 IST the next trading
+//	day — meaning the position is protected from the moment the market
+//	opens, not from 09:14 onward.
 //
 // What this does NOT do (deferred to next commit):
 //   - Layer 4 retry queue for users whose JWT was expired at 16:35
 //   - Earlier JWT-expiry alert at 14:30 IST so users can re-login in time
-//   The 09:14 cron remains the per-day fallback for any positions this
-//   cycle couldn't arm — see protective_replay.go for the modification
-//   that makes the morning cron skip AMOs that already converted to live SL.
+//     The 09:14 cron remains the per-day fallback for any positions this
+//     cycle couldn't arm — see protective_replay.go for the modification
+//     that makes the morning cron skip AMOs that already converted to live SL.
 //
 // Concurrency:
-//   Runs in the same goroutine as scheduleDaily — sequential per position.
-//   We do NOT parallelise broker calls; Indira rate-limits AMO submission
-//   and the volume is small (≤ MaxPositions per user, ≤ 25 in production).
-//   InsertAMOOrder is idempotent via a partial UNIQUE on (parent_order_id,
-//   trade_date) so re-running the cycle after a crash / deploy is safe.
+//
+//	Runs in the same goroutine as scheduleDaily — sequential per position.
+//	We do NOT parallelise broker calls; Indira rate-limits AMO submission
+//	and the volume is small (≤ MaxPositions per user, ≤ 25 in production).
+//	InsertAMOOrder is idempotent via a partial UNIQUE on (parent_order_id,
+//	trade_date) so re-running the cycle after a crash / deploy is safe.
 package manthan
 
 import (
@@ -348,8 +351,30 @@ func (p *ProtectiveReplay) RunEODPhaseANow(ctx context.Context) {
 // nextTradingDate returns the IST date of the next trading session strictly
 // after `now`. Used to stamp the AMO row's trade_date so subsequent cycles
 // (and the morning skip-if-protected check) match by exact date.
+// nextTradingDate returns the SESSION an AMO submitted at `now` will enter —
+// which is what trade_date must record. Indira releases queued AMOs at 09:00
+// of the next session to open, so:
+//   - after the 15:30 close on a trading day → the next trading day;
+//   - BEFORE the close (00:03 arm-retry, 08:50 pre-open, a Saturday) → the
+//     first trading day that is today-or-later.
+//
+// The previous version was calendar-tomorrow unconditionally. The
+// ArmRetryWorker re-runs this cycle every 5 min around the clock while a
+// user is queued, so its 00:03 IST cycle stamped AMOs that really entered
+// TODAY's session with TOMORROW's date. Consequences seen 2026-08-18: the
+// same-evening 16:35 cycle then found "already armed" for tomorrow (a dead,
+// swept order) and placed nothing; the 09:14 morning cron trusted the same
+// row and skipped; and yesterday's correctly-dated attempts had all died on
+// the signal_id UNIQUE (see InsertAMOOrder) — the book was protected only
+// by accident. Callers that need the label of a *manual* mid-session run
+// get today, which is also what the broker does with it.
 func (p *ProtectiveReplay) nextTradingDate(now time.Time) time.Time {
-	d := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, p.ist).Add(24 * time.Hour)
+	n := now.In(p.ist)
+	d := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, p.ist)
+	closeAt := d.Add(15*time.Hour + 30*time.Minute)
+	if !n.Before(closeAt) {
+		d = d.Add(24 * time.Hour)
+	}
 	for !indiraClient.IsTradingDay(d) {
 		d = d.Add(24 * time.Hour)
 	}

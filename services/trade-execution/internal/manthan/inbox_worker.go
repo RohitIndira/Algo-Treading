@@ -23,14 +23,15 @@ import (
 // DLQ exactly once.
 //
 // Backoff policy (per attempt):
-//   AUTH_EXPIRED   30 s     — gate-driven; the auth-restored hook also
-//                              wakes us early via the workCh.
-//   BROKER_REJECT  exp      — 1 s, 2 s, 4 s … capped at 5 min, max 50.
-//   TRANSIENT      exp      — same as BROKER_REJECT.
-//   POISON         DLQ      — never retry; operator pages.
-//   UPPER_CIRCUIT  retry    — flat 3min, attempts NOT counted; entry is
-//                             placeable the moment the band releases. Ends
-//                             via the 15:20 market-close pre-check (POISON).
+//
+//	AUTH_EXPIRED   30 s     — gate-driven; the auth-restored hook also
+//	                           wakes us early via the workCh.
+//	BROKER_REJECT  exp      — 1 s, 2 s, 4 s … capped at 5 min, max 50.
+//	TRANSIENT      exp      — same as BROKER_REJECT.
+//	POISON         DLQ      — never retry; operator pages.
+//	UPPER_CIRCUIT  retry    — flat 3min, attempts NOT counted; entry is
+//	                          placeable the moment the band releases. Ends
+//	                          via the 15:20 market-close pre-check (POISON).
 type InboxWorker struct {
 	repo      *Repository
 	entry     *EntryHandler
@@ -229,9 +230,9 @@ func (w *InboxWorker) processRow(ctx context.Context, row *InboxRow) {
 		// would DLQ the hold mid-session). Keeping UPPER_CIRCUIT preserves
 		// the no-burn policy and the 3-min cadence; the on-login wake plus
 		// that cadence resumes the hold within ~3 min of re-login.
-		if row.LastErrorClass == InboxErrUpperCircuit {
-			w.markFailed(ctx, row, InboxErrUpperCircuit,
-				"auth gate while at upper-circuit hold — session expired")
+		if isHoldClass(row.LastErrorClass) {
+			w.markFailed(ctx, row, row.LastErrorClass,
+				"auth gate while on hold ("+row.LastErrorClass+") — session expired")
 			return
 		}
 		w.markFailed(ctx, row, InboxErrAuthExpired,
@@ -349,7 +350,7 @@ func (w *InboxWorker) markFailed(ctx context.Context, row *InboxRow, class, msg 
 	// 15:20 IST the same row fails "too close to market close" (POISON) and
 	// dead-letters cleanly at end of session. The computed value is passed
 	// to MarkInboxFailed verbatim (the SQL no longer increments on its own).
-	if class == InboxErrUpperCircuit {
+	if isHoldClass(class) {
 		attempts = row.Attempts
 	}
 	if attempts >= w.maxAttempts {
@@ -403,6 +404,9 @@ func classifyHandlerErr(err error) string {
 	if errors.Is(err, ErrUpperCircuitHold) {
 		return InboxErrUpperCircuit
 	}
+	if errors.Is(err, ErrPreOpenHold) {
+		return InboxErrPreOpen
+	}
 	var pe poisonError
 	if errors.As(err, &pe) {
 		return InboxErrPoison
@@ -447,6 +451,11 @@ func backoffFor(class string, attempts int) time.Duration {
 	if class == InboxErrUpperCircuit {
 		return 3 * time.Minute
 	}
+	// Pre-open holds: wake precisely at 09:15:10 IST (a few seconds after
+	// the bell so the LTP feed has a live tick), never sooner than 30 s.
+	if class == InboxErrPreOpen {
+		return untilMarketOpen(time.Now())
+	}
 	const cap = 5 * time.Minute
 	exp := attempts
 	if exp > 8 {
@@ -455,6 +464,32 @@ func backoffFor(class string, attempts int) time.Duration {
 	d := time.Duration(1<<uint(exp)) * time.Second
 	if d > cap {
 		return cap
+	}
+	return d
+}
+
+// isHoldClass reports whether an inbox error class is a WAIT state (the
+// condition self-resolves with time) rather than a failure. Hold classes do
+// not burn attempts and keep their class through an auth outage.
+func isHoldClass(class string) bool {
+	return class == InboxErrUpperCircuit || class == InboxErrPreOpen
+}
+
+// untilMarketOpen returns how long to sleep so the next attempt lands at
+// 09:15:10 IST today (10 s past the bell so the LTP feed has a live tick).
+// If that instant has already passed — the hold was set at 09:14:59 and we
+// are now at 09:15:30, or the clock is odd — fall back to 30 s so the row
+// simply re-runs the pre-check, which will now pass.
+func untilMarketOpen(now time.Time) time.Duration {
+	loc, _ := time.LoadLocation("Asia/Kolkata")
+	if loc == nil {
+		loc = time.FixedZone("IST", 5*60*60+30*60)
+	}
+	n := now.In(loc)
+	open := time.Date(n.Year(), n.Month(), n.Day(), 9, 15, 10, 0, loc)
+	d := open.Sub(n)
+	if d < 30*time.Second {
+		return 30 * time.Second
 	}
 	return d
 }

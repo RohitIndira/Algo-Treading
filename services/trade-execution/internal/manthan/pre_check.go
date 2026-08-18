@@ -11,9 +11,9 @@ import (
 
 // PreChecker validates preconditions before placing any order.
 type PreChecker struct {
-	repo    *Repository
-	broker  *BrokerAdapter
-	logger  *zap.Logger
+	repo   *Repository
+	broker *BrokerAdapter
+	logger *zap.Logger
 }
 
 func NewPreChecker(repo *Repository, broker *BrokerAdapter, logger *zap.Logger) *PreChecker {
@@ -26,7 +26,7 @@ type PreCheckResult struct {
 	Reason     string
 }
 
-func pass() PreCheckResult { return PreCheckResult{CanProceed: true} }
+func pass() PreCheckResult              { return PreCheckResult{CanProceed: true} }
 func fail(reason string) PreCheckResult { return PreCheckResult{CanProceed: false, Reason: reason} }
 
 // CheckEntry runs all pre-checks before a LIMIT BUY.
@@ -126,6 +126,17 @@ func (p *PreChecker) CheckSLModify(ctx context.Context, signal SLModifySignal, i
 // literal here would silently revert to the DLQ behavior, so keep them tied.
 const ReasonUpperCircuit = "stock at upper circuit — skip entry"
 
+// ReasonPreOpen is the pre-check reason for an entry that arrived BEFORE the
+// 09:15 IST open. Like ReasonUpperCircuit it is a WAIT state, not a
+// rejection: the daily 09:00 IST publish (and any sheet edit inside the
+// 08:45–09:15 watch window) lands entries here every single morning. The
+// entry handler matches on this literal to return ErrPreOpenHold, which the
+// inbox classifier maps to the PRE_OPEN retry class (wake at 09:15:10, no
+// attempt burn) instead of POISON/DLQ. 2026-08-17: all 26 of FIV99's
+// Monday-morning entries were DLQ'd on attempt 1 by exactly this reason,
+// and 2026-08-18's cron-time entries would have died the same way.
+const ReasonPreOpen = "market not open yet (before 9:15)"
+
 // checkMarketHours validates we're within trading hours.
 // Entry orders rejected before 9:15 and after 15:20 (last 10 min buffer).
 //
@@ -156,7 +167,7 @@ func (p *PreChecker) checkMarketHours() PreCheckResult {
 	marketClose := 15*60 + 20 // 15:20 (10 min buffer before 15:30)
 
 	if minuteOfDay < marketOpen {
-		return fail("market not open yet (before 9:15)")
+		return fail(ReasonPreOpen)
 	}
 	if minuteOfDay >= marketClose {
 		if os.Getenv("MANTHAN_TEST_SKIP_CLOSE_CUTOFF") == "1" {
