@@ -180,6 +180,27 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 		// only protects the outer portfolios map. Inner Positions writes
 		// must take the per-types.Portfolio Mu so concurrent LTPFeed poll +
 		// allocator + fill consumer don't trip the concurrent-map panic.
+		// Self-heal a stop that is TIGHTER than the trail rule allows. With
+		// a stop distance of slPct, CurrentSL can never legitimately exceed
+		// HighSinceEntry × (1 − slPct/100): every ratchet sets exactly that
+		// from the high at the time. Anything above it is corrupt state —
+		// 2026-08-18: a "TEST MODE" 0.98 initial stop (allocator) had been
+		// persisted for every entry; each restart rehydrated it and the next
+		// 2% dip "exited" real positions (SHANTIGOLD, FILATEX, GNA,
+		// NRBBEARING; ALIVUS was still armed at 98%). Clamping only ever
+		// LOWERS such a stop to the rule's own level, never below it.
+		if maxSL := high * (1 - effectiveStopLossPct(strategy.StopLossPct)/100); sl > maxSL+0.005 && high > 0 {
+			pm.logger.Warn("Rehydrate: stop-loss tighter than trail rule permits — clamping to rule level",
+				zap.String("strategy_id", strategyID), zap.String("symbol", symbol),
+				zap.Float64("persisted_sl", sl), zap.Float64("high", high), zap.Float64("rule_sl", maxSL))
+			sl = maxSL
+			if _, uerr := db.ExecContext(ctx, `
+				UPDATE manthan_positions SET current_sl = $1, updated_at = now()
+				WHERE strategy_id = $2 AND symbol = $3 AND status = 'ACTIVE' AND current_sl > $1`,
+				sl, strategyID, symbol); uerr != nil {
+				pm.logger.Warn("Rehydrate: persisting clamped SL failed (memory clamped; DB retried next restart)", zap.Error(uerr))
+			}
+		}
 		p := pm.GetOrCreate(*strategy)
 		p.Mu.Lock()
 		p.Positions[symbol] = &types.Position{
@@ -236,6 +257,55 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 	}
 	if err := rows.Err(); err != nil {
 		return restored, orphans, 0, fmt.Errorf("iterate rows: %w", err)
+	}
+
+	// Recent PENDING_ENTRY rows (dispatched, fill not yet confirmed) are
+	// reloaded as in-memory pendings so that (a) a restart inside the
+	// dispatch→fill window — 15 min every morning under the pre-open hold,
+	// hours under an upper-circuit hold — keeps the slot/cap reservation and
+	// (b) the fill confirmation finds its position (ProcessFillEvent is a
+	// no-op for unknown symbols). Older pendings are dead by construction
+	// (entries cannot fill after the 15:20 IST cutoff) and are left for the
+	// scanner to EXPIRE.
+	pendings := 0
+	if prows, perr := db.QueryContext(ctx, `
+		SELECT strategy_id, symbol, COALESCE(isin,''), COALESCE(industry,''), COALESCE(mcap_bucket,''),
+		       COALESCE(index_name,''), entry_price, quantity, COALESCE(invested_amt, entry_price*quantity),
+		       COALESCE(ema_alloc_pct,0), entry_time
+		FROM manthan_positions
+		WHERE status = 'PENDING_ENTRY' AND entry_time > now() - $1::interval`,
+		fmt.Sprintf("%d seconds", int(PendingEntryTTL.Seconds()))); perr != nil {
+		pm.logger.Warn("Rehydrate: pending-entry query failed (pendings not reloaded)", zap.Error(perr))
+	} else {
+		defer prows.Close()
+		for prows.Next() {
+			var strategyID, symbol, isin, industry, bucket, index string
+			var entryPrice, invested, emaPct float64
+			var qty int32
+			var entryTime time.Time
+			if err := prows.Scan(&strategyID, &symbol, &isin, &industry, &bucket, &index,
+				&entryPrice, &qty, &invested, &emaPct, &entryTime); err != nil {
+				continue
+			}
+			strategy := strategyByID(strategyID)
+			if strategy == nil {
+				continue
+			}
+			p := pm.GetOrCreate(*strategy)
+			p.Mu.Lock()
+			if _, exists := p.Positions[symbol]; !exists {
+				p.Positions[symbol] = &types.Position{
+					Symbol: symbol, ISIN: isin, Industry: industry, MCapBucket: bucket, IndexName: index,
+					EntryPrice: entryPrice, EntryTime: entryTime, Quantity: qty, InvestedAmt: invested,
+					State: types.StatePendingEntry, Active: false,
+				}
+				pendings++
+			}
+			p.Mu.Unlock()
+		}
+	}
+	if pendings > 0 {
+		pm.logger.Info("Rehydrate: pending entries reloaded (slot/cap reservations kept)", zap.Int("pending", pendings))
 	}
 
 	// Evict stale Redis keys that have no corresponding ACTIVE DB row.
@@ -394,6 +464,43 @@ func (pm *PortfolioManager) CleanupOrphans(
 // file). user-config is the single owner of the strategies table per
 // docs/architecture/data-ownership.md.
 
+// PendingEntryTTL bounds how long a dispatched entry may stay PENDING_ENTRY
+// (DB row and in-memory reservation) without a fill confirmation. Entries
+// are placed intraday only (pre-check rejects after 15:20 IST; upper-circuit
+// and pre-open holds end at the close), so 8 h after dispatch an unfilled
+// entry is dead by construction — and it must release its slot/cap before
+// the next morning's 09:00 batch. Kept well above the longest legitimate
+// wait (09:00 dispatch → 15:19 upper-circuit release ≈ 6.3 h).
+const PendingEntryTTL = 8 * time.Hour
+
+// ExpireStalePendingsInMemory drops PENDING_ENTRY positions older than ttl
+// from every portfolio and returns how many were released. Memory-only:
+// the DB row is retired by the scanner's UPDATE with the same TTL.
+func (pm *PortfolioManager) ExpireStalePendingsInMemory(ttl time.Duration) int {
+	pm.mu.RLock()
+	ports := make([]*types.Portfolio, 0, len(pm.portfolios))
+	for _, p := range pm.portfolios {
+		ports = append(ports, p)
+	}
+	pm.mu.RUnlock()
+	released := 0
+	cutoff := time.Now().Add(-ttl)
+	for _, p := range ports {
+		p.Mu.Lock()
+		for sym, pos := range p.Positions {
+			if pos.State == types.StatePendingEntry && !pos.Active && !pos.EntryTime.IsZero() && pos.EntryTime.Before(cutoff) {
+				delete(p.Positions, sym)
+				released++
+				pm.logger.Warn("Stale PENDING_ENTRY released — entry never filled",
+					zap.String("strategy_id", p.StrategyID), zap.String("symbol", sym),
+					zap.Time("dispatched_at", pos.EntryTime))
+			}
+		}
+		p.Mu.Unlock()
+	}
+	return released
+}
+
 // StartOrphanScanner runs CleanupOrphans on a ticker. Blocks until ctx
 // cancelled. Intended to be launched once from main() in a goroutine.
 func (pm *PortfolioManager) StartOrphanScanner(
@@ -422,18 +529,23 @@ func (pm *PortfolioManager) StartOrphanScanner(
 			} else if cleaned > 0 {
 				pm.logger.Info("Orphan scanner pass", zap.Int("cleaned", cleaned))
 			}
-			// Expire PENDING_ENTRY rows whose fill never confirmed within a
-			// session (dispatches that died at trade-execution). Keeps the
-			// book free of stale dispatch clutter (2026-08-18 phantom fix).
+			// Expire PENDING_ENTRY rows whose fill never confirmed within
+			// PendingEntryTTL (dispatches that died at trade-execution) —
+			// in the DB and in memory, so a dead dispatch releases its
+			// slot/cap reservation before the next morning's batch.
 			if db != nil {
 				if res, err := db.ExecContext(ctx, `
 					UPDATE manthan_positions
 					SET status='EXPIRED', exit_reason='ENTRY_NEVER_FILLED', updated_at=now()
-					WHERE status='PENDING_ENTRY' AND entry_time < now() - interval '24 hours'`); err == nil {
+					WHERE status='PENDING_ENTRY' AND entry_time < now() - $1::interval`,
+					fmt.Sprintf("%d seconds", int(PendingEntryTTL.Seconds()))); err == nil {
 					if n, _ := res.RowsAffected(); n > 0 {
 						pm.logger.Info("Orphan scanner: expired stale PENDING_ENTRY rows", zap.Int64("expired", n))
 					}
 				}
+			}
+			if n := pm.ExpireStalePendingsInMemory(PendingEntryTTL); n > 0 {
+				pm.logger.Info("Orphan scanner: released stale in-memory pendings", zap.Int("released", n))
 			}
 		}
 	}

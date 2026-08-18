@@ -271,11 +271,15 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			// the Manthan spec default — this only seeds rules-engine's OWN SL
 			// bookkeeping (trade-execution owns the real broker SLs).
 			ConfirmFill: func(strategyID, symbol string, price float64, qty int32) {
-				m.portfolioMgr.ConfirmFill(strategyID, symbol, price, qty, slMgr, 20)
+				// ONE stop distance for memory and DB — the strategy's config.
+				slPct := m.portfolioMgr.StopLossPct(strategyID)
+				m.portfolioMgr.ConfirmFill(strategyID, symbol, price, qty, slMgr, slPct)
 				// Promote the DB row PENDING_ENTRY → ACTIVE with the real fill
-				// (the row is born PENDING at dispatch; only a confirmed fill
-				// makes it ACTIVE — the 2026-08-18 phantom-row fix).
-				_ = m.publisher.PersistFillConfirmed(context.Background(), strategyID, symbol, price, qty)
+				// AND the post-fill SL/high/trail (the row is born PENDING at
+				// dispatch; only a confirmed fill makes it ACTIVE — the
+				// 2026-08-18 phantom-row fix; persisting the SL here is what
+				// stops a restart from rehydrating the provisional stop).
+				_ = m.publisher.PersistFillConfirmed(context.Background(), strategyID, symbol, price, qty, slPct)
 			},
 			// Broker-confirmed exits release memory + book the DB exit with
 			// the REAL reason. tick_handler no longer books at trail-cross.

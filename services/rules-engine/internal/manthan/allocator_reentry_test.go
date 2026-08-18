@@ -78,3 +78,26 @@ func TestAllocator_BlocksReentryForAnyTrackedNonExitedState(t *testing.T) {
 		t.Errorf("fresh symbol was not allocated; skips=%v", skipped)
 	}
 }
+
+// Pendings must reserve their slot AND their sector/bucket cap from dispatch,
+// otherwise every signal in a morning batch (one Kafka message each) sees the
+// same free slot while earlier dispatches are still unfilled — 2026-08-17:
+// FIV99 dispatched 26 entries on a 25-slot book.
+func TestCaps_PendingEntriesOccupySlotsAndBuckets(t *testing.T) {
+	positions := map[string]*types.Position{
+		"A": {Symbol: "A", Industry: "Auto", MCapBucket: "SMALL", State: types.StatePendingEntry, Active: false},
+		"B": {Symbol: "B", Industry: "Auto", MCapBucket: "SMALL", State: types.StateActive, Active: true},
+		"C": {Symbol: "C", Industry: "Auto", MCapBucket: "SMALL", State: types.StateExitPending, Active: true},
+		"X": {Symbol: "X", Industry: "Auto", MCapBucket: "SMALL", State: types.StateExited, Active: false},
+	}
+	if got := countActive(positions); got != 3 {
+		t.Fatalf("occupied slots = %d, want 3 (pending + active + exit-pending; exited excluded)", got)
+	}
+	caps := types.NewCapCheck(4, positions) // MaxPerSector = 1, MaxPerBucket = 2
+	if caps.SectorCount["Auto"] != 3 || caps.BucketCount["SMALL"] != 3 {
+		t.Fatalf("cap counters = sector %d / bucket %d, want 3/3", caps.SectorCount["Auto"], caps.BucketCount["SMALL"])
+	}
+	if ok, _ := caps.CanAdd("Auto", "SMALL"); ok {
+		t.Fatal("cap must be reached with pendings counted")
+	}
+}

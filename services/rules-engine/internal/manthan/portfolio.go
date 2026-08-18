@@ -42,11 +42,40 @@ func (pm *PortfolioManager) GetOrCreate(strategy types.UserStrategy) *types.Port
 		CurrentCapital: strategy.TotalCapital,
 		MaxPositions:   strategy.MaxPositions,
 		PerStockBase:   strategy.TotalCapital / float64(strategy.MaxPositions),
+		StopLossPct:    effectiveStopLossPct(strategy.StopLossPct),
 		Positions:      make(map[string]*types.Position),
 		Cooldown:       make(map[string]*types.CooldownEntry),
 	}
 	pm.portfolios[strategy.StrategyID] = p
 	return p
+}
+
+// DefaultStopLossPct is Manthan's stop distance when a strategy config
+// carries no explicit value. Kept as ONE constant so allocator (initial SL),
+// fill-confirm (post-fill SL) and DB persistence can never disagree.
+const DefaultStopLossPct = 20.0
+
+// effectiveStopLossPct guards against a zero/negative config value: a 0%
+// stop would exit on the first tick, so anything non-positive falls back to
+// the default rather than being trusted.
+func effectiveStopLossPct(v float64) float64 {
+	if v <= 0 || v >= 100 {
+		return DefaultStopLossPct
+	}
+	return v
+}
+
+// StopLossPct returns the strategy's configured stop distance (percent) for
+// a known portfolio, or DefaultStopLossPct when the portfolio has not been
+// created yet.
+func (pm *PortfolioManager) StopLossPct(strategyID string) float64 {
+	pm.mu.RLock()
+	p, ok := pm.portfolios[strategyID]
+	pm.mu.RUnlock()
+	if !ok {
+		return DefaultStopLossPct
+	}
+	return effectiveStopLossPct(p.StopLossPct)
 }
 
 // Get returns a portfolio if it exists.
@@ -99,7 +128,7 @@ func (pm *PortfolioManager) AddPosition(strategyID string, alloc types.Allocatio
 		Quantity:    alloc.Quantity,
 		InvestedAmt: alloc.PerCallActual,
 		State:       types.StatePendingEntry, // NOT active until fill confirmed
-		Active:      false,             // trailing SL disabled until ACTIVE
+		Active:      false,                   // trailing SL disabled until ACTIVE
 	}
 	// Inner write — Mu guards Positions against concurrent external readers
 	// (LTPFeed poll, allocator cap-check, publisher snapshot).
@@ -239,8 +268,21 @@ func (pm *PortfolioManager) MarkExitPending(strategyID, symbol string) {
 	defer p.Mu.Unlock()
 	if pos, ok := p.Positions[symbol]; ok && pos.State == types.StateActive {
 		pos.State = types.StateExitPending
+		pos.ExitPendingSince = time.Now()
 	}
 }
+
+// ExitPendingTTL bounds how long a position may sit EXIT_PENDING without a
+// broker confirmation before the tick loop hands it back to ACTIVE. The
+// downstream inbox retries an SL_EXIT for up to ~25 min (AUTH_EXPIRED) /
+// several hours (TRANSIENT) before DLQ, and a real market sell confirms in
+// seconds — so 45 min of silence means the command is dead, not slow.
+// Reverting is memory-only and safe: same-day re-fire at the same SL level
+// is deduplicated by the (date, level) signal_id, so at worst the position
+// resumes trailing and re-fires under tomorrow's id. Without this, a
+// position whose exit died (2026-08-18: FIV99 SHANTIGOLD, dead token) would
+// stay frozen — no trail, no re-fire — until someone restarted the service.
+const ExitPendingTTL = 45 * time.Minute
 
 func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice float64) float64 {
 	pm.mu.RLock()

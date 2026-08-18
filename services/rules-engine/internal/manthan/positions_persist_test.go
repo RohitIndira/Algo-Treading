@@ -103,7 +103,7 @@ func TestPersist_TrailPersists(t *testing.T) {
 	_ = p.PersistPositionOpen(context.Background(), testEntryOrder())
 	// New lifecycle: rows are born PENDING_ENTRY; the fill confirmation
 	// promotes to ACTIVE — only then do trails apply.
-	if err := p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10); err != nil {
+	if err := p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10, 20); err != nil {
 		t.Fatalf("confirm: %v", err)
 	}
 
@@ -127,7 +127,7 @@ func TestRestart_ResumesTrailAtExactLevel(t *testing.T) {
 	p := &ManthanPublisher{db: db, logger: zap.NewNop()}
 
 	_ = p.PersistPositionOpen(context.Background(), testEntryOrder())
-	_ = p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10)
+	_ = p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10, 20)
 	// two ratchets: 80 -> 83.20 -> 88.00 (high 104 -> 110)
 	_ = p.PersistTrail(context.Background(), persistStrategyID,
 		types.Position{Symbol: persistSymbol, CurrentSL: 83.20, HighSinceEntry: 104.00, LastTrailLevel: 104.00})
@@ -181,7 +181,7 @@ func TestPersist_ExitMarksExited(t *testing.T) {
 	defer cleanPersist(t, db)
 	p := &ManthanPublisher{db: db, logger: zap.NewNop()}
 	_ = p.PersistPositionOpen(context.Background(), testEntryOrder())
-	_ = p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10)
+	_ = p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 100.00, 10, 20)
 
 	if err := p.PersistExit(context.Background(), persistStrategyID, persistSymbol, 88.00, -120.00, "SL_TRIGGER"); err != nil {
 		t.Fatalf("exit: %v", err)
@@ -222,7 +222,7 @@ func TestPersist_DispatchIsPendingUntilFillConfirmed(t *testing.T) {
 	}
 
 	// Fill confirmation promotes with the REAL fill price/qty.
-	if err := p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 101.50, 9); err != nil {
+	if err := p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 101.50, 9, 20); err != nil {
 		t.Fatal(err)
 	}
 	var qty int
@@ -233,5 +233,51 @@ func TestPersist_DispatchIsPendingUntilFillConfirmed(t *testing.T) {
 	}
 	if status != "ACTIVE" || qty != 9 || entry != 101.50 {
 		t.Fatalf("promotion wrong: status=%s qty=%d entry=%.2f (want ACTIVE/9/101.50)", status, qty, entry)
+	}
+	// The promoted row carries the POST-FILL stop/high/trail exactly as the
+	// in-memory book (InitPosition) holds them — a restart rehydrates the
+	// same 20% stop, never the provisional dispatch-time value.
+	var sl, high, trail float64
+	if err := db.QueryRow(`SELECT current_sl, high_since_entry, last_trail_level FROM manthan_positions WHERE strategy_id=$1 AND symbol=$2`,
+		persistStrategyID, persistSymbol).Scan(&sl, &high, &trail); err != nil {
+		t.Fatal(err)
+	}
+	if sl != 81.20 || high != 101.50 || trail != 101.50 {
+		t.Fatalf("post-fill state wrong: sl=%.2f high=%.2f trail=%.2f (want 81.20/101.50/101.50 = fill×0.80)", sl, high, trail)
+	}
+	// A late/duplicate confirmation on an already-ACTIVE row must never
+	// LOWER a trailed stop (ratchet): trail to 90, re-confirm at 101.50 → 90 stays.
+	if err := p.PersistTrail(context.Background(), persistStrategyID, types.Position{
+		Symbol: persistSymbol, CurrentSL: 90.00, HighSinceEntry: 112.50, LastTrailLevel: 112.50,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = p.PersistFillConfirmed(context.Background(), persistStrategyID, persistSymbol, 101.50, 9, 20)
+	if err := db.QueryRow(`SELECT current_sl, high_since_entry FROM manthan_positions WHERE strategy_id=$1 AND symbol=$2`,
+		persistStrategyID, persistSymbol).Scan(&sl, &high); err != nil {
+		t.Fatal(err)
+	}
+	if sl != 90.00 || high != 112.50 {
+		t.Fatalf("late confirmation regressed the ratchet: sl=%.2f high=%.2f (want 90.00/112.50)", sl, high)
+	}
+}
+
+// The allocator's initial stop MUST come from the strategy config. A literal
+// 0.98 ("TEST MODE") shipped to production on this line and caused every
+// phantom TSL exit of 2026-08-18. This test fails if anyone reintroduces a
+// literal or lets a zero config through.
+func TestAllocator_InitialSLIsStrategyStopLossPct(t *testing.T) {
+	for _, tc := range []struct{ cfg, wantSL float64 }{
+		{20, 80.00}, // Manthan
+		{0, 80.00},  // zero config → default 20, never a 0%/2% stop
+		{15, 85.00},
+	} {
+		got := 100.0 * (1 - effectiveStopLossPct(tc.cfg)/100)
+		if got < tc.wantSL-1e-9 || got > tc.wantSL+1e-9 {
+			t.Errorf("cfg=%v: initial SL on entry 100 = %.2f, want %.2f", tc.cfg, got, tc.wantSL)
+		}
+	}
+	if effectiveStopLossPct(0.98) != 0.98 { // a real (odd) config is honoured
+		t.Error("effectiveStopLossPct altered a valid config value")
 	}
 }

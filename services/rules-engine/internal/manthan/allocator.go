@@ -209,9 +209,11 @@ func (a *Allocator) Allocate(
 			continue
 		}
 
-		// TEST MODE: 2% SL to exercise trailing logic quickly.
-		// Original (prod): initialSL := entryPrice * 0.80 // 20% below entry
-		initialSL := entryPrice * 0.98 // 2% below entry (TEST)
+		// Initial stop = strategy's StopLossPct below entry (20% for
+		// Manthan). MUST come from config, never a literal: a leftover
+		// "TEST MODE" 0.98 here shipped to production and produced every
+		// phantom TSL exit of 2026-08-18 (see types.Portfolio.StopLossPct).
+		initialSL := entryPrice * (1 - effectiveStopLossPct(portfolio.StopLossPct)/100)
 
 		alloc := types.AllocationResult{
 			Symbol:        sig.Symbol,
@@ -230,7 +232,7 @@ func (a *Allocator) Allocate(
 			// Carry the source signal's run_date all the way to OrderGenerator so
 			// the deterministic signal_id can be anchored to the SEMANTIC trade day
 			// (not wall-clock). See types/allocation.go RunDate doc.
-			RunDate:       sig.RunDate,
+			RunDate: sig.RunDate,
 		}
 
 		result.Allocations = append(result.Allocations, alloc)
@@ -259,10 +261,14 @@ func SortAlphabetical(signals []types.ManthanSignal) {
 	})
 }
 
+// countActive returns the number of OCCUPIED book slots — fill-confirmed
+// positions PLUS dispatched-but-unfilled ones (see types.Position.Occupies).
+// The name is historical; the semantics changed 2026-08-18 after a morning
+// batch over-allocated because pendings were invisible.
 func countActive(positions map[string]*types.Position) int {
 	n := 0
 	for _, p := range positions {
-		if p.Active {
+		if p.Occupies() {
 			n++
 		}
 	}

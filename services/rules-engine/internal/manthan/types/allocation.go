@@ -54,8 +54,10 @@ func NewCapCheck(maxPositions int32, existing map[string]*Position) *CapCheck {
 	if c.MaxPerBucket < 1 {
 		c.MaxPerBucket = 1
 	}
+	// Occupies(): dispatched-but-unfilled positions reserve their sector /
+	// bucket slot too (see Position.Occupies).
 	for _, p := range existing {
-		if p.Active {
+		if p.Occupies() {
 			c.SectorCount[p.Industry]++
 			c.BucketCount[p.MCapBucket]++
 		}

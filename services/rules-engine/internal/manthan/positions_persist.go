@@ -1,9 +1,9 @@
 package manthan
 
 import (
-	"time"
-	"fmt"
 	"context"
+	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -102,21 +102,38 @@ func (p *ManthanPublisher) PersistTrail(ctx context.Context, strategyID string, 
 // re-entry guard — so the DB can never hold an ACTIVE row for an entry that
 // did not really fill. Also idempotently upgrades legacy ACTIVE rows'
 // price/qty when the confirmation arrives late.
-func (p *ManthanPublisher) PersistFillConfirmed(ctx context.Context, strategyID, symbol string, fillPrice float64, qty int32) error {
+//
+// slPct is the strategy's stop distance: on PENDING_ENTRY → ACTIVE promotion
+// the row's provisional SL/high/trail (sized from the DISPATCH price) are
+// replaced with the post-fill values the in-memory book now holds
+// (TrailingSLManager.InitPosition: high=fill, sl=fill×(1−slPct), trail=fill),
+// so a rehydrate after restart reproduces memory exactly. A row that is
+// already ACTIVE (late/duplicate confirmation) keeps its trailed SL/high —
+// GREATEST guards the ratchet: the SL never moves down from a late fill.
+func (p *ManthanPublisher) PersistFillConfirmed(ctx context.Context, strategyID, symbol string, fillPrice float64, qty int32, slPct float64) error {
 	if p.db == nil {
 		return nil
 	}
+	if slPct <= 0 || slPct >= 100 {
+		slPct = DefaultStopLossPct
+	}
+	postFillSL := fillPrice * (1 - slPct/100)
 	_, err := p.db.ExecContext(ctx, `
 		UPDATE manthan_positions
-		SET status = 'ACTIVE',
-		    entry_price = $1,
+		SET entry_price = $1,
 		    quantity = $2,
 		    invested_amt = $5,
-		    high_since_entry = GREATEST(COALESCE(high_since_entry, 0), $1),
+		    high_since_entry = CASE WHEN status = 'PENDING_ENTRY' THEN $1
+		                           ELSE GREATEST(COALESCE(high_since_entry, 0), $1) END,
+		    last_trail_level = CASE WHEN status = 'PENDING_ENTRY' THEN $1
+		                           ELSE COALESCE(last_trail_level, $1) END,
+		    current_sl = CASE WHEN status = 'PENDING_ENTRY' THEN $6
+		                      ELSE GREATEST(COALESCE(current_sl, 0), $6) END,
+		    status = 'ACTIVE',
 		    updated_at = now()
 		WHERE strategy_id = $3 AND symbol = $4
 		  AND status IN ('PENDING_ENTRY','ACTIVE')`,
-		fillPrice, qty, strategyID, symbol, fillPrice*float64(qty))
+		fillPrice, qty, strategyID, symbol, fillPrice*float64(qty), postFillSL)
 	if err != nil {
 		p.logger.Warn("PersistFillConfirmed failed — row stays PENDING_ENTRY until next confirmation/restart",
 			zap.String("symbol", symbol), zap.Error(err))

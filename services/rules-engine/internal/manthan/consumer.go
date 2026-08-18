@@ -58,7 +58,7 @@ type OrderPublisher interface {
 	PersistPositionOpen(ctx context.Context, order ManthanOrder) error
 	PersistTrail(ctx context.Context, strategyID string, pos types.Position) error
 	PersistExit(ctx context.Context, strategyID, symbol string, exitPrice, pnl float64, reason string) error
-	PersistFillConfirmed(ctx context.Context, strategyID, symbol string, fillPrice float64, qty int32) error
+	PersistFillConfirmed(ctx context.Context, strategyID, symbol string, fillPrice float64, qty int32, slPct float64) error
 }
 
 // ConsumerConfig configures the manthan signal consumer.

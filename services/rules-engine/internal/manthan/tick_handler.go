@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"context"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -55,6 +56,17 @@ func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float6
 		// (nested lock would deadlock the goroutine).
 		portfolio.Mu.Lock()
 		pos, ok := portfolio.Positions[symbol]
+		if ok && pos.Active && pos.State == types.StateExitPending &&
+			!pos.ExitPendingSince.IsZero() && time.Since(pos.ExitPendingSince) > ExitPendingTTL {
+			// Exit command never confirmed — see ExitPendingTTL. Resume trailing.
+			h.logger.Warn("EXIT_PENDING timed out without broker confirmation — reverting to ACTIVE (exit will re-fire under a fresh id)",
+				zap.String("strategy_id", portfolio.StrategyID),
+				zap.String("symbol", symbol),
+				zap.Duration("pending_for", time.Since(pos.ExitPendingSince)),
+				zap.Float64("current_sl", pos.CurrentSL))
+			pos.State = types.StateActive
+			pos.ExitPendingSince = time.Time{}
+		}
 		if !ok || !pos.Active || pos.State != types.StateActive {
 			portfolio.Mu.Unlock()
 			continue
