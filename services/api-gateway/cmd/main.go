@@ -384,7 +384,12 @@ func main() {
 	// Token lookup uses ordersDB (execution_db.manthan_orders) — the
 	// authoritative writer for exchange_token. Previously read from
 	// stockk_trading which was a silent replica; DB.1 killed that path.
-	if pfAddr := envOr("PORTFOLIO_GRPC_ADDR", "localhost:9005"); pfAddr != "" && ordersDB != nil {
+	// Portfolio svc gRPC is :9008 (see deployments ecosystem + portfolio
+	// cmd/main.go). The old default of :9005 pointed at RULES-ENGINE's gRPC
+	// port — every /users/me/portfolio/* call 500'd with "connection refused"
+	// while the strategy-scoped endpoints worked, which surfaced to users as
+	// an "allocation data mismatch" between screens (2026-08-18).
+	if pfAddr := envOr("PORTFOLIO_GRPC_ADDR", "localhost:9008"); pfAddr != "" && ordersDB != nil {
 		pfClient, err := grpc_clients.NewPortfolioClient(pfAddr, 5*time.Second)
 		if err != nil {
 			log.Printf("Warning: portfolio gRPC dial (%s) failed: %v (portfolio endpoints disabled)", pfAddr, err)

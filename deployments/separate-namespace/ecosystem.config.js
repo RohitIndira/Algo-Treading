@@ -109,6 +109,7 @@ module.exports = {
         TRADE_EXECUTION_PAPER_URL: 'http://localhost:8091',
         CORS_ALLOWED_ORIGINS: 'https://manthan-dev.stockk.trade',
         REDIS_LOCAL_ADDR: 'localhost:6389',               // ws pub/sub redis (algo-dev)
+        PORTFOLIO_GRPC_ADDR: 'localhost:9008',            // portfolio svc gRPC (NOT 9005 = rules-engine)
     }},
     // manthan-live is a BATCH job (reads sheet → publishes signals → exits), not
     // a daemon. Don't keep-alive it; run it once daily pre-open via cron_restart.
