@@ -285,28 +285,29 @@ func watchLoop(logger *zap.Logger) {
 	logger.Info("manthan-live WATCH mode — sheet edits trigger the pipeline automatically",
 		zap.Duration("poll", interval), zap.String("sheet", sheetID))
 
-	var lastFP string
-	fingerprint := func() (string, bool) {
+	var lastSyms []string
+	haveBaseline := false
+	buySymbols := func() ([]string, bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		r := manthan.NewGSheetReader(sheetID, creds, logger)
 		if err := r.Connect(ctx); err != nil {
 			logger.Warn("watch: sheets connect failed — will retry", zap.Error(err))
-			return "", false
+			return nil, false
 		}
-		fp, err := r.FingerprintTab(ctx, manthan.SheetBuySignal)
+		syms, err := r.BuySymbols(ctx)
 		if err != nil {
-			logger.Warn("watch: fingerprint failed — will retry", zap.Error(err))
-			return "", false
+			logger.Warn("watch: buy-symbol read failed — will retry", zap.Error(err))
+			return nil, false
 		}
-		return fp, true
+		return syms, true
 	}
 
-	// Initial run + baseline fingerprint.
+	// Initial run + baseline symbol set.
 	if err := runPipelineOnce(logger); err != nil {
 		logger.Error("watch: initial run failed — will retry on next change/tick", zap.Error(err))
-	} else if fp, ok := fingerprint(); ok {
-		lastFP = fp
+	} else if syms, ok := buySymbols(); ok {
+		lastSyms, haveBaseline = syms, true
 	}
 
 	ist, _ := time.LoadLocation("Asia/Kolkata")
@@ -323,23 +324,51 @@ func watchLoop(logger *zap.Logger) {
 		if mod < 8*60+45 || mod > 15*60+25 {
 			continue // outside the tradeable window — edits wait for the window
 		}
-		fp, ok := fingerprint()
-		if !ok || fp == lastFP {
+		syms, ok := buySymbols()
+		if !ok {
 			continue
 		}
-		logger.Info("watch: BuySignal tab CHANGED — running pipeline",
-			zap.String("old_fp", short(lastFP)), zap.String("new_fp", short(fp)))
-		if err := runPipelineOnce(logger); err != nil {
-			logger.Error("watch: pipeline run failed — fingerprint kept, will retry next tick", zap.Error(err))
-			continue // lastFP unchanged → next tick sees the same change and retries
+		if !haveBaseline {
+			// The initial run never established a baseline (e.g. it failed):
+			// treat the first successful read as a change so the pipeline
+			// catches up, then baseline from it.
+			logger.Info("watch: establishing baseline — running pipeline",
+				zap.Int("buy_symbols", len(syms)))
+		} else {
+			added, removed := diffSymbols(lastSyms, syms)
+			if len(added) == 0 && len(removed) == 0 {
+				continue // price recalcs / cosmetic edits — NOT a stock change
+			}
+			logger.Info("watch: BUY LIST CHANGED — running pipeline",
+				zap.Strings("added", added),
+				zap.Strings("removed", removed),
+				zap.Int("total_now", len(syms)))
 		}
-		lastFP = fp
+		if err := runPipelineOnce(logger); err != nil {
+			logger.Error("watch: pipeline run failed — baseline kept, will retry next tick", zap.Error(err))
+			continue // lastSyms unchanged → next tick sees the same diff and retries
+		}
+		lastSyms, haveBaseline = syms, true
 	}
 }
 
-func short(fp string) string {
-	if len(fp) > 12 {
-		return fp[:12]
+// diffSymbols returns (added, removed) between two SORTED symbol slices.
+func diffSymbols(old, new []string) (added, removed []string) {
+	oldSet := make(map[string]struct{}, len(old))
+	for _, s := range old {
+		oldSet[s] = struct{}{}
 	}
-	return fp
+	newSet := make(map[string]struct{}, len(new))
+	for _, s := range new {
+		newSet[s] = struct{}{}
+		if _, ok := oldSet[s]; !ok {
+			added = append(added, s)
+		}
+	}
+	for _, s := range old {
+		if _, ok := newSet[s]; !ok {
+			removed = append(removed, s)
+		}
+	}
+	return added, removed
 }

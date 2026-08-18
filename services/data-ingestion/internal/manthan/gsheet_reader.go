@@ -1,9 +1,7 @@
 package manthan
 
 import (
-	"encoding/json"
-	"encoding/hex"
-	"crypto/sha256"
+	"sort"
 	"context"
 	"fmt"
 	"strings"
@@ -228,21 +226,43 @@ func interfaceGridToStrings(grid [][]interface{}) [][]string {
 }
 
 
-// FingerprintTab returns a SHA-256 over the raw values of one tab — the
-// change-detection primitive for manthan-live's watch mode. One Values.Get
-// per call; requires only the Sheets-readonly scope (no Drive metadata).
-func (r *GSheetReader) FingerprintTab(ctx context.Context, tab string) (string, error) {
+// BuySymbols returns the sorted set of scrips currently flagged ATH_Entry=Buy
+// on the BuySignal tab — the change-detection primitive for manthan-live's
+// watch mode. The trigger is deliberately the SYMBOL SET, not a raw-values
+// hash: the live sheet carries price formulas that recalc continuously, so a
+// content hash would differ on nearly every poll and re-run the pipeline all
+// day for cosmetic changes. Only an operator ADDING or REMOVING a Buy row
+// should fire the pipeline. One Values.Get per call; Sheets-readonly scope.
+func (r *GSheetReader) BuySymbols(ctx context.Context) ([]string, error) {
 	if r.svc == nil {
-		return "", fmt.Errorf("sheets service not connected")
+		return nil, fmt.Errorf("sheets service not connected")
 	}
-	resp, err := r.svc.Spreadsheets.Values.Get(r.sheetID, tab+"!A:AZ").Context(ctx).Do()
+	resp, err := r.svc.Spreadsheets.Values.Get(r.sheetID, SheetBuySignal+"!A:AZ").Context(ctx).Do()
 	if err != nil {
-		return "", fmt.Errorf("fingerprint %s: %w", tab, err)
+		return nil, fmt.Errorf("read %s: %w", SheetBuySignal, err)
 	}
-	raw, err := json.Marshal(resp.Values)
+	rows := make([][]string, 0, len(resp.Values))
+	for _, rv := range resp.Values {
+		row := make([]string, len(rv))
+		for i, c := range rv {
+			row[i] = fmt.Sprint(c)
+		}
+		rows = append(rows, row)
+	}
+	parsed, err := parseBuySignal(rows)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("parse %s: %w", SheetBuySignal, err)
 	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:]), nil
+	set := make(map[string]struct{}, len(parsed))
+	for _, bs := range parsed {
+		if strings.TrimSpace(bs.ATHEntry) == "Buy" && bs.ScripName != "" {
+			set[bs.ScripName] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for sym := range set {
+		out = append(out, sym)
+	}
+	sort.Strings(out)
+	return out, nil
 }
