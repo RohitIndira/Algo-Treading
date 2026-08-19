@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -220,7 +221,21 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 
 		// Only emergency sell for real order failures — NOT for auth/session issues
 		// Auth failures will be retried on next safety monitor cycle with fresh token
-		if strings.Contains(errMsg, "Session expired") || strings.Contains(errMsg, "AU004") || strings.Contains(errMsg, "401") {
+		// A CANCELLED CONTEXT (service shutdown / restart, caller deadline) or
+		// a network-level failure is NOT a broker refusal: the stop can be
+		// placed on the next cycle. Escalating those to a MARKET SELL would let
+		// a routine pm2 restart during the session liquidate a position.
+		// 2026-08-19: a restart cancelled SHANTIGOLD's placement mid-flight and
+		// the fallback fired (it only failed because the same context was
+		// already cancelled). The safety monitor's naked-position check retries
+		// placement every cycle, so "retry" is always the safe default here.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+			strings.Contains(errMsg, "context canceled") || strings.Contains(errMsg, "context deadline exceeded") ||
+			strings.Contains(errMsg, "connection refused") || strings.Contains(errMsg, "no such host") ||
+			strings.Contains(errMsg, "i/o timeout") || strings.Contains(errMsg, "EOF") {
+			h.logger.Warn("SL placement interrupted (shutdown/network) — will retry via safety monitor, NOT escalating",
+				zap.String("symbol", signal.Symbol), zap.Error(err))
+		} else if strings.Contains(errMsg, "Session expired") || strings.Contains(errMsg, "AU004") || strings.Contains(errMsg, "401") {
 			h.logger.Warn("SL placement failed due to auth — will retry via safety monitor",
 				zap.String("symbol", signal.Symbol), zap.Error(err))
 		} else {
