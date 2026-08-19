@@ -180,7 +180,7 @@ func (p *ProtectiveReplay) SetEventPublisher(ep *ManthanEventPublisher) {
 // startup-catch-up window so a deploy mid-window doesn't skip a day.
 func (p *ProtectiveReplay) Start(ctx context.Context) {
 	p.logger.Info("Protective replayer started (server-side trigger engine)",
-		zap.String("schedule", "14:30 IST · JWT pre-flight  +  16:35 IST · EOD AMO pre-stage  +  09:14 IST · morning hot-SL fallback"))
+		zap.String("schedule", "09:14 · 09:35 · 11:00 IST hot-SL passes  +  14:30 IST · JWT pre-flight  +  16:35 IST · EOD AMO pre-stage"))
 
 	// 09:14 morning hot-SL fallback.
 	now := p.now()
@@ -192,6 +192,16 @@ func (p *ProtectiveReplay) Start(ctx context.Context) {
 		}
 	}
 	go p.scheduleDaily(ctx, 9, 14, p.runOnce)
+	// Follow-up sweeps (2026-08-19): the 09:14 pass can miss a position for
+	// transient reasons — holdings not yet loaded at 09:15, a DPR/LTP feed
+	// blip, an AMO whose conversion the reconciler had not yet synced, a
+	// broker session that came alive minutes later. runOnce is idempotent
+	// (HasActiveProtectionForToday skips anything already armed today), so
+	// re-running it costs nothing and turns "someone must replay by hand"
+	// into "the system re-checks itself". 09:35 catches the morning misses;
+	// 11:00 catches late logins and band moves after the open.
+	go p.scheduleDaily(ctx, 9, 35, p.runOnce)
+	go p.scheduleDaily(ctx, 11, 0, p.runOnce)
 
 	// 14:30 EOD pre-flight — Layer 3 (defined in eod_phase_pre.go).
 	p.StartEODPreFlight(ctx)
