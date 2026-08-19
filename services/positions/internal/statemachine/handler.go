@@ -10,6 +10,7 @@ package statemachine
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -126,13 +127,13 @@ func (h *Handler) Handle(ctx context.Context, ev *consumer.OrderEvent) error {
 // isSLTrackingEvent returns true iff the event should be routed to
 // handleSLTrackingEvent (which updates positions.current_sl). We match:
 //
-//   order_type contains "SL"    — broker's SL order events (REST format
-//                                 uses "SL"; WSS may use "SL-L", "SL_LIMIT")
-//   AND (
-//     event carries a real trigger_price (SL_PLACED or SL_MODIFIED)
-//     OR event_type == CANCELLED with filled_qty == 0 (SL cancelled
-//        without firing — CANCELLED-with-fill is the fill path below)
-//   )
+//	order_type contains "SL"    — broker's SL order events (REST format
+//	                              uses "SL"; WSS may use "SL-L", "SL_LIMIT")
+//	AND (
+//	  event carries a real trigger_price (SL_PLACED or SL_MODIFIED)
+//	  OR event_type == CANCELLED with filled_qty == 0 (SL cancelled
+//	     without firing — CANCELLED-with-fill is the fill path below)
+//	)
 //
 // FILLED events on SL orders (SL triggered → position exit) are handled
 // by the fill path via handleManthanSellFill, NOT here — position exits
@@ -170,7 +171,7 @@ func isSLOrderTypeString(ot string) bool {
 //   - event_type == "FILLED"                              — full fill
 //   - event_type == "PARTIALLY_FILLED" AND filled_qty > 0 — mid-flight partial
 //   - event_type == "CANCELLED"        AND filled_qty > 0 — partial-fill-then-
-//                                                            cancelled
+//     cancelled
 //
 // Explicitly EXCLUDES event_type in {STATUS_CHANGED, MODIFIED, REJECTED,
 // TRIGGERED, EXPIRED}. Also excludes CANCELLED events with filled_qty=0
@@ -316,6 +317,22 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 	// for this signal, merge this fill into it (VWAP) rather than opening a
 	// second row — positions_db must show ONE lot at the true combined qty
 	// (2026-08-11 PICCADIL: held 7 in positions_db while the broker had 24).
+	// Resolve the PARENT signal UUID once: child-order ids ("mkt-<uuid>", …)
+	// are not UUIDs and must never reach positions.signal_id.
+	if meta.Found {
+		if canon := canonicalSignalUUID(meta); canon != "" {
+			if canon != meta.SignalID {
+				h.logger.Info("state-machine: child-order signal id normalized to parent UUID",
+					zap.String("raw_signal_id", meta.SignalID), zap.String("signal_id", canon),
+					zap.String("broker_order_id", ev.BrokerOrderID))
+			}
+			meta.SignalID = canon
+		} else {
+			h.logger.Warn("state-machine: Manthan order without a resolvable signal UUID — recording as USER_MANUAL origin",
+				zap.String("raw_signal_id", meta.SignalID), zap.String("broker_order_id", ev.BrokerOrderID))
+			meta.Found = false
+		}
+	}
 	if meta.Found && meta.SignalID != "" {
 		if existing, ferr := h.store.FindManthanLotBySignalID(ctx, meta.SignalID); ferr == nil &&
 			existing != nil && existing.EntryBrokerOrderID != ev.BrokerOrderID {
@@ -355,13 +372,13 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 	}
 
 	auditEvent := &store.PositionEvent{
-		EventType:     eventType,
-		BrokerOrderID: ev.BrokerOrderID,
-		SignalID:      pos.SignalID,
-		DeltaQty:      qty,
-		FillPrice:     entryPrice,
+		EventType:      eventType,
+		BrokerOrderID:  ev.BrokerOrderID,
+		SignalID:       pos.SignalID,
+		DeltaQty:       qty,
+		FillPrice:      entryPrice,
 		RawSourceEvent: ev.RawMessage,
-		SourceEventID: ev.EventID,
+		SourceEventID:  ev.EventID,
 	}
 
 	if err := h.store.InsertEntryWithEvent(ctx, pos, auditEvent); err != nil {
@@ -758,8 +775,8 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 // handleManualSellFill — user sold via broker app. FIFO across ACTIVE lots
 // per §7.2 manual-sell branch:
 //
-//	1. USER_MANUAL lots first (entry_time ASC)
-//	2. MANTHAN lots next        (entry_time ASC)
+//  1. USER_MANUAL lots first (entry_time ASC)
+//  2. MANTHAN lots next        (entry_time ASC)
 //
 // Each lot fully-consumed by the SELL flips EXITED. If a lot is only
 // partially consumed (last remaining lot when qty runs out), quantity is
@@ -945,3 +962,27 @@ func isSellOrderType(t string) bool {
 	}
 	return false
 }
+
+// canonicalSignalUUID returns the PARENT signal's UUID for a Manthan order's
+// meta. positions.signal_id is a UUID column, but trade-execution derives
+// child order ids from the entry signal: "mkt-<uuid>" for the market
+// fallback after a partial LIMIT fill, "sl-<uuid>" for stops,
+// "protective-<uuid>-<date>" for replayed stops. Passing those raw broke the
+// INSERT ("invalid input syntax for type uuid") and silently dropped the
+// fill — 2026-08-11 S4450 CUB: the 91-share market leg never became a
+// position, so the live-algo API showed 16 holdings while the broker held
+// 17 (found 2026-08-19). Preference: meta.EntrySignalID when it is a UUID,
+// else the first UUID embedded in meta.SignalID, else "" (caller logs).
+func canonicalSignalUUID(meta tradeexec.OrderMeta) string {
+	if u, err := uuid.Parse(strings.TrimSpace(meta.EntrySignalID)); err == nil {
+		return u.String()
+	}
+	if m := uuidInSignalID.FindString(meta.SignalID); m != "" {
+		if u, err := uuid.Parse(m); err == nil {
+			return u.String()
+		}
+	}
+	return ""
+}
+
+var uuidInSignalID = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
