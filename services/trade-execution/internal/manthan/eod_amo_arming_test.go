@@ -46,14 +46,14 @@ func TestNextTradingDate_IsTheSessionTheAMOEnters(t *testing.T) {
 }
 
 func TestArmedWindowStart_IsPreviousSessionClose(t *testing.T) {
-	// Wed 19th → Tue 18th 15:30 IST
+	// Wed 19th → Tue 18th 15:30 IST (minus 60 s clock-skew tolerance)
 	got := armedWindowStart(time.Date(2026, 8, 19, 0, 0, 0, 0, istTZ))
-	if want := time.Date(2026, 8, 18, 15, 30, 0, 0, istTZ); !got.Equal(want) {
+	if want := time.Date(2026, 8, 18, 15, 29, 0, 0, istTZ); !got.Equal(want) {
 		t.Errorf("Wed: got %v want %v", got, want)
 	}
 	// Mon 24th → Fri 21st 15:30 IST (skips the weekend)
 	got = armedWindowStart(time.Date(2026, 8, 24, 0, 0, 0, 0, istTZ))
-	if want := time.Date(2026, 8, 21, 15, 30, 0, 0, istTZ); !got.Equal(want) {
+	if want := time.Date(2026, 8, 21, 15, 29, 0, 0, istTZ); !got.Equal(want) {
 		t.Errorf("Mon: got %v want %v", got, want)
 	}
 	// The incident row: created 00:03 IST Tue, stamped Wed → BEFORE Tue's

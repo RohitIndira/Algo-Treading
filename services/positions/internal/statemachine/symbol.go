@@ -22,7 +22,16 @@ import "regexp"
 // on positions (positions.exchange holds the exchange name; the token
 // only matters for the LTP Redis key format and lives on manthan_orders
 // via the join back through entry_broker_order_id).
-var symbolWirePattern = regexp.MustCompile(`^STK_(.+?)_EQ_(NSE|BSE)_\d+$`)
+//
+// 2026-08-19: the series is NOT always EQ. NSE trade-to-trade stocks carry
+// BE (MODISONLTD arrived as STK_MODISONLTD_BE_NSE_3325), and BZ/BL/SM/ST/
+// GC… exist too. With the old `_EQ_`-only pattern the raw wire string
+// passed straight through: the position was stored and published as
+// "STK_MODISONLTD_BE_NSE_3325", the UI showed that string with no LTP,
+// and rules-engine's fill confirmation never matched its pending position.
+// The series is now any 1–3 char alphanumeric group; the non-greedy symbol
+// group still yields "M_M" for STK_M_M_EQ_NSE_2031.
+var symbolWirePattern = regexp.MustCompile(`^STK_(.+?)_([A-Z0-9]{1,3})_(NSE|BSE)_\d+$`)
 
 // normalizeSymbol maps an OrderEvent's raw symbol (whatever the wire
 // carried) to the canonical (symbol, exchange) pair used throughout
@@ -45,5 +54,5 @@ func normalizeSymbol(raw string) (symbol, exchange string) {
 	if m == nil {
 		return raw, ""
 	}
-	return m[1], m[2]
+	return m[1], m[3]
 }

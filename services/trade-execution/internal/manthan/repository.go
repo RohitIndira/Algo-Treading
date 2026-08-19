@@ -1076,7 +1076,10 @@ func armedWindowStart(tradeDate time.Time) time.Time {
 	for !indiraClient.IsTradingDay(d) {
 		d = d.Add(-24 * time.Hour)
 	}
-	return d.Add(15*time.Hour + 30*time.Minute)
+	// 60 s of tolerance: an ArmRetryWorker cycle that lands at 15:30:00.x
+	// stamps tomorrow from the app clock while created_at comes from the DB
+	// clock; without slack a legit row could be judged pre-window.
+	return d.Add(15*time.Hour + 30*time.Minute - time.Minute)
 }
 
 // InsertAMOOrder writes a new SL_SELL_AMO row for the given position+trade_date
@@ -1161,11 +1164,15 @@ func (r *Repository) InsertAMOOrder(
 	// is exactly how 2026-08-17's ten correctly-dated evening attempts died
 	// every 5 min until midnight. First attempt keeps the historical
 	// "<entry>-amo-<date>" id; retries append "-r<n>".
+	// Count by signal_id prefix (not order_type): a converted AMO is
+	// promoted to SL_SELL but keeps its "<entry>-amo-<date>" id, and a later
+	// re-arm for the same date must not collide with it.
 	var priorAttempts int
 	if err = tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM manthan_orders
-		WHERE  parent_order_id = $1 AND trade_date = $2 AND order_type = 'SL_SELL_AMO'`,
-		parentEntryOrderID, tradeDate,
+		WHERE  parent_order_id = $1 AND trade_date = $2
+		  AND  signal_id LIKE $3`,
+		parentEntryOrderID, tradeDate, p.EntrySignalID+"-amo-"+tradeDate.Format("20060102")+"%",
 	).Scan(&priorAttempts); err != nil {
 		return 0, false, fmt.Errorf("count prior attempts: %w", err)
 	}
@@ -1197,6 +1204,47 @@ func (r *Repository) InsertAMOOrder(
 		return 0, false, fmt.Errorf("commit: %w", err)
 	}
 	return id, false, nil
+}
+
+// PromoteAMOToLiveSL records a successful 08:50 IST AMO→live conversion:
+// the broker assigns a NEW ordId at conversion, so the row is re-keyed to it
+// and promoted to a plain SL_SELL so the trail (SL_MODIFY), the reconciler
+// and HasActiveProtectionForToday all treat it as the live stop it now is.
+// DB-only; the broker order is untouched.
+func (r *Repository) PromoteAMOToLiveSL(ctx context.Context, id int64, newBrokerID, brokerStatus string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		SET    order_type = 'SL_SELL', broker_order_id = $2, broker_status = $3, updated_at = now()
+		WHERE  id = $1 AND order_type = 'SL_SELL_AMO' AND status = 'SL_PLACED'`,
+		id, newBrokerID, brokerStatus)
+	return err
+}
+
+// MarkAMOConversionRejected records that the exchange REJECTED the AMO at
+// 08:50 IST conversion (typically "Order entered has invalid data." — the
+// trigger fell outside the new day's circuit band). Keeps the new broker id
+// for traceability. Once REJECTED the row no longer counts as protection, so
+// the 09:14 cron / ArmRetryWorker re-plan the position from scratch.
+func (r *Repository) MarkAMOConversionRejected(ctx context.Context, id int64, newBrokerID, reason string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		SET    status = 'REJECTED', broker_order_id = COALESCE(NULLIF($2,''), broker_order_id),
+		       broker_status = 'Rejected', last_error = $3, updated_at = now()
+		WHERE  id = $1 AND status = 'SL_PLACED'`,
+		id, newBrokerID, reason)
+	return err
+}
+
+// ExpireStaleAMORow retires an SL_SELL_AMO row whose session has passed
+// (created before the current armed window) and that never got reconciled
+// — it cannot be a live order any more, whatever its status says. DB-only.
+func (r *Repository) ExpireStaleAMORow(ctx context.Context, id int64, reason string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		SET    status = 'EXPIRED', last_error = $2, updated_at = now()
+		WHERE  id = $1 AND order_type = 'SL_SELL_AMO' AND status = 'SL_PLACED'`,
+		id, reason)
+	return err
 }
 
 // AMOReplayRow is a thin view of a pending SL_SELL_AMO row used by Phase B/C.

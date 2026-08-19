@@ -244,8 +244,20 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 	// width past the allocation the caps were checked against (review
 	// finding, 2026-08-18). Clamp qty so invested never exceeds the
 	// signal's budget at the actual entry price.
+	// Late-entry sizing clamp — ONLY for a real run-up (upper-circuit /
+	// pre-open holds). InvestedAmt is qty×signal-price, so a 1% tolerance
+	// absorbs the LTP+2-tick entry premium and intraday noise on an ordinary
+	// entry (2026-08-19: without it every entry lost ≥1 share and qty=1
+	// signals were POISONed — MODISONLTD 53→51). A genuine +5% run still
+	// clamps. One share is always affordable while the price is within 5%
+	// of the budget (a single share can never materially exceed it).
 	if signal.InvestedAmt > 0 && entryPrice > 0 {
-		if maxQty := int(signal.InvestedAmt / entryPrice); maxQty < int(signal.Quantity) {
+		budget := signal.InvestedAmt * 1.01
+		maxQty := int(budget / entryPrice)
+		if maxQty < 1 && signal.Quantity >= 1 && entryPrice <= signal.InvestedAmt*1.05 {
+			maxQty = 1
+		}
+		if maxQty < int(signal.Quantity) {
 			if maxQty <= 0 {
 				h.logger.Warn("Entry skipped — price moved above the entire sizing budget",
 					zap.String("symbol", signal.Symbol),

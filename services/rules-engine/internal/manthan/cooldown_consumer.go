@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -35,7 +36,7 @@ type CooldownConsumer struct {
 	// the fill-confirmation feed the allocator's "already holding" guard
 	// depends on; it was never wired before 2026-08-05 (positions stayed
 	// pending forever and day-2 signals re-bought held symbols).
-	confirmFill func(strategyID, symbol string, price float64, qty int32)
+	confirmFill   func(strategyID, symbol string, price float64, qty int32)
 	exitConfirmed func(strategyID, symbol string, exitPrice float64, reason string)
 }
 
@@ -96,9 +97,9 @@ func NewCooldownConsumer(cfg CooldownConsumerConfig, db *sql.DB, logger *zap.Log
 		StartOffset: kafka.LastOffset,
 	})
 	return &CooldownConsumer{
-		reader:      reader,
-		db:          db,
-		logger:      logger,
+		reader:        reader,
+		db:            db,
+		logger:        logger,
 		confirmFill:   cfg.ConfirmFill,
 		exitConfirmed: cfg.ExitConfirmed,
 	}
@@ -107,6 +108,18 @@ func NewCooldownConsumer(cfg CooldownConsumerConfig, db *sql.DB, logger *zap.Log
 // Start blocks until ctx cancelled. At-least-once: commit AFTER SQL upsert.
 // The UNIQUE (strategy_id, symbol) constraint + DO UPDATE means replayed
 // events are idempotent (last-writer-wins on the same key).
+// canonicalSymbol maps Indira's wire symbol shape STK_<SYM>_<SERIES>_<EXCH>_<token>
+// (any series: EQ, BE, BZ, SM, …) to the short NSE symbol used as the book
+// key. Anything else passes through unchanged.
+var wireSymbolRe = regexp.MustCompile(`^STK_(.+?)_([A-Z0-9]{1,3})_(NSE|BSE)_\d+$`)
+
+func canonicalSymbol(raw string) string {
+	if m := wireSymbolRe.FindStringSubmatch(strings.TrimSpace(raw)); m != nil {
+		return m[1]
+	}
+	return raw
+}
+
 func (c *CooldownConsumer) Start(ctx context.Context) {
 	c.logger.Info("position.events cooldown consumer started",
 		zap.String("topic", c.reader.Config().Topic),
@@ -169,6 +182,15 @@ func (c *CooldownConsumer) handleMessage(ctx context.Context, msg kafka.Message)
 	if !strings.EqualFold(ev.Origin, "MANTHAN") {
 		return nil // USER_MANUAL cooldown isn't a thing
 	}
+
+	// Symbols on position.events may arrive in Indira's raw wire form
+	// ("STK_MODISONLTD_BE_NSE_3325") when the positions service could not
+	// normalize them (2026-08-19: BE-series stock; the OPENED confirmation
+	// missed S4450's pending MODISONLTD and it stayed PENDING_ENTRY with no
+	// software stop). Normalize here too — the book is keyed by the short
+	// NSE symbol and a confirmation that misses its position is worse than
+	// useless.
+	ev.Symbol = canonicalSymbol(ev.Symbol)
 
 	// POSITION_OPENED → fill confirmation into the in-memory portfolio.
 	// This arms the allocator's "already holding" re-entry guard with the

@@ -19,6 +19,15 @@ func TestNormalizeSymbol(t *testing.T) {
 		// regex must match the shortest string up to `_EQ_`.
 		{"multi-underscore symbol", "STK_M_M_EQ_NSE_2031", "M_M", "NSE"},
 
+		// Non-EQ series (2026-08-19 incident): trade-to-trade BE, SME SM,
+		// BZ etc. must normalize exactly like EQ — the series is not part
+		// of the canonical symbol.
+		{"NSE trade-to-trade BE series", "STK_MODISONLTD_BE_NSE_3325", "MODISONLTD", "NSE"},
+		{"NSE BZ series", "STK_XYZLTD_BZ_NSE_99", "XYZLTD", "NSE"},
+		{"NSE SME series", "STK_SMECO_SM_NSE_77", "SMECO", "NSE"},
+		{"BSE non-EQ series (A group code)", "STK_ABCD_A_BSE_500001", "ABCD", "BSE"},
+		{"multi-underscore symbol, BE series", "STK_M_M_BE_NSE_2031", "M_M", "NSE"},
+
 		// Already-short form (WSS numeric-buy_sell path emits these).
 		// Pass through unchanged; exchange returned empty so caller can
 		// fall back to ev.Exchange.

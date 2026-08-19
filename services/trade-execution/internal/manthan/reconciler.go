@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,7 +29,7 @@ import (
 //     - If broker says Executed/Traded  → UpdateOrderFilled + RECONCILER_FIXED event
 //     - If broker says Cancelled/Rejected → UpdateOrderCancelled + RECONCILER_FIXED event
 //     - If broker has no such ordId     → log warning (not auto-cancelled:
-//       broker may have purged the order at EOD rollover; too risky to flip)
+//     broker may have purged the order at EOD rollover; too risky to flip)
 //
 // Pairs with SafetyMonitor (2s interval, SL-focused) — together they provide
 // fast-reaction SL insurance + slow-reaction state-consistency enforcement.
@@ -165,9 +167,105 @@ func (r *Reconciler) reconcileUser(ctx context.Context, userID string, auth Brok
 		return
 	}
 
-	fixed, notFound := 0, 0
-	for _, dbOrd := range dbOrders {
+	// Broker ids already referenced by some DB row — a converted AMO must
+	// never be matched to an order that another row legitimately owns.
+	claimed := make(map[string]bool, len(dbOrders))
+	for _, o := range dbOrders {
+		if o.BrokerOrderID != "" {
+			claimed[o.BrokerOrderID] = true
+		}
+	}
+
+	// AMO pre-pass, NEWEST FIRST: several SL_PLACED AMO rows for one symbol
+	// can share qty+trigger across days (yesterday's stale rows plus last
+	// night's real one). The row that converted today is the newest, so it
+	// must get first claim on the broker order; rows from past sessions are
+	// retired instead of being allowed to steal the match.
+	handled := make(map[int64]bool)
+	fixed := 0
+	if len(dbOrders) > 0 {
+		sorted := append([]*ManthanOrder(nil), dbOrders...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].CreatedAt.After(sorted[j].CreatedAt) })
+		ist, _ := time.LoadLocation("Asia/Kolkata")
+		if ist == nil {
+			ist = time.FixedZone("IST", 5*3600+1800)
+		}
+		windowStart := armedWindowStart(time.Now().In(ist))
+		for _, dbOrd := range sorted {
+			if dbOrd.OrderType != OrderTypeSLSellAMO || dbOrd.Status != StatusSLPlaced {
+				continue
+			}
+			if _, ok := brokerByID[dbOrd.BrokerOrderID]; ok {
+				continue // still visible under its own id (queued, not yet released)
+			}
+			if !dbOrd.CreatedAt.IsZero() && dbOrd.CreatedAt.Before(windowStart) {
+				reason := "AMO session passed without conversion sync — retired by reconciler"
+				if err := r.repo.ExpireStaleAMORow(ctx, dbOrd.ID, reason); err == nil {
+					handled[dbOrd.ID] = true
+					fixed++
+					r.logger.Info("Reconciler: stale AMO row from a past session retired (EXPIRED)",
+						zap.String("user", userID), zap.String("symbol", dbOrd.Symbol),
+						zap.String("amo_id", dbOrd.BrokerOrderID), zap.Time("created_at", dbOrd.CreatedAt))
+				}
+				continue
+			}
+			// (matching happens in the main loop below, in this newest-first
+			// order, so the freshest row claims the broker order)
+		}
+	}
+
+	notFound := 0
+	ordered := append([]*ManthanOrder(nil), dbOrders...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].CreatedAt.After(ordered[j].CreatedAt) })
+	for _, dbOrd := range ordered {
+		if handled[dbOrd.ID] {
+			continue
+		}
 		bOrd, ok := brokerByID[dbOrd.BrokerOrderID]
+		if !ok && dbOrd.OrderType == OrderTypeSLSellAMO && dbOrd.Status == StatusSLPlaced {
+			// AMO CONVERSION SYNC (the "Phase C" the models always promised):
+			// Indira gives a queued AMO a NEW ordId when it releases it at
+			// 08:50 IST, so the id we stored can never appear in the book.
+			// Match by content instead — same symbol, SELL, stop order, same
+			// qty and trigger — and either promote the row to the live SL_SELL
+			// under the new id, or record the exchange's REJECTION so the
+			// 09:14 cron stops trusting a stop that does not exist
+			// (2026-08-19: six S4450 AMOs rejected "invalid data" at
+			// conversion; DB said SL_PLACED; cron skipped them all).
+			if conv := matchConvertedAMO(dbOrd, brokerOrders, claimed); conv != nil {
+				br := strings.ToUpper(strings.TrimSpace(conv.Status))
+				claimed[conv.OrdId] = true
+				if br == "REJECTED" {
+					reason := "AMO rejected at conversion: " + conv.RejReason
+					if err := r.repo.MarkAMOConversionRejected(ctx, dbOrd.ID, conv.OrdId, reason); err != nil {
+						r.logger.Warn("Reconciler: AMO rejection sync failed", zap.Int64("order_id", dbOrd.ID), zap.Error(err))
+					} else {
+						_ = r.repo.InsertEvent(ctx, dbOrd.ID, "AMO_CONVERSION_REJECTED", string(dbOrd.Status), "REJECTED",
+							conv.Status, conv.TriggerPrice, conv.Qty, reason)
+						r.logger.Warn("Reconciler: AMO REJECTED at conversion — row marked REJECTED (position needs a fresh stop)",
+							zap.String("user", userID), zap.String("symbol", dbOrd.Symbol),
+							zap.String("amo_id", dbOrd.BrokerOrderID), zap.String("broker_id", conv.OrdId),
+							zap.Float64("trigger", conv.TriggerPrice), zap.String("reason", conv.RejReason))
+						fixed++
+					}
+					continue
+				}
+				if err := r.repo.PromoteAMOToLiveSL(ctx, dbOrd.ID, conv.OrdId, conv.Status); err != nil {
+					r.logger.Warn("Reconciler: AMO promotion failed", zap.Int64("order_id", dbOrd.ID), zap.Error(err))
+					continue
+				}
+				_ = r.repo.InsertEvent(ctx, dbOrd.ID, "AMO_CONVERTED", string(dbOrd.Status), string(StatusSLPlaced),
+					conv.Status, conv.TriggerPrice, conv.Qty, "AMO released as live SL under new broker id "+conv.OrdId)
+				r.logger.Info("Reconciler: AMO converted — promoted to live SL_SELL under new broker id",
+					zap.String("user", userID), zap.String("symbol", dbOrd.Symbol),
+					zap.String("amo_id", dbOrd.BrokerOrderID), zap.String("broker_id", conv.OrdId),
+					zap.String("broker_status", conv.Status))
+				dbOrd.BrokerOrderID = conv.OrdId
+				dbOrd.OrderType = OrderTypeSLSell
+				bOrd, ok = conv, true
+				fixed++
+			}
+		}
 		if !ok {
 			notFound++
 			r.logger.Warn("Reconciler: DB order not in broker order-book",
@@ -258,6 +356,67 @@ func (r *Reconciler) applyDrift(ctx context.Context, db *ManthanOrder, bOrd *ind
 		return true
 	}
 
+	return false
+}
+
+// matchConvertedAMO finds the broker order that a queued SL_SELL_AMO row
+// became at conversion: same base symbol, SELL, a stop-type order, same qty,
+// same trigger (2dp), placed TODAY, and not already claimed by another DB
+// row. Returns nil when there is no unambiguous match.
+func matchConvertedAMO(db *ManthanOrder, book []indiraClient.OrderBook, claimed map[string]bool) *indiraClient.OrderBook {
+	want := strings.ToUpper(strings.TrimSpace(db.Symbol))
+	var found *indiraClient.OrderBook
+	for i := range book {
+		o := &book[i]
+		if o.OrdId == "" || claimed[o.OrdId] {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(o.OrdAction), "SELL") {
+			continue
+		}
+		ot := strings.ToUpper(o.OrdType)
+		if !strings.Contains(ot, "SL") && !strings.Contains(ot, "STOP") {
+			continue
+		}
+		base := strings.ToUpper(strings.TrimSpace(o.Symbol.BaseSym))
+		if base == "" {
+			base = strings.ToUpper(strings.TrimSpace(o.Symbol.DispSym))
+			if i := strings.Index(base, "-"); i > 0 {
+				base = base[:i]
+			}
+		}
+		if base != want {
+			continue
+		}
+		if o.Qty != db.Qty || math.Abs(o.TriggerPrice-db.TriggerPrice) > 0.011 {
+			continue
+		}
+		if !placedTodayIST(o.OrdDate) {
+			continue
+		}
+		if found != nil {
+			return nil // ambiguous — leave it for a human
+		}
+		found = o
+	}
+	return found
+}
+
+// placedTodayIST reports whether an order-book date string ("2026-08-19
+// 09:15:14" or "19-Aug-2026 09:15:14") falls on today's IST calendar day.
+// Unparseable → false (never match on a guess).
+func placedTodayIST(ordDate string) bool {
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	if ist == nil {
+		ist = time.FixedZone("IST", 5*3600+1800)
+	}
+	s := strings.TrimSpace(ordDate)
+	for _, layout := range []string{"2006-01-02 15:04:05", "02-Jan-2006 15:04:05", "2006-01-02", "02-Jan-2006"} {
+		if t, err := time.ParseInLocation(layout, s, ist); err == nil {
+			n := time.Now().In(ist)
+			return t.Year() == n.Year() && t.YearDay() == n.YearDay()
+		}
+	}
 	return false
 }
 

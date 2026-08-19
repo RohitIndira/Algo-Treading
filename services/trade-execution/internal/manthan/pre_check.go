@@ -3,6 +3,7 @@ package manthan
 import (
 	"context"
 	"fmt"
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"os"
 	"time"
 
@@ -158,6 +159,12 @@ func (p *PreChecker) checkMarketHours() PreCheckResult {
 	weekday := now.Weekday()
 	if weekday == time.Saturday || weekday == time.Sunday {
 		return fail(fmt.Sprintf("market closed — %s", weekday))
+	}
+	// NSE holiday on a weekday: a hard close, not a pre-open wait. Without
+	// this the PRE_OPEN hold would carry the 09:00 batch to 09:15 and send
+	// LIMIT BUYs at stale prices to the broker on an exchange holiday.
+	if !indiraClient.IsTradingDay(now) {
+		return fail("market closed — exchange holiday")
 	}
 
 	hour, min := now.Hour(), now.Minute()
