@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,42 @@ import (
 // safe trigger floor. 1.005 = trigger sits 50bps inside the lower band, so
 // pre-open DPR re-bucketing can't push it outside.
 const DPRSafetyBuffer = 1.005
+
+// BandFloorClampMaxPct — policy chosen 2026-08-19: when the intended 20%
+// stop is BELOW the day's circuit-band floor (the exchange rejects such a
+// trigger), place the stop AT the floor if the floor is no more than this
+// fraction above the intended level; otherwise defer (software stop only).
+//
+// Why: NSE's band is 20% below the PREVIOUS CLOSE while the strategy's stop
+// is 20% below ENTRY/HIGH, so any position at or below yesterday's close has
+// its stop just under the band — for 20%-band stocks the floor is only a
+// few % above the intended stop and a broker-resident stop there (with
+// gap-at-open protection the software trail cannot give) is worth that
+// small cost. For 5–10%-band stocks the floor is far above the intended
+// stop and would exit on normal volatility, so those keep deferring. The
+// intended level stays the trail's truth (trigger_price); the broker holds
+// the clamped value (broker_trigger_price) and is re-modified as the band
+// allows.
+const BandFloorClampMaxPct = 0.05
+
+// resolveBandFloor decides how to protect at `intended` given today's band.
+//   - intended inside the band          → (intended, false, "")
+//   - floor ≤ intended×(1+ClampMax)      → (floor,   true,  "")   place at floor
+//   - floor further above                → (0,      false, reason) defer
+func resolveBandFloor(intended, dprLower float64) (trigger float64, clampedToFloor bool, deferReason string) {
+	if dprLower <= 0 || intended <= 0 {
+		return intended, false, ""
+	}
+	floor := dprLower * DPRSafetyBuffer
+	if intended >= floor {
+		return intended, false, ""
+	}
+	if floor <= intended*(1+BandFloorClampMaxPct) {
+		return floor, true, ""
+	}
+	return 0, false, fmt.Sprintf("intended SL %.2f is %.1f%% below DPR floor %.2f (> %.0f%% policy) — deferred (band too narrow; software stop until band re-centers)",
+		intended, (floor/intended-1)*100, floor, BandFloorClampMaxPct*100)
+}
 
 // MarketOpenFireDelay is how long after 09:15:00 IST to wait before firing
 // the SL placements. 100ms gives the exchange's first tick a chance to
@@ -499,15 +536,22 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 		// and a later cycle re-attempts once the band re-centers low enough, so
 		// the SL walks to the true 20%. Gate runs before the action switch so it
 		// short-circuits every placement path (including lower-circuit AMO).
-		if info.DPRLower > 0 && intended < info.DPRLower*DPRSafetyBuffer {
+		resolved, clamped, deferWhy := resolveBandFloor(intended, info.DPRLower)
+		if deferWhy != "" {
 			plans = append(plans, FirePlan{
 				Pos:        pos,
 				Auth:       *auth,
 				Info:       info,
 				Action:     FireSkip,
-				SkipReason: fmt.Sprintf("intended SL %.2f below DPR floor %.2f — deferred (unreachable this session; places at 20%% when band re-centers)", intended, info.DPRLower*DPRSafetyBuffer),
+				SkipReason: deferWhy,
 			})
 			continue
+		}
+		if clamped {
+			p.logger.Info("Replay: intended stop below band — placing at the band floor (within policy)",
+				zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol),
+				zap.Float64("intended", intended), zap.Float64("floor", resolved))
+			intended = resolved
 		}
 
 		// Tick-align via broker_adapter's clamp (intended is within band here).
@@ -810,8 +854,20 @@ func (p *ProtectiveReplay) insertProtectionRow(ctx context.Context, plan FirePla
 	} else if plan.Action == FireAMOLowerCircuit {
 		orderType = OrderTypeAMOSell
 	}
+	// Dated + retryable id: "protective-<entry>-<yyyymmdd>[-rN]". The first
+	// attempt keeps the historical id; a same-day re-attempt after a broker
+	// REJECTION gets -rN (UNIQUE(signal_id) otherwise blocked every retry
+	// that day, exactly like the AMO ids did). trade_date is stamped so
+	// HasActiveProtectionForToday sees a live hot SL and the 09:35 / 11:00
+	// sweeps skip it cleanly instead of relying on the unique-key failure.
+	base := fmt.Sprintf("protective-%s-%s", plan.Pos.EntrySignalID, p.now().Format("20060102"))
+	sigID := base
+	if n, err := p.repo.CountSignalIDPrefix(ctx, base); err == nil && n > 0 {
+		sigID = fmt.Sprintf("%s-r%d", base, n)
+	}
 	o := &ManthanOrder{
-		SignalID:      fmt.Sprintf("protective-%s-%s", plan.Pos.EntrySignalID, p.now().Format("20060102")),
+		SignalID:      sigID,
+		TradeDate:     sql.NullTime{Time: p.todayTradeDateIST(), Valid: true},
 		StrategyID:    plan.Pos.StrategyID,
 		UserID:        plan.Pos.UserID,
 		Symbol:        plan.Pos.Symbol,

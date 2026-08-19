@@ -172,7 +172,16 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 	// one session (circuit caps the move), so we hold: mark the row
 	// SL_DEFERRED_BAND (no broker order) and let the daily protective-replay
 	// place the real 20% SL once the band re-centers low enough.
-	if info.DPRLower > 0 && triggerPrice < info.DPRLower {
+	if resolved, clamped, deferWhy := resolveBandFloor(triggerPrice, info.DPRLower); clamped {
+		// Policy (2026-08-19): floor within 5% of the intended stop → place AT
+		// the floor now (broker-resident, gap-protected). trigger_price stays
+		// the intended level (set at InsertOrder); the broker holds the clamp.
+		h.logger.Info("Initial SL below band — placing at the band floor (within policy)",
+			zap.String("symbol", signal.Symbol),
+			zap.Float64("intended_trigger", triggerPrice), zap.Float64("floor", resolved))
+		triggerPrice = resolved
+		limitPrice = h.broker.roundAndClamp(triggerPrice-SLLimitGap(triggerPrice, info.TickSize), info.TickSize, info.DPRLower, info.DPRUpper)
+	} else if deferWhy != "" {
 		// Park it: link to the parent entry, keep trigger_price = intended (set at
 		// InsertOrder). The trail keeps this intended current via the deferred
 		// branch in ModifyTrail; the daily replay places it once the band allows.

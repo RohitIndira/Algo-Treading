@@ -323,11 +323,15 @@ func (p *ProtectiveReplay) planEODTrigger(
 	// touch). The position can't reach the intended level in one session, and a
 	// later cycle re-attempts once the band re-centers low enough. The caller
 	// treats a non-empty reason as a clean skip + ProtectionSkipped event.
-	if info.DPRLower > 0 {
-		floor := info.DPRLower * DPRSafetyBuffer
-		if intended < floor {
-			return 0, 0, info, fmt.Sprintf("intended SL %.2f below DPR floor %.2f — deferred (unreachable next session; replay places at 20%% when band re-centers)", intended, floor)
-		}
+	resolved, clamped, deferWhy := resolveBandFloor(intended, info.DPRLower)
+	if deferWhy != "" {
+		return 0, 0, info, deferWhy
+	}
+	if clamped {
+		p.logger.Info("EOD Phase A: intended stop below band — arming at the band floor (within policy)",
+			zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol),
+			zap.Float64("intended", intended), zap.Float64("floor", resolved))
+		intended = resolved
 	}
 	safeTrigger := p.broker.roundAndClamp(intended, info.TickSize, info.DPRLower, info.DPRUpper)
 	safeLimit := p.broker.roundAndClamp(

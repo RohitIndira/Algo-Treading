@@ -66,13 +66,13 @@ func (r *Repository) InsertOrder(ctx context.Context, o *ManthanOrder) (int64, e
 			signal_id, strategy_id, user_id, symbol, isin, exchange,
 			order_type, order_side, product_type,
 			qty, limit_price, trigger_price,
-			indira_symbol, exchange_token, status, max_retries
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+			indira_symbol, exchange_token, status, max_retries, trade_date
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 		RETURNING id`,
 		nullStr(o.SignalID), o.StrategyID, o.UserID, o.Symbol, nullStr(o.ISIN), o.Exchange,
 		o.OrderType, o.OrderSide, o.ProductType,
 		o.Qty, o.LimitPrice, o.TriggerPrice,
-		o.IndiraSymbol, o.ExchangeToken, o.Status, o.MaxRetries,
+		o.IndiraSymbol, o.ExchangeToken, o.Status, o.MaxRetries, o.TradeDate,
 	).Scan(&id)
 	if err != nil {
 		// Detect the partial-UNIQUE conflict from migration 016 and
@@ -1204,6 +1204,15 @@ func (r *Repository) InsertAMOOrder(
 		return 0, false, fmt.Errorf("commit: %w", err)
 	}
 	return id, false, nil
+}
+
+// CountSignalIDPrefix returns how many rows already carry a signal_id that
+// starts with prefix (used to derive "-rN" retry ids without colliding with
+// UNIQUE(signal_id)).
+func (r *Repository) CountSignalIDPrefix(ctx context.Context, prefix string) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM manthan_orders WHERE signal_id LIKE $1`, prefix+"%").Scan(&n)
+	return n, err
 }
 
 // PromoteAMOToLiveSL records a successful 08:50 IST AMO→live conversion:

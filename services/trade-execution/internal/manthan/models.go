@@ -1,6 +1,9 @@
 package manthan
 
-import "time"
+import (
+	"database/sql"
+	"time"
+)
 
 // OrderType classifies the kind of broker order.
 type OrderType string
@@ -19,18 +22,18 @@ const (
 type OrderStatus string
 
 const (
-	StatusPending          OrderStatus = "PENDING"
-	StatusPlaced           OrderStatus = "PLACED"
-	StatusFilled           OrderStatus = "FILLED"
-	StatusPartial          OrderStatus = "PARTIAL"
-	StatusRejected         OrderStatus = "REJECTED"
-	StatusCancelled        OrderStatus = "CANCELLED"
-	StatusExpired          OrderStatus = "EXPIRED"
-	StatusSLPlaced         OrderStatus = "SL_PLACED"
-	StatusSLTriggered      OrderStatus = "SL_TRIGGERED"
-	StatusSLFilled         OrderStatus = "SL_FILLED"
-	StatusSLModifyPending  OrderStatus = "SL_MODIFY_PENDING"
-	StatusEmergencySell    OrderStatus = "EMERGENCY_SELL"
+	StatusPending         OrderStatus = "PENDING"
+	StatusPlaced          OrderStatus = "PLACED"
+	StatusFilled          OrderStatus = "FILLED"
+	StatusPartial         OrderStatus = "PARTIAL"
+	StatusRejected        OrderStatus = "REJECTED"
+	StatusCancelled       OrderStatus = "CANCELLED"
+	StatusExpired         OrderStatus = "EXPIRED"
+	StatusSLPlaced        OrderStatus = "SL_PLACED"
+	StatusSLTriggered     OrderStatus = "SL_TRIGGERED"
+	StatusSLFilled        OrderStatus = "SL_FILLED"
+	StatusSLModifyPending OrderStatus = "SL_MODIFY_PENDING"
+	StatusEmergencySell   OrderStatus = "EMERGENCY_SELL"
 	// SL_DEFERRED_BAND: the intended 20% stop is below the day's DPR band, so a
 	// resting SL there is unplaceable and a band-floor stop would exit prematurely.
 	// We hold (no broker order) — the stock can't reach the intended level in one
@@ -59,40 +62,44 @@ func (s OrderStatus) IsTerminal() bool {
 
 // ManthanOrder represents one order tracked in manthan_orders table.
 type ManthanOrder struct {
-	ID              int64       `db:"id"`
-	SignalID        string      `db:"signal_id"`
-	StrategyID      string      `db:"strategy_id"`
-	UserID          string      `db:"user_id"`
-	Symbol          string      `db:"symbol"`
-	ISIN            string      `db:"isin"`
-	Exchange        string      `db:"exchange"`
-	OrderType       OrderType   `db:"order_type"`
-	OrderSide       string      `db:"order_side"`
-	ProductType     string      `db:"product_type"`
-	Qty             int         `db:"qty"`
-	FilledQty       int         `db:"filled_qty"`
-	LimitPrice      float64     `db:"limit_price"`
-	TriggerPrice    float64     `db:"trigger_price"` // INTENDED stop (high*0.80, un-clamped) — drives trail/ratchet
-	AvgFillPrice    float64     `db:"avg_fill_price"`
+	ID           int64     `db:"id"`
+	SignalID     string    `db:"signal_id"`
+	StrategyID   string    `db:"strategy_id"`
+	UserID       string    `db:"user_id"`
+	Symbol       string    `db:"symbol"`
+	ISIN         string    `db:"isin"`
+	Exchange     string    `db:"exchange"`
+	OrderType    OrderType `db:"order_type"`
+	OrderSide    string    `db:"order_side"`
+	ProductType  string    `db:"product_type"`
+	Qty          int       `db:"qty"`
+	FilledQty    int       `db:"filled_qty"`
+	LimitPrice   float64   `db:"limit_price"`
+	TriggerPrice float64   `db:"trigger_price"` // INTENDED stop (high*0.80, un-clamped) — drives trail/ratchet
+	AvgFillPrice float64   `db:"avg_fill_price"`
 	// BrokerTriggerPrice/BrokerLimitPrice mirror the broker's actual resting SL
 	// (post DPR/tick clamp). Populated from the adapter's place/modify return
 	// value and re-synced by the reconciler. trigger_price stays the intended 20%.
 	BrokerTriggerPrice float64 `db:"broker_trigger_price"`
 	BrokerLimitPrice   float64 `db:"broker_limit_price"`
-	BrokerOrderID   string      `db:"broker_order_id"`
-	BrokerStatus    string      `db:"broker_status"`
-	IndiraSymbol    string      `db:"indira_symbol"`
-	ExchangeToken   string      `db:"exchange_token"`
-	Status          OrderStatus `db:"status"`
-	RetryCount      int         `db:"retry_count"`
-	MaxRetries      int         `db:"max_retries"`
-	LastError       string      `db:"last_error"`
-	ParentOrderID   *int64      `db:"parent_order_id"`
-	CreatedAt       time.Time   `db:"created_at"`
-	PlacedAt        *time.Time  `db:"placed_at"`
-	FilledAt        *time.Time  `db:"filled_at"`
-	CancelledAt     *time.Time  `db:"cancelled_at"`
-	UpdatedAt       time.Time   `db:"updated_at"`
+	BrokerOrderID      string  `db:"broker_order_id"`
+	// TradeDate (optional) — the session a protective row belongs to. Set on
+	// AMO rows and (since 2026-08-19) on hot protective SL rows so
+	// HasActiveProtectionForToday can see them; NULL on entry/legacy rows.
+	TradeDate     sql.NullTime `db:"trade_date"`
+	BrokerStatus  string       `db:"broker_status"`
+	IndiraSymbol  string       `db:"indira_symbol"`
+	ExchangeToken string       `db:"exchange_token"`
+	Status        OrderStatus  `db:"status"`
+	RetryCount    int          `db:"retry_count"`
+	MaxRetries    int          `db:"max_retries"`
+	LastError     string       `db:"last_error"`
+	ParentOrderID *int64       `db:"parent_order_id"`
+	CreatedAt     time.Time    `db:"created_at"`
+	PlacedAt      *time.Time   `db:"placed_at"`
+	FilledAt      *time.Time   `db:"filled_at"`
+	CancelledAt   *time.Time   `db:"cancelled_at"`
+	UpdatedAt     time.Time    `db:"updated_at"`
 }
 
 // ManthanSignal is the Kafka message from rules-engine (or rebalancer).
@@ -103,15 +110,15 @@ type ManthanSignal struct {
 	Symbol        string  `json:"symbol"`
 	ISIN          string  `json:"isin"`
 	Exchange      string  `json:"exchange"`
-	OrderType     string  `json:"order_type"`      // MARKET
-	OrderSide     string  `json:"order_side"`       // BUY or SELL
-	ProductType   string  `json:"product_type"`     // DELIVERY
+	OrderType     string  `json:"order_type"`   // MARKET
+	OrderSide     string  `json:"order_side"`   // BUY or SELL
+	ProductType   string  `json:"product_type"` // DELIVERY
 	Quantity      int32   `json:"quantity"`
 	EntryPrice    float64 `json:"entry_price"`
 	StopLoss      float64 `json:"stop_loss"`
-	StopLossType  string  `json:"stop_loss_type"`   // TRAILING
-	StopLossPct   float64 `json:"stop_loss_pct"`    // 20
-	TrailingSLPct float64 `json:"trailing_sl_pct"`  // 2
+	StopLossType  string  `json:"stop_loss_type"`  // TRAILING
+	StopLossPct   float64 `json:"stop_loss_pct"`   // 20
+	TrailingSLPct float64 `json:"trailing_sl_pct"` // 2
 	InvestedAmt   float64 `json:"invested_amt"`
 	Industry      string  `json:"industry"`
 	MCapBucket    string  `json:"mcap_bucket"`
@@ -121,7 +128,7 @@ type ManthanSignal struct {
 	// always fetch creds at-edge via authProvider (user-config gRPC + DB
 	// fallback). The token no longer rides the Kafka wire. See
 	// internal/repository/grpc_credentials_repository.go.
-	TradingMode   string  `json:"trading_mode"`
+	TradingMode string `json:"trading_mode"`
 
 	// TopUpForSignalID — when set, this signal tops up an existing position
 	// rather than opening a fresh one. Set only by the rebalancer (see
@@ -157,15 +164,15 @@ type SLExitSignal struct {
 	Symbol      string  `json:"symbol"`
 	ISIN        string  `json:"isin"`
 	Exchange    string  `json:"exchange"`
-	OrderType   string  `json:"order_type"`    // MARKET
-	OrderSide   string  `json:"order_side"`     // SELL
-	ProductType string  `json:"product_type"`   // DELIVERY
+	OrderType   string  `json:"order_type"`   // MARKET
+	OrderSide   string  `json:"order_side"`   // SELL
+	ProductType string  `json:"product_type"` // DELIVERY
 	Quantity    int32   `json:"quantity"`
 	ExitPrice   float64 `json:"exit_price"`
 	SLPrice     float64 `json:"sl_price"`
 	PnL         float64 `json:"pnl"`
 	// Auth fields removed 2026-06-25 — fetched at-edge via authProvider.
-	TradingMode string  `json:"trading_mode"`
+	TradingMode string `json:"trading_mode"`
 }
 
 // BrokerAuth holds credentials for broker API calls.
