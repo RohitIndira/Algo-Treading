@@ -259,7 +259,8 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 		return restored, orphans, 0, fmt.Errorf("iterate rows: %w", err)
 	}
 
-	// Recent PENDING_ENTRY rows (dispatched, fill not yet confirmed) are
+	// Recent PENDING_ENTRY rows (dispatched, fill not yet confirmed; up to
+	// 24h — the scanner expires the truly stale ones after 09:30 IST) are
 	// reloaded as in-memory pendings so that (a) a restart inside the
 	// dispatch→fill window — 15 min every morning under the pre-open hold,
 	// hours under an upper-circuit hold — keeps the slot/cap reservation and
@@ -273,8 +274,7 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 		       COALESCE(index_name,''), entry_price, quantity, COALESCE(invested_amt, entry_price*quantity),
 		       COALESCE(ema_alloc_pct,0), entry_time
 		FROM manthan_positions
-		WHERE status = 'PENDING_ENTRY' AND entry_time > now() - $1::interval`,
-		fmt.Sprintf("%d seconds", int(PendingEntryTTL.Seconds()))); perr != nil {
+		WHERE status = 'PENDING_ENTRY' AND entry_time > now() - interval '24 hours'`); perr != nil {
 		pm.logger.Warn("Rehydrate: pending-entry query failed (pendings not reloaded)", zap.Error(perr))
 	} else {
 		defer prows.Close()
@@ -473,6 +473,23 @@ func (pm *PortfolioManager) CleanupOrphans(
 // wait (09:00 dispatch → 15:19 upper-circuit release ≈ 6.3 h).
 const PendingEntryTTL = 8 * time.Hour
 
+// pendingExpiryAllowedNow gates the pending expiry: a dispatch that is
+// waiting for the 09:15 IST open (pre-open hold) can legitimately be older
+// than PendingEntryTTL at 09:00 if it was dispatched overnight, so on a
+// trading day nothing is expired before 09:30 IST — after the hold has had
+// its chance to fill and confirm.
+func pendingExpiryAllowedNow(now time.Time) bool {
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	if ist == nil {
+		ist = time.FixedZone("IST", 5*60*60+30*60)
+	}
+	n := now.In(ist)
+	if n.Weekday() == time.Saturday || n.Weekday() == time.Sunday {
+		return true
+	}
+	return n.Hour()*60+n.Minute() >= 9*60+30
+}
+
 // ExpireStalePendingsInMemory drops PENDING_ENTRY positions older than ttl
 // from every portfolio and returns how many were released. Memory-only:
 // the DB row is retired by the scanner's UPDATE with the same TTL.
@@ -533,7 +550,7 @@ func (pm *PortfolioManager) StartOrphanScanner(
 			// PendingEntryTTL (dispatches that died at trade-execution) —
 			// in the DB and in memory, so a dead dispatch releases its
 			// slot/cap reservation before the next morning's batch.
-			if db != nil {
+			if db != nil && pendingExpiryAllowedNow(time.Now()) {
 				if res, err := db.ExecContext(ctx, `
 					UPDATE manthan_positions
 					SET status='EXPIRED', exit_reason='ENTRY_NEVER_FILLED', updated_at=now()
@@ -543,6 +560,9 @@ func (pm *PortfolioManager) StartOrphanScanner(
 						pm.logger.Info("Orphan scanner: expired stale PENDING_ENTRY rows", zap.Int64("expired", n))
 					}
 				}
+			}
+			if !pendingExpiryAllowedNow(time.Now()) {
+				continue
 			}
 			if n := pm.ExpireStalePendingsInMemory(PendingEntryTTL); n > 0 {
 				pm.logger.Info("Orphan scanner: released stale in-memory pendings", zap.Int("released", n))

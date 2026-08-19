@@ -82,10 +82,15 @@ func (p *ManthanPublisher) PersistTrail(ctx context.Context, strategyID string, 
 	if p.db == nil {
 		return nil
 	}
+	// A trail only happens for an in-memory ACTIVE (fill-confirmed) position,
+	// so a row still PENDING_ENTRY here means PersistFillConfirmed failed or
+	// was missed — promote it as we go rather than let the scanner EXPIRE a
+	// live position (self-heal; entry price/qty stay dispatch-time values).
 	_, err := p.db.ExecContext(ctx, `
 		UPDATE manthan_positions
-		SET current_sl = $1, high_since_entry = $2, last_trail_level = $3, updated_at = now()
-		WHERE strategy_id = $4 AND symbol = $5 AND status = 'ACTIVE'`,
+		SET current_sl = $1, high_since_entry = $2, last_trail_level = $3,
+		    status = 'ACTIVE', updated_at = now()
+		WHERE strategy_id = $4 AND symbol = $5 AND status IN ('ACTIVE','PENDING_ENTRY')`,
 		pos.CurrentSL, pos.HighSinceEntry, pos.LastTrailLevel, strategyID, pos.Symbol)
 	if err != nil {
 		p.logger.Warn("PersistTrail failed — DB trail lags memory by one ratchet (safe: SL only moves up, next tick re-ratchets)",
@@ -135,7 +140,7 @@ func (p *ManthanPublisher) PersistFillConfirmed(ctx context.Context, strategyID,
 		  AND status IN ('PENDING_ENTRY','ACTIVE')`,
 		fillPrice, qty, strategyID, symbol, fillPrice*float64(qty), postFillSL)
 	if err != nil {
-		p.logger.Warn("PersistFillConfirmed failed — row stays PENDING_ENTRY until next confirmation/restart",
+		p.logger.Error("PersistFillConfirmed failed — row stays PENDING_ENTRY (next trail ratchet self-heals it)",
 			zap.String("symbol", symbol), zap.Error(err))
 	}
 	return err

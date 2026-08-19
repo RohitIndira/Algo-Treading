@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -289,7 +290,27 @@ func (pm *PortfolioManager) MarkExitPending(strategyID, symbol string) {
 // stay frozen — no trail, no re-fire — until someone restarted the service.
 const ExitPendingTTL = 45 * time.Minute
 
+// ExitPosition books a confirmed exit and installs the re-entry cooldown
+// (SL-driven exits). For non-SL exits use ExitPositionWithReason.
 func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice float64) float64 {
+	return pm.ExitPositionWithReason(strategyID, symbol, exitPrice, "SL_TRIGGER")
+}
+
+// exitReasonInstallsCooldown: the Manthan re-entry cooldown (stock must
+// correct 20% from its ATH before re-entry) applies to STOP-LOSS exits.
+// Manual / strategy / liquidation exits release the book but install no
+// cooldown — the user_override window in manthan_signal_decisions is the
+// only re-entry gate for those (matches the cooldown consumer's own
+// SL_TRIGGER filter; before 2026-08-18 non-SL exits never reached memory).
+func exitReasonInstallsCooldown(reason string) bool {
+	r := strings.ToUpper(strings.TrimSpace(reason))
+	return r == "" || r == "SL_TRIGGER" || r == "TSL_HIT" || strings.Contains(r, "SL")
+}
+
+// ExitPositionWithReason is ExitPosition with the broker-reported exit
+// reason: capital is always rebalanced by the realized P&L (it really
+// changed), the cooldown only for SL-driven exits.
+func (pm *PortfolioManager) ExitPositionWithReason(strategyID, symbol string, exitPrice float64, reason string) float64 {
 	pm.mu.RLock()
 	p, ok := pm.portfolios[strategyID]
 	pm.mu.RUnlock()
@@ -333,12 +354,15 @@ func (pm *PortfolioManager) ExitPosition(strategyID, symbol string, exitPrice fl
 	}
 
 	// Add to cooldown — stock must correct 20% from ATH before re-entry
-	p.Cooldown[symbol] = &types.CooldownEntry{
-		Symbol:       symbol,
-		ATHAtExit:    ath,
-		ExitPrice:    exitPrice,
-		ExitTime:     time.Now(),
-		ReentryBelow: ath * 0.80, // 20% below ATH
+	// (SL-driven exits only; see exitReasonInstallsCooldown).
+	if exitReasonInstallsCooldown(reason) {
+		p.Cooldown[symbol] = &types.CooldownEntry{
+			Symbol:       symbol,
+			ATHAtExit:    ath,
+			ExitPrice:    exitPrice,
+			ExitTime:     time.Now(),
+			ReentryBelow: ath * 0.80, // 20% below ATH
+		}
 	}
 
 	pm.logger.Info("Position exited",

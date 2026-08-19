@@ -285,7 +285,7 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			// Broker-confirmed exits release memory + book the DB exit with
 			// the REAL reason. tick_handler no longer books at trail-cross.
 			ExitConfirmed: func(strategyID, symbol string, exitPrice float64, reason string) {
-				pnl := m.portfolioMgr.ExitPosition(strategyID, symbol, exitPrice)
+				pnl := m.portfolioMgr.ExitPositionWithReason(strategyID, symbol, exitPrice, reason)
 				_ = m.publisher.PersistExit(context.Background(), strategyID, symbol, exitPrice, pnl, reason)
 				logger.Info("Confirmed exit booked",
 					zap.String("strategy", strategyID), zap.String("symbol", symbol),
