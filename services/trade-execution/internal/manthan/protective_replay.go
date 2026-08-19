@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -94,7 +95,42 @@ type ProtectiveReplay struct {
 	// Optional SESSION_EXPIRED publisher — nil-safe.
 	authNotif AuthExpiryNotifier
 
+	// stopSource (optional) answers "what is the CURRENT trailed stop for
+	// (strategy, symbol)?" from rules-engine's book (trading_db
+	// manthan_positions.current_sl) — the source of truth for the trail.
+	// Without it the replayer used the newest manthan_orders trigger, which
+	// goes stale whenever SL_MODIFYs cannot land (no live SL row → DLQ):
+	// 2026-08-19 it deferred GNA at 439.30 (below band) while the real stop
+	// was 468.80 (placeable). nil-safe: falls back to LatestTrigger.
+	stopSource StopSource
+
 	ist *time.Location
+}
+
+// StopSource returns (currentStop, true) when the trail owner knows the
+// position, (0, false) otherwise.
+type StopSource func(ctx context.Context, strategyID, symbol string) (float64, bool)
+
+// SetStopSource wires the trail-owner lookup (see stopSource).
+func (p *ProtectiveReplay) SetStopSource(fn StopSource) { p.stopSource = fn }
+
+// intendedStop is the trigger the replayer should protect at: rules-engine's
+// live trailed stop when known, else the order-history trigger.
+func (p *ProtectiveReplay) intendedStop(ctx context.Context, pos PositionNeedingProtection) float64 {
+	intended := pos.LatestTrigger
+	if p.stopSource == nil {
+		return intended
+	}
+	sl, ok := p.stopSource(ctx, pos.StrategyID, pos.Symbol)
+	if !ok || sl <= 0 {
+		return intended
+	}
+	if intended > 0 && math.Abs(sl-intended)/intended > 0.005 {
+		p.logger.Info("Replay: using rules-engine's trailed stop (order-history trigger was stale)",
+			zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol),
+			zap.Float64("rules_engine_sl", sl), zap.Float64("order_history_trigger", intended))
+	}
+	return sl
 }
 
 // SetAuthExpiryNotifier wires the SESSION_EXPIRED publisher.
@@ -131,13 +167,13 @@ func (p *ProtectiveReplay) SetEventPublisher(ep *ManthanEventPublisher) {
 
 // Start runs the daily protective-replay scheduling. Two crons fire:
 //
-//   1. 16:35 IST — EOD Phase A (this file: eod_phase_a.go). For every open
-//      position, place an AMO+SL on Indira's overnight queue so the
-//      position is protected the moment the market reopens.
+//  1. 16:35 IST — EOD Phase A (this file: eod_phase_a.go). For every open
+//     position, place an AMO+SL on Indira's overnight queue so the
+//     position is protected the moment the market reopens.
 //
-//   2. 09:14 IST — Hot SL placement (this method's runOnce). Builds plans
-//      for any positions still unprotected (EOD failed, AMO didn't
-//      convert, etc.) and places live SL orders before the 09:15 open.
+//  2. 09:14 IST — Hot SL placement (this method's runOnce). Builds plans
+//     for any positions still unprotected (EOD failed, AMO didn't
+//     convert, etc.) and places live SL orders before the 09:15 open.
 //
 // Both honor IsTradingDay so we never wake up on holidays/weekends to
 // place orders the broker would reject. Each cron has an independent
@@ -229,26 +265,26 @@ func isWeekend(t time.Time) bool {
 
 // FirePlan is the per-position decision built at 09:14, executed at 09:15.
 type FirePlan struct {
-	Pos          PositionNeedingProtection
-	Auth         BrokerAuth
-	Info         *SymbolInfo
-	IntendedQty  int     // qty actually sellable (min of pos.NetQty and freeQty)
-	SafeTrigger  float64 // DPR-clamped, tick-aligned
-	SafeLimit    float64 // SL limit price (= SafeTrigger - SLLimitGap)
-	LTP          float64 // best-effort latest market price
-	Action       FireAction
-	SkipReason   string // populated when Action == FireSkip
+	Pos         PositionNeedingProtection
+	Auth        BrokerAuth
+	Info        *SymbolInfo
+	IntendedQty int     // qty actually sellable (min of pos.NetQty and freeQty)
+	SafeTrigger float64 // DPR-clamped, tick-aligned
+	SafeLimit   float64 // SL limit price (= SafeTrigger - SLLimitGap)
+	LTP         float64 // best-effort latest market price
+	Action      FireAction
+	SkipReason  string // populated when Action == FireSkip
 }
 
 // FireAction is the order-type decision made by the planner.
 type FireAction string
 
 const (
-	FireSkip       FireAction = "SKIP"        // skip + alert (freeQty=0, no auth, etc.)
-	FireSLLimit    FireAction = "SL_LIMIT"    // place SL-L at SafeTrigger (LTP > trigger)
-	FireSLMarket   FireAction = "SL_MARKET"   // place SL-M (gap-down already breached)
-	FireMarketSell FireAction = "MARKET_SELL" // straight market sell (deep gap, exit now)
-	FireAMOLowerCircuit FireAction = "AMO_LC" // lower-circuit at open, AMO is only path out
+	FireSkip            FireAction = "SKIP"        // skip + alert (freeQty=0, no auth, etc.)
+	FireSLLimit         FireAction = "SL_LIMIT"    // place SL-L at SafeTrigger (LTP > trigger)
+	FireSLMarket        FireAction = "SL_MARKET"   // place SL-M (gap-down already breached)
+	FireMarketSell      FireAction = "MARKET_SELL" // straight market sell (deep gap, exit now)
+	FireAMOLowerCircuit FireAction = "AMO_LC"      // lower-circuit at open, AMO is only path out
 )
 
 func (p *ProtectiveReplay) runOnce(ctx context.Context) {
@@ -429,7 +465,7 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 		}
 
 		// Compute safe trigger: clamp to DPR_lower * buffer, tick-align.
-		intended := pos.LatestTrigger
+		intended := p.intendedStop(ctx, pos)
 		if intended <= 0 {
 			// No prior SL trail — default to entry × 0.92 (8% loss cap).
 			ltp := p.fetchLTP(ctx, info)
@@ -565,14 +601,15 @@ func (p *ProtectiveReplay) fetchFreeQtyMap(ctx context.Context, auth BrokerAuth,
 // Phase A 16:35 IST path. Computed as holdingQty - usedQty - pledgeQty.
 //
 // Why not freeQty?
-//   freeQty is 0 for any position bought TODAY (T+0) because Indian markets
-//   are T+1 settle: today's CNC buy moves into the demat account overnight
-//   and isn't "free to sell" until the next morning. But EOD Phase A's AMO
-//   doesn't fire today — Indira queues it overnight and releases it at
-//   09:00 IST next session, after settlement completes. By that time the
-//   shares ARE free. Gating on freeQty here would mass-skip every position
-//   bought the same day Manthan signaled the entry — exactly the case
-//   Phase A is meant to protect.
+//
+//	freeQty is 0 for any position bought TODAY (T+0) because Indian markets
+//	are T+1 settle: today's CNC buy moves into the demat account overnight
+//	and isn't "free to sell" until the next morning. But EOD Phase A's AMO
+//	doesn't fire today — Indira queues it overnight and releases it at
+//	09:00 IST next session, after settlement completes. By that time the
+//	shares ARE free. Gating on freeQty here would mass-skip every position
+//	bought the same day Manthan signaled the entry — exactly the case
+//	Phase A is meant to protect.
 //
 // holdingQty - usedQty - pledgeQty is the "shares sellable once T+1
 // settlement clears". usedQty/pledgeQty subtractions cover shares pledged

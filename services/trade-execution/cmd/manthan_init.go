@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -26,12 +27,12 @@ type ManthanModule struct {
 	EntryHandler        *manthan.EntryHandler
 	SLHandler           *manthan.SLHandler
 	BrokerAdapter       *manthan.BrokerAdapter
-	ExternalDetector    *manthan.ExternalActivityDetector  // nil when disabled
-	ProtectiveReplay    *manthan.ProtectiveReplay          // custom-GTC AMO replayer
-	JWTNotifier         *manthan.JWTExpiryNotifier         // pre-open JWT-expiry alerts
-	InboxWorker         *manthan.InboxWorker               // drains signal_inbox (transactional inbox)
-	ArmRetryWorker      *manthan.ArmRetryWorker            // Layer 4: drains manthan_arm_retries on re-login
-	OrderEventsConsumer *manthan.OrderEventsConsumer       // Kafka reader for order.events from orderstatus svc (Chunk E)
+	ExternalDetector    *manthan.ExternalActivityDetector // nil when disabled
+	ProtectiveReplay    *manthan.ProtectiveReplay         // custom-GTC AMO replayer
+	JWTNotifier         *manthan.JWTExpiryNotifier        // pre-open JWT-expiry alerts
+	InboxWorker         *manthan.InboxWorker              // drains signal_inbox (transactional inbox)
+	ArmRetryWorker      *manthan.ArmRetryWorker           // Layer 4: drains manthan_arm_retries on re-login
+	OrderEventsConsumer *manthan.OrderEventsConsumer      // Kafka reader for order.events from orderstatus svc (Chunk E)
 
 	// AuthProvider — the same per-user credentials closure used internally
 	// by all handlers. Exposed so main.go can compose it with BrokerAdapter
@@ -289,6 +290,27 @@ func InitManthan(
 	var protectiveReplay *manthan.ProtectiveReplay
 	if os.Getenv("MANTHAN_PROTECTIVE_REPLAY_ENABLED") == "true" {
 		protectiveReplay = manthan.NewProtectiveReplay(broker, repo, getAuth, logger)
+		// Trail source of truth: rules-engine's book in trading_db (same
+		// Postgres, different database). Read-only; nil-safe fallback to the
+		// order-history trigger if the DB is unreachable.
+		if tdb, terr := openTradingDBReadOnly(); terr != nil {
+			logger.Warn("trading_db (rules-engine stops) unavailable — replayer falls back to order-history triggers", zap.Error(terr))
+		} else {
+			protectiveReplay.SetStopSource(func(ctx context.Context, strategyID, symbol string) (float64, bool) {
+				var sl float64
+				qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				defer cancel()
+				err := tdb.QueryRowContext(qctx, `
+					SELECT current_sl FROM manthan_positions
+					WHERE strategy_id = $1 AND symbol = $2 AND status = 'ACTIVE'
+					ORDER BY updated_at DESC LIMIT 1`, strategyID, symbol).Scan(&sl)
+				if err != nil || sl <= 0 {
+					return 0, false
+				}
+				return sl, true
+			})
+			logger.Info("Replayer stop source wired: rules-engine trading_db.manthan_positions.current_sl")
+		}
 		protectiveReplay.SetEventPublisher(eventPub)
 		log.Println("[manthan] Protective replayer ENABLED (server-side trigger: 09:14 plan → 09:15:00.1 fire → 09:15:30 reconcile)")
 	}
@@ -347,18 +369,18 @@ func InitManthan(
 	log.Println("[manthan] ✓ All components initialized")
 
 	return &ManthanModule{
-		SignalConsumer:   signalConsumer,
-		SafetyMonitor:    safetyMonitor,
-		Reconciler:       reconciler,
-		Recovery:         recovery,
-		WSSBridge:        wssBridge,
-		EntryHandler:     entryHandler,
-		SLHandler:        slHandler,
-		BrokerAdapter:    broker,
-		ExternalDetector: externalDetector,
-		ProtectiveReplay: protectiveReplay,
-		InboxWorker:      inboxWorker,
-		JWTNotifier:      jwtNotifier,
+		SignalConsumer:      signalConsumer,
+		SafetyMonitor:       safetyMonitor,
+		Reconciler:          reconciler,
+		Recovery:            recovery,
+		WSSBridge:           wssBridge,
+		EntryHandler:        entryHandler,
+		SLHandler:           slHandler,
+		BrokerAdapter:       broker,
+		ExternalDetector:    externalDetector,
+		ProtectiveReplay:    protectiveReplay,
+		InboxWorker:         inboxWorker,
+		JWTNotifier:         jwtNotifier,
 		ArmRetryWorker:      armRetryWorker,
 		OrderEventsConsumer: orderEventsConsumer,
 		AuthProvider:        getAuth,
@@ -487,4 +509,30 @@ func (a authGateWaker) ClearSessionExpired(userID string) {
 	if a.worker != nil {
 		a.worker.Notify()
 	}
+}
+
+// openTradingDBReadOnly opens rules-engine's trading_db on the same Postgres
+// as execution_db (env RULES_ENGINE_DB, default "trading_db").
+func openTradingDBReadOnly() (*sql.DB, error) {
+	dsn := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		getEnv("POSTGRES_HOST", "localhost"),
+		getEnv("POSTGRES_PORT", "5432"),
+		getEnv("POSTGRES_USER", "postgres"),
+		getEnv("POSTGRES_PASSWORD", "postgres"),
+		getEnv("RULES_ENGINE_DB", "trading_db"),
+		getEnv("POSTGRES_SSL_MODE", "disable"),
+	)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(2)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }

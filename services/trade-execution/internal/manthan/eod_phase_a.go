@@ -309,7 +309,7 @@ func (p *ProtectiveReplay) planEODTrigger(
 	// basis. A drifted close would either tighten the SL well above
 	// entry (cutting position prematurely) or loosen it (giving up the
 	// risk-management edge). Entry price is the right anchor.
-	intended := pos.LatestTrigger
+	intended := p.intendedStop(ctx, pos)
 	if intended <= 0 {
 		if pos.EntryFillPrice > 0 {
 			intended = pos.EntryFillPrice * EODFallbackSLPct
