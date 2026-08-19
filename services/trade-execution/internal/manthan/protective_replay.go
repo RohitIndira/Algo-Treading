@@ -75,22 +75,14 @@ import (
 // pre-open DPR re-bucketing can't push it outside.
 const DPRSafetyBuffer = 1.005
 
-// BandFloorClampMaxPct — policy chosen 2026-08-19: when the intended 20%
-// stop is BELOW the day's circuit-band floor (the exchange rejects such a
-// trigger), place the stop AT the floor if the floor is no more than this
-// fraction above the intended level; otherwise defer (software stop only).
-//
-// Why: NSE's band is 20% below the PREVIOUS CLOSE while the strategy's stop
-// is 20% below ENTRY/HIGH, so any position at or below yesterday's close has
-// its stop just under the band — for 20%-band stocks the floor is only a
-// few % above the intended stop and a broker-resident stop there (with
-// gap-at-open protection the software trail cannot give) is worth that
-// small cost. For 5–10%-band stocks the floor is far above the intended
-// stop and would exit on normal volatility, so those keep deferring. The
-// intended level stays the trail's truth (trigger_price); the broker holds
-// the clamped value (broker_trigger_price) and is re-modified as the band
-// allows.
-const BandFloorClampMaxPct = 0.05
+// BandFloorClampMaxPct — HARD RULE (operator, 2026-08-19): the stop is
+// ALWAYS the exact 20% trailing level. If that level is outside the day's
+// circuit band the broker cannot hold it, so nothing is placed until the
+// level comes back inside the band; it is NEVER moved to the band floor.
+// (A brief experiment on 2026-08-19 placed floor stops when the floor was
+// within 5% of the intended level; the operator reverted it the same hour.)
+// Kept as a constant so the rule is visible in one place; 0 = never clamp.
+const BandFloorClampMaxPct = 0.0
 
 // resolveBandFloor decides how to protect at `intended` given today's band.
 //   - intended inside the band          → (intended, false, "")
@@ -104,11 +96,11 @@ func resolveBandFloor(intended, dprLower float64) (trigger float64, clampedToFlo
 	if intended >= floor {
 		return intended, false, ""
 	}
-	if floor <= intended*(1+BandFloorClampMaxPct) {
+	if BandFloorClampMaxPct > 0 && floor <= intended*(1+BandFloorClampMaxPct) {
 		return floor, true, ""
 	}
-	return 0, false, fmt.Sprintf("intended SL %.2f is %.1f%% below DPR floor %.2f (> %.0f%% policy) — deferred (band too narrow; software stop until band re-centers)",
-		intended, (floor/intended-1)*100, floor, BandFloorClampMaxPct*100)
+	return 0, false, fmt.Sprintf("intended 20%% SL %.2f is %.1f%% below DPR floor %.2f — not placeable this session (hard rule: exact 20%% stop only; places when the band lets it in)",
+		intended, (floor/intended-1)*100, floor)
 }
 
 // MarketOpenFireDelay is how long after 09:15:00 IST to wait before firing
