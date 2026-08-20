@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -430,6 +431,22 @@ func (h *LiveAlgosHandler) GetStrategyDetails(w http.ResponseWriter, r *http.Req
 	// current live P&L so the frontend can render a real curve from day 0
 	// to today instead of an empty chart.
 	payload.Chart = h.chartFor(r.Context(), algoID, meta.CreatedAt, payload.NetPnL.Percent)
+
+	// ── True production metrics (2026-08-20) ──
+	// TotalReturn: the header's NetPnL.Percent (realized + unrealized on
+	// deployed capital). computeMetrics's realized-only figure contradicted
+	// the header on the same screen — a single stop-out showed a negative
+	// "total return" next to a positive net P&L.
+	payload.Metrics.TotalReturnPct = payload.NetPnL.Percent
+	// CAGR / MaxDrawdown / Sharpe: computed from the SAME curve the page's
+	// chart renders (the algo's real daily series rebased at this user's
+	// deployment date, live point included) so the tiles always match the
+	// chart. Honesty gates inside — fields stay 0 until the deployment's
+	// data genuinely supports them.
+	dd, sharpe, cagr := metricsFromChart(payload.Chart)
+	payload.Metrics.MaxDrawdownPct = dd
+	payload.Metrics.SharpeRatio = sharpe
+	payload.Metrics.CAGRPct = cagr
 	respondIndiraOK(w, payload)
 }
 
@@ -516,6 +533,70 @@ func (h *LiveAlgosHandler) chartFor(ctx context.Context, algoID string, deployed
 
 // istLoc returns Asia/Kolkata with a UTC fallback — matches the tz-load
 // pattern used by startOfTodayIST above.
+// metricsFromChart derives MaxDrawdown / Sharpe / CAGR from the details
+// chart's equity points (Pct is an equity index: 100 = deployed capital).
+// The chart is the deployment's truth on this page, so metrics computed from
+// it can never disagree with what the user sees.
+//
+// Honesty gates (same discipline as internal/performance):
+//   - MaxDrawdown: ≥2 points (a single point has no drawdown);
+//   - Sharpe:      ≥31 points (≥30 daily returns) — annualised, rf=0,
+//     0 on zero volatility, never NaN/Inf;
+//   - CAGR:        span ≥365 days — never annualise a shorter deployment.
+func metricsFromChart(chart livealgos.DetailsChart) (maxDD, sharpe, cagr float64) {
+	pts := chart.Points
+	if len(pts) < 2 {
+		return 0, 0, 0
+	}
+	// Max drawdown over the equity curve.
+	peak := math.Inf(-1)
+	for _, p := range pts {
+		if p.Pct > peak {
+			peak = p.Pct
+		}
+		if peak > 0 {
+			if dd := (p.Pct - peak) / peak * 100; dd < maxDD {
+				maxDD = dd
+			}
+		}
+	}
+	maxDD = round2Pct(maxDD)
+	// Sharpe from daily equity returns.
+	if len(pts) >= 31 {
+		daily := make([]float64, 0, len(pts)-1)
+		for i := 1; i < len(pts); i++ {
+			if pts[i-1].Pct > 0 {
+				daily = append(daily, pts[i].Pct/pts[i-1].Pct-1)
+			}
+		}
+		if len(daily) >= 30 {
+			var sum float64
+			for _, r := range daily {
+				sum += r
+			}
+			mean := sum / float64(len(daily))
+			var varSum float64
+			for _, r := range daily {
+				varSum += (r - mean) * (r - mean)
+			}
+			if std := math.Sqrt(varSum / float64(len(daily))); std > 0 {
+				sharpe = round2Pct(mean / std * math.Sqrt(252))
+			}
+		}
+	}
+	// CAGR only once the deployment spans a year.
+	firstT, err1 := time.Parse("2006-01-02", pts[0].Date)
+	lastT, err2 := time.Parse("2006-01-02", pts[len(pts)-1].Date)
+	if err1 == nil && err2 == nil {
+		if years := lastT.Sub(firstT).Hours() / 24 / 365.25; years >= 1 {
+			if pts[0].Pct > 0 && pts[len(pts)-1].Pct > 0 {
+				cagr = round2Pct((math.Pow(pts[len(pts)-1].Pct/pts[0].Pct, 1/years) - 1) * 100)
+			}
+		}
+	}
+	return maxDD, sharpe, cagr
+}
+
 func istLoc() *time.Location {
 	loc, err := time.LoadLocation("Asia/Kolkata")
 	if err != nil {

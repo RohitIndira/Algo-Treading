@@ -93,20 +93,20 @@ func BuildDetails(
 	}
 
 	return DetailsResponse{
-		StrategyID:      meta.StrategyID,
-		AlgoID:          algoID,
-		Name:            algoName,
-		Status:          status,
-		DeployedCapital: deployed,
-		AsOf:            latest,
-		NetPnL:          PnL{Amount: netAmount, Percent: round2(netPct)},
-		TodayPnL:        PnL{Amount: todayAmt, Percent: round2(todayPct)},
-		Chart:           DetailsChart{Points: []DetailsChartPoint{}}, // filled by nav.go later
-		Metrics:         computeMetrics(exited, deployed),
-		TopHoldings:     topHoldings,
-		AllocationSector:  allocationBy(active, float64(deployed), func(p PositionRow) string { return nullStr(p.Industry) }),
-		AllocationMCap:    allocationBy(active, float64(deployed), func(p PositionRow) string { return nullStr(p.MCapBucket) }),
-		TopPastTrades:     trades,
+		StrategyID:       meta.StrategyID,
+		AlgoID:           algoID,
+		Name:             algoName,
+		Status:           status,
+		DeployedCapital:  deployed,
+		AsOf:             latest,
+		NetPnL:           PnL{Amount: netAmount, Percent: round2(netPct)},
+		TodayPnL:         PnL{Amount: todayAmt, Percent: round2(todayPct)},
+		Chart:            DetailsChart{Points: []DetailsChartPoint{}}, // filled by nav.go later
+		Metrics:          computeMetrics(exited, deployed),
+		TopHoldings:      topHoldings,
+		AllocationSector: allocationBy(active, float64(deployed), func(p PositionRow) string { return nullStr(p.Industry) }),
+		AllocationMCap:   allocationBy(active, float64(deployed), func(p PositionRow) string { return nullStr(p.MCapBucket) }),
+		TopPastTrades:    trades,
 	}
 }
 
@@ -135,12 +135,12 @@ func BuildTrades(exited []PositionRow) TradesResponse {
 // same symbol twice); we aggregate across them.
 func BuildStockPnL(symbol string, positions []PositionRow, orders []OrderRow) StockPnLResponse {
 	var (
-		industry             string
-		totalBuyQty          int
-		totalSellQty         int
-		totalBuyValue        float64
-		totalSellValue       float64
-		totalRealised        int64
+		industry       string
+		totalBuyQty    int
+		totalSellQty   int
+		totalBuyValue  float64
+		totalSellValue float64
+		totalRealised  int64
 	)
 	for _, p := range positions {
 		if industry == "" && p.Industry.Valid {
@@ -472,13 +472,18 @@ func computeMetrics(exited []PositionRow, deployed int64) Metrics {
 		totalReturnPct = float64(realisedSum) / float64(deployed) * 100
 	}
 
+	// TotalReturnPct here is REALIZED-only (closed lots / deployed) and the
+	// CAGR/MaxDD/Sharpe slots are zero — the handler overwrites all four
+	// from the page's own truth (NetPnL header + chart curve) with honesty
+	// gates; see GetStrategyDetails + metricsFromChart (2026-08-20). Only
+	// WinRate and AvgHolding survive from here (the user's real closed lots).
 	return Metrics{
 		TotalReturnPct: round2(totalReturnPct),
-		CAGRPct:        0, // Phase 2 — NAV history required
+		CAGRPct:        0,
 		WinRatePct:     round2(winRate),
-		MaxDrawdownPct: 0, // Phase 2
+		MaxDrawdownPct: 0,
 		AvgHoldingDays: round1(avgHolding),
-		SharpeRatio:    0, // Phase 2
+		SharpeRatio:    0,
 	}
 }
 
