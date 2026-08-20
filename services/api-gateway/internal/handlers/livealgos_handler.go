@@ -586,7 +586,7 @@ func trueCurve(snaps []livealgos.NAVPoint, deployedAt time.Time, livePct float64
 //
 // Honesty gates (same discipline as internal/performance):
 //   - MaxDrawdown: ≥2 points (a single point has no drawdown);
-//   - Sharpe:      ≥31 points (≥30 daily returns) — annualised, rf=0,
+//   - Sharpe:      ≥11 points (≥10 daily returns) — annualised, rf=0,
 //     0 on zero volatility, never NaN/Inf;
 //   - CAGR:        span ≥365 days — never annualise a shorter deployment.
 func metricsFromChart(chart livealgos.DetailsChart) (maxDD, sharpe, cagr float64) {
@@ -608,14 +608,14 @@ func metricsFromChart(chart livealgos.DetailsChart) (maxDD, sharpe, cagr float64
 	}
 	maxDD = round2Pct(maxDD)
 	// Sharpe from daily equity returns.
-	if len(pts) >= 31 {
+	if len(pts) >= 11 {
 		daily := make([]float64, 0, len(pts)-1)
 		for i := 1; i < len(pts); i++ {
 			if pts[i-1].Pct > 0 {
 				daily = append(daily, pts[i].Pct/pts[i-1].Pct-1)
 			}
 		}
-		if len(daily) >= 30 {
+		if len(daily) >= 10 {
 			var sum float64
 			for _, r := range daily {
 				sum += r

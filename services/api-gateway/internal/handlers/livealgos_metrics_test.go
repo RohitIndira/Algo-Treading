@@ -27,7 +27,7 @@ func TestMetricsFromChart_DrawdownFromCurve(t *testing.T) {
 	if math.Abs(dd-(-10)) > 0.01 {
 		t.Errorf("maxDD = %v, want −10", dd)
 	}
-	// 4 points: too short for Sharpe (needs 31) and CAGR (needs 1y).
+	// 4 points: too short for Sharpe (needs 11) and CAGR (needs 1y).
 	if sharpe != 0 || cagr != 0 {
 		t.Errorf("short deployment must gate sharpe/cagr: sharpe=%v cagr=%v", sharpe, cagr)
 	}
