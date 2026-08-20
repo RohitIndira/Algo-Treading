@@ -66,6 +66,9 @@ type LiveAlgosHandler struct {
 	// pending" placeholder.
 	perfStore     performance.Store
 	perfClientMap map[string]string
+	// navStore (optional) serves the TRUE per-deployment curve; when nil or
+	// empty the chart falls back to the reference series rebased at deploy.
+	navStore *livealgos.NAVStore
 }
 
 // NewLiveAlgosHandler wires the handler to its dependencies. Both
@@ -82,6 +85,7 @@ func NewLiveAlgosHandler(
 	ltp *livealgos.LTPStore,
 	perfStore performance.Store,
 	perfClientMap map[string]string,
+	navStore *livealgos.NAVStore,
 ) *LiveAlgosHandler {
 	if userConfig == nil {
 		panic("handlers.NewLiveAlgosHandler: userConfig is required")
@@ -96,6 +100,7 @@ func NewLiveAlgosHandler(
 		ltp:           ltp,
 		perfStore:     perfStore,
 		perfClientMap: perfClientMap,
+		navStore:      navStore,
 	}
 }
 
@@ -430,7 +435,7 @@ func (h *LiveAlgosHandler) GetStrategyDetails(w http.ResponseWriter, r *http.Req
 	// or perfStore isn't wired) synthesize a 2-point line from the strategy's
 	// current live P&L so the frontend can render a real curve from day 0
 	// to today instead of an empty chart.
-	payload.Chart = h.chartFor(r.Context(), algoID, meta.CreatedAt, payload.NetPnL.Percent)
+	payload.Chart = h.chartForStrategy(r.Context(), strategyID, algoID, meta.CreatedAt, payload.NetPnL.Percent)
 
 	// ── True production metrics (2026-08-20) ──
 	// TotalReturn: the header's NetPnL.Percent (realized + unrealized on
@@ -462,6 +467,24 @@ func (h *LiveAlgosHandler) GetStrategyDetails(w http.ResponseWriter, r *http.Req
 // return_pct so the earliest chart point sits at 100. Every subsequent
 // point is 100 + (row.ReturnPct - baseline) — i.e. growth from the day
 // this strategy deployed.
+// chartForStrategy prefers the TRUE deployment curve (strategy_nav_daily —
+// the user's own recorded NAV) and only falls back to the reference series
+// rebased at the deploy date while no snapshots exist yet (pre-2026-08-20
+// deployments accrue their true history from the day the snapshot job
+// started; per-symbol daily closes don't exist anywhere, so the past cannot
+// be reconstructed honestly). Metrics tiles derive from whatever curve is
+// returned, so they always match the chart.
+func (h *LiveAlgosHandler) chartForStrategy(ctx context.Context, strategyID, algoID string, deployedAt time.Time, livePct float64) livealgos.DetailsChart {
+	if h.navStore != nil && strategyID != "" {
+		if snaps, err := h.navStore.Series(ctx, strategyID); err != nil {
+			log.Printf("livealgos: NAV series %s: %v — falling back to reference curve", strategyID, err)
+		} else if len(snaps) > 0 {
+			return trueCurve(snaps, deployedAt, livePct, time.Now().In(istLoc()))
+		}
+	}
+	return h.chartFor(ctx, algoID, deployedAt, livePct)
+}
+
 func (h *LiveAlgosHandler) chartFor(ctx context.Context, algoID string, deployedAt time.Time, livePct float64) livealgos.DetailsChart {
 	// Primary source: algo_performance_daily since deploy day.
 	if h.perfStore != nil && algoID != "" {
@@ -533,6 +556,29 @@ func (h *LiveAlgosHandler) chartFor(ctx context.Context, algoID string, deployed
 
 // istLoc returns Asia/Kolkata with a UTC fallback — matches the tz-load
 // pattern used by startOfTodayIST above.
+// trueCurve builds the chart from recorded NAV snapshots: a 100 anchor at
+// the deploy date (when it precedes the first snapshot), one point per
+// settled day (100 + that day's net P&L %), and today's LIVE value replacing
+// or appending the final point so the curve always ends at what the header
+// shows right now.
+func trueCurve(snaps []livealgos.NAVPoint, deployedAt time.Time, livePct float64, now time.Time) livealgos.DetailsChart {
+	today := now.Format("2006-01-02")
+	pts := make([]livealgos.DetailsChartPoint, 0, len(snaps)+2)
+	deployDate := deployedAt.Format("2006-01-02")
+	if len(snaps) > 0 && deployDate < snaps[0].Date.Format("2006-01-02") {
+		pts = append(pts, livealgos.DetailsChartPoint{Date: deployDate, Pct: 100})
+	}
+	for _, sn := range snaps {
+		d := sn.Date.Format("2006-01-02")
+		if d == today {
+			continue // replaced by the live point below
+		}
+		pts = append(pts, livealgos.DetailsChartPoint{Date: d, Pct: 100 + sn.NetPnLPct})
+	}
+	pts = append(pts, livealgos.DetailsChartPoint{Date: today, Pct: 100 + livePct})
+	return livealgos.DetailsChart{Points: pts}
+}
+
 // metricsFromChart derives MaxDrawdown / Sharpe / CAGR from the details
 // chart's equity points (Pct is an equity index: 100 = deployed capital).
 // The chart is the deployment's truth on this page, so metrics computed from

@@ -74,3 +74,49 @@ func TestMetricsFromChart_DegenerateInputs(t *testing.T) {
 	}
 	_ = fmt.Sprint()
 }
+
+// ═══ trueCurve: the TRUE deployment chart from NAV snapshots ═══
+
+func navPt(y, m, d int, pct float64) livealgos.NAVPoint {
+	return livealgos.NAVPoint{Date: time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC), NetPnLPct: pct}
+}
+
+func TestTrueCurve_AnchorsSnapshotsAndLivePoint(t *testing.T) {
+	deployed := time.Date(2026, 8, 11, 6, 35, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)
+	c := trueCurve([]livealgos.NAVPoint{navPt(2026, 8, 20, 0.42), navPt(2026, 8, 21, 0.90)}, deployed, 1.35, now)
+	want := []struct {
+		date string
+		pct  float64
+	}{
+		{"2026-08-11", 100},    // deploy anchor (precedes first snapshot)
+		{"2026-08-20", 100.42}, // settled snapshots
+		{"2026-08-21", 100.90},
+		{"2026-08-22", 101.35}, // today's LIVE value ends the curve
+	}
+	if len(c.Points) != len(want) {
+		t.Fatalf("points = %v", c.Points)
+	}
+	for i, w := range want {
+		if c.Points[i].Date != w.date || math.Abs(c.Points[i].Pct-w.pct) > 0.001 {
+			t.Errorf("point %d = %+v, want %+v", i, c.Points[i], w)
+		}
+	}
+}
+
+func TestTrueCurve_TodaySnapshotReplacedByLive(t *testing.T) {
+	// Intraday: today's snapshot row exists (30-min upsert) but the response
+	// must show the CURRENT header value, not the stale snapshot.
+	deployed := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 20, 13, 0, 0, 0, time.UTC)
+	c := trueCurve([]livealgos.NAVPoint{navPt(2026, 8, 20, 0.10)}, deployed, 0.55, now)
+	last := c.Points[len(c.Points)-1]
+	if last.Date != "2026-08-20" || math.Abs(last.Pct-100.55) > 0.001 {
+		t.Errorf("today's point = %+v, want live 100.55", last)
+	}
+	for i, p := range c.Points[:len(c.Points)-1] {
+		if p.Date == "2026-08-20" {
+			t.Errorf("stale today snapshot survived at %d: %+v", i, p)
+		}
+	}
+}

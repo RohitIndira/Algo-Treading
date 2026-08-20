@@ -17,9 +17,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/config"
-	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/auth"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/handlers"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/livealgos"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
@@ -127,7 +127,8 @@ func main() {
 	// GetStrategyDetails (algo_performance_daily → DetailsChart).
 	var liveAlgosPerfStore performance.Store
 	var liveAlgosPerfClientMap map[string]string
-	var extRedis *redis.Client // hoisted: reused by the market-quote handler
+	var liveAlgosNAVStore *livealgos.NAVStore // true deployment NAV curve (stockk_market)
+	var extRedis *redis.Client                // hoisted: reused by the market-quote handler
 	// positionsDB, ordersDB + their DB names hoisted so downstream setup
 	// (live-algos store in DB.1, portfolio token lookup in PF.D) can reuse
 	// the same pools instead of dialling a second time.
@@ -221,6 +222,7 @@ func main() {
 			log.Printf("Manthan performance DB connected (%s)", perfDBName)
 			defer perfDB.Close()
 			perfStore := performance.NewPostgresStore(perfDB)
+			liveAlgosNAVStore = livealgos.NewNAVStore(perfDB)
 			// Maps algo id → reference client id in the sheet. Grows as
 			// we add more algos; for launch there's exactly one entry.
 			perfClientMap := map[string]string{
@@ -372,7 +374,11 @@ func main() {
 		pCancel()
 	}
 
-	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP, liveAlgosPerfStore, liveAlgosPerfClientMap)
+	liveAlgosHandler := handlers.NewLiveAlgosHandler(userConfigClient, algosCatalog, liveAlgosStore, liveAlgosLTP, liveAlgosPerfStore, liveAlgosPerfClientMap, liveAlgosNAVStore)
+	// True per-deployment NAV snapshots — feeds the details chart + metrics.
+	if pgStore, ok := liveAlgosStore.(*livealgos.PostgresStore); ok {
+		startNAVSnapshots(context.Background(), pgStore, liveAlgosLTP, liveAlgosNAVStore)
+	}
 
 	// ── Portfolio handler (PF.D) ────────────────────────────────────────
 	// Dials portfolio svc's gRPC, composes an Enricher over the same
