@@ -109,3 +109,54 @@ func TestComputeAlgoStats_DoesNotMutateInput(t *testing.T) {
 		t.Error("input slice was reordered")
 	}
 }
+
+// ═══ 2026-08-20: production metrics — CAGR / Sharpe / TotalReturn ═══
+
+// CAGR is only reported when the series covers ≥ 1 year — annualising a
+// shorter span inflates the figure (the same fabrication rule as windows).
+func TestComputeAlgoStats_CAGRHonesty(t *testing.T) {
+	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	short := []DailyRow{
+		{Date: day(base, -200), ReturnPct: 0},
+		{Date: base, ReturnPct: 30},
+	}
+	if st := ComputeAlgoStats(short); st.CAGRPct != 0 {
+		t.Errorf("CAGR from 200 days = %v, want 0 (never annualise <1y)", st.CAGRPct)
+	}
+	// Exactly 2 years, 0 → 44%: CAGR = sqrt(1.44)−1 = 20%.
+	twoYears := []DailyRow{
+		{Date: day(base, -730), ReturnPct: 0},
+		{Date: base, ReturnPct: 44},
+	}
+	st := ComputeAlgoStats(twoYears)
+	if math.Abs(st.CAGRPct-20) > 0.15 {
+		t.Errorf("CAGR = %v, want ≈20 (sqrt(1.44)−1)", st.CAGRPct)
+	}
+	if st.TotalReturnPct != 44 {
+		t.Errorf("TotalReturnPct = %v, want 44", st.TotalReturnPct)
+	}
+}
+
+func TestComputeAlgoStats_SharpeFiniteAndSigned(t *testing.T) {
+	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	// Steadily rising with mild noise → positive, finite Sharpe.
+	var rows []DailyRow
+	cum := 0.0
+	for i := -260; i <= 0; i++ {
+		if i%2 == 0 {
+			cum += 0.20
+		} else {
+			cum -= 0.05
+		}
+		rows = append(rows, DailyRow{Date: day(base, i), ReturnPct: cum})
+	}
+	st := ComputeAlgoStats(rows)
+	if st.SharpeRatio <= 0 || math.IsInf(st.SharpeRatio, 0) || math.IsNaN(st.SharpeRatio) {
+		t.Errorf("Sharpe = %v, want positive finite", st.SharpeRatio)
+	}
+	// Flat series → zero volatility → 0, never NaN.
+	flat := []DailyRow{{Date: day(base, -2), ReturnPct: 5}, {Date: day(base, -1), ReturnPct: 5}, {Date: base, ReturnPct: 5}}
+	if st := ComputeAlgoStats(flat); st.SharpeRatio != 0 {
+		t.Errorf("flat Sharpe = %v, want 0", st.SharpeRatio)
+	}
+}

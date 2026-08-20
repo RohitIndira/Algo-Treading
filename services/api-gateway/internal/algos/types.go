@@ -1,15 +1,17 @@
 // Package algos owns the "algo catalog" concept for api-gateway.
 //
 // What is an "algo"?
-//   An algo is an automated trading strategy users can browse, subscribe to,
-//   and run on their account. Right now we have one (Manthan); more will be
-//   added later. The data shown on the frontend Explore screen comes from
-//   this package.
+//
+//	An algo is an automated trading strategy users can browse, subscribe to,
+//	and run on their account. Right now we have one (Manthan); more will be
+//	added later. The data shown on the frontend Explore screen comes from
+//	this package.
 //
 // What's in this file?
-//   Only the data shapes (Go structs) — no logic, no Redis, no HTTP. Keeping
-//   types in their own file makes them easy to find and to share with other
-//   parts of the codebase that may need to read or write algo data later.
+//
+//	Only the data shapes (Go structs) — no logic, no Redis, no HTTP. Keeping
+//	types in their own file makes them easy to find and to share with other
+//	parts of the codebase that may need to read or write algo data later.
 package algos
 
 import "errors"
@@ -23,24 +25,24 @@ var ErrAlgoNotFound = errors.New("algos: algo not found")
 //
 // Field-by-field map back to the screen:
 //
-//   ID            stable identifier the frontend uses to link this card to
-//                 a future detail page or subscribe action. Never shown to
-//                 the user directly.
-//   Name          "Manthan" (big text on the card)
-//   Type          "Equity" (left of the dot separator)
-//   Style         "Positional" (right of the dot separator)
-//   Logo          URL to the green icon shown on the card
-//   Description   the paragraph under the title
-//   Badge         "Most subscribed" — small pill in the top-right
-//   MinInvestment 1500000 in rupees. The frontend formats it as "15 Lac".
-//                 We send raw rupees so the API stays stable even if the
-//                 display format ("15 Lac" / "15 Lakhs" / "₹15,00,000") changes.
-//   MaxDrawdown   -12.6 (a percentage as a plain number). Frontend prefixes
-//                 the "%" sign.
-//   PrimaryReturn flexible map of {"3Y Return": 28.4, "2Y Return": 32.9}.
-//                 Using a map (instead of fixed fields like Return3Y, Return2Y)
-//                 means we can add "5Y Return" / "1Y Return" later without
-//                 changing this struct or breaking the frontend.
+//	ID            stable identifier the frontend uses to link this card to
+//	              a future detail page or subscribe action. Never shown to
+//	              the user directly.
+//	Name          "Manthan" (big text on the card)
+//	Type          "Equity" (left of the dot separator)
+//	Style         "Positional" (right of the dot separator)
+//	Logo          URL to the green icon shown on the card
+//	Description   the paragraph under the title
+//	Badge         "Most subscribed" — small pill in the top-right
+//	MinInvestment 1500000 in rupees. The frontend formats it as "15 Lac".
+//	              We send raw rupees so the API stays stable even if the
+//	              display format ("15 Lac" / "15 Lakhs" / "₹15,00,000") changes.
+//	MaxDrawdown   -12.6 (a percentage as a plain number). Frontend prefixes
+//	              the "%" sign.
+//	PrimaryReturn flexible map of {"3Y Return": 28.4, "2Y Return": 32.9}.
+//	              Using a map (instead of fixed fields like Return3Y, Return2Y)
+//	              means we can add "5Y Return" / "1Y Return" later without
+//	              changing this struct or breaking the frontend.
 //
 // The `json:"..."` tags tell Go how to convert this struct into JSON. The
 // JSON keys are lowerCamelCase because that's what the frontend payload spec
@@ -70,14 +72,14 @@ type Algo struct {
 //
 // The full final response (with the Indira envelope around this) will look like:
 //
-//   {
-//     "infoID": "0",
-//     "infoMsg": "success",
-//     "timestamp": 1781843472610,
-//     "data": {
-//       "algos": [ {...}, {...} ]
-//     }
-//   }
+//	{
+//	  "infoID": "0",
+//	  "infoMsg": "success",
+//	  "timestamp": 1781843472610,
+//	  "data": {
+//	    "algos": [ {...}, {...} ]
+//	  }
+//	}
 //
 // The envelope ({infoID, infoMsg, timestamp}) is added by a separate helper
 // (envelope.go). That separation keeps this package focused only on what an
@@ -90,28 +92,35 @@ type ListResponse struct {
 // performance metrics shown as a 2×3 tile grid.
 //
 // Field notes:
-//   WinRatePct     — 62 means "62%". Frontend adds the % sign.
-//   ProfitFactor   — 24.1. Dimensionless ratio, no % suffix in the UI.
-//   TotalTradesPct — 68 means "68%". Confusingly named on the mockup
-//                    ("Total Trades") but it IS shown with a % sign,
-//                    so it's a percentage. Kept the "Pct" suffix so
-//                    future readers of this file don't wonder.
-//   AvgHoldingDays — a signed number (screen shows -7.4). Frontend
-//                    prefixes appropriately.
-//   Sortino        — the Sortino ratio. Dimensionless.
-//   VolatilityDays — displayed as "12 days" on the mockup. Integer.
+//
+//	WinRatePct     — 62 means "62%". Frontend adds the % sign.
+//	ProfitFactor   — 24.1. Dimensionless ratio, no % suffix in the UI.
+//	TotalTradesPct — 68 means "68%". Confusingly named on the mockup
+//	                 ("Total Trades") but it IS shown with a % sign,
+//	                 so it's a percentage. Kept the "Pct" suffix so
+//	                 future readers of this file don't wonder.
+//	AvgHoldingDays — a signed number (screen shows -7.4). Frontend
+//	                 prefixes appropriately.
+//	Sortino        — the Sortino ratio. Dimensionless.
+//	VolatilityDays — displayed as "12 days" on the mockup. Integer.
 //
 // Every field defaults to zero-value when omitted; the frontend
 // should treat all-zeros as "no data yet" (helpful when we add a
 // new algo before we've computed its metrics).
 type KeyStats struct {
-	WinRatePct     float64 `json:"winRatePct"`
-	ProfitFactor   float64 `json:"profitFactor"`
+	WinRatePct   float64 `json:"winRatePct"`
+	ProfitFactor float64 `json:"profitFactor"`
 	// TotalTradesPct is a COUNT of trades (e.g. 205), not a percentage —
 	// the json name is legacy and kept for frontend compatibility.
 	TotalTradesPct float64 `json:"totalTradesPct"`
 	AvgHoldingDays float64 `json:"avgHoldingDays"`
 	Sortino        float64 `json:"sortino"`
+	// Sharpe, TotalReturnPct, CAGRPct (2026-08-20): computed from the real
+	// daily series (see cmd/algo_stats.go); additive fields — older frontends
+	// ignore them, zero values are omitted.
+	Sharpe         float64 `json:"sharpe,omitempty"`
+	TotalReturnPct float64 `json:"totalReturnPct,omitempty"`
+	CAGRPct        float64 `json:"cagrPct,omitempty"`
 	VolatilityDays int     `json:"volatilityDays,omitempty"` // omitted when 0 (removed from UI)
 }
 
@@ -145,11 +154,11 @@ type AlsoWorthKnowingItem struct {
 // stays in ONE place. Go's JSON encoder "promotes" embedded struct
 // fields to the parent level automatically, so the output JSON is flat:
 //
-//   { "id": "...", "name": "...", ..., "keyStats": {...}, ... }
+//	{ "id": "...", "name": "...", ..., "keyStats": {...}, ... }
 //
 // not:
 //
-//   { "algo": { "id": "...", "name": "..." }, "keyStats": {...} }
+//	{ "algo": { "id": "...", "name": "..." }, "keyStats": {...} }
 //
 // which is what the frontend expects.
 //

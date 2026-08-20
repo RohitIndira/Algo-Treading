@@ -295,7 +295,7 @@ func main() {
 	// windows, maxDrawdown, sortino) instead of hardcoded constants. Nil-safe:
 	// if the perf store isn't wired the catalog keeps its defaults.
 	if sc, ok := algosCatalog.(*algos.StaticCatalog); ok && liveAlgosPerfStore != nil {
-		sc.SetStatsProvider(newAlgoStatsProvider(liveAlgosPerfStore, liveAlgosPerfClientMap, algoStatsTTL))
+		sc.SetStatsProvider(newAlgoStatsProvider(liveAlgosPerfStore, liveAlgosPerfClientMap, algoStatsTTL, positionsSSotDB))
 		log.Println("Algo catalog: live performance stats enabled (algo_performance_daily)")
 	} else {
 		log.Println("Algo catalog: perf store unavailable — serving catalog default stats")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log"
 	"sync"
 	"time"
@@ -27,7 +28,9 @@ const algoStatsTTL = 5 * time.Minute
 // drawdown of −5.68%. Returns (zero, false) whenever the figures cannot be
 // computed, in which case the catalog keeps its baked-in defaults rather
 // than rendering zeros.
-func newAlgoStatsProvider(store performance.Store, clientMap map[string]string, ttl time.Duration) algos.StatsProvider {
+// tradeDB (optional) adds trade-level metrics from positions_db closed lots;
+// they only go live past performance.MinTradesForStats (honesty threshold).
+func newAlgoStatsProvider(store performance.Store, clientMap map[string]string, ttl time.Duration, tradeDB *sql.DB) algos.StatsProvider {
 	type entry struct {
 		val algos.LiveStats
 		ok  bool
@@ -69,6 +72,22 @@ func newAlgoStatsProvider(store performance.Store, clientMap map[string]string, 
 					PrimaryReturn:  st.PrimaryReturn,
 					MaxDrawdownPct: st.MaxDrawdownPct,
 					SortinoRatio:   st.SortinoRatio,
+					SharpeRatio:    st.SharpeRatio,
+					TotalReturnPct: st.TotalReturnPct,
+					CAGRPct:        st.CAGRPct,
+				}
+				// Trade-level metrics from live closed lots (best-effort: a
+				// failed query never blocks the series stats).
+				if ts, terr := performance.FetchTradeStats(ctx, tradeDB); terr != nil {
+					log.Printf("algos: trade stats unavailable (%v) — keeping track-record key stats", terr)
+				} else if ts.Available {
+					val.TradeStatsLive = true
+					val.WinRatePct = ts.WinRatePct
+					val.ProfitFactor = ts.ProfitFactor
+					val.TotalTrades = ts.TotalTrades
+					val.AvgHoldingDays = ts.AvgHoldingDays
+				} else if ts.TotalTrades > 0 {
+					log.Printf("algos: %d live closed lots (<%d) — key stats stay track-record until the sample is meaningful", ts.TotalTrades, performance.MinTradesForStats)
 				}
 				ok = true
 			}

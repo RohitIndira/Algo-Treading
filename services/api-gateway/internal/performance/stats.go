@@ -48,6 +48,18 @@ type AlgoStats struct {
 	// SortinoRatio is annualised, risk-free = 0, using downside deviation.
 	// Zero when there is no downside volatility (or too few points).
 	SortinoRatio float64
+	// SharpeRatio is annualised, risk-free = 0, using the standard deviation
+	// of daily equity returns. Zero when there is no volatility (<2 points).
+	SharpeRatio float64
+	// TotalReturnPct is the cumulative return since inception (the latest
+	// row of the series) — same number as PrimaryReturn["Since Inception"],
+	// exposed as a typed field for the key-stats tiles.
+	TotalReturnPct float64
+	// CAGRPct is the compound annual growth rate over the series span.
+	// HONESTY: only computed when the series covers ≥ 1 year (annualising a
+	// shorter span inflates the number); 0 otherwise — callers keep their
+	// defaults or omit the tile.
+	CAGRPct float64
 
 	// AsOf is the last date in the series; Days is its span.
 	AsOf time.Time
@@ -110,7 +122,52 @@ func ComputeAlgoStats(rows []DailyRow) AlgoStats {
 
 	out.MaxDrawdownPct = maxDrawdownPct(series)
 	out.SortinoRatio = sortinoRatio(series)
+	out.SharpeRatio = sharpeRatio(series)
+	out.TotalReturnPct = round2(last.ReturnPct)
+	// CAGR only when the span genuinely covers a year (see field doc).
+	if years := last.Date.Sub(first.Date).Hours() / 24 / 365.25; years >= 1 {
+		endEquity := 100 + last.ReturnPct
+		startEquity := 100 + first.ReturnPct
+		if startEquity > 0 && endEquity > 0 {
+			out.CAGRPct = round2((math.Pow(endEquity/startEquity, 1/years) - 1) * 100)
+		}
+	}
 	return out
+}
+
+// sharpeRatio is the annualised Sharpe (risk-free = 0) over daily equity
+// returns: mean/stddev × √252. Reported as 0 with <2 usable points or zero
+// volatility, never NaN/Inf.
+func sharpeRatio(series []DailyRow) float64 {
+	if len(series) < 2 {
+		return 0
+	}
+	daily := make([]float64, 0, len(series)-1)
+	for i := 1; i < len(series); i++ {
+		prev := 100 + series[i-1].ReturnPct
+		curr := 100 + series[i].ReturnPct
+		if prev <= 0 {
+			continue
+		}
+		daily = append(daily, curr/prev-1)
+	}
+	if len(daily) < 2 {
+		return 0
+	}
+	var sum float64
+	for _, r := range daily {
+		sum += r
+	}
+	mean := sum / float64(len(daily))
+	var varSum float64
+	for _, r := range daily {
+		varSum += (r - mean) * (r - mean)
+	}
+	std := math.Sqrt(varSum / float64(len(daily)))
+	if std == 0 {
+		return 0
+	}
+	return round2(mean / std * math.Sqrt(tradingDaysPerYear))
 }
 
 // returnAsOf returns the cumulative return on the last row at/before `t`.

@@ -14,6 +14,17 @@ type LiveStats struct {
 	PrimaryReturn  map[string]float64
 	MaxDrawdownPct float64
 	SortinoRatio   float64
+	SharpeRatio    float64
+	TotalReturnPct float64
+	CAGRPct        float64
+	// Trade-level (positions_db closed lots). TradeStatsLive is true only
+	// when the sample passed performance.MinTradesForStats — below that the
+	// catalog's operator track-record figures stand.
+	TradeStatsLive bool
+	WinRatePct     float64
+	ProfitFactor   float64
+	TotalTrades    int
+	AvgHoldingDays float64
 }
 
 // StatsProvider returns computed stats for an algo. ok=false → keep defaults.
@@ -33,7 +44,11 @@ func (s *StaticCatalog) applyStats(ctx context.Context, a *Algo) LiveStats {
 	if len(live.PrimaryReturn) > 0 {
 		a.PrimaryReturn = live.PrimaryReturn
 	}
-
+	// 2026-08-20: the computed drawdown was populated into LiveStats but
+	// never APPLIED — the card kept the baked-in constant. Overlay it too.
+	if live.MaxDrawdownPct != 0 {
+		a.MaxDrawdown = live.MaxDrawdownPct
+	}
 	return live
 }
 
@@ -62,7 +77,29 @@ func (s *StaticCatalog) ByID(ctx context.Context, id string) (*AlgoDetail, error
 	if !ok {
 		return nil, ErrAlgoNotFound
 	}
-	s.applyStats(ctx, &detail.Algo) // primaryReturn only — see applyStats
+	live := s.applyStats(ctx, &detail.Algo)
+	// Series-derived key stats — real whenever the daily series exists.
+	if live.SortinoRatio != 0 {
+		detail.KeyStats.Sortino = live.SortinoRatio
+	}
+	if live.SharpeRatio != 0 {
+		detail.KeyStats.Sharpe = live.SharpeRatio
+	}
+	if live.TotalReturnPct != 0 {
+		detail.KeyStats.TotalReturnPct = live.TotalReturnPct
+	}
+	if live.CAGRPct != 0 {
+		detail.KeyStats.CAGRPct = live.CAGRPct
+	}
+	// Trade-derived key stats — only once the LIVE closed-lot sample is
+	// meaningful (performance.MinTradesForStats); until then the operator's
+	// track-record figures remain (see manthanDetail).
+	if live.TradeStatsLive {
+		detail.KeyStats.WinRatePct = live.WinRatePct
+		detail.KeyStats.ProfitFactor = live.ProfitFactor
+		detail.KeyStats.TotalTradesPct = float64(live.TotalTrades)
+		detail.KeyStats.AvgHoldingDays = live.AvgHoldingDays
+	}
 	return &detail, nil
 }
 
