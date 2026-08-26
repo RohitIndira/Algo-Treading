@@ -187,13 +187,29 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 			continue
 		}
 
+		// Already armed? Check BEFORE the attempt cap: a position whose stop
+		// is standing must count as protected, not raise a give-up alarm —
+		// even when earlier churn burned attempts (2026-08-26 first deploy:
+		// every armed position logged "GIVING UP" because the cap ran first).
+		if protected, perr := p.repo.HasActiveProtectionForToday(cycleCtx, pos.EntryOrderID, tradeDate); perr == nil && protected {
+			alreadyArmed++
+			continue
+		}
+
 		// Give-up cap: if tonight's window has already burned several AMO
 		// attempts for this position, the broker is rejecting this order
 		// deterministically (ghost position with no holdings, corporate-action
 		// price scale, band exclusion) — placing attempt N+1 is pure churn.
 		// Skip loudly; the alert names the position for manual reconciliation.
 		const maxAMOAttempts = 5
-		if attempts, cerr := p.repo.CountAMOAttemptsToday(cycleCtx, pos.EntryOrderID, tradeDate); cerr == nil && attempts >= maxAMOAttempts {
+		attempts, cerr := p.repo.CountAMOAttemptsToday(cycleCtx, pos.EntryOrderID, tradeDate)
+		if cerr != nil {
+			// Fail toward placing (the protective order matters more than the
+			// cap) but never silently: the count failing is itself a defect.
+			p.logger.Warn("EOD Phase A: attempt-cap count failed — proceeding without cap",
+				zap.String("symbol", pos.Symbol), zap.Error(cerr))
+		}
+		if cerr == nil && attempts >= maxAMOAttempts {
 			p.logger.Error("EOD Phase A: AMO attempt cap reached — GIVING UP for tonight; position needs manual review",
 				zap.String("symbol", pos.Symbol),
 				zap.String("user_id", pos.UserID),
