@@ -1,0 +1,279 @@
+<meta charset="utf-8">
+<title>Manthan Strategy Write-up</title>
+<style>
+/*__FONTS__*/
+@page { size: letter; margin: 0.62in 0.6in; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body {
+  font-family: "IBM Plex Serif", Georgia, serif;
+  font-size: 8.6pt; line-height: 1.62; color: #16191d; margin: 0;
+}
+p, ul, .callout, .disc { max-width: 4.62in; }
+p { margin: 0 0 9px; }
+b, strong { font-weight: 600; }
+code, .mono { font-family: "IBM Plex Mono", "DejaVu Sans Mono", monospace; }
+
+/* ---- cover ---- */
+.cover { text-align: center; padding-top: 90px; page-break-after: always; }
+.eyebrow {
+  font-family: "IBM Plex Sans", sans-serif; font-size: 6pt; font-weight: 600;
+  letter-spacing: 2.1px; text-transform: uppercase; color: #2a5c8f; margin-bottom: 15px;
+}
+.cover h1 {
+  font-family: "IBM Plex Sans", sans-serif; font-size: 18pt; font-weight: 700;
+  letter-spacing: -0.4px; color: #10131a; margin: 0 0 1px;
+}
+.cover .seg { font-weight: 700; font-size: 8.8pt; color: #16191d; margin: 0 0 2px; }
+.cover .ver { font-size: 8pt; color: #5d6570; margin: 0 0 15px; }
+.cover .line { font-size: 8.4pt; line-height: 1.42; color: #24282e; margin: 0; }
+.cover hr { border: 0; border-top: 1px solid #2c3138; margin: 34px 0 0; }
+
+/* ---- section headings ---- */
+h2 {
+  font-family: "IBM Plex Sans", sans-serif; font-size: 10.4pt; font-weight: 600;
+  color: #10131a; margin: 21px 0 2px; padding-bottom: 6px;
+  border-bottom: 1px solid #d9dde2; page-break-after: avoid;
+}
+h2 .num { color: #2a5c8f; font-weight: 600; margin-right: 7px; }
+h2 + p, h2 + table, h2 + ul { margin-top: 10px; }
+h3 {
+  font-family: "IBM Plex Sans", sans-serif; font-size: 7.6pt; font-weight: 600;
+  color: #10131a; margin: 15px 0 4px; page-break-after: avoid;
+}
+h4 {
+  font-family: "IBM Plex Sans", sans-serif; font-size: 7.4pt; font-weight: 600;
+  color: #10131a; margin: 14px 0 3px; page-break-after: avoid;
+}
+
+/* ---- tables ---- */
+table {
+  width: 100%; border-collapse: collapse; margin: 8px 0 12px;
+  font-size: 7.6pt; line-height: 1.45; page-break-inside: avoid;
+}
+th {
+  font-family: "IBM Plex Sans", sans-serif; font-size: 6.4pt; font-weight: 500;
+  letter-spacing: 0.9px; text-transform: uppercase; color: #5d6570;
+  text-align: left; padding: 0 8px 5px; vertical-align: bottom;
+  border-top: 1.1px solid #2c3138; border-bottom: 0.8px solid #b9c0c8;
+  padding-top: 5px;
+}
+td { padding: 5px 8px; vertical-align: top; border-bottom: 0.6px solid #e2e6ea; }
+tr:last-child td { border-bottom: 1.1px solid #2c3138; }
+td.k { width: 21%; }
+table.calc td.k { width: 19%; }
+table.calc td.c, table.calc td.w {
+  font-family: "IBM Plex Mono", monospace; font-size: 6.9pt; background: #f4f6f8;
+}
+table.calc td.c { width: 40%; }
+table.data td.k { width: 30%; }
+table.data td.s { width: 32%; }
+
+/* ---- code sample block ---- */
+pre.rec {
+  font-family: "IBM Plex Mono", monospace; font-size: 7.1pt; line-height: 1.55;
+  color: #16191d; margin: 0 0 11px; white-space: pre-wrap; word-break: break-word;
+  page-break-inside: avoid;
+}
+
+/* ---- callout ---- */
+.callout {
+  border: 0.8px solid #c3cad2; padding: 9px 12px; margin: 12px 0 14px;
+  font-size: 7.5pt; line-height: 1.5; page-break-inside: avoid;
+}
+.callout p { margin: 0; }
+
+/* ---- bullets ---- */
+ul { margin: 8px 0 10px; padding-left: 17px; }
+li { margin: 0 0 6px; padding-left: 3px; }
+li::marker { color: #2c3138; font-size: 7pt; }
+
+/* ---- disclaimer + footer ---- */
+.disc-h {
+  font-family: "IBM Plex Sans", sans-serif; font-size: 6.6pt; font-weight: 500;
+  letter-spacing: 1.1px; text-transform: uppercase; color: #3b424a;
+  margin: 30px 0 5px; padding-top: 9px; border-top: 0.8px solid #c3cad2;
+}
+.disc { font-size: 7.5pt; line-height: 1.52; color: #3b424a; margin: 0; }
+.foot {
+  font-family: "IBM Plex Sans", sans-serif; font-size: 6.8pt; color: #5d6570;
+  margin-top: 26px; padding-top: 7px; border-top: 0.6px solid #d9dde2;
+  display: flex; justify-content: space-between;
+}
+</style>
+
+<div class="cover">
+  <div class="eyebrow">Manthan Strategy</div>
+  <h1>Manthan Strategy Write-up</h1>
+  <p class="seg">NSE &mdash; Cash Market (CM)</p>
+  <p class="ver">2026 &mdash; Version 1.0</p>
+  <p class="line">Automated Positional Techno-Funda Trading Strategy</p>
+  <p class="line">Strategy Design &amp; Operating-Logic Write-up</p>
+  <p class="line">Submitted for Exchange Review &amp; Approval</p>
+  <hr>
+</div>
+
+<h2><span class="num">01</span>Strategy Overview</h2>
+<p>Manthan is a systematic, <b>positional</b> trading strategy for NSE-listed cash-market equities, executed entirely in the DELIVERY (CNC) product. Candidate securities originate from a <b>proprietary quantitative research process</b> maintained by the member's research function; the automated system consumes the curated candidate list, applies a further set of <b>automated fundamental eligibility screens</b>, enforces portfolio-level concentration limits, and manages the complete order lifecycle &mdash; entry, protective stop management, and exit &mdash; without manual intervention.</p>
+<p>The strategy holds positions across sessions. Its core risk discipline is that <b>every open position is at all times governed by a trailing stop-loss framework</b>: a protective sell is armed on entry and only ever tightens as the position appreciates. Capital is deployed from a fixed-slot book so that no single order, security, sector, or market-capitalisation class can dominate exposure.</p>
+
+<table>
+<tr><th>Parameter</th><th>Value</th></tr>
+<tr><td class="k">Segment</td><td>NSE Cash Market (NSE_EQ)</td></tr>
+<tr><td class="k">Symbol universe</td><td>NSE-listed equities from the proprietary research screen, further filtered by automated eligibility checks (market-capitalisation band, valuation, profitability and quality-score floors &mdash; parameters internal)</td></tr>
+<tr><td class="k">Product type</td><td>DELIVERY (CNC); positional, multi-session holding</td></tr>
+<tr><td class="k">Order side</td><td>BUY entries; SELL only as protective stop / exit</td></tr>
+<tr><td class="k">Order types</td><td>LIMIT (marketable) entries; Stop-Loss-Limit (SL-L) protective exits; After-Market Orders (AMO) for overnight stop staging. Plain MARKET orders are not used in the normal lifecycle.</td></tr>
+<tr><td class="k">Validity</td><td>DAY</td></tr>
+<tr><td class="k">Position sizing</td><td>Capital-budget per slot: total strategy capital &divide; configured maximum positions, modulated by an internal allocation model; quantity derived from budget at the prevailing market price</td></tr>
+<tr><td class="k">Book structure</td><td>Fixed maximum number of concurrent positions per strategy (configurable; 25 in the current production configuration)</td></tr>
+<tr><td class="k">Concentration limits</td><td>&le; 25% of the complete book per sector; &le; 50% per market-capitalisation class (AMFI-convention classes); enforced with floor semantics including in-flight orders</td></tr>
+<tr><td class="k">Stop framework</td><td>Trailing stop-loss on every position: configurable initial distance below fill, ratcheting upward in configurable steps as the price advances (current production configuration: 20% trail, 2% steps). The stop never widens.</td></tr>
+<tr><td class="k">Entries per security</td><td>At most one open position per (strategy, security); re-entry gated (&sect;04)</td></tr>
+</table>
+
+<h2><span class="num">02</span>Entry Logic</h2>
+<p>The entry pipeline transforms a research-list candidate into a compliant, risk-checked exchange order through the deterministic sequence below. Every stage must pass; failure at any stage drops the candidate and records a structured audit entry with the failing reason.</p>
+
+<h3>Step 1 &mdash; Universe ingestion (event-driven)</h3>
+<p>The research candidate list is ingested both on a fixed pre-open schedule each trading day and event-driven upon list changes during market hours (change detection on the candidate set, polled at a fixed cadence within a configured ingestion window). Each candidate carries security identity (symbol, ISIN, exchange token) and the research fields consumed by the eligibility screens.</p>
+
+<h3>Step 2 &mdash; Automated eligibility screens</h3>
+<p>Candidates pass independent screens on market-capitalisation band, valuation ratio, profitability, and a fundamental quality score. Screen parameters are proprietary and configurable; every rejection is persisted per security per day with the specific failing screen for audit review. A candidate lacking the required fundamental data cannot qualify.</p>
+
+<h3>Step 3 &mdash; Signal publication (idempotent)</h3>
+<p>Eligible candidates are published as dated signals exactly once per security per trading day onto the internal signal bus. Each signal carries a <b>first-seen timestamp</b> &mdash; the moment the security first entered the current candidate run &mdash; used by subscription gating (&sect;04).</p>
+
+<h3>Step 4 &mdash; Per-subscription allocation</h3>
+<p>Each subscribing strategy instance evaluates the signal independently: subscription-date gate &rarr; duplicate-holding guard &rarr; re-entry cooldown &rarr; sector and market-cap concentration checks on the complete book (open positions plus in-flight orders) &rarr; capital-budget sizing. Orders receive a <b>deterministic identity</b> derived from (strategy, security, trade date), making every downstream stage replay-safe.</p>
+
+<h3>Step 5 &mdash; Order construction</h3>
+<table>
+<tr><th>Parameter</th><th>Value</th></tr>
+<tr><td class="k">Order type</td><td>LIMIT (marketable)</td></tr>
+<tr><td class="k">Entry limit price</td><td>Prevailing LTP + a small fixed tick buffer, tick-aligned</td></tr>
+<tr><td class="k">Quantity</td><td>floor(allocated budget &divide; entry price), re-clamped to budget at placement time so a delayed placement can never overdeploy</td></tr>
+<tr><td class="k">Price basis</td><td>Real-time market data resolved at placement (LTP, tick size, Daily Price Range band) &mdash; a stale research snapshot cannot price an order</td></tr>
+</table>
+
+<h3>Step 6 &mdash; Pre-trade compliance &amp; risk validation</h3>
+<p>Every constructed order passes a chain of hard checks; any breach records a structured rejection and the order is not transmitted:</p>
+<table>
+<tr><th>Validation</th><th>Purpose</th></tr>
+<tr><td class="k">Trading holiday check</td><td>No order processing on NSE/BSE holidays or weekends (calendar-driven, fail-closed)</td></tr>
+<tr><td class="k">Market hours check</td><td>Entries only within the trading session (with a pre-close cut-off buffer so a fill can be stop-protected before close). Orders generated before the open are <i>held</i> and released at session start &mdash; never transmitted early.</td></tr>
+<tr><td class="k">Price-band (circuit) check</td><td>A security pinned at its upper band is held and re-checked on a fixed cadence, entering only when the band releases; lower-band state never triggers buying</td></tr>
+<tr><td class="k">Duplicate check</td><td>Deterministic order identity enforced by database uniqueness &mdash; one entry per (strategy, security, day)</td></tr>
+<tr><td class="k">Margin pre-check</td><td>Broker fund-limit verification before placement</td></tr>
+<tr><td class="k">DPR band check</td><td>All prices tick-aligned and validated against the exchange Daily Price Range</td></tr>
+<tr><td class="k">Sizing ceiling</td><td>Quantity re-derived and clamped against the allocated budget at the prevailing price</td></tr>
+</table>
+
+<h3>Step 7 &mdash; Order transmission</h3>
+<p>On passing all checks the order is persisted, transmitted to the broker gateway, and tracked through its full lifecycle (WebSocket fill stream with REST order-book reconciliation as backstop). All requests and responses &mdash; order identifiers, response codes, statuses, timestamps &mdash; are captured.</p>
+
+<h4>Representative structured audit records (sanitised)</h4>
+<pre class="rec">{"event":"ORDER_AUDIT","ts":"2026-08-19T09:15:31+05:30","user_id":"S44**","strategy_id":"a6cb&hellip;5149",
+ "symbol":"MODISONLTD","exchange":"NSE","side":"BUY","quantity":51,"price":381.10,
+ "order_type":"LIMIT","product_type":"DELIVERY","ltp":380.95}</pre>
+<pre class="rec">{"event":"SL_PLACED","signal_id":"eaca&hellip;f9fd","symbol":"MODISONLTD","order_type":"SL-L",
+ "trigger":304.88,"limit":301.83,"validity":"DAY","broker_order_id":"NYMZ&hellip;"}</pre>
+<pre class="rec">{"event":"ORDER_SKIPPED","reason":"MCAP_BUCKET_CAP_REACHED","symbol":"IIFL",
+ "bucket":"SMALL","held":12,"cap":12,"ts":"2026-08-21T11:56:20+05:30"}</pre>
+<pre class="rec">{"event":"SL_DEFERRED_BAND","symbol":"APARINDS","intended_trigger":13337.60,
+ "dpr_lower":13772.00,"action":"defer &mdash; software supervision until band admits level"}</pre>
+
+<h2><span class="num">03</span>Exit Framework</h2>
+<p>Every filled entry is protected by an automated stop framework. Protective legs are placed as <b>Stop-Loss-Limit (SL-L)</b> orders in accordance with NSE algorithmic-trading rules; the limit leg sits a controlled distance through the trigger to bound slippage.</p>
+
+<h3>Exit 1 &mdash; Initial protective stop</h3>
+<p>On broker-confirmed fill, an SL-L sell is armed at the configured trail distance below the actual fill price. Placement failures are retried with backoff and independently supervised (&sect;05).</p>
+
+<h3>Exit 2 &mdash; Trailing ratchet</h3>
+<p>As the security makes new highs beyond the configured step increment, the stop trigger is re-armed at the trail distance below the new high via order modification. The stop only ever moves up. Modification is step-gated to avoid excessive broker traffic.</p>
+
+<h3>Exit 3 &mdash; Band-aware placement (deferral rule)</h3>
+<p>If the intended trigger lies outside the day's DPR band, the exchange cannot hold the order. The strategy defers placement &mdash; it never re-prices the stop to the band floor, which would alter the strategy's declared risk point. While deferred, the engine's internal price supervision watches the position tick-by-tick and (a) re-attempts broker placement at every scheduled pass until the band admits the true level, and (b) executes the exit itself if the level is breached meanwhile.</p>
+
+<h3>Exit 4 &mdash; Overnight continuity (AMO staging)</h3>
+<p>Because the broker cancels resting DAY orders at session close, the system re-arms protection for the next session automatically: at a fixed post-close time, an AMO SL-L is staged for every open position at its current trailed level. At the broker's AMO release, a reconciliation pass matches conversions against the exchange order book &mdash; under the broker's newly assigned identifiers &mdash; and records acceptance or rejection, so an unconverted stop can never be mistaken for active protection. Morning passes at scheduled times place any stop still missing. Retry identities are collision-safe across attempts and sessions.</p>
+
+<h3>Exit 5 &mdash; Independent safety supervision</h3>
+<p>A safety monitor runs continuously during market hours: it detects positions whose protective order has vanished (external cancellation, rejection) and re-places it; if a stop has triggered but not filled, it escalates to close the position. Transient conditions (connectivity, restarts) are retried, never escalated.</p>
+
+<div class="callout"><p><b>Accounting rule:</b> position state is confirmation-driven end to end. An entry is recorded as held only on a broker-confirmed fill; an exit is booked only on a broker-confirmed sale, at actual traded prices. Order intent alone never mutates the position book.</p></div>
+
+<h2><span class="num">04</span>Re-entry &amp; Deduplication Logic</h2>
+<ul>
+<li><b>Daily per-security lock:</b> one signal per security per trading day at publication, and one deterministic order identity per (strategy, security, day) enforced at every storage layer (publisher set, signal bus identity, transactional inbox uniqueness, order-store constraint).</li>
+<li><b>Holding guard:</b> a strategy holding &mdash; or with an in-flight order for &mdash; a security never receives a second entry for it. In-flight orders reserve their concentration-cap slot from the moment of dispatch.</li>
+<li><b>Re-entry cooldown:</b> after a stop-loss exit, the security is barred from re-entry until a configured retracement condition from its exit-time reference level is met. Manual exits impose a separate re-entry embargo window.</li>
+<li><b>Subscription-date gate:</b> a strategy instance acts only on signals whose first appearance postdates the subscription; pre-existing candidates are never back-filled.</li>
+<li><b>Reset:</b> daily publication state is keyed to the trading date; all gates re-evaluate afresh each session.</li>
+</ul>
+
+<h2><span class="num">05</span>System Integrity Rules</h2>
+<table>
+<tr><th>Event</th><th>Action</th></tr>
+<tr><td class="k">Trading holiday / weekend</td><td>All order processing suspended (fail-closed calendar check)</td></tr>
+<tr><td class="k">Broker session expiry</td><td>Orders held at an authentication gate without consuming retry budget; automatic re-arm on re-login; pre-emptive expiry alerts to the user during the session</td></tr>
+<tr><td class="k">Price-feed loss / invalid data</td><td>No action without a valid real-time price and tick size &mdash; the system skips rather than guesses</td></tr>
+<tr><td class="k">Service restart</td><td>Position book, in-flight reservations and trail state rehydrate from durable storage; stops inconsistent with the trail rule self-heal on load</td></tr>
+<tr><td class="k">Broker / system drift</td><td>A scheduled reconciler syncs order truth (fills, cancellations, AMO conversions) from the broker order book</td></tr>
+<tr><td class="k">Message delivery</td><td>At-least-once bus delivery into a transactional inbox with typed retry classes and a dead-letter queue; poison messages are isolated, never looped</td></tr>
+<tr><td class="k">Audit traceability</td><td>Every signal, order, modification, rejection and exit carries correlated identifiers end-to-end across structured logs and durable tables</td></tr>
+</table>
+
+<h2><span class="num">06</span>Data Requirements</h2>
+<table class="data">
+<tr><th>Data point</th><th>Source</th><th>Purpose</th></tr>
+<tr><td class="k">Research candidate list + fundamentals</td><td class="s">Proprietary research feed</td><td>Universe &amp; eligibility screening</td></tr>
+<tr><td class="k">Security identity (symbol, ISIN, token)</td><td class="s">Instrument master</td><td>Order routing</td></tr>
+<tr><td class="k">Real-time LTP, tick size, DPR band</td><td class="s">Market-data cache (tick stream + snapshot fallback)</td><td>Pricing, band compliance, trail supervision</td></tr>
+<tr><td class="k">Broker order / fill / position updates</td><td class="s">Broker WebSocket + REST order book</td><td>Fill confirmation, stop lifecycle, reconciliation</td></tr>
+<tr><td class="k">Fund limits</td><td class="s">Broker API</td><td>Margin pre-check</td></tr>
+<tr><td class="k">Trading calendar</td><td class="s">Exchange holiday list</td><td>Holiday fail-close, session scheduling</td></tr>
+</table>
+
+<h2><span class="num">07</span>Complete Calculation Reference</h2>
+<p>Formulas are stated with configurable parameters ( <code>SL%</code> = trail distance, <code>step%</code> = ratchet increment, <code>N</code> = maximum positions). Worked examples use the current production configuration (SL% = 20, step% = 2, N = 25 &mdash; figures already published to subscribers in the product) and actual production fills; proprietary screen parameters do not appear in any order calculation.</p>
+<table class="calc">
+<tr><th>Formula</th><th>Calculation</th><th>Worked example (production fill)</th></tr>
+<tr><td class="k">Per-slot budget</td><td class="c">capital &divide; N &times; allocation factor</td><td class="w">500,000 &divide; 25 &times; 1.00 = 20,000</td></tr>
+<tr><td class="k">Entry limit price</td><td class="c">LTP + 2 &times; tick, tick-aligned</td><td class="w">380.95 + 0.10 &rarr; 381.10 (tick 0.05)</td></tr>
+<tr><td class="k">Quantity</td><td class="c">floor(budget &divide; entry price), re-clamped at placement price</td><td class="w">floor(20,000 &divide; 381.10) &rarr; 51 after clamp</td></tr>
+<tr><td class="k">Order value</td><td class="c">quantity &times; price &le; budget &times; 1.01</td><td class="w">51 &times; 381.10 = 19,436.10</td></tr>
+<tr><td class="k">Initial stop trigger</td><td class="c">fill &times; (1 &minus; SL%/100)</td><td class="w">381.10 &times; 0.80 = 304.88</td></tr>
+<tr><td class="k">SL-L limit leg</td><td class="c">trigger &minus; controlled gap, tick-aligned</td><td class="w">304.88 &minus; 1% &asymp; 301.83</td></tr>
+<tr><td class="k">Trail condition</td><td class="c">new high &ge; last trail level &times; (1 + step%/100)</td><td class="w">388.72 crossed at 392.55</td></tr>
+<tr><td class="k">Trailed stop</td><td class="c">high &times; (1 &minus; SL%/100), never lower than current</td><td class="w">392.55 &times; 0.80 = 314.04</td></tr>
+<tr><td class="k">Band-deferral test</td><td class="c">trigger &lt; DPR_lower &rarr; defer (never re-price)</td><td class="w">13,337.60 &lt; 13,772.00 &rarr; deferred</td></tr>
+<tr><td class="k">Sector cap</td><td class="c">floor(N &times; 25%)</td><td class="w">floor(25 &times; 0.25) = 6</td></tr>
+<tr><td class="k">Market-cap class cap</td><td class="c">floor(N &times; 50%)</td><td class="w">floor(25 &times; 0.50) = 12 (13th rejected)</td></tr>
+<tr><td class="k">Re-entry condition</td><td class="c">price &le; reference level &times; (1 &minus; SL%/100)</td><td class="w">configured retracement from exit-time reference</td></tr>
+</table>
+
+<h2><span class="num">08</span>Execution Flow</h2>
+<p><b>Phase 1 &mdash; Pre-open:</b> trading-day confirmation &rarr; candidate ingestion &rarr; eligibility screens &rarr; signal publication &rarr; per-subscription allocation &rarr; orders constructed and <i>held</i> for the open.</p>
+<p><b>Phase 2 &mdash; Session open:</b> held entries released at session start after re-pricing against the market; protective stop placed on each confirmed fill; morning protection passes re-arm any position whose overnight stop did not convert.</p>
+<p><b>Phase 3 &mdash; Continuous supervision:</b> market-price trail ratchet; stop modifications; band-deferral supervision; safety monitor; broker reconciliation; event-driven intake of newly added candidates (same pipeline, same checks).</p>
+<p><b>Phase 4 &mdash; Pre-close:</b> entry cut-off buffer before close; no entry may fill without time to arm its stop.</p>
+<p><b>Phase 5 &mdash; Post-close:</b> AMO staging of next-session protection for all open positions; end-of-day state reconciliation; daily gates reset for the next session.</p>
+
+<h2><span class="num">09</span>Key Design Decisions</h2>
+<h4>Q1 &mdash; Why LIMIT entries and never MARKET orders?</h4>
+<p>NSE algorithmic-trading norms discourage unpriced orders. A marketable LIMIT priced a small buffer through the prevailing LTP fills essentially immediately while bounding the fill price; the same discipline applies to every stop leg (SL-L, never SL-M in the normal path).</p>
+<h4>Q2 &mdash; Why is a stop deferred rather than re-priced when the DPR band excludes it?</h4>
+<p>The trailing level is the strategy's declared risk point. Re-pricing it to the band floor would both alter the strategy's risk contract and invite spurious exits on routine circuit touches. Deferral with continuous internal supervision preserves the contract; the resting stop is placed the first session the band admits it.</p>
+<h4>Q3 &mdash; Why confirmation-driven position accounting?</h4>
+<p>The book records what the exchange/broker confirms, not what was intended. Dispatch failures cannot create phantom positions; unconfirmed exits cannot release capital; restarts reproduce broker reality exactly.</p>
+<h4>Q4 &mdash; Why do in-flight orders count against concentration caps?</h4>
+<p>Capital commits at dispatch. Counting only confirmed fills would let a burst of same-day signals share one free slot and overshoot the declared limits.</p>
+<h4>Q5 &mdash; Why hold (rather than reject) pre-open and circuit-pinned entries?</h4>
+<p>Both are wait-states resolving on a known clock &mdash; the opening bell, the band release. Holding with a precise wake preserves the day's signal under full compliance checks at release time; rejecting would silently discard it.</p>
+<h4>Q6 &mdash; What bounds order size and exposure regardless of configuration?</h4>
+<p>Sizing is structural: per-order value cannot exceed the per-slot capital budget, quantity is re-derived at the prevailing price at placement, aggregate exposure cannot exceed the strategy's total subscribed capital, and sector / market-cap concentration is capped on the complete book. Firm-wide absolute ceilings (quantity, order value, per-user exposure) are enforced at the member level in addition to the strategy's own limits.</p>
+
+<div class="disc-h">Disclaimer</div>
+<p class="disc">This document describes the design and operating logic of the Manthan Strategy for the NSE Cash Market segment and is submitted for exchange review. Proprietary research methodology and screen parameters are summarised at the category level; they operate strictly upstream of, and never bypass, the pre-trade compliance chain described herein. All order placement is subject to exchange and regulatory approval, applicable SEBI algorithmic-trading regulations, and the member's risk-management policies. Parameter values stated as current production configuration are configurable within approved limits. Trading in securities carries risk of loss; past performance does not guarantee future results.</p>
+
+<div class="foot"><span>Manthan Strategy &mdash; NSE Cash Market &mdash; Version 1.0</span><span>Strategy design &amp; operating-logic write-up</span></div>

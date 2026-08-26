@@ -1,0 +1,5 @@
+id,strategy_id,user_id,event_type,details,created_at
+1,b5aca8c5-b981-4789-ab90-bb0a539de466,ND03920,DEPLOYED,"{""capital"": 500000}",2026-08-24 17:22:16.070284+05:30
+2,b5aca8c5-b981-4789-ab90-bb0a539de466,ND03920,PAUSED,"{""positions_exited"": 0}",2026-08-25 13:34:14.515537+05:30
+3,b5aca8c5-b981-4789-ab90-bb0a539de466,ND03920,RESUMED,{},2026-08-25 13:37:40.386578+05:30
+4,b5aca8c5-b981-4789-ab90-bb0a539de466,ND03920,DELETED,"{""positions_exited"": 0}",2026-08-25 13:39:52.329994+05:30

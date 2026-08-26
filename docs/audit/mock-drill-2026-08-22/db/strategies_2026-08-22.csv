@@ -1,0 +1,4 @@
+strategy_id,user_id,strategy_name,active,trading_mode,strategy_type,version,created_at,updated_at,stopped_at,deleted_at
+a6cb5b08-dddd-4e54-ad2d-d5ae55edb3c9,S4450,My Manthan Deploy,t,LIVE,MANTHAN,1,2026-08-11 06:35:25.46676+00,2026-08-11 06:35:25.46676+00,,
+e36bd07e-4eb9-48c0-8425-62ce25715149,FIV99,My Manthan Deploy,t,LIVE,MANTHAN,1,2026-08-14 16:20:10.128069+00,2026-08-14 16:20:10.128069+00,,
+64601479-1226-4a47-885d-ced9226e35ba,ND03920,My Manthan Deploy,f,LIVE,MANTHAN,4,2026-08-22 08:28:27.155263+00,2026-08-22 08:53:45.895714+00,2026-08-22 08:43:52.003181+00,2026-08-22 08:53:45.895714+00

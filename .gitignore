@@ -99,3 +99,11 @@ test.js
 *-sheet.json
 service-account*.json
 StockK-Mobile/
+
+# Local evidence archives — screenshots, zips, generated heavy HTML (rebuildable via docs/architecture/build_*.py)
+mockmanthan/
+uatmanthan/
+strategies-writeup-ref/
+Strategies Write UP-*.zip
+docs/architecture/auditors-checklist-*.html
+docs/architecture/Manthan-Strategy-Writeup-v1.0.html
