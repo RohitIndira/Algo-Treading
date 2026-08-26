@@ -156,15 +156,20 @@ func (p *PreChecker) checkMarketHours() PreCheckResult {
 	}
 	now := time.Now().In(loc)
 
+	mockSession := os.Getenv("MANTHAN_MOCK_SESSION") == "1"
 	weekday := now.Weekday()
-	if weekday == time.Saturday || weekday == time.Sunday {
+	if (weekday == time.Saturday || weekday == time.Sunday) && !mockSession {
 		return fail(fmt.Sprintf("market closed — %s", weekday))
 	}
 	// NSE holiday on a weekday: a hard close, not a pre-open wait. Without
 	// this the PRE_OPEN hold would carry the 09:00 batch to 09:15 and send
 	// LIMIT BUYs at stale prices to the broker on an exchange holiday.
-	if !indiraClient.IsTradingDay(now) {
+	if !indiraClient.IsTradingDay(now) && !mockSession {
 		return fail("market closed — exchange holiday")
+	}
+	if mockSession {
+		p.logger.Warn("⚠️ MANTHAN_MOCK_SESSION=1 — weekend/holiday gates bypassed; other pre-checks active")
+		return pass()
 	}
 
 	hour, min := now.Hour(), now.Minute()
