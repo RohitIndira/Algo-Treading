@@ -107,3 +107,9 @@ strategies-writeup-ref/
 Strategies Write UP-*.zip
 docs/architecture/auditors-checklist-*.html
 docs/architecture/Manthan-Strategy-Writeup-v1.0.html
+
+# Local build outputs, logs, DB dump baselines
+bin/
+logs/
+backups/
+pkg/indira/wss-capture
