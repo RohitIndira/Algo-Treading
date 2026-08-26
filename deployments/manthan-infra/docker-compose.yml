@@ -1,0 +1,106 @@
+# Manthan data infrastructure — Postgres, Kafka(+ZK), Redis, Kafka-UI.
+#
+# Faithful, declarative recreation of the ad-hoc `docker run` containers on
+# manthan-prod (captured via `docker inspect`, 2026-08-26): same images, same
+# host ports, same volume mounts, same Kafka listener topology. Written for
+# the server migration so the new box comes up with `docker compose up -d`
+# instead of tribal knowledge.
+#
+#   docker compose -f deployments/manthan-infra/docker-compose.yml up -d
+#
+# The `name:` below pins the compose project to "algo-dev" so container and
+# volume names match the existing production ones (algo-dev-postgres,
+# algo-dev_algo-dev-pgdata, ...) and every runbook/command keeps working.
+#
+# SECURITY (improvement over the old box): Postgres/Redis bind to 127.0.0.1.
+# The old server exposed 0.0.0.0:5442 to the internet. All Manthan services
+# run on the same host, so loopback is sufficient. Remove the 127.0.0.1
+# prefix only if a remote reader genuinely needs it — and firewall it.
+
+name: algo-dev
+
+services:
+  algo-dev-postgres:
+    image: postgres:15-alpine
+    container_name: algo-dev-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trading_db
+    ports:
+      - "127.0.0.1:5442:5432"
+    volumes:
+      - algo-dev-pgdata:/var/lib/postgresql/data
+      - ./init/10-init_databases.sh:/docker-entrypoint-initdb.d/10-init_databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  algo-dev-zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: algo-dev-zookeeper
+    hostname: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - algo-dev-zk:/var/lib/zookeeper/data
+      - algo-dev-zk-log:/var/lib/zookeeper/log
+
+  algo-dev-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: algo-dev-kafka
+    hostname: kafka
+    restart: unless-stopped
+    depends_on:
+      - algo-dev-zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Dual listeners: in-network clients (kafka-ui) use kafka:9092,
+      # the PM2 service binaries on the host use localhost:9192.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9192
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "127.0.0.1:9192:9192"
+    volumes:
+      - algo-dev-kafka:/var/lib/kafka/data
+
+  algo-dev-redis:
+    image: redis:7-alpine
+    container_name: algo-dev-redis
+    restart: unless-stopped
+    # Holds durable Manthan state (manthan:signals:<date> publish-once locks,
+    # position/portfolio caches) — its RDB is migrated in 02-dump.sh /
+    # 03-restore.sh, and appendonly keeps restarts lossless going forward.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6389:6379"
+    volumes:
+      - algo-dev-redisdata:/data
+
+  algo-dev-kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: algo-dev-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - algo-dev-kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: algo-dev
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "127.0.0.1:8083:8080"
+
+volumes:
+  algo-dev-pgdata:
+  algo-dev-zk:
+  algo-dev-zk-log:
+  algo-dev-kafka:
+  algo-dev-redisdata:
