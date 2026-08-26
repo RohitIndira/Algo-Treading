@@ -99,7 +99,7 @@ func TestBuyFillCreatesManthanRow(t *testing.T) {
 	db := openTestDB(t)
 	defer db.Close()
 
-	entryBrokerID := "PAPER-ENTRY-A"
+	entryBrokerID := "TB-ENTRY-A"
 	stub := map[string]tradeexec.OrderMeta{
 		entryBrokerID: {
 			Found:              true,
@@ -193,8 +193,8 @@ func TestManthanSellComputesRealizedPnl(t *testing.T) {
 	db := openTestDB(t)
 	defer db.Close()
 
-	entryBrokerID := "PAPER-ENTRY-B"
-	slBrokerID := "PAPER-SL-B"
+	entryBrokerID := "TB-ENTRY-B"
+	slBrokerID := "TB-SL-B"
 	entrySignal := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	slSignal := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 	strategyID := "22222222-2222-2222-2222-222222222222"
@@ -265,8 +265,8 @@ func TestManualSellFIFOAcrossOrigins(t *testing.T) {
 	db := openTestDB(t)
 	defer db.Close()
 
-	manthanBID := "PAPER-ENTRY-M"
-	manualBID := "PAPER-ENTRY-U"
+	manthanBID := "TB-ENTRY-M"
+	manualBID := "TB-ENTRY-U"
 
 	stub := map[string]tradeexec.OrderMeta{
 		manthanBID: {

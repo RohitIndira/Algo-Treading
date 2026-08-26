@@ -696,7 +696,7 @@ func (s *OrderStatusService) publishNotification(ctx context.Context, order *mod
 		update.Message = fmt.Sprintf("%d of %d shares filled for %s", tradedQty, wsStatus.OrderOriginalQty, order.Symbol)
 		update.DetailedMessage = fmt.Sprintf(
 			"Partially filled %d/%d at %s | Pending qty: %d | Broker ref: %s",
-			tradedQty, wsStatus.OrderOriginalQty, tradedPriceStr, wsStatus.PendingQty, brokerRef,
+			tradedQty, wsStatus.OrderOriginalQty, tradedPriceStr, flexToInt(wsStatus.PendingQty), brokerRef,
 		)
 		update.StatusEmoji = "🔶"
 		update.StatusColor = "#FFBB33"

@@ -86,8 +86,8 @@ func TestPublisher_PositionOpenedOnBuy(t *testing.T) {
 
 func TestPublisher_PositionExitedOnManthanSell(t *testing.T) {
 	cap := &capturingPublisher{}
-	entryBID := "PAPER-ENTRY-Z"
-	slBID := "PAPER-SL-Z"
+	entryBID := "TB-ENTRY-Z"
+	slBID := "TB-SL-Z"
 	entrySig := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	slSig := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
@@ -132,8 +132,8 @@ func TestPublisher_PositionExitedOnManthanSell(t *testing.T) {
 
 func TestPublisher_ManualSellEmitsPerTouchedLot(t *testing.T) {
 	cap := &capturingPublisher{}
-	manthanBID := "PAPER-M2"
-	manualBID := "PAPER-U2"
+	manthanBID := "TB-M2"
+	manualBID := "TB-U2"
 
 	stub := map[string]tradeexec.OrderMeta{
 		manthanBID: {

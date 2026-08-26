@@ -19,6 +19,7 @@ package oco
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -1034,7 +1035,7 @@ func (m *OCOManager) placeLegWithRetry(
 		log.Printf("[oco] WARNING: failed to persist %s leg failure for group %s: %v", legName, groupID, err)
 	}
 
-	return "", fmt.Errorf(errMsg)
+	return "", errors.New(errMsg)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
