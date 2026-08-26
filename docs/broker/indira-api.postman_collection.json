@@ -1,0 +1,710 @@
+{
+  "info": {
+    "_postman_id": "9669a8f2-700e-4d68-a3a1-2eb8f04361db",
+    "name": "Indira Securities API Collection",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "38266104",
+    "_collection_link": "https://go.postman.co/collection/38266104-9669a8f2-700e-4d68-a3a1-2eb8f04361db?source=collection_link"
+  },
+  "item": [
+    {
+      "name": "Profile",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/user-services/api/user/v1/AccountInfo",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "user-services",
+            "api",
+            "user",
+            "v1",
+            "AccountInfo"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "place-order",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"symbol\": \"STK_APOLLOHOSP_EQ_NSE_157\",\n    \"excToken\": \"157\",\n    \"exc\": \"NSE\",\n    \"ordAction\": \"BUY\",\n    \"ordValidity\": \"DAY\",\n    \"ordType\": \"Market\",\n    \"prdType\": \"INTRADAY\",\n    \"limitPrice\": 0.0,\n    \"triggerPrice\": 0.0,\n    \"qty\": 1,\n    \"disQty\": 0,\n    \"lotSize\": 1,\n    \"instrument\": \"STK\",\n    \"amo\": true,\n    \"boStpLoss\": null,\n    \"boTgtPrice\": null\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/order-services/api/order/v1/place-order",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "order-services",
+            "api",
+            "order",
+            "v1",
+            "place-order"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Modify-Order",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n  \"ordId\": \"NZULR1000AI2\",\r\n  \"symbol\": \"STK_TCS_EQ_NSE_11536\",\r\n  \"ordAction\": \"BUY\",\r\n  \"ordValidity\": \"DAY\",\r\n  \"exchangeToken\": \"11536\",\r\n  \"exc\": \"NSE\",\r\n  \"qty\": 11,\r\n  \"tradedQty\": 0,\r\n  \"limitPrice\": 3961.0,\r\n  \"triggerPrice\": 0.0,\r\n  \"ordType\": \"Limit\",\r\n  \"prdType\": \"DELIVERY\",\r\n  \"instrument\": \"STK\",\r\n  \"lotSize\": 1,\r\n  \"disQty\": 0,\r\n  \"offMktFlag\": false\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/order-services/api/order/v1/modify-order",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "order-services",
+            "api",
+            "order",
+            "v1",
+            "modify-order"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Cancel-Order",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"symbol\": \"STK_TCS_EQ_NSE_11536\",\r\n    \"exc\": \"NSE\",\r\n    \"ordId\": \"NZYXM00002@2\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/order-services/api/order/v1/cancel-order",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "order-services",
+            "api",
+            "order",
+            "v1",
+            "cancel-order"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Brokerage-Charges",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"symbol\": \"STK_BAJAJ-AUTO_EQ_NSE_16669\",\n    \"excToken\": \"16669\",\n    \"prdType\": \"INTRADAY\",\n    \"instrument\": \"STK\",\n    \"exc\": \"NSE\",\n    \"orderAction\": \"BUY\",\n    \"qty\": \"1\",\n    \"price\": \"9109.0\",\n    \"triggerPrice\": \"0.00\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/order-services/api/order/v1/brokerage-charges",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "order-services",
+            "api",
+            "order",
+            "v1",
+            "brokerage-charges"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Order-Book",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/portfolio-services/api/order/v1/order-book",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "portfolio-services",
+            "api",
+            "order",
+            "v1",
+            "order-book"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Order-Trail",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"ordId\":\"NZYXM00002@2\",\n    \"instrument\":\"STK\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/portfolio-services/api/order/v2/order-trail",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "portfolio-services",
+            "api",
+            "order",
+            "v2",
+            "order-trail"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Trade-Book",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/portfolio-services/api/order/v1/trade-book?orderIds=NZUMV000028",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "portfolio-services",
+            "api",
+            "order",
+            "v1",
+            "trade-book"
+          ],
+          "query": [
+            {
+              "key": "orderIds",
+              "value": "NZUMV000028"
+            }
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Holdings",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/portfolio-services/api/portfolio/v2/holdings",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "portfolio-services",
+            "api",
+            "portfolio",
+            "v2",
+            "holdings"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Position",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/portfolio-services/api/portfolio/v1/position-book",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "portfolio-services",
+            "api",
+            "portfolio",
+            "v1",
+            "position-book"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Position-Convertion",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"ordAction\": \"BUY\",\n    \"prdType\": \"CASH\",\n    \"toPrdType\": \"INTRADAY\",\n    \"qty\": 7,\n    \"symbol\": \"STK_TCS_EQ_NSE_11536\",\n    \"excToken\": \"11536\",\n    \"exc\": \"NSE\",\n    \"lotSize\": 0,\n    \"instrument\": \"IDX\",\n    \"type\":\"DAY1\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/portfolio-services/api/portfolio/v1/convert-position",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "portfolio-services",
+            "api",
+            "portfolio",
+            "v1",
+            "convert-position"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Fund-Limit",
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      },
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{ssoToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "appId",
+            "value": "{{testappID}}"
+          },
+          {
+            "key": "source",
+            "value": "{{source}}"
+          },
+          {
+            "key": "userId",
+            "value": "{{testuserId}}"
+          },
+          {
+            "key": "sso",
+            "value": "true",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "https://livemiddleware.indiratrade.com/payments/api/v1/get-fund-limit",
+          "protocol": "https",
+          "host": [
+            "livemiddleware",
+            "indiratrade",
+            "com"
+          ],
+          "path": [
+            "payments",
+            "api",
+            "v1",
+            "get-fund-limit"
+          ]
+        }
+      },
+      "response": []
+    }
+  ]
+}
