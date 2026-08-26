@@ -194,11 +194,23 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Check HTTP status code — skip body for noisy position-book responses
-	if path == "/portfolio-services/api/portfolio/v1/position-book" {
-		log.Printf("[indira] ← %s %s  status=%d", method, path, resp.StatusCode)
-	} else {
+	// Response logging: full bodies only where they carry signal — order-
+	// mutating calls (audit trail), non-success responses (forensics: AU004s,
+	// rejections), or INDIRA_LOG_BODIES=1 (debug). Success bodies on read
+	// endpoints log status+size only: the order-book poller alone was writing
+	// ~3 GB of repeated success dumps into the service log (2026-08-26).
+	mutating := strings.Contains(path, "place-order") ||
+		strings.Contains(path, "modify-order") ||
+		strings.Contains(path, "cancel-order")
+	head := responseBody
+	if len(head) > 64 {
+		head = head[:64]
+	}
+	successBody := resp.StatusCode == http.StatusOK && bytes.Contains(head, []byte(`"infoID":"0"`))
+	if mutating || !successBody || os.Getenv("INDIRA_LOG_BODIES") == "1" {
 		log.Printf("[indira] ← %s %s  status=%d  body=%s", method, path, resp.StatusCode, string(responseBody))
+	} else {
+		log.Printf("[indira] ← %s %s  status=%d  bytes=%d", method, path, resp.StatusCode, len(responseBody))
 	}
 
 	// Auth-expired detection runs BEFORE the HTTP-status gate because Indira
