@@ -1,6 +1,8 @@
 package livealgos
 
 import (
+	"context"
+
 	pb "github.com/RohitIndira/Algo-Treading/api/proto/user_config"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
 )
@@ -55,6 +57,7 @@ type StrategyMetrics struct {
 // the frontend then shows an empty-state card ("Deploy an algo to see
 // it here").
 func Build(
+	ctx context.Context,
 	strategies []*pb.Strategy,
 	catalog algos.Catalog,
 	metricsByStrategy map[string]StrategyMetrics,
@@ -69,7 +72,7 @@ func Build(
 	// and putting it in a map keyed on the algo id. Kept local so we
 	// re-fetch on every call — it's a static in-memory catalog with
 	// ~1 entry, no need to cache further.
-	all, _ := catalog.All(nil) //nolint:staticcheck  // static catalog ignores ctx
+	all, _ := catalog.All(ctx)
 	byID := make(map[string]algos.Algo, len(all))
 	for _, a := range all {
 		byID[a.ID] = a

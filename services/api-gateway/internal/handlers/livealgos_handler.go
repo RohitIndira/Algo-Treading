@@ -174,7 +174,7 @@ func (h *LiveAlgosHandler) GetLiveAlgos(w http.ResponseWriter, r *http.Request) 
 
 	// ── Assemble the response ──────────────────────────────────────
 	// Aggregator is a pure function: strategies + catalog + metrics → Response.
-	payload := livealgos.Build(resp.Strategies, h.catalog, metrics)
+	payload := livealgos.Build(r.Context(), resp.Strategies, h.catalog, metrics)
 
 	respondIndiraOK(w, payload)
 }

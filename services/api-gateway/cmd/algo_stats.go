@@ -40,6 +40,12 @@ func newAlgoStatsProvider(store performance.Store, clientMap map[string]string, 
 	cache := make(map[string]entry)
 
 	return func(ctx context.Context, algoID string) (algos.LiveStats, bool) {
+		// Defensive: a caller passing a nil ctx must degrade to catalog
+		// defaults, never panic the whole request (2026-08-26 incident:
+		// /users/me/live-algos 500'd on every call via WithTimeout(nil)).
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		mu.Lock()
 		if e, hit := cache[algoID]; hit && time.Since(e.at) < ttl {
 			mu.Unlock()
