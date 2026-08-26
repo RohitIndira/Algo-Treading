@@ -269,12 +269,32 @@ func IsAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Indira overloads the AU004 code: "AU004 Pending Order Not Found" means
+	// the TARGET ORDER is gone (modify/cancel of a dead order), not that the
+	// session is bad. Classifying it as auth caused a refresh+retry loop and,
+	// worse, escalation to emergency sell (2026-08-26 IOLCP incident: GTC SL
+	// silently downgraded to DAY expired at close → modify hit "not found" →
+	// position market-sold). Order-not-found is never an auth failure.
+	if IsOrderNotFoundError(err) {
+		return false
+	}
 	s := err.Error()
 	return strings.Contains(s, "AU004") ||
 		strings.Contains(s, "Session expired") ||
 		strings.Contains(s, "Session data not received") ||
 		strings.Contains(s, "HTTP error 401") ||
 		strings.Contains(s, "status code 401")
+}
+
+// IsOrderNotFoundError reports whether the broker says the order we tried to
+// modify/cancel no longer exists in its book ("AU004 Pending Order Not
+// Found"). The position is unaffected — the correct reaction is to mark our
+// row dead and place a FRESH order, never to touch the position itself.
+func IsOrderNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "Pending Order Not Found")
 }
 
 // SLLimitGap computes the gap between SL trigger and SL limit. Returns the

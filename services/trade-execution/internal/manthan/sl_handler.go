@@ -33,7 +33,22 @@ type SLHandler struct {
 	cooldownMu sync.Mutex
 	lastModify map[string]time.Time // symbol → last modify time
 	cooldown   time.Duration
+
+	// Emergency-sell latch: one emergency sell per symbol per window.
+	// 2026-08-26 IOLCP incident: the modify-failure path fired an EMERGENCY
+	// MARKET SELL on every trail tick (~every 10s) until the position book
+	// caught up — only the broker's holdings limit stopped duplicates from
+	// executing. A repeat inside the window is a bug upstream, never a
+	// legitimate second exit of the same position.
+	emergencyMu   sync.Mutex
+	lastEmergency map[string]time.Time // symbol → last emergency sell time
 }
+
+// emergencyLatchWindow: refuse a second emergency sell for the same symbol
+// within this window. Long enough for fills + reconciler to update the book,
+// short enough that a genuinely new position later in the day can still be
+// emergency-exited.
+const emergencyLatchWindow = 10 * time.Minute
 
 func NewSLHandler(broker *BrokerAdapter, repo *Repository, logger *zap.Logger) *SLHandler {
 	return &SLHandler{
@@ -42,6 +57,8 @@ func NewSLHandler(broker *BrokerAdapter, repo *Repository, logger *zap.Logger) *
 		logger:     logger,
 		lastModify: make(map[string]time.Time),
 		cooldown:   30 * time.Second,
+
+		lastEmergency: make(map[string]time.Time),
 	}
 }
 
@@ -524,6 +541,23 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 			brokerTrig, brokerLim, err = h.broker.ModifySLOrder(ctx, auth, info, targetSL.BrokerOrderID, targetSL.Qty, signal.NewSL, newLimit)
 		}
 	}
+	if IsOrderNotFoundError(err) {
+		// The SL order is GONE from the broker book (e.g. Indira silently
+		// downgraded the GTC stop to DAY and it expired at close). The
+		// POSITION is untouched — mark our row CANCELLED so the reconciler /
+		// protective replay places a FRESH stop at the intended level. Never
+		// market-sell a healthy position over a failed modify (2026-08-26
+		// IOLCP incident: repeated EMERGENCY MARKET SELLs from this path).
+		h.logger.Warn("SL modify target vanished at broker — marking row CANCELLED; fresh stop will be re-placed",
+			zap.String("symbol", signal.Symbol),
+			zap.String("broker_order_id", targetSL.BrokerOrderID))
+		if uerr := h.repo.UpdateOrderStatus(ctx, targetSL.ID, StatusCancelled, "NOT_IN_BROKER_BOOK", 0,
+			"modify target not found at broker — GTC likely expired; fresh SL to be placed"); uerr != nil {
+			h.logger.Error("failed to mark vanished SL row CANCELLED",
+				zap.String("symbol", signal.Symbol), zap.Error(uerr))
+		}
+		return fmt.Errorf("SL modify target vanished at broker: %w", err)
+	}
 	if err != nil {
 		h.logger.Error("SL modify FAILED — will retry or emergency sell",
 			zap.String("symbol", signal.Symbol),
@@ -658,6 +692,22 @@ func (h *SLHandler) emergencySell(ctx context.Context, signal ManthanSignal, inf
 }
 
 func (h *SLHandler) emergencySellInternal(ctx context.Context, info *SymbolInfo, auth BrokerAuth, qty int, reason string) error {
+	// One emergency sell per symbol per window. A repeat inside the window
+	// means an upstream loop is re-firing on a position that is already being
+	// (or has been) closed — placing it again risks a short. Log and refuse.
+	h.emergencyMu.Lock()
+	if last, ok := h.lastEmergency[info.Symbol]; ok && time.Since(last) < emergencyLatchWindow {
+		h.emergencyMu.Unlock()
+		h.logger.Error("EMERGENCY SELL SUPPRESSED — already fired for symbol inside latch window; upstream loop must be investigated",
+			zap.String("symbol", info.Symbol),
+			zap.Int("qty", qty),
+			zap.String("reason", reason),
+			zap.Time("last_fired", last))
+		return fmt.Errorf("emergency sell for %s suppressed: already fired at %s", info.Symbol, last.Format(time.RFC3339))
+	}
+	h.lastEmergency[info.Symbol] = time.Now()
+	h.emergencyMu.Unlock()
+
 	// Check if lower circuit — use AMO if so
 	_, atLower, _ := h.broker.CheckCircuit(ctx, info.ExchangeToken)
 	if atLower {
