@@ -1089,6 +1089,25 @@ func armedWindowStart(tradeDate time.Time) time.Time {
 //
 // alreadyExists==true means the caller should skip rather than treat the
 // conflict as an error.
+// CountAMOAttemptsToday returns how many AMO rows (any status) exist for this
+// entry order and trade date within the current arming window. The EOD armer
+// uses it as a give-up cap: a broker that has rejected the same protective
+// order several times tonight will reject it again — re-placing forever just
+// churns the audit trail and the broker API (2026-08-26 incident: ghost
+// positions whose exits never wrote a SELL row were re-armed every 5 minutes
+// all evening).
+func (r *Repository) CountAMOAttemptsToday(ctx context.Context, parentEntryOrderID int64, tradeDate time.Time) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM manthan_orders
+		WHERE  parent_order_id = $1
+		  AND  trade_date = $2
+		  AND  order_type = 'SL_SELL_AMO'
+		  AND  created_at >= $3`,
+		parentEntryOrderID, tradeDate, armedWindowStart(tradeDate)).Scan(&n)
+	return n, err
+}
+
 func (r *Repository) InsertAMOOrder(
 	ctx context.Context,
 	parentEntryOrderID int64,

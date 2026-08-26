@@ -91,6 +91,13 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 	cycleCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
+	// AMO window gate — see amoWindowOpen.
+	if nowIST := p.now().In(p.ist); !amoWindowOpen(nowIST) {
+		p.logger.Info("EOD Phase A: outside AMO window (08:45–16:00 IST) — deferring cycle",
+			zap.String("now_ist", nowIST.Format("15:04")))
+		return
+	}
+
 	positions, err := p.repo.ListPositionsNeedingProtection(cycleCtx)
 	if err != nil {
 		p.logger.Error("EOD Phase A: list positions failed", zap.Error(err))
@@ -175,6 +182,29 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 				Info:       info,
 				Action:     FireSkip,
 				SkipReason: "EOD: " + skipReason,
+			})
+			skipped++
+			continue
+		}
+
+		// Give-up cap: if tonight's window has already burned several AMO
+		// attempts for this position, the broker is rejecting this order
+		// deterministically (ghost position with no holdings, corporate-action
+		// price scale, band exclusion) — placing attempt N+1 is pure churn.
+		// Skip loudly; the alert names the position for manual reconciliation.
+		const maxAMOAttempts = 5
+		if attempts, cerr := p.repo.CountAMOAttemptsToday(cycleCtx, pos.EntryOrderID, tradeDate); cerr == nil && attempts >= maxAMOAttempts {
+			p.logger.Error("EOD Phase A: AMO attempt cap reached — GIVING UP for tonight; position needs manual review",
+				zap.String("symbol", pos.Symbol),
+				zap.String("user_id", pos.UserID),
+				zap.Int("attempts", attempts),
+				zap.Float64("trigger", safeTrigger))
+			p.publishProtectionSkipped(cycleCtx, FirePlan{
+				Pos:        pos,
+				Auth:       *uc.auth,
+				Info:       info,
+				Action:     FireSkip,
+				SkipReason: fmt.Sprintf("EOD: AMO attempt cap (%d) reached — broker rejects deterministically; manual review needed", attempts),
 			})
 			skipped++
 			continue
@@ -358,6 +388,18 @@ func (p *ProtectiveReplay) planEODTrigger(
 // fresh AMOs.
 func (p *ProtectiveReplay) RunEODPhaseANow(ctx context.Context) {
 	p.runEODPhaseA(ctx)
+}
+
+// amoWindowOpen reports whether Indira's overnight-order window is open at
+// the given IST time. The broker accepts AMOs from ~16:00 IST after close
+// until the next pre-open; anything submitted between 08:45 and 16:00 comes
+// back Rejected in the order book — which the reconciler then syncs to
+// CANCELLED, which made the retry worker re-place the identical doomed order
+// every 5 minutes (2026-08-26, 15:30–16:00). Intraday protection belongs to
+// the DAY-SL path, never to AMO staging.
+func amoWindowOpen(nowIST time.Time) bool {
+	minuteOfDay := nowIST.Hour()*60 + nowIST.Minute()
+	return minuteOfDay < 8*60+45 || minuteOfDay >= 16*60
 }
 
 // nextTradingDate returns the IST date of the next trading session strictly
