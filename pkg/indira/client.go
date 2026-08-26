@@ -141,6 +141,17 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 		req.Header.Set("api-key", apiKey)
 	}
 
+	// Registered exchange algo id (SEBI algo-tagging). Two delivery paths:
+	// the order BODY carries algoID/algoCategory (MANTHAN_ALGO_ID /
+	// MANTHAN_ALGO_CATEGORY — see types.go), and the broker's order-rate
+	// gate wants the same registration as an X-Algo-Id HEADER: above
+	// 10 orders/sec it 429s with "Provide a registered X-Algo-Id header to
+	// continue" (seen live 2026-08-26 during EOD AMO arming). Harmless on
+	// non-order endpoints.
+	if algoID := os.Getenv("INDIRA_X_ALGO_ID"); algoID != "" {
+		req.Header.Set("X-Algo-Id", algoID)
+	}
+
 	// Set per-request authentication headers (from frontend)
 	if auth.UserId != "" {
 		req.Header.Set("userId", auth.UserId)

@@ -115,7 +115,15 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 	cache := map[string]*userCache{}
 
 	var placed, alreadyArmed, skipped, failed int
-	for _, pos := range positions {
+	for i, pos := range positions {
+		// Pace the batch under Indira's order-rate gate: without a registered
+		// X-Algo-Id header the broker 429s anything above 10 orders/sec
+		// ("Order rate exceeded 10/sec", seen live 2026-08-26 15:30-16:00 —
+		// the AMO tail was rejected every retry cycle). 150ms keeps the
+		// worst case under 7/s with headroom for the HTTP round trip.
+		if i > 0 {
+			time.Sleep(150 * time.Millisecond)
+		}
 		uc := cache[pos.UserID]
 		if uc == nil {
 			uc = &userCache{auth: p.getAuth(pos.UserID)}
