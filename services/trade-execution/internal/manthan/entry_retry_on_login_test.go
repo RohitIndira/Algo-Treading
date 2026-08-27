@@ -120,3 +120,26 @@ func TestExpireStaleEntrySignals_SameDayOnly(t *testing.T) {
 	assertStatus("exp-test-t-pending", "PENDING")
 	assertStatus("exp-test-y-slmod", "PENDING")
 }
+
+func TestCheckDuplicate_TerminalFailuresDoNotBlockRetry(t *testing.T) {
+	db := openExecTestDB(t)
+	defer db.Close()
+	repo := &Repository{db: db}
+	ctx := context.Background()
+
+	sig := "dup-retry-test-1"
+	_, _ = db.Exec(`DELETE FROM manthan_orders WHERE signal_id LIKE 'dup-retry-test-%'`)
+	defer func() { _, _ = db.Exec(`DELETE FROM manthan_orders WHERE signal_id LIKE 'dup-retry-test-%'`) }()
+
+	// A REJECTED prior attempt must NOT count as duplicate (retry-on-login).
+	seedOrder(t, db, sig, "DUPSYM", "BUY", "LIMIT_BUY", "REJECTED", 10, "")
+	if dup, err := repo.CheckDuplicate(ctx, sig); err != nil || dup {
+		t.Fatalf("REJECTED row: dup=%v err=%v — want not-duplicate (retryable)", dup, err)
+	}
+
+	// A live row for the same signal MUST dedup (double-buy guard intact).
+	seedOrder(t, db, "dup-retry-test-2", "DUPSYM2", "BUY", "LIMIT_BUY", "PLACED", 10, "NKDUP01")
+	if dup, err := repo.CheckDuplicate(ctx, "dup-retry-test-2"); err != nil || !dup {
+		t.Fatalf("PLACED row: dup=%v err=%v — want duplicate", dup, err)
+	}
+}

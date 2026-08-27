@@ -273,9 +273,17 @@ func (r *Repository) UpdateSLAfterTopupMerge(ctx context.Context, id int64, newQ
 
 // CheckDuplicate returns true if a signal_id already exists (idempotency).
 func (r *Repository) CheckDuplicate(ctx context.Context, signalID string) (bool, error) {
+	// Terminal-failure rows (REJECTED / CANCELLED / EXPIRED) do not count as
+	// duplicates: they are failed ATTEMPTS, and the retry-on-login flow
+	// (2026-08-27, SHREEPUSHK) re-runs the same signal_id after the user's
+	// session is restored. Counting them here DLQ'd the retry as
+	// "pre-check: duplicate signal_id" — the fourth status-blind dedup
+	// layer, one below the inbox's. Live or completed rows still dedup.
 	var count int
 	err := r.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM manthan_orders WHERE signal_id=$1`, signalID).Scan(&count)
+		`SELECT COUNT(*) FROM manthan_orders
+		  WHERE signal_id=$1
+		    AND status NOT IN ('REJECTED','CANCELLED','EXPIRED')`, signalID).Scan(&count)
 	return count > 0, err
 }
 
