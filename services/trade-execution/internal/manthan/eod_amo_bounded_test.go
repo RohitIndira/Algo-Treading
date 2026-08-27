@@ -50,17 +50,21 @@ func TestCountAMOAttemptsToday_CapsGhostPositionChurn(t *testing.T) {
 	tradeDate := time.Now().In(istTZ).AddDate(0, 0, 1)
 
 	// Simulate the churn: N AMO attempts tonight, each later CANCELLED by
-	// the reconciler after the broker rejected it.
+	// the reconciler after the broker rejected it. created_at is pinned
+	// explicitly INSIDE the arming window (windowStart+1h) — seeding with
+	// NOW() made this test time-of-day dependent: run before 15:29 IST, the
+	// rows fell outside armedWindowStart(tradeDate) and counted as zero.
+	inWindow := armedWindowStart(tradeDate).Add(1 * time.Hour)
 	for i := 0; i < 5; i++ {
 		var id int64
 		err := db.QueryRow(`
 			INSERT INTO manthan_orders
 				(signal_id, strategy_id, user_id, symbol, order_type, order_side,
-				 qty, filled_qty, status, parent_order_id, trade_date, trigger_price)
-			VALUES ($1,$2,'S4450','GHOSTSYM','SL_SELL_AMO','SELL',100,0,'CANCELLED',$3,$4,468.80)
+				 qty, filled_qty, status, parent_order_id, trade_date, trigger_price, created_at)
+			VALUES ($1,$2,'S4450','GHOSTSYM','SL_SELL_AMO','SELL',100,0,'CANCELLED',$3,$4,468.80,$5)
 			RETURNING id`,
 			// distinct signal ids — the table has UNIQUE(signal_id)
-			"bounded-amo-"+string(rune('a'+i)), nkStrategy, entryID, tradeDate).Scan(&id)
+			"bounded-amo-"+string(rune('a'+i)), nkStrategy, entryID, tradeDate, inWindow).Scan(&id)
 		if err != nil {
 			t.Fatalf("seed AMO attempt %d: %v", i, err)
 		}

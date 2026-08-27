@@ -137,6 +137,34 @@ func (w *InboxWorker) Start(ctx context.Context) {
 			zap.Int64("count", n))
 	}
 
+	// Same-day expiry: entry signals never survive their trading date —
+	// yesterday's signal must not place today (prices, allocation and
+	// eligibility were computed for yesterday's session). Swept at startup
+	// and every 5 minutes so held/auth-parked rows die at the day boundary.
+	expireStale := func() {
+		now := time.Now().In(istLocation())
+		todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, istLocation())
+		if n, err := w.repo.ExpireStaleEntrySignals(ctx, todayStart); err != nil {
+			w.logger.Warn("Inbox expiry sweep failed", zap.Error(err))
+		} else if n > 0 {
+			w.logger.Info("Inbox expiry sweep: dead-lettered stale entry signals (same-day-only rule)",
+				zap.Int64("count", n))
+		}
+	}
+	expireStale()
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				expireStale()
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
 	for i := 0; i < w.workers; i++ {
 		wg.Add(1)
@@ -307,10 +335,24 @@ func (w *InboxWorker) dispatch(ctx context.Context, row *InboxRow) error {
 		// DONE rather than churning the broker.
 		if w.repo != nil && sig.OrderID != "" {
 			if existing, err := w.repo.GetOrderBySignalID(ctx, sig.OrderID); err == nil && existing != nil {
-				w.logger.Info("Inbox MANTHAN_ENTRY already placed — dedup OK",
-					zap.String("signal_id", sig.OrderID),
-					zap.Int64("existing_order_id", existing.ID))
-				return nil
+				if entryAttemptIsTerminalFailure(existing.Status) {
+					// 2026-08-27 SHREEPUSHK: an AU004-rejected entry row was
+					// treated as "already placed" here, the inbox row went
+					// DONE, and the day's signal died while the user simply
+					// hadn't logged in yet. A REJECTED/CANCELLED row is a
+					// failed ATTEMPT, not a placement — fall through and
+					// re-attempt. Same-day only: the expiry sweep dead-letters
+					// yesterday's entry rows before they can reach this point.
+					w.logger.Info("Inbox MANTHAN_ENTRY prior attempt failed terminally — re-attempting",
+						zap.String("signal_id", sig.OrderID),
+						zap.Int64("prior_order_id", existing.ID),
+						zap.String("prior_status", string(existing.Status)))
+				} else {
+					w.logger.Info("Inbox MANTHAN_ENTRY already placed — dedup OK",
+						zap.String("signal_id", sig.OrderID),
+						zap.Int64("existing_order_id", existing.ID))
+					return nil
+				}
 			}
 		}
 		_, err := w.entry.ExecuteEntry(ctx, sig)
@@ -472,7 +514,23 @@ func backoffFor(class string, attempts int) time.Duration {
 // condition self-resolves with time) rather than a failure. Hold classes do
 // not burn attempts and keep their class through an auth outage.
 func isHoldClass(class string) bool {
-	return class == InboxErrUpperCircuit || class == InboxErrPreOpen
+	// AUTH_EXPIRED joined the hold classes 2026-08-27: a dead broker session
+	// can last hours (user hasn't logged in), and 50 × 30 s burned the
+	// attempt budget in 25 minutes — the day's signals DLQ'd long before the
+	// user could ever act. Like the other holds it is bounded externally:
+	// the same-day expiry sweep dead-letters entry rows at the next IST day,
+	// and the market-hours pre-check poisons them after the entry cutoff.
+	return class == InboxErrUpperCircuit || class == InboxErrPreOpen ||
+		class == InboxErrAuthExpired
+}
+
+// entryAttemptIsTerminalFailure reports whether an existing manthan_orders
+// row for a signal represents a FAILED placement attempt (safe to retry)
+// rather than a live or completed one. Everything not listed here — PENDING,
+// PLACED, PARTIAL, FILLED, SL_* — means the entry is in flight or done, and
+// the inbox must dedup.
+func entryAttemptIsTerminalFailure(s OrderStatus) bool {
+	return s == StatusRejected || s == StatusCancelled || s == StatusExpired
 }
 
 // untilMarketOpen returns how long to sleep so the next attempt lands at
@@ -480,13 +538,19 @@ func isHoldClass(class string) bool {
 // If that instant has already passed — the hold was set at 09:14:59 and we
 // are now at 09:15:30, or the clock is odd — fall back to 30 s so the row
 // simply re-runs the pre-check, which will now pass.
-func untilMarketOpen(now time.Time) time.Duration {
+// istLocation returns Asia/Kolkata, falling back to a fixed +05:30 zone on
+// hosts without tzdata.
+func istLocation() *time.Location {
 	loc, _ := time.LoadLocation("Asia/Kolkata")
 	if loc == nil {
 		loc = time.FixedZone("IST", 5*60*60+30*60)
 	}
-	n := now.In(loc)
-	open := time.Date(n.Year(), n.Month(), n.Day(), 9, 15, 10, 0, loc)
+	return loc
+}
+
+func untilMarketOpen(now time.Time) time.Duration {
+	n := now.In(istLocation())
+	open := time.Date(n.Year(), n.Month(), n.Day(), 9, 15, 10, 0, istLocation())
 	d := open.Sub(n)
 	if d < 30*time.Second {
 		return 30 * time.Second

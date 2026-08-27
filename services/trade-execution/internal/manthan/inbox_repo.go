@@ -95,6 +95,27 @@ RETURNING id`
 // the same row. The caller MUST eventually call MarkInboxDone, MarkInboxFailed
 // or MarkInboxDLQ — a worker crash leaves the row in RUNNING, but the
 // reaper (ResetStuckInboxRows) sweeps those back to FAILED.
+// ExpireStaleEntrySignals dead-letters every pending/failed MANTHAN_ENTRY
+// inbox row created before todayStart (IST midnight). Entry signals are
+// same-day only by policy: yesterday's signal must never place today —
+// prices, allocation, and eligibility were all computed for yesterday's
+// session. SL/exit rows are untouched: protective actions must survive
+// day boundaries. Returns the number of rows expired.
+func (r *Repository) ExpireStaleEntrySignals(ctx context.Context, todayStart time.Time) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `
+        UPDATE signal_inbox
+           SET status='DLQ', completed_at=now(),
+               last_error='expired: entry signals are same-day only (generated before ' || $1::date || ')',
+               last_error_class='EXPIRED'
+         WHERE order_type='MANTHAN_ENTRY'
+           AND status IN ('PENDING','FAILED')
+           AND created_at < $1`, todayStart)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (r *Repository) ClaimDueInboxRows(ctx context.Context, limit int) ([]*InboxRow, error) {
 	if limit <= 0 {
 		limit = 16

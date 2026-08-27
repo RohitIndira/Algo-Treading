@@ -31,12 +31,18 @@ func TestClassify_PreOpenHoldRetries(t *testing.T) {
 }
 
 func TestHoldClasses_DoNotBurnAttempts(t *testing.T) {
-	for _, c := range []string{InboxErrUpperCircuit, InboxErrPreOpen} {
+	// AUTH_EXPIRED moved to the hold classes 2026-08-27 (operator requirement:
+	// a signal blocked by dead credentials retries until the user logs in,
+	// same-day only). It originally burned attempts because no day-boundary
+	// bound existed then — DLQ-at-50 was the only stop. The same-day expiry
+	// sweep (ExpireStaleEntrySignals) now provides the correct bound, so the
+	// hold is safe: entry rows die at the next IST day, not at attempt 50.
+	for _, c := range []string{InboxErrUpperCircuit, InboxErrPreOpen, InboxErrAuthExpired} {
 		if !isHoldClass(c) {
 			t.Errorf("%s must be a hold class (no attempt burn, class kept through auth gate)", c)
 		}
 	}
-	for _, c := range []string{InboxErrPoison, InboxErrTransient, InboxErrAuthExpired, InboxErrBrokerReject} {
+	for _, c := range []string{InboxErrPoison, InboxErrTransient, InboxErrBrokerReject} {
 		if isHoldClass(c) {
 			t.Errorf("%s must NOT be a hold class", c)
 		}
