@@ -272,6 +272,32 @@ func (r *Repository) UpdateSLAfterTopupMerge(ctx context.Context, id int64, newQ
 }
 
 // CheckDuplicate returns true if a signal_id already exists (idempotency).
+// ReuseOrderForRetry resets a terminal-failed entry row (REJECTED /
+// CANCELLED / EXPIRED) back to PENDING with freshly derived qty and limit
+// price, so the retry-on-login flow can re-drive it through placement.
+// Reuse — not a fresh insert — because manthan_orders_signal_id_key is an
+// UNCONDITIONAL unique: the signal_id can only ever live on one row
+// (2026-08-27 SHREEPUSHK). The status guard makes this a no-op on a row
+// that is live or completed.
+func (r *Repository) ReuseOrderForRetry(ctx context.Context, id int64, qty int, limitPrice float64) error {
+	res, err := r.db.ExecContext(ctx, `
+        UPDATE manthan_orders
+           SET status='PENDING', qty=$2, limit_price=$3, filled_qty=0,
+               broker_order_id='', broker_status='', last_error='',
+               retry_count=retry_count+1, placed_at=NULL, cancelled_at=NULL,
+               updated_at=now()
+         WHERE id=$1 AND status IN ('REJECTED','CANCELLED','EXPIRED')`,
+		id, qty, limitPrice)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("order %d not in a terminal-failed state — refusing reuse", id)
+	}
+	return nil
+}
+
 func (r *Repository) CheckDuplicate(ctx context.Context, signalID string) (bool, error) {
 	// Terminal-failure rows (REJECTED / CANCELLED / EXPIRED) do not count as
 	// duplicates: they are failed ATTEMPTS, and the retry-on-login flow

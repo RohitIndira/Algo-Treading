@@ -324,7 +324,35 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 		Status:        StatusPending,
 		MaxRetries:    h.maxRetries,
 	}
-	orderID, err := h.repo.InsertOrder(ctx, order)
+
+	// Retry-on-login reuse: manthan_orders_signal_id_key is an UNCONDITIONAL
+	// unique, so a re-attempt for a signal whose earlier try was
+	// REJECTED/CANCELLED/EXPIRED can never insert a fresh row — the insert
+	// bounces off the index and was mislogged as the migration-016 race
+	// (2026-08-27 SHREEPUSHK). Reset and reuse the prior row instead: same
+	// signal_id keeps event attribution intact, and the status guard inside
+	// ReuseOrderForRetry makes racing a live row impossible.
+	var orderID int64
+	var prior *ManthanOrder
+	if signal.OrderID != "" {
+		if p, perr := h.repo.GetOrderBySignalID(ctx, signal.OrderID); perr == nil && p != nil && entryAttemptIsTerminalFailure(p.Status) {
+			prior = p
+		}
+	}
+	if prior != nil {
+		if rerr := h.repo.ReuseOrderForRetry(ctx, prior.ID, order.Qty, order.LimitPrice); rerr != nil {
+			return 0, fmt.Errorf("reuse terminal-failed entry row %d: %w", prior.ID, rerr)
+		}
+		orderID = prior.ID
+		_ = h.repo.InsertEvent(ctx, orderID, "ENTRY_RETRY_REUSED", string(prior.Status), "PENDING",
+			"", order.LimitPrice, order.Qty, "retry-on-login: prior attempt reset for re-placement")
+		h.logger.Info("Entry retry — reusing prior terminal-failed order row",
+			zap.String("symbol", signal.Symbol),
+			zap.Int64("order_id", orderID),
+			zap.String("prior_status", string(prior.Status)))
+	} else {
+		orderID, err = h.repo.InsertOrder(ctx, order)
+	}
 	if err != nil {
 		// Race defense: another concurrent worker already has an active
 		// entry order for this (strategy, symbol, order_type). Migration

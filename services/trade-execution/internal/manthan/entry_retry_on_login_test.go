@@ -143,3 +143,36 @@ func TestCheckDuplicate_TerminalFailuresDoNotBlockRetry(t *testing.T) {
 		t.Fatalf("PLACED row: dup=%v err=%v — want duplicate", dup, err)
 	}
 }
+
+func TestReuseOrderForRetry_ResetsOnlyTerminalFailures(t *testing.T) {
+	db := openExecTestDB(t)
+	defer db.Close()
+	repo := &Repository{db: db}
+	ctx := context.Background()
+
+	_, _ = db.Exec(`DELETE FROM manthan_orders WHERE signal_id LIKE 'reuse-test-%'`)
+	defer func() { _, _ = db.Exec(`DELETE FROM manthan_orders WHERE signal_id LIKE 'reuse-test-%'`) }()
+
+	// REJECTED row → reset to PENDING with fresh qty/price.
+	id := seedOrder(t, db, "reuse-test-1", "REUSESYM", "BUY", "LIMIT_BUY", "REJECTED", 42, "OLDBRK")
+	if err := repo.ReuseOrderForRetry(ctx, id, 40, 475.50); err != nil {
+		t.Fatalf("reuse rejected row: %v", err)
+	}
+	var status, brokerID string
+	var qty int
+	var price float64
+	if err := db.QueryRow(`SELECT status, broker_order_id, qty, limit_price FROM manthan_orders WHERE id=$1`, id).
+		Scan(&status, &brokerID, &qty, &price); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if status != "PENDING" || brokerID != "" || qty != 40 || price != 475.50 {
+		t.Fatalf("row after reuse = %s/%q/qty=%d/price=%.2f — want PENDING/\"\"/40/475.50", status, brokerID, qty, price)
+	}
+
+	// A live (PLACED) row must refuse reuse — resetting it would orphan a
+	// real resting broker order.
+	live := seedOrder(t, db, "reuse-test-2", "REUSESYM2", "BUY", "LIMIT_BUY", "PLACED", 10, "LIVEBRK")
+	if err := repo.ReuseOrderForRetry(ctx, live, 10, 100); err == nil {
+		t.Fatal("reusing a PLACED row must be refused")
+	}
+}
