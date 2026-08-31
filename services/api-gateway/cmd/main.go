@@ -525,6 +525,16 @@ func main() {
 		adminHTTP.SetProber(prober)
 		prober.StartDailySweep(context.Background(), istLoc, adminFleet.ActiveUserIDs)
 		log.Printf("Admin credential probe + 08:30 IST pre-market sweep enabled")
+
+		// M4: strategy control (pause/resume/delete on behalf, timeline,
+		// cooldown/embargo manager). Delete is KEEP_POSITIONS_OPEN only —
+		// square-off delete arrives with M7.3. Blocks live in signals_db.
+		if signalsDB != nil {
+			adminHTTP.SetStrategyControl(admin.NewStrategyControl(userConfigClient, adminFleet, signalsDB))
+			log.Printf("Admin strategy control enabled (user-config gRPC + signals_db blocks)")
+		} else {
+			log.Printf("⚠ Admin strategy control DISABLED — signals_db handle unavailable")
+		}
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)

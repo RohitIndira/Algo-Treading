@@ -35,13 +35,17 @@ func SessionFromContext(ctx context.Context) (*Session, bool) {
 
 // HTTP bundles the service for route registration.
 type HTTP struct {
-	svc    *Service
-	fleet  *FleetStore // nil-safe: M2 routes absent when business DBs are unavailable
-	prober *Prober     // nil-safe: M3 probe routes absent without it
+	svc        *Service
+	fleet      *FleetStore      // nil-safe: M2 routes absent when business DBs are unavailable
+	prober     *Prober          // nil-safe: M3 probe routes absent without it
+	strategies *StrategyControl // nil-safe: M4 strategy routes absent without it
 }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
 func (h *HTTP) SetProber(p *Prober) { h.prober = p }
+
+// SetStrategyControl enables the M4 strategy endpoints. Call before Register.
+func (h *HTTP) SetStrategyControl(sc *StrategyControl) { h.strategies = sc }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 
@@ -87,6 +91,139 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "POST", "/users/{user_id}/credential/expire", "CREDENTIAL_EXPIRE", TierConfirm, h.handleCredentialExpire)
 		h.Route(token, "POST", "/credential-sweep", "CREDENTIAL_SWEEP", TierRead, h.handleCredentialSweep)
 	}
+	if h.strategies != nil {
+		h.Route(token, "GET", "/strategies/{strategy_id}/timeline", "STRATEGY_TIMELINE", TierRead, h.handleTimeline)
+		h.Route(token, "GET", "/strategies/{strategy_id}/blocks", "STRATEGY_BLOCKS", TierRead, h.handleBlocks)
+		h.Route(token, "POST", "/strategies/{strategy_id}/blocks/clear", "STRATEGY_BLOCK_CLEAR", TierConfirm, h.handleBlockClear)
+		h.Route(token, "POST", "/strategies/{strategy_id}/pause", "STRATEGY_PAUSE", TierConfirm, h.handlePause)
+		h.Route(token, "POST", "/strategies/{strategy_id}/resume", "STRATEGY_RESUME", TierConfirm, h.handleResume)
+		h.Route(token, "DELETE", "/strategies/{strategy_id}", "STRATEGY_DELETE", TierTyped, h.handleDelete)
+	}
+}
+
+// ── M4 handlers ─────────────────────────────────────────────────────────
+
+// resolveStrategy is the shared entry: 404s unknown strategies before any
+// tier logic runs a real action.
+func (h *HTTP) resolveStrategy(w http.ResponseWriter, ar *AdminRequest) *StrategyRef {
+	ref, err := h.strategies.Resolve(ar.Request.Context(), mux.Vars(ar.Request)["strategy_id"])
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "E_ADMIN_STRATEGY_NOT_FOUND", err.Error())
+		return nil
+	}
+	return ref
+}
+
+func (h *HTTP) handleTimeline(w http.ResponseWriter, ar *AdminRequest) {
+	ref := h.resolveStrategy(w, ar)
+	if ref == nil {
+		return
+	}
+	events, err := h.strategies.Timeline(ar.Request.Context(), ref.StrategyID)
+	if err != nil {
+		log.Printf("admin: timeline failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "timeline query failed")
+		return
+	}
+	writeOK(w, map[string]any{"strategy": ref, "events": events, "count": len(events)})
+}
+
+func (h *HTTP) handleBlocks(w http.ResponseWriter, ar *AdminRequest) {
+	ref := h.resolveStrategy(w, ar)
+	if ref == nil {
+		return
+	}
+	blocks, err := h.strategies.Blocks(ar.Request.Context(), ref.StrategyID)
+	if err != nil {
+		log.Printf("admin: blocks failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "blocks query failed")
+		return
+	}
+	writeOK(w, map[string]any{"strategy": ref, "blocks": blocks, "count": len(blocks)})
+}
+
+func (h *HTTP) handleBlockClear(w http.ResponseWriter, ar *AdminRequest) {
+	ref := h.resolveStrategy(w, ar)
+	if ref == nil {
+		return
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(ar.BodyString("symbol")))
+	kind := strings.ToUpper(strings.TrimSpace(ar.BodyString("kind")))
+	if symbol == "" || kind == "" {
+		writeErr(w, http.StatusBadRequest, "E_ADMIN_BAD_REQUEST", `body needs "symbol" and "kind" (COOLDOWN|OVERRIDE)`)
+		return
+	}
+	if err := h.strategies.ClearBlock(ar.Request.Context(), ref.StrategyID, symbol, kind); err != nil {
+		_ = ar.Audit(ref.UserID, ref.StrategyID, map[string]string{"symbol": symbol, "kind": kind}, "FAILED", err.Error())
+		writeErr(w, http.StatusUnprocessableEntity, "E_ADMIN_CLEAR_FAILED", err.Error())
+		return
+	}
+	if aerr := ar.Audit(ref.UserID, ref.StrategyID, map[string]string{"symbol": symbol, "kind": kind}, "OK",
+		"re-entry block lifted early by admin"); aerr != nil {
+		log.Printf("admin: CRITICAL — block cleared but audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "cleared, but audit write failed — check logs")
+		return
+	}
+	writeOK(w, map[string]string{"status": "cleared", "symbol": symbol, "kind": kind})
+}
+
+// strategyAction runs pause/resume through the shared audit discipline.
+func (h *HTTP) strategyAction(w http.ResponseWriter, ar *AdminRequest, verb string,
+	act func(context.Context, *StrategyRef) error) {
+	ref := h.resolveStrategy(w, ar)
+	if ref == nil {
+		return
+	}
+	if err := act(ar.Request.Context(), ref); err != nil {
+		_ = ar.Audit(ref.UserID, ref.StrategyID, nil, "FAILED", err.Error())
+		writeErr(w, http.StatusUnprocessableEntity, "E_ADMIN_STRATEGY_ACTION", err.Error())
+		return
+	}
+	if aerr := ar.Audit(ref.UserID, ref.StrategyID, nil, "OK", verb+" on behalf of user"); aerr != nil {
+		log.Printf("admin: CRITICAL — %s executed but audit failed: %v", verb, aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", verb+" done, but audit write failed — check logs")
+		return
+	}
+	writeOK(w, map[string]any{"status": verb, "strategy_id": ref.StrategyID, "user_id": ref.UserID})
+}
+
+func (h *HTTP) handlePause(w http.ResponseWriter, ar *AdminRequest) {
+	h.strategyAction(w, ar, "paused", h.strategies.Pause)
+}
+
+func (h *HTTP) handleResume(w http.ResponseWriter, ar *AdminRequest) {
+	h.strategyAction(w, ar, "resumed", h.strategies.Resume)
+}
+
+func (h *HTTP) handleDelete(w http.ResponseWriter, ar *AdminRequest) {
+	ref := h.resolveStrategy(w, ar)
+	if ref == nil {
+		return
+	}
+	expected := DeleteConfirmation(ref)
+	if ar.IsPreview() {
+		writeOK(w, map[string]any{"confirmation_text": expected, "strategy": ref})
+		return
+	}
+	if err := ar.RequireTyped(expected); err != nil {
+		_ = ar.Audit(ref.UserID, ref.StrategyID, nil, "DENIED", err.Error())
+		writeErr(w, http.StatusPreconditionFailed, "E_ADMIN_CONFIRMATION", err.Error())
+		return
+	}
+	if err := h.strategies.Delete(ar.Request.Context(), ref); err != nil {
+		_ = ar.Audit(ref.UserID, ref.StrategyID, nil, "FAILED", err.Error())
+		writeErr(w, http.StatusUnprocessableEntity, "E_ADMIN_STRATEGY_ACTION", err.Error())
+		return
+	}
+	if aerr := ar.Audit(ref.UserID, ref.StrategyID,
+		map[string]any{"open_positions_kept": ref.OpenPositions}, "OK",
+		"strategy deleted — positions kept open under their standing stops"); aerr != nil {
+		log.Printf("admin: CRITICAL — delete executed but audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "deleted, but audit write failed — check logs")
+		return
+	}
+	writeOK(w, map[string]any{"status": "deleted", "strategy_id": ref.StrategyID,
+		"user_id": ref.UserID, "open_positions_kept": ref.OpenPositions})
 }
 
 // ── M3 handlers ─────────────────────────────────────────────────────────
