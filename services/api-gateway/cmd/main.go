@@ -564,6 +564,14 @@ func main() {
 		teMetrics := envOr("TRADE_EXEC_METRICS_URL", "http://localhost:9090")
 		adminHTTP.SetInterventions(admin.NewInterventions(adminFleet, istLoc, teMetrics))
 		log.Printf("Admin interventions enabled (resurrect/re-arm/hold/cap; trade-exec metrics=%s)", teMetrics)
+
+		// M7 A2/B: order view/cancel, ghost heal, supervised square-off
+		// proxy, rebalance preview/trigger (operator CLI). REBALANCER_BIN
+		// empty → 7.7 answers 503 rather than half-working.
+		adminHTTP.SetActions(admin.NewActions(adminFleet, userConfigClient, adminIndira,
+			admin.NewStrategyControl(userConfigClient, adminFleet), adminLTP, teMetrics,
+			envOr("REBALANCER_BIN", ""), envOr("REBALANCER_DIR", "")))
+		log.Printf("Admin actions enabled (order-cancel/ghost-heal/squareoff/rebalance; rebalancer_bin=%q)", envOr("REBALANCER_BIN", ""))
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)

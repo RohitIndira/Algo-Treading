@@ -45,6 +45,7 @@ type HTTP struct {
 	scale      *ScaleChecker    // nil-safe: M5.4 check route absent without it
 	explorer   *Explorer        // nil-safe: M6 pipeline explorer routes absent without it
 	interv     *Interventions   // nil-safe: M7 intervention routes absent without it
+	actions    *Actions         // nil-safe: M7 A2/B routes absent without it
 }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
@@ -69,6 +70,10 @@ func (h *HTTP) SetExplorer(e *Explorer) { h.explorer = e }
 // SetInterventions enables the M7 Phase A intervention endpoints. Call
 // before Register.
 func (h *HTTP) SetInterventions(iv *Interventions) { h.interv = iv }
+
+// SetActions enables the M7 A2/B endpoints (order cancel, ghost heal,
+// square-off, rebalance). Call before Register.
+func (h *HTTP) SetActions(a *Actions) { h.actions = a }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 
@@ -146,6 +151,181 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "POST", "/users/{user_id}/rearm-protection", "PROTECTION_REARM", TierConfirm, h.handleRearm)
 		h.Route(token, "POST", "/users/{user_id}/amo-cap/reset", "AMO_CAP_RESET", TierConfirm, h.handleCapReset)
 	}
+	if h.actions != nil {
+		h.Route(token, "GET", "/users/{user_id}/orders/{broker_order_id}", "ORDER_VIEW", TierRead, h.handleOrderView)
+		h.Route(token, "POST", "/users/{user_id}/orders/{broker_order_id}/cancel", "ORDER_CANCEL", TierConfirm, h.handleOrderCancel)
+		h.Route(token, "GET", "/users/{user_id}/ghosts/{symbol}", "GHOST_PREVIEW", TierRead, h.handleGhostPreview)
+		h.Route(token, "POST", "/users/{user_id}/ghosts/{symbol}/heal", "GHOST_HEAL", TierTyped, h.handleGhostHeal)
+		h.Route(token, "POST", "/strategies/{strategy_id}/positions/{symbol}/squareoff", "POSITION_SQUAREOFF", TierTyped, h.handleSquareOff)
+		h.Route(token, "POST", "/rebalance/preview", "REBALANCE_PREVIEW", TierRead, h.handleRebalancePreview)
+		h.Route(token, "POST", "/rebalance/trigger", "REBALANCE_TRIGGER", TierTyped, h.handleRebalanceTrigger)
+	}
+}
+
+// ── M7 A2/B handlers ────────────────────────────────────────────────────
+
+func (h *HTTP) handleOrderView(w http.ResponseWriter, ar *AdminRequest) {
+	vars := mux.Vars(ar.Request)
+	userID, brokerID := vars["user_id"], vars["broker_order_id"]
+	view, err := h.actions.ViewOrder(ar.Request.Context(), userID, brokerID)
+	if err != nil {
+		h.intervErr(w, ar, userID, brokerID, err)
+		return
+	}
+	if aerr := ar.Audit(userID, brokerID, map[string]string{"verdict": view.Verdict}, "OK", ""); aerr != nil {
+		log.Printf("admin: order view audit failed: %v", aerr)
+	}
+	writeOK(w, view)
+}
+
+func (h *HTTP) handleOrderCancel(w http.ResponseWriter, ar *AdminRequest) {
+	reason, ok := requireReason(w, ar)
+	if !ok {
+		return
+	}
+	vars := mux.Vars(ar.Request)
+	userID, brokerID := vars["user_id"], vars["broker_order_id"]
+	view, err := h.actions.CancelOrder(ar.Request.Context(), userID, brokerID)
+	if err != nil {
+		h.intervErr(w, ar, userID, brokerID, err)
+		return
+	}
+	if aerr := ar.Audit(userID, brokerID, map[string]string{"reason": reason}, "OK", "broker order cancelled"); aerr != nil {
+		log.Printf("admin: order cancel audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_AUDIT", "audit write failed")
+		return
+	}
+	writeOK(w, view)
+}
+
+func (h *HTTP) handleGhostPreview(w http.ResponseWriter, ar *AdminRequest) {
+	vars := mux.Vars(ar.Request)
+	plan, err := h.actions.GhostPreview(ar.Request.Context(), vars["user_id"], vars["symbol"])
+	if err != nil {
+		h.intervErr(w, ar, vars["user_id"], vars["symbol"], err)
+		return
+	}
+	if aerr := ar.Audit(vars["user_id"], vars["symbol"], plan.Evidence, "OK", "ghost heal previewed"); aerr != nil {
+		log.Printf("admin: ghost preview audit failed: %v", aerr)
+	}
+	writeOK(w, plan)
+}
+
+func (h *HTTP) handleGhostHeal(w http.ResponseWriter, ar *AdminRequest) {
+	vars := mux.Vars(ar.Request)
+	userID, symbol := vars["user_id"], vars["symbol"]
+	// Evidence is ALWAYS refetched live — a stale preview cannot authorize.
+	plan, err := h.actions.GhostPreview(ar.Request.Context(), userID, symbol)
+	if err != nil {
+		h.intervErr(w, ar, userID, symbol, err)
+		return
+	}
+	if ar.IsPreview() {
+		writeOK(w, plan)
+		return
+	}
+	if terr := ar.RequireTyped(plan.ConfirmationText); terr != nil {
+		if aerr := ar.Audit(userID, symbol, nil, "DENIED", terr.Error()); aerr != nil {
+			log.Printf("admin: ghost heal denial audit failed: %v", aerr)
+		}
+		writeErr(w, http.StatusPreconditionFailed, "E_ADMIN_CONFIRMATION", terr.Error())
+		return
+	}
+	result, err := h.actions.GhostHeal(ar.Request.Context(), plan)
+	if err != nil {
+		h.intervErr(w, ar, userID, symbol, err)
+		return
+	}
+	if aerr := ar.Audit(userID, symbol, map[string]any{"evidence": plan.Evidence, "result": result}, "OK", "ghost healed from broker-verified evidence"); aerr != nil {
+		log.Printf("admin: ghost heal audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_AUDIT", "audit write failed")
+		return
+	}
+	writeOK(w, map[string]any{"healed": result, "plan": plan})
+}
+
+func (h *HTTP) handleSquareOff(w http.ResponseWriter, ar *AdminRequest) {
+	// Resolve through the Actions bundle's own strategy control — the M4
+	// field may legitimately be unset while actions are wired (tests, or a
+	// partial deployment).
+	ref, err := h.actions.strategies.Resolve(ar.Request.Context(), mux.Vars(ar.Request)["strategy_id"])
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "E_ADMIN_STRATEGY_NOT_FOUND", err.Error())
+		return
+	}
+	symbol := mux.Vars(ar.Request)["symbol"]
+	sc, err := h.actions.SquareOffPreview(ar.Request.Context(), ref, symbol)
+	if err != nil {
+		h.intervErr(w, ar, ref.UserID, symbol, err)
+		return
+	}
+	if ar.IsPreview() {
+		writeOK(w, sc)
+		return
+	}
+	if terr := ar.RequireTyped(sc.ConfirmationText); terr != nil {
+		if aerr := ar.Audit(ref.UserID, symbol, nil, "DENIED", terr.Error()); aerr != nil {
+			log.Printf("admin: squareoff denial audit failed: %v", aerr)
+		}
+		writeErr(w, http.StatusPreconditionFailed, "E_ADMIN_CONFIRMATION", terr.Error())
+		return
+	}
+	report, err := h.actions.SquareOffExecute(ar.Request.Context(), ref, symbol)
+	if err != nil {
+		h.intervErr(w, ar, ref.UserID, symbol, err)
+		return
+	}
+	if aerr := ar.Audit(ref.UserID, symbol, map[string]any{"qty": sc.Qty, "approx_value": sc.ApproxValue}, "OK", "supervised square-off executed"); aerr != nil {
+		log.Printf("admin: squareoff audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_AUDIT", "audit write failed")
+		return
+	}
+	writeOK(w, map[string]any{"trade_execution": json.RawMessage(report), "context": sc})
+}
+
+func (h *HTTP) handleRebalancePreview(w http.ResponseWriter, ar *AdminRequest) {
+	userID := ar.BodyString("user_id")
+	out, err := h.actions.Rebalance(ar.Request.Context(), userID, true)
+	if err != nil {
+		h.intervErr(w, ar, userID, "", err)
+		return
+	}
+	if aerr := ar.Audit(userID, "", nil, "OK", "rebalance dry-run"); aerr != nil {
+		log.Printf("admin: rebalance preview audit failed: %v", aerr)
+	}
+	writeOK(w, map[string]any{"dry_run": true, "output": out})
+}
+
+func (h *HTTP) handleRebalanceTrigger(w http.ResponseWriter, ar *AdminRequest) {
+	userID := strings.TrimSpace(ar.BodyString("user_id"))
+	if userID == "" && !ar.IsPreview() {
+		writeErr(w, http.StatusUnprocessableEntity, "E_ADMIN_BAD_INPUT", `"user_id" is required — a live rebalance runs one user at a time`)
+		return
+	}
+	expected := fmt.Sprintf("REBALANCE %s — PUBLISH REAL ENTRY ORDERS", userID)
+	if ar.IsPreview() {
+		writeOK(w, map[string]any{"confirmation_text": expected,
+			"note": "run /rebalance/preview first to see the plan; then resend with confirmation_text"})
+		return
+	}
+	if terr := ar.RequireTyped(expected); terr != nil {
+		if aerr := ar.Audit(userID, "", nil, "DENIED", terr.Error()); aerr != nil {
+			log.Printf("admin: rebalance denial audit failed: %v", aerr)
+		}
+		writeErr(w, http.StatusPreconditionFailed, "E_ADMIN_CONFIRMATION", terr.Error())
+		return
+	}
+	out, err := h.actions.Rebalance(ar.Request.Context(), userID, false)
+	if err != nil {
+		h.intervErr(w, ar, userID, "", err)
+		return
+	}
+	if aerr := ar.Audit(userID, "", nil, "OK", "rebalance pass executed — entries published"); aerr != nil {
+		log.Printf("admin: rebalance audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_AUDIT", "audit write failed")
+		return
+	}
+	writeOK(w, map[string]any{"dry_run": false, "output": out})
 }
 
 // ── M7 Phase A handlers ─────────────────────────────────────────────────

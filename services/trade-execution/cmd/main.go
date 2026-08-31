@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -669,6 +670,38 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, `{"ok":true,"user_id":%q}`, userID)
 		})
+
+		// POST /manthan/admin/squareoff?user_id=X&strategy_id=Y&symbol=Z
+		//
+		// M7.3 admin square-off: cancel-SL-then-sell as one supervised,
+		// position-locked operation (see admin_squareoff.go). Called only by
+		// the api-gateway admin console (TYPED confirmation + audit live
+		// there); this port is not internet-reachable.
+		if manthanModule.SLHandler != nil {
+			slh := manthanModule.SLHandler
+			metricsMux.HandleFunc("/manthan/admin/squareoff", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					http.Error(w, "POST required", http.StatusMethodNotAllowed)
+					return
+				}
+				q := r.URL.Query()
+				userID, strategyID, symbol := q.Get("user_id"), q.Get("strategy_id"), q.Get("symbol")
+				if userID == "" || strategyID == "" || symbol == "" {
+					http.Error(w, "user_id, strategy_id and symbol query parameters required", http.StatusBadRequest)
+					return
+				}
+				ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+				defer cancel()
+				report, err := slh.AdminSquareOff(ctx, userID, strategyID, symbol)
+				if err != nil {
+					log.Printf("[admin-squareoff] %s/%s/%s failed: %v", userID, strategyID, symbol, err)
+					http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(report)
+			})
+		}
 
 		// POST /manthan/replay/runEODNow — manually trigger Layer 1
 		// EOD Phase A AMO+SL submission outside the 16:35 IST cron window.
