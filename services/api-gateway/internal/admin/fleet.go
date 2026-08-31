@@ -120,8 +120,11 @@ func (f *FleetStore) credentialAges(ctx context.Context) (map[string]time.Durati
 	// Age computed SERVER-side: updated_at is timestamp-without-tz written
 	// by the DB's own now(), so only the DB clock compares it consistently
 	// (Go-side subtraction shifts by the session-timezone offset).
+	// Blank token = force-expired (or never completed) — treated as absent
+	// everywhere, regardless of updated_at (a DB trigger auto-bumps it).
 	rows, err := f.execDB.QueryContext(ctx,
-		`SELECT user_id, EXTRACT(EPOCH FROM (now() - updated_at)) FROM user_credentials`)
+		`SELECT user_id, EXTRACT(EPOCH FROM (now() - updated_at))
+		   FROM user_credentials WHERE indira_bearer_token <> ''`)
 	if err != nil {
 		return nil, fmt.Errorf("fleet credentials: %w", err)
 	}
@@ -219,6 +222,80 @@ func (f *FleetStore) fillPositions(ctx context.Context, r *FleetRow) error {
 		return fmt.Errorf("fleet pnl: %w", err)
 	}
 	return nil
+}
+
+// ── M3 helpers ──────────────────────────────────────────────────────────
+
+// CredentialFacts is the stored-side view (the probe adds the live side).
+type CredentialFacts struct {
+	UserID   string  `json:"user_id"`
+	Stored   bool    `json:"stored"`
+	AgeHours float64 `json:"age_hours"`
+	Source   string  `json:"source,omitempty"`
+}
+
+// CredentialFacts reads what the credential store holds for one user.
+func (f *FleetStore) CredentialFacts(ctx context.Context, userID string) (CredentialFacts, error) {
+	c := CredentialFacts{UserID: userID, AgeHours: -1}
+	var secs float64
+	var token string
+	err := f.execDB.QueryRowContext(ctx, `
+		SELECT EXTRACT(EPOCH FROM (now() - updated_at)), COALESCE(indira_source,''), indira_bearer_token
+		  FROM user_credentials WHERE user_id = $1`, userID).Scan(&secs, &c.Source, &token)
+	if err == sql.ErrNoRows {
+		return c, nil
+	}
+	if err != nil {
+		return c, fmt.Errorf("credential facts: %w", err)
+	}
+	if token == "" { // force-expired: row exists, credential does not
+		return c, nil
+	}
+	c.Stored, c.AgeHours = true, secs/3600
+	return c, nil
+}
+
+// ExpireCredential force-expires a stored credential: the token is blanked
+// and the timestamp pushed to the epoch, so every consumer (services via
+// user-config gRPC, the fleet staleness dot, the probe) treats it as absent
+// until the user's next platform login overwrites it. Refuses when nothing
+// is stored — expiring a ghost is a UI bug worth surfacing.
+func (f *FleetStore) ExpireCredential(ctx context.Context, userID string) error {
+	// Blanking the token is the whole mechanism: every consumer (services
+	// via user-config gRPC, fleet staleness, probe) treats a blank token as
+	// no-credential. updated_at is left to its trigger — it is ignored for
+	// blank rows. Refuses when nothing effective is stored.
+	res, err := f.execDB.ExecContext(ctx, `
+		UPDATE user_credentials SET indira_bearer_token = ''
+		 WHERE user_id = $1 AND indira_bearer_token <> ''`, userID)
+	if err != nil {
+		return fmt.Errorf("expire credential: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("no live credential stored for %s", userID)
+	}
+	return nil
+}
+
+// ActiveUserIDs returns the distinct users holding non-deleted active
+// strategies — the pre-market sweep population.
+func (f *FleetStore) ActiveUserIDs(ctx context.Context) ([]string, error) {
+	rows, err := f.tradingDB.QueryContext(ctx, `
+		SELECT DISTINCT user_id FROM strategies
+		 WHERE deleted_at IS NULL AND active = true ORDER BY user_id`)
+	if err != nil {
+		return nil, fmt.Errorf("active users: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 // ── 2.2 Attention queue ─────────────────────────────────────────────────

@@ -16,6 +16,7 @@ import (
 	_ "github.com/lib/pq"
 	"go.uber.org/zap"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/config"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/admin"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
@@ -509,8 +510,21 @@ func main() {
 	// M2 fleet/attention need all three business DBs; absent any, the
 	// routes stay unregistered (loud 404 beats a half-truthful grid).
 	if adminHTTP != nil && positionsDB != nil && ordersDB != nil && positionsSSotDB != nil {
-		adminHTTP.SetFleetStore(admin.NewFleetStore(positionsDB, ordersDB, positionsSSotDB))
+		adminFleet := admin.NewFleetStore(positionsDB, ordersDB, positionsSSotDB)
+		adminHTTP.SetFleetStore(adminFleet)
 		log.Printf("Admin fleet endpoints enabled (trading+execution+positions handles)")
+
+		// M3: live credential probe + 08:30 IST pre-market sweep. Decrypted
+		// creds come over the existing user-config gRPC (the encryption key
+		// never leaves user-config); the probe is one GetFundLimit call.
+		istLoc, _ := time.LoadLocation("Asia/Kolkata")
+		if istLoc == nil {
+			istLoc = time.FixedZone("IST", 5*3600+30*60)
+		}
+		prober := admin.NewProber(userConfigClient, indiraClient.NewClient(indiraClient.Config{}))
+		adminHTTP.SetProber(prober)
+		prober.StartDailySweep(context.Background(), istLoc, adminFleet.ActiveUserIDs)
+		log.Printf("Admin credential probe + 08:30 IST pre-market sweep enabled")
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)

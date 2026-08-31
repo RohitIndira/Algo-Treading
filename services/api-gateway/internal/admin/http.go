@@ -35,9 +35,13 @@ func SessionFromContext(ctx context.Context) (*Session, bool) {
 
 // HTTP bundles the service for route registration.
 type HTTP struct {
-	svc   *Service
-	fleet *FleetStore // nil-safe: M2 routes absent when business DBs are unavailable
+	svc    *Service
+	fleet  *FleetStore // nil-safe: M2 routes absent when business DBs are unavailable
+	prober *Prober     // nil-safe: M3 probe routes absent without it
 }
+
+// SetProber enables the M3 credential endpoints. Call before Register.
+func (h *HTTP) SetProber(p *Prober) { h.prober = p }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 
@@ -78,6 +82,59 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "GET", "/fleet", "FLEET_VIEW", TierRead, h.handleFleet)
 		h.Route(token, "GET", "/attention", "ATTENTION_VIEW", TierRead, h.handleAttention)
 	}
+	if h.fleet != nil && h.prober != nil {
+		h.Route(token, "GET", "/users/{user_id}/credential", "CREDENTIAL_PROBE", TierRead, h.handleCredential)
+		h.Route(token, "POST", "/users/{user_id}/credential/expire", "CREDENTIAL_EXPIRE", TierConfirm, h.handleCredentialExpire)
+		h.Route(token, "POST", "/credential-sweep", "CREDENTIAL_SWEEP", TierRead, h.handleCredentialSweep)
+	}
+}
+
+// ── M3 handlers ─────────────────────────────────────────────────────────
+
+func (h *HTTP) handleCredential(w http.ResponseWriter, ar *AdminRequest) {
+	userID := mux.Vars(ar.Request)["user_id"]
+	facts, err := h.fleet.CredentialFacts(ar.Request.Context(), userID)
+	if err != nil {
+		log.Printf("admin: credential facts failed for %s: %v", userID, err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "credential lookup failed")
+		return
+	}
+	verdict := h.prober.Probe(ar.Request.Context(), userID)
+	if aerr := ar.Audit(userID, "", map[string]string{"verdict": verdict.Verdict}, "OK", ""); aerr != nil {
+		log.Printf("admin: credential probe audit failed: %v", aerr)
+	}
+	writeOK(w, map[string]any{"stored": facts, "probe": verdict})
+}
+
+func (h *HTTP) handleCredentialExpire(w http.ResponseWriter, ar *AdminRequest) {
+	userID := mux.Vars(ar.Request)["user_id"]
+	// CONFIRM tier already enforced by Route(). Mutating action: the audit
+	// row is part of the action — a failed audit fails the request.
+	if err := h.fleet.ExpireCredential(ar.Request.Context(), userID); err != nil {
+		_ = ar.Audit(userID, "", nil, "FAILED", err.Error())
+		writeErr(w, http.StatusUnprocessableEntity, "E_ADMIN_EXPIRE_FAILED", err.Error())
+		return
+	}
+	if aerr := ar.Audit(userID, "", nil, "OK", "credential force-expired — user must re-login via platform"); aerr != nil {
+		log.Printf("admin: CRITICAL — expire executed but audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "expired, but audit write failed — check logs")
+		return
+	}
+	writeOK(w, map[string]string{"status": "expired", "user_id": userID})
+}
+
+func (h *HTTP) handleCredentialSweep(w http.ResponseWriter, ar *AdminRequest) {
+	users, err := h.fleet.ActiveUserIDs(ar.Request.Context())
+	if err != nil {
+		log.Printf("admin: sweep user list failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "user list failed")
+		return
+	}
+	results := h.prober.Sweep(ar.Request.Context(), users)
+	if aerr := ar.Audit("", "", map[string]int{"users_probed": len(results)}, "OK", ""); aerr != nil {
+		log.Printf("admin: sweep audit failed: %v", aerr)
+	}
+	writeOK(w, map[string]any{"results": results, "count": len(results)})
 }
 
 // ── M2 handlers ─────────────────────────────────────────────────────────
@@ -98,6 +155,13 @@ func (h *HTTP) handleAttention(w http.ResponseWriter, ar *AdminRequest) {
 		log.Printf("admin: attention failed: %v", err)
 		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "attention query failed")
 		return
+	}
+	// M3: live-probe failures from the last sweep outrank the age heuristic —
+	// prepend and keep CRITICAL-first ordering.
+	if h.prober != nil {
+		if fails := h.prober.sweepFailuresAsAttention(); len(fails) > 0 {
+			items = append(fails, items...)
+		}
 	}
 	writeOK(w, map[string]any{"items": items, "count": len(items), "not_wired": notWired})
 }
