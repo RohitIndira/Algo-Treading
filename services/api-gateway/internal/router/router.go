@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/admin"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/auth"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/handlers"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/middleware"
@@ -25,6 +26,7 @@ func NewRouter(
 	verifier auth.Verifier,
 	tokenCapture *middleware.TokenCapture, // nil-safe: auto-refresh stored broker creds from validated headers
 	corsConfig middleware.CORSConfig,
+	adminHTTP *admin.HTTP, // nil-safe: admin console absent when trading_db is unavailable
 ) http.Handler {
 
 	r := mux.NewRouter()
@@ -108,6 +110,17 @@ func NewRouter(
 	// ?token= directly.
 	if marketHandler != nil {
 		api.HandleFunc("/market/quote", marketHandler.GetQuote).Methods("GET")
+	}
+
+	// ── Admin console (spec M1) ─────────────────────────────────────
+	// MUST be mounted before the `protected` catch-all below — gorilla
+	// matches subrouters in registration order, and a later PathPrefix("")
+	// would shadow /admin/* into its own 404. Elevation is platform-authed;
+	// everything else demands the opaque admin session token. See
+	// internal/admin for the security model.
+	if adminHTTP != nil {
+		adminHTTP.Register(api.PathPrefix("/admin").Subrouter(),
+			middleware.AuthRequired(verifier, tokenCapture))
 	}
 
 	// ── Protected subrouter ─────────────────────────────────────────

@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/config"
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/admin"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/algos"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/auth"
 	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/grpc_clients"
@@ -467,7 +468,19 @@ func main() {
 	// Kills the daily "app validated but never pushed the fresh token" gap.
 	tokenCapture := middleware.NewTokenCapture(userConfigClient)
 
-	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, tokenCapture, corsConfig)
+	// ── Admin console (spec M1) ──────────────────────────────────────
+	// Rides the existing trading_db handle (admin_users / admin_sessions /
+	// admin_audit — migration 019). Absent handle → admin surface absent,
+	// loudly: an admin console silently missing is an ops trap.
+	var adminHTTP *admin.HTTP
+	if positionsDB != nil {
+		adminHTTP = admin.NewHTTP(admin.NewService(admin.NewStore(positionsDB)))
+		log.Printf("Admin console enabled (trading_db=%s)", positionsDBName)
+	} else {
+		log.Printf("⚠ Admin console DISABLED — trading_db handle unavailable")
+	}
+
+	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, tokenCapture, corsConfig, adminHTTP)
 
 	// Debug: list all routes
 	_ = r.(*mux.Router).Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
