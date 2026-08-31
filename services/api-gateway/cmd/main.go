@@ -528,13 +528,12 @@ func main() {
 
 		// M4: strategy control (pause/resume/delete on behalf, timeline,
 		// cooldown/embargo manager). Delete is KEEP_POSITIONS_OPEN only —
-		// square-off delete arrives with M7.3. Blocks live in signals_db.
-		if signalsDB != nil {
-			adminHTTP.SetStrategyControl(admin.NewStrategyControl(userConfigClient, adminFleet, signalsDB))
-			log.Printf("Admin strategy control enabled (user-config gRPC + signals_db blocks)")
-		} else {
-			log.Printf("⚠ Admin strategy control DISABLED — signals_db handle unavailable")
-		}
+		// square-off delete arrives with M7.3. Blocks (manthan_cooldown,
+		// manthan_signal_decisions) live in TRADING_DB — rules-engine writes
+		// them via its main pool — so strategy control rides the fleet
+		// store's handle and needs no extra DB.
+		adminHTTP.SetStrategyControl(admin.NewStrategyControl(userConfigClient, adminFleet))
+		log.Printf("Admin strategy control enabled (user-config gRPC + trading_db blocks)")
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)

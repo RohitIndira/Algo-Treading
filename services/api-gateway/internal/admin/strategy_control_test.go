@@ -1,9 +1,12 @@
 package admin
 
 // M4 tests. gRPC is stubbed (recording calls for on-behalf verification);
-// timeline and blocks run against the real local trading_db/signals_db;
-// the HTTP chain exercises CONFIRM pause/resume, the TYPED delete
-// preview→retype handshake, and the audited block-clear.
+// timeline and blocks run against the real local trading_db — the SAME DB
+// rules-engine writes manthan_cooldown / manthan_signal_decisions to on
+// prod (its main pool; the raw signal feed lives elsewhere — the
+// 2026-08-31 wrong-DB deploy bug this pins down). The HTTP chain exercises
+// CONFIRM pause/resume, the TYPED delete preview→retype handshake, and the
+// audited block-clear.
 
 import (
 	"context"
@@ -39,32 +42,18 @@ func (s *stubStrategyRPC) DeleteStrategy(_ context.Context, r *pb.DeleteStrategy
 	return &pb.DeleteStrategyResponse{Success: !s.fail}, nil
 }
 
-func openSignalsDB(t *testing.T) *sql.DB {
+func cleanupM4(t *testing.T, trading *sql.DB) {
 	t.Helper()
-	db, err := sql.Open("postgres",
-		"host=localhost port=5432 user=postgres password=postgres dbname=signals_db sslmode=disable")
-	if err != nil {
-		t.Fatalf("open signals_db: %v", err)
-	}
-	if err := db.Ping(); err != nil {
-		t.Skipf("signals_db not reachable — skipping M4 DB tests (%v)", err)
-	}
-	cleanupM4(t, db)
-	t.Cleanup(func() { cleanupM4(t, db); db.Close() })
-	return db
+	_, _ = trading.Exec(`DELETE FROM manthan_cooldown WHERE strategy_id = $1::uuid`, m2Strat)
+	_, _ = trading.Exec(`DELETE FROM manthan_signal_decisions WHERE strategy_id = $1::uuid`, m2Strat)
 }
 
-func cleanupM4(t *testing.T, signals *sql.DB) {
-	t.Helper()
-	_, _ = signals.Exec(`DELETE FROM manthan_cooldown WHERE strategy_id = $1::uuid`, m2Strat)
-	_, _ = signals.Exec(`DELETE FROM manthan_signal_decisions WHERE strategy_id = $1::uuid`, m2Strat)
-}
-
-func newM4Router(t *testing.T) (root http.Handler, rpc *stubStrategyRPC, signals *sql.DB, token string, trading *sql.DB) {
+func newM4Router(t *testing.T) (root http.Handler, rpc *stubStrategyRPC, token string, trading *sql.DB) {
 	t.Helper()
 	tradingDB, execDB, posDB := openFleetDBs(t)
 	seedFleetFixtures(t, tradingDB, execDB, posDB, time.Now())
-	signals = openSignalsDB(t)
+	cleanupM4(t, tradingDB)
+	t.Cleanup(func() { cleanupM4(t, tradingDB) })
 
 	adminDB := openAdminTestDB(t)
 	seedAdmin(t, adminDB, "TADM_M4ADMIN", true)
@@ -72,9 +61,9 @@ func newM4Router(t *testing.T) (root http.Handler, rpc *stubStrategyRPC, signals
 	fleet := NewFleetStore(tradingDB, execDB, posDB)
 	h.SetFleetStore(fleet)
 	rpc = &stubStrategyRPC{}
-	h.SetStrategyControl(NewStrategyControl(rpc, fleet, signals))
+	h.SetStrategyControl(NewStrategyControl(rpc, fleet))
 	r := newRouterFor(t, h)
-	return r, rpc, signals, elevateViaHTTP(t, r, "TADM_M4ADMIN"), tradingDB
+	return r, rpc, elevateViaHTTP(t, r, "TADM_M4ADMIN"), tradingDB
 }
 
 func m4do(t *testing.T, root http.Handler, token, method, path, body string) *httptest.ResponseRecorder {
@@ -92,7 +81,7 @@ func m4do(t *testing.T, root http.Handler, token, method, path, body string) *ht
 }
 
 func TestM4_PauseResume_OnBehalf(t *testing.T) {
-	root, rpc, _, token, _ := newM4Router(t)
+	root, rpc, token, _ := newM4Router(t)
 	base := "/api/v1/admin/strategies/" + m2Strat
 
 	// Unconfirmed → 412, no RPC fired.
@@ -124,7 +113,7 @@ func TestM4_PauseResume_OnBehalf(t *testing.T) {
 }
 
 func TestM4_Delete_TypedHandshake(t *testing.T) {
-	root, rpc, _, token, _ := newM4Router(t)
+	root, rpc, token, _ := newM4Router(t)
 	base := "/api/v1/admin/strategies/" + m2Strat
 
 	// Bare delete → 412 (TYPED tier demands the handshake).
@@ -155,7 +144,7 @@ func TestM4_Delete_TypedHandshake(t *testing.T) {
 }
 
 func TestM4_TimelineAndBlocks(t *testing.T) {
-	root, _, signals, token, trading := newM4Router(t)
+	root, _, token, trading := newM4Router(t)
 	base := "/api/v1/admin/strategies/" + m2Strat
 
 	// Seed lifecycle events + both block kinds.
@@ -168,12 +157,12 @@ func TestM4_TimelineAndBlocks(t *testing.T) {
 	t.Cleanup(func() {
 		_, _ = trading.Exec(`DELETE FROM strategy_lifecycle_events WHERE strategy_id=$1::uuid`, m2Strat)
 	})
-	if _, err := signals.Exec(`
+	if _, err := trading.Exec(`
 		INSERT INTO manthan_cooldown (strategy_id, symbol, ath_at_exit, exit_price, reentry_below)
 		VALUES ($1::uuid, 'COOLSYM', 500, 400, 400)`, m2Strat); err != nil {
 		t.Fatalf("seed cooldown: %v", err)
 	}
-	if _, err := signals.Exec(`
+	if _, err := trading.Exec(`
 		INSERT INTO manthan_signal_decisions
 			(signal_id, user_id, strategy_id, symbol, ltp_at_decision,
 			 intended_qty, intended_invested, initial_sl_target,
@@ -204,7 +193,7 @@ func TestM4_TimelineAndBlocks(t *testing.T) {
 		t.Fatalf("clear: %d %s", rec.Code, rec.Body.String())
 	}
 	var cleared bool
-	if err := signals.QueryRow(`SELECT cleared FROM manthan_cooldown WHERE strategy_id=$1::uuid AND symbol='COOLSYM'`,
+	if err := trading.QueryRow(`SELECT cleared FROM manthan_cooldown WHERE strategy_id=$1::uuid AND symbol='COOLSYM'`,
 		m2Strat).Scan(&cleared); err != nil || !cleared {
 		t.Fatalf("cooldown not cleared: %v cleared=%v", err, cleared)
 	}
@@ -219,7 +208,7 @@ func TestM4_TimelineAndBlocks(t *testing.T) {
 		t.Fatalf("clear override: %d %s", rec.Code, rec.Body.String())
 	}
 	var overrides int
-	if err := signals.QueryRow(`SELECT COUNT(*) FROM manthan_signal_decisions
+	if err := trading.QueryRow(`SELECT COUNT(*) FROM manthan_signal_decisions
 		WHERE strategy_id=$1::uuid AND user_override_until IS NOT NULL`, m2Strat).Scan(&overrides); err != nil || overrides != 0 {
 		t.Fatalf("override not nulled: %v n=%d", err, overrides)
 	}

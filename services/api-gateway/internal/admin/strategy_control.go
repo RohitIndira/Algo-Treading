@@ -13,9 +13,14 @@ package admin
 //     rules-engine's portfolio state with no write RPC (bodging cross-
 //     service writes is how books diverge), and the 20% stop is a declared
 //     hard rule (operator 2026-08-19 + the NSE writeup).
-//   - 4.4 covers BOTH invisible block mechanisms in signals_db: SL-exit
-//     re-entry cooldowns (manthan_cooldown) and manual-exit embargoes
-//     (manthan_signal_decisions.user_override_until).
+//   - 4.4 covers BOTH invisible block mechanisms: SL-exit re-entry
+//     cooldowns (manthan_cooldown) and manual-exit embargoes
+//     (manthan_signal_decisions.user_override_until). Both tables live in
+//     TRADING_DB — rules-engine writes them through its main pool
+//     (deps.ManthanDB, POSTGRES_DB=trading_db); its signals_db connection
+//     only reads the raw manthan_signals feed. Verified on prod
+//     2026-08-31: manthan_cooldown has rows in trading_db, none in
+//     signals_db.
 
 import (
 	"context"
@@ -35,15 +40,15 @@ type strategyRPC interface {
 	DeleteStrategy(ctx context.Context, req *pb.DeleteStrategyRequest) (*pb.DeleteStrategyResponse, error)
 }
 
-// StrategyControl bundles M4's dependencies.
+// StrategyControl bundles M4's dependencies. Blocks ride the fleet store's
+// trading_db handle — the same DB Resolve and Timeline already use.
 type StrategyControl struct {
-	rpc       strategyRPC
-	fleet     *FleetStore
-	signalsDB *sql.DB // manthan_cooldown, manthan_signal_decisions (rules-engine's DB)
+	rpc   strategyRPC
+	fleet *FleetStore
 }
 
-func NewStrategyControl(rpc strategyRPC, fleet *FleetStore, signalsDB *sql.DB) *StrategyControl {
-	return &StrategyControl{rpc: rpc, fleet: fleet, signalsDB: signalsDB}
+func NewStrategyControl(rpc strategyRPC, fleet *FleetStore) *StrategyControl {
+	return &StrategyControl{rpc: rpc, fleet: fleet}
 }
 
 // StrategyRef resolves a strategy to its owner + live context — every M4
@@ -202,7 +207,7 @@ type Block struct {
 func (sc *StrategyControl) Blocks(ctx context.Context, strategyID string) ([]Block, error) {
 	var out []Block
 
-	cd, err := sc.signalsDB.QueryContext(ctx, `
+	cd, err := sc.fleet.tradingDB.QueryContext(ctx, `
 		SELECT symbol, exit_price, reentry_below, exit_time
 		  FROM manthan_cooldown
 		 WHERE strategy_id = $1::uuid AND cleared = false
@@ -228,7 +233,7 @@ func (sc *StrategyControl) Blocks(ctx context.Context, strategyID string) ([]Blo
 		return nil, err
 	}
 
-	ov, err := sc.signalsDB.QueryContext(ctx, `
+	ov, err := sc.fleet.tradingDB.QueryContext(ctx, `
 		SELECT symbol, MAX(user_override_until)
 		  FROM manthan_signal_decisions
 		 WHERE strategy_id = $1::uuid
@@ -260,12 +265,12 @@ func (sc *StrategyControl) ClearBlock(ctx context.Context, strategyID, symbol, k
 	var err error
 	switch kind {
 	case "COOLDOWN":
-		res, err = sc.signalsDB.ExecContext(ctx, `
+		res, err = sc.fleet.tradingDB.ExecContext(ctx, `
 			UPDATE manthan_cooldown SET cleared = true, cleared_at = now()
 			 WHERE strategy_id = $1::uuid AND symbol = $2 AND cleared = false`,
 			strategyID, symbol)
 	case "OVERRIDE":
-		res, err = sc.signalsDB.ExecContext(ctx, `
+		res, err = sc.fleet.tradingDB.ExecContext(ctx, `
 			UPDATE manthan_signal_decisions SET user_override_until = NULL
 			 WHERE strategy_id = $1::uuid AND symbol = $2
 			   AND user_override_until IS NOT NULL AND user_override_until > now()`,
