@@ -188,3 +188,85 @@ func TestHTTP_CredentialProbeExpireSweep_EndToEnd(t *testing.T) {
 		t.Fatalf("expire not audited: %s", rec.Body.String())
 	}
 }
+
+// seqCreds returns a different credentials response per call — models the
+// store moving under the probe (token_capture refreshing mid-probe).
+type seqCreds struct {
+	responses []*pb.GetUserCredentialsResponse
+	calls     int
+}
+
+func (s *seqCreds) GetUserCredentials(context.Context, *pb.GetUserCredentialsRequest) (*pb.GetUserCredentialsResponse, error) {
+	i := s.calls
+	if i >= len(s.responses) {
+		i = len(s.responses) - 1
+	}
+	s.calls++
+	return s.responses[i], nil
+}
+
+func credsWithToken(user, token string) *pb.GetUserCredentialsResponse {
+	return &pb.GetUserCredentialsResponse{
+		Success: true,
+		IndiraAuth: &commonpb.IndiraAuthContext{
+			UserId: user, AppId: "app", Source: "AND", BearerToken: token,
+		},
+	}
+}
+
+func TestProbe_RefetchRetryOnFlap(t *testing.T) {
+	// The 2026-08-31 S4450 flap: stored token dead at first probe, a fresher
+	// token lands mid-call → verdict self-corrects to WORKS in one Probe().
+	p := &Prober{
+		creds: &seqCreds{responses: []*pb.GetUserCredentialsResponse{
+			credsWithToken("U1", "OLD-DEAD"),
+			credsWithToken("U1", "NEW-LIVE"),
+		}},
+		probe: func(_ context.Context, a *indiraClient.AuthContext) error {
+			if a.BearerToken == "OLD-DEAD" {
+				return fmt.Errorf("verify: %w", indiraClient.ErrAuthExpired)
+			}
+			return nil
+		},
+		lastSweep: map[string]ProbeVerdict{},
+	}
+	v := p.Probe(context.Background(), "U1")
+	if v.Verdict != "WORKS" || !strings.Contains(v.Detail, "recovered on retry") {
+		t.Fatalf("flap probe = %+v, want WORKS with recovered-on-retry detail", v)
+	}
+
+	// Same dead token on both fetches → genuinely dead, exactly one retry.
+	dead := &seqCreds{responses: []*pb.GetUserCredentialsResponse{
+		credsWithToken("U1", "OLD-DEAD"),
+		credsWithToken("U1", "OLD-DEAD"),
+	}}
+	probeCalls := 0
+	p2 := &Prober{
+		creds: dead,
+		probe: func(context.Context, *indiraClient.AuthContext) error {
+			probeCalls++
+			return fmt.Errorf("verify: %w", indiraClient.ErrAuthExpired)
+		},
+		lastSweep: map[string]ProbeVerdict{},
+	}
+	if v := p2.Probe(context.Background(), "U1"); v.Verdict != "AUTH_EXPIRED" {
+		t.Fatalf("dead probe = %+v, want AUTH_EXPIRED", v)
+	}
+	if probeCalls != 1 { // same token → no second broker call
+		t.Fatalf("broker calls = %d, want 1 (identical token must not re-probe)", probeCalls)
+	}
+}
+
+func TestProbe_LatencyIsMeasured(t *testing.T) {
+	p := &Prober{
+		creds: stubCreds{resp: credsOK("U1")},
+		probe: func(context.Context, *indiraClient.AuthContext) error {
+			time.Sleep(25 * time.Millisecond)
+			return nil
+		},
+		lastSweep: map[string]ProbeVerdict{},
+	}
+	if v := p.Probe(context.Background(), "U1"); v.LatencyMS < 20 {
+		t.Fatalf("latency_ms=%d, want >=20 (defer-on-value-return bug)", v.LatencyMS)
+	}
+}

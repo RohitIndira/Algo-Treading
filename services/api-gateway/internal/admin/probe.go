@@ -75,36 +75,70 @@ func NewProber(creds credentialsFetcher, ic *indiraClient.Client) *Prober {
 	}
 }
 
-// Probe runs one live check for userID.
-func (p *Prober) Probe(ctx context.Context, userID string) ProbeVerdict {
-	v := ProbeVerdict{UserID: userID, ProbedAt: time.Now()}
+// Probe runs one live check for userID. Named return so the deferred
+// latency stamp lands on what the caller actually receives.
+//
+// On AUTH_EXPIRED it re-fetches the credential once and retries: the store
+// moves under live probes (token_capture refreshes it whenever the user's
+// own app sends a newer token — observed live 2026-08-31: S4450 probed dead
+// at 16:25:23, token refreshed 16:26:19, probed alive 16:26:48). If a newer
+// token just landed, the verdict self-corrects within the same call; if the
+// token is unchanged, dead is dead.
+func (p *Prober) Probe(ctx context.Context, userID string) (v ProbeVerdict) {
+	v = ProbeVerdict{UserID: userID, ProbedAt: time.Now()}
 	start := time.Now()
 	defer func() { v.LatencyMS = time.Since(start).Milliseconds() }()
 
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
+	auth, verdict, detail := p.fetchAuth(ctx, userID)
+	if verdict != "" {
+		v.Verdict, v.Detail = verdict, detail
+		return v
+	}
+	v.Source = auth.Source
+
+	if p.classify(ctx, auth, &v); v.Verdict != "AUTH_EXPIRED" {
+		return v
+	}
+	// One refetch+retry: has a newer token landed since we read the store?
+	auth2, verdict2, _ := p.fetchAuth(ctx, userID)
+	if verdict2 != "" || auth2.BearerToken == auth.BearerToken {
+		return v // nothing newer — the session is genuinely dead
+	}
+	v.Detail = ""
+	p.classify(ctx, auth2, &v)
+	if v.Verdict == "WORKS" {
+		v.Detail = "recovered on retry — a fresher token had just been stored"
+	}
+	return v
+}
+
+// fetchAuth reads the decrypted credential; a non-empty verdict short-circuits.
+func (p *Prober) fetchAuth(ctx context.Context, userID string) (*indiraClient.AuthContext, string, string) {
 	resp, err := p.creds.GetUserCredentials(ctx, &pb.GetUserCredentialsRequest{UserId: userID})
 	switch {
 	case err != nil:
-		v.Verdict, v.Detail = "ERROR", "credentials fetch: "+err.Error()
-		return v
+		return nil, "ERROR", "credentials fetch: " + err.Error()
 	case resp == nil || !resp.Success || resp.IndiraAuth == nil || resp.IndiraAuth.BearerToken == "":
-		v.Verdict = "NO_CREDENTIAL"
+		detail := ""
 		if resp != nil && resp.Error != nil {
-			v.Detail = resp.Error.Message
+			detail = resp.Error.Message
 		}
-		return v
+		return nil, "NO_CREDENTIAL", detail
 	}
-	auth := &indiraClient.AuthContext{
+	return &indiraClient.AuthContext{
 		UserId:      resp.IndiraAuth.UserId,
 		AppId:       resp.IndiraAuth.AppId,
 		Source:      resp.IndiraAuth.Source,
 		BearerToken: resp.IndiraAuth.BearerToken,
-	}
-	v.Source = resp.IndiraAuth.Source
+	}, "", ""
+}
 
-	err = p.probe(ctx, auth)
+// classify runs the strict broker call and writes the verdict into v.
+func (p *Prober) classify(ctx context.Context, auth *indiraClient.AuthContext, v *ProbeVerdict) {
+	err := p.probe(ctx, auth)
 	switch {
 	case err == nil:
 		v.Verdict = "WORKS"
@@ -117,7 +151,6 @@ func (p *Prober) Probe(ctx context.Context, userID string) ProbeVerdict {
 		}
 		v.Verdict, v.Detail = "ERROR", msg
 	}
-	return v
 }
 
 // Sweep probes every given user sequentially and stores the results for the
