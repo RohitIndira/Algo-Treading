@@ -169,9 +169,12 @@ func (e *Explorer) traceSignalsDB(ctx context.Context, res *TraceResult, symbol 
 }
 
 func (e *Explorer) traceDecisions(ctx context.Context, res *TraceResult, symbol, userID string, cutoff time.Time) error {
+	// Migration 009 extended this table to ALL signal types — SL_MODIFY /
+	// SL_EXIT rows carry NULL qty/ltp/sl-target (live prod fact that
+	// 500'd the first trace deploy). COALESCE everything numeric.
 	q := `
-		SELECT decided_at, signal_id::text, user_id, status,
-		       intended_qty, ltp_at_decision, initial_sl_target,
+		SELECT decided_at, signal_id::text, user_id, COALESCE(signal_type,'ENTRY_BUY'), status,
+		       COALESCE(intended_qty,0), COALESCE(ltp_at_decision,0), COALESCE(initial_sl_target,0),
 		       COALESCE(rejection_reason,''), dispatched_at
 		  FROM manthan_signal_decisions
 		 WHERE UPPER(symbol) = $1 AND decided_at >= $2`
@@ -188,18 +191,21 @@ func (e *Explorer) traceDecisions(ctx context.Context, res *TraceResult, symbol,
 	defer rows.Close()
 	for rows.Next() {
 		var ts time.Time
-		var sigID, uid, status, reject string
+		var sigID, uid, sigType, status, reject string
 		var qty int
 		var ltp, slTarget float64
 		var dispatched sql.NullTime
-		if err := rows.Scan(&ts, &sigID, &uid, &status, &qty, &ltp, &slTarget, &reject, &dispatched); err != nil {
+		if err := rows.Scan(&ts, &sigID, &uid, &sigType, &status, &qty, &ltp, &slTarget, &reject, &dispatched); err != nil {
 			return err
 		}
-		sum := fmt.Sprintf("allocator → %s: %s qty %d @ %.2f", uid, status, qty, ltp)
+		sum := fmt.Sprintf("%s → %s: %s", sigType, uid, status)
+		if qty > 0 {
+			sum += fmt.Sprintf(" qty %d @ %.2f", qty, ltp)
+		}
 		if reject != "" {
 			sum += " — " + reject
 		}
-		d := map[string]any{"signal_id": sigID, "user_id": uid, "status": status,
+		d := map[string]any{"signal_id": sigID, "user_id": uid, "signal_type": sigType, "status": status,
 			"intended_qty": qty, "ltp_at_decision": ltp, "initial_sl_target": slTarget}
 		if dispatched.Valid {
 			d["dispatched_at"] = dispatched.Time
@@ -263,9 +269,9 @@ func (e *Explorer) traceInbox(ctx context.Context, res *TraceResult, symbol, use
 func (e *Explorer) traceOrders(ctx context.Context, res *TraceResult, symbol, userID string, cutoff time.Time) error {
 	q := `
 		SELECT created_at, signal_id, user_id, order_type, order_side, status,
-		       qty, filled_qty, COALESCE(avg_fill_price,0),
+		       COALESCE(qty,0), COALESCE(filled_qty,0), COALESCE(avg_fill_price,0),
 		       COALESCE(broker_order_id,''), COALESCE(broker_status,''),
-		       retry_count, COALESCE(last_error,''),
+		       COALESCE(retry_count,0), COALESCE(last_error,''),
 		       COALESCE(trigger_price,0), COALESCE(broker_trigger_price,0),
 		       COALESCE(parent_order_id::text,''), filled_at
 		  FROM manthan_orders
@@ -333,7 +339,8 @@ func (e *Explorer) traceOrders(ctx context.Context, res *TraceResult, symbol, us
 
 func (e *Explorer) tracePositions(ctx context.Context, res *TraceResult, symbol, userID string, cutoff time.Time) error {
 	q := `
-		SELECT entry_time, position_id::text, user_id, origin, status, quantity, entry_price,
+		SELECT entry_time, position_id::text, user_id, COALESCE(origin,''), status,
+		       COALESCE(quantity,0), COALESCE(entry_price,0),
 		       exit_time, COALESCE(exit_price,0), COALESCE(exit_reason,''), realized_pnl
 		  FROM positions
 		 WHERE UPPER(symbol) = $1 AND entry_time >= $2`

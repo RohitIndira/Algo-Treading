@@ -58,6 +58,13 @@ func seedM6(t *testing.T, signals, trading, exec, pos *sql.DB) {
 		m2User, m2Strat, m6Sym)
 	mustExec(t, trading, `UPDATE manthan_signal_decisions SET rejection_reason='margin insufficient'
 		WHERE user_id='TADM_OTHER' AND symbol=$1`, m6Sym)
+	// The prod shape that 500'd the first deploy: a non-entry decision row
+	// (migration 009) with NULL qty/ltp/sl-target.
+	mustExec(t, trading, `INSERT INTO manthan_signal_decisions
+			(signal_id, user_id, strategy_id, symbol, signal_type, status, decided_at, payload,
+			 ltp_at_decision, intended_qty, intended_invested, initial_sl_target)
+		VALUES ('aaaaaaaa-6666-2222-3333-000000000004', $1, $2::uuid, $3, 'SL_MODIFY', 'DISPATCHED',
+			now() - interval '20 hours', '{}'::jsonb, NULL, NULL, NULL, NULL)`, m2User, m2Strat, m6Sym)
 
 	// Inbox: a DONE entry and an AUTH_EXPIRED DLQ.
 	mustExec(t, exec, `INSERT INTO signal_inbox (signal_id, user_id, order_type, payload, kafka_topic, kafka_partition, kafka_offset, status, attempts, created_at, completed_at)
@@ -106,7 +113,7 @@ func TestM6_Trace_EndToEnd(t *testing.T) {
 			t.Fatalf("stage %s missing (got %+v)", want, stages)
 		}
 	}
-	if stages["UNIVERSE"] != 2 || stages["DECISION"] != 2 || stages["INBOX"] != 2 {
+	if stages["UNIVERSE"] != 2 || stages["DECISION"] != 3 || stages["INBOX"] != 2 {
 		t.Fatalf("stage counts: %+v", stages)
 	}
 	// Chronological.
@@ -116,7 +123,7 @@ func TestM6_Trace_EndToEnd(t *testing.T) {
 		}
 	}
 	// The rejection day's verdict text must surface.
-	var sawReject, sawAuthDLQ, sawCooldown bool
+	var sawReject, sawAuthDLQ, sawCooldown, sawNullQty bool
 	for _, ev := range res.Events {
 		if ev.Stage == "UNIVERSE" && strings.Contains(ev.Summary, "PE out of range") {
 			sawReject = true
@@ -127,9 +134,12 @@ func TestM6_Trace_EndToEnd(t *testing.T) {
 		if ev.Stage == "COOLDOWN" && strings.Contains(ev.Summary, "below 420.00") {
 			sawCooldown = true
 		}
+		if ev.Stage == "DECISION" && strings.Contains(ev.Summary, "SL_MODIFY") {
+			sawNullQty = true
+		}
 	}
-	if !sawReject || !sawAuthDLQ || !sawCooldown {
-		t.Fatalf("summaries missing: reject=%v authDLQ=%v cooldown=%v", sawReject, sawAuthDLQ, sawCooldown)
+	if !sawReject || !sawAuthDLQ || !sawCooldown || !sawNullQty {
+		t.Fatalf("summaries missing: reject=%v authDLQ=%v cooldown=%v nullQty=%v", sawReject, sawAuthDLQ, sawCooldown, sawNullQty)
 	}
 
 	// User filter: TADM_OTHER's decision must vanish.
