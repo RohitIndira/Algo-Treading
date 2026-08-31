@@ -181,6 +181,13 @@ func seedM5(t *testing.T, trading, exec, pos *sql.DB, now time.Time) {
 		VALUES ('aaaaaaaa-1111-2222-3333-000000000601', 'MANTHAN', $1, $2, 'aaaaaaaa-1111-4444-3333-000000000601', 'FFF', 'NSE',
 			'ACTIVE', 50, $3, 20, 1000)`, m2User, m2Strat, now.Add(-30*24*time.Hour))
 
+	// A manual row with NULL strategy_id — the live prod shape that
+	// crashed the first board deploy. Must render, as NAKED.
+	mustExec(t, pos, `INSERT INTO positions (position_id, origin, user_id, strategy_id, signal_id, symbol, exchange,
+			status, entry_price, entry_time, quantity, invested_amount)
+		VALUES ('aaaaaaaa-1111-2222-3333-000000000901', 'USER_MANUAL', $1, NULL, NULL, 'MANUALPOS', 'NSE',
+			'ACTIVE', 10, $2, 100, 1000)`, m2User, now.Add(-90*24*time.Hour))
+
 	// Trail state for AAA (armed) and CCC (naked): the manthan book.
 	mustExec(t, trading, `INSERT INTO manthan_positions (strategy_id, user_id, symbol, entry_price, quantity, invested_amt,
 			high_since_entry, current_sl, status, entry_time, industry, mcap_bucket, index_name)
@@ -227,7 +234,7 @@ func TestM5_Board_States(t *testing.T) {
 
 	want := map[string]string{
 		"AAA": "ARMED", "BBB": "DEFERRED_BAND", "CCC": "NAKED",
-		"FFF": "CAPPED", "HHH": "AMO_PENDING",
+		"FFF": "CAPPED", "HHH": "AMO_PENDING", "MANUALPOS": "NAKED",
 	}
 	for sym, state := range want {
 		r, ok := rows[sym]
@@ -319,7 +326,7 @@ func TestM5_Reconcile_EndToEnd(t *testing.T) {
 		classes[m.Class]++
 		bySym[m.Class+"/"+m.Symbol] = m
 	}
-	if classes["GHOST"] != 3 { // CCC, FFF, HHH
+	if classes["GHOST"] != 4 { // CCC, FFF, HHH, MANUALPOS
 		t.Fatalf("ghosts: %+v", res.Mismatches)
 	}
 	// HHH entered 20h ago → settlement caveat; FFF entered 30d ago → none.

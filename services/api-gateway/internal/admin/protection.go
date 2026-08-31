@@ -102,8 +102,11 @@ func (p *ProtectionStore) Board(ctx context.Context) (*ProtectionBoard, error) {
 
 	// 1) The open book, deduped per symbol with the duplicate count kept
 	// visible (BALUFORGE ×17 must show as 17, not be silently collapsed).
+	// strategy_id is NULL on manual/legacy rows (live prod fact,
+	// 2026-08-31) — the whole-book view must still carry them; they
+	// simply have no SL ledger or trail to join, so they read NAKED.
 	rows, err := p.fleet.posDB.QueryContext(ctx, `
-		SELECT user_id, strategy_id, symbol, COUNT(*), SUM(quantity)
+		SELECT user_id, COALESCE(strategy_id::text, ''), symbol, COUNT(*), SUM(quantity)
 		  FROM positions WHERE status = 'ACTIVE'
 		 GROUP BY user_id, strategy_id, symbol`)
 	if err != nil {
@@ -125,7 +128,9 @@ func (p *ProtectionStore) Board(ctx context.Context) (*ProtectionBoard, error) {
 
 	strategies := map[string]bool{}
 	for _, r := range board.Rows {
-		strategies[r.StrategyID] = true
+		if r.StrategyID != "" { // strategy-less rows have nothing to join
+			strategies[r.StrategyID] = true
+		}
 	}
 
 	// 2) SL ledger per strategy: open protection rows, precedence in Go.
