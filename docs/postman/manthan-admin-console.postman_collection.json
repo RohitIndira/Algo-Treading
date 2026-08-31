@@ -1,0 +1,955 @@
+{
+  "info": {
+    "name": "Manthan Admin Console (M1–M6)",
+    "description": "Complete admin API surface as of 2026-08-31 (commit 48c6888).\n\nSETUP\n1. Set collection variable `user_session_jwt` to the platform SSO cookie `user_session` (HS512 — starts eyJhbGciOiJIUzUxMiJ9). NOT the `user_token` cookie.\n2. Run '1. Elevate' — its test script auto-saves `admin_token` for every other request.\n3. Token expires after 30 min — just re-run Elevate.\n\nTIERS\nREAD: plain request. CONFIRM: body must carry \"confirmed\": true (else 412). TYPED (delete strategy): call with {\"preview\":true} to receive the exact blast-radius text, then resend it verbatim as \"confirmation_text\".\n\nEvery mutating call — including denials — lands in the append-only audit trail.\n\n⚠ LIVE-FIRE requests are marked in their descriptions. Everything else is read-only.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://manthan.stockk.trade"
+    },
+    {
+      "key": "user_session_jwt",
+      "value": "PASTE-user_session-COOKIE-JWT-HERE"
+    },
+    {
+      "key": "admin_token",
+      "value": ""
+    },
+    {
+      "key": "strategy_id",
+      "value": "a6cb5b08-dddd-4e54-ad2d-d5ae55edb3c9",
+      "description": "S4450's Manthan strategy (get others from Fleet)"
+    },
+    {
+      "key": "user_id",
+      "value": "S4450"
+    }
+  ],
+  "item": [
+    {
+      "name": "M1 · Session & Audit",
+      "item": [
+        {
+          "name": "1. Elevate (get admin token)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{user_session_jwt}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/elevate",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "elevate"
+              ]
+            },
+            "description": "Exchange your platform SSO JWT for a 30-min admin session token. Rate-limited 3/15min. The test script auto-saves admin_token."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Auto-save the admin token for every other request in this collection.",
+                  "const js = pm.response.json();",
+                  "if (js && js.data && js.data.admin_token) {",
+                  "    pm.collectionVariables.set('admin_token', js.data.admin_token);",
+                  "    console.log('admin_token saved, expires', js.data.expires_at);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2. Whoami",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/whoami",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "whoami"
+              ]
+            },
+            "description": "Verify the current admin session: admin id + expiry."
+          }
+        },
+        {
+          "name": "3. Audit trail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/audit?limit=50&since=&admin_id=&target_user=",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "audit"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50",
+                  "description": "max rows"
+                },
+                {
+                  "key": "since",
+                  "value": "",
+                  "description": "RFC3339 lower bound (optional)"
+                },
+                {
+                  "key": "admin_id",
+                  "value": "",
+                  "description": "filter by admin (optional)"
+                },
+                {
+                  "key": "target_user",
+                  "value": "",
+                  "description": "filter by target (optional)"
+                }
+              ]
+            },
+            "description": "Append-only audit log, newest first. Filters: limit, since (RFC3339), admin_id, target_user. Immutable even to superuser (trigger-enforced)."
+          }
+        },
+        {
+          "name": "4. Audit CSV export",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/audit?format=csv&limit=500",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "audit"
+              ],
+              "query": [
+                {
+                  "key": "format",
+                  "value": "csv",
+                  "description": "CSV export"
+                },
+                {
+                  "key": "limit",
+                  "value": "500",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "Same rows as the audit trail, as RFC-4180 CSV with UTC ISO timestamps — the compliance export."
+          }
+        },
+        {
+          "name": "5. Logout (revoke token)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/logout",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "logout"
+              ]
+            },
+            "description": "Revoke the current admin session immediately."
+          }
+        }
+      ]
+    },
+    {
+      "name": "M2 · Fleet & Attention",
+      "item": [
+        {
+          "name": "Fleet grid",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/fleet",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "fleet"
+              ]
+            },
+            "description": "Every live strategy: open/armed/deferred/naked counts, naked symbols, realized P&L (total + today, IST day boundary), credential age + staleness."
+          }
+        },
+        {
+          "name": "Attention queue",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/attention",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "attention"
+              ]
+            },
+            "description": "Ranked queue: DEAD_SESSION, NAKED_POSITION, AMO_GIVEUP, DLQ_SIGNAL, RECONCILER_ACTIVITY, plus M3 probe failures and M5.4 scale findings. not_wired lists what is deliberately absent."
+          }
+        }
+      ]
+    },
+    {
+      "name": "M3 · Credential Health",
+      "item": [
+        {
+          "name": "Probe one user (live broker call)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/credential",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "credential"
+              ]
+            },
+            "description": "Truth, not heuristic: a real strict broker call with the stored credential. Verdicts: WORKS / AUTH_EXPIRED / NO_CREDENTIAL / ERROR. Auto-retries once if a fresher token lands mid-probe."
+          }
+        },
+        {
+          "name": "Sweep all active users",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/credential-sweep",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "credential-sweep"
+              ]
+            },
+            "description": "Probe every user holding an active strategy (also runs automatically 08:30 IST daily). Failures feed the attention queue."
+          }
+        },
+        {
+          "name": "Force-expire a credential",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/credential/expire",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "credential",
+                "expire"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM tier): blanks the stored broker token so every automated action for this user halts until their next platform login. Body {} first to see the 412 gate.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "M4 · Strategy Control",
+      "item": [
+        {
+          "name": "Lifecycle timeline",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}/timeline",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}",
+                "timeline"
+              ]
+            },
+            "description": "strategy_lifecycle_events newest-first (DEPLOYED / PAUSED / RESUMED / ... with details JSON) + resolved strategy context."
+          }
+        },
+        {
+          "name": "Blocks (cooldowns & embargoes)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}/blocks",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}",
+                "blocks"
+              ]
+            },
+            "description": "Both invisible re-entry restrictions: COOLDOWN (SL-exit, 20% ATH re-entry rule, shows reentry_below) and OVERRIDE (manual-exit embargo, shows until)."
+          }
+        },
+        {
+          "name": "Clear a block",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}/blocks/clear",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}",
+                "blocks",
+                "clear"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM tier): lifts a real trading restriction early. 422 if no matching active block (ghost-clear refusal).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true,\n  \"symbol\": \"SYMBOL\",\n  \"kind\": \"COOLDOWN\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Pause strategy",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}/pause",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}",
+                "pause"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM tier): DeactivateStrategy on behalf of the owner — new signals skip it while paused. Send {} first to see the 412 gate.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Resume strategy",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}/resume",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}",
+                "resume"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM tier): ActivateStrategy on behalf of the owner.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete strategy — step 1 PREVIEW (safe)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}"
+              ]
+            },
+            "description": "TYPED tier, step 1: returns the exact blast-radius text with the real open-position count. Nothing is deleted.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"preview\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Delete strategy — step 2 TYPED (⚠ deletes!)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE: paste the EXACT text from the preview. Positions stay open (KEEP_POSITIONS_OPEN) guarded by their standing stops. Wrong text → 412, nothing fires.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmation_text\": \"PASTE-EXACT-PREVIEW-TEXT-HERE\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "M5 · Positions & Protection",
+      "item": [
+        {
+          "name": "Protection board",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/protection",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "protection"
+              ]
+            },
+            "description": "Every open position fleet-wide, worst first: NAKED → CAPPED → DEFERRED_BAND → AMO_PENDING → ARMED. Trail context, standing vs intended trigger, live distance-to-trigger (ltp_status honest when feed down), duplicate-row counts surfaced."
+          }
+        },
+        {
+          "name": "Three-way reconcile (live broker call)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/reconcile",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "reconcile"
+              ]
+            },
+            "description": "Book vs SL ledger vs broker holdings. Classes: GHOST (IOLCP), UNLEDGERED_EXIT (stale stop), DUPLICATE_BOOK_ROWS (BALUFORGE ×17), UNKNOWN_HOLDING, QTY_MISMATCH. Observe-only; fixes arrive with M7. Dead credential → broker_leg names it, DB legs still render."
+          }
+        },
+        {
+          "name": "Broker mirror — holdings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/broker/holdings",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "broker",
+                "holdings"
+              ]
+            },
+            "description": "Raw broker truth with the freeQty=0-rows-hidden warning. What does Indira actually say?"
+          }
+        },
+        {
+          "name": "Broker mirror — orderbook",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/broker/orderbook",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "broker",
+                "orderbook"
+              ]
+            },
+            "description": "Raw order book passthrough for the user."
+          }
+        },
+        {
+          "name": "Broker mirror — tradebook",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/broker/trades",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "broker",
+                "trades"
+              ]
+            },
+            "description": "Parsed tradebook for the user."
+          }
+        },
+        {
+          "name": "Scale check (run now)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/scale-check",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "scale-check"
+              ]
+            },
+            "description": "5.4 on demand (also runs 08:35 IST daily): trail trigger vs LTP out of band (frozen protection / corp action) + book-vs-broker qty drift. Findings land on the attention queue.",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "M6 · Signal Pipeline Explorer",
+      "item": [
+        {
+          "name": "End-to-end trace",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/trace/SHREEPUSHK?days=10&user_id=",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "trace",
+                "SHREEPUSHK"
+              ],
+              "query": [
+                {
+                  "key": "days",
+                  "value": "10",
+                  "description": "lookback window (default 60, max 365)"
+                },
+                {
+                  "key": "user_id",
+                  "value": "",
+                  "description": "optional user filter"
+                }
+              ]
+            },
+            "description": "One symbol as a chronological timeline: sheet run + verdict → signal published → per-user allocator decision → inbox (class/attempts/error) → every order attempt (broker id, error, SL lineage) → fills → position open/exit + P&L → trail state → cooldown. Optional user_id filter."
+          }
+        },
+        {
+          "name": "Candidate universe (why not signaled?)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/signals/candidates?date=",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "signals",
+                "candidates"
+              ],
+              "query": [
+                {
+                  "key": "date",
+                  "value": "",
+                  "description": "YYYY-MM-DD (optional; empty = latest run)"
+                }
+              ]
+            },
+            "description": "The whole per-day universe with each verdict: ELIGIBLE / FILTER_REJECTED / DATA_DROPPED + reason, counts, recent-dates picker. No date = latest run."
+          }
+        },
+        {
+          "name": "Inbox browser",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/inbox?class=AUTH_EXPIRED&status=&user_id=&days=90",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "inbox"
+              ],
+              "query": [
+                {
+                  "key": "class",
+                  "value": "AUTH_EXPIRED",
+                  "description": "error class filter (optional)"
+                },
+                {
+                  "key": "status",
+                  "value": "",
+                  "description": "status filter (optional)"
+                },
+                {
+                  "key": "user_id",
+                  "value": "",
+                  "description": "user filter (optional)"
+                },
+                {
+                  "key": "days",
+                  "value": "90",
+                  "description": "lookback (default 7, max 90)"
+                }
+              ]
+            },
+            "description": "signal_inbox rows with attempts + errors + aggregates. class: AUTH_EXPIRED / UPPER_CIRCUIT / PRE_OPEN / TRANSIENT / POISON. status: PENDING / RUNNING / DONE / DLQ."
+          }
+        },
+        {
+          "name": "Rejection analytics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/rejections?days=30",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "rejections"
+              ],
+              "query": [
+                {
+                  "key": "days",
+                  "value": "30",
+                  "description": "lookback (default 14, max 90)"
+                }
+              ]
+            },
+            "description": "REJECTED/CANCELLED/AMO_REJECTED orders grouped by exchange-error taxonomy, user and day, each bucket with a representative sample_error."
+          }
+        }
+      ]
+    }
+  ]
+}

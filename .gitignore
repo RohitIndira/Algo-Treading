@@ -92,6 +92,8 @@ docs/_build/
 site/
 *.pdf
 *.json
+# ...but API collections are docs, not build output
+!docs/postman/*.postman_collection.json
 test.js
 # Secrets — never commit
 **/credentials/
