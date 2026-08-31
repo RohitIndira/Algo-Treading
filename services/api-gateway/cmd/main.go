@@ -557,6 +557,13 @@ func main() {
 		// with a note, candidates 503s loudly).
 		adminHTTP.SetExplorer(admin.NewExplorer(signalsDB, adminFleet))
 		log.Printf("Admin signal pipeline explorer enabled (signals_db wired=%v)", signalsDB != nil)
+
+		// M7 Phase A: interventions — resurrect / re-arm / hold release /
+		// cap reset. Re-arm proxies trade-execution's existing operator
+		// endpoint on its metrics server.
+		teMetrics := envOr("TRADE_EXEC_METRICS_URL", "http://localhost:9090")
+		adminHTTP.SetInterventions(admin.NewInterventions(adminFleet, istLoc, teMetrics))
+		log.Printf("Admin interventions enabled (resurrect/re-arm/hold/cap; trade-exec metrics=%s)", teMetrics)
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)

@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -43,6 +44,7 @@ type HTTP struct {
 	recon      *ReconStore      // nil-safe: M5.2/5.3 broker routes absent without it
 	scale      *ScaleChecker    // nil-safe: M5.4 check route absent without it
 	explorer   *Explorer        // nil-safe: M6 pipeline explorer routes absent without it
+	interv     *Interventions   // nil-safe: M7 intervention routes absent without it
 }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
@@ -63,6 +65,10 @@ func (h *HTTP) SetScaleChecker(s *ScaleChecker) { h.scale = s }
 
 // SetExplorer enables the M6 signal pipeline explorer. Call before Register.
 func (h *HTTP) SetExplorer(e *Explorer) { h.explorer = e }
+
+// SetInterventions enables the M7 Phase A intervention endpoints. Call
+// before Register.
+func (h *HTTP) SetInterventions(iv *Interventions) { h.interv = iv }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 
@@ -134,6 +140,122 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "GET", "/inbox", "INBOX_VIEW", TierRead, h.handleInbox)
 		h.Route(token, "GET", "/rejections", "REJECTIONS_VIEW", TierRead, h.handleRejections)
 	}
+	if h.interv != nil {
+		h.Route(token, "POST", "/inbox/{id}/resurrect", "SIGNAL_RESURRECT", TierConfirm, h.handleResurrect)
+		h.Route(token, "POST", "/inbox/{id}/release", "HOLD_RELEASE", TierConfirm, h.handleReleaseHold)
+		h.Route(token, "POST", "/users/{user_id}/rearm-protection", "PROTECTION_REARM", TierConfirm, h.handleRearm)
+		h.Route(token, "POST", "/users/{user_id}/amo-cap/reset", "AMO_CAP_RESET", TierConfirm, h.handleCapReset)
+	}
+}
+
+// ── M7 Phase A handlers ─────────────────────────────────────────────────
+
+// requireReason enforces the 7.6 rule: overrides carry WHY, in the audit.
+func requireReason(w http.ResponseWriter, ar *AdminRequest) (string, bool) {
+	reason := strings.TrimSpace(ar.BodyString("reason"))
+	if reason == "" {
+		writeErr(w, http.StatusUnprocessableEntity, "E_ADMIN_REASON_REQUIRED",
+			`overrides require a "reason" in the body — it goes in the audit trail`)
+		return "", false
+	}
+	return reason, true
+}
+
+// intervErr maps a guardrail refusal vs infra error, auditing the refusal.
+func (h *HTTP) intervErr(w http.ResponseWriter, ar *AdminRequest, targetUser, targetRef string, err error) {
+	if r := asRefusal(err); r != nil {
+		if aerr := ar.Audit(targetUser, targetRef, nil, "REFUSED", r.msg); aerr != nil {
+			log.Printf("admin: intervention refusal audit failed: %v", aerr)
+		}
+		writeErr(w, r.code, "E_ADMIN_GUARDRAIL", r.msg)
+		return
+	}
+	log.Printf("admin: intervention failed: %v", err)
+	writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "intervention failed")
+}
+
+func (h *HTTP) handleResurrect(w http.ResponseWriter, ar *AdminRequest) {
+	id, err := strconv.ParseInt(mux.Vars(ar.Request)["id"], 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "E_ADMIN_BAD_ID", "inbox id must be numeric")
+		return
+	}
+	info, rerr := h.interv.Resurrect(ar.Request.Context(), id)
+	if rerr != nil {
+		h.intervErr(w, ar, "", fmt.Sprint(id), rerr)
+		return
+	}
+	if aerr := ar.Audit(info.UserID, fmt.Sprint(id), info, "OK", "entry signal reset for same-day retry"); aerr != nil {
+		log.Printf("admin: resurrect audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_AUDIT", "audit write failed")
+		return
+	}
+	writeOK(w, map[string]any{"resurrected": info,
+		"note": "row re-queued — the inbox worker picks it up within its normal cadence; the auth gate still applies until the user's platform login"})
+}
+
+func (h *HTTP) handleReleaseHold(w http.ResponseWriter, ar *AdminRequest) {
+	reason, ok := requireReason(w, ar)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseInt(mux.Vars(ar.Request)["id"], 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "E_ADMIN_BAD_ID", "inbox id must be numeric")
+		return
+	}
+	info, rerr := h.interv.ReleaseHold(ar.Request.Context(), id)
+	if rerr != nil {
+		h.intervErr(w, ar, "", fmt.Sprint(id), rerr)
+		return
+	}
+	if aerr := ar.Audit(info.UserID, fmt.Sprint(id), map[string]any{"reason": reason, "row": info}, "OK", "hold released early"); aerr != nil {
+		log.Printf("admin: release audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_AUDIT", "audit write failed")
+		return
+	}
+	writeOK(w, map[string]any{"released": info, "note": "next_attempt_at=now — the worker's own gates (auth, circuit re-check, market hours) still apply on pickup"})
+}
+
+func (h *HTTP) handleRearm(w http.ResponseWriter, ar *AdminRequest) {
+	userID := mux.Vars(ar.Request)["user_id"]
+	body, rerr := h.interv.Rearm(ar.Request.Context(), userID)
+	if rerr != nil {
+		h.intervErr(w, ar, userID, "", rerr)
+		return
+	}
+	if aerr := ar.Audit(userID, "", nil, "OK", "protective replay RunOnceForUser fired"); aerr != nil {
+		log.Printf("admin: rearm audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_AUDIT", "audit write failed")
+		return
+	}
+	writeOK(w, map[string]any{"trade_execution": json.RawMessage(body),
+		"note": "same buildPlans→fireAll→reconcile flow as the 09:14 cron, scoped to this user"})
+}
+
+func (h *HTTP) handleCapReset(w http.ResponseWriter, ar *AdminRequest) {
+	reason, ok := requireReason(w, ar)
+	if !ok {
+		return
+	}
+	userID := mux.Vars(ar.Request)["user_id"]
+	symbol := strings.TrimSpace(ar.BodyString("symbol"))
+	if symbol == "" {
+		writeErr(w, http.StatusUnprocessableEntity, "E_ADMIN_BAD_INPUT", `"symbol" is required`)
+		return
+	}
+	n, rerr := h.interv.ResetAMOCap(ar.Request.Context(), userID, symbol)
+	if rerr != nil {
+		h.intervErr(w, ar, userID, symbol, rerr)
+		return
+	}
+	if aerr := ar.Audit(userID, symbol, map[string]any{"reason": reason, "attempts_cleared": n}, "OK", "AMO give-up cap reset for tonight"); aerr != nil {
+		log.Printf("admin: cap reset audit failed: %v", aerr)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_AUDIT", "audit write failed")
+		return
+	}
+	writeOK(w, map[string]any{"attempts_cleared": n,
+		"note": "tonight's 16:35 EOD cycle (or a manual re-arm) will attempt this stop again from zero"})
 }
 
 // ── M6 handlers ─────────────────────────────────────────────────────────
