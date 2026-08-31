@@ -42,6 +42,7 @@ type HTTP struct {
 	protection *ProtectionStore // nil-safe: M5.1 board route absent without it
 	recon      *ReconStore      // nil-safe: M5.2/5.3 broker routes absent without it
 	scale      *ScaleChecker    // nil-safe: M5.4 check route absent without it
+	explorer   *Explorer        // nil-safe: M6 pipeline explorer routes absent without it
 }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
@@ -59,6 +60,9 @@ func (h *HTTP) SetRecon(r *ReconStore) { h.recon = r }
 
 // SetScaleChecker enables the M5.4 on-demand check. Call before Register.
 func (h *HTTP) SetScaleChecker(s *ScaleChecker) { h.scale = s }
+
+// SetExplorer enables the M6 signal pipeline explorer. Call before Register.
+func (h *HTTP) SetExplorer(e *Explorer) { h.explorer = e }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 
@@ -124,6 +128,59 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 	if h.scale != nil {
 		h.Route(token, "POST", "/scale-check", "SCALE_CHECK", TierRead, h.handleScaleCheck)
 	}
+	if h.explorer != nil {
+		h.Route(token, "GET", "/trace/{symbol}", "SIGNAL_TRACE", TierRead, h.handleTrace)
+		h.Route(token, "GET", "/signals/candidates", "CANDIDATES_VIEW", TierRead, h.handleCandidates)
+		h.Route(token, "GET", "/inbox", "INBOX_VIEW", TierRead, h.handleInbox)
+		h.Route(token, "GET", "/rejections", "REJECTIONS_VIEW", TierRead, h.handleRejections)
+	}
+}
+
+// ── M6 handlers ─────────────────────────────────────────────────────────
+
+func (h *HTTP) handleTrace(w http.ResponseWriter, ar *AdminRequest) {
+	qv := ar.Request.URL.Query()
+	days, _ := strconv.Atoi(qv.Get("days"))
+	res, err := h.explorer.Trace(ar.Request.Context(), mux.Vars(ar.Request)["symbol"], qv.Get("user_id"), days)
+	if err != nil {
+		log.Printf("admin: trace failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "trace failed")
+		return
+	}
+	writeOK(w, res)
+}
+
+func (h *HTTP) handleCandidates(w http.ResponseWriter, ar *AdminRequest) {
+	res, err := h.explorer.Candidates(ar.Request.Context(), ar.Request.URL.Query().Get("date"))
+	if err != nil {
+		log.Printf("admin: candidates failed: %v", err)
+		writeErr(w, http.StatusServiceUnavailable, "E_ADMIN_CANDIDATES", err.Error())
+		return
+	}
+	writeOK(w, res)
+}
+
+func (h *HTTP) handleInbox(w http.ResponseWriter, ar *AdminRequest) {
+	qv := ar.Request.URL.Query()
+	days, _ := strconv.Atoi(qv.Get("days"))
+	res, err := h.explorer.Inbox(ar.Request.Context(), qv.Get("status"), qv.Get("class"), qv.Get("user_id"), days)
+	if err != nil {
+		log.Printf("admin: inbox browse failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "inbox browse failed")
+		return
+	}
+	writeOK(w, res)
+}
+
+func (h *HTTP) handleRejections(w http.ResponseWriter, ar *AdminRequest) {
+	days, _ := strconv.Atoi(ar.Request.URL.Query().Get("days"))
+	buckets, err := h.explorer.Rejections(ar.Request.Context(), days)
+	if err != nil {
+		log.Printf("admin: rejections failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "rejection analytics failed")
+		return
+	}
+	writeOK(w, map[string]any{"buckets": buckets, "count": len(buckets)})
 }
 
 // ── M5 handlers ─────────────────────────────────────────────────────────

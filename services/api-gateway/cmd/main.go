@@ -551,6 +551,12 @@ func main() {
 		adminHTTP.SetScaleChecker(adminScale)
 		adminScale.StartDaily(context.Background(), istLoc)
 		log.Printf("Admin protection console enabled (board + reconcile + mirror + 08:35 IST scale check; LTP feed wired=%v)", adminLTP != nil)
+
+		// M6: signal pipeline explorer — trace / candidates / inbox /
+		// rejections. Pure DB reads; signalsDB may be nil (trace degrades
+		// with a note, candidates 503s loudly).
+		adminHTTP.SetExplorer(admin.NewExplorer(signalsDB, adminFleet))
+		log.Printf("Admin signal pipeline explorer enabled (signals_db wired=%v)", signalsDB != nil)
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)
