@@ -950,6 +950,156 @@
           }
         }
       ]
+    },
+    {
+      "name": "M7 · Interventions (Phase A)",
+      "item": [
+        {
+          "name": "Resurrect dead entry signal",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/inbox/1/resurrect",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "inbox",
+                "1",
+                "resurrect"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM): reset a DLQ'd/DONE MANTHAN_ENTRY row for retry — the Aug-27-validated procedure. Server REFUSES: non-entry rows (422, use re-arm), any row not from TODAY IST (422 — same-trading-day rule), RUNNING/PENDING rows. Get the inbox id from GET /admin/inbox. Replace the 1 in the URL.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Release a hold early",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/inbox/1/release",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "inbox",
+                "1",
+                "release"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM): re-queue a held PENDING/FAILED row now (upper-circuit / pre-open / auth hold). Worker gates still apply on pickup. Reason REQUIRED — lands in audit. Replace the 1 in the URL.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true,\n  \"reason\": \"why you are releasing this hold\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Re-arm protection for a user",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/rearm-protection",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "rearm-protection"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM): fires trade-execution's RunOnceForUser — the same buildPlans→fireAll→reconcile flow as the 09:14 cron, scoped to one user. Places REAL protective orders; most useful in market hours or pre-16:35.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Reset AMO give-up cap",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/amo-cap/reset",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "amo-cap",
+                "reset"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM): clears tonight's give-up counter for one symbol so the 16:35 EOD cycle (or a re-arm) tries again from zero. Attempt rows survive for audit (trade_date NULLed). Reason REQUIRED. 422 if nothing counted.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true,\n  \"symbol\": \"SYMBOL\",\n  \"reason\": \"why the broker will accept it now\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   ]
 }
