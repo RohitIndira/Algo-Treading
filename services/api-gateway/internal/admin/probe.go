@@ -117,7 +117,14 @@ func (p *Prober) Probe(ctx context.Context, userID string) (v ProbeVerdict) {
 
 // fetchAuth reads the decrypted credential; a non-empty verdict short-circuits.
 func (p *Prober) fetchAuth(ctx context.Context, userID string) (*indiraClient.AuthContext, string, string) {
-	resp, err := p.creds.GetUserCredentials(ctx, &pb.GetUserCredentialsRequest{UserId: userID})
+	return fetchAuthFor(ctx, p.creds, userID)
+}
+
+// fetchAuthFor is the shared credential→auth resolution (M3 probe, M5
+// reconcile/mirror): a non-empty verdict (ERROR | NO_CREDENTIAL)
+// short-circuits.
+func fetchAuthFor(ctx context.Context, creds credentialsFetcher, userID string) (*indiraClient.AuthContext, string, string) {
+	resp, err := creds.GetUserCredentials(ctx, &pb.GetUserCredentialsRequest{UserId: userID})
 	switch {
 	case err != nil:
 		return nil, "ERROR", "credentials fetch: " + err.Error()

@@ -521,7 +521,8 @@ func main() {
 		if istLoc == nil {
 			istLoc = time.FixedZone("IST", 5*3600+30*60)
 		}
-		prober := admin.NewProber(userConfigClient, indiraClient.NewClient(indiraClient.Config{}))
+		adminIndira := indiraClient.NewClient(indiraClient.Config{})
+		prober := admin.NewProber(userConfigClient, adminIndira)
 		adminHTTP.SetProber(prober)
 		prober.StartDailySweep(context.Background(), istLoc, adminFleet.ActiveUserIDs)
 		log.Printf("Admin credential probe + 08:30 IST pre-market sweep enabled")
@@ -534,6 +535,22 @@ func main() {
 		// store's handle and needs no extra DB.
 		adminHTTP.SetStrategyControl(admin.NewStrategyControl(userConfigClient, adminFleet))
 		log.Printf("Admin strategy control enabled (user-config gRPC + trading_db blocks)")
+
+		// M5: protection board (5.1), three-way reconciliation + broker
+		// mirror (5.2/5.3), price-scale check (5.4, daily 08:35 IST —
+		// after the credential sweep, before the 08:50 AMO conversion).
+		var adminLTP admin.LTPFeed
+		if liveAlgosLTP != nil {
+			adminLTP = liveAlgosLTP // typed-nil guard: only a real store enters the interface
+		}
+		adminProt := admin.NewProtectionStore(adminFleet, adminLTP)
+		adminRecon := admin.NewReconStore(userConfigClient, adminIndira, adminFleet)
+		adminScale := admin.NewScaleChecker(adminProt, adminRecon)
+		adminHTTP.SetProtection(adminProt)
+		adminHTTP.SetRecon(adminRecon)
+		adminHTTP.SetScaleChecker(adminScale)
+		adminScale.StartDaily(context.Background(), istLoc)
+		log.Printf("Admin protection console enabled (board + reconcile + mirror + 08:35 IST scale check; LTP feed wired=%v)", adminLTP != nil)
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)

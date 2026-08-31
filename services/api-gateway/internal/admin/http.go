@@ -39,6 +39,9 @@ type HTTP struct {
 	fleet      *FleetStore      // nil-safe: M2 routes absent when business DBs are unavailable
 	prober     *Prober          // nil-safe: M3 probe routes absent without it
 	strategies *StrategyControl // nil-safe: M4 strategy routes absent without it
+	protection *ProtectionStore // nil-safe: M5.1 board route absent without it
+	recon      *ReconStore      // nil-safe: M5.2/5.3 broker routes absent without it
+	scale      *ScaleChecker    // nil-safe: M5.4 check route absent without it
 }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
@@ -46,6 +49,16 @@ func (h *HTTP) SetProber(p *Prober) { h.prober = p }
 
 // SetStrategyControl enables the M4 strategy endpoints. Call before Register.
 func (h *HTTP) SetStrategyControl(sc *StrategyControl) { h.strategies = sc }
+
+// SetProtection enables the M5.1 protection board. Call before Register.
+func (h *HTTP) SetProtection(p *ProtectionStore) { h.protection = p }
+
+// SetRecon enables the M5.2 reconciliation + M5.3 broker mirror. Call
+// before Register.
+func (h *HTTP) SetRecon(r *ReconStore) { h.recon = r }
+
+// SetScaleChecker enables the M5.4 on-demand check. Call before Register.
+func (h *HTTP) SetScaleChecker(s *ScaleChecker) { h.scale = s }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 
@@ -99,6 +112,78 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "POST", "/strategies/{strategy_id}/resume", "STRATEGY_RESUME", TierConfirm, h.handleResume)
 		h.Route(token, "DELETE", "/strategies/{strategy_id}", "STRATEGY_DELETE", TierTyped, h.handleDelete)
 	}
+	if h.protection != nil {
+		h.Route(token, "GET", "/protection", "PROTECTION_VIEW", TierRead, h.handleProtection)
+	}
+	if h.recon != nil {
+		h.Route(token, "GET", "/users/{user_id}/reconcile", "RECONCILE_VIEW", TierRead, h.handleReconcile)
+		h.Route(token, "GET", "/users/{user_id}/broker/holdings", "BROKER_MIRROR_HOLDINGS", TierRead, h.mirrorHandler("holdings"))
+		h.Route(token, "GET", "/users/{user_id}/broker/orderbook", "BROKER_MIRROR_ORDERBOOK", TierRead, h.mirrorHandler("orderbook"))
+		h.Route(token, "GET", "/users/{user_id}/broker/trades", "BROKER_MIRROR_TRADES", TierRead, h.mirrorHandler("trades"))
+	}
+	if h.scale != nil {
+		h.Route(token, "POST", "/scale-check", "SCALE_CHECK", TierRead, h.handleScaleCheck)
+	}
+}
+
+// ── M5 handlers ─────────────────────────────────────────────────────────
+
+func (h *HTTP) handleProtection(w http.ResponseWriter, ar *AdminRequest) {
+	board, err := h.protection.Board(ar.Request.Context())
+	if err != nil {
+		log.Printf("admin: protection board failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "protection board failed")
+		return
+	}
+	writeOK(w, board)
+}
+
+func (h *HTTP) handleReconcile(w http.ResponseWriter, ar *AdminRequest) {
+	userID := mux.Vars(ar.Request)["user_id"]
+	res, err := h.recon.Reconcile(ar.Request.Context(), userID)
+	if err != nil {
+		log.Printf("admin: reconcile %s failed: %v", userID, err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "reconciliation failed")
+		return
+	}
+	if aerr := ar.Audit(userID, "", map[string]any{"broker_leg": res.BrokerLeg, "mismatches": len(res.Mismatches)}, "OK", ""); aerr != nil {
+		log.Printf("admin: reconcile audit failed: %v", aerr)
+	}
+	writeOK(w, res)
+}
+
+// mirrorHandler builds the per-view broker mirror handler (M5.3): a live
+// broker read on behalf of the target user, always audited.
+func (h *HTTP) mirrorHandler(view string) func(http.ResponseWriter, *AdminRequest) {
+	return func(w http.ResponseWriter, ar *AdminRequest) {
+		userID := mux.Vars(ar.Request)["user_id"]
+		res, err := h.recon.Mirror(ar.Request.Context(), userID, view)
+		if err != nil {
+			log.Printf("admin: mirror %s/%s failed: %v", userID, view, err)
+			writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "broker mirror failed")
+			return
+		}
+		if aerr := ar.Audit(userID, "", map[string]string{"view": view, "broker_leg": res.BrokerLeg}, "OK", ""); aerr != nil {
+			log.Printf("admin: mirror audit failed: %v", aerr)
+		}
+		writeOK(w, res)
+	}
+}
+
+func (h *HTTP) handleScaleCheck(w http.ResponseWriter, ar *AdminRequest) {
+	findings, err := h.scale.Run(ar.Request.Context())
+	if err != nil {
+		log.Printf("admin: scale check failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "scale check failed")
+		return
+	}
+	if aerr := ar.Audit("", "", map[string]int{"findings": len(findings)}, "OK", ""); aerr != nil {
+		log.Printf("admin: scale check audit failed: %v", aerr)
+	}
+	if findings == nil {
+		findings = []ScaleFinding{}
+	}
+	writeOK(w, map[string]any{"findings": findings, "count": len(findings)})
 }
 
 // ── M4 handlers ─────────────────────────────────────────────────────────
@@ -299,6 +384,10 @@ func (h *HTTP) handleAttention(w http.ResponseWriter, ar *AdminRequest) {
 		if fails := h.prober.sweepFailuresAsAttention(); len(fails) > 0 {
 			items = append(fails, items...)
 		}
+	}
+	// M5.4: out-of-band scale findings from the last check.
+	if h.scale != nil {
+		items = append(items, h.scale.findingsAsAttention()...)
 	}
 	writeOK(w, map[string]any{"items": items, "count": len(items), "not_wired": notWired})
 }
