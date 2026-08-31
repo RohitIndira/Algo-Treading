@@ -469,15 +469,42 @@ func main() {
 	tokenCapture := middleware.NewTokenCapture(userConfigClient)
 
 	// ── Admin console (spec M1) ──────────────────────────────────────
-	// Rides the existing trading_db handle (admin_users / admin_sessions /
-	// admin_audit — migration 019). Absent handle → admin surface absent,
-	// loudly: an admin console silently missing is an ops trap.
+	// Preferred: a DEDICATED least-privilege connection (gateway_admin,
+	// migration 020 — INSERT+SELECT only on admin_audit) via
+	// ADMIN_DB_USER/ADMIN_DB_PASSWORD. Fallback: the shared trading_db
+	// handle, with a loud warning — grant-level immutability is then NOT in
+	// force (the trigger guard from migration 020 still is). Absent both →
+	// admin surface absent, loudly: silently missing is an ops trap.
 	var adminHTTP *admin.HTTP
-	if positionsDB != nil {
+	adminDBUser, adminDBPass := os.Getenv("ADMIN_DB_USER"), os.Getenv("ADMIN_DB_PASSWORD")
+	if adminDBUser != "" && adminDBPass != "" {
+		connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+			envOr("POSTGRES_HOST", "localhost"), envOr("POSTGRES_PORT", "5432"),
+			adminDBUser, adminDBPass, positionsDBName, envOr("POSTGRES_SSLMODE", "disable"))
+		if adminDB, err := sql.Open("postgres", connStr); err == nil {
+			adminDB.SetMaxOpenConns(4)
+			adminDB.SetMaxIdleConns(1)
+			pCtx, pCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			pingErr := adminDB.PingContext(pCtx)
+			pCancel()
+			if pingErr == nil {
+				adminHTTP = admin.NewHTTP(admin.NewService(admin.NewStore(adminDB)))
+				defer adminDB.Close()
+				log.Printf("Admin console enabled (dedicated role %s on %s — grant-hardened)", adminDBUser, positionsDBName)
+			} else {
+				_ = adminDB.Close()
+				log.Printf("⚠ Admin dedicated role ping failed (%v) — falling back to shared handle", pingErr)
+			}
+		} else {
+			log.Printf("⚠ Admin dedicated role open failed (%v) — falling back to shared handle", err)
+		}
+	}
+	if adminHTTP == nil && positionsDB != nil {
 		adminHTTP = admin.NewHTTP(admin.NewService(admin.NewStore(positionsDB)))
-		log.Printf("Admin console enabled (trading_db=%s)", positionsDBName)
-	} else {
-		log.Printf("⚠ Admin console DISABLED — trading_db handle unavailable")
+		log.Printf("⚠ Admin console on SHARED superuser handle (%s) — set ADMIN_DB_USER/ADMIN_DB_PASSWORD for grant-level immutability", positionsDBName)
+	}
+	if adminHTTP == nil {
+		log.Printf("⚠ Admin console DISABLED — no usable trading_db handle")
 	}
 
 	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, tokenCapture, corsConfig, adminHTTP)
