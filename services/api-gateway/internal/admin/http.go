@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"log"
@@ -284,6 +285,32 @@ func (h *HTTP) handleAuditList(w http.ResponseWriter, ar *AdminRequest) {
 	if err != nil {
 		log.Printf("admin: audit list failed: %v", err)
 		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "audit query failed")
+		return
+	}
+	// ?format=csv — compliance export (spec M1.2). Same filters, same rows,
+	// RFC-4180 quoting via encoding/csv; UTC ISO timestamps for auditors.
+	if q.Get("format") == "csv" {
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition",
+			`attachment; filename="admin_audit_`+time.Now().UTC().Format("20060102T150405Z")+`.csv"`)
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"id", "created_at_utc", "admin_id", "action", "tier",
+			"target_user", "target_ref", "result", "detail", "self_action", "ip", "params"})
+		for _, r := range rows {
+			params := ""
+			if len(r.Params) > 0 && string(r.Params) != "null" {
+				params = string(r.Params)
+			}
+			_ = cw.Write([]string{
+				strconv.FormatInt(r.ID, 10), r.CreatedAt.UTC().Format(time.RFC3339),
+				r.AdminID, r.Action, r.Tier, r.TargetUser, r.TargetRef,
+				r.Result, r.Detail, strconv.FormatBool(r.SelfAction), r.IP, params,
+			})
+		}
+		cw.Flush()
+		if err := cw.Error(); err != nil {
+			log.Printf("admin: audit csv write failed: %v", err)
+		}
 		return
 	}
 	writeOK(w, map[string]any{"rows": rows, "count": len(rows)})

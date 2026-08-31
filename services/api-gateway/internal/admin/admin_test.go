@@ -110,7 +110,13 @@ func openAdminTestDB(t *testing.T) *sql.DB {
 
 func cleanupAdminTestRows(t *testing.T, db *sql.DB) {
 	t.Helper()
-	_, _ = db.Exec(`DELETE FROM admin_audit    WHERE admin_id LIKE 'TADM%' OR admin_id = 'UNKNOWN'`)
+	// The migration-020 append-only trigger (rightly) blocks DELETE for
+	// everyone. Test cleanup uses the one legitimate escape hatch — a
+	// superuser deliberately disabling the trigger — which is exactly the
+	// loud, intentional act the design demands for any purge.
+	_, _ = db.Exec(`ALTER TABLE admin_audit DISABLE TRIGGER trg_admin_audit_append_only`)
+	_, _ = db.Exec(`DELETE FROM admin_audit WHERE admin_id LIKE 'TADM%' OR admin_id = 'UNKNOWN'`)
+	_, _ = db.Exec(`ALTER TABLE admin_audit ENABLE TRIGGER trg_admin_audit_append_only`)
 	_, _ = db.Exec(`DELETE FROM admin_sessions WHERE admin_id LIKE 'TADM%'`)
 	_, _ = db.Exec(`DELETE FROM admin_users    WHERE user_id  LIKE 'TADM%'`)
 }
@@ -371,5 +377,73 @@ func TestHTTP_TierEnforcement(t *testing.T) {
 	}
 	if rec := post("/api/v1/admin/t-typed", `{"confirmation_text":"SELL 42 TESTSYM order-1 FOR S9999"}`); rec.Code != http.StatusOK {
 		t.Fatalf("exact typed text: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHTTP_AuditCSVExport(t *testing.T) {
+	db := openAdminTestDB(t)
+	seedAdmin(t, db, "TADM_CSV", true)
+	r, _ := newTestRouter(t, db)
+	token := elevateViaHTTP(t, r, "TADM_CSV")
+
+	req := httptest.NewRequest("GET", "/api/v1/admin/audit?admin_id=TADM_CSV&format=csv", nil)
+	req.Header.Set(TokenHeader, token)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("csv export: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/csv") {
+		t.Fatalf("content-type = %q, want text/csv", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, "admin_audit_") {
+		t.Fatalf("content-disposition = %q", cd)
+	}
+	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) < 2 { // header + at least the ELEVATE row
+		t.Fatalf("csv rows = %d, want >= 2:\n%s", len(lines), rec.Body.String())
+	}
+	if !strings.HasPrefix(lines[0], "id,created_at_utc,admin_id,action") {
+		t.Fatalf("csv header wrong: %s", lines[0])
+	}
+	if !strings.Contains(rec.Body.String(), "TADM_CSV,ELEVATE") {
+		t.Fatalf("elevation row missing from csv:\n%s", rec.Body.String())
+	}
+}
+
+func TestAuditAppendOnly_TriggerBlocksRewrites(t *testing.T) {
+	db := openAdminTestDB(t)
+	// Apply migration 020 (idempotent) — the trigger under test.
+	mig, err := os.ReadFile(filepath.Join("..", "..", "..", "user-config", "migrations", "020_admin_hardening.sql"))
+	if err != nil {
+		t.Fatalf("read migration 020: %v", err)
+	}
+	if _, err := db.Exec(string(mig)); err != nil {
+		t.Fatalf("apply migration 020: %v", err)
+	}
+
+	store := NewStore(db)
+	if err := store.Audit(context.Background(), AuditEntry{
+		AdminID: "TADM_IMMUT", Action: "TEST", Tier: "READ", Result: "OK",
+	}); err != nil {
+		t.Fatalf("audit insert: %v", err)
+	}
+
+	// UPDATE and DELETE must be refused for EVERYONE — superuser included
+	// (this test connects as postgres, the most privileged case).
+	if _, err := db.Exec(`UPDATE admin_audit SET result='TAMPERED' WHERE admin_id='TADM_IMMUT'`); err == nil {
+		t.Fatal("UPDATE on admin_audit must be refused by the append-only trigger")
+	} else if !strings.Contains(err.Error(), "append-only") {
+		t.Fatalf("unexpected UPDATE error: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM admin_audit WHERE admin_id='TADM_IMMUT'`); err == nil {
+		t.Fatal("DELETE on admin_audit must be refused by the append-only trigger")
+	}
+	// Inserts still work — append-only, not read-only.
+	if err := store.Audit(context.Background(), AuditEntry{
+		AdminID: "TADM_IMMUT", Action: "TEST2", Tier: "READ", Result: "OK",
+	}); err != nil {
+		t.Fatalf("insert after trigger: %v", err)
 	}
 }
