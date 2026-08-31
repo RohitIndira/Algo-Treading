@@ -235,6 +235,13 @@ func TestValidate_ExpiredSessionRejected(t *testing.T) {
 func newTestRouter(t *testing.T, db *sql.DB) (*mux.Router, *HTTP) {
 	t.Helper()
 	h := NewHTTP(NewService(NewStore(db)))
+	return newRouterFor(t, h), h
+}
+
+// newRouterFor mounts an already-configured HTTP (e.g. with a FleetStore)
+// behind the fake platform-auth middleware.
+func newRouterFor(t *testing.T, h *HTTP) *mux.Router {
+	t.Helper()
 	root := mux.NewRouter()
 	adminSub := root.PathPrefix("/api/v1/admin").Subrouter()
 	// Fake platform auth: trusts header X-Test-User (test double for the
@@ -250,7 +257,7 @@ func newTestRouter(t *testing.T, db *sql.DB) (*mux.Router, *HTTP) {
 		})
 	}
 	h.Register(adminSub, fakeAuth)
-	return root, h
+	return root
 }
 
 func elevateViaHTTP(t *testing.T, r *mux.Router, user string) string {

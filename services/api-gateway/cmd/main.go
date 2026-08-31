@@ -506,6 +506,15 @@ func main() {
 	if adminHTTP == nil {
 		log.Printf("⚠ Admin console DISABLED — no usable trading_db handle")
 	}
+	// M2 fleet/attention need all three business DBs; absent any, the
+	// routes stay unregistered (loud 404 beats a half-truthful grid).
+	if adminHTTP != nil && positionsDB != nil && ordersDB != nil && positionsSSotDB != nil {
+		adminHTTP.SetFleetStore(admin.NewFleetStore(positionsDB, ordersDB, positionsSSotDB))
+		log.Printf("Admin fleet endpoints enabled (trading+execution+positions handles)")
+	} else if adminHTTP != nil {
+		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
+			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)
+	}
 
 	r := router.NewRouter(userConfigHandler, websocketHandler, paperTradingHandler, manthanHandler, healthHandler, marketHandler, algosHandler, perfHandler, liveAlgosHandler, portfolioHandler, verifier, tokenCapture, corsConfig, adminHTTP)
 

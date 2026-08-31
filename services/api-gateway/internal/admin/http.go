@@ -35,10 +35,16 @@ func SessionFromContext(ctx context.Context) (*Session, bool) {
 
 // HTTP bundles the service for route registration.
 type HTTP struct {
-	svc *Service
+	svc   *Service
+	fleet *FleetStore // nil-safe: M2 routes absent when business DBs are unavailable
 }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
+
+// SetFleetStore enables the M2 fleet/attention endpoints. Call before
+// Register; a nil store leaves those routes unregistered (a loud 404, not a
+// half-working screen).
+func (h *HTTP) SetFleetStore(f *FleetStore) { h.fleet = f }
 
 // ── Route registration ──────────────────────────────────────────────────
 
@@ -68,6 +74,32 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 	h.Route(token, "GET", "/whoami", "ADMIN_WHOAMI", TierRead, h.handleWhoami)
 	h.Route(token, "POST", "/logout", "ADMIN_LOGOUT", TierRead, h.handleLogout)
 	h.Route(token, "GET", "/audit", "AUDIT_VIEW", TierRead, h.handleAuditList)
+	if h.fleet != nil {
+		h.Route(token, "GET", "/fleet", "FLEET_VIEW", TierRead, h.handleFleet)
+		h.Route(token, "GET", "/attention", "ATTENTION_VIEW", TierRead, h.handleAttention)
+	}
+}
+
+// ── M2 handlers ─────────────────────────────────────────────────────────
+
+func (h *HTTP) handleFleet(w http.ResponseWriter, ar *AdminRequest) {
+	rows, err := h.fleet.Fleet(ar.Request.Context())
+	if err != nil {
+		log.Printf("admin: fleet failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "fleet query failed")
+		return
+	}
+	writeOK(w, map[string]any{"rows": rows, "count": len(rows)})
+}
+
+func (h *HTTP) handleAttention(w http.ResponseWriter, ar *AdminRequest) {
+	items, notWired, err := h.fleet.Attention(ar.Request.Context())
+	if err != nil {
+		log.Printf("admin: attention failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "attention query failed")
+		return
+	}
+	writeOK(w, map[string]any{"items": items, "count": len(items), "not_wired": notWired})
 }
 
 // Required is the admin-session middleware: X-Admin-Token → live session →
