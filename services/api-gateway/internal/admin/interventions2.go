@@ -31,6 +31,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -46,11 +47,16 @@ type actionBroker interface {
 }
 
 // cmdRunner executes one local command — injectable so tests never fork.
-type cmdRunner func(ctx context.Context, dir, bin string, args ...string) ([]byte, error)
+// extraEnv entries are appended to the inherited environment (child wins
+// on duplicates by POSIX last-one rules).
+type cmdRunner func(ctx context.Context, dir string, extraEnv []string, bin string, args ...string) ([]byte, error)
 
-func execRunner(ctx context.Context, dir, bin string, args ...string) ([]byte, error) {
+func execRunner(ctx context.Context, dir string, extraEnv []string, bin string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = dir
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	return cmd.CombinedOutput()
 }
 
@@ -64,18 +70,24 @@ type Actions struct {
 
 	teMetricsURL  string
 	httpc         *http.Client
-	rebalancerBin string // absolute path to the built CLI ("" disables 7.7)
-	rebalancerDir string // cwd for the run (repo root: .env discovery)
-	run           cmdRunner
+	rebalancerBin string   // absolute path to the built CLI ("" disables 7.7)
+	rebalancerDir string   // cwd for the run (repo root: .env discovery)
+	rebalancerEnv []string // explicit env for the child — the 2026-09-01
+	// lesson: the CLI reads REDIS_ADDR/REDIS_URI, the gateway carries
+	// REDIS_LOCAL_ADDR, and no .env exists on prod, so the child silently
+	// hit the wrong redis and fell back to 30% EMA targets. The gateway
+	// now hands it the exact redis it verified the key on.
+	run cmdRunner
 }
 
 func NewActions(fleet *FleetStore, creds credentialsFetcher, broker actionBroker,
-	strategies *StrategyControl, ltp LTPFeed, teMetricsURL, rebalancerBin, rebalancerDir string) *Actions {
+	strategies *StrategyControl, ltp LTPFeed, teMetricsURL, rebalancerBin, rebalancerDir string,
+	rebalancerEnv []string) *Actions {
 	return &Actions{
 		fleet: fleet, creds: creds, broker: broker, strategies: strategies, ltp: ltp,
 		teMetricsURL: strings.TrimRight(teMetricsURL, "/"),
 		httpc:        &http.Client{Timeout: 120 * time.Second},
-		rebalancerBin: rebalancerBin, rebalancerDir: rebalancerDir,
+		rebalancerBin: rebalancerBin, rebalancerDir: rebalancerDir, rebalancerEnv: rebalancerEnv,
 		run: execRunner,
 	}
 }
@@ -467,7 +479,7 @@ func (a *Actions) Rebalance(ctx context.Context, userID string, dryRun bool) (st
 	}
 	ctx, cancel := context.WithTimeout(ctx, 110*time.Second)
 	defer cancel()
-	out, err := a.run(ctx, a.rebalancerDir, a.rebalancerBin, args...)
+	out, err := a.run(ctx, a.rebalancerDir, a.rebalancerEnv, a.rebalancerBin, args...)
 	if len(out) > rebalanceOutputCap {
 		out = out[len(out)-rebalanceOutputCap:]
 	}

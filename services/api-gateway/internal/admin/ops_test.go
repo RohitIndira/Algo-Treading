@@ -180,7 +180,7 @@ func TestM10_M11_HTTP(t *testing.T) {
 	h.SetEOD(NewEODStore(fleet, nil, ist))
 	h.SetRisk(NewRiskStore(fleet, userKeyedCreds{}, stubFunds{fl: &indiraClient.FundLimit{}}, nil))
 	ops := NewOpsStore(fleet, "http://127.0.0.1:1", nil)
-	ops.run = func(context.Context, string, string, ...string) ([]byte, error) {
+	ops.run = func(context.Context, string, []string, string, ...string) ([]byte, error) {
 		return []byte(`[{"name":"api-gateway","pm2_env":{"status":"online","pm_uptime":1,"restart_time":4}}]`), nil
 	}
 	h.SetOps(ops)

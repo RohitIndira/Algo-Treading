@@ -262,7 +262,7 @@ func (o *OpsStore) Board(ctx context.Context) *InfraBoard {
 		NotWired: []string{"kafka consumer lag", "per-user broker WSS state"}}
 
 	// PM2 process table.
-	if out, err := o.run(ctx, "", "pm2", "jlist"); err != nil {
+	if out, err := o.run(ctx, "", nil, "pm2", "jlist"); err != nil {
 		b.PM2Error = truncate(err.Error(), 120)
 	} else {
 		var procs []struct {

@@ -568,9 +568,11 @@ func main() {
 		// M7 A2/B: order view/cancel, ghost heal, supervised square-off
 		// proxy, rebalance preview/trigger (operator CLI). REBALANCER_BIN
 		// empty → 7.7 answers 503 rather than half-working.
+		rebalancerRedis := envOr("REDIS_LOCAL_ADDR", "localhost:6379")
 		adminHTTP.SetActions(admin.NewActions(adminFleet, userConfigClient, adminIndira,
 			admin.NewStrategyControl(userConfigClient, adminFleet), adminLTP, teMetrics,
-			envOr("REBALANCER_BIN", ""), envOr("REBALANCER_DIR", "")))
+			envOr("REBALANCER_BIN", ""), envOr("REBALANCER_DIR", ""),
+			[]string{"REDIS_ADDR=" + rebalancerRedis, "REDIS_URI=" + rebalancerRedis}))
 		log.Printf("Admin actions enabled (order-cancel/ghost-heal/squareoff/rebalance; rebalancer_bin=%q)", envOr("REBALANCER_BIN", ""))
 
 		// M8–M11: overnight board, risk caps/drivers, infra, exports.

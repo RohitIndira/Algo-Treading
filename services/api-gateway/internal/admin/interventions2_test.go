@@ -58,9 +58,12 @@ func newM7BEnv(t *testing.T, broker *m7Broker, teURL string) *m7Env {
 
 	runs := &[][]string{}
 	a := NewActions(fleet, userKeyedCreds{m2User: credsOK(m2User)}, broker,
-		NewStrategyControl(&stubStrategyRPC{}, fleet), nil, teURL, "/fake/rebalancer", "/tmp")
-	a.run = func(_ context.Context, dir, bin string, args ...string) ([]byte, error) {
-		*runs = append(*runs, append([]string{bin}, args...))
+		NewStrategyControl(&stubStrategyRPC{}, fleet), nil, teURL, "/fake/rebalancer", "/tmp",
+		[]string{"REDIS_ADDR=localhost:6389", "REDIS_URI=localhost:6389"})
+	a.run = func(_ context.Context, dir string, env []string, bin string, args ...string) ([]byte, error) {
+		rec := append([]string{bin}, args...)
+		rec = append(rec, env...) // env travels with the record for assertions
+		*runs = append(*runs, rec)
 		return []byte("PLAN: topup FOO +10 | 1 entry | total ₹18900"), nil
 	}
 	h.SetActions(a)
@@ -271,6 +274,16 @@ func TestM7B_Rebalance(t *testing.T) {
 	}
 	if got := (*env.runs)[0]; got[1] != "--dry-run" || got[2] != "--user" || got[3] != m2User {
 		t.Fatalf("preview args: %v", got)
+	}
+	// The child MUST receive the gateway-verified redis (the 30%-fallback bug).
+	var redisEnv bool
+	for _, e := range (*env.runs)[0] {
+		if e == "REDIS_ADDR=localhost:6389" {
+			redisEnv = true
+		}
+	}
+	if !redisEnv {
+		t.Fatalf("rebalancer env missing REDIS_ADDR: %v", (*env.runs)[0])
 	}
 
 	// Trigger without user → 422.
