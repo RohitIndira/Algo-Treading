@@ -109,13 +109,17 @@ func (e *EODStore) Board(ctx context.Context) (*EODBoard, error) {
 		conversion    string
 	}
 	facts := map[string]*ledgerFacts{}
+	// Standing rows regardless of age (a DEFERRED_BAND row can stand for
+	// weeks — the 36h window on the first deploy misread MANORAMA as
+	// NAKED); failures only from the last cycle-and-a-half.
 	lr, err := e.fleet.execDB.QueryContext(ctx, `
 		SELECT COALESCE(strategy_id::text,''), UPPER(symbol), order_type, status,
 		       COALESCE(broker_order_id,''), COALESCE(last_error,''),
 		       trade_date, created_at
 		  FROM manthan_orders
 		 WHERE order_type IN ('SL_SELL','SL_SELL_AMO')
-		   AND created_at >= now() - interval '36 hours'
+		   AND (status IN ('SL_PLACED','SL_MODIFY_PENDING','AMO_PENDING','SL_DEFERRED_BAND')
+		        OR created_at >= now() - interval '36 hours')
 		 ORDER BY created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("eod ledger: %w", err)
@@ -156,8 +160,11 @@ func (e *EODStore) Board(ctx context.Context) (*EODBoard, error) {
 			if tradeDay == todayIST && strings.Contains(lastErr, "conversion") {
 				f.conversion = "REJECTED_AT_CONVERSION"
 			}
-			// Attempt counting: overnight attempts targeting the NEXT session.
-			if otype == "SL_SELL_AMO" && tradeDay > todayIST {
+			// Attempt counting: the current overnight cycle — intraday that
+			// is LAST night's attempts (targeting today) which never
+			// promoted; after 16:00 it becomes tonight's (targeting
+			// tomorrow). >= keeps SHANTIGOLD's story visible all day.
+			if otype == "SL_SELL_AMO" && tradeDay >= todayIST {
 				f.attempts++
 				if lastErr != "" {
 					f.lastError = truncate(lastErr, 160)

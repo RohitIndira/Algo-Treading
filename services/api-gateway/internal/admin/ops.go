@@ -161,6 +161,12 @@ func (rs *RiskStore) fillCaps(ctx context.Context, sc *StrategyCaps) error {
 	}
 	sort.Slice(sc.Sectors, func(i, j int) bool { return sc.Sectors[i].Used > sc.Sectors[j].Used })
 	sort.Slice(sc.McapBuckets, func(i, j int) bool { return sc.McapBuckets[i].Used > sc.McapBuckets[j].Used })
+	if sc.Sectors == nil {
+		sc.Sectors = []CapSlot{}
+	}
+	if sc.McapBuckets == nil {
+		sc.McapBuckets = []CapSlot{}
+	}
 	return nil
 }
 

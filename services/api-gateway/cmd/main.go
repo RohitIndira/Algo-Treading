@@ -575,11 +575,11 @@ func main() {
 
 		// M8–M11: overnight board, risk caps/drivers, infra, exports.
 		adminHTTP.SetEOD(admin.NewEODStore(adminFleet, prober, istLoc))
-		var emaFetch func(context.Context) (string, error)
-		if liveAlgosLTP != nil {
-			emaFetch = func(ctx context.Context) (string, error) {
-				return liveAlgosLTP.GetString(ctx, "manthan:ema:allocations")
-			}
+		// manthan:ema:allocations lives on the LOCAL redis (data-ingestion
+		// writes it there; verified on prod 2026-09-01) — not the external
+		// LTP feed.
+		emaFetch := func(ctx context.Context) (string, error) {
+			return redisClient.Get(ctx, "manthan:ema:allocations").Result()
 		}
 		adminHTTP.SetRisk(admin.NewRiskStore(adminFleet, userConfigClient, adminIndira, emaFetch))
 		var infraLTP interface{ IsHealthy() bool }
