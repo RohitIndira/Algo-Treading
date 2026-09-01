@@ -105,6 +105,7 @@ func (e *EODStore) Board(ctx context.Context) (*EODBoard, error) {
 		standingState string // ARMED | AMO_PENDING | DEFERRED
 		brokerID      string
 		attempts      int
+		attemptsDay   string // the cycle the count belongs to (latest trade_date)
 		lastError     string
 		conversion    string
 	}
@@ -160,14 +161,21 @@ func (e *EODStore) Board(ctx context.Context) (*EODBoard, error) {
 			if tradeDay == todayIST && strings.Contains(lastErr, "conversion") {
 				f.conversion = "REJECTED_AT_CONVERSION"
 			}
-			// Attempt counting: the current overnight cycle — intraday that
-			// is LAST night's attempts (targeting today) which never
-			// promoted; after 16:00 it becomes tonight's (targeting
-			// tomorrow). >= keeps SHANTIGOLD's story visible all day.
+			// Attempt counting: ONE cycle only — the LATEST trade_date seen
+			// for this position. The first deploy summed consecutive nights
+			// (5 targeting today + 5 targeting tomorrow read as "10/5",
+			// implying a broken cap that DB checks disprove — the cap holds
+			// at ≤5 per night). Rows arrive in created_at order, so a newer
+			// cycle resets the counter.
 			if otype == "SL_SELL_AMO" && tradeDay >= todayIST {
-				f.attempts++
-				if lastErr != "" {
-					f.lastError = truncate(lastErr, 160)
+				if tradeDay > f.attemptsDay {
+					f.attemptsDay, f.attempts, f.lastError = tradeDay, 0, ""
+				}
+				if tradeDay == f.attemptsDay {
+					f.attempts++
+					if lastErr != "" {
+						f.lastError = truncate(lastErr, 160)
+					}
 				}
 			}
 		}
