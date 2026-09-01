@@ -952,7 +952,7 @@
       ]
     },
     {
-      "name": "M7 · Interventions (Phase A)",
+      "name": "M7 · Interventions (complete)",
       "item": [
         {
           "name": "Resurrect dead entry signal",
@@ -1091,6 +1091,284 @@
             "body": {
               "mode": "raw",
               "raw": "{\n  \"confirmed\": true,\n  \"symbol\": \"SYMBOL\",\n  \"reason\": \"why the broker will accept it now\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Order view (broker truth)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/orders/BROKERID",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "orders",
+                "BROKERID"
+              ]
+            },
+            "description": "Broker-truth first: LIVE / TERMINAL / VANISHED verdict + our ledger row beside it. Replace BROKERID."
+          }
+        },
+        {
+          "name": "Cancel an order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/orders/BROKERID/cancel",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "orders",
+                "BROKERID",
+                "cancel"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE (CONFIRM+reason): cancels ONE broker order. REFUSED for any SL-family ledger order (June-liquidation guardrail — use square-off/re-arm); a vanished order is a 422 verdict, never an escalation.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true,\n  \"reason\": \"why this order should die\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Ghost preview (safe)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/ghosts/SYMBOL",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "ghosts",
+                "SYMBOL"
+              ]
+            },
+            "description": "Broker-verified heal plan: refuses if broker holds it, if an open SELL order commits the qty (the ALIVUS freeQty=0 trap), or if within 72h settlement without a tradebook SELL. Returns the TYPED confirmation text."
+          }
+        },
+        {
+          "name": "Ghost heal (TYPED ⚠)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/ghosts/SYMBOL/heal",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "ghosts",
+                "SYMBOL",
+                "heal"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE: evidence re-fetched live at heal time; paste the EXACT preview text. Closes book rows (ADMIN_GHOST_CLEANUP) + writes the FIX-5 synthetic SELL for any Manthan ledger net.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmation_text\": \"PASTE-EXACT-PREVIEW-TEXT\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Square-off — step 1 PREVIEW (safe)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}/positions/SYMBOL/squareoff",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}",
+                "positions",
+                "SYMBOL",
+                "squareoff"
+              ]
+            },
+            "description": "Rupee blast radius from live data: 'SQUARE OFF SYM ×QTY FOR USER — CANCEL N STOPS AND SELL AT MARKET ≈₹V'. Nothing fires.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"preview\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Square-off — step 2 TYPED (⚠ sells!)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/strategies/{{strategy_id}}/positions/SYMBOL/squareoff",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "strategies",
+                "{{strategy_id}}",
+                "positions",
+                "SYMBOL",
+                "squareoff"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE: cancel-SL-then-sell as ONE supervised operation inside trade-execution (position lock + emergency latch + lower-circuit AMO fallback). Paste the EXACT preview text.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmation_text\": \"PASTE-EXACT-PREVIEW-TEXT\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Rebalance preview (dry-run, safe)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/rebalance/preview",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "rebalance",
+                "preview"
+              ]
+            },
+            "description": "Runs the rebalancer CLI with --dry-run: full plan (per-position gap to EMA target, entries it would place), NOTHING published. ~30-60s.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"S4450\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Rebalance trigger (TYPED ⚠)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/rebalance/trigger",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "rebalance",
+                "trigger"
+              ]
+            },
+            "description": "⚠ LIVE-FIRE: the real pass for ONE user — publishes actual MANTHAN_ENTRY orders. Send {\"preview\":true,\"user_id\":...} to get the confirmation text first.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"S4450\",\n  \"confirmation_text\": \"REBALANCE S4450 \\u2014 PUBLISH REAL ENTRY ORDERS\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
