@@ -46,6 +46,10 @@ type HTTP struct {
 	explorer   *Explorer        // nil-safe: M6 pipeline explorer routes absent without it
 	interv     *Interventions   // nil-safe: M7 intervention routes absent without it
 	actions    *Actions         // nil-safe: M7 A2/B routes absent without it
+	eod        *EODStore        // nil-safe: M8 board route absent without it
+	risk       *RiskStore       // nil-safe: M9 routes absent without it
+	ops        *OpsStore        // nil-safe: M10 route absent without it
+	exports    *ExportStore     // nil-safe: M11 routes absent without it
 }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
@@ -74,6 +78,12 @@ func (h *HTTP) SetInterventions(iv *Interventions) { h.interv = iv }
 // SetActions enables the M7 A2/B endpoints (order cancel, ghost heal,
 // square-off, rebalance). Call before Register.
 func (h *HTTP) SetActions(a *Actions) { h.actions = a }
+
+// SetEOD / SetRisk / SetOps / SetExports enable M8–M11. Call before Register.
+func (h *HTTP) SetEOD(e *EODStore)         { h.eod = e }
+func (h *HTTP) SetRisk(r *RiskStore)       { h.risk = r }
+func (h *HTTP) SetOps(o *OpsStore)         { h.ops = o }
+func (h *HTTP) SetExports(x *ExportStore)  { h.exports = x }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 
@@ -159,6 +169,108 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "POST", "/strategies/{strategy_id}/positions/{symbol}/squareoff", "POSITION_SQUAREOFF", TierTyped, h.handleSquareOff)
 		h.Route(token, "POST", "/rebalance/preview", "REBALANCE_PREVIEW", TierRead, h.handleRebalancePreview)
 		h.Route(token, "POST", "/rebalance/trigger", "REBALANCE_TRIGGER", TierTyped, h.handleRebalanceTrigger)
+	}
+	if h.eod != nil {
+		h.Route(token, "GET", "/eod", "EOD_VIEW", TierRead, h.handleEOD)
+	}
+	if h.risk != nil {
+		h.Route(token, "GET", "/risk/caps", "RISK_CAPS", TierRead, h.handleRiskCaps)
+		h.Route(token, "GET", "/risk/drivers", "RISK_DRIVERS", TierRead, h.handleRiskDrivers)
+	}
+	if h.ops != nil {
+		h.Route(token, "GET", "/infra", "INFRA_VIEW", TierRead, h.handleInfra)
+	}
+	if h.exports != nil {
+		h.Route(token, "GET", "/exports/orders", "EXPORT_ORDERS", TierRead, h.handleExportOrders)
+		h.Route(token, "GET", "/exports/events", "EXPORT_EVENTS", TierRead, h.handleExportEvents)
+		h.Route(token, "GET", "/exports/admin-actions", "EXPORT_ADMIN_ACTIONS", TierRead, h.handleExportAdmin)
+	}
+}
+
+// ── M8–M11 handlers ─────────────────────────────────────────────────────
+
+func (h *HTTP) handleEOD(w http.ResponseWriter, ar *AdminRequest) {
+	board, err := h.eod.Board(ar.Request.Context())
+	if err != nil {
+		log.Printf("admin: eod board failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "eod board failed")
+		return
+	}
+	writeOK(w, board)
+}
+
+func (h *HTTP) handleRiskCaps(w http.ResponseWriter, ar *AdminRequest) {
+	caps, err := h.risk.Caps(ar.Request.Context())
+	if err != nil {
+		log.Printf("admin: risk caps failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "caps computation failed")
+		return
+	}
+	if aerr := ar.Audit("", "", map[string]int{"strategies": len(caps)}, "OK", "caps + live margin read"); aerr != nil {
+		log.Printf("admin: caps audit failed: %v", aerr)
+	}
+	writeOK(w, map[string]any{"strategies": caps, "rules": "sector ≤ ceil(25% × max_positions); mcap bucket ≤ ceil(50%); in-flight reservations occupy caps"})
+}
+
+func (h *HTTP) handleRiskDrivers(w http.ResponseWriter, ar *AdminRequest) {
+	d, err := h.risk.Drivers(ar.Request.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "drivers read failed")
+		return
+	}
+	writeOK(w, d)
+}
+
+func (h *HTTP) handleInfra(w http.ResponseWriter, ar *AdminRequest) {
+	writeOK(w, h.ops.Board(ar.Request.Context()))
+}
+
+func (h *HTTP) exportRange(w http.ResponseWriter, ar *AdminRequest) (from, to time.Time, ok bool) {
+	qv := ar.Request.URL.Query()
+	from, to, err := parseRange(qv.Get("from"), qv.Get("to"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "E_ADMIN_BAD_INPUT", err.Error())
+		return from, to, false
+	}
+	return from, to, true
+}
+
+func (h *HTTP) auditExport(ar *AdminRequest, kind string, from, to time.Time) {
+	if aerr := ar.Audit("", kind, map[string]string{"from": from.Format("2006-01-02"), "to": to.Format("2006-01-02")}, "OK", "compliance export"); aerr != nil {
+		log.Printf("admin: export audit failed: %v", aerr)
+	}
+}
+
+func (h *HTTP) handleExportOrders(w http.ResponseWriter, ar *AdminRequest) {
+	from, to, ok := h.exportRange(w, ar)
+	if !ok {
+		return
+	}
+	h.auditExport(ar, "orders", from, to)
+	if err := h.exports.OrdersCSV(ar.Request.Context(), w, from, to); err != nil {
+		log.Printf("admin: orders export failed: %v", err)
+	}
+}
+
+func (h *HTTP) handleExportEvents(w http.ResponseWriter, ar *AdminRequest) {
+	from, to, ok := h.exportRange(w, ar)
+	if !ok {
+		return
+	}
+	h.auditExport(ar, "events", from, to)
+	if err := h.exports.EventsCSV(ar.Request.Context(), w, from, to, ar.Request.URL.Query().Get("order_id")); err != nil {
+		log.Printf("admin: events export failed: %v", err)
+	}
+}
+
+func (h *HTTP) handleExportAdmin(w http.ResponseWriter, ar *AdminRequest) {
+	from, to, ok := h.exportRange(w, ar)
+	if !ok {
+		return
+	}
+	h.auditExport(ar, "admin-actions", from, to)
+	if err := h.exports.AdminActionsCSV(ar.Request.Context(), w, from, to); err != nil {
+		log.Printf("admin: admin-actions export failed: %v", err)
 	}
 }
 

@@ -572,6 +572,23 @@ func main() {
 			admin.NewStrategyControl(userConfigClient, adminFleet), adminLTP, teMetrics,
 			envOr("REBALANCER_BIN", ""), envOr("REBALANCER_DIR", "")))
 		log.Printf("Admin actions enabled (order-cancel/ghost-heal/squareoff/rebalance; rebalancer_bin=%q)", envOr("REBALANCER_BIN", ""))
+
+		// M8–M11: overnight board, risk caps/drivers, infra, exports.
+		adminHTTP.SetEOD(admin.NewEODStore(adminFleet, prober, istLoc))
+		var emaFetch func(context.Context) (string, error)
+		if liveAlgosLTP != nil {
+			emaFetch = func(ctx context.Context) (string, error) {
+				return liveAlgosLTP.GetString(ctx, "manthan:ema:allocations")
+			}
+		}
+		adminHTTP.SetRisk(admin.NewRiskStore(adminFleet, userConfigClient, adminIndira, emaFetch))
+		var infraLTP interface{ IsHealthy() bool }
+		if liveAlgosLTP != nil {
+			infraLTP = liveAlgosLTP
+		}
+		adminHTTP.SetOps(admin.NewOpsStore(adminFleet, teMetrics, infraLTP))
+		adminHTTP.SetExports(admin.NewExportStore(adminFleet, admin.NewStore(positionsDB)))
+		log.Printf("Admin EOD/risk/infra/exports enabled (M8–M11)")
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)

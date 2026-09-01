@@ -2,6 +2,7 @@ package livealgos
 
 import (
 	"context"
+	"fmt"
 	"encoding/json"
 	"log"
 	"sync/atomic"
@@ -73,6 +74,17 @@ type LTPStore struct {
 // Unavailable rather than pretending everything's fine.
 func NewLTPStore(rdb *redis.Client) *LTPStore {
 	return &LTPStore{rdb: rdb}
+}
+
+// GetString reads one raw key from the feed redis — the admin console's
+// EMA-allocation read (manthan:ema:allocations) rides the existing
+// connection instead of opening another client. ("", error) when the
+// store is unwired or the key is absent.
+func (s *LTPStore) GetString(ctx context.Context, key string) (string, error) {
+	if s == nil || s.rdb == nil {
+		return "", fmt.Errorf("ltp store unwired")
+	}
+	return s.rdb.Get(ctx, key).Result()
 }
 
 // IsHealthy reports the current probe status. Lock-free read.
