@@ -546,6 +546,7 @@ func (e *Explorer) Candidates(ctx context.Context, date string) (*CandidatesResu
 
 // InboxRow is one signal_inbox row for the browser.
 type InboxRow struct {
+	ID         int64      `json:"id"` // the resurrect/release endpoints take this
 	SignalID   string     `json:"signal_id"`
 	UserID     string     `json:"user_id"`
 	OrderType  string     `json:"order_type"`
@@ -577,7 +578,7 @@ func (e *Explorer) Inbox(ctx context.Context, status, class, userID string, days
 	cutoff := time.Now().AddDate(0, 0, -days)
 
 	q := `
-		SELECT signal_id, user_id, order_type, COALESCE(payload->>'symbol',''),
+		SELECT id, signal_id, user_id, order_type, COALESCE(payload->>'symbol',''),
 		       status, COALESCE(last_error_class,''), attempts,
 		       COALESCE(last_error,''), created_at, completed_at
 		  FROM signal_inbox WHERE created_at >= $1`
@@ -605,7 +606,7 @@ func (e *Explorer) Inbox(ctx context.Context, status, class, userID string, days
 	for rows.Next() {
 		var r InboxRow
 		var completed sql.NullTime
-		if err := rows.Scan(&r.SignalID, &r.UserID, &r.OrderType, &r.Symbol,
+		if err := rows.Scan(&r.ID, &r.SignalID, &r.UserID, &r.OrderType, &r.Symbol,
 			&r.Status, &r.ErrorClass, &r.Attempts, &r.LastError, &r.CreatedAt, &completed); err != nil {
 			return nil, err
 		}
