@@ -34,6 +34,7 @@ import (
 // so tests stub the broker without HTTP.
 type brokerReader interface {
 	GetHoldings(ctx context.Context, auth *indiraClient.AuthContext) ([]indiraClient.Holding, error)
+	GetOrderBook(ctx context.Context, auth *indiraClient.AuthContext) ([]indiraClient.OrderBook, error)
 	GetOrderBookRaw(ctx context.Context, auth *indiraClient.AuthContext) ([]byte, error)
 	GetTradeBook(ctx context.Context, auth *indiraClient.AuthContext, orderIds ...string) ([]indiraClient.TradeBook, error)
 }
@@ -51,7 +52,7 @@ func NewReconStore(creds credentialsFetcher, broker brokerReader, fleet *FleetSt
 
 // HoldingsWarning is rendered on every mirror/reconcile response so the
 // operator never mistakes an absent row for an absent holding.
-const HoldingsWarning = "broker v2 holdings HIDE rows with freeQty=0 (pledged / unsettled T+1 / TPIN pending) — an absent row does NOT prove the account holds nothing; cross-check the order book and tradebook"
+const HoldingsWarning = "broker totals = v2 holdings + qty committed in open SELL orders (v2 hides freeQty=0 rows — intraday, every armed symbol is hidden under its standing SL)"
 
 // settlementWindow: a position younger than this may legitimately be a
 // hidden freeQty=0 row (T+1 settlement + a buffer day).
@@ -199,21 +200,63 @@ func (rs *ReconStore) authFor(ctx context.Context, userID string) (*indiraClient
 	return auth, "OK", ""
 }
 
-// brokerTotals fetches holdings totals for one user. legStatus != "OK"
-// means the map is nil and the broker leg must not be trusted.
+// brokerTotals fetches what the broker ACTUALLY holds for one user:
+// v2 holdings PLUS qty committed in open SELL orders. The intraday trap
+// (found by UAT 2026-09-01, market open): every armed symbol has its
+// entire qty locked under its standing SL → freeQty=0 → the v2 holdings
+// row VANISHES — reconcile read the whole armed book as ghosts. An open
+// SELL order is proof of holding; its remaining qty counts as held.
 func (rs *ReconStore) brokerTotals(ctx context.Context, userID string) (map[string]int, string) {
 	auth, legStatus, _ := rs.authFor(ctx, userID)
 	if legStatus != "OK" {
 		return nil, legStatus
 	}
-	holdings, err := rs.broker.GetHoldings(ctx, auth)
+	totals, err := rs.brokerTotalsWithAuth(ctx, auth)
 	if err != nil {
 		if isAuthExpired(err) {
 			return nil, "AUTH_EXPIRED"
 		}
 		return nil, "ERROR"
 	}
-	return holdingsTotals(holdings), "OK"
+	return totals, "OK"
+}
+
+func (rs *ReconStore) brokerTotalsWithAuth(ctx context.Context, auth *indiraClient.AuthContext) (map[string]int, error) {
+	holdings, err := rs.broker.GetHoldings(ctx, auth)
+	if err != nil {
+		return nil, err
+	}
+	totals := holdingsTotals(holdings)
+	book, berr := rs.broker.GetOrderBook(ctx, auth)
+	if berr != nil {
+		return nil, fmt.Errorf("orderbook leg: %w", berr)
+	}
+	addOpenSellCommitments(totals, book)
+	return totals, nil
+}
+
+// addOpenSellCommitments folds open (cancellable) SELL orders' remaining
+// qty into the totals — those shares exist, they are just spoken for.
+func addOpenSellCommitments(totals map[string]int, book []indiraClient.OrderBook) {
+	for _, ob := range book {
+		if !strings.EqualFold(ob.OrdAction, "SELL") || !ob.Cancellable {
+			continue
+		}
+		sym := strings.ToUpper(ob.Symbol.DispSym)
+		if sym == "" {
+			sym = strings.ToUpper(ob.Symbol.BaseSym)
+		}
+		if sym == "" {
+			continue
+		}
+		qty := ob.RemainQty
+		if qty == 0 {
+			qty = ob.Qty - ob.TradedQty
+		}
+		if qty > 0 {
+			totals[sym] += qty
+		}
+	}
 }
 
 func isAuthExpired(err error) bool {
@@ -270,14 +313,14 @@ func (rs *ReconStore) Reconcile(ctx context.Context, userID string) (*ReconResul
 	auth, legStatus, legDetail := rs.authFor(ctx, userID)
 	res.BrokerLeg, res.BrokerDetail = legStatus, legDetail
 	if legStatus == "OK" {
-		holdings, herr := rs.broker.GetHoldings(ctx, auth)
+		bt, herr := rs.brokerTotalsWithAuth(ctx, auth)
 		switch {
 		case isAuthExpired(herr):
 			res.BrokerLeg = "AUTH_EXPIRED"
 		case herr != nil:
 			res.BrokerLeg, res.BrokerDetail = "ERROR", herr.Error()
 		default:
-			totals = holdingsTotals(holdings)
+			totals = bt
 		}
 	}
 

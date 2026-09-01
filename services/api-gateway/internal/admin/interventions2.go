@@ -273,6 +273,9 @@ func (a *Actions) GhostPreview(ctx context.Context, userID, symbol string) (*Gho
 		return nil, fmt.Errorf("ghost holdings: %w", err)
 	}
 	totals := holdingsTotals(holdings)
+	if book, berr := a.broker.GetOrderBook(ctx, auth); berr == nil {
+		addOpenSellCommitments(totals, book) // SL-committed qty is HELD (the intraday freeQty=0 trap)
+	}
 	p.Evidence.BrokerQty = totals[symbol]
 	p.Evidence.HoldingsAbsent = p.Evidence.BrokerQty == 0
 	if !p.Evidence.HoldingsAbsent {

@@ -32,8 +32,13 @@ func (m userKeyedCreds) GetUserCredentials(_ context.Context, req *pb.GetUserCre
 
 // stubBroker serves canned holdings; orderbook/trades are static.
 type stubBroker struct {
-	holdings []indiraClient.Holding
-	err      error
+	holdings  []indiraClient.Holding
+	orderbook []indiraClient.OrderBook
+	err       error
+}
+
+func (b stubBroker) GetOrderBook(context.Context, *indiraClient.AuthContext) ([]indiraClient.OrderBook, error) {
+	return b.orderbook, b.err
 }
 
 func (b stubBroker) GetHoldings(context.Context, *indiraClient.AuthContext) ([]indiraClient.Holding, error) {
@@ -358,6 +363,37 @@ func TestM5_Reconcile_EndToEnd(t *testing.T) {
 	for _, m := range resDead.Mismatches {
 		if m.Class == "GHOST" || m.Class == "QTY_MISMATCH" || m.Class == "UNKNOWN_HOLDING" {
 			t.Fatalf("broker-side class %s fired without a broker leg", m.Class)
+		}
+	}
+}
+
+func TestM5_Reconcile_OpenSellCommitment(t *testing.T) {
+	// The intraday trap (UAT 2026-09-01, market open): an armed symbol's
+	// full qty sits under its standing SL → freeQty=0 → v2 holdings hides
+	// the row. The open SELL order proves the holding — NOT a ghost.
+	trading, exec, pos := openFleetDBs(t)
+	now := time.Now()
+	seedFleetFixtures(t, trading, exec, pos, now)
+	seedM5(t, trading, exec, pos, now)
+
+	rs := NewReconStore(
+		userKeyedCreds{m2User: credsOK(m2User)},
+		stubBroker{
+			holdings: []indiraClient.Holding{nseHolding("BBB", 10)}, // AAA hidden!
+			orderbook: []indiraClient.OrderBook{{
+				OrdId: "SL-AAA", OrdAction: "SELL", Cancellable: true, Qty: 10, RemainQty: 10,
+				Symbol: indiraClient.OrderBookSymbol{DispSym: "AAA", Exc: "NSE"},
+			}},
+		},
+		NewFleetStore(trading, exec, pos),
+	)
+	res, err := rs.Reconcile(context.Background(), m2User)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	for _, m := range res.Mismatches {
+		if m.Class == "GHOST" && m.Symbol == "AAA" {
+			t.Fatalf("AAA read as ghost despite standing SELL order: %+v", m)
 		}
 	}
 }
