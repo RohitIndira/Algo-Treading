@@ -339,9 +339,17 @@ func (r *Reconciler) applyDrift(ctx context.Context, db *ManthanOrder, bOrd *ind
 	// Drift B: broker says Cancelled/Rejected but DB says still-placed or sl-placed
 	if isCancelledBrokerStatus(br) && (db.Status == StatusPlaced || db.Status == StatusSLPlaced) {
 		_ = r.repo.UpdateOrderCancelled(ctx, db.ID)
+		rej := strings.TrimSpace(bOrd.RejReason)
+		if rej != "" {
+			if len(rej) > 200 {
+				rej = rej[:200]
+			}
+			_ = r.repo.AnnotateOrderError(ctx, db.ID, "broker: "+rej)
+		}
 		_ = r.repo.InsertEvent(ctx, db.ID, "RECONCILER_FIXED", string(db.Status), "CANCELLED",
 			bOrd.Status, 0, 0,
-			fmt.Sprintf("reconciler: broker=%s but DB=%s → synced", bOrd.Status, db.Status))
+			fmt.Sprintf("reconciler: broker=%s but DB=%s → synced%s", bOrd.Status, db.Status,
+				func() string { if rej != "" { return " — " + rej }; return "" }()))
 		r.logger.Warn("Reconciler fixed order → CANCELLED",
 			zap.Int64("order_id", db.ID),
 			zap.String("symbol", db.Symbol),

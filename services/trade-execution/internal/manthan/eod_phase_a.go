@@ -226,6 +226,30 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 			continue
 		}
 
+		// Attempt spacing (2026-09-01 root cause): the broker accepts each
+		// evening AMO then RMS-rejects it minutes later with "Limit
+		// exceeded … T.Free Qty=0" — the day's expired SL orders still hold
+		// the qty until the broker's evening batch releases it. Burning all
+		// 5 attempts in the first 30 minutes guaranteed a giving-up night,
+		// every night. Escalating gaps spread the same 5 attempts across
+		// the whole evening (≈16:00 → 19:10+) so at least one lands after
+		// the release. Skipping here consumes NO attempt; the retry worker
+		// returns every 5 minutes until the gap has passed.
+		if last, ok, lerr := p.repo.LastAMOAttemptAt(cycleCtx, pos.EntryOrderID, tradeDate); lerr == nil && ok {
+			gaps := []time.Duration{0, 10 * time.Minute, 30 * time.Minute, 60 * time.Minute, 90 * time.Minute}
+			gap := gaps[len(gaps)-1]
+			if attempts < len(gaps) {
+				gap = gaps[attempts]
+			}
+			if since := time.Since(last); since < gap {
+				p.logger.Info("EOD Phase A: attempt spacing — waiting for broker qty release",
+					zap.String("symbol", pos.Symbol), zap.Int("attempts", attempts),
+					zap.Duration("since_last", since), zap.Duration("required_gap", gap))
+				skipped++
+				continue
+			}
+		}
+
 		// Insert the AMO row first — idempotent via partial UNIQUE index
 		// on (parent_order_id, trade_date) for active statuses. A
 		// re-run after crash / deploy returns alreadyExists=true.

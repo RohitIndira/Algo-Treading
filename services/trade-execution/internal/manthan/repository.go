@@ -1142,6 +1142,35 @@ func (r *Repository) CountAMOAttemptsToday(ctx context.Context, parentEntryOrder
 	return n, err
 }
 
+// LastAMOAttemptAt returns the newest overnight attempt's creation time
+// for one (entry, target-date) — the spacing gate's clock. ok=false when
+// no attempt exists yet.
+func (r *Repository) LastAMOAttemptAt(ctx context.Context, parentEntryOrderID int64, tradeDate time.Time) (time.Time, bool, error) {
+	var ts sql.NullTime
+	err := r.db.QueryRowContext(ctx, `
+		SELECT MAX(created_at) FROM manthan_orders
+		WHERE  parent_order_id = $1
+		  AND  trade_date = $2
+		  AND  order_type = 'SL_SELL_AMO'
+		  AND  created_at >= $3`,
+		parentEntryOrderID, tradeDate, armedWindowStart(tradeDate)).Scan(&ts)
+	if err != nil || !ts.Valid {
+		return time.Time{}, false, err
+	}
+	return ts.Time, true, nil
+}
+
+// AnnotateOrderError appends the broker's stated reason to a row that a
+// sync just closed — 'Rejected' without the why cost us the freeQty-release
+// diagnosis for a week.
+func (r *Repository) AnnotateOrderError(ctx context.Context, id int64, reason string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET last_error = COALESCE(NULLIF(last_error,'') || ' | ', '') || $2, updated_at = now()
+		 WHERE id = $1`, id, reason)
+	return err
+}
+
 func (r *Repository) InsertAMOOrder(
 	ctx context.Context,
 	parentEntryOrderID int64,
