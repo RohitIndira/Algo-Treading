@@ -1249,12 +1249,19 @@ func (r *Repository) InsertAMOOrder(
 	// Count by signal_id prefix (not order_type): a converted AMO is
 	// promoted to SL_SELL but keeps its "<entry>-amo-<date>" id, and a later
 	// re-arm for the same date must not collide with it.
+	// Deliberately NOT filtered by trade_date: the admin cap-reset lever
+	// (M7.6) clears the counter by NULLing trade_date on burned attempts —
+	// those rows still hold their signal_ids, and excluding them from this
+	// count made a freed retry reuse the base id and die on the
+	// UNIQUE(signal_id) forever (2026-09-01, failed:8 every 5 minutes).
+	// The prefix already encodes the date, so cross-date collisions are
+	// impossible either way.
 	var priorAttempts int
 	if err = tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM manthan_orders
-		WHERE  parent_order_id = $1 AND trade_date = $2
-		  AND  signal_id LIKE $3`,
-		parentEntryOrderID, tradeDate, p.EntrySignalID+"-amo-"+tradeDate.Format("20060102")+"%",
+		WHERE  parent_order_id = $1
+		  AND  signal_id LIKE $2`,
+		parentEntryOrderID, p.EntrySignalID+"-amo-"+tradeDate.Format("20060102")+"%",
 	).Scan(&priorAttempts); err != nil {
 		return 0, false, fmt.Errorf("count prior attempts: %w", err)
 	}
