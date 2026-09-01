@@ -188,6 +188,24 @@ func TestM7B_GhostPreviewAndHeal(t *testing.T) {
 	}
 }
 
+func TestM7B_GhostOpenSellOrderGate(t *testing.T) {
+	// The ALIVUS false-positive: holdings absent (freeQty=0 hides the row)
+	// BUT a standing SL SELL sits in the order book → NOT a ghost.
+	broker := &m7Broker{orderbook: []indiraClient.OrderBook{
+		{OrdId: "BRK-SL-9", Status: "Requested", OrdAction: "SELL", Cancellable: true,
+			Symbol: indiraClient.OrderBookSymbol{DispSym: "HIDDENQ", BaseSym: "HIDDENQ", Exc: "NSE"}},
+	}}
+	env := newM7BEnv(t, broker, "http://127.0.0.1:1")
+	mustExec(t, env.pos, `INSERT INTO positions (position_id, origin, user_id, strategy_id, signal_id, symbol, exchange,
+			status, entry_price, entry_time, quantity, invested_amount)
+		VALUES ('aaaaaaaa-1111-2222-3333-000000000d01', 'MANTHAN', $1, $2, 'aaaaaaaa-1111-4444-3333-000000000d01', 'HIDDENQ', 'NSE',
+			'ACTIVE', 100, now() - interval '30 days', 14, 1400)`, m2User, m2Strat)
+	rec := m4do(t, env.root, env.token, "GET", "/api/v1/admin/users/"+m2User+"/ghosts/HIDDENQ", "")
+	if rec.Code != 422 || !strings.Contains(rec.Body.String(), "open SELL order BRK-SL-9") {
+		t.Fatalf("open-sell ghost not refused: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestM7B_GhostSettlementGate(t *testing.T) {
 	broker := &m7Broker{} // holds nothing, no tradebook sells
 	env := newM7BEnv(t, broker, "http://127.0.0.1:1")

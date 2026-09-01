@@ -192,6 +192,7 @@ func (a *Actions) CancelOrder(ctx context.Context, userID, brokerID string) (*Or
 type GhostEvidence struct {
 	HoldingsAbsent   bool       `json:"holdings_absent"`
 	BrokerQty        int        `json:"broker_qty"` // >0 → NOT a ghost
+	OpenSellOrder    string     `json:"open_sell_order,omitempty"` // standing SELL at broker → NOT a ghost
 	TradebookSell    bool       `json:"tradebook_sell"`
 	TradebookPrice   float64    `json:"tradebook_price,omitempty"`
 	TradebookQty     int        `json:"tradebook_qty,omitempty"`
@@ -265,6 +266,24 @@ func (a *Actions) GhostPreview(ctx context.Context, userID, symbol string) (*Gho
 	if !p.Evidence.HoldingsAbsent {
 		return nil, &refusal{code: 422, msg: fmt.Sprintf(
 			"broker HOLDS %d of %s — this is not a ghost; reconcile shows it as QTY_MISMATCH instead", p.Evidence.BrokerQty, symbol)}
+	}
+
+	// The ALIVUS lesson (2026-09-01 probe): qty fully committed to an OPEN
+	// SELL order (a standing SL) has freeQty=0 and VANISHES from holdings —
+	// looking exactly like a ghost while the shares are really there. An
+	// open sell-side order at the broker is proof of holding: refuse.
+	if book, berr := a.broker.GetOrderBook(ctx, auth); berr == nil {
+		for _, ob := range book {
+			if strings.EqualFold(ob.OrdAction, "SELL") && ob.Cancellable &&
+				(strings.EqualFold(ob.Symbol.DispSym, symbol) || strings.EqualFold(ob.Symbol.BaseSym, symbol)) {
+				p.Evidence.OpenSellOrder = ob.OrdId
+				return nil, &refusal{code: 422, msg: fmt.Sprintf(
+					"open SELL order %s (%s) stands at the broker for %s — the qty is committed there (freeQty=0 hides the holding); NOT a ghost. Square off or wait for that order to resolve",
+					ob.OrdId, ob.Status, symbol)}
+			}
+		}
+	} else {
+		return nil, fmt.Errorf("ghost orderbook check: %w", berr)
 	}
 
 	// Tradebook: today's SELL executions for the symbol (best evidence).
