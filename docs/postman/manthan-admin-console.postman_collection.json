@@ -1378,6 +1378,247 @@
           }
         }
       ]
+    },
+    {
+      "name": "M8 · Overnight Arming Board",
+      "item": [
+        {
+          "name": "EOD board",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/eod",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "eod"
+              ]
+            },
+            "description": "Every open position's overnight state, worst first: NAKED / USER_BLOCKED / CAPPED / REJECTED (attempt n/5 + error) / DEFERRED / AMO_PENDING / ARMED (broker id). Plus this morning's 08:50 conversion outcomes, the AMO window clock, and per-row action hints (re-arm / cap reset / credential). All read-only."
+          }
+        }
+      ]
+    },
+    {
+      "name": "M9 · Risk & Limits",
+      "item": [
+        {
+          "name": "Caps utilization",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/risk/caps",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "risk",
+                "caps"
+              ]
+            },
+            "description": "Per strategy: sector slots vs ceil(25%×max_positions), mcap-bucket slots vs ceil(50%) — in-flight reservations included; invested vs configured capital; LIVE margin headroom per user (broker call, leg verdict on dead sessions)."
+          }
+        },
+        {
+          "name": "Allocation drivers",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/risk/drivers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "risk",
+                "drivers"
+              ]
+            },
+            "description": "The EMA allocation map per index (the sizing modulator, refreshed daily post-market). Read-only; risk-management limits listed as not_wired."
+          }
+        }
+      ]
+    },
+    {
+      "name": "M10 · System Health",
+      "item": [
+        {
+          "name": "Infra board",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/infra",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "infra"
+              ]
+            },
+            "description": "PM2 services (status/uptime/restarts), DB ping latencies, LTP feed health (silent-tunnel detector), trade-execution reachability, reconciler activity 24h, disk usage. Kafka lag + per-user WSS: not_wired."
+          }
+        }
+      ]
+    },
+    {
+      "name": "M11 · Compliance Exports",
+      "item": [
+        {
+          "name": "Orders register CSV",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/exports/orders?from=2026-08-01&to=2026-09-01",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "exports",
+                "orders"
+              ],
+              "query": [
+                {
+                  "key": "from",
+                  "value": "2026-08-01",
+                  "description": "YYYY-MM-DD inclusive"
+                },
+                {
+                  "key": "to",
+                  "value": "2026-09-01",
+                  "description": "YYYY-MM-DD inclusive"
+                }
+              ]
+            },
+            "description": "Date-range CSV of manthan_orders — the NSE-submission order register shape. Defaults to the last 7 days. Postman: use 'Send and Download' to save the file."
+          }
+        },
+        {
+          "name": "Order event trail CSV",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/exports/events?from=2026-08-01&to=2026-09-01&order_id=",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "exports",
+                "events"
+              ],
+              "query": [
+                {
+                  "key": "from",
+                  "value": "2026-08-01",
+                  "description": ""
+                },
+                {
+                  "key": "to",
+                  "value": "2026-09-01",
+                  "description": ""
+                },
+                {
+                  "key": "order_id",
+                  "value": "",
+                  "description": "optional: one order's trail"
+                }
+              ]
+            },
+            "description": "Per-order event trail (manthan_order_events joined with order context). Optional order_id filter for one order's full lifecycle."
+          }
+        },
+        {
+          "name": "Admin actions CSV",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/exports/admin-actions?from=2026-08-01&to=2026-09-01",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "exports",
+                "admin-actions"
+              ],
+              "query": [
+                {
+                  "key": "from",
+                  "value": "2026-08-01",
+                  "description": ""
+                },
+                {
+                  "key": "to",
+                  "value": "2026-09-01",
+                  "description": ""
+                }
+              ]
+            },
+            "description": "The admin-action report from the append-only audit — every elevation, action, refusal and denial in range."
+          }
+        }
+      ]
     }
   ]
 }
