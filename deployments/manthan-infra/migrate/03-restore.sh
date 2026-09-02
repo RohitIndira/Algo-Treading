@@ -26,12 +26,27 @@ for db in $DBS; do
 done
 
 echo "== redis restore (manthan:* durable state) =="
-docker compose -f ~/Algo-Treading/deployments/manthan-infra/docker-compose.yml stop algo-dev-redis
-docker cp "$BUNDLE/redis-dump.rdb" algo-dev-redis:/data/dump.rdb
-# with appendonly enabled the AOF wins over the RDB, so rebuild it from this RDB
-docker compose -f ~/Algo-Treading/deployments/manthan-infra/docker-compose.yml start algo-dev-redis
-sleep 2
-docker exec algo-dev-redis redis-cli BGREWRITEAOF >/dev/null || true
+# The compose service runs with --appendonly yes, so on a normal start Redis
+# loads the (empty) AOF and IGNORES the RDB — and `docker cp` into the minimal
+# alpine image fails ("Could not find /proc/self/fd"). So: drop the RDB into the
+# named volume via its host path, load it in a TRANSIENT no-AOF container, enable
+# AOF at runtime (which writes the loaded keys into a fresh AOF), then bring the
+# real service up so it loads the now-populated AOF. (2026-09-02: the old
+# cp+start+BGREWRITEAOF sequence silently produced an empty DB.)
+COMPOSE=~/Algo-Treading/deployments/manthan-infra/docker-compose.yml
+REDIS_VOL=$(docker inspect algo-dev-redis --format '{{range .Mounts}}{{.Name}}{{end}}')
+REDIS_MP=$(docker volume inspect "$REDIS_VOL" -f '{{.Mountpoint}}')
+docker compose -f "$COMPOSE" rm -sf algo-dev-redis >/dev/null 2>&1 || true
+sudo rm -rf "$REDIS_MP/appendonlydir"
+sudo cp "$BUNDLE/redis-dump.rdb" "$REDIS_MP/dump.rdb"
+docker run -d --name redis-seed -v "${REDIS_VOL}":/data redis:7-alpine redis-server --appendonly no >/dev/null
+sleep 3
+seeded=$(docker exec redis-seed redis-cli DBSIZE)
+docker exec redis-seed redis-cli CONFIG SET appendonly yes >/dev/null; sleep 1
+docker exec redis-seed redis-cli BGREWRITEAOF >/dev/null; sleep 2
+docker rm -f redis-seed >/dev/null
+docker compose -f "$COMPOSE" up -d algo-dev-redis >/dev/null; sleep 3
+echo "  redis loaded: $(docker exec algo-dev-redis redis-cli DBSIZE) keys (seed saw $seeded)"
 
 echo "== verify against manifest =="
 {

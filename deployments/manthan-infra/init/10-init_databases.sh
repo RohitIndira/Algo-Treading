@@ -30,6 +30,7 @@ DBS=(
     "signals_db         data-ingestion"
     "positions_db        positions"
     "order_status_db     orderstatus"
+    "stockk_market       data-ingestion"
 )
 
 for row in "${DBS[@]}"; do
