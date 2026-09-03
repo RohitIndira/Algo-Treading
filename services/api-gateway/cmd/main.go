@@ -569,10 +569,27 @@ func main() {
 		// proxy, rebalance preview/trigger (operator CLI). REBALANCER_BIN
 		// empty → 7.7 answers 503 rather than half-working.
 		rebalancerRedis := envOr("REDIS_LOCAL_ADDR", "localhost:6379")
-		adminHTTP.SetActions(admin.NewActions(adminFleet, userConfigClient, adminIndira,
+		adminActions := admin.NewActions(adminFleet, userConfigClient, adminIndira,
 			admin.NewStrategyControl(userConfigClient, adminFleet), adminLTP, teMetrics,
 			envOr("REBALANCER_BIN", ""), envOr("REBALANCER_DIR", ""),
-			[]string{"REDIS_ADDR=" + rebalancerRedis, "REDIS_URI=" + rebalancerRedis}))
+			[]string{"REDIS_ADDR=" + rebalancerRedis, "REDIS_URI=" + rebalancerRedis})
+		adminHTTP.SetActions(adminActions)
+
+		// Ghost reaper: automated sweep through the SAME GhostPreview →
+		// GhostHeal gate as the manual flow. Hard default OFF — it exists
+		// only when MANTHAN_GHOST_REAPER_MODE is explicitly dry_run/enabled.
+		// Rollback: unset the var and restart.
+		switch mode := os.Getenv("MANTHAN_GHOST_REAPER_MODE"); mode {
+		case admin.ReaperModeDryRun, admin.ReaperModeEnabled:
+			reaper := admin.NewGhostReaper(mode, adminActions, adminRecon,
+				adminFleet, adminHTTP.AuditStore(), istLoc)
+			go reaper.Start(context.Background())
+			log.Printf("[ghost-reaper] active mode=%s (daily 15:50 IST sweep)", mode)
+		case "":
+			// default: reaper does not exist
+		default:
+			log.Printf("[ghost-reaper] unknown MANTHAN_GHOST_REAPER_MODE=%q — reaper OFF", mode)
+		}
 		log.Printf("Admin actions enabled (order-cancel/ghost-heal/squareoff/rebalance; rebalancer_bin=%q)", envOr("REBALANCER_BIN", ""))
 
 		// M8–M11: overnight board, risk caps/drivers, infra, exports.
