@@ -33,6 +33,7 @@ type ManthanModule struct {
 	InboxWorker         *manthan.InboxWorker              // drains signal_inbox (transactional inbox)
 	ArmRetryWorker      *manthan.ArmRetryWorker           // Layer 4: drains manthan_arm_retries on re-login
 	OrderEventsConsumer *manthan.OrderEventsConsumer      // Kafka reader for order.events from orderstatus svc (Chunk E)
+	ManualExitLedger    *manthan.ManualExitLedgerConsumer // position.events → manthan_orders manual-exit projection (formation fix)
 
 	// AuthProvider — the same per-user credentials closure used internally
 	// by all handlers. Exposed so main.go can compose it with BrokerAdapter
@@ -262,25 +263,34 @@ func InitManthan(
 	// Recovery
 	recovery := manthan.NewRecovery(broker, repo, wssBridge, slHandler, getAuth, logger)
 
-	// External activity detector — watches for manual user interference
-	// (manual sell, manual SL cancel, manual buy) outside our system.
-	// Off by default; enable with MANTHAN_EXTERNAL_DETECTOR_ENABLED=true.
+	// External activity detector — RETIRED PATH, do not enable (2026-09-03
+	// ghost investigation): it publishes through ManthanEventPublisher, a
+	// no-op since manthan.execution.events was retired 2026-07-10 with its
+	// consumers, so enabling it burns broker API polls for zero effect.
+	// Manual exits are covered by the live canonical chain instead:
+	// orderstatus (whole-book) → order.events → positions svc manual-FIFO →
+	// position.events → rules-engine slot release + the manual-exit ledger
+	// consumer below. The env check stays only to warn loudly if someone
+	// sets the old flag expecting the old behavior.
 	var externalDetector *manthan.ExternalActivityDetector
 	if os.Getenv("MANTHAN_EXTERNAL_DETECTOR_ENABLED") == "true" {
-		externalDetector = manthan.NewExternalActivityDetector(
-			broker, repo, eventPub,
-			func() []string {
-				ids, err := repo.ListUserIDsWithLiveOrders(ctx)
-				if err != nil {
-					log.Printf("[manthan] external-detector: user list query failed: %v", err)
-					return nil
-				}
-				return ids
-			},
-			getAuth, logger,
-			manthan.ExternalActivityDetectorConfig{PollInterval: 30 * time.Minute},
-		)
-		log.Println("[manthan] ExternalActivityDetector ENABLED (30 min poll)")
+		log.Println("[manthan] ⚠ MANTHAN_EXTERNAL_DETECTOR_ENABLED is set but the detector's event path " +
+			"(manthan.execution.events) was retired 2026-07-10 — REFUSING to start it. Manual exits are " +
+			"handled by the order.events → position.events chain; unset this variable.")
+	}
+
+	// Manual-exit ledger projector (formation fix, 2026-09-03): consumes
+	// position.events and records a synthetic FILLED SELL in manthan_orders
+	// when positions svc confirms a full manual exit of a Manthan lot —
+	// releasing the position from ListPositionsNeedingProtection so EOD
+	// stops arming AMO SLs for shares the user already sold.
+	// ON by default (it is the fix); MANTHAN_MANUAL_EXIT_LEDGER=off disables.
+	var manualExitLedger *manthan.ManualExitLedgerConsumer
+	if os.Getenv("MANTHAN_MANUAL_EXIT_LEDGER") == "off" {
+		log.Println("[manthan] manual-exit ledger consumer DISABLED via MANTHAN_MANUAL_EXIT_LEDGER=off")
+	} else if len(kafkaBrokers) > 0 {
+		manualExitLedger = manthan.NewManualExitLedgerConsumer(
+			manthan.ManualExitLedgerConfig{KafkaBrokers: kafkaBrokers}, repo, logger)
 	}
 
 	// Protective replayer — server-side trigger engine. Single 09:14 IST cron
@@ -383,6 +393,7 @@ func InitManthan(
 		JWTNotifier:         jwtNotifier,
 		ArmRetryWorker:      armRetryWorker,
 		OrderEventsConsumer: orderEventsConsumer,
+		ManualExitLedger:    manualExitLedger,
 		AuthProvider:        getAuth,
 	}
 }
@@ -419,6 +430,15 @@ func (m *ManthanModule) Start(ctx context.Context) {
 		go func() {
 			log.Println("[manthan] Starting order.events consumer (from orderstatus svc)...")
 			m.OrderEventsConsumer.Start(ctx)
+		}()
+	}
+
+	// Manual-exit ledger projector: position.events → manthan_orders
+	// synthetic SELL on confirmed manual exits (formation fix 2026-09-03).
+	if m.ManualExitLedger != nil {
+		go func() {
+			log.Println("[manthan] Starting manual-exit ledger consumer (position.events)...")
+			m.ManualExitLedger.Start(ctx)
 		}()
 	}
 

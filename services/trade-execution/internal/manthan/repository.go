@@ -1725,3 +1725,29 @@ func (r *Repository) GetOrderContext(ctx context.Context, brokerOrderID string) 
 	}
 	return &oc, nil
 }
+
+// InsertManualExitLedgerSell records the synthetic FILLED SELL that projects
+// a positions-svc-confirmed manual exit (POSITION_EXITED / MANUAL_EXIT) into
+// this service's ledger, so ListPositionsNeedingProtection stops arming SLs
+// for shares the user already sold (2026-09-03 ghost-churn formation fix).
+//
+// Idempotent via UNIQUE(signal_id): signal_id is "manualexit-<position_id>",
+// stable per closed lot. Returns (false, nil) on replay. Same column set as
+// the admin ghost-heal FIX-5 insert — the net-qty CTE only needs order_side,
+// status and filled_qty.
+func (r *Repository) InsertManualExitLedgerSell(ctx context.Context, e ManualExitLedgerRow) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		INSERT INTO manthan_orders
+			(signal_id, strategy_id, user_id, symbol, order_type, order_side,
+			 qty, filled_qty, status, avg_fill_price, exchange, filled_at, last_error)
+		VALUES ($1, $2, $3, $4, 'MARKET_SELL', 'SELL', $5, $5, 'FILLED', NULLIF($6, 0), 'NSE', now(),
+		        'manual-exit ledger projection: user sold via broker app (event '||$7||', broker order '||COALESCE(NULLIF($8,''),'?')||')')
+		ON CONFLICT (signal_id) DO NOTHING`,
+		e.SignalID, e.StrategyID, e.UserID, e.Symbol, e.Qty, e.ExitPrice,
+		e.SourceEventID, e.BrokerOrderID)
+	if err != nil {
+		return false, fmt.Errorf("InsertManualExitLedgerSell: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}

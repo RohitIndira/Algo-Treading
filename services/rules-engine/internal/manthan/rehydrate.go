@@ -546,6 +546,14 @@ func (pm *PortfolioManager) StartOrphanScanner(
 			} else if cleaned > 0 {
 				pm.logger.Info("Orphan scanner pass", zap.Int("cleaned", cleaned))
 			}
+			// External-exit sync: rows an admin/ops writer marked EXITED in
+			// manthan_positions (ghost heal) get booked into memory + redis
+			// here, releasing the slot without waiting for a restart.
+			if synced, err := pm.SyncExitedFromDB(ctx, db, rdb); err != nil {
+				pm.logger.Warn("Orphan scanner: DB→memory exit sync failed", zap.Error(err))
+			} else if synced > 0 {
+				pm.logger.Info("Orphan scanner: external exits synced to memory", zap.Int("synced", synced))
+			}
 			// Expire PENDING_ENTRY rows whose fill never confirmed within
 			// PendingEntryTTL (dispatches that died at trade-execution) —
 			// in the DB and in memory, so a dead dispatch releases its
@@ -569,4 +577,97 @@ func (pm *PortfolioManager) StartOrphanScanner(
 			}
 		}
 	}
+}
+
+// SyncExitedFromDB reconciles the in-memory portfolio against manthan_positions
+// rows that an EXTERNAL writer marked EXITED/EXPIRED — the admin console's
+// ghost heal (ADMIN_GHOST_CLEANUP) or operator SQL. The normal exit path books
+// memory FIRST (ExitConfirmed → ExitPositionWithReason) and persists after
+// (PersistExit), so this scan no-ops for it; only externally-exited rows still
+// live in memory can match. Matches are booked through the SAME
+// ExitPositionWithReason path as a confirmed exit (idempotent on State — a
+// concurrent normal exit wins harmlessly) and their Redis cache keys evicted,
+// releasing the portfolio slot within one scanner tick instead of at the next
+// restart's boot-rehydrate.
+//
+// Capital math: an externally-cleaned ghost has no trustworthy exit price —
+// when the DB row carries none (exit_price<=0), the exit books at the lot's
+// own entry price so realized PnL is zero and CurrentCapital/PerStockBase
+// stay undistorted.
+//
+// The 48h updated_at window bounds the scan; anything older was either synced
+// already (State=Exited no-ops forever) or predates this mechanism and clears
+// at the next boot rehydrate.
+func (pm *PortfolioManager) SyncExitedFromDB(ctx context.Context, db *sql.DB, rdb *redis.Client) (int, error) {
+	if db == nil {
+		return 0, nil
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT strategy_id, symbol, COALESCE(exit_price, 0), COALESCE(exit_reason, '')
+		FROM manthan_positions
+		WHERE status IN ('EXITED','EXPIRED') AND updated_at > now() - interval '48 hours'`)
+	if err != nil {
+		return 0, fmt.Errorf("sync exited query: %w", err)
+	}
+	type exited struct {
+		strategyID, symbol, reason string
+		exitPrice                  float64
+	}
+	var candidates []exited
+	for rows.Next() {
+		var e exited
+		if err := rows.Scan(&e.strategyID, &e.symbol, &e.exitPrice, &e.reason); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		candidates = append(candidates, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	synced := 0
+	for _, e := range candidates {
+		pm.mu.RLock()
+		p, ok := pm.portfolios[e.strategyID]
+		pm.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		p.Mu.Lock()
+		pos, live := p.Positions[e.symbol]
+		stillOpen := live && pos.State != types.StateExited
+		exitPrice := e.exitPrice
+		if stillOpen && exitPrice <= 0 {
+			exitPrice = pos.EntryPrice // capital-neutral for evidence-less closes
+		}
+		p.Mu.Unlock()
+		if !stillOpen {
+			continue // normal path already booked it — the common case
+		}
+
+		reason := e.reason
+		if reason == "" {
+			reason = "DB_SYNC"
+		}
+		pnl := pm.ExitPositionWithReason(e.strategyID, e.symbol, exitPrice, reason)
+		synced++
+		pm.logger.Warn("DB→memory sync: booked externally-recorded exit — slot released",
+			zap.String("strategy_id", e.strategyID),
+			zap.String("symbol", e.symbol),
+			zap.String("db_exit_reason", e.reason),
+			zap.Float64("booked_exit_price", exitPrice),
+			zap.Float64("realized_pnl", pnl))
+
+		if rdb != nil {
+			posKey := fmt.Sprintf("manthan:position:%s:%s", e.strategyID, e.symbol)
+			if err := rdb.Del(ctx, posKey).Err(); err != nil {
+				pm.logger.Warn("DB→memory sync: redis key eviction failed (boot rehydrate will retry)",
+					zap.String("key", posKey), zap.Error(err))
+			}
+			_ = rdb.SRem(ctx, "manthan:positions:active", e.strategyID+":"+e.symbol).Err()
+		}
+	}
+	return synced, nil
 }

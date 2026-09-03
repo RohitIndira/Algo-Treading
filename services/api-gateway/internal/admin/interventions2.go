@@ -85,8 +85,8 @@ func NewActions(fleet *FleetStore, creds credentialsFetcher, broker actionBroker
 	rebalancerEnv []string) *Actions {
 	return &Actions{
 		fleet: fleet, creds: creds, broker: broker, strategies: strategies, ltp: ltp,
-		teMetricsURL: strings.TrimRight(teMetricsURL, "/"),
-		httpc:        &http.Client{Timeout: 120 * time.Second},
+		teMetricsURL:  strings.TrimRight(teMetricsURL, "/"),
+		httpc:         &http.Client{Timeout: 120 * time.Second},
 		rebalancerBin: rebalancerBin, rebalancerDir: rebalancerDir, rebalancerEnv: rebalancerEnv,
 		run: execRunner,
 	}
@@ -104,11 +104,11 @@ func (a *Actions) authFor(ctx context.Context, userID string) (*indiraClient.Aut
 
 // OrderView is broker truth + our ledger row, side by side.
 type OrderView struct {
-	BrokerOrderID string                 `json:"broker_order_id"`
-	BrokerFound   bool                   `json:"broker_found"`
+	BrokerOrderID string                  `json:"broker_order_id"`
+	BrokerFound   bool                    `json:"broker_found"`
 	Broker        *indiraClient.OrderBook `json:"broker,omitempty"`
-	Ledger        map[string]any         `json:"ledger,omitempty"` // our manthan_orders row, if any
-	Verdict       string                 `json:"verdict"`          // LIVE | TERMINAL | VANISHED
+	Ledger        map[string]any          `json:"ledger,omitempty"` // our manthan_orders row, if any
+	Verdict       string                  `json:"verdict"`          // LIVE | TERMINAL | VANISHED
 }
 
 func (a *Actions) findBrokerOrder(ctx context.Context, auth *indiraClient.AuthContext, brokerID string) (*indiraClient.OrderBook, error) {
@@ -202,14 +202,14 @@ func (a *Actions) CancelOrder(ctx context.Context, userID, brokerID string) (*Or
 
 // GhostEvidence is what the broker said at preview/heal time.
 type GhostEvidence struct {
-	HoldingsAbsent   bool       `json:"holdings_absent"`
-	BrokerQty        int        `json:"broker_qty"` // >0 → NOT a ghost
-	OpenSellOrder    string     `json:"open_sell_order,omitempty"` // standing SELL at broker → NOT a ghost
-	TradebookSell    bool       `json:"tradebook_sell"`
-	TradebookPrice   float64    `json:"tradebook_price,omitempty"`
-	TradebookQty     int        `json:"tradebook_qty,omitempty"`
-	OldestEntry      *time.Time `json:"oldest_entry,omitempty"`
-	PastSettlement   bool       `json:"past_settlement_window"`
+	HoldingsAbsent bool       `json:"holdings_absent"`
+	BrokerQty      int        `json:"broker_qty"`                // >0 → NOT a ghost
+	OpenSellOrder  string     `json:"open_sell_order,omitempty"` // standing SELL at broker → NOT a ghost
+	TradebookSell  bool       `json:"tradebook_sell"`
+	TradebookPrice float64    `json:"tradebook_price,omitempty"`
+	TradebookQty   int        `json:"tradebook_qty,omitempty"`
+	OldestEntry    *time.Time `json:"oldest_entry,omitempty"`
+	PastSettlement bool       `json:"past_settlement_window"`
 }
 
 // GhostPlan is the previewed heal.
@@ -359,7 +359,29 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 		}
 		ledgerRow = true
 	}
-	return map[string]any{"book_rows_closed": closed, "ledger_sell_written": ledgerRow, "exit_price": p.ExitPrice}, nil
+
+	// Portfolio-slot release: mark the rules-engine's own row EXITED (same
+	// semantics as its orphan cleanup). Its 60s orphan-scanner DB→memory
+	// sync (SyncExitedFromDB) then books the exit in memory and evicts the
+	// Redis cache keys — the slot frees within a tick, no restart needed.
+	var slotRows int64
+	if p.StrategyID != "" {
+		res, serr := a.fleet.tradingDB.ExecContext(ctx, `
+			UPDATE manthan_positions
+			   SET status = 'EXITED', exit_reason = 'ADMIN_GHOST_CLEANUP',
+			       exit_time = now(), updated_at = now()
+			 WHERE strategy_id = $1 AND UPPER(symbol) = $2 AND status = 'ACTIVE'`,
+			p.StrategyID, p.Symbol)
+		if serr != nil {
+			// The book+ledger heal succeeded — don't fail the whole heal;
+			// report so the operator knows the slot needs the manual UPDATE.
+			slotRows = -1
+		} else {
+			slotRows, _ = res.RowsAffected()
+		}
+	}
+	return map[string]any{"book_rows_closed": closed, "ledger_sell_written": ledgerRow,
+		"exit_price": p.ExitPrice, "slot_rows_marked": slotRows}, nil
 }
 
 // tradeSymbolMatches digs the display symbol out of the tradebook's
@@ -491,4 +513,3 @@ func (a *Actions) Rebalance(ctx context.Context, userID string, dryRun bool) (st
 	}
 	return string(out), nil
 }
-
