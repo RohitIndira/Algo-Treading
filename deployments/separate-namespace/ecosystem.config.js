@@ -110,6 +110,11 @@ module.exports = {
         CORS_ALLOWED_ORIGINS: 'https://manthan-dev.stockk.trade',
         REDIS_LOCAL_ADDR: 'localhost:6389',               // ws pub/sub redis (algo-dev)
         PORTFOLIO_GRPC_ADDR: 'localhost:9008',            // portfolio svc gRPC (NOT 9005 = rules-engine)
+        // Ghost reaper (2026-09-03): unset/'' = OFF, 'dry_run' = audit-only
+        // daily 15:50 IST sweep, 'enabled' = auto-heal through the same
+        // GhostPreview gate as the manual flow. Value comes from .env so
+        // flipping modes is a .env edit + restart, no code change.
+        MANTHAN_GHOST_REAPER_MODE: ENV.MANTHAN_GHOST_REAPER_MODE || '',
     }},
     // manthan-live now runs as a WATCH DAEMON (2026-08-18): after the initial
     // run it fingerprints the BuySignal tab every MANTHAN_WATCH_INTERVAL secs
