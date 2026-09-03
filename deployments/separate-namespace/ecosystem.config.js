@@ -80,6 +80,11 @@ module.exports = {
         // USER_CREDENTIALS_UPDATED, 5-min poll fallback). Without this flag
         // deferred SLs are never re-armed (2026-08-05: 5/8 unprotected).
         MANTHAN_PROTECTIVE_REPLAY_ENABLED: 'true',
+        // Manual-exit ledger projector (2026-09-03 ghost formation fix):
+        // ON by default; set MANTHAN_MANUAL_EXIT_LEDGER=off in .env to
+        // disable (rollback path — must be forwarded here or it never
+        // reaches the process; env blocks are whitelists).
+        MANTHAN_MANUAL_EXIT_LEDGER: ENV.MANTHAN_MANUAL_EXIT_LEDGER || '',
         // Price client (paper monitor, OCO trailing SL, price-monitor fallback)
         // reads market:nse:{token} LTP — point REDIS_HOST/PORT at the external
         // market feed, NOT the empty local redis. EXT_REDIS_ADDR (broker adapter)
