@@ -300,8 +300,13 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 	// Optional LTP feed.
 	if deps.ExtRedisAddr != "" {
 		feed, ltpErr := NewLTPFeed(LTPFeedConfig{
-			Addr:         deps.ExtRedisAddr,
-			Password:     deps.ExtRedisPassword,
+			Addr:     deps.ExtRedisAddr,
+			Password: deps.ExtRedisPassword,
+			// DB 0 = LIVE market data — EXPLICIT since the 2026-09-04 KEI
+			// incident: DB 1 on the same server is the MOCK universe (the
+			// 22/29-Aug Saturday mock sessions leaked into DB 0 and poisoned
+			// a trail). Live trailing must never read any other DB.
+			DB:           0,
 			PollInterval: 1 * time.Second,
 		}, tickHandler, m.portfolioMgr, logger)
 		if ltpErr != nil {

@@ -9,20 +9,20 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
-
 )
 
 // LTPFeed polls an external Redis instance for live LTP data and feeds it
 // to the TickHandler for trailing SL processing.
 //
 // Data path:
-//   1. ISIN → isin:{ISIN} → get NSE token
-//   2. Token → market:nse:{token} → get LTP
-//   3. Feed LTP to TickHandler.ProcessTick()
+//  1. ISIN → isin:{ISIN} → get NSE token
+//  2. Token → market:nse:{token} → get LTP
+//  3. Feed LTP to TickHandler.ProcessTick()
 //
 // External Redis schema (already populated by Indira's websocket feed):
-//   isin:INE297H01019 → {"nsecode":"13337", ...}
-//   market:nse:13337   → {"ltp":916.15, "symbol":"GALLANTT", ...}
+//
+//	isin:INE297H01019 → {"nsecode":"13337", ...}
+//	market:nse:13337   → {"ltp":916.15, "symbol":"GALLANTT", ...}
 type LTPFeed struct {
 	extRedis     *redis.Client
 	tickHandler  *TickHandler
@@ -86,6 +86,7 @@ func NewLTPFeed(
 
 	logger.Info("LTP feed connected to external Redis",
 		zap.String("addr", cfg.Addr),
+		zap.Int("db", cfg.DB), // 0 = live; 1 = mock universe (2026-09-04 incident)
 		zap.Duration("poll_interval", interval))
 
 	return &LTPFeed{

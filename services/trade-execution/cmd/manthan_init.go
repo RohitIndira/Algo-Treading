@@ -61,8 +61,12 @@ func InitManthan(
 	}
 
 	extRedis := redis.NewClient(&redis.Options{
-		Addr:         extRedisAddr,
-		Password:     extRedisPass,
+		Addr:     extRedisAddr,
+		Password: extRedisPass,
+		// DB 0 = LIVE market data — EXPLICIT since the 2026-09-04 KEI
+		// incident: DB 1 on this server is the MOCK universe. Live broker
+		// adapter / DPR / LTP reads must never touch any other DB.
+		DB:           0,
 		PoolSize:     20,
 		MinIdleConns: 5,
 		ReadTimeout:  2 * time.Second,
