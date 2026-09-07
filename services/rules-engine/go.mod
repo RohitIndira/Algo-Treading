@@ -40,3 +40,5 @@ require (
 )
 
 replace github.com/RohitIndira/Algo-Treading => ../..
+
+replace github.com/RohitIndira/Algo-Treading/pkg/indira => ../../pkg/indira

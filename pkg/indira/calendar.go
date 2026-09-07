@@ -69,3 +69,30 @@ func NextTradingDay(t time.Time) time.Time {
 	}
 	return d
 }
+
+// IsMarketOpen reports whether t falls inside a live NSE/BSE equity session:
+// a trading day (IsTradingDay) AND within 09:15–15:30 IST. t may be in any
+// timezone — it is converted to Asia/Kolkata internally, so callers on a
+// UTC host don't have to convert first.
+//
+// Added 2026-09-07 for the trailing-SL feed: the trail ratchet must ignore
+// ticks published outside live hours. Weekend/holiday "ticks" (mock-session
+// or feed garbage leaking into the market-data Redis) had poisoned trailing
+// stops — KEI stopped out prematurely on an Aug-29 Saturday tick of 6094;
+// IIFL's stop was tightened by a Sep-5 Saturday tick of 781.35. The
+// one-way ratchet keeps any bogus high forever, so the fix is to never
+// consider an out-of-hours tick in the first place.
+func IsMarketOpen(t time.Time) bool {
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil || loc == nil {
+		loc = time.FixedZone("IST", 5*60*60+30*60)
+	}
+	ist := t.In(loc)
+	if !IsTradingDay(ist) {
+		return false
+	}
+	mins := ist.Hour()*60 + ist.Minute()
+	const open = 9*60 + 15   // 09:15 IST
+	const close = 15*60 + 30 // 15:30 IST
+	return mins >= open && mins <= close
+}

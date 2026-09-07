@@ -9,6 +9,8 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
+
+	indiraCal "github.com/RohitIndira/Algo-Treading/pkg/indira"
 )
 
 // LTPFeed polls an external Redis instance for live LTP data and feeds it
@@ -117,6 +119,18 @@ func (f *LTPFeed) Start(ctx context.Context) {
 }
 
 func (f *LTPFeed) poll(ctx context.Context) {
+	// Market-hours gate (2026-09-07): the trailing ratchet must only ever
+	// act on ticks published during a live NSE session. Out-of-hours the
+	// market-data Redis can carry stale or mock/garbage values (weekend
+	// mock sessions leaking into DB 0 poisoned KEI's and IIFL's trails via
+	// the one-way high ratchet). Standing down entirely when the exchange
+	// is closed removes that whole class of failure — and there is nothing
+	// legitimate to trail or exit on outside 09:15–15:30 IST anyway (the
+	// resting broker-side SL protects overnight; morning arming is a
+	// separate 09:14 cron).
+	if !indiraCal.IsMarketOpen(time.Now()) {
+		return
+	}
 	// Collect ISINs from active positions in a single pass — the previous
 	// implementation called ActiveSymbols() just to test for empty and
 	// then re-walked AllPortfolios, wasting the first call's result.
@@ -170,13 +184,41 @@ func (f *LTPFeed) fetchLTP(ctx context.Context, isin, symbol string) (float64, b
 	}
 
 	var data struct {
-		LTP float64 `json:"ltp"`
+		LTP  float64 `json:"ltp"`
+		High float64 `json:"high"` // exchange's official session high, same payload
 	}
 	if json.Unmarshal([]byte(raw), &data) != nil || data.LTP <= 0 {
 		return 0, false
 	}
 
+	// Plausibility guard (2026-09-07): a real new high updates BOTH ltp and
+	// the official session-high field in the same message, so a legitimate
+	// tick always has ltp <= high. An ltp that exceeds the payload's own
+	// high is impossible market data — a spurious print (the KEI/IIFL
+	// poisoning shape). Reject it so the one-way ratchet never records it.
+	// Guarded on High>0 (older/partial payloads without the field are left
+	// alone), with a 0.1% epsilon for tick/float rounding. Defense-in-depth
+	// behind the market-hours gate — this catches an in-hours bad print.
+	if !plausibleTick(data.LTP, data.High) {
+		f.warnRedisErr("implausible tick rejected (ltp>day-high)", key, symbol, nil)
+		return 0, false
+	}
+
 	return data.LTP, true
+}
+
+// plausibleTick reports whether an ltp is consistent with the exchange's
+// own official session high in the same payload. A genuine new high moves
+// both fields together (ltp == high), so any legitimate tick has
+// ltp <= high. An ltp above high is impossible real data — a spurious
+// print. High<=0 means the payload didn't carry the field (older/partial
+// feed): we can't judge, so we accept. The 0.1% epsilon absorbs
+// tick-size/float rounding at the boundary.
+func plausibleTick(ltp, high float64) bool {
+	if high <= 0 {
+		return true
+	}
+	return ltp <= high*1.001
 }
 
 func (f *LTPFeed) resolveToken(ctx context.Context, isin string) (string, bool) {
