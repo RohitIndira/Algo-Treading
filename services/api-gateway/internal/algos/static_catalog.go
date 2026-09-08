@@ -123,12 +123,13 @@ func manthanDetail() AlgoDetail {
 			// Operator track-record figures — MUST match the strategy
 			// writeup sheet (rows 241-246; corrected 2026-09-08 to the
 			// sheet: winrate 48.78, PF 2.42, avg holding 96d, Sortino 2.25).
-			WinRatePct:     48.78,
-			ProfitFactor:   2.42,
-			TotalTradesPct: 205, // a COUNT despite the field name — see types.go
-			AvgHoldingDays: 96,
-			Sortino:        2.25,
-			VolatilityDays: 0, // removed from the UI — omitted via json:omitempty
+			WinRatePct:      48.78,
+			ProfitFactor:    2.42,
+			ProfitFactorPct: 2.42, // alias — see types.go
+			TotalTradesPct:  205,  // a COUNT despite the field name — see types.go
+			AvgHoldingDays:  96,
+			Sortino:         2.25,
+			VolatilityDays:  0, // removed from the UI — omitted via json:omitempty
 		},
 		WhatYouGet: []WhatYouGetItem{
 			{Icon: "automation", Title: "Automated execution", Description: "Trades placed by us — no manual orders"},

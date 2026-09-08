@@ -110,6 +110,12 @@ type ListResponse struct {
 type KeyStats struct {
 	WinRatePct   float64 `json:"winRatePct"`
 	ProfitFactor float64 `json:"profitFactor"`
+	// ProfitFactorPct is an ALIAS of ProfitFactor under the name some app
+	// builds read (their tile grid uses Pct-suffixed keys — winRatePct,
+	// totalTradesPct — and rendered "0%" because profitFactorPct was
+	// absent; 2026-09-08). Same value, not a percentage. Keep both until
+	// every app build reads profitFactor.
+	ProfitFactorPct float64 `json:"profitFactorPct"`
 	// TotalTradesPct is a COUNT of trades (e.g. 205), not a percentage —
 	// the json name is legacy and kept for frontend compatibility.
 	TotalTradesPct float64 `json:"totalTradesPct"`
