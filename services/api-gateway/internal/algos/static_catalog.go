@@ -127,11 +127,14 @@ func manthanDetail() AlgoDetail {
 		},
 
 		KeyStats: KeyStats{
-			WinRatePct:     54.63,
-			ProfitFactor:   2.60,
+			// Operator track-record figures — MUST match the strategy
+			// writeup sheet (rows 241-246; corrected 2026-09-08 to the
+			// sheet: winrate 48.78, PF 2.42, avg holding 96d, Sortino 2.25).
+			WinRatePct:     48.78,
+			ProfitFactor:   2.42,
 			TotalTradesPct: 205, // a COUNT despite the field name — see types.go
-			AvgHoldingDays: 87,
-			Sortino:        2.12,
+			AvgHoldingDays: 96,
+			Sortino:        2.25,
 			VolatilityDays: 0, // removed from the UI — omitted via json:omitempty
 		},
 		WhatYouGet: []WhatYouGetItem{

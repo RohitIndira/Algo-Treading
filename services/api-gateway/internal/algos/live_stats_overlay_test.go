@@ -36,7 +36,7 @@ func TestOverlay_SeriesStatsAlwaysApply(t *testing.T) {
 		t.Errorf("series key stats not applied: %+v", d.KeyStats)
 	}
 	// Trade stats NOT live → operator track-record figures must remain.
-	if d.KeyStats.WinRatePct != 54.63 || d.KeyStats.TotalTradesPct != 205 {
+	if d.KeyStats.WinRatePct != 48.78 || d.KeyStats.TotalTradesPct != 205 {
 		t.Errorf("track-record stats must stand below threshold: %+v", d.KeyStats)
 	}
 }
@@ -62,7 +62,7 @@ func TestOverlay_NoDataKeepsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.MaxDrawdown != -17 || d.KeyStats.WinRatePct != 54.63 || d.KeyStats.Sortino != 2.12 {
+	if d.MaxDrawdown != -17 || d.KeyStats.WinRatePct != 48.78 || d.KeyStats.Sortino != 2.25 {
 		t.Errorf("catalog defaults must survive a stats outage: %+v", d.KeyStats)
 	}
 }
