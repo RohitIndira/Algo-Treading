@@ -44,11 +44,10 @@ func (s *StaticCatalog) applyStats(ctx context.Context, a *Algo) LiveStats {
 	if len(live.PrimaryReturn) > 0 {
 		a.PrimaryReturn = live.PrimaryReturn
 	}
-	// 2026-08-20: the computed drawdown was populated into LiveStats but
-	// never APPLIED — the card kept the baked-in constant. Overlay it too.
-	if live.MaxDrawdownPct != 0 {
-		a.MaxDrawdown = live.MaxDrawdownPct
-	}
+	// 2026-09-08 (operator decision): MaxDrawdown is STATIC track-record
+	// data from the strategy writeup sheet (-17). The 2026-08-20 live
+	// overlay is intentionally NOT applied — the catalog shows the sheet's
+	// figures; live series numbers stay on the performance chart instead.
 	return live
 }
 
@@ -78,10 +77,13 @@ func (s *StaticCatalog) ByID(ctx context.Context, id string) (*AlgoDetail, error
 		return nil, ErrAlgoNotFound
 	}
 	live := s.applyStats(ctx, &detail.Algo)
-	// Series-derived key stats — real whenever the daily series exists.
-	if live.SortinoRatio != 0 {
-		detail.KeyStats.Sortino = live.SortinoRatio
-	}
+	// 2026-09-08 (operator decision): the Key Stats grid (win rate, profit
+	// factor, total trades, avg holding, Sortino) and MaxDrawdown are
+	// STATIC operator track-record figures from the strategy writeup sheet
+	// (rows 241-246) — live overlays for these are intentionally disabled.
+	// Only the ADDITIVE series fields (Sharpe / TotalReturn / CAGR, which
+	// the sheet does not define and older frontends ignore) still come
+	// from the real daily series.
 	if live.SharpeRatio != 0 {
 		detail.KeyStats.Sharpe = live.SharpeRatio
 	}
@@ -90,15 +92,6 @@ func (s *StaticCatalog) ByID(ctx context.Context, id string) (*AlgoDetail, error
 	}
 	if live.CAGRPct != 0 {
 		detail.KeyStats.CAGRPct = live.CAGRPct
-	}
-	// Trade-derived key stats — only once the LIVE closed-lot sample is
-	// meaningful (performance.MinTradesForStats); until then the operator's
-	// track-record figures remain (see manthanDetail).
-	if live.TradeStatsLive {
-		detail.KeyStats.WinRatePct = live.WinRatePct
-		detail.KeyStats.ProfitFactor = live.ProfitFactor
-		detail.KeyStats.TotalTradesPct = float64(live.TotalTrades)
-		detail.KeyStats.AvgHoldingDays = live.AvgHoldingDays
 	}
 	return &detail, nil
 }

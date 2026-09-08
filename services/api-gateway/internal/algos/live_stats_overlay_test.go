@@ -1,49 +1,67 @@
 package algos
 
-// The 2026-08-20 overlay contract: series-derived stats (drawdown, Sortino,
-// Sharpe, total return, CAGR) apply whenever computed; trade-derived stats
-// (win rate, profit factor, trades, holding) apply ONLY when the live
-// closed-lot sample passed the threshold (TradeStatsLive) — otherwise the
-// operator's track-record figures stand. Regression: MaxDrawdown was
-// computed but never applied (card kept −17 while the data said −5.68).
+// Catalog stats contract — updated 2026-09-08 (operator decision):
+// the Key Stats grid (win rate, profit factor, total trades, avg holding,
+// Sortino) and MaxDrawdown are STATIC track-record figures from the
+// strategy writeup sheet (rows 241-246) and must NEVER be replaced by
+// live-computed values. Only the additive series fields (Sharpe /
+// TotalReturnPct / CAGRPct) and the PrimaryReturn headline overlay from
+// the real daily series. These tests pin both directions.
 
 import (
 	"context"
 	"testing"
 )
 
-func overlayCatalog(live LiveStats, ok bool) *StaticCatalog {
-	c := NewStaticCatalog().(*StaticCatalog)
-	c.SetStatsProvider(func(ctx context.Context, algoID string) (LiveStats, bool) { return live, ok })
+// Sheet-of-record values (strategy writeup rows 241-246).
+const (
+	sheetWinRate    = 48.78
+	sheetPF         = 2.42
+	sheetTrades     = 205
+	sheetAvgHolding = 96
+	sheetSortino    = 2.25
+	sheetMaxDD      = -17
+)
+
+func overlayCatalog(live LiveStats, ok bool) Catalog {
+	c := NewStaticCatalog()
+	c.(*StaticCatalog).SetStatsProvider(func(context.Context, string) (LiveStats, bool) {
+		return live, ok
+	})
 	return c
 }
 
-func TestOverlay_SeriesStatsAlwaysApply(t *testing.T) {
+// Live series present → statics must still stand; only additive fields +
+// the PrimaryReturn headline change.
+func TestStatics_SurviveLiveSeries(t *testing.T) {
 	live := LiveStats{
-		PrimaryReturn:  map[string]float64{"1Y Return": 41.5, "Since Inception": 47.23},
-		MaxDrawdownPct: -5.68, SortinoRatio: 1.9, SharpeRatio: 1.4,
+		PrimaryReturn:  map[string]float64{"1Y Return": 44.78},
+		MaxDrawdownPct: -5.68, SortinoRatio: 4.23, SharpeRatio: 1.4,
 		TotalReturnPct: 47.23, CAGRPct: 29.1,
 	}
 	d, err := overlayCatalog(live, true).ByID(context.Background(), "algo_manthan_v1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.MaxDrawdown != -5.68 {
-		t.Errorf("MaxDrawdown = %v, want −5.68 (the never-applied overlay bug)", d.MaxDrawdown)
+	if d.MaxDrawdown != sheetMaxDD {
+		t.Errorf("MaxDrawdown = %v, want the STATIC sheet value %v", d.MaxDrawdown, sheetMaxDD)
 	}
-	if d.KeyStats.Sortino != 1.9 || d.KeyStats.Sharpe != 1.4 ||
-		d.KeyStats.TotalReturnPct != 47.23 || d.KeyStats.CAGRPct != 29.1 {
-		t.Errorf("series key stats not applied: %+v", d.KeyStats)
+	if d.KeyStats.Sortino != sheetSortino {
+		t.Errorf("Sortino = %v, want the STATIC sheet value %v", d.KeyStats.Sortino, sheetSortino)
 	}
-	// Trade stats NOT live → operator track-record figures must remain.
-	if d.KeyStats.WinRatePct != 48.78 || d.KeyStats.TotalTradesPct != 205 {
-		t.Errorf("track-record stats must stand below threshold: %+v", d.KeyStats)
+	if d.PrimaryReturn["1Y Return"] != 44.78 {
+		t.Errorf("PrimaryReturn headline must stay LIVE: %+v", d.PrimaryReturn)
+	}
+	// Additive series fields still overlay.
+	if d.KeyStats.Sharpe != 1.4 || d.KeyStats.TotalReturnPct != 47.23 || d.KeyStats.CAGRPct != 29.1 {
+		t.Errorf("additive series fields not applied: %+v", d.KeyStats)
 	}
 }
 
-func TestOverlay_TradeStatsApplyOnlyWhenLive(t *testing.T) {
+// Even a meaningful live closed-lot sample must NOT replace the sheet's
+// trade stats any more.
+func TestStatics_SurviveLiveTradeSample(t *testing.T) {
 	live := LiveStats{
-		PrimaryReturn:  map[string]float64{"Since Inception": 47.23},
 		TradeStatsLive: true, WinRatePct: 61.9, ProfitFactor: 2.1,
 		TotalTrades: 42, AvgHoldingDays: 34.5,
 	}
@@ -52,17 +70,21 @@ func TestOverlay_TradeStatsApplyOnlyWhenLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	ks := d.KeyStats
-	if ks.WinRatePct != 61.9 || ks.ProfitFactor != 2.1 || ks.TotalTradesPct != 42 || ks.AvgHoldingDays != 34.5 {
-		t.Errorf("live trade stats not applied: %+v", ks)
+	if ks.WinRatePct != sheetWinRate || ks.ProfitFactor != sheetPF ||
+		ks.TotalTradesPct != sheetTrades || ks.AvgHoldingDays != sheetAvgHolding {
+		t.Errorf("trade stats must stay STATIC per the sheet: %+v", ks)
 	}
 }
 
-func TestOverlay_NoDataKeepsDefaults(t *testing.T) {
+// Stats provider absent/failing → full statics, no zeroes.
+func TestStatics_NoDataKeepsDefaults(t *testing.T) {
 	d, err := overlayCatalog(LiveStats{}, false).ByID(context.Background(), "algo_manthan_v1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.MaxDrawdown != -17 || d.KeyStats.WinRatePct != 48.78 || d.KeyStats.Sortino != 2.25 {
-		t.Errorf("catalog defaults must survive a stats outage: %+v", d.KeyStats)
+	ks := d.KeyStats
+	if d.MaxDrawdown != sheetMaxDD || ks.WinRatePct != sheetWinRate || ks.ProfitFactor != sheetPF ||
+		ks.TotalTradesPct != sheetTrades || ks.AvgHoldingDays != sheetAvgHolding || ks.Sortino != sheetSortino {
+		t.Errorf("catalog statics must survive a stats outage: MaxDD=%v %+v", d.MaxDrawdown, ks)
 	}
 }
