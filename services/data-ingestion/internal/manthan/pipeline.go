@@ -1,6 +1,7 @@
 package manthan
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -10,12 +11,12 @@ import (
 // Pipeline processes the Manthan xlsx into a list of eligible stocks.
 //
 // Flow (confirmed 2026-04-15):
-//   1. Universe = every ScripName in BuySignal sheet
-//   2. For each stock, enrich from PE / FScore / LifeTimeHigh
-//   3. If ANY required field is missing → DROP (record reason)
-//   4. Apply all filters (MCap, PE, FScore, PAT, BarNo, Volume, ATH trigger)
-//   5. Apply portfolio caps (25% sector, 50% MCap bucket) — FCFS tie-break
-//   6. Return eligible stocks for publishing to Kafka + Postgres + Redis
+//  1. Universe = every ScripName in BuySignal sheet
+//  2. For each stock, enrich from PE / FScore / LifeTimeHigh
+//  3. If ANY required field is missing → DROP (record reason)
+//  4. Apply all filters (MCap, PE, FScore, PAT, BarNo, Volume, ATH trigger)
+//  5. Apply portfolio caps (25% sector, 50% MCap bucket) — FCFS tie-break
+//  6. Return eligible stocks for publishing to Kafka + Postgres + Redis
 type Pipeline struct {
 	logger *zap.Logger
 }
@@ -34,32 +35,32 @@ type DropReason struct {
 
 // PipelineResult holds the output of a full pipeline run.
 type PipelineResult struct {
-	Eligible        []*ManthanStock          // passed all filters + caps
-	FilteredOut     []*ManthanStock          // passed data check but failed a filter
-	Drops           []DropReason             // missing-data drops
-	IndexAllocation map[string]float64       // from IndicesGradeRange
+	Eligible        []*ManthanStock    // passed all filters + caps
+	FilteredOut     []*ManthanStock    // passed data check but failed a filter
+	Drops           []DropReason       // missing-data drops
+	IndexAllocation map[string]float64 // from IndicesGradeRange
 	Stats           PipelineStats
 }
 
 // PipelineStats is a counter bundle for observability.
 type PipelineStats struct {
-	BuySignalTotal     int
-	MissingData        int
-	FilterFailed       int
-	CapRejected        int
-	Eligible           int
-	BySectorCap        int
-	ByMCapBucketCap    int
+	BuySignalTotal  int
+	MissingData     int
+	FilterFailed    int
+	CapRejected     int
+	Eligible        int
+	BySectorCap     int
+	ByMCapBucketCap int
 
 	// Per-filter reject counts
-	FailedMCap       int
-	FailedPE         int
-	FailedPAT        int
-	FailedFScore     int
-	FailedBarNo      int
-	FailedVolume     int
-	FailedATHEntry   int
-	FailedIndustry   int
+	FailedMCap     int
+	FailedPE       int
+	FailedPAT      int
+	FailedFScore   int
+	FailedBarNo    int
+	FailedVolume   int
+	FailedATHEntry int
+	FailedIndustry int
 }
 
 // Run executes the full pipeline on the raw xlsx data.
@@ -195,6 +196,28 @@ func (p *Pipeline) Run(raw *ReadResult) *PipelineResult {
 				Symbol: sym, Stage: "missing_data", Reason: "ISIN missing",
 			})
 			continue
+		}
+		// --- MCap plausibility gate (2026-09-09) ---
+		// The sheet is operator-edited; a fabricated MarketCap re-labels the
+		// mcap bucket and silently bypasses the 50%-per-bucket concentration
+		// cap (twice observed: small-caps entered as "MID" via a 28,000 Cr
+		// figure ~15-20x reality). The same sheet row carries PE and PAT, and
+		// MCap ~= PE x PAT for any internally-consistent row — so a claimed
+		// MCap more than 4x away from that implied value (in either
+		// direction) is treated as bad data and dropped, loudly, into the
+		// candidates view. Applies only when PE>0 and PAT>0 (loss-makers
+		// fail the PAT filter anyway). The 4x tolerance absorbs
+		// standalone-vs-consolidated and TTM-vintage noise.
+		if pe.TTMPE > 0 && pe.PAT > 0 {
+			implied := pe.TTMPE * pe.PAT
+			if !mcapPlausible(pe.LatestMarketCap, implied) {
+				stats.MissingData++
+				res.Drops = append(res.Drops, DropReason{
+					Symbol: sym, Stage: "missing_data",
+					Reason: fmt.Sprintf("MCap implausible: claimed %.0f Cr vs PExPAT-implied ~%.0f Cr — fix the sheet row", pe.LatestMarketCap, implied),
+				})
+				continue
+			}
 		}
 		// PE allowed to be 0 only if PAT<=0 (loss-maker) — but loss-makers fail PAT filter anyway
 		if pe.TTMPE <= 0 && pe.PAT > 0 && pe.TTMEPS > 0 {
@@ -387,4 +410,14 @@ func (p *Pipeline) applyCaps(candidates []*ManthanStock, stats *PipelineStats) [
 		out = append(out, s)
 	}
 	return out
+}
+
+// mcapPlausible reports whether a sheet-claimed market cap is internally
+// consistent with the same row's PE x PAT implied value, within a generous
+// 4x band either way. See the plausibility gate above (2026-09-09).
+func mcapPlausible(claimedCr, impliedCr float64) bool {
+	if impliedCr <= 0 {
+		return true // can't judge
+	}
+	return claimedCr <= 4*impliedCr && claimedCr >= impliedCr/4
 }
