@@ -43,20 +43,20 @@ func (e *BrokerBusinessError) Error() string {
 // preventing Indira EG003 "Price Not in multiple of PriceTick" caused by float64
 // representation (e.g. 5911.3 stored as 5911.2999... → broker gets 591129 paise ≠ multiple of 5).
 type PlaceOrderRequest struct {
-	Symbol       string    `json:"symbol"`       // e.g., "STK_TCS_EQ_NSE_11536"
-	ExcToken     string    `json:"excToken"`     // Exchange token, e.g., "11536"
-	Exc          string    `json:"exc"`          // Exchange, e.g., "NSE"
-	OrdAction    string    `json:"ordAction"`    // "BUY" or "SELL"
-	OrdValidity  string    `json:"ordValidity"`  // "DAY", "IOC"
-	OrdType      string    `json:"ordType"`      // "Market", "Limit", "SL", "SL-M"
-	PrdType      string    `json:"prdType"`      // "INTRADAY", "DELIVERY", "CASH"
+	Symbol       string    `json:"symbol"`                 // e.g., "STK_TCS_EQ_NSE_11536"
+	ExcToken     string    `json:"excToken"`               // Exchange token, e.g., "11536"
+	Exc          string    `json:"exc"`                    // Exchange, e.g., "NSE"
+	OrdAction    string    `json:"ordAction"`              // "BUY" or "SELL"
+	OrdValidity  string    `json:"ordValidity"`            // "DAY", "IOC"
+	OrdType      string    `json:"ordType"`                // "Market", "Limit", "SL", "SL-M"
+	PrdType      string    `json:"prdType"`                // "INTRADAY", "DELIVERY", "CASH"
 	LimitPrice   Price2DP  `json:"limitPrice"`             // Limit price — emits "5911.30" not "5911.3"
 	TriggerPrice Price2DP  `json:"triggerPrice,omitempty"` // Trigger price — omitted when 0 (Limit/Market orders); broker rejects triggerPrice:0 on non-SL orders
-	Qty          int       `json:"qty"`          // Quantity
-	DisQty       int       `json:"disQty"`       // Disclosed quantity
-	LotSize      int       `json:"lotSize"`      // Lot size
-	Instrument   string    `json:"instrument"`   // "STK", "OPT", "FUT", "IDX"
-	Amo          bool      `json:"amo"`          // After Market Order
+	Qty          int       `json:"qty"`                    // Quantity
+	DisQty       int       `json:"disQty"`                 // Disclosed quantity
+	LotSize      int       `json:"lotSize"`                // Lot size
+	Instrument   string    `json:"instrument"`             // "STK", "OPT", "FUT", "IDX"
+	Amo          bool      `json:"amo"`                    // After Market Order
 	BoStpLoss    *Price2DP `json:"boStpLoss,omitempty"`    // Bracket order stop loss
 	BoTgtPrice   *Price2DP `json:"boTgtPrice,omitempty"`   // Bracket order target price
 
@@ -67,7 +67,7 @@ type PlaceOrderRequest struct {
 	// AlgoCategory env vars (MANTHAN_ALGO_ID, MANTHAN_ALGO_CATEGORY) before
 	// SEBI's enforcement deadline; orders without these will then fail with
 	// infoID/exchange code 17179 ERR_INVALID_ALGO_ID.
-	AlgoID       int    `json:"algoID,omitempty"`
+	AlgoID       int    `json:"algoId,omitempty"`
 	AlgoCategory string `json:"algoCategory,omitempty"`
 }
 
@@ -171,7 +171,7 @@ type OrderBook struct {
 	Price        float64         `json:"price,omitempty"`        // LIMIT price (NOT limitPrice — API doc names it `price`)
 	TriggerPrice float64         `json:"triggerPrice,omitempty"` // SL trigger
 	RejReason    string          `json:"rejReason,omitempty"`
-	OrdDate      string          `json:"ordDate,omitempty"`   // dd-MMM-yyyy hh24:mm:ss
+	OrdDate      string          `json:"ordDate,omitempty"` // dd-MMM-yyyy hh24:mm:ss
 	ExcOrdTime   string          `json:"excOrdTime,omitempty"`
 	Qty          int             `json:"qty,omitempty"`
 	DisQty       int             `json:"disQty,omitempty"`
@@ -205,17 +205,17 @@ type TradeBook struct {
 	// decoding; parse it with ExchTradeID() which fails loudly on overflow.
 	ExchTrdId json.RawMessage `json:"exchTrdId,omitempty"`
 	ExchOrdId string          `json:"exchOrdId,omitempty"`
-	PrdType    string      `json:"prdType,omitempty"`
-	OrdAction  string      `json:"ordAction,omitempty"`
-	OrdType    string      `json:"ordType,omitempty"`
+	PrdType   string          `json:"prdType,omitempty"`
+	OrdAction string          `json:"ordAction,omitempty"`
+	OrdType   string          `json:"ordType,omitempty"`
 	// TradedPrice is the actual exchange fill price (authoritative).
-	TradedPrice float64 `json:"tradedPrice,omitempty"`
-	TradeTime   string  `json:"tradeTime,omitempty"` // e.g. "2026-03-30 11:57:08"
-	TradedQty   int     `json:"tradedQty,omitempty"`
-	RemainQty   int     `json:"remainQty,omitempty"`
-	Qty         int     `json:"qty,omitempty"`
+	TradedPrice float64     `json:"tradedPrice,omitempty"`
+	TradeTime   string      `json:"tradeTime,omitempty"` // e.g. "2026-03-30 11:57:08"
+	TradedQty   int         `json:"tradedQty,omitempty"`
+	RemainQty   int         `json:"remainQty,omitempty"`
+	Qty         int         `json:"qty,omitempty"`
 	Symbol      interface{} `json:"symbol,omitempty"` // complex object from broker
-	UndAsset    string  `json:"undAsset,omitempty"`
+	UndAsset    string      `json:"undAsset,omitempty"`
 }
 
 // ExchTradeID parses the raw exchTrdId into an int64. The broker sends it as a
@@ -248,13 +248,13 @@ func (t *TradeBook) ExchTradeID() (int64, error) {
 // returns it as an array because a single security may be listed on multiple
 // exchanges (NSE + BSE). For Manthan we only act on the NSE leg.
 type HoldingSymbol struct {
-	Symbol        string `json:"symbol,omitempty"`        // STK_KINGFA_EQ_NSE_18944
-	DispSym       string `json:"dispSym,omitempty"`       // KINGFA
-	BaseSym       string `json:"baseSym,omitempty"`       // KINGFA
-	Instrument    string `json:"instrument,omitempty"`    // STK
+	Symbol        string `json:"symbol,omitempty"`     // STK_KINGFA_EQ_NSE_18944
+	DispSym       string `json:"dispSym,omitempty"`    // KINGFA
+	BaseSym       string `json:"baseSym,omitempty"`    // KINGFA
+	Instrument    string `json:"instrument,omitempty"` // STK
 	CompanyName   string `json:"companyName,omitempty"`
 	ISIN          string `json:"isin,omitempty"`
-	Exc           string `json:"exc,omitempty"`           // NSE / BSE
+	Exc           string `json:"exc,omitempty"` // NSE / BSE
 	ExcTkn        int    `json:"excTkn,omitempty"`
 	Series        string `json:"series,omitempty"`
 	StreamSym     string `json:"streamSym,omitempty"`
@@ -266,12 +266,12 @@ type HoldingSymbol struct {
 // Holding represents one holding in the user's portfolio. Shape matches
 // Indira API doc (Portfolio → Holdings, page 21–22):
 //
-//   data.holdings[] = {
-//     symbol: [HoldingSymbol, ...],          // array of exchange listings
-//     ltp, qty, holdingQty, usedQty, btst,
-//     pledgeQty, prdType, avgPrice, invested,
-//     haircut, pledgeable, freeQty
-//   }
+//	data.holdings[] = {
+//	  symbol: [HoldingSymbol, ...],          // array of exchange listings
+//	  ltp, qty, holdingQty, usedQty, btst,
+//	  pledgeQty, prdType, avgPrice, invested,
+//	  haircut, pledgeable, freeQty
+//	}
 //
 // freeQty is the field that matters for SELL pre-flight checks: the doc
 // says "Quantity free and unrestricted, available for immediate sale; should
@@ -311,12 +311,12 @@ type Holding struct {
 // Position represents a position in the position book
 // PositionSymbol is the nested "symbol" object inside each Indira position.
 type PositionSymbol struct {
-	Symbol      string `json:"symbol,omitempty"`      // e.g. "STK_MOTHERSON_EQ_NSE_4204"
-	DispSym     string `json:"dispSym,omitempty"`     // e.g. "MOTHERSON"
-	BaseSym     string `json:"baseSym,omitempty"`     // e.g. "MOTHERSON"
-	Instrument  string `json:"instrument,omitempty"`  // e.g. "STK"
-	Exc         string `json:"exc,omitempty"`         // e.g. "NSE"
-	ExcTkn      int    `json:"excTkn,omitempty"`      // e.g. 4204
+	Symbol      string `json:"symbol,omitempty"`        // e.g. "STK_MOTHERSON_EQ_NSE_4204"
+	DispSym     string `json:"dispSym,omitempty"`       // e.g. "MOTHERSON"
+	BaseSym     string `json:"baseSym,omitempty"`       // e.g. "MOTHERSON"
+	Instrument  string `json:"instrument,omitempty"`    // e.g. "STK"
+	Exc         string `json:"exc,omitempty"`           // e.g. "NSE"
+	ExcTkn      int    `json:"excTkn,omitempty"`        // e.g. 4204
 	TradingSym  string `json:"tradingSymbol,omitempty"` // e.g. "MOTHERSON-EQ"
 	Series      string `json:"series,omitempty"`
 	TickSize    string `json:"tickSize,omitempty"`
@@ -327,25 +327,25 @@ type PositionSymbol struct {
 }
 
 type Position struct {
-	Symbol        PositionSymbol `json:"symbol"`
-	PrdType       string         `json:"prdType,omitempty"`
-	Type          string         `json:"type,omitempty"` // "DAILY" or "EXPIRY"
-	NetQty        int            `json:"netQty"`
-	BuyQty        int            `json:"buyQty"`
-	SellQty       int            `json:"sellQty"`
-	BuyAvgPrice   float64        `json:"buyAvgPrice"`
-	SellAvgPrice  float64        `json:"sellAvgPrice"`
-	LTP           float64        `json:"ltp"`           // last traded price
-	NetPnL        float64        `json:"netPnl"`        // net P&L
-	PnLPerc       float64        `json:"pnlPerc"`       // P&L percentage
-	AvgPrice      float64        `json:"avgPrice"`
-	BuyAmt        float64        `json:"buyAmt"`
-	SellAmt       float64        `json:"sellAmt"`
-	OrdAction     string         `json:"ordAction,omitempty"` // "BUY" or "SELL"
-	DayBuyQty     int            `json:"dayBuyQty"`
-	DaySellQty    int            `json:"daySellQty"`
-	CFBuyQty      int            `json:"cfBuyQty"`
-	CFSellQty     int            `json:"cfSellQty"`
+	Symbol       PositionSymbol `json:"symbol"`
+	PrdType      string         `json:"prdType,omitempty"`
+	Type         string         `json:"type,omitempty"` // "DAILY" or "EXPIRY"
+	NetQty       int            `json:"netQty"`
+	BuyQty       int            `json:"buyQty"`
+	SellQty      int            `json:"sellQty"`
+	BuyAvgPrice  float64        `json:"buyAvgPrice"`
+	SellAvgPrice float64        `json:"sellAvgPrice"`
+	LTP          float64        `json:"ltp"`     // last traded price
+	NetPnL       float64        `json:"netPnl"`  // net P&L
+	PnLPerc      float64        `json:"pnlPerc"` // P&L percentage
+	AvgPrice     float64        `json:"avgPrice"`
+	BuyAmt       float64        `json:"buyAmt"`
+	SellAmt      float64        `json:"sellAmt"`
+	OrdAction    string         `json:"ordAction,omitempty"` // "BUY" or "SELL"
+	DayBuyQty    int            `json:"dayBuyQty"`
+	DaySellQty   int            `json:"daySellQty"`
+	CFBuyQty     int            `json:"cfBuyQty"`
+	CFSellQty    int            `json:"cfSellQty"`
 }
 
 // ConvertPositionRequest represents a request to convert position

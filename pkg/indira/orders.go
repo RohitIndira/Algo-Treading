@@ -4,13 +4,37 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 )
+
+// applyAlgoTag stamps the SEBI-registered algo id (and category) onto an
+// order body from env — MANTHAN_ALGO_ID / MANTHAN_ALGO_CATEGORY — unless the
+// caller already set them. Called ONLY by PlaceOrder (per operator scope
+// 2026-09-18: tag place-order bodies; leave modify/cancel/other requests
+// exactly as they are). Post the 2026-09 NSE approval
+// (algo id 162933) an untagged order fails with exchange code 17179
+// ERR_INVALID_ALGO_ID; the X-Algo-Id header (INDIRA_X_ALGO_ID, set in
+// doRequest) covers the broker rate-gate separately.
+func applyAlgoTag(algoID *int, algoCategory *string) {
+	if *algoID == 0 {
+		if v := os.Getenv("MANTHAN_ALGO_ID"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				*algoID = n
+			}
+		}
+	}
+	if *algoCategory == "" {
+		*algoCategory = os.Getenv("MANTHAN_ALGO_CATEGORY")
+	}
+}
 
 // ============ Order Management Methods ============
 
 // PlaceOrder places a new order
 // auth parameter contains user-specific authentication from frontend
 func (c *Client) PlaceOrder(ctx context.Context, auth *AuthContext, req *PlaceOrderRequest) (*PlaceOrderResponse, error) {
+	applyAlgoTag(&req.AlgoID, &req.AlgoCategory)
 	resp, err := c.doRequest(ctx, auth, "POST", "/order-services/api/order/v1/place-order", req)
 	if err != nil {
 		return nil, fmt.Errorf("place order request failed: %w", err)
