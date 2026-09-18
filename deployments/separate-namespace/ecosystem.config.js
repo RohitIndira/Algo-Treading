@@ -85,6 +85,11 @@ module.exports = {
         // disable (rollback path — must be forwarded here or it never
         // reaches the process; env blocks are whitelists).
         MANTHAN_MANUAL_EXIT_LEDGER: ENV.MANTHAN_MANUAL_EXIT_LEDGER || '',
+        // SEBI algo tag (NSE approval 162933) — stamped on place-order
+        // bodies as algoId. From .env so it can be set/rotated without a
+        // code change. Env blocks are whitelists — must be forwarded here.
+        MANTHAN_ALGO_ID: ENV.MANTHAN_ALGO_ID || '',
+        MANTHAN_ALGO_CATEGORY: ENV.MANTHAN_ALGO_CATEGORY || '',
         // Price client (paper monitor, OCO trailing SL, price-monitor fallback)
         // reads market:nse:{token} LTP — point REDIS_HOST/PORT at the external
         // market feed, NOT the empty local redis. EXT_REDIS_ADDR (broker adapter)
