@@ -50,6 +50,7 @@ type HTTP struct {
 	risk       *RiskStore       // nil-safe: M9 routes absent without it
 	ops        *OpsStore        // nil-safe: M10 route absent without it
 	exports    *ExportStore     // nil-safe: M11 routes absent without it
+	dashboard  *DashboardStore  // nil-safe: M12 dashboard/clients routes absent without it
 }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
@@ -84,6 +85,10 @@ func (h *HTTP) SetEOD(e *EODStore)         { h.eod = e }
 func (h *HTTP) SetRisk(r *RiskStore)       { h.risk = r }
 func (h *HTTP) SetOps(o *OpsStore)         { h.ops = o }
 func (h *HTTP) SetExports(x *ExportStore)  { h.exports = x }
+
+// SetDashboard enables the M12 dashboard + clients analytics. Call before
+// Register.
+func (h *HTTP) SetDashboard(d *DashboardStore) { h.dashboard = d }
 
 func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 
@@ -184,6 +189,23 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "GET", "/exports/orders", "EXPORT_ORDERS", TierRead, h.handleExportOrders)
 		h.Route(token, "GET", "/exports/events", "EXPORT_EVENTS", TierRead, h.handleExportEvents)
 		h.Route(token, "GET", "/exports/admin-actions", "EXPORT_ADMIN_ACTIONS", TierRead, h.handleExportAdmin)
+	}
+	// M12: dashboard + clients analytics (all read-only).
+	if h.dashboard != nil {
+		h.Route(token, "GET", "/portfolio/pnl-history", "DASH_PNL_HISTORY", TierRead, h.handleDashPnLHistory)
+		h.Route(token, "GET", "/portfolio/position-history", "DASH_POSITION_HISTORY", TierRead, h.handleDashPositionHistory)
+		h.Route(token, "GET", "/portfolio/best-worst-trades", "DASH_BEST_WORST", TierRead, h.handleDashBestWorst)
+		h.Route(token, "GET", "/portfolio/sector-breakdown", "DASH_SECTORS", TierRead, h.handleDashSectors)
+		h.Route(token, "GET", "/portfolio/stock-allocation", "DASH_STOCK_ALLOC", TierRead, h.handleDashStockAlloc)
+		h.Route(token, "GET", "/portfolio/mcap-performance", "DASH_MCAP_PERF", TierRead, h.handleDashMcap)
+		h.Route(token, "GET", "/portfolio/ema-allocation", "DASH_EMA_ALLOC", TierRead, h.handleDashEMA)
+		h.Route(token, "GET", "/portfolio/positions", "DASH_POSITIONS", TierRead, h.handleDashPositions)
+		h.Route(token, "GET", "/portfolio/positions-summary", "DASH_POSITIONS_SUMMARY", TierRead, h.handleDashPositionsSummary)
+		h.Route(token, "GET", "/clients", "CLIENTS_LIST", TierRead, h.handleClientsList)
+		h.Route(token, "GET", "/clients/{client_id}/summary", "CLIENT_SUMMARY", TierRead, h.handleClientSummary)
+		h.Route(token, "GET", "/clients/{client_id}/equity-curve", "CLIENT_EQUITY_CURVE", TierRead, h.handleClientEquityCurve)
+		h.Route(token, "GET", "/clients/{client_id}/drawdown", "CLIENT_DRAWDOWN", TierRead, h.handleClientDrawdown)
+		h.Route(token, "GET", "/clients/{client_id}/mtm-series", "CLIENT_MTM_SERIES", TierRead, h.handleClientMTM)
 	}
 }
 

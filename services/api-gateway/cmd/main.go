@@ -130,6 +130,7 @@ func main() {
 	var liveAlgosPerfStore performance.Store
 	var liveAlgosPerfClientMap map[string]string
 	var liveAlgosNAVStore *livealgos.NAVStore // true deployment NAV curve (stockk_market)
+	var dashPerfDB *sql.DB                    // stockk_market handle for the M12 admin dashboard
 	var extRedis *redis.Client                // hoisted: reused by the market-quote handler
 	// positionsDB, ordersDB + their DB names hoisted so downstream setup
 	// (live-algos store in DB.1, portfolio token lookup in PF.D) can reuse
@@ -223,6 +224,7 @@ func main() {
 		} else {
 			log.Printf("Manthan performance DB connected (%s)", perfDBName)
 			defer perfDB.Close()
+			dashPerfDB = perfDB // shared with the M12 admin dashboard (reads only)
 			perfStore := performance.NewPostgresStore(perfDB)
 			liveAlgosNAVStore = livealgos.NewNAVStore(perfDB)
 			// Maps algo id → reference client id in the sheet. Grows as
@@ -608,6 +610,16 @@ func main() {
 		adminHTTP.SetOps(admin.NewOpsStore(adminFleet, teMetrics, infraLTP))
 		adminHTTP.SetExports(admin.NewExportStore(adminFleet, admin.NewStore(positionsDB)))
 		log.Printf("Admin EOD/risk/infra/exports enabled (M8–M11)")
+
+		// M12: dashboard + clients analytics. Needs the NAV/benchmark DB
+		// (stockk_market) on top of the business handles; LTP optional
+		// (valuations degrade to entry prices without it).
+		if dashPerfDB != nil {
+			adminHTTP.SetDashboard(admin.NewDashboardStore(positionsDB, ordersDB, dashPerfDB, adminLTP))
+			log.Printf("Admin dashboard/clients analytics enabled (M12; LTP wired=%v)", adminLTP != nil)
+		} else {
+			log.Printf("⚠ Admin M12 dashboard DISABLED — stockk_market handle unavailable")
+		}
 	} else if adminHTTP != nil {
 		log.Printf("⚠ Admin fleet endpoints DISABLED — missing business DB handle (trading=%v orders=%v positions=%v)",
 			positionsDB != nil, ordersDB != nil, positionsSSotDB != nil)
