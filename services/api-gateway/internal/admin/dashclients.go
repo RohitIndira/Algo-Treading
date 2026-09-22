@@ -146,7 +146,7 @@ func (d *DashboardStore) Clients(ctx context.Context) (any, error) {
 			StartedAt: b.StartedAt.In(d.ist).Format("2006-01-02"),
 			Positions: counts[b.UserID], InvestedFund: round2f(b.InvestedFund),
 			UtilizedExposure: round2f(utilized[b.UserID]),
-			Status:           "STOPPED",
+			Status:           "PAUSED", // deactivated but resumable (deleted strategies are excluded)
 		}
 		if b.ActiveCount > 0 {
 			c.Status = "ACTIVE"
@@ -283,21 +283,38 @@ func (d *DashboardStore) EquityCurve(ctx context.Context, userID string, days in
 		return nil, err
 	}
 	type point struct {
-		Date             string   `json:"date"`
-		PortfolioIndexed float64  `json:"portfolio_indexed"`
-		NiftyIndexed     *float64 `json:"nifty_indexed,omitempty"`
-		PortfolioValue   float64  `json:"portfolio_value"`
+		Date              string   `json:"date"`
+		PortfolioIndexed  float64  `json:"portfolio_indexed"`
+		NiftyIndexed      *float64 `json:"nifty_indexed,omitempty"`
+		Midcap150Indexed  *float64 `json:"midcap150_indexed,omitempty"`
+		Smallcap250Indexed *float64 `json:"smallcap250_indexed,omitempty"`
+		PortfolioValue    float64  `json:"portfolio_value"`
 	}
 	series := make([]point, 0, len(nav))
 	if len(nav) == 0 {
 		return map[string]any{"series": series, "outperformance_pct": 0}, nil
 	}
 
-	nifty, err := d.niftyCloses(ctx, nav[0].Date)
+	// Three index overlays, one query. Same omit-on-missing-date rule for
+	// each: the frontend carries the previous value forward when plotting.
+	closes, err := d.benchmarkCloses(ctx, nav[0].Date)
 	if err != nil {
 		return nil, err
 	}
-	var niftyBase, lastPort, lastNifty float64
+	base := map[string]float64{}
+	last := map[string]float64{"portfolio": 0}
+	idxFor := func(bench, date string) *float64 {
+		c, ok := closes[bench][date]
+		if !ok {
+			return nil
+		}
+		if base[bench] == 0 {
+			base[bench] = c
+		}
+		v := round2f(c / base[bench] * 100)
+		last[bench] = v
+		return &v
+	}
 	for i, n := range nav {
 		p := point{
 			Date:           n.Date.Format("2006-01-02"),
@@ -305,43 +322,51 @@ func (d *DashboardStore) EquityCurve(ctx context.Context, userID string, days in
 		}
 		if vals[0] > 0 {
 			p.PortfolioIndexed = round2f(vals[i] / vals[0] * 100)
-			lastPort = p.PortfolioIndexed
+			last["portfolio"] = p.PortfolioIndexed
 		}
-		if close, ok := nifty[p.Date]; ok {
-			if niftyBase == 0 {
-				niftyBase = close
-			}
-			idx := round2f(close / niftyBase * 100)
-			p.NiftyIndexed = &idx
-			lastNifty = idx
-		}
+		p.NiftyIndexed = idxFor("nifty50", p.Date)
+		p.Midcap150Indexed = idxFor("midcap150", p.Date)
+		p.Smallcap250Indexed = idxFor("smallcap250", p.Date)
 		series = append(series, p)
 	}
-	out := round2f(lastPort - lastNifty)
-	if lastNifty == 0 {
-		out = 0
+	outVs := func(bench string) float64 {
+		if last[bench] == 0 {
+			return 0
+		}
+		return round2f(last["portfolio"] - last[bench])
 	}
-	return map[string]any{"series": series, "outperformance_pct": out}, nil
+	return map[string]any{
+		"series":                        series,
+		"outperformance_pct":            outVs("nifty50"),
+		"outperformance_midcap150_pct":  outVs("midcap150"),
+		"outperformance_smallcap250_pct": outVs("smallcap250"),
+	}, nil
 }
 
-// niftyCloses maps ISO date → nifty50 close since a start date.
-func (d *DashboardStore) niftyCloses(ctx context.Context, since time.Time) (map[string]float64, error) {
+// benchmarkCloses maps benchmark_id → (ISO date → close) since a start
+// date, for every benchmark the sync script maintains.
+func (d *DashboardStore) benchmarkCloses(ctx context.Context, since time.Time) (map[string]map[string]float64, error) {
 	rows, err := d.perfDB.QueryContext(ctx, `
-		SELECT date, close_value FROM benchmark_daily
-		WHERE benchmark_id = 'nifty50' AND date >= $1 ORDER BY date`,
+		SELECT benchmark_id, date, close_value FROM benchmark_daily
+		WHERE benchmark_id IN ('nifty50','midcap150','smallcap250') AND date >= $1
+		ORDER BY date`,
 		since.Format("2006-01-02"))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]float64{}
+	out := map[string]map[string]float64{}
 	for rows.Next() {
+		var id string
 		var dt time.Time
 		var close float64
-		if err := rows.Scan(&dt, &close); err != nil {
+		if err := rows.Scan(&id, &dt, &close); err != nil {
 			return nil, err
 		}
-		out[dt.Format("2006-01-02")] = close
+		if out[id] == nil {
+			out[id] = map[string]float64{}
+		}
+		out[id][dt.Format("2006-01-02")] = close
 	}
 	return out, rows.Err()
 }
@@ -429,11 +454,17 @@ func (d *DashboardStore) MTMSeries(ctx context.Context, userID string, days int)
 		prev = n.NetPnL
 		sum += mtm
 	}
-	avg := 0.0
+	avg, avgPct := 0.0, 0.0
 	if len(series) > 1 {
-		avg = round2f(sum / float64(len(series)-1)) // first point carries no MTM
+		n := float64(len(series) - 1) // first point carries no MTM
+		avg = round2f(sum / n)
+		pctSum := 0.0
+		for _, p := range series[1:] {
+			pctSum += p.MTMPct
+		}
+		avgPct = round2f(pctSum / n)
 	}
-	return map[string]any{"series": series, "avg_daily_mtm": avg}, nil
+	return map[string]any{"series": series, "avg_daily_mtm": avg, "avg_daily_mtm_pct": avgPct}, nil
 }
 
 // silence the unused-import vet if sql ends up unused in a refactor

@@ -615,7 +615,7 @@ func main() {
 		// (stockk_market) on top of the business handles; LTP optional
 		// (valuations degrade to entry prices without it).
 		if dashPerfDB != nil {
-			adminHTTP.SetDashboard(admin.NewDashboardStore(positionsDB, ordersDB, dashPerfDB, adminLTP))
+			adminHTTP.SetDashboard(admin.NewDashboardStore(positionsDB, ordersDB, dashPerfDB, signalsDB, adminLTP))
 			log.Printf("Admin dashboard/clients analytics enabled (M12; LTP wired=%v)", adminLTP != nil)
 		} else {
 			log.Printf("⚠ Admin M12 dashboard DISABLED — stockk_market handle unavailable")

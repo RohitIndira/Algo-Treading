@@ -36,8 +36,14 @@
 set -euo pipefail
 
 RANGE="${1:-3mo}"
-BENCH_ID="nifty50"
-URL="https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?range=${RANGE}&interval=1d"
+# One run syncs ALL benchmark ids below (2026-09-22: midcap150 + smallcap250
+# added for the admin equity-curve overlay) — the existing daily cron needs
+# no change. Symbols are Yahoo chart tickers, URL-encoded where needed.
+BENCHES=(
+  "nifty50|%5ENSEI"
+  "midcap150|NIFTYMIDCAP150.NS"
+  "smallcap250|NIFTYSMLCAP250.NS"
+)
 
 PGHOST="${PGHOST:-localhost}"
 PGPORT="${PGPORT:-5432}"
@@ -50,7 +56,12 @@ trap 'rm -rf "$WORKDIR"' EXIT
 JSON="$WORKDIR/nsei.json"
 SQL="$WORKDIR/upsert.sql"
 
-echo "[nifty] fetching ^NSEI range=${RANGE} from Yahoo…"
+for PAIR in "${BENCHES[@]}"; do
+BENCH_ID="${PAIR%%|*}"
+SYMBOL="${PAIR#*|}"
+URL="https://query1.finance.yahoo.com/v8/finance/chart/${SYMBOL}?range=${RANGE}&interval=1d"
+
+echo "[${BENCH_ID}] fetching ${SYMBOL} range=${RANGE} from Yahoo…"
 # Yahoo rejects the default curl agent.
 curl -fsSL -H "User-Agent: Mozilla/5.0" --max-time 30 "$URL" -o "$JSON"
 
@@ -106,15 +117,16 @@ with open(sql_path, "w") as out:
         )
     out.write("COMMIT;\n")
 
-print(f"[nifty] parsed {len(points)} sessions: {points[0][0]} → {points[-1][0]}", file=sys.stderr)
+print(f"[{bench_id}] parsed {len(points)} sessions: {points[0][0]} → {points[-1][0]}", file=sys.stderr)
 PY
 
-echo "[nifty] applying to ${PGDATABASE}…"
+echo "[${BENCH_ID}] applying to ${PGDATABASE}…"
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -q -v ON_ERROR_STOP=1 -f "$SQL"
 
-echo "[nifty] verifying…"
+echo "[${BENCH_ID}] verifying…"
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c "
 SELECT count(*) AS rows, min(date) AS first_date, max(date) AS latest_date
 FROM benchmark_daily WHERE benchmark_id='${BENCH_ID}';"
+done
 
-echo "[nifty] done."
+echo "[benchmarks] done."

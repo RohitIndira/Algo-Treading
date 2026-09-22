@@ -26,12 +26,16 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
+
+	"github.com/RohitIndira/Algo-Treading/services/api-gateway/internal/livealgos"
 )
 
 // DashboardStore owns the SQL + LTP access for the M12 endpoints.
@@ -39,18 +43,19 @@ type DashboardStore struct {
 	tradingDB *sql.DB // manthan_positions, strategies, trade_configs
 	execDB    *sql.DB // manthan_orders (tokens), signal_inbox (signal times)
 	perfDB    *sql.DB // strategy_nav_daily, benchmark_daily
+	signalsDB *sql.DB // manthan_stocks (52-week highs); nil-safe
 	ltp       LTPFeed // nil-safe: prices degrade to entry-price valuation
 	ist       *time.Location
 	now       func() time.Time
 }
 
-func NewDashboardStore(tradingDB, execDB, perfDB *sql.DB, ltp LTPFeed) *DashboardStore {
+func NewDashboardStore(tradingDB, execDB, perfDB, signalsDB *sql.DB, ltp LTPFeed) *DashboardStore {
 	loc, err := time.LoadLocation("Asia/Kolkata")
 	if err != nil || loc == nil {
 		loc = time.FixedZone("IST", 5*3600+30*60)
 	}
 	return &DashboardStore{
-		tradingDB: tradingDB, execDB: execDB, perfDB: perfDB,
+		tradingDB: tradingDB, execDB: execDB, perfDB: perfDB, signalsDB: signalsDB,
 		ltp: ltp, ist: loc, now: time.Now,
 	}
 }
@@ -128,8 +133,10 @@ func pct(part, whole float64) float64 {
 
 // ── 1. P&L history ──────────────────────────────────────────────────────
 
-func (d *DashboardStore) PnLHistory(ctx context.Context, days int) (any, error) {
-	nav, err := d.navSeries(ctx, "", days)
+// PnLHistory serves both the portfolio chart (userID == "") and the
+// per-client mirror (§4a of the frontend gaps doc).
+func (d *DashboardStore) PnLHistory(ctx context.Context, userID string, days int) (any, error) {
+	nav, err := d.navSeries(ctx, userID, days)
 	if err != nil {
 		return nil, err
 	}
@@ -157,8 +164,8 @@ func (d *DashboardStore) PnLHistory(ctx context.Context, days int) (any, error) 
 
 // ── 2. Position-count history ───────────────────────────────────────────
 
-func (d *DashboardStore) PositionHistory(ctx context.Context, days int) (any, error) {
-	nav, err := d.navSeries(ctx, "", days)
+func (d *DashboardStore) PositionHistory(ctx context.Context, userID string, days int) (any, error) {
+	nav, err := d.navSeries(ctx, userID, days)
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +301,34 @@ func (d *DashboardStore) EMAAllocation(ctx context.Context) (any, error) {
 		}
 		out = append(out, alloc{EMALevel: lvl, Percentage: pct(values[i], total), PositionCount: counts[i], Value: round2f(values[i])})
 	}
-	return map[string]any{"allocations": out}, nil
+
+	// §6b: with-EMA vs without-EMA cohorts. A direct-buy position (outside
+	// the signal flow) carries NULL ema_alloc_pct; every allocator entry
+	// has a value. Cohorts are over the open book, like the levels above.
+	type cohort struct {
+		PositionCount int     `json:"position_count"`
+		Value         float64 `json:"value"`
+		Percentage    float64 `json:"percentage"`
+	}
+	var with, without cohort
+	err = d.tradingDB.QueryRowContext(ctx, `
+		SELECT COUNT(*) FILTER (WHERE ema_alloc_pct IS NOT NULL),
+		       COALESCE(SUM(invested_amt) FILTER (WHERE ema_alloc_pct IS NOT NULL), 0),
+		       COUNT(*) FILTER (WHERE ema_alloc_pct IS NULL),
+		       COALESCE(SUM(invested_amt) FILTER (WHERE ema_alloc_pct IS NULL), 0)
+		FROM manthan_positions WHERE status IN `+openStatuses).
+		Scan(&with.PositionCount, &with.Value, &without.PositionCount, &without.Value)
+	if err != nil {
+		return nil, err
+	}
+	tot := with.Value + without.Value
+	with.Percentage, without.Percentage = pct(with.Value, tot), pct(without.Value, tot)
+	with.Value, without.Value = round2f(with.Value), round2f(without.Value)
+
+	return map[string]any{
+		"allocations": out,
+		"by_ema_flag": map[string]any{"with_ema": with, "without_ema": without},
+	}, nil
 }
 
 func (d *DashboardStore) McapPerformance(ctx context.Context) (any, error) {
@@ -321,6 +355,7 @@ func (d *DashboardStore) McapPerformance(ctx context.Context) (any, error) {
 		Value         float64 `json:"value"`
 	}
 	var out []segment
+	seen := map[string]bool{}
 	for rows.Next() {
 		var s segment
 		if err := rows.Scan(&s.Cap, &s.PositionCount, &s.Value, &s.AvgReturnPct); err != nil {
@@ -328,8 +363,19 @@ func (d *DashboardStore) McapPerformance(ctx context.Context) (any, error) {
 		}
 		s.AvgReturnPct, s.Value = round2f(s.AvgReturnPct), round2f(s.Value)
 		out = append(out, s)
+		seen[s.Cap] = true
 	}
-	return map[string]any{"segments": out}, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Canonical buckets always present, zero-filled — the frontend's
+	// LARGE tile must render even while nothing large-cap is held.
+	for _, cap := range []string{"SMALL", "MID", "LARGE"} {
+		if !seen[cap] {
+			out = append(out, segment{Cap: cap})
+		}
+	}
+	return map[string]any{"segments": out}, nil
 }
 
 // ── LTP helpers ─────────────────────────────────────────────────────────
@@ -366,9 +412,12 @@ func (d *DashboardStore) symbolTokens(ctx context.Context, symbols []string) map
 	return out
 }
 
-// fetchLTPs returns symbol → last traded price for whatever the feed knows.
-func (d *DashboardStore) fetchLTPs(ctx context.Context, symbols []string) map[string]float64 {
-	out := map[string]float64{}
+// fetchQuotes returns symbol → full live quote for whatever the feed
+// knows. The market payload carries LTP plus the live 52-week high and
+// its date (verified against the real feed 2026-09-22) — no separate
+// lookup needed for the down-from-high metrics.
+func (d *DashboardStore) fetchQuotes(ctx context.Context, symbols []string) map[string]livealgos.LTPQuote {
+	out := map[string]livealgos.LTPQuote{}
 	if d.ltp == nil {
 		return out
 	}
@@ -385,7 +434,34 @@ func (d *DashboardStore) fetchLTPs(ctx context.Context, symbols []string) map[st
 	quotes, _ := d.ltp.FetchByTokens(ctx, list)
 	for tok, q := range quotes {
 		if sym, ok := tokToSym[tok]; ok && q.LTP > 0 {
-			out[sym] = q.LTP
+			out[sym] = q
+		}
+	}
+	return out
+}
+
+// w52Highs maps symbol → latest 52-week high from the signals universe
+// (data-ingestion refreshes manthan_stocks daily from the sheet). Symbols
+// absent from the sheet simply have no entry — callers omit the metric.
+func (d *DashboardStore) w52Highs(ctx context.Context) map[string]float64 {
+	out := map[string]float64{}
+	if d.signalsDB == nil {
+		return out
+	}
+	rows, err := d.signalsDB.QueryContext(ctx, `
+		SELECT DISTINCT ON (symbol) symbol, week52_high
+		FROM manthan_stocks WHERE week52_high > 0
+		ORDER BY symbol, created_at DESC`)
+	if err != nil {
+		log.Printf("admin dashboard: w52 high lookup failed: %v", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sym string
+		var h float64
+		if rows.Scan(&sym, &h) == nil {
+			out[sym] = h
 		}
 	}
 	return out
@@ -393,11 +469,18 @@ func (d *DashboardStore) fetchLTPs(ctx context.Context, symbols []string) map[st
 
 // ── 5. Stock allocation (top holdings) ──────────────────────────────────
 
-func (d *DashboardStore) StockAllocation(ctx context.Context) (any, error) {
+// StockAllocation is the open book per symbol; userID == "" is book-wide,
+// otherwise scoped to one client (§6d of the frontend gaps doc).
+func (d *DashboardStore) StockAllocation(ctx context.Context, userID string) (any, error) {
 	q := `SELECT symbol, SUM(quantity), COALESCE(SUM(invested_amt),0)
-	      FROM manthan_positions WHERE status IN ` + openStatuses + `
-	      GROUP BY symbol`
-	rows, err := d.tradingDB.QueryContext(ctx, q)
+	      FROM manthan_positions WHERE status IN ` + openStatuses
+	args := []any{}
+	if userID != "" {
+		q += ` AND user_id = $1`
+		args = append(args, userID)
+	}
+	q += ` GROUP BY symbol`
+	rows, err := d.tradingDB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -429,13 +512,13 @@ func (d *DashboardStore) StockAllocation(ctx context.Context) (any, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	ltps := d.fetchLTPs(ctx, syms)
+	quotes := d.fetchQuotes(ctx, syms)
 	total := 0.0
 	for i := range hs {
-		if ltp, ok := ltps[hs[i].Symbol]; ok {
-			live := ltp * float64(hs[i].Quantity)
+		if q, ok := quotes[hs[i].Symbol]; ok {
+			live := q.LTP * float64(hs[i].Quantity)
 			hs[i].PnL = round2f(live - hs[i].Value)
-			hs[i].Value, hs[i].Price, hs[i].priceLive = live, ltp, true
+			hs[i].Value, hs[i].Price, hs[i].priceLive = live, q.LTP, true
 		}
 		total += hs[i].Value
 	}
@@ -470,25 +553,63 @@ type matrixRow struct {
 	SignalExitTime   string   `json:"signal_exit_time,omitempty"`
 	PnL              float64  `json:"pnl"`
 	PnLPct           float64  `json:"pnl_pct"`
+	CurrentValue     float64  `json:"current_value"`
+	Stoploss         *float64 `json:"stoploss,omitempty"`
+	DownFromHighPct  *float64 `json:"down_from_high_pct,omitempty"`
+	ClosedDate       string   `json:"closed_date,omitempty"` // alias of exit_date, per spec
 	EMAAllocationPct *float64 `json:"ema_allocation_pct,omitempty"`
 	HoldingDays      int      `json:"holding_period_days"`
 	Status           string   `json:"status"`
 	signalID         string
 }
 
-func (d *DashboardStore) Positions(ctx context.Context, statusFilter string) (any, error) {
+// PositionsFilter narrows the matrix (§7 of the frontend gaps doc).
+// Zero values mean "no filter"; unknown values fall back to no filter,
+// matching the status parameter's behaviour.
+type PositionsFilter struct {
+	Status   string // all | open | closed
+	Industry string // exact match
+	Mcap     string // SMALL | MID | LARGE
+	EMA      string // with | without (ema_alloc_pct NULL-ness)
+	ClientID string // user_id
+}
+
+func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any, error) {
+	statuses := "('ACTIVE','EXIT_PENDING','EXITED')"
+	switch f.Status {
+	case "open":
+		statuses = openStatuses
+	case "closed":
+		statuses = "('EXITED')"
+	}
 	q := `SELECT id, user_id, symbol, COALESCE(industry,''), COALESCE(mcap_bucket,''),
 	             quantity, entry_price, COALESCE(invested_amt,0), entry_time, exit_time,
-	             exit_price, realized_pnl, ema_alloc_pct, status, COALESCE(signal_id::text,'')
-	      FROM manthan_positions WHERE status IN ('ACTIVE','EXIT_PENDING','EXITED')`
-	switch statusFilter {
-	case "open":
-		q = q[:len(q)-len("('ACTIVE','EXIT_PENDING','EXITED')")] + openStatuses
-	case "closed":
-		q = q[:len(q)-len("('ACTIVE','EXIT_PENDING','EXITED')")] + "('EXITED')"
+	             exit_price, realized_pnl, ema_alloc_pct, status, COALESCE(signal_id::text,''),
+	             current_sl
+	      FROM manthan_positions WHERE status IN ` + statuses
+	args := []any{}
+	add := func(cond string, v any) {
+		args = append(args, v)
+		q += fmt.Sprintf(" AND "+cond, len(args))
+	}
+	if f.Industry != "" {
+		add("industry = $%d", f.Industry)
+	}
+	switch strings.ToUpper(f.Mcap) {
+	case "SMALL", "MID", "LARGE":
+		add("mcap_bucket = $%d", strings.ToUpper(f.Mcap))
+	}
+	switch strings.ToLower(f.EMA) {
+	case "with":
+		q += " AND ema_alloc_pct IS NOT NULL"
+	case "without":
+		q += " AND ema_alloc_pct IS NULL"
+	}
+	if f.ClientID != "" {
+		add("user_id = $%d", f.ClientID)
 	}
 	q += ` ORDER BY entry_time DESC NULLS LAST`
-	rows, err := d.tradingDB.QueryContext(ctx, q)
+	rows, err := d.tradingDB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -501,11 +622,15 @@ func (d *DashboardStore) Positions(ctx context.Context, statusFilter string) (an
 		var r matrixRow
 		var id int64
 		var entryT, exitT sql.NullTime
-		var exitPx, realized, ema sql.NullFloat64
+		var exitPx, realized, ema, csl sql.NullFloat64
 		if err := rows.Scan(&id, &r.ClientID, &r.Script, &r.Industry, &r.Mcap,
 			&r.Quantity, &r.BuyRate, &r.PnL /*invested, reused below*/, &entryT, &exitT,
-			&exitPx, &realized, &ema, &r.Status, &r.signalID); err != nil {
+			&exitPx, &realized, &ema, &r.Status, &r.signalID, &csl); err != nil {
 			return nil, err
+		}
+		if csl.Valid && csl.Float64 > 0 {
+			v := round2f(csl.Float64)
+			r.Stoploss = &v
 		}
 		invested := r.PnL
 		r.PnL = 0
@@ -524,6 +649,7 @@ func (d *DashboardStore) Positions(ctx context.Context, statusFilter string) (an
 			if exitT.Valid {
 				t := exitT.Time.In(d.ist)
 				r.ExitDate, r.ExitTime = t.Format("2006-01-02"), t.Format("15:04")
+				r.ClosedDate = r.ExitDate
 				if entryT.Valid {
 					r.HoldingDays = int(exitT.Time.Sub(entryT.Time).Hours() / 24)
 				}
@@ -531,6 +657,7 @@ func (d *DashboardStore) Positions(ctx context.Context, statusFilter string) (an
 			if exitPx.Valid {
 				r.CurrentPrice = round2f(exitPx.Float64)
 			}
+			r.CurrentValue = round2f(r.CurrentPrice * float64(r.Quantity))
 			if realized.Valid {
 				r.PnL = round2f(realized.Float64)
 				r.PnLPct = pct(realized.Float64, invested)
@@ -551,17 +678,29 @@ func (d *DashboardStore) Positions(ctx context.Context, statusFilter string) (an
 		return nil, err
 	}
 
-	// Live prices for the open rows.
-	ltps := d.fetchLTPs(ctx, openSyms)
+	// Live quotes for the open rows: price, and the feed's own live
+	// 52-week high (falls back to the sheet universe when the feed
+	// misses a symbol).
+	quotes := d.fetchQuotes(ctx, openSyms)
+	sheetHighs := d.w52Highs(ctx)
 	for i := range out {
 		if out[i].Status != "OPEN" {
 			continue
 		}
-		if ltp, ok := ltps[out[i].Script]; ok {
-			out[i].CurrentPrice = round2f(ltp)
+		high := sheetHighs[out[i].Script]
+		if q, ok := quotes[out[i].Script]; ok {
+			out[i].CurrentPrice = round2f(q.LTP)
 			cost := out[i].BuyRate * float64(out[i].Quantity)
-			out[i].PnL = round2f((ltp - out[i].BuyRate) * float64(out[i].Quantity))
+			out[i].PnL = round2f((q.LTP - out[i].BuyRate) * float64(out[i].Quantity))
 			out[i].PnLPct = pct(out[i].PnL, cost)
+			if q.Week52High > 0 {
+				high = q.Week52High
+			}
+		}
+		out[i].CurrentValue = round2f(out[i].CurrentPrice * float64(out[i].Quantity))
+		if high > 0 && out[i].CurrentPrice > 0 {
+			v := pct(out[i].CurrentPrice-high, high) // ≤ 0 when below the high
+			out[i].DownFromHighPct = &v
 		}
 	}
 
@@ -665,17 +804,124 @@ func (d *DashboardStore) positionsAgg(ctx context.Context, userID string) (*posi
 	return &s, nil
 }
 
+// PortfolioSummary is /portfolio/positions-summary: the matrix aggregate
+// plus the portfolio-wide KPIs from §3 of the frontend gaps doc. All the
+// KPI inputs already exist (NAV history, strategy capital, open book).
+type portfolioSummary struct {
+	positionsSummary
+	RealizedPnL         float64 `json:"realized_pnl"`
+	UnrealizedPnL       float64 `json:"unrealized_pnl"`
+	PortfolioValue      float64 `json:"portfolio_value"`
+	CAGR                float64 `json:"cagr"`
+	XIRR                float64 `json:"xirr"` // == CAGR (no cash-flow ledger)
+	AnnualizedReturnPct float64 `json:"annualized_return_pct"`
+	MaxDrawdownPct      float64 `json:"max_drawdown_pct"`
+	CurrentExposurePct  float64 `json:"current_exposure_pct"`
+}
+
+func (d *DashboardStore) PortfolioSummary(ctx context.Context) (any, error) {
+	agg, err := d.positionsAgg(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	out := portfolioSummary{positionsSummary: *agg}
+
+	bases, err := d.clientBases(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	invested := 0.0
+	for _, b := range bases {
+		invested += b.InvestedFund
+	}
+	_, utilized, err := d.openBook(ctx)
+	if err != nil {
+		return nil, err
+	}
+	deployed := 0.0
+	for _, v := range utilized {
+		deployed += v
+	}
+
+	nav, vals, err := d.valueSeries(ctx, "", 3650)
+	if err != nil {
+		return nil, err
+	}
+	if n := len(nav); n > 0 {
+		last := nav[n-1]
+		out.RealizedPnL = round2f(last.Realized)
+		out.UnrealizedPnL = round2f(last.Unrealized)
+		out.PortfolioValue = round2f(invested + last.NetPnL)
+	} else {
+		out.PortfolioValue = round2f(invested)
+	}
+	if len(vals) > 1 && vals[0] > 0 {
+		years := nav[len(nav)-1].Date.Sub(nav[0].Date).Hours() / 24 / 365.25
+		if years > 0 {
+			out.CAGR = round2f((math.Pow(vals[len(vals)-1]/vals[0], 1/years) - 1) * 100)
+		}
+	}
+	out.XIRR, out.AnnualizedReturnPct = out.CAGR, out.CAGR
+	maxDD, _ := drawdownStats(vals)
+	out.MaxDrawdownPct = maxDD
+	out.CurrentExposurePct = pct(deployed, invested)
+	return out, nil
+}
+
+// DownFromHigh lists open positions by distance below their 52-week high
+// (§6c). window is accepted for forward compatibility; today the one
+// source is the sheet-refreshed 52-week high, so any value maps to 52w.
+func (d *DashboardStore) DownFromHigh(ctx context.Context) (any, error) {
+	res, err := d.Positions(ctx, PositionsFilter{Status: "open"})
+	if err != nil {
+		return nil, err
+	}
+	rows := res.(map[string]any)["positions"].([]matrixRow)
+	syms := make([]string, 0, len(rows))
+	for _, r := range rows {
+		syms = append(syms, r.Script)
+	}
+	quotes := d.fetchQuotes(ctx, syms)
+	sheetHighs := d.w52Highs(ctx)
+	type entry struct {
+		PositionID      string  `json:"position_id"`
+		Script          string  `json:"script"`
+		ClientID        string  `json:"client_id"`
+		CurrentPrice    float64 `json:"current_price"`
+		HighPrice       float64 `json:"high_price"`
+		HighDate        string  `json:"high_date,omitempty"` // from the live feed
+		DownFromHighPct float64 `json:"down_from_high_pct"`
+	}
+	out := make([]entry, 0, len(rows))
+	for _, r := range rows {
+		h, hd := sheetHighs[r.Script], ""
+		if q, ok := quotes[r.Script]; ok && q.Week52High > 0 {
+			h, hd = q.Week52High, q.Week52HighDate // live feed beats sheet snapshot
+		}
+		if h <= 0 || r.CurrentPrice <= 0 {
+			continue // no 52w high known for this symbol in feed or sheet
+		}
+		out = append(out, entry{
+			PositionID: r.PositionID, Script: r.Script, ClientID: r.ClientID,
+			CurrentPrice: r.CurrentPrice, HighPrice: round2f(h), HighDate: hd,
+			DownFromHighPct: pct(r.CurrentPrice-h, h),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DownFromHighPct < out[j].DownFromHighPct })
+	return map[string]any{"positions": out, "source": "live feed week_52_high (sheet universe fallback)"}, nil
+}
+
 // ── HTTP handlers (mounted in http.go) ──────────────────────────────────
 
 func (h *HTTP) handleDashPnLHistory(w http.ResponseWriter, ar *AdminRequest) {
 	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.PnLHistory(ctx, daysParam(ar.Request, 90))
+		return h.dashboard.PnLHistory(ctx, "", daysParam(ar.Request, 90))
 	})
 }
 
 func (h *HTTP) handleDashPositionHistory(w http.ResponseWriter, ar *AdminRequest) {
 	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.PositionHistory(ctx, daysParam(ar.Request, 30))
+		return h.dashboard.PositionHistory(ctx, "", daysParam(ar.Request, 30))
 	})
 }
 
@@ -688,7 +934,9 @@ func (h *HTTP) handleDashSectors(w http.ResponseWriter, ar *AdminRequest) {
 }
 
 func (h *HTTP) handleDashStockAlloc(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, h.dashboard.StockAllocation)
+	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
+		return h.dashboard.StockAllocation(ctx, "")
+	})
 }
 
 func (h *HTTP) handleDashMcap(w http.ResponseWriter, ar *AdminRequest) {
@@ -701,13 +949,52 @@ func (h *HTTP) handleDashEMA(w http.ResponseWriter, ar *AdminRequest) {
 
 func (h *HTTP) handleDashPositions(w http.ResponseWriter, ar *AdminRequest) {
 	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.Positions(ctx, ar.Request.URL.Query().Get("status"))
+		qp := ar.Request.URL.Query()
+		return h.dashboard.Positions(ctx, PositionsFilter{
+			Status:   qp.Get("status"),
+			Industry: qp.Get("industry"),
+			Mcap:     qp.Get("mcap"),
+			EMA:      qp.Get("ema"),
+			ClientID: qp.Get("client_id"),
+		})
 	})
 }
 
 func (h *HTTP) handleDashPositionsSummary(w http.ResponseWriter, ar *AdminRequest) {
+	h.dashJSON(w, ar, h.dashboard.PortfolioSummary)
+}
+
+func (h *HTTP) handleDashDownFromHigh(w http.ResponseWriter, ar *AdminRequest) {
+	h.dashJSON(w, ar, h.dashboard.DownFromHigh)
+}
+
+func (h *HTTP) handleClientPnLHistory(w http.ResponseWriter, ar *AdminRequest) {
 	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.positionsAgg(ctx, "")
+		uid := mux.Vars(ar.Request)["client_id"]
+		if err := h.dashboard.requireClient(ctx, uid); err != nil {
+			return nil, err
+		}
+		return h.dashboard.PnLHistory(ctx, uid, daysParam(ar.Request, 90))
+	})
+}
+
+func (h *HTTP) handleClientPositionHistory(w http.ResponseWriter, ar *AdminRequest) {
+	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
+		uid := mux.Vars(ar.Request)["client_id"]
+		if err := h.dashboard.requireClient(ctx, uid); err != nil {
+			return nil, err
+		}
+		return h.dashboard.PositionHistory(ctx, uid, daysParam(ar.Request, 30))
+	})
+}
+
+func (h *HTTP) handleClientStockAlloc(w http.ResponseWriter, ar *AdminRequest) {
+	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
+		uid := mux.Vars(ar.Request)["client_id"]
+		if err := h.dashboard.requireClient(ctx, uid); err != nil {
+			return nil, err
+		}
+		return h.dashboard.StockAllocation(ctx, uid)
 	})
 }
 

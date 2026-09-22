@@ -51,6 +51,9 @@ type LTPQuote struct {
 	Volume        int64   `json:"volume"`
 	Week52High    float64 `json:"week_52_high"`
 	Week52Low     float64 `json:"week_52_low"`
+	// Feed also stamps when the 52w high was made — used by the admin
+	// down-from-high view (2026-09-22).
+	Week52HighDate string `json:"week_52_high_date"`
 }
 
 // LTPStore is a thin wrapper around a *redis.Client that speaks the
