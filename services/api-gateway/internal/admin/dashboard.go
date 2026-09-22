@@ -479,7 +479,7 @@ type matrixRow struct {
 func (d *DashboardStore) Positions(ctx context.Context, statusFilter string) (any, error) {
 	q := `SELECT id, user_id, symbol, COALESCE(industry,''), COALESCE(mcap_bucket,''),
 	             quantity, entry_price, COALESCE(invested_amt,0), entry_time, exit_time,
-	             exit_price, realized_pnl, ema_alloc_pct, status, COALESCE(signal_id,'')
+	             exit_price, realized_pnl, ema_alloc_pct, status, COALESCE(signal_id::text,'')
 	      FROM manthan_positions WHERE status IN ('ACTIVE','EXIT_PENDING','EXITED')`
 	switch statusFilter {
 	case "open":
