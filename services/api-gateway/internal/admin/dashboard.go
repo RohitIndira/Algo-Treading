@@ -26,7 +26,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -855,15 +854,14 @@ func (d *DashboardStore) PortfolioSummary(ctx context.Context) (any, error) {
 	} else {
 		out.PortfolioValue = round2f(invested)
 	}
-	if len(vals) > 1 && vals[0] > 0 {
-		years := nav[len(nav)-1].Date.Sub(nav[0].Date).Hours() / 24 / 365.25
-		if years > 0 {
-			out.CAGR = round2f((math.Pow(vals[len(vals)-1]/vals[0], 1/years) - 1) * 100)
-		}
-	}
+	// TWR index: capital-flow immune (new strategies/capital are not
+	// "returns"; a strategy leaving the snapshots is not a "drawdown").
+	idx := twrIndex(nav)
+	out.CAGR = cagrFromIndex(nav, idx)
 	out.XIRR, out.AnnualizedReturnPct = out.CAGR, out.CAGR
-	maxDD, _ := drawdownStats(vals)
+	maxDD, _ := drawdownStats(idx)
 	out.MaxDrawdownPct = maxDD
+	_ = vals
 	out.CurrentExposurePct = pct(deployed, invested)
 	return out, nil
 }

@@ -188,6 +188,37 @@ func (d *DashboardStore) valueSeries(ctx context.Context, userID string, days in
 	return nav, vals, nil
 }
 
+// twrIndex builds a time-weighted return index (base 100) from NAV days:
+// each day compounds that day's P&L change over that day's deployed
+// capital. Immune to capital additions/removals — a client activating a
+// second strategy (FIV99 2026-09-10, +10L) is NOT a "return", and a
+// strategy leaving the snapshot set is NOT a "drawdown". The absolute
+// value series (capital + pnl) stays for ₹ display only; every growth or
+// drawdown percentage must come from this index.
+func twrIndex(nav []navDay) []float64 {
+	idx := make([]float64, len(nav))
+	cur := 100.0
+	for i, n := range nav {
+		if i > 0 && n.Capital > 0 {
+			cur *= 1 + (n.NetPnL-nav[i-1].NetPnL)/n.Capital
+		}
+		idx[i] = cur
+	}
+	return idx
+}
+
+// cagrFromIndex annualizes a TWR index over the span of nav.
+func cagrFromIndex(nav []navDay, idx []float64) float64 {
+	if len(idx) < 2 || idx[0] <= 0 {
+		return 0
+	}
+	years := nav[len(nav)-1].Date.Sub(nav[0].Date).Hours() / 24 / 365.25
+	if years <= 0 {
+		return 0
+	}
+	return round2f((math.Pow(idx[len(idx)-1]/idx[0], 1/years) - 1) * 100)
+}
+
 // requireClient 404s unknown client ids before running series queries.
 func (d *DashboardStore) requireClient(ctx context.Context, userID string) error {
 	bases, err := d.clientBases(ctx, userID)
@@ -237,17 +268,13 @@ func (d *DashboardStore) ClientSummary(ctx context.Context, userID string) (any,
 		}
 	}
 
-	// CAGR from the first to the last portfolio value. XIRR needs a cash-flow
-	// ledger the platform doesn't keep, so it's reported equal to CAGR
-	// (single-deposit approximation).
-	cagr := 0.0
-	if len(vals) > 1 && vals[0] > 0 {
-		years := nav[len(nav)-1].Date.Sub(nav[0].Date).Hours() / 24 / 365.25
-		if years > 0 {
-			cagr = round2f((math.Pow(vals[len(vals)-1]/vals[0], 1/years) - 1) * 100)
-		}
-	}
-	maxDD, _ := drawdownStats(vals)
+	// CAGR + drawdown from the TWR index — capital-flow immune. XIRR needs
+	// a cash-flow ledger the platform doesn't keep, so it's reported equal
+	// to CAGR (single-deposit approximation).
+	_ = vals
+	idx := twrIndex(nav)
+	cagr := cagrFromIndex(nav, idx)
+	maxDD, _ := drawdownStats(idx)
 
 	return map[string]any{
 		"client_name":          userID,
@@ -315,15 +342,14 @@ func (d *DashboardStore) EquityCurve(ctx context.Context, userID string, days in
 		last[bench] = v
 		return &v
 	}
+	idx := twrIndex(nav) // capital-flow-immune growth index
 	for i, n := range nav {
 		p := point{
 			Date:           n.Date.Format("2006-01-02"),
 			PortfolioValue: round2f(vals[i]),
 		}
-		if vals[0] > 0 {
-			p.PortfolioIndexed = round2f(vals[i] / vals[0] * 100)
-			last["portfolio"] = p.PortfolioIndexed
-		}
+		p.PortfolioIndexed = round2f(idx[i])
+		last["portfolio"] = p.PortfolioIndexed
 		p.NiftyIndexed = idxFor("nifty50", p.Date)
 		p.Midcap150Indexed = idxFor("midcap150", p.Date)
 		p.Smallcap250Indexed = idxFor("smallcap250", p.Date)
@@ -399,7 +425,10 @@ func (d *DashboardStore) Drawdown(ctx context.Context, userID string, days int) 
 	if err != nil {
 		return nil, err
 	}
-	maxDD, dd := drawdownStats(vals)
+	// Percentages from the TWR index (capital additions are not gains and
+	// a strategy leaving the snapshot set is not a loss); peak_value stays
+	// the absolute ₹ portfolio peak for display.
+	maxDD, dd := drawdownStats(twrIndex(nav))
 	type point struct {
 		Date        string  `json:"date"`
 		DrawdownPct float64 `json:"drawdown_pct"`
