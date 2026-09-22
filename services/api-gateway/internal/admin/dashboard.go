@@ -626,6 +626,7 @@ func (d *DashboardStore) positionsAgg(ctx context.Context, userID string) (*posi
 	q := `SELECT
 	        COUNT(*) FILTER (WHERE status IN ` + openStatuses + `),
 	        COUNT(*) FILTER (WHERE status = 'EXITED'),
+	        COUNT(*) FILTER (WHERE status = 'EXITED' AND realized_pnl IS NOT NULL),
 	        COUNT(*) FILTER (WHERE status = 'EXITED' AND realized_pnl > 0),
 	        COUNT(*) FILTER (WHERE status = 'EXITED' AND realized_pnl < 0),
 	        COUNT(*) FILTER (WHERE status = 'EXITED' AND realized_pnl = 0),
@@ -640,9 +641,12 @@ func (d *DashboardStore) positionsAgg(ctx context.Context, userID string) (*posi
 		args = append(args, userID)
 	}
 	var s positionsSummary
+	var decided int // closed trades with a recorded realized_pnl — manual
+	// exits and ghost heals can close a row without one; win rate is
+	// computed over decided trades only, never the NULLs.
 	var grossProfit, grossLoss float64
 	if err := d.tradingDB.QueryRowContext(ctx, q, args...).Scan(
-		&s.OpenPositions, &s.ClosedPositions, &s.ProfitMaking, &s.LossMaking,
+		&s.OpenPositions, &s.ClosedPositions, &decided, &s.ProfitMaking, &s.LossMaking,
 		&s.BreakevenTrades, &s.AvgProfitPerTrade, &s.AvgLossPerTrade,
 		&grossProfit, &grossLoss); err != nil {
 		return nil, err
@@ -650,8 +654,8 @@ func (d *DashboardStore) positionsAgg(ctx context.Context, userID string) (*posi
 	s.TotalPositions = s.OpenPositions + s.ClosedPositions
 	s.AvgProfitPerTrade = round2f(s.AvgProfitPerTrade)
 	s.AvgLossPerTrade = round2f(s.AvgLossPerTrade)
-	if s.ClosedPositions > 0 {
-		s.WinRatePct = pct(float64(s.ProfitMaking), float64(s.ClosedPositions))
+	if decided > 0 {
+		s.WinRatePct = pct(float64(s.ProfitMaking), float64(decided))
 	}
 	if grossLoss > 0 {
 		s.ProfitFactor = round2f(grossProfit / grossLoss)
