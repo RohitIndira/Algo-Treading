@@ -67,7 +67,10 @@ type PlaceOrderRequest struct {
 	// AlgoCategory env vars (MANTHAN_ALGO_ID, MANTHAN_ALGO_CATEGORY) before
 	// SEBI's enforcement deadline; orders without these will then fail with
 	// infoID/exchange code 17179 ERR_INVALID_ALGO_ID.
-	AlgoID       int    `json:"algoId,omitempty"`
+	// Serialized as a STRING per the broker/exchange order spec
+	// (2026-09-23: int was accepted by the OMS but the spec wants
+	// "algoId":"162933", not 162933).
+	AlgoID       string `json:"algoId,omitempty"`
 	AlgoCategory string `json:"algoCategory,omitempty"`
 }
 

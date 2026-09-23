@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 )
 
 // applyAlgoTag stamps the SEBI-registered algo id (and category) onto an
@@ -16,13 +15,9 @@ import (
 // (algo id 162933) an untagged order fails with exchange code 17179
 // ERR_INVALID_ALGO_ID; the X-Algo-Id header (INDIRA_X_ALGO_ID, set in
 // doRequest) covers the broker rate-gate separately.
-func applyAlgoTag(algoID *int, algoCategory *string) {
-	if *algoID == 0 {
-		if v := os.Getenv("MANTHAN_ALGO_ID"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				*algoID = n
-			}
-		}
+func applyAlgoTag(algoID *string, algoCategory *string) {
+	if *algoID == "" {
+		*algoID = os.Getenv("MANTHAN_ALGO_ID")
 	}
 	if *algoCategory == "" {
 		*algoCategory = os.Getenv("MANTHAN_ALGO_CATEGORY")
