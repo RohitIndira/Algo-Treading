@@ -54,6 +54,8 @@ type OrderPublisher interface {
 	PublishEntryOrder(ctx context.Context, order ManthanOrder) error
 	PublishSLModify(ctx context.Context, order SLModifyOrder) error
 	PublishSLExit(ctx context.Context, order SLExitOrder) error
+	// Best-effort skip audit (decision row + Kafka event); never errors.
+	PublishSignalSkip(ctx context.Context, userID, strategyID string, skip SkipReason)
 
 	// FIX F — persist trail state so a restart resumes it (see positions_persist.go).
 	PersistPositionOpen(ctx context.Context, order ManthanOrder) error
@@ -326,6 +328,7 @@ func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy types.UserSt
 			zap.String("strategy", strategy.StrategyID),
 			zap.String("symbol", skip.Symbol),
 			zap.String("reason", skip.Reason))
+		c.publisher.PublishSignalSkip(ctx, strategy.UserID, strategy.StrategyID, skip)
 	}
 
 	if len(result.Allocations) == 0 {
@@ -639,6 +642,7 @@ func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal
 				zap.String("symbol", skip.Symbol),
 				zap.String("reason", skip.Reason),
 			)
+			c.publisher.PublishSignalSkip(ctx, strategy.UserID, strategy.StrategyID, skip)
 		}
 
 		if len(result.Allocations) == 0 {

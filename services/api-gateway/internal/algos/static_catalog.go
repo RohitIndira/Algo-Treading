@@ -111,7 +111,7 @@ func manthanDetail() AlgoDetail {
 			Badge:       "Most Subscribed",
 			// Values MUST match manthan() to stay consistent
 			// between the Explore card and the detail page.
-			MinInvestment: 500_000,
+			MinInvestment: 50_000, // slab revision 2026-09-24 (was 5L)
 			MaxDrawdown:   -17, // operator-supplied track-record drawdown
 			PrimaryReturn: map[string]float64{
 				"3Y Return": 28.4,
@@ -155,10 +155,10 @@ func manthan() Algo {
 		Logo:        "https://stockk-assets.s3.ap-south-1.amazonaws.com/algos/manthan.png",
 		Description: "The Manthan strategy involves an integrated techno-funda approach for stock analysis. In the realm of technical analysis, the emphasis is on identifying stocks that exhibit superior relative strength compared to both the index and peers.",
 		Badge:       "Most subscribed",
-		// 5,00,000 rupees = ₹5 Lakhs. We send raw rupees as an int64
-		// so the API stays stable when the frontend changes its display
-		// format ("5 Lac" / "5 Lakhs" / "₹5,00,000").
-		MinInvestment: 500_000,
+		// 50,000 rupees (slab revision 2026-09-24; was ₹5,00,000). Raw
+		// rupees as an int64 so the API stays stable when the frontend
+		// changes its display format ("50K" / "₹50,000").
+		MinInvestment: 50_000,
 		// Stored as a plain number; the frontend adds the "%" suffix.
 		MaxDrawdown: -17, // operator-supplied track-record drawdown
 		// Map keys exactly match what the frontend expects to render.

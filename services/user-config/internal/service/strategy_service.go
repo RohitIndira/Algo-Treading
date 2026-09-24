@@ -555,23 +555,20 @@ func (s *StrategyService) validateCreateRequest(ctx context.Context, req *models
 			return fmt.Errorf("%w: strategy_name must be less than 100 characters", apperr.ErrValidation)
 		}
 
-		// Total capital: min ₹5,00,000 (5 lakh), no upper limit
+		// Total capital: min ₹50,000 (product slab revision 2026-09-24;
+		// was ₹5,00,000), no upper limit
 		if req.TradeConfig == nil {
 			req.TradeConfig = &models.TradeConfig{}
 		}
 		if req.TradeConfig.TotalCapital == nil {
-			return fmt.Errorf("%w: total_capital is required (minimum ₹5,00,000)", apperr.ErrValidation)
+			return fmt.Errorf("%w: total_capital is required (minimum ₹50,000)", apperr.ErrValidation)
 		}
 		cap := *req.TradeConfig.TotalCapital
-		if cap < 500000 {
-			return fmt.Errorf("%w: total_capital must be at least ₹5,00,000 for Manthan strategy", apperr.ErrValidation)
+		if cap < manthanMinCapital {
+			return fmt.Errorf("%w: total_capital must be at least ₹50,000 for Manthan strategy", apperr.ErrValidation)
 		}
 
-		// Max positions: ≤25L → 25 stocks, >25L → 50 stocks
-		maxPos := int32(25)
-		if cap > 2500000 {
-			maxPos = 50
-		}
+		maxPos := manthanSlabPositions(cap)
 		req.TradeConfig.MaxPositions = &maxPos
 
 		perStock := cap / float64(maxPos)

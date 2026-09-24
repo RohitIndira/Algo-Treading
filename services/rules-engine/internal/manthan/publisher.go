@@ -211,6 +211,66 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 	return nil
 }
 
+// PublishSignalSkip makes an allocator skip AUDITABLE (2026-09-24):
+//   1. manthan_signal_decisions row — signal_type='ENTRY_BUY',
+//      status='REJECTED', rejection_reason=<why>, zeroed intent fields
+//      (allowed by chk_msd_entry_fields_required: NOT NULL, zero ok).
+//      Visible in /trace and any decisions-based dashboard.
+//   2. portfolio.allocations Kafka event {"type":"SIGNAL_SKIPPED", ...} —
+//      same stream that carries POSITION_OPENED, so downstream consumers
+//      see the negative outcome too.
+//
+// Idempotent per (strategy, symbol, run_date): the id carries a "SKIP"
+// discriminator so it can NEVER collide with a real entry's id for the
+// same day — a signal skipped at 10:00 (caps full) must still be able to
+// allocate at 14:00 when a slot frees. Catch-up re-runs dedupe on the
+// UNIQUE(signal_id) conflict. Best-effort by design: failures are logged,
+// never propagated — observability must not block the allocation loop.
+func (p *ManthanPublisher) PublishSignalSkip(ctx context.Context, userID, strategyID string, skip SkipReason) {
+	sig := skip.Signal
+	id := deterministicSignalID(strategyID, sig.Symbol, sig.RunDate, "SKIP")
+
+	event := map[string]any{
+		"type":        "SIGNAL_SKIPPED",
+		"user_id":     userID,
+		"strategy_id": strategyID,
+		"symbol":      sig.Symbol,
+		"reason":      skip.Reason,
+		"run_date":    sig.RunDate,
+		"timestamp":   time.Now().UTC().Format(time.RFC3339),
+	}
+	body, _ := json.Marshal(event)
+
+	if p.db != nil {
+		if _, err := p.db.ExecContext(ctx, `
+			INSERT INTO manthan_signal_decisions (
+				signal_id, user_id, strategy_id, symbol, isin,
+				signal_type, ltp_at_decision, ema_alloc_pct,
+				intended_qty, intended_invested, initial_sl_target,
+				industry, mcap_bucket, index_name,
+				status, rejection_reason, kafka_payload
+			) VALUES ($1,$2,$3,$4,$5,'ENTRY_BUY',$6,0,0,0,0,$7,$8,$9,'REJECTED',$10,$11)
+			ON CONFLICT (signal_id) DO NOTHING`,
+			id, userID, strategyID, sig.Symbol, sig.ISIN,
+			sig.LatestPrice, sig.Industry, sig.MCapBucket, sig.IndexName,
+			skip.Reason, body,
+		); err != nil {
+			p.logger.Warn("signal-skip decision insert failed",
+				zap.String("symbol", sig.Symbol), zap.Error(err))
+		}
+	}
+
+	if p.portfolioWriter != nil {
+		if err := p.portfolioWriter.WriteMessages(ctx, kafka.Message{
+			Key:   []byte(fmt.Sprintf("%s:%s", strategyID, sig.Symbol)),
+			Value: body,
+		}); err != nil {
+			p.logger.Warn("portfolio.allocations publish failed (SIGNAL_SKIPPED)",
+				zap.String("symbol", sig.Symbol), zap.Error(err))
+		}
+	}
+}
+
 // ────────────────────────────────────────────────────────────────────
 // SL modify — signal_type='SL_MODIFY'
 // ────────────────────────────────────────────────────────────────────

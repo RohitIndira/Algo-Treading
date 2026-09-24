@@ -1,6 +1,7 @@
 package manthan
 
 import (
+	"fmt"
 	"context"
 	"database/sql"
 	"sort"
@@ -87,10 +88,14 @@ type AllocateResult struct {
 	Skipped     []SkipReason
 }
 
-// SkipReason records why a signal was not allocated.
+// SkipReason records why a signal was not allocated. Carries the full
+// signal so the consumer can write an auditable decision row + Kafka
+// event without re-fetching anything (2026-09-24: skips used to be
+// log-only, invisible to /trace and the ops dashboards).
 type SkipReason struct {
 	Symbol string
 	Reason string
+	Signal types.ManthanSignal
 }
 
 // Allocate processes eligible signals against a user's portfolio and EMA allocations.
@@ -140,7 +145,7 @@ func (a *Allocator) Allocate(
 				reason = "already holding (" + string(pos.State) + ")"
 			}
 			result.Skipped = append(result.Skipped, SkipReason{
-				Symbol: sig.Symbol, Reason: reason,
+				Symbol: sig.Symbol, Signal: sig, Reason: reason,
 			})
 			continue
 		}
@@ -151,7 +156,7 @@ func (a *Allocator) Allocate(
 		// Per (strategy, symbol). Other users / other symbols are unaffected.
 		if blocked, until := a.isUserOverrideActive(portfolio.StrategyID, sig.Symbol); blocked {
 			result.Skipped = append(result.Skipped, SkipReason{
-				Symbol: sig.Symbol,
+				Symbol: sig.Symbol, Signal: sig,
 				Reason: "user_override_active until " + until.Format(time.RFC3339),
 			})
 			continue
@@ -161,7 +166,7 @@ func (a *Allocator) Allocate(
 		if cd, ok := portfolio.Cooldown[sig.Symbol]; ok {
 			if sig.LatestPrice > cd.ReentryBelow {
 				result.Skipped = append(result.Skipped, SkipReason{
-					Symbol: sig.Symbol,
+					Symbol: sig.Symbol, Signal: sig,
 					Reason: "in cooldown — price hasn't corrected 20% from ATH yet",
 				})
 				continue
@@ -174,7 +179,7 @@ func (a *Allocator) Allocate(
 		ok, reason := caps.CanAdd(sig.Industry, sig.MCapBucket)
 		if !ok {
 			result.Skipped = append(result.Skipped, SkipReason{
-				Symbol: sig.Symbol, Reason: reason,
+				Symbol: sig.Symbol, Signal: sig, Reason: reason,
 			})
 			continue
 		}
@@ -183,7 +188,7 @@ func (a *Allocator) Allocate(
 		emaAlloc := emaByIndex[sig.IndexName]
 		if emaAlloc <= 0 {
 			result.Skipped = append(result.Skipped, SkipReason{
-				Symbol: sig.Symbol,
+				Symbol: sig.Symbol, Signal: sig,
 				Reason: "EMA allocation 0% for index " + sig.IndexName,
 			})
 			continue
@@ -193,7 +198,7 @@ func (a *Allocator) Allocate(
 		entryPrice := sig.LatestPrice
 		if entryPrice <= 0 {
 			result.Skipped = append(result.Skipped, SkipReason{
-				Symbol: sig.Symbol, Reason: "latest_price is 0",
+				Symbol: sig.Symbol, Signal: sig, Reason: "latest_price is 0",
 			})
 			continue
 		}
@@ -203,8 +208,8 @@ func (a *Allocator) Allocate(
 		qty := int32(perCallActual / effectiveEntry)
 		if qty <= 0 {
 			result.Skipped = append(result.Skipped, SkipReason{
-				Symbol: sig.Symbol,
-				Reason: "quantity = 0 (per_call too small for stock price)",
+				Symbol: sig.Symbol, Signal: sig,
+				Reason: fmt.Sprintf("quantity = 0 (per_call ₹%.0f < effective price ₹%.2f)", perCallActual, effectiveEntry),
 			})
 			continue
 		}
