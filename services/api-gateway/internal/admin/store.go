@@ -60,6 +60,10 @@ type Session struct {
 	ID        int64
 	AdminID   string
 	ExpiresAt time.Time
+	// Role gates the tier an admin may act at (2026-09-25, for external
+	// testers): "full" = everything; "read_only" = TierRead endpoints
+	// only — every Confirm/Typed action 403s centrally in Route().
+	Role string
 }
 
 // LookupSession validates a presented token hash end-to-end: session exists,
@@ -68,14 +72,14 @@ type Session struct {
 func (s *Store) LookupSession(ctx context.Context, tokenHash string) (*Session, error) {
 	var sess Session
 	err := s.db.QueryRowContext(ctx, `
-		SELECT s.id, s.admin_id, s.expires_at
+		SELECT s.id, s.admin_id, s.expires_at, COALESCE(u.role, 'full')
 		  FROM admin_sessions s
 		  JOIN admin_users u ON u.user_id = s.admin_id
 		 WHERE s.token_hash = $1
 		   AND s.revoked_at IS NULL
 		   AND s.expires_at > now()
 		   AND u.active = true`,
-		tokenHash).Scan(&sess.ID, &sess.AdminID, &sess.ExpiresAt)
+		tokenHash).Scan(&sess.ID, &sess.AdminID, &sess.ExpiresAt, &sess.Role)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrSessionInvalid
 	}

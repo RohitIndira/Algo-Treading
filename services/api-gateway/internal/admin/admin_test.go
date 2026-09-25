@@ -103,6 +103,14 @@ func openAdminTestDB(t *testing.T) *sql.DB {
 	if _, err := db.Exec(string(mig)); err != nil {
 		t.Fatalf("apply migration: %v", err)
 	}
+	// 021: read-only role column — LookupSession selects it.
+	mig21, err := os.ReadFile(filepath.Join("..", "..", "..", "user-config", "migrations", "021_admin_read_only_role.sql"))
+	if err != nil {
+		t.Fatalf("read migration 021: %v", err)
+	}
+	if _, err := db.Exec(string(mig21)); err != nil {
+		t.Fatalf("apply migration 021: %v", err)
+	}
 	cleanupAdminTestRows(t, db)
 	t.Cleanup(func() { cleanupAdminTestRows(t, db); db.Close() })
 	return db
@@ -452,5 +460,53 @@ func TestAuditAppendOnly_TriggerBlocksRewrites(t *testing.T) {
 		AdminID: "TADM_IMMUT", Action: "TEST2", Tier: "READ", Result: "OK",
 	}); err != nil {
 		t.Fatalf("insert after trigger: %v", err)
+	}
+}
+
+// ── read-only role (migration 021) ──────────────────────────────────────
+
+func TestHTTP_ReadOnlyRoleBlocksMutations(t *testing.T) {
+	db := openAdminTestDB(t)
+	seedAdmin(t, db, "TADM_RO", true)
+	if _, err := db.Exec(`UPDATE admin_users SET role='read_only' WHERE user_id='TADM_RO'`); err != nil {
+		t.Fatalf("set read_only: %v", err)
+	}
+	r, h := newTestRouter(t, db)
+	sub := r.PathPrefix("/api/v1/admin").Subrouter()
+	sub.Use(h.Required)
+	h.Route(sub, "GET", "/ro-read", "RO_READ", TierRead,
+		func(w http.ResponseWriter, ar *AdminRequest) { writeOK(w, "read ok") })
+	h.Route(sub, "POST", "/ro-confirm", "RO_CONFIRM", TierConfirm,
+		func(w http.ResponseWriter, ar *AdminRequest) { writeOK(w, "must never run") })
+	h.Route(sub, "POST", "/ro-typed", "RO_TYPED", TierTyped,
+		func(w http.ResponseWriter, ar *AdminRequest) { writeOK(w, "must never run") })
+
+	token := elevateViaHTTP(t, r, "TADM_RO")
+	call := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set(TokenHeader, token)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Reads work.
+	if rec := call("GET", "/api/v1/admin/ro-read", ""); rec.Code != http.StatusOK {
+		t.Fatalf("read for read_only admin: HTTP %d", rec.Code)
+	}
+	// Mutations are refused BEFORE tier machinery — even a fully-confirmed
+	// request must 403, and the handler must never execute.
+	for _, path := range []string{"/api/v1/admin/ro-confirm", "/api/v1/admin/ro-typed"} {
+		rec := call("POST", path, `{"confirmed":true}`)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s for read_only admin: HTTP %d want 403 (body=%s)", path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "E_ADMIN_READ_ONLY") {
+			t.Fatalf("%s: want E_ADMIN_READ_ONLY envelope, got %s", path, rec.Body.String())
+		}
+	}
+	// Each denial leaves an audit row.
+	if n := auditCount(t, db, "TADM_RO", "RO_CONFIRM", "DENIED"); n != 1 {
+		t.Fatalf("read_only denial must be audited, got %d rows", n)
 	}
 }

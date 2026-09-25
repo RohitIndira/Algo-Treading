@@ -929,6 +929,19 @@ func (h *HTTP) Route(r *mux.Router, method, path, action string, tier Tier,
 		}
 		ar := &AdminRequest{Request: req, Session: sess, http: h, action: action, tier: tier}
 
+		// Read-only admins (external testers) stop HERE for anything
+		// mutating — one central gate covers every Confirm/Typed route,
+		// present and future, with an audit row per denial.
+		if sess.Role == "read_only" && tier != TierRead {
+			_ = h.svc.store.Audit(req.Context(), AuditEntry{
+				AdminID: sess.AdminID, Action: action, Tier: string(tier),
+				Result: "DENIED", Detail: "read_only role", IP: clientIP(req), SessionID: sess.ID,
+			})
+			writeErr(w, http.StatusForbidden, "E_ADMIN_READ_ONLY",
+				"this admin account is read-only — mutating actions are not permitted")
+			return
+		}
+
 		if tier == TierConfirm || tier == TierTyped {
 			if err := ar.enforceTier(); err != nil {
 				_ = h.svc.store.Audit(req.Context(), AuditEntry{
