@@ -272,8 +272,11 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			// the Manthan spec default — this only seeds rules-engine's OWN SL
 			// bookkeeping (trade-execution owns the real broker SLs).
 			ConfirmFill: func(strategyID, symbol string, price float64, qty int32) {
-				// ONE stop distance for memory and DB — the strategy's config.
-				slPct := m.portfolioMgr.StopLossPct(strategyID)
+				// ONE stop distance for memory and DB — bucket-aware
+				// (LARGE trails at 10%, else the strategy's config).
+				slPct := bucketStopLossPct(
+					m.portfolioMgr.PositionBucket(strategyID, symbol),
+					m.portfolioMgr.StopLossPct(strategyID))
 				m.portfolioMgr.ConfirmFill(strategyID, symbol, price, qty, slMgr, slPct)
 				// Promote the DB row PENDING_ENTRY → ACTIVE with the real fill
 				// AND the post-fill SL/high/trail (the row is born PENDING at

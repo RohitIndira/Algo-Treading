@@ -121,7 +121,7 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 	}
 
 	// NOTE: the DPR clamp deliberately does NOT happen here. The incoming
-	// triggerPrice is the INTENDED stop (entry/high * 0.80) and is stored as-is
+	// triggerPrice is the INTENDED stop (entry/high x slFactor(pct)) and is stored as-is
 	// in trigger_price so the trail ratchet can keep modifying on 2% moves and
 	// relax back to the true 20%. The broker adapter (PlaceSLSell) applies the
 	// DPR/tick clamp at placement time only and returns the broker-real value,
@@ -299,7 +299,7 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 //
 // Approach: ModifyOrder on the parent SL with combined_qty. Indira's
 // modify-order accepts a new qty as long as it's >= already-traded. The
-// new trigger is the higher of (existing_trigger, topup_avg × 0.80) so the
+// new trigger is the higher of (existing_trigger, topup_avg x slFactor(pct)) so the
 // SL is never lowered (any prior trailing is preserved).
 //
 // Fallback: if the parent SL can't be located (DB out of sync, or AMO not
@@ -321,7 +321,7 @@ func (h *SLHandler) MergeTopupSL(
 			zap.String("symbol", signal.Symbol),
 			zap.String("parent_signal_id", signal.TopUpForSignalID),
 			zap.Error(err))
-		triggerPrice := topupAvgPrice * 0.80
+		triggerPrice := topupAvgPrice * slFactor(signal.StopLossPct)
 		limitPrice := triggerPrice - SLLimitGap(triggerPrice, info.TickSize)
 		h.PlaceInitialSL(ctx, topupEntryOrderID, signal, info, topupQty, triggerPrice, limitPrice)
 		return
@@ -337,7 +337,7 @@ func (h *SLHandler) MergeTopupSL(
 	// (which is now the intended, un-clamped value). DPR clamping is left to the
 	// broker adapter at placement time; we store the intended here.
 	newTrigger := parentSL.TriggerPrice
-	if topupBased := topupAvgPrice * 0.80; topupBased > newTrigger {
+	if topupBased := topupAvgPrice * slFactor(signal.StopLossPct); topupBased > newTrigger {
 		newTrigger = topupBased
 	}
 	newLimit := newTrigger - SLLimitGap(newTrigger, info.TickSize)
@@ -365,7 +365,7 @@ func (h *SLHandler) MergeTopupSL(
 			zap.String("symbol", signal.Symbol),
 			zap.String("parent_broker_id", parentSL.BrokerOrderID),
 			zap.Error(modErr))
-		triggerPrice := topupAvgPrice * 0.80
+		triggerPrice := topupAvgPrice * slFactor(signal.StopLossPct)
 		limitPrice := triggerPrice - SLLimitGap(triggerPrice, info.TickSize)
 		h.PlaceInitialSL(ctx, topupEntryOrderID, signal, info, topupQty, triggerPrice, limitPrice)
 		return

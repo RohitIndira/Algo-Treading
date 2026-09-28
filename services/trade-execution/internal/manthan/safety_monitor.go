@@ -196,7 +196,7 @@ func (m *SafetyMonitor) checkNakedPositions(ctx context.Context) {
 		// Baseline protection: 20% below the entry fill. If rules-engine has
 		// trailed higher, its next SL_MODIFY ratchets up (the ratchet guard
 		// prevents lowering), so this can never over-tighten a trailed stop.
-		trigger := pos.EntryFillPrice * 0.80
+		trigger := pos.EntryFillPrice * slFactor(m.repo.GetEntryStopLossPct(ctx, pos.EntrySignalID))
 		limit := trigger - SLLimitGap(trigger, info.TickSize)
 
 		signal := ManthanSignal{

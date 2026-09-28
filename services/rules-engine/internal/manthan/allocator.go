@@ -218,7 +218,7 @@ func (a *Allocator) Allocate(
 		// Manthan). MUST come from config, never a literal: a leftover
 		// "TEST MODE" 0.98 here shipped to production and produced every
 		// phantom TSL exit of 2026-08-18 (see types.Portfolio.StopLossPct).
-		initialSL := entryPrice * (1 - effectiveStopLossPct(portfolio.StopLossPct)/100)
+		initialSL := entryPrice * (1 - bucketStopLossPct(sig.MCapBucket, portfolio.StopLossPct)/100)
 
 		alloc := types.AllocationResult{
 			Symbol:        sig.Symbol,

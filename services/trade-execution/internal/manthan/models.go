@@ -82,6 +82,9 @@ type ManthanOrder struct {
 	// value and re-synced by the reconciler. trigger_price stays the intended 20%.
 	BrokerTriggerPrice float64 `db:"broker_trigger_price"`
 	BrokerLimitPrice   float64 `db:"broker_limit_price"`
+	// Effective stop distance stamped by rules-engine (LARGE=10, else 20).
+	// Zero = legacy row from before migration 017 → treat as 20.
+	StopLossPct float64 `json:"stop_loss_pct"`
 	BrokerOrderID      string  `db:"broker_order_id"`
 	// TradeDate (optional) — the session a protective row belongs to. Set on
 	// AMO rows and (since 2026-08-19) on hot protective SL rows so
@@ -198,4 +201,16 @@ type SymbolInfo struct {
 	// 5-20 lakh shares, so rarely hit for Manthan positional sizing — kept
 	// here as defensive sanity cap.
 	FreezeQty int
+}
+
+// slFactor converts a stop-loss percent into the trigger multiplier
+// (20 → 0.80). Non-positive or implausible values fall back to the
+// legacy 20% — rows and signals from before the bucket-aware stops
+// (migration 017) carry no pct. EVERY initial-SL trigger computation
+// must use this; never a 0.80 literal (bucket-aware stops, 2026-09-28).
+func slFactor(pct float64) float64 {
+	if pct <= 0 || pct >= 100 {
+		pct = 20
+	}
+	return 1 - pct/100
 }

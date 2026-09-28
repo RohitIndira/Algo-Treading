@@ -164,7 +164,9 @@ func (g *OrderGenerator) GenerateEntryOrders(
 			EntryPrice:    alloc.EntryPrice,
 			StopLoss:      alloc.InitialSL,
 			StopLossType:  "TRAILING",
-			StopLossPct:   strategy.StopLossPct,
+			// Effective (bucket-aware) pct — trade-execution derives its
+			// broker SL triggers from THIS value, never a literal.
+			StopLossPct:   bucketStopLossPct(alloc.MCapBucket, strategy.StopLossPct),
 			TrailingSLPct: strategy.TrailingSLPct,
 			InvestedAmt:   float64(alloc.Quantity) * alloc.EntryPrice,
 			TxnCostPct:    types.TotalTxnCostPct() * 100,

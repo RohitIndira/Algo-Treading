@@ -66,13 +66,15 @@ func (r *Repository) InsertOrder(ctx context.Context, o *ManthanOrder) (int64, e
 			signal_id, strategy_id, user_id, symbol, isin, exchange,
 			order_type, order_side, product_type,
 			qty, limit_price, trigger_price,
-			indira_symbol, exchange_token, status, max_retries, trade_date
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+			indira_symbol, exchange_token, status, max_retries, trade_date,
+			stop_loss_pct
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+			NULLIF($18, 0))
 		RETURNING id`,
 		nullStr(o.SignalID), o.StrategyID, o.UserID, o.Symbol, nullStr(o.ISIN), o.Exchange,
 		o.OrderType, o.OrderSide, o.ProductType,
 		o.Qty, o.LimitPrice, o.TriggerPrice,
-		o.IndiraSymbol, o.ExchangeToken, o.Status, o.MaxRetries, o.TradeDate,
+		o.IndiraSymbol, o.ExchangeToken, o.Status, o.MaxRetries, o.TradeDate, o.StopLossPct,
 	).Scan(&id)
 	if err != nil {
 		// Detect the partial-UNIQUE conflict from migration 016 and
@@ -1750,4 +1752,19 @@ func (r *Repository) InsertManualExitLedgerSell(ctx context.Context, e ManualExi
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// GetEntryStopLossPct returns the stop distance recorded on an entry
+// order (by signal_id); 20 when the row predates migration 017 or the
+// signal is unknown. Used by the safety monitor's naked-coverage path,
+// which has no signal payload in hand.
+func (r *Repository) GetEntryStopLossPct(ctx context.Context, entrySignalID string) float64 {
+	var pct sql.NullFloat64
+	err := r.db.QueryRowContext(ctx,
+		`SELECT stop_loss_pct FROM manthan_orders WHERE signal_id = $1`,
+		entrySignalID).Scan(&pct)
+	if err != nil || !pct.Valid || pct.Float64 <= 0 {
+		return 20
+	}
+	return pct.Float64
 }

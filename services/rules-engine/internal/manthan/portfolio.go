@@ -56,6 +56,25 @@ func (pm *PortfolioManager) GetOrCreate(strategy types.UserStrategy) *types.Port
 // fill-confirm (post-fill SL) and DB persistence can never disagree.
 const DefaultStopLossPct = 20.0
 
+// LargeCapStopLossPct — product rule (operator, 2026-09-28): LARGE-cap
+// positions trail at 10%, not the configured 20%. Large caps move less,
+// so a 20% trail gives back too much profit before exiting. MID/SMALL
+// keep the strategy's configured distance. This supersedes, for LARGE
+// only, the earlier exact-20% directive (2026-08-19); defer-never-clamp
+// band handling is unchanged and applies to the 10% stop identically.
+const LargeCapStopLossPct = 10.0
+
+// bucketStopLossPct is THE stop-distance decision for a position: the
+// bucket override first, then the configured value guarded by
+// effectiveStopLossPct. Every SL computation (initial stop, trail
+// ratchet, order stamping) must go through here — never a literal.
+func bucketStopLossPct(mcapBucket string, configured float64) float64 {
+	if strings.EqualFold(strings.TrimSpace(mcapBucket), "LARGE") {
+		return LargeCapStopLossPct
+	}
+	return effectiveStopLossPct(configured)
+}
+
 // effectiveStopLossPct guards against a zero/negative config value: a 0%
 // stop would exit on the first tick, so anything non-positive falls back to
 // the default rather than being trusted.
@@ -193,6 +212,22 @@ func (pm *PortfolioManager) ProcessFillEvent(strategyID, symbol string, avgFillP
 }
 
 // ConfirmFill is a convenience wrapper for full fills (backward compat).
+// PositionBucket returns the mcap bucket of a live position ("" when the
+// position or portfolio is unknown) — used to pick the bucket-aware stop
+// distance at fill-confirmation time.
+func (pm *PortfolioManager) PositionBucket(strategyID, symbol string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if p, ok := pm.portfolios[strategyID]; ok && p != nil {
+		p.Mu.RLock()
+		defer p.Mu.RUnlock()
+		if pos, ok := p.Positions[symbol]; ok && pos != nil {
+			return pos.MCapBucket
+		}
+	}
+	return ""
+}
+
 func (pm *PortfolioManager) ConfirmFill(strategyID, symbol string, avgFillPrice float64, filledQty int32, slMgr *TrailingSLManager, slPct float64) {
 	pm.ProcessFillEvent(strategyID, symbol, avgFillPrice, filledQty, filledQty, true, slMgr, slPct)
 }

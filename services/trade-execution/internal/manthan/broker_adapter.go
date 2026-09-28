@@ -642,7 +642,7 @@ func (b *BrokerAdapter) PlaceAMOSell(ctx context.Context, auth BrokerAuth, info 
 // executed avg — it's literally absent from the response schema. Returning
 // the limit price as "avg" is wrong because:
 //   - Partial-fill orders may execute at multiple prices below the limit
-//   - The downstream SL math uses avgPrice * 0.80 to compute trigger; a 0 or
+//   - The downstream SL math uses avgPrice x slFactor(pct) to compute trigger; a 0 or
 //     a wrong avg here cascades into bogus SLs and trail-modifications
 //     (verified live 2026-05-12: 8 entries had entry_price=0 in
 //     manthan_positions because we returned o.LimitPrice — a legacy field

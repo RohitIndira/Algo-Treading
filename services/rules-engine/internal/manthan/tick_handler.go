@@ -76,7 +76,7 @@ func (h *TickHandler) ProcessTick(ctx context.Context, symbol string, ltp float6
 			portfolio.Mu.Unlock()
 			continue
 		}
-		update := h.slMgr.ProcessTick(pos, ltp, strategy.StopLossPct, strategy.TrailingSLPct)
+		update := h.slMgr.ProcessTick(pos, ltp, bucketStopLossPct(pos.MCapBucket, strategy.StopLossPct), strategy.TrailingSLPct)
 		strategyID := portfolio.StrategyID
 		posSnap := *pos // value copy for use after Unlock
 		portfolio.Mu.Unlock()

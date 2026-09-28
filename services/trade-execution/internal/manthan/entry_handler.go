@@ -309,6 +309,7 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 	// Create DB record
 	order := &ManthanOrder{
 		SignalID:      signal.OrderID,
+		StopLossPct:   signal.StopLossPct,
 		StrategyID:    signal.StrategyID,
 		UserID:        signal.UserID,
 		Symbol:        signal.Symbol,
@@ -427,7 +428,7 @@ func (h *EntryHandler) executePaper(ctx context.Context, orderID int64, order *M
 
 	// Manthan production SL: 20% below entry. Positional strategy — wide SL lets
 	// normal market noise pass while capping catastrophic loss.
-	slTrigger := ltp * 0.80
+	slTrigger := ltp * slFactor(signal.StopLossPct)
 	slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
 	h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, order.Qty, slTrigger, slLimit)
 
@@ -912,8 +913,9 @@ func (h *EntryHandler) handleFill(ctx context.Context, orderID int64, result fil
 	if signal.TopUpForSignalID != "" {
 		h.slHandler.MergeTopupSL(ctx, orderID, signal, info, result.filledQty, result.avgPrice)
 	} else {
-		// First-time entry — fresh SL at 20% below actual fill price.
-		slTrigger := result.avgPrice * 0.80
+		// First-time entry — fresh SL at the signal's stop distance
+		// below actual fill price (bucket-aware: LARGE=10%, else 20%).
+		slTrigger := result.avgPrice * slFactor(signal.StopLossPct)
 		slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
 		if slErr := h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit); slErr != nil {
 			// FIX 3: the position is FILLED but its SL did not land — it is NAKED.
@@ -985,7 +987,7 @@ func (h *EntryHandler) handlePartialFill(ctx context.Context, orderID int64, res
 	if signal.TopUpForSignalID != "" {
 		h.slHandler.MergeTopupSL(ctx, orderID, signal, info, result.filledQty, result.avgPrice)
 	} else {
-		slTrigger := result.avgPrice * 0.80
+		slTrigger := result.avgPrice * slFactor(signal.StopLossPct)
 		slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
 		h.slHandler.PlaceInitialSL(ctx, orderID, signal, info, result.filledQty, slTrigger, slLimit)
 	}
@@ -1119,7 +1121,7 @@ func (h *EntryHandler) attemptMarketTopup(ctx context.Context, parentOrderID int
 	// SL for the topup fill. Uses the same 20%-below-fill rule; SL sizing is
 	// per-tranche because broker won't merge SLs across parent orders and
 	// this MARKET row has its own broker_order_id lineage.
-	slTrigger := avgPrice * 0.80
+	slTrigger := avgPrice * slFactor(signal.StopLossPct)
 	slLimit := slTrigger - SLLimitGap(slTrigger, info.TickSize)
 	h.slHandler.PlaceInitialSL(ctx, topupOrderID, signal, info, filledQty, slTrigger, slLimit)
 	return true
