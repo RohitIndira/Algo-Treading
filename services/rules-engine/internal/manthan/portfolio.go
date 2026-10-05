@@ -75,6 +75,26 @@ func bucketStopLossPct(mcapBucket string, configured float64) float64 {
 	return effectiveStopLossPct(configured)
 }
 
+// rehydrateClampSL is the restart self-heal for a persisted stop that is
+// TIGHTER than the trail rule allows. With a stop distance of slPct the
+// CurrentSL can never legitimately exceed high × (1 − slPct/100): every
+// ratchet sets exactly that from the high at the time, so anything above it
+// is corrupt state (the 2026-08-18 "TEST MODE" 0.98 initial stop). Returns
+// the rule level and whether the caller must clamp DOWN to it.
+//
+// The distance is the POSITION's — bucketStopLossPct(mcapBucket, …) — so a
+// LARGE-cap position (10% trail) is judged against 10%, not the strategy's
+// 20%. Judging it against 20% (pre-2026-09-30 behaviour) "clamped" a
+// perfectly valid 10% stop down to the 20% level on every restart and
+// persisted the widened stop.
+func rehydrateClampSL(high, persistedSL float64, mcapBucket string, configuredPct float64) (ruleSL float64, clamp bool) {
+	if high <= 0 {
+		return persistedSL, false
+	}
+	ruleSL = high * (1 - bucketStopLossPct(mcapBucket, configuredPct)/100)
+	return ruleSL, persistedSL > ruleSL+0.005
+}
+
 // effectiveStopLossPct guards against a zero/negative config value: a 0%
 // stop would exit on the first tick, so anything non-positive falls back to
 // the default rather than being trusted.

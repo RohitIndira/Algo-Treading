@@ -189,9 +189,35 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 		// 2% dip "exited" real positions (SHANTIGOLD, FILATEX, GNA,
 		// NRBBEARING; ALIVUS was still armed at 98%). Clamping only ever
 		// LOWERS such a stop to the rule's own level, never below it.
-		if maxSL := high * (1 - effectiveStopLossPct(strategy.StopLossPct)/100); sl > maxSL+0.005 && high > 0 {
+		//
+		// The rule level is the POSITION's stop distance — bucket-aware via
+		// bucketStopLossPct (LARGE trails at 10%), never the raw strategy
+		// pct. Before 2026-09-30 this used effectiveStopLossPct(strategy),
+		// so every restart judged a LARGE 10% stop against the 20% rule,
+		// "clamped" it down to 20% below the high and persisted that —
+		// silently widening the stop on every boot.
+		//
+		// NOTE — this is an UNGATED restart-path behaviour change (design §6
+		// Phase 0 item 1; ship/commit it separately from the flexi feature).
+		// It only STOPS the erroneous widening; it does not re-tighten a LARGE
+		// stop an earlier restart already widened to high×0.80 (the clamp only
+		// ever lowers, and ProcessTick ratchets only on a new high). After the
+		// first deploy, list such positions on prod trading_db:
+		//
+		//   SELECT strategy_id, symbol, current_sl, high_since_entry,
+		//          round(high_since_entry * 0.9, 2) AS rule_sl_10pct
+		//   FROM manthan_positions
+		//   WHERE status = 'ACTIVE' AND upper(mcap_bucket) = 'LARGE'
+		//     AND current_sl < high_since_entry * 0.9 - 0.01;
+		//
+		// If rows exist, plan a one-off OFF-HOURS repair that ALSO re-syncs
+		// the broker-side SL (trade-execution) — rules-engine and broker stops
+		// must never diverge. S4450 holds 0 LARGE today, so this is fleet
+		// hygiene, not an S4450 blocker.
+		if maxSL, clamp := rehydrateClampSL(high, sl, mcapBucket, strategy.StopLossPct); clamp {
 			pm.logger.Warn("Rehydrate: stop-loss tighter than trail rule permits — clamping to rule level",
 				zap.String("strategy_id", strategyID), zap.String("symbol", symbol),
+				zap.String("mcap_bucket", mcapBucket),
 				zap.Float64("persisted_sl", sl), zap.Float64("high", high), zap.Float64("rule_sl", maxSL))
 			sl = maxSL
 			if _, uerr := db.ExecContext(ctx, `
