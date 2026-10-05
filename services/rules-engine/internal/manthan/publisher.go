@@ -37,9 +37,9 @@ var ErrDuplicateDecision = errors.New("manthan: signal_id already dispatched (du
 //   - manthan_signal_decisions — INSERT one row per signal fired, then
 //     UPDATE dispatched_at after Kafka ACK (transactional outbox pattern).
 //     Row content differs by signal_type:
-//       ENTRY_BUY   — allocator entry decision (existing columns populated)
-//       SL_MODIFY   — trailing SL ratchet (payload JSONB)
-//       EXIT_TSL    — TSL crossed → exit (payload JSONB)
+//     ENTRY_BUY   — allocator entry decision (existing columns populated)
+//     SL_MODIFY   — trailing SL ratchet (payload JSONB)
+//     EXIT_TSL    — TSL crossed → exit (payload JSONB)
 //   - manthan_portfolio_state  — LEGACY UpdatePortfolioState still called from
 //     consumer.go on batch end. Belongs to portfolio svc long-term; stays here
 //     as a stub until that service exists.
@@ -49,6 +49,7 @@ var ErrDuplicateDecision = errors.New("manthan: signal_id already dispatched (du
 //   - Write manthan_position_events (positions svc)
 //   - Update Redis :position: keys (positions svc will own)
 //   - Notify users (moves to notification svc)
+//
 // kafkaMessageWriter is the slice of *kafka.Writer the publisher needs. Keeping
 // it as an interface (rather than the concrete *kafka.Writer) lets the recovery
 // worker's re-publish path be unit-tested with a fake that can inject failures.
@@ -198,6 +199,17 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 			"mode":        order.TradingMode,
 			"timestamp":   time.Now().UTC().Format(time.RFC3339),
 		}
+		// Optional flexi object — present ONLY on a borrowed-slot entry
+		// (flexi on-mode), so the event bytes are unchanged otherwise.
+		if order.Flexi != nil {
+			event["flexi"] = map[string]any{
+				"recipient":   order.Flexi.Recipient,
+				"donors":      order.Flexi.Donors,
+				"base":        order.Flexi.Base,
+				"ceiling":     order.Flexi.Ceiling,
+				"held_before": order.Flexi.HeldBefore,
+			}
+		}
 		body, _ := json.Marshal(event)
 		if err := p.portfolioWriter.WriteMessages(ctx, kafka.Message{
 			Key:   []byte(fmt.Sprintf("%s:%s", order.StrategyID, order.Symbol)),
@@ -212,13 +224,13 @@ func (p *ManthanPublisher) PublishEntryOrder(ctx context.Context, order ManthanO
 }
 
 // PublishSignalSkip makes an allocator skip AUDITABLE (2026-09-24):
-//   1. manthan_signal_decisions row — signal_type='ENTRY_BUY',
-//      status='REJECTED', rejection_reason=<why>, zeroed intent fields
-//      (allowed by chk_msd_entry_fields_required: NOT NULL, zero ok).
-//      Visible in /trace and any decisions-based dashboard.
-//   2. portfolio.allocations Kafka event {"type":"SIGNAL_SKIPPED", ...} —
-//      same stream that carries POSITION_OPENED, so downstream consumers
-//      see the negative outcome too.
+//  1. manthan_signal_decisions row — signal_type='ENTRY_BUY',
+//     status='REJECTED', rejection_reason=<why>, zeroed intent fields
+//     (allowed by chk_msd_entry_fields_required: NOT NULL, zero ok).
+//     Visible in /trace and any decisions-based dashboard.
+//  2. portfolio.allocations Kafka event {"type":"SIGNAL_SKIPPED", ...} —
+//     same stream that carries POSITION_OPENED, so downstream consumers
+//     see the negative outcome too.
 //
 // Idempotent per (strategy, symbol, run_date): the id carries a "SKIP"
 // discriminator so it can NEVER collide with a real entry's id for the
@@ -267,6 +279,99 @@ func (p *ManthanPublisher) PublishSignalSkip(ctx context.Context, userID, strate
 		}); err != nil {
 			p.logger.Warn("portfolio.allocations publish failed (SIGNAL_SKIPPED)",
 				zap.String("symbol", sig.Symbol), zap.Error(err))
+		}
+	}
+}
+
+// PublishFlexiEval makes a flexi-caps evaluation AUDITABLE (2026-09-30):
+//  1. manthan_signal_decisions row — signal_type='FLEXI_EVAL',
+//     status='EVALUATED' (both admitted by migration 014), the event in
+//     `payload` (chk_msd_non_entry_needs_payload is on payload — NOT on
+//     kafka_payload, which stays NULL: nothing here ever goes to
+//     trade-signals and the recovery worker scans PROPOSED only).
+//     rejection_reason carries a one-line summary for /trace.
+//  2. portfolio.allocations Kafka event {"type":"FLEXI_EVAL", ...} — same
+//     stream as SIGNAL_SKIPPED / POSITION_OPENED.
+//
+// Idempotent per (strategy, symbol, run_date) via the "FLEXI_EVAL" id
+// discriminator + ON CONFLICT DO NOTHING — a Kafka redelivery re-evaluates
+// but never double-writes. This is FIRST-WRITE-WINS: the id carries no
+// outcome/attempt discriminator, so a same-day re-evaluation of the same
+// symbol with a DIFFERENT outcome (replay, catch-up, manual re-fire) is
+// dropped and the row — and the dry-run shadow book, which reads
+// WOULD_ALLOCATE rows — reflect the FIRST evaluation only. Normal days are
+// unaffected (data-ingestion publishes each symbol at most once per day);
+// treat it as a fidelity limit of the Phase-1 evidence, not a failed
+// dry-run. The Kafka event is emitted only when the row was NEWLY inserted
+// (RowsAffected == 1), so a redelivery does not over-count on the topic;
+// without a DB handle, or if the insert itself errors, the event is still
+// sent (best-effort, at-least-once). Best-effort like PublishSignalSkip:
+// failures are logged, never propagated; the allocation loop is never
+// blocked by audit.
+func (p *ManthanPublisher) PublishFlexiEval(ctx context.Context, userID, strategyID string, ev types.FlexiEval) {
+	id := deterministicSignalID(strategyID, ev.Symbol, ev.RunDate, "FLEXI_EVAL")
+
+	event := map[string]any{
+		"type":         "FLEXI_EVAL",
+		"mode":         string(ev.Mode),
+		"outcome":      ev.Outcome,
+		"user_id":      userID,
+		"strategy_id":  strategyID,
+		"symbol":       ev.Symbol,
+		"run_date":     ev.RunDate,
+		"bucket":       ev.Bucket,
+		"industry":     ev.Industry,
+		"index_name":   ev.IndexName,
+		"latest_price": ev.LatestPrice,
+		"base_outcome": ev.BaseOutcome,
+		"eval_held":    ev.EvalHeld,
+		"eval_limit":   ev.EvalLimit,
+		"tail_reason":  ev.TailReason,
+		"plan":         ev.Plan,
+		"sim":          ev.Sim,
+		"config":       ev.Config,
+		"timestamp":    time.Now().UTC().Format(time.RFC3339),
+	}
+	body, err := json.Marshal(event)
+	if err != nil {
+		p.logger.Warn("flexi-eval marshal failed", zap.String("symbol", ev.Symbol), zap.Error(err))
+		return
+	}
+
+	publishEvent := true // no DB / insert error → still publish (at-least-once)
+	if p.db != nil {
+		res, err := p.db.ExecContext(ctx, `
+			INSERT INTO manthan_signal_decisions (
+				signal_id, user_id, strategy_id, symbol, isin,
+				signal_type, ltp_at_decision,
+				industry, mcap_bucket, index_name,
+				status, rejection_reason, payload
+			) VALUES ($1,$2,$3,$4,$5,'FLEXI_EVAL',$6,$7,$8,$9,'EVALUATED',$10,$11)
+			ON CONFLICT (signal_id) DO NOTHING`,
+			id, userID, strategyID, ev.Symbol, ev.ISIN,
+			ev.LatestPrice, ev.Industry, ev.Bucket, ev.IndexName,
+			ev.Summary(), body,
+		)
+		if err != nil {
+			p.logger.Warn("flexi-eval decision insert failed (is migration 014 applied?)",
+				zap.String("symbol", ev.Symbol), zap.String("outcome", ev.Outcome), zap.Error(err))
+		} else if n, raErr := res.RowsAffected(); raErr == nil && n == 0 {
+			// Conflict: already evaluated today (first-write-wins). The event
+			// for this row has been published once already — don't repeat it.
+			publishEvent = false
+			p.logger.Debug("flexi-eval already recorded for today — row and event kept as first written",
+				zap.String("strategy", strategyID), zap.String("symbol", ev.Symbol),
+				zap.String("run_date", ev.RunDate), zap.String("new_outcome", ev.Outcome))
+		}
+	}
+
+	if publishEvent && p.portfolioWriter != nil {
+		if err := p.portfolioWriter.WriteMessages(ctx, kafka.Message{
+			Key:   []byte(fmt.Sprintf("%s:%s", strategyID, ev.Symbol)),
+			Value: body,
+		}); err != nil {
+			p.logger.Warn("portfolio.allocations publish failed (FLEXI_EVAL)",
+				zap.String("symbol", ev.Symbol), zap.Error(err))
 		}
 	}
 }
@@ -547,6 +652,35 @@ func (p *ManthanPublisher) dbInsertEntryDecision(ctx context.Context, order Mant
 		return fmt.Errorf("marshal entry outbox payload: %w", err)
 	}
 	var returnedID string
+	if order.Flexi != nil {
+		// Flexi on-mode borrowed-slot entry: the SAME row plus flexi_grant
+		// (migration 014). Kept as a separate statement so the base INSERT
+		// below never references the column — an un-migrated DB can still
+		// take every ordinary entry, and off-mode SQL is untouched.
+		grant, gerr := json.Marshal(order.Flexi)
+		if gerr != nil {
+			return fmt.Errorf("marshal flexi_grant: %w", gerr)
+		}
+		err = p.db.QueryRowContext(ctx, `
+			INSERT INTO manthan_signal_decisions (
+				signal_id, user_id, strategy_id, symbol, isin,
+				signal_type,
+				ltp_at_decision, ema_alloc_pct, intended_qty, intended_invested,
+				initial_sl_target, industry, mcap_bucket, index_name, status,
+				kafka_payload, flexi_grant
+			) VALUES ($1,$2,$3,$4,$5,'ENTRY_BUY',$6,$7,$8,$9,$10,$11,$12,$13,'PROPOSED',$14,$15)
+			ON CONFLICT (signal_id) DO NOTHING
+			RETURNING signal_id`,
+			order.OrderID, order.UserID, order.StrategyID, order.Symbol, order.ISIN,
+			order.EntryPrice, order.EMAAllocPct/100, order.Quantity, order.InvestedAmt,
+			order.StopLoss, order.Industry, order.MCapBucket, order.IndexName,
+			payload, grant,
+		).Scan(&returnedID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrDuplicateDecision
+		}
+		return err
+	}
 	err = p.db.QueryRowContext(ctx, `
 		INSERT INTO manthan_signal_decisions (
 			signal_id, user_id, strategy_id, symbol, isin,

@@ -1,9 +1,9 @@
 package manthan
 
 import (
-	"fmt"
 	"context"
 	"database/sql"
+	"fmt"
 	"sort"
 	"time"
 
@@ -86,6 +86,60 @@ func (a *Allocator) isUserOverrideActive(strategyID, symbol string) (bool, time.
 type AllocateResult struct {
 	Allocations []types.AllocationResult
 	Skipped     []SkipReason
+
+	// Flexi caps (2026-09-30). Both stay zero-valued whenever the feature is
+	// off or fx == nil — the golden off-mode identity test pins that.
+	//   FlexiEvals      — one FLEXI_EVAL per signal whose bucket was in play
+	//                     (dry_run: prediction; on: fact). Consumer persists.
+	//   FlexiNotApplied — guard reason when a plan was attempted and not
+	//                     built ("" when built, or when flexi was not tried).
+	FlexiEvals      []types.FlexiEval
+	FlexiNotApplied string
+}
+
+// FlexiInput is the per-call flexi context (nil ⇒ feature off). Alias so
+// callers in this package don't spell the types path.
+type FlexiInput = types.FlexiInput
+
+// portfolioFullReason is the SkipReason text for "no open slot" — emitted
+// for every signal when the book is full at call start and for every
+// signal left after the mid-loop break (P0.2, 2026-09-30). Before this the
+// allocator returned silently and the one regret flexi can create (a late
+// LARGE/MID arrival after SMALL borrowed) had no audit row.
+//
+// GATED on flexi being enabled (fx != nil && fx.Cfg.Enabled()): with the
+// feature off the allocator still returns / breaks silently, exactly as
+// before, so off-mode writes no new decision rows and no new Kafka events
+// (design §7.8 leaves shipping it ungated as an owner decision — until that
+// is made, the row only appears in dry_run / on).
+func portfolioFullReason(held int, maxPositions int32) string {
+	return fmt.Sprintf("portfolio full (%d/%d slots)", held, maxPositions)
+}
+
+// holdingReason mirrors the "already holding" guard in the main loop: a
+// symbol the strategy tracks in ANY non-exited state. Used by the
+// portfolio-full paths so a held symbol never carries a misleading
+// "portfolio full" audit row (PublishSignalSkip is first-write-wins per
+// (strategy, symbol, run_date)).
+func holdingReason(positions map[string]*types.Position, symbol string) (string, bool) {
+	pos, ok := positions[symbol]
+	if !ok || pos.State == types.StateExited {
+		return "", false
+	}
+	if !pos.Active {
+		return "already holding (" + string(pos.State) + ")", true
+	}
+	return "already holding", true
+}
+
+// portfolioFullSkip is the audit SkipReason for one signal that found no
+// open slot: "already holding …" when the strategy holds it, else
+// "portfolio full (held/N slots)".
+func portfolioFullSkip(portfolio *types.Portfolio, sig types.ManthanSignal, held int) SkipReason {
+	if reason, ok := holdingReason(portfolio.Positions, sig.Symbol); ok {
+		return SkipReason{Symbol: sig.Symbol, Signal: sig, Reason: reason}
+	}
+	return SkipReason{Symbol: sig.Symbol, Signal: sig, Reason: portfolioFullReason(held, portfolio.MaxPositions)}
 }
 
 // SkipReason records why a signal was not allocated. Carries the full
@@ -107,6 +161,28 @@ func (a *Allocator) Allocate(
 	portfolio *types.Portfolio,
 	emaByIndex map[string]float64,
 ) *AllocateResult {
+	return a.AllocateWithFlexi(signals, portfolio, emaByIndex, nil)
+}
+
+// AllocateWithFlexi is Allocate plus the flexi-caps context. fx == nil (or
+// mode off) is the pre-flexi path, byte-for-byte: same AllocateResult, same
+// skip strings, no plan, no evals.
+//
+// Mode on: the plan's ceilings are applied to the live CapCheck; an entry
+// above base carries AllocationResult.Flexi.
+//
+// Mode dry_run: the live decision uses BASE caps exactly as off-mode. The
+// plan is computed against a CLONED CapCheck overlaid with the strategy's
+// shadow book (earlier WOULD_ALLOCATEs today) and each in-play signal is
+// evaluated against that clone, including the real EMA / price / qty tail.
+// Real decisions are never influenced by the shadow (design §2.5 — the
+// shadow models on-mode; it must not restrict the live book).
+func (a *Allocator) AllocateWithFlexi(
+	signals []types.ManthanSignal,
+	portfolio *types.Portfolio,
+	emaByIndex map[string]float64,
+	fx *FlexiInput,
+) *AllocateResult {
 	result := &AllocateResult{}
 
 	// Allocate touches portfolio.Positions + portfolio.Cooldown (delete on
@@ -116,20 +192,87 @@ func (a *Allocator) Allocate(
 	portfolio.Mu.Lock()
 	defer portfolio.Mu.Unlock()
 
-	openSlots := int(portfolio.MaxPositions) - countActive(portfolio.Positions)
+	// P0.2 audit rows exist only while flexi is enabled (see
+	// portfolioFullReason). Off / nil input ⇒ silent return + break, as
+	// before — pinned by TestAllocator_OffModeGoldenIdentity.
+	auditFull := fx != nil && fx.Cfg.Enabled()
+
+	held := countActive(portfolio.Positions)
+	openSlots := int(portfolio.MaxPositions) - held
 	if openSlots <= 0 {
 		a.logger.Info("Portfolio full, no open slots",
 			zap.String("user", portfolio.UserID),
 			zap.Int("positions", countActive(portfolio.Positions)))
+		if auditFull {
+			for _, sig := range signals {
+				result.Skipped = append(result.Skipped, portfolioFullSkip(portfolio, sig, held))
+			}
+		}
 		return result
 	}
 
 	caps := types.NewCapCheck(portfolio.MaxPositions, portfolio.Positions)
 	perCallBase := portfolio.CurrentCapital / float64(portfolio.MaxPositions)
 
+	// ── Flexi plan (one per call; nil on any guard → base caps) ──────────
+	//
+	// The plan is computed ONCE for the whole call. The live path hands the
+	// allocator one signal per call, so there the plan is always fresh. In a
+	// multi-signal batch (CatchUpNewStrategy — dead today under the creation
+	// gate) the ceiling stays fixed while the batch fills: a receiver signal
+	// that lands AT the ceiling inside the batch is blocked with the flexi
+	// string, whereas the one-signal-per-call path recomputes Spare 0 → no
+	// plan → the legacy string. Cosmetic divergence in the skip text only;
+	// the grants themselves are identical (Σ grants ≤ Spare either way).
+	var plan *types.FlexiPlan
+	var evalCaps *types.CapCheck // caps the FLEXI_EVAL outcomes are judged on
+	evalOpenSlots := openSlots
+	flexiMode := types.FlexiOff
+	if fx != nil && fx.Cfg.Enabled() && len(signals) > 0 {
+		flexiMode = fx.Cfg.Mode
+		var why string
+		switch flexiMode {
+		case types.FlexiOn:
+			plan, why = types.BuildFlexiPlan(fx, caps, portfolio.MaxPositions, held,
+				portfolio.Positions, nil, signals)
+			if plan != nil {
+				caps.BucketCeiling = plan.Ceiling
+				caps.FlexiDonors = plan.Donors
+				evalCaps = caps
+			}
+		case types.FlexiDryRun:
+			shadowCaps, shadowN, shadowSyms := types.OverlayShadow(caps, fx.Shadow, portfolio.Positions)
+			plan, why = types.BuildFlexiPlan(fx, shadowCaps, portfolio.MaxPositions, held+shadowN,
+				portfolio.Positions, shadowSyms, signals)
+			if plan != nil {
+				shadowCaps.BucketCeiling = plan.Ceiling
+				shadowCaps.FlexiDonors = plan.Donors
+				evalCaps = shadowCaps
+				evalOpenSlots = openSlots - shadowN
+			}
+		}
+		if plan == nil {
+			result.FlexiNotApplied = why
+		} else {
+			a.logger.Info("Flexi plan built",
+				zap.String("strategy", portfolio.StrategyID),
+				zap.String("mode", string(flexiMode)),
+				zap.Any("ceiling", plan.Ceiling),
+				zap.Strings("donors", plan.Donors),
+				zap.Any("base_claim", plan.BaseClaim),
+				zap.Int("spare", plan.SpareBefore),
+				zap.Int("free", plan.Free))
+		}
+	}
+
 	for _, sig := range signals {
 		if openSlots <= 0 {
-			break
+			if !auditFull {
+				break // pre-flexi behaviour: the rest of the batch is dropped silently
+			}
+			// P0.2 (flexi enabled): the rest of the batch is auditable.
+			result.Skipped = append(result.Skipped, portfolioFullSkip(portfolio, sig, int(portfolio.MaxPositions)))
+			continue
 		}
 
 		// Skip if this strategy already tracks the symbol in ANY non-exited
@@ -177,6 +320,20 @@ func (a *Allocator) Allocate(
 
 		// Sector + MCap cap check
 		ok, reason := caps.CanAdd(sig.Industry, sig.MCapBucket)
+
+		// FLEXI_EVAL — only when this signal's bucket is in play under the
+		// plan. Dry-run judges the shadow clone (and grows it on a
+		// WOULD_ALLOCATE so a multi-signal batch is self-consistent); on-mode
+		// judges the live caps, so the eval and the real decision agree.
+		if plan.InPlay(sig.MCapBucket) {
+			ev := a.evalFlexi(fx, plan, evalCaps, evalOpenSlots, sig, reason, perCallBase, emaByIndex, portfolio.StopLossPct)
+			result.FlexiEvals = append(result.FlexiEvals, ev)
+			if flexiMode == types.FlexiDryRun && ev.Outcome == types.FlexiWouldAllocate {
+				evalCaps.Add(sig.Industry, sig.MCapBucket)
+				evalOpenSlots--
+			}
+		}
+
 		if !ok {
 			result.Skipped = append(result.Skipped, SkipReason{
 				Symbol: sig.Symbol, Signal: sig, Reason: reason,
@@ -240,9 +397,29 @@ func (a *Allocator) Allocate(
 			RunDate: sig.RunDate,
 		}
 
+		// On-mode only: an entry that passed CanAdd while its bucket was
+		// already AT/ABOVE base took a borrowed slot → record the grant. The
+		// stock's MCapBucket / InitialSL above are untouched (rule follows the
+		// stock, not the seat). Never set in dry_run or off.
+		if plan != nil && flexiMode == types.FlexiOn && caps.BucketCount[sig.MCapBucket] >= caps.MaxPerBucket {
+			g := plan.GrantFor(sig.MCapBucket, caps)
+			alloc.Flexi = &g
+		}
+
 		result.Allocations = append(result.Allocations, alloc)
 		caps.Add(sig.Industry, sig.MCapBucket)
 		openSlots--
+
+		// Dry-run: a REAL allocation also lands in the shadow world (the
+		// shadow clone models on-mode, whose book would hold this entry too),
+		// so a later eval in the same multi-signal batch is judged against a
+		// clone that already has the seat. In on-mode evalCaps IS caps, so
+		// the Add above already covered it. Live path is one signal per call;
+		// this matters only for CatchUpNewStrategy-style batches.
+		if plan != nil && flexiMode == types.FlexiDryRun && evalCaps != nil {
+			evalCaps.Add(sig.Industry, sig.MCapBucket)
+			evalOpenSlots--
+		}
 
 		a.logger.Debug("Allocated",
 			zap.String("symbol", sig.Symbol),
@@ -255,6 +432,91 @@ func (a *Allocator) Allocate(
 	}
 
 	return result
+}
+
+// evalFlexi produces the FLEXI_EVAL record for one signal whose bucket is in
+// play. evalCaps is the shadow clone in dry-run (already carrying the plan's
+// ceilings) and the live caps in on-mode. The decision ladder mirrors the
+// real allocator exactly — sector first, slots, base, ceiling, then the real
+// EMA / price / qty tail with the same perCallBase — so a dry-run
+// WOULD_ALLOCATE is what on-mode would have bought (first order).
+func (a *Allocator) evalFlexi(
+	fx *FlexiInput,
+	plan *types.FlexiPlan,
+	evalCaps *types.CapCheck,
+	evalOpenSlots int,
+	sig types.ManthanSignal,
+	baseReason string,
+	perCallBase float64,
+	emaByIndex map[string]float64,
+	stopLossPct float64,
+) types.FlexiEval {
+	b := sig.MCapBucket
+	ev := types.FlexiEval{
+		Mode:        fx.Cfg.Mode,
+		Symbol:      sig.Symbol,
+		RunDate:     sig.RunDate,
+		Bucket:      b,
+		Industry:    sig.Industry,
+		IndexName:   sig.IndexName,
+		ISIN:        sig.ISIN,
+		LatestPrice: sig.LatestPrice,
+		BaseOutcome: baseReason,
+		EvalHeld:    evalCaps.BucketCount[b],
+		EvalLimit:   evalCaps.BucketLimit(b),
+		Plan:        plan,
+		Config:      fx.Cfg.Summary(),
+	}
+	dry := fx.Cfg.Mode == types.FlexiDryRun
+
+	switch {
+	case evalCaps.SectorCount[sig.Industry] >= evalCaps.MaxPerSector:
+		ev.Outcome = types.FlexiBlockedSector
+	case dry && evalOpenSlots <= 0:
+		ev.Outcome = types.FlexiWouldBlockPortfolioFull
+	case evalCaps.BucketCount[b] < evalCaps.MaxPerBucket:
+		// Fits under its own base cap — flexi makes no difference here.
+		ev.Outcome = types.FlexiNoDifference
+	case evalCaps.BucketCount[b] >= ev.EvalLimit:
+		if dry {
+			ev.Outcome = types.FlexiWouldBlockFlexiCeiling
+		} else {
+			ev.Outcome = types.FlexiBlockedFlexiCeiling
+		}
+	default:
+		// Borrowed slot admitted by the ceiling — simulate the real tail.
+		emaAlloc := emaByIndex[sig.IndexName]
+		switch {
+		case emaAlloc <= 0:
+			ev.Outcome = types.FlexiWouldFailTail
+			ev.TailReason = "EMA allocation 0% for index " + sig.IndexName
+		case sig.LatestPrice <= 0:
+			ev.Outcome = types.FlexiWouldFailTail
+			ev.TailReason = "latest_price is 0"
+		default:
+			perCallActual := perCallBase * emaAlloc
+			effectiveEntry := sig.LatestPrice * (1 + types.TotalTxnCostPct())
+			qty := int32(perCallActual / effectiveEntry)
+			if qty <= 0 {
+				ev.Outcome = types.FlexiWouldFailTail
+				ev.TailReason = fmt.Sprintf("quantity = 0 (per_call ₹%.0f < effective price ₹%.2f)", perCallActual, effectiveEntry)
+				break
+			}
+			ev.Sim = &types.FlexiSim{
+				EMAAllocPct: emaAlloc,
+				PerCallBase: perCallBase,
+				Quantity:    qty,
+				Invested:    float64(qty) * sig.LatestPrice,
+				InitialSL:   sig.LatestPrice * (1 - bucketStopLossPct(b, stopLossPct)/100),
+			}
+			if dry {
+				ev.Outcome = types.FlexiWouldAllocate
+			} else {
+				ev.Outcome = types.FlexiGranted
+			}
+		}
+	}
+	return ev
 }
 
 // SortAlphabetical sorts signals alphabetically by symbol. Used when choosing

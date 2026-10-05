@@ -33,9 +33,10 @@ var manthanSignalIDNamespace = uuid.MustParse("6f4f7f2c-3b0f-4c5a-8c11-9ddaa63d8
 // key format is "field1|field2|..." — the pipe is just a readable
 // separator; we don't parse it back out. Callers pass whatever
 // discriminates one legitimate signal from another of the same shape:
-//   entry:      strategyID|symbol|runDate
-//   SL modify:  strategyID|symbol|runDate|SLMOD|<newSL:2dp>
-//   SL exit:    strategyID|symbol|runDate|EXIT|<slPrice:2dp>
+//
+//	entry:      strategyID|symbol|runDate
+//	SL modify:  strategyID|symbol|runDate|SLMOD|<newSL:2dp>
+//	SL exit:    strategyID|symbol|runDate|EXIT|<slPrice:2dp>
 //
 // The 2dp price truncation means "SL modify to 220.34" dedups against
 // itself but not against "SL modify to 220.35" — which is the intended
@@ -71,9 +72,9 @@ type ManthanOrder struct {
 	Symbol        string  `json:"symbol"`
 	ISIN          string  `json:"isin"`
 	Exchange      string  `json:"exchange"`
-	OrderType     string  `json:"order_type"`     // MARKET
-	OrderSide     string  `json:"order_side"`      // BUY
-	ProductType   string  `json:"product_type"`    // DELIVERY
+	OrderType     string  `json:"order_type"`   // MARKET
+	OrderSide     string  `json:"order_side"`   // BUY
+	ProductType   string  `json:"product_type"` // DELIVERY
 	Quantity      int32   `json:"quantity"`
 	EntryPrice    float64 `json:"entry_price"`
 	StopLoss      float64 `json:"stop_loss"`
@@ -84,9 +85,9 @@ type ManthanOrder struct {
 	TxnCostPct    float64 `json:"txn_cost_pct"`
 
 	// Allocation context
-	Industry   string  `json:"industry"`
-	MCapBucket string  `json:"mcap_bucket"`
-	IndexName  string  `json:"index_name"`
+	Industry    string  `json:"industry"`
+	MCapBucket  string  `json:"mcap_bucket"`
+	IndexName   string  `json:"index_name"`
 	EMAAllocPct float64 `json:"ema_alloc_pct"`
 
 	// Auth fields removed 2026-06-25: broker creds are fetched at-edge by
@@ -95,6 +96,12 @@ type ManthanOrder struct {
 
 	TradingMode string    `json:"trading_mode"` // PAPER or LIVE
 	Timestamp   time.Time `json:"timestamp"`
+
+	// Flexi is the borrowed-slot audit record (flexi caps on-mode only;
+	// nil otherwise). json:"-" — it NEVER reaches the trade-signals wire or
+	// kafka_payload: trade-execution's contract is byte-identical in every
+	// mode. Persisted separately as manthan_signal_decisions.flexi_grant.
+	Flexi *types.FlexiGrant `json:"-"`
 }
 
 // SLModifyOrder is published when trailing SL needs to be updated.
@@ -116,18 +123,18 @@ type SLModifyOrder struct {
 
 // SLExitOrder is published when trailing SL is triggered.
 type SLExitOrder struct {
-	OrderID    string  `json:"order_id"`
-	UserID     string  `json:"user_id"`
-	StrategyID string  `json:"strategy_id"`
-	Symbol     string  `json:"symbol"`
-	Exchange   string  `json:"exchange"`
-	OrderType  string  `json:"order_type"`   // MARKET
-	OrderSide  string  `json:"order_side"`    // SELL
-	ProductType string `json:"product_type"`  // DELIVERY
-	Quantity   int32   `json:"quantity"`
-	ExitPrice  float64 `json:"exit_price"`
-	SLPrice    float64 `json:"sl_price"`
-	PnL        float64 `json:"pnl"`
+	OrderID     string  `json:"order_id"`
+	UserID      string  `json:"user_id"`
+	StrategyID  string  `json:"strategy_id"`
+	Symbol      string  `json:"symbol"`
+	Exchange    string  `json:"exchange"`
+	OrderType   string  `json:"order_type"`   // MARKET
+	OrderSide   string  `json:"order_side"`   // SELL
+	ProductType string  `json:"product_type"` // DELIVERY
+	Quantity    int32   `json:"quantity"`
+	ExitPrice   float64 `json:"exit_price"`
+	SLPrice     float64 `json:"sl_price"`
+	PnL         float64 `json:"pnl"`
 
 	// Auth fields removed 2026-06-25 — fetched at-edge in trade-execution.
 	TradingMode string    `json:"trading_mode"`
@@ -151,19 +158,19 @@ func (g *OrderGenerator) GenerateEntryOrders(
 		// Never fall back to today() here — a cross-midnight retry would compute
 		// a different id and break dedup.
 		order := ManthanOrder{
-			OrderID:       deterministicSignalID(strategy.StrategyID, alloc.Symbol, alloc.RunDate),
-			UserID:        strategy.UserID,
-			StrategyID:    strategy.StrategyID,
-			Symbol:        alloc.Symbol,
-			ISIN:          alloc.ISIN,
-			Exchange:      "NSE",
-			OrderType:     "MARKET",
-			OrderSide:     "BUY",
-			ProductType:   "DELIVERY",
-			Quantity:      alloc.Quantity,
-			EntryPrice:    alloc.EntryPrice,
-			StopLoss:      alloc.InitialSL,
-			StopLossType:  "TRAILING",
+			OrderID:      deterministicSignalID(strategy.StrategyID, alloc.Symbol, alloc.RunDate),
+			UserID:       strategy.UserID,
+			StrategyID:   strategy.StrategyID,
+			Symbol:       alloc.Symbol,
+			ISIN:         alloc.ISIN,
+			Exchange:     "NSE",
+			OrderType:    "MARKET",
+			OrderSide:    "BUY",
+			ProductType:  "DELIVERY",
+			Quantity:     alloc.Quantity,
+			EntryPrice:   alloc.EntryPrice,
+			StopLoss:     alloc.InitialSL,
+			StopLossType: "TRAILING",
 			// Effective (bucket-aware) pct — trade-execution derives its
 			// broker SL triggers from THIS value, never a literal.
 			StopLossPct:   bucketStopLossPct(alloc.MCapBucket, strategy.StopLossPct),
@@ -176,6 +183,7 @@ func (g *OrderGenerator) GenerateEntryOrders(
 			EMAAllocPct:   alloc.EMAAllocPct * 100,
 			TradingMode:   strategy.TradingMode,
 			Timestamp:     time.Now(),
+			Flexi:         alloc.Flexi, // nil unless flexi on-mode granted a borrowed slot
 		}
 		orders = append(orders, order)
 

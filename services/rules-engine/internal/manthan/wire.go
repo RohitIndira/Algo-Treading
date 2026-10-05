@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -71,6 +72,13 @@ type Deps struct {
 	// External Redis (Indira live LTP feed). Empty Addr disables the feed.
 	ExtRedisAddr     string
 	ExtRedisPassword string
+
+	// Flexi caps (MANTHAN_FLEXI_*). main.go parses the nine env keys with
+	// types.LoadFlexiConfigFromEnv — the same place the other MANTHAN_* flags
+	// are read — and passes the result here. nil ⇒ Wire parses the process
+	// env itself (keeps older callers / tests working). Unset env == off ==
+	// today's behaviour.
+	Flexi *types.FlexiConfig
 }
 
 // ConfigConsumerCallbackSetter is the slice of internal/kafka.ConfigConsumer
@@ -249,6 +257,65 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 		getEMAAllocations,
 		logger,
 	)
+
+	// Flexi caps (MANTHAN_FLEXI_*; unset == off == today's behaviour). The
+	// config is parsed in cmd/main.go like the other MANTHAN_* flags and
+	// arrives via deps.Flexi (nil ⇒ parse the process env here). A non-off
+	// mode is honoured only when the decisions schema admits
+	// FLEXI_EVAL/EVALUATED (migration 014) — otherwise the mode is forced off
+	// with an Error so a dry-run can never silently write zero rows. The
+	// probe distinguishes a DEFINITIVE "not migrated" answer (forced off at
+	// once, message names the migration) from a DB/connectivity error (retried
+	// a few times with backoff — a 03:30 restart blip must not cost a whole
+	// session — then forced off with a message that blames the DB, not the
+	// migration). A missing signals DB is NOT forced off: each plan then
+	// fails closed to base caps at runtime (rate-limited Warn).
+	var flexiCfg types.FlexiConfig
+	if deps.Flexi != nil {
+		flexiCfg = *deps.Flexi
+	} else {
+		flexiCfg = types.LoadFlexiConfigFromEnv()
+	}
+	for _, w := range flexiCfg.Warnings {
+		logger.Warn("Manthan flexi caps config", zap.String("warning", w))
+	}
+	if flexiCfg.Enabled() {
+		if err := probeFlexiSchemaWithRetry(ctx, deps.ManthanDB, logger); err != nil {
+			if errors.Is(err, ErrFlexiSchemaNotMigrated) {
+				logger.Error("MANTHAN_FLEXI_CAPS_MODE forced OFF — audit schema not migrated (apply migrations/014_flexi_audit.sql on trading_db off-hours, then restart with --update-env)",
+					zap.String("requested_mode", string(flexiCfg.Mode)), zap.Error(err))
+			} else {
+				logger.Error("MANTHAN_FLEXI_CAPS_MODE forced OFF — schema probe failed (DB error, not a missing migration); fix connectivity and restart",
+					zap.String("requested_mode", string(flexiCfg.Mode)), zap.Int("attempts", flexiProbeAttempts), zap.Error(err))
+			}
+			flexiCfg.Mode = types.FlexiOff
+			flexiCfg.ForcedOff = true
+		} else if m.signalsDB == nil {
+			logger.Error("Manthan flexi caps enabled but signals DB is unavailable — every plan will fail closed to base caps",
+				zap.String("mode", string(flexiCfg.Mode)))
+		}
+	}
+	if flexiCfg.Mode == types.FlexiOn && len(flexiCfg.Allowlist) == 0 {
+		// Policy guard for the rollout plan (S4450 first): on-mode with an
+		// empty allowlist is FLEET-WIDE on the first flip. Not forced off —
+		// spec §2.6 defines empty = all and Phase 3 is fleet-wide — but loud.
+		logger.Error("MANTHAN_FLEXI_CAPS_MODE=on with EMPTY MANTHAN_FLEXI_STRATEGY_ALLOWLIST — flexi caps apply to EVERY strategy; set the allowlist unless fleet-wide is intended")
+	}
+	m.consumer.SetFlexi(flexiCfg, deps.ManthanDB)
+	if flexiCfg.Enabled() {
+		logger.Info("Manthan flexi caps ENABLED",
+			zap.String("mode", string(flexiCfg.Mode)),
+			zap.Strings("priority", flexiCfg.Priority),
+			zap.Strings("donors", flexiCfg.Donors),
+			zap.Int("max_receiver_pct", flexiCfg.MaxReceiverPct),
+			zap.Int("min_idle_slots", flexiCfg.MinIdleSlots),
+			zap.Int("min_universe_rows", flexiCfg.MinUniverseRows),
+			zap.String("cutoff_ist", flexiCfg.CutoffIST),
+			zap.Strings("allowlist", flexiCfg.Allowlist),
+			zap.Duration("db_timeout", flexiCfg.DBTimeout))
+	} else {
+		logger.Info("Manthan flexi caps off (base caps only)", zap.Bool("forced_off", flexiCfg.ForcedOff))
+	}
 
 	tickHandler := NewTickHandler(
 		slMgr,

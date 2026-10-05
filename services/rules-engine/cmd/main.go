@@ -11,13 +11,14 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/RohitIndira/Algo-Treading/services/rules-engine/config"
 	"database/sql"
+	"github.com/RohitIndira/Algo-Treading/services/rules-engine/config"
 
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/cache"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/configstore"
 	intkafka "github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/kafka"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan"
+	manthantypes "github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/manthan/types"
 	"github.com/RohitIndira/Algo-Treading/services/rules-engine/internal/startup"
 
 	_ "github.com/lib/pq"
@@ -135,6 +136,12 @@ func main() {
 	<-lc.ConfigConsumerStarted
 	logger.Info("Config consumer started — system is LIVE")
 
+	// Flexi caps config: the nine MANTHAN_FLEXI_* keys, parsed here with the
+	// other MANTHAN_* flags (unset == off == today's behaviour). Wire logs
+	// the parse warnings and probes the audit schema before honouring a
+	// non-off mode.
+	flexiCfg := manthantypes.LoadFlexiConfigFromEnv()
+
 	// Hand Manthan everything it needs and let the wire helper own the
 	// rest of the boot order. Was ~290 LOC inline; now lives in
 	// internal/manthan/wire.go.
@@ -155,6 +162,7 @@ func main() {
 		NotificationsEnabled: os.Getenv("MANTHAN_NOTIFICATIONS_ENABLED") == "true",
 		ExtRedisAddr:         os.Getenv("EXT_REDIS_ADDR"),
 		ExtRedisPassword:     os.Getenv("EXT_REDIS_PASSWORD"),
+		Flexi:                &flexiCfg,
 	})
 	if err != nil {
 		logger.Fatal("Manthan wire failed", zap.Error(err))

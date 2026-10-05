@@ -46,6 +46,13 @@ type Consumer struct {
 	strategyFn   func() []types.UserStrategy
 	emaFn        func() map[string]float64
 	logger       *zap.Logger
+
+	// Flexi caps (2026-09-30) — see flexi.go. Zero values == feature off:
+	// no universe fetch, nil FlexiInput, allocator byte-identical.
+	flexiCfg   types.FlexiConfig
+	flexiDB    *sql.DB // trading_db: dry-run shadow book (manthan_signal_decisions)
+	flexiStats *flexiStats
+	flexiNow   func() time.Time // IST clock for the cutoff; nil → nowIST (tests inject)
 }
 
 // OrderPublisher is the interface for publishing trade signals + persisting the
@@ -56,6 +63,10 @@ type OrderPublisher interface {
 	PublishSLExit(ctx context.Context, order SLExitOrder) error
 	// Best-effort skip audit (decision row + Kafka event); never errors.
 	PublishSignalSkip(ctx context.Context, userID, strategyID string, skip SkipReason)
+	// Best-effort flexi-caps evaluation audit (FLEXI_EVAL/EVALUATED row +
+	// Kafka event on portfolio.allocations); never errors. Only ever called
+	// when MANTHAN_FLEXI_CAPS_MODE is dry_run or on.
+	PublishFlexiEval(ctx context.Context, userID, strategyID string, ev types.FlexiEval)
 
 	// FIX F — persist trail state so a restart resumes it (see positions_persist.go).
 	PersistPositionOpen(ctx context.Context, order ManthanOrder) error
@@ -318,7 +329,21 @@ func (c *Consumer) CatchUpNewStrategy(ctx context.Context, strategy types.UserSt
 	portfolio := c.portfolioMgr.GetOrCreate(strategy)
 	emaByIndex := c.emaFn()
 
-	result := c.allocator.Allocate(signals, portfolio, emaByIndex)
+	// Flexi caps: same call as the live path (one universe fetch for the
+	// batch's run_date; nil input when the feature is off). Effectively
+	// unreachable today because of the creation gate above, kept identical.
+	var fx *FlexiInput
+	var universe *types.FlexiUniverse
+	if c.flexiWanted([]types.UserStrategy{strategy}) {
+		universe = c.fetchFlexiUniverse(ctx, signals[0].RunDate)
+		c.observeFlexiUniverse(universe)
+		fx = c.flexiInputFor(ctx, strategy, universe, signals)
+	}
+
+	result := c.allocator.AllocateWithFlexi(signals, portfolio, emaByIndex, fx)
+	if fx != nil {
+		c.publishFlexiResult(ctx, strategy, universe, result)
+	}
 
 	// Always log skip reasons so we never silently drop a signal on catch-up.
 	// This is the single biggest source of "why didn't it buy?" debugging time.
@@ -609,6 +634,15 @@ func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal
 
 	emaByIndex := c.emaFn()
 
+	// Flexi caps: ONE universe fetch per Kafka message, outside any
+	// portfolio Mu, shared by every strategy below. Only when the mode is
+	// dry_run/on — off-mode never touches signals_db here.
+	var universe *types.FlexiUniverse
+	if c.flexiWanted(strategies) {
+		universe = c.fetchFlexiUniverse(ctx, signal.RunDate)
+		c.observeFlexiUniverse(universe)
+	}
+
 	for _, strategy := range strategies {
 		// Portfolio object first (as before the gate existed) so a new
 		// strategy is registered in the manager on its first signal even
@@ -630,11 +664,12 @@ func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal
 				zap.String("user", strategy.UserID), zap.String("strategy", strategy.StrategyID))
 		}
 
-		result := c.allocator.Allocate(
-			[]types.ManthanSignal{signal},
-			portfolio,
-			emaByIndex,
-		)
+		sigs := []types.ManthanSignal{signal}
+		fx := c.flexiInputFor(ctx, strategy, universe, sigs) // nil unless dry_run/on AND allowlisted
+		result := c.allocator.AllocateWithFlexi(sigs, portfolio, emaByIndex, fx)
+		if fx != nil {
+			c.publishFlexiResult(ctx, strategy, universe, result)
+		}
 
 		for _, skip := range result.Skipped {
 			c.logger.Info("Signal skipped",

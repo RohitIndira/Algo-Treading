@@ -70,6 +70,28 @@ module.exports = {
         POSTGRES_DB: 'trading_db', MANTHAN_SIGNALS_DB: 'signals_db',
         USER_CONFIG_GRPC_ADDR: 'localhost:9003', USER_CONFIG_SERVICE_ADDR: 'localhost:9003',
         ENVIRONMENT: 'production',
+        // Flexi caps (2026-09-30). ALL nine MANTHAN_FLEXI_* keys are read by
+        // rules-engine (internal/manthan/types/flexi.go FlexiEnvKeys) and MUST
+        // be forwarded here — env blocks are whitelists, an unforwarded key
+        // means the feature silently never runs. Values come from .env
+        // (uncommitted); '' == unset == today's behaviour (mode off).
+        // First production target: MANTHAN_FLEXI_CAPS_MODE=dry_run with
+        // MANTHAN_FLEXI_STRATEGY_ALLOWLIST=<S4450 strategy id>. Apply
+        // migrations/014_flexi_audit.sql off-hours FIRST or boot forces off.
+        // PM2 caches this env block at the last `pm2 start/restart <file>`:
+        // after editing .env run
+        //   pm2 restart ecosystem.config.js --only rules-engine --update-env
+        // (a plain `pm2 restart rules-engine` and the 03:30 cron_restart keep
+        // the OLD values). Full procedure: services/rules-engine/migrations/README.md.
+        MANTHAN_FLEXI_CAPS_MODE:          ENV.MANTHAN_FLEXI_CAPS_MODE          || '',
+        MANTHAN_FLEXI_PRIORITY:           ENV.MANTHAN_FLEXI_PRIORITY           || '',
+        MANTHAN_FLEXI_DONORS:             ENV.MANTHAN_FLEXI_DONORS             || '',
+        MANTHAN_FLEXI_MAX_RECEIVER_PCT:   ENV.MANTHAN_FLEXI_MAX_RECEIVER_PCT   || '',
+        MANTHAN_FLEXI_MIN_IDLE_SLOTS:     ENV.MANTHAN_FLEXI_MIN_IDLE_SLOTS     || '',
+        MANTHAN_FLEXI_MIN_UNIVERSE_ROWS:  ENV.MANTHAN_FLEXI_MIN_UNIVERSE_ROWS  || '',
+        MANTHAN_FLEXI_CUTOFF_IST:         ENV.MANTHAN_FLEXI_CUTOFF_IST         || '',
+        MANTHAN_FLEXI_STRATEGY_ALLOWLIST: ENV.MANTHAN_FLEXI_STRATEGY_ALLOWLIST || '',
+        MANTHAN_FLEXI_DB_TIMEOUT_MS:      ENV.MANTHAN_FLEXI_DB_TIMEOUT_MS      || '',
     }},
     { name: 'trade-execution', script: './bin/trade-execution', ...common, env: {
         ...BASE, ...KEY, SERVICE_PORT: '9004', METRICS_PORT: '9090', PAPER_WS_PORT: '8091',
