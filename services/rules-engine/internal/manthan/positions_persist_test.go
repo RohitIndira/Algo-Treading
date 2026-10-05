@@ -281,3 +281,79 @@ func TestAllocator_InitialSLIsStrategyStopLossPct(t *testing.T) {
 		t.Error("effectiveStopLossPct altered a valid config value")
 	}
 }
+
+// 2026-10-05: active_count is re-derived from the positions table after every
+// persist, and the ENTRY_BUY decision follows the position's truth
+// (DISPATCHED → CONFIRMED on fill → CLOSED on exit).
+func TestPersist_ActiveCountAndDecisionFollowPosition(t *testing.T) {
+	db := openPersistTestDB(t)
+	defer cleanPersist(t, db)
+	_, _ = db.Exec(`DELETE FROM manthan_signal_decisions WHERE signal_id=$1`, persistSignalID)
+	_, _ = db.Exec(`DELETE FROM manthan_portfolio_state WHERE strategy_id::text=$1`, persistStrategyID)
+	defer func() {
+		_, _ = db.Exec(`DELETE FROM manthan_signal_decisions WHERE signal_id=$1`, persistSignalID)
+		_, _ = db.Exec(`DELETE FROM manthan_portfolio_state WHERE strategy_id::text=$1`, persistStrategyID)
+	}()
+	// seed: a state row at the stale value, and a DISPATCHED entry decision
+	if _, err := db.Exec(`INSERT INTO manthan_portfolio_state
+		(strategy_id, user_id, initial_capital, current_capital, max_positions, per_stock_base, active_count, updated_at)
+		VALUES ($1,'S4450',500000,500000,25,20000,99,now())`, persistStrategyID); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO manthan_signal_decisions
+		(signal_id, user_id, strategy_id, symbol, isin, signal_type, ltp_at_decision, ema_alloc_pct,
+		 intended_qty, intended_invested, initial_sl_target, industry, mcap_bucket, index_name, status)
+		VALUES ($1,'S4450',$2,$3,'INE000TEST01','ENTRY_BUY',100,1,10,1000,80,'IT','LARGE','NIFTY50','DISPATCHED')`,
+		persistSignalID, persistStrategyID, persistSymbol); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	p := &ManthanPublisher{db: db, logger: zap.NewNop()}
+	ctx := context.Background()
+	count := func() int {
+		var n int
+		if err := db.QueryRow(`SELECT active_count FROM manthan_portfolio_state WHERE strategy_id::text=$1`, persistStrategyID).Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+	decision := func() string {
+		var s string
+		if err := db.QueryRow(`SELECT status FROM manthan_signal_decisions WHERE signal_id=$1`, persistSignalID).Scan(&s); err != nil {
+			t.Fatalf("decision: %v", err)
+		}
+		return s
+	}
+
+	if err := p.PersistPositionOpen(ctx, testEntryOrder()); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("after open active_count = %d, want 1 (PENDING_ENTRY occupies a slot)", got)
+	}
+	if got := decision(); got != "DISPATCHED" {
+		t.Fatalf("decision before fill = %s, want DISPATCHED", got)
+	}
+
+	if err := p.PersistFillConfirmed(ctx, persistStrategyID, persistSymbol, 101, 10, 20); err != nil {
+		t.Fatalf("fill: %v", err)
+	}
+	if got := decision(); got != "CONFIRMED" {
+		t.Fatalf("decision after fill = %s, want CONFIRMED", got)
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("after fill active_count = %d, want 1", got)
+	}
+
+	if err := p.PersistExit(ctx, persistStrategyID, persistSymbol, 110, 90, "TSL_HIT"); err != nil {
+		t.Fatalf("exit: %v", err)
+	}
+	if got := decision(); got != "CLOSED" {
+		t.Fatalf("decision after exit = %s, want CLOSED", got)
+	}
+	if got := count(); got != 0 {
+		t.Fatalf("after exit active_count = %d, want 0", got)
+	}
+	if exitDecisionStatus("MANUAL_EXIT") != "MANUALLY_EXITED" || exitDecisionStatus("TSL_HIT") != "CLOSED" {
+		t.Fatalf("exit reason mapping wrong")
+	}
+}

@@ -3,6 +3,7 @@ package manthan
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -73,6 +74,9 @@ func (p *ManthanPublisher) PersistPositionOpen(ctx context.Context, order Mantha
 			zap.String("signal_id", order.OrderID),
 			zap.Error(err))
 	}
+	if err == nil {
+		p.refreshActiveCount(ctx, order.StrategyID)
+	}
 	return err
 }
 
@@ -142,8 +146,11 @@ func (p *ManthanPublisher) PersistFillConfirmed(ctx context.Context, strategyID,
 	if err != nil {
 		p.logger.Error("PersistFillConfirmed failed — row stays PENDING_ENTRY (next trail ratchet self-heals it)",
 			zap.String("symbol", symbol), zap.Error(err))
+		return err
 	}
-	return err
+	p.syncEntryDecision(ctx, strategyID, symbol, "CONFIRMED")
+	p.refreshActiveCount(ctx, strategyID)
+	return nil
 }
 
 // PersistExit marks the position EXITED so rehydrate does not restore a closed
@@ -169,6 +176,10 @@ func (p *ManthanPublisher) PersistExit(ctx context.Context, strategyID, symbol s
 		p.logger.Warn("PersistExit failed — EXITED position may re-appear on restart (reconciled by orphan scanner / next tick)",
 			zap.String("symbol", symbol), zap.Error(err))
 	}
+	if err == nil {
+		p.syncEntryDecision(ctx, strategyID, symbol, exitDecisionStatus(reason))
+		p.refreshActiveCount(ctx, strategyID)
+	}
 	return err
 }
 
@@ -189,5 +200,83 @@ func (p *ManthanPublisher) ExpireStalePendingEntries(ctx context.Context, maxAge
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	if n > 0 {
+		p.refreshAllActiveCounts(ctx)
+	}
 	return n, nil
+}
+
+// occupyingStatuses mirrors types.Position.Occupies() for the DB: every row
+// that holds a slot right now. Keep the two in lockstep.
+const occupyingStatuses = "('PENDING_ENTRY','PARTIALLY_FILLED','ACTIVE','EXIT_PENDING')"
+
+// refreshActiveCount re-derives manthan_portfolio_state.active_count from the
+// positions table (2026-10-05). UpdatePortfolioState writes the in-memory
+// count at publish time — BEFORE the consumer adds the new position — so the
+// row lagged by one until the next event (S4450 read 17 with 18 held). A
+// derived count after every persist can never drift. Best-effort: logged,
+// never propagated — the state table is reporting, not the source of truth.
+func (p *ManthanPublisher) refreshActiveCount(ctx context.Context, strategyID string) {
+	if p.db == nil {
+		return
+	}
+	if _, err := p.db.ExecContext(ctx, `
+		UPDATE manthan_portfolio_state ps
+		SET active_count = (SELECT COUNT(*) FROM manthan_positions mp
+		                    WHERE mp.strategy_id = ps.strategy_id
+		                      AND mp.status IN `+occupyingStatuses+`),
+		    updated_at = now()
+		WHERE ps.strategy_id::text = $1`, strategyID); err != nil {
+		p.logger.Warn("portfolio_state active_count refresh failed",
+			zap.String("strategy", strategyID), zap.Error(err))
+	}
+}
+
+// refreshAllActiveCounts is the fleet-wide form, for paths that touch rows
+// across strategies (the stale-PENDING expiry sweep).
+func (p *ManthanPublisher) refreshAllActiveCounts(ctx context.Context) {
+	if p.db == nil {
+		return
+	}
+	if _, err := p.db.ExecContext(ctx, `
+		UPDATE manthan_portfolio_state ps
+		SET active_count = (SELECT COUNT(*) FROM manthan_positions mp
+		                    WHERE mp.strategy_id = ps.strategy_id
+		                      AND mp.status IN `+occupyingStatuses+`),
+		    updated_at = now()`); err != nil {
+		p.logger.Warn("portfolio_state fleet active_count refresh failed", zap.Error(err))
+	}
+}
+
+// syncEntryDecision advances the position's ENTRY_BUY decision row to its
+// terminal truth (2026-10-05): CONFIRMED on a broker-confirmed fill, CLOSED /
+// MANUALLY_EXITED on a confirmed exit. Decisions used to freeze at
+// DISPATCHED forever, so the audit table could not answer "did it fill?"
+// on its own. Keyed by the position's signal_id; idempotent (only moves
+// forward from DISPATCHED/CONFIRMED). Best-effort.
+func (p *ManthanPublisher) syncEntryDecision(ctx context.Context, strategyID, symbol, newStatus string) {
+	if p.db == nil {
+		return
+	}
+	if _, err := p.db.ExecContext(ctx, `
+		UPDATE manthan_signal_decisions d
+		SET status = $3, final_status_at = now()
+		FROM manthan_positions mp
+		WHERE mp.strategy_id::text = $1 AND mp.symbol = $2
+		  AND mp.signal_id IS NOT NULL
+		  AND d.signal_id = mp.signal_id
+		  AND d.signal_type = 'ENTRY_BUY'
+		  AND d.status IN ('DISPATCHED','CONFIRMED')
+		  AND d.status <> $3`, strategyID, symbol, newStatus); err != nil {
+		p.logger.Warn("entry decision status sync failed",
+			zap.String("symbol", symbol), zap.String("to", newStatus), zap.Error(err))
+	}
+}
+
+// exitDecisionStatus maps a confirmed exit reason onto the decisions enum.
+func exitDecisionStatus(reason string) string {
+	if strings.Contains(strings.ToUpper(reason), "MANUAL") {
+		return "MANUALLY_EXITED"
+	}
+	return "CLOSED"
 }
