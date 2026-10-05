@@ -570,7 +570,7 @@ func TestAllocator_DryRun_RealDecisionsUnchanged(t *testing.T) {
 	}
 	// Guarded plan → no evals, reason recorded, decision still base.
 	res = a.AllocateWithFlexi([]types.ManthanSignal{flexiSig("sa", types.BucketSmall)}, flexiPortfolio(12, 5, 0), fullEMA,
-		flexiInput(cfg, &types.FlexiUniverse{RunDate: flexiRunDate, StocksRows: 2}, nil))
+		flexiInput(cfg, &types.FlexiUniverse{RunDate: flexiRunDate, StocksRows: 0}, nil))
 	if len(res.FlexiEvals) != 0 || res.FlexiNotApplied != types.FlexiGuardUniverseRows || res.Skipped[0].Reason != "mcap bucket cap 50% reached for SMALL" {
 		t.Fatalf("guarded: %+v", res)
 	}

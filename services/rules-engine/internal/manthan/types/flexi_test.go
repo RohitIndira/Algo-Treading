@@ -32,7 +32,7 @@ func TestFlexiConfig_Parse(t *testing.T) {
 	if c.Mode != FlexiOff || c.Enabled() {
 		t.Fatalf("unset must be off, got %s", c.Mode)
 	}
-	if c.MaxReceiverPct != 80 || c.MinIdleSlots != 1 || c.MinUniverseRows != 5 || c.CutoffIST != "15:20" ||
+	if c.MaxReceiverPct != 80 || c.MinIdleSlots != 1 || c.MinUniverseRows != 1 || c.CutoffIST != "15:20" ||
 		c.DBTimeout != 300*time.Millisecond || len(c.Priority) != 3 || len(c.Donors) != 3 {
 		t.Fatalf("defaults wrong: %+v", c)
 	}
@@ -465,8 +465,13 @@ func TestBuildFlexiPlan_Guards(t *testing.T) {
 	want(run(input(onCfg(nil), &bad), caps, held, pos, sigs), FlexiGuardUniverseError)
 
 	few := *u
-	few.StocksRows = 4
+	few.StocksRows = 0 // empty snapshot still fails closed (default min is 1)
 	want(run(input(onCfg(nil), &few), caps, held, pos, sigs), FlexiGuardUniverseRows)
+	one := *u
+	one.StocksRows = 1 // a one-stock day is a valid universe → plan builds
+	if plan, why := BuildFlexiPlan(input(onCfg(nil), &one), caps, 25, held, pos, nil, sigs); plan == nil {
+		t.Fatalf("a 1-row universe must build a plan, got guard %s", why)
+	}
 
 	// Self-consistency: symbol absent / bucket flipped / non-canonical string.
 	want(run(input(onCfg(nil), u), caps, held, pos, []ManthanSignal{sigOf("GHOST", BucketSmall)}), FlexiGuardNotInSnapshot)

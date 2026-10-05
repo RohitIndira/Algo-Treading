@@ -97,7 +97,7 @@ type FlexiConfig struct {
 	Donors          []string // buckets allowed to donate when void
 	MaxReceiverPct  int      // any bucket's effective ceiling ≤ floor(N·pct/100); 50–100
 	MinIdleSlots    int      // slots never lent
-	MinUniverseRows int      // manthan_stocks rows for D required before any bucket may be void
+	MinUniverseRows int      // manthan_stocks rows for D required (default 1 = non-empty) before any bucket may be void
 	CutoffIST       string   // "HH:MM" — no new grants at/after
 	Allowlist       []string // strategy_ids (lower-cased); empty = all
 	DBTimeout       time.Duration
@@ -164,12 +164,17 @@ func LoadFlexiConfigFromEnv() FlexiConfig {
 func ParseFlexiConfig(lookup func(string) string) FlexiConfig {
 	get := func(k string) string { return strings.TrimSpace(lookup(k)) }
 	c := FlexiConfig{
-		Mode:            FlexiOff,
-		Priority:        append([]string(nil), CanonicalBuckets...),
-		Donors:          append([]string(nil), CanonicalBuckets...),
-		MaxReceiverPct:  80,
-		MinIdleSlots:    1,
-		MinUniverseRows: 5,
+		Mode:           FlexiOff,
+		Priority:       append([]string(nil), CanonicalBuckets...),
+		Donors:         append([]string(nil), CanonicalBuckets...),
+		MaxReceiverPct: 80,
+		MinIdleSlots:   1,
+		// 1, not a "sheet looks half-loaded" heuristic: the Buy list is
+		// operator-curated and a one-stock day is normal (operator,
+		// 2026-10-05). An EMPTY snapshot still fails closed, and the
+		// signal-in-snapshot self-consistency check remains the stale/
+		// mismatch guard.
+		MinUniverseRows: 1,
 		CutoffIST:       "15:20",
 		DBTimeout:       300 * time.Millisecond,
 		cutoffMinute:    15*60 + 20,
