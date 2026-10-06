@@ -54,10 +54,12 @@ func (d *DashboardStore) clientBases(ctx context.Context, userID string) (map[st
 }
 
 // openBook returns per-user open-position count + utilized exposure.
-func (d *DashboardStore) openBook(ctx context.Context) (map[string]int, map[string]float64, error) {
+// userID == "" covers every user.
+func (d *DashboardStore) openBook(ctx context.Context, userID string) (map[string]int, map[string]float64, error) {
+	scope, args := userScope(userID, nil)
 	rows, err := d.tradingDB.QueryContext(ctx, `
 		SELECT user_id, COUNT(*), COALESCE(SUM(invested_amt),0)
-		FROM manthan_positions WHERE status IN `+openStatuses+` GROUP BY user_id`)
+		FROM manthan_positions WHERE status IN `+openStatuses+scope+` GROUP BY user_id`, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -115,7 +117,7 @@ func (d *DashboardStore) Clients(ctx context.Context) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	counts, utilized, err := d.openBook(ctx)
+	counts, utilized, err := d.openBook(ctx, "")
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +141,7 @@ func (d *DashboardStore) Clients(ctx context.Context) (any, error) {
 		DailyMTMPct      float64 `json:"daily_mtm_pct"`
 		NetWorth         float64 `json:"net_worth"`
 	}
-	var out []client
+	out := make([]client, 0, len(bases))
 	for _, b := range bases {
 		c := client{
 			UserID: b.UserID, ClientCode: b.UserID, ClientName: b.UserID,
@@ -219,34 +221,62 @@ func cagrFromIndex(nav []navDay, idx []float64) float64 {
 	return round2f((math.Pow(idx[len(idx)-1]/idx[0], 1/years) - 1) * 100)
 }
 
-// requireClient 404s unknown client ids before running series queries.
-func (d *DashboardStore) requireClient(ctx context.Context, userID string) error {
+// hasPositions reports whether any manthan_positions row exists for the
+// user. A client whose strategies were all deleted (KEEP_POSITIONS_OPEN)
+// is gone from the strategy roster but still in the book — the book-wide
+// charts count those rows, so the per-client views must resolve the id.
+func (d *DashboardStore) hasPositions(ctx context.Context, userID string) (bool, error) {
+	var one int
+	err := d.tradingDB.QueryRowContext(ctx,
+		`SELECT 1 FROM manthan_positions WHERE user_id = $1 LIMIT 1`, userID).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// clientBase resolves one client: the strategy-roster row when it has
+// non-deleted strategies, else a zero-capital base when only positions
+// remain, else errClientUnknown.
+func (d *DashboardStore) clientBase(ctx context.Context, userID string) (*clientBase, error) {
+	if userID == "" {
+		return nil, errClientUnknown
+	}
 	bases, err := d.clientBases(ctx, userID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(bases) == 0 {
-		return errClientUnknown
+	if b, ok := bases[userID]; ok {
+		return b, nil
 	}
-	return nil
+	held, err := d.hasPositions(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !held {
+		return nil, errClientUnknown
+	}
+	return &clientBase{UserID: userID}, nil
+}
+
+// requireClient 404s unknown client ids before running series queries.
+func (d *DashboardStore) requireClient(ctx context.Context, userID string) error {
+	_, err := d.clientBase(ctx, userID)
+	return err
 }
 
 // ── 11. Client summary ──────────────────────────────────────────────────
 
 func (d *DashboardStore) ClientSummary(ctx context.Context, userID string) (any, error) {
-	bases, err := d.clientBases(ctx, userID)
+	b, err := d.clientBase(ctx, userID)
 	if err != nil {
 		return nil, err
-	}
-	b, ok := bases[userID]
-	if !ok {
-		return nil, errClientUnknown
 	}
 	agg, err := d.positionsAgg(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	counts, utilized, err := d.openBook(ctx)
+	counts, utilized, err := d.openBook(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -310,12 +340,12 @@ func (d *DashboardStore) EquityCurve(ctx context.Context, userID string, days in
 		return nil, err
 	}
 	type point struct {
-		Date              string   `json:"date"`
-		PortfolioIndexed  float64  `json:"portfolio_indexed"`
-		NiftyIndexed      *float64 `json:"nifty_indexed,omitempty"`
-		Midcap150Indexed  *float64 `json:"midcap150_indexed,omitempty"`
+		Date               string   `json:"date"`
+		PortfolioIndexed   float64  `json:"portfolio_indexed"`
+		NiftyIndexed       *float64 `json:"nifty_indexed,omitempty"`
+		Midcap150Indexed   *float64 `json:"midcap150_indexed,omitempty"`
 		Smallcap250Indexed *float64 `json:"smallcap250_indexed,omitempty"`
-		PortfolioValue    float64  `json:"portfolio_value"`
+		PortfolioValue     float64  `json:"portfolio_value"`
 	}
 	series := make([]point, 0, len(nav))
 	if len(nav) == 0 {
@@ -362,9 +392,9 @@ func (d *DashboardStore) EquityCurve(ctx context.Context, userID string, days in
 		return round2f(last["portfolio"] - last[bench])
 	}
 	return map[string]any{
-		"series":                        series,
-		"outperformance_pct":            outVs("nifty50"),
-		"outperformance_midcap150_pct":  outVs("midcap150"),
+		"series":                         series,
+		"outperformance_pct":             outVs("nifty50"),
+		"outperformance_midcap150_pct":   outVs("midcap150"),
 		"outperformance_smallcap250_pct": outVs("smallcap250"),
 	}, nil
 }

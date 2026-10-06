@@ -210,6 +210,7 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "GET", "/clients/{client_id}/equity-curve", "CLIENT_EQUITY_CURVE", TierRead, h.handleClientEquityCurve)
 		h.Route(token, "GET", "/clients/{client_id}/drawdown", "CLIENT_DRAWDOWN", TierRead, h.handleClientDrawdown)
 		h.Route(token, "GET", "/clients/{client_id}/mtm-series", "CLIENT_MTM_SERIES", TierRead, h.handleClientMTM)
+		h.Route(token, "GET", "/clients/{client_id}/dashboard", "CLIENT_DASHBOARD", TierRead, h.handleClientDashboard)
 	}
 }
 

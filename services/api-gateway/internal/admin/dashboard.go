@@ -1,6 +1,11 @@
 package admin
 
-// M12 — Admin Dashboard + Clients analytics (14 read-only endpoints).
+// M12 — Admin Dashboard + Clients analytics (read-only endpoints).
+//
+// Every book-wide function takes a userID: "" is the whole book (the
+// /portfolio/* overview), a client id narrows to that client — reached
+// either via ?client_id= on the same /portfolio/* routes or in one shot
+// via GET /clients/{id}/dashboard, which composes every panel.
 //
 // Data sources (all reads, no writes):
 //   trading_db.manthan_positions   — the rules-engine position book: entry/exit,
@@ -24,6 +29,7 @@ package admin
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -230,8 +236,9 @@ func (d *DashboardStore) bestWorst(ctx context.Context, userID string) (best, wo
 	return best, worst, err
 }
 
-func (d *DashboardStore) BestWorstTrades(ctx context.Context) (any, error) {
-	best, worst, err := d.bestWorst(ctx, "")
+// BestWorstTrades is book-wide for userID == "", else one client's.
+func (d *DashboardStore) BestWorstTrades(ctx context.Context, userID string) (any, error) {
+	best, worst, err := d.bestWorst(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -240,13 +247,26 @@ func (d *DashboardStore) BestWorstTrades(ctx context.Context) (any, error) {
 
 // ── 4/6/7. Open-book groupings (sector / mcap / ema) ────────────────────
 
+// userScope appends the optional per-client predicate. Every book-wide
+// query in this file takes userID == "" for the whole book; a non-empty
+// id narrows to that client (the /portfolio/*?client_id= and
+// /clients/{id}/dashboard views). Returns the SQL fragment and args.
+func userScope(userID string, args []any) (string, []any) {
+	if userID == "" {
+		return "", args
+	}
+	args = append(args, userID)
+	return fmt.Sprintf(" AND user_id = $%d", len(args)), args
+}
+
 // groupOpen aggregates the open book by an expression over manthan_positions.
-func (d *DashboardStore) groupOpen(ctx context.Context, expr string) (labels []string, counts []int, values []float64, total float64, err error) {
+func (d *DashboardStore) groupOpen(ctx context.Context, expr, userID string) (labels []string, counts []int, values []float64, total float64, err error) {
+	scope, args := userScope(userID, nil)
 	q := `SELECT COALESCE(NULLIF(` + expr + `, ''), 'Unknown') AS grp,
 	             COUNT(*), COALESCE(SUM(invested_amt), 0)
-	      FROM manthan_positions WHERE status IN ` + openStatuses + `
+	      FROM manthan_positions WHERE status IN ` + openStatuses + scope + `
 	      GROUP BY grp ORDER BY 3 DESC`
-	rows, err := d.tradingDB.QueryContext(ctx, q)
+	rows, err := d.tradingDB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -264,8 +284,8 @@ func (d *DashboardStore) groupOpen(ctx context.Context, expr string) (labels []s
 	return labels, counts, values, total, rows.Err()
 }
 
-func (d *DashboardStore) SectorBreakdown(ctx context.Context) (any, error) {
-	labels, _, values, total, err := d.groupOpen(ctx, "industry")
+func (d *DashboardStore) SectorBreakdown(ctx context.Context, userID string) (any, error) {
+	labels, _, values, total, err := d.groupOpen(ctx, "industry", userID)
 	if err != nil {
 		return nil, err
 	}
@@ -281,8 +301,8 @@ func (d *DashboardStore) SectorBreakdown(ctx context.Context) (any, error) {
 	return map[string]any{"sectors": out}, nil
 }
 
-func (d *DashboardStore) EMAAllocation(ctx context.Context) (any, error) {
-	labels, counts, values, total, err := d.groupOpen(ctx, "TO_CHAR(ema_alloc_pct * 100, 'FM999')")
+func (d *DashboardStore) EMAAllocation(ctx context.Context, userID string) (any, error) {
+	labels, counts, values, total, err := d.groupOpen(ctx, "TO_CHAR(ema_alloc_pct * 100, 'FM999')", userID)
 	if err != nil {
 		return nil, err
 	}
@@ -310,12 +330,13 @@ func (d *DashboardStore) EMAAllocation(ctx context.Context) (any, error) {
 		Percentage    float64 `json:"percentage"`
 	}
 	var with, without cohort
+	scope, args := userScope(userID, nil)
 	err = d.tradingDB.QueryRowContext(ctx, `
 		SELECT COUNT(*) FILTER (WHERE ema_alloc_pct IS NOT NULL),
 		       COALESCE(SUM(invested_amt) FILTER (WHERE ema_alloc_pct IS NOT NULL), 0),
 		       COUNT(*) FILTER (WHERE ema_alloc_pct IS NULL),
 		       COALESCE(SUM(invested_amt) FILTER (WHERE ema_alloc_pct IS NULL), 0)
-		FROM manthan_positions WHERE status IN `+openStatuses).
+		FROM manthan_positions WHERE status IN `+openStatuses+scope, args...).
 		Scan(&with.PositionCount, &with.Value, &without.PositionCount, &without.Value)
 	if err != nil {
 		return nil, err
@@ -330,19 +351,20 @@ func (d *DashboardStore) EMAAllocation(ctx context.Context) (any, error) {
 	}, nil
 }
 
-func (d *DashboardStore) McapPerformance(ctx context.Context) (any, error) {
+func (d *DashboardStore) McapPerformance(ctx context.Context, userID string) (any, error) {
 	// avg_return_pct is over CLOSED trades (realized truth); count + value
 	// describe the OPEN book — the chart shows "how has each cap performed"
 	// beside "what's deployed there now".
+	scope, args := userScope(userID, nil)
 	q := `SELECT COALESCE(NULLIF(mcap_bucket,''),'Unknown') AS cap,
 	             COUNT(*) FILTER (WHERE status IN ` + openStatuses + `),
 	             COALESCE(SUM(invested_amt) FILTER (WHERE status IN ` + openStatuses + `), 0),
 	             COALESCE(AVG(realized_pnl / NULLIF(invested_amt,0) * 100)
 	                      FILTER (WHERE status = 'EXITED'), 0)
 	      FROM manthan_positions
-	      WHERE status IN ('ACTIVE','EXIT_PENDING','EXITED')
+	      WHERE status IN ('ACTIVE','EXIT_PENDING','EXITED')` + scope + `
 	      GROUP BY cap ORDER BY 3 DESC`
-	rows, err := d.tradingDB.QueryContext(ctx, q)
+	rows, err := d.tradingDB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -493,7 +515,7 @@ func (d *DashboardStore) StockAllocation(ctx context.Context, userID string) (an
 		PnL        float64 `json:"pnl"`
 		priceLive  bool
 	}
-	var hs []holding
+	hs := make([]holding, 0) // [] not null when the client holds nothing
 	var syms []string
 	for rows.Next() {
 		var h holding
@@ -560,6 +582,8 @@ type matrixRow struct {
 	HoldingDays      int      `json:"holding_period_days"`
 	Status           string   `json:"status"`
 	signalID         string
+	w52High          float64 // resolved high (feed, else sheet); 0 = unknown
+	w52HighDate      string  // feed-supplied date of that high, if any
 }
 
 // PositionsFilter narrows the matrix (§7 of the frontend gaps doc).
@@ -614,7 +638,7 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 	}
 	defer rows.Close()
 
-	var out []matrixRow
+	out := make([]matrixRow, 0) // [] not null for an empty filter result
 	var openSyms []string
 	nowT := d.now()
 	for rows.Next() {
@@ -686,17 +710,18 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 		if out[i].Status != "OPEN" {
 			continue
 		}
-		high := sheetHighs[out[i].Script]
+		high, highDate := sheetHighs[out[i].Script], ""
 		if q, ok := quotes[out[i].Script]; ok {
 			out[i].CurrentPrice = round2f(q.LTP)
 			cost := out[i].BuyRate * float64(out[i].Quantity)
 			out[i].PnL = round2f((q.LTP - out[i].BuyRate) * float64(out[i].Quantity))
 			out[i].PnLPct = pct(out[i].PnL, cost)
 			if q.Week52High > 0 {
-				high = q.Week52High
+				high, highDate = q.Week52High, q.Week52HighDate // live feed beats sheet snapshot
 			}
 		}
 		out[i].CurrentValue = round2f(out[i].CurrentPrice * float64(out[i].Quantity))
+		out[i].w52High, out[i].w52HighDate = high, highDate
 		if high > 0 && out[i].CurrentPrice > 0 {
 			v := pct(out[i].CurrentPrice-high, high) // ≤ 0 when below the high
 			out[i].DownFromHighPct = &v
@@ -818,14 +843,16 @@ type portfolioSummary struct {
 	CurrentExposurePct  float64 `json:"current_exposure_pct"`
 }
 
-func (d *DashboardStore) PortfolioSummary(ctx context.Context) (any, error) {
-	agg, err := d.positionsAgg(ctx, "")
+// PortfolioSummary is book-wide for userID == "", else the same KPIs over
+// one client's strategies and positions.
+func (d *DashboardStore) PortfolioSummary(ctx context.Context, userID string) (any, error) {
+	agg, err := d.positionsAgg(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 	out := portfolioSummary{positionsSummary: *agg}
 
-	bases, err := d.clientBases(ctx, "")
+	bases, err := d.clientBases(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -833,7 +860,7 @@ func (d *DashboardStore) PortfolioSummary(ctx context.Context) (any, error) {
 	for _, b := range bases {
 		invested += b.InvestedFund
 	}
-	_, utilized, err := d.openBook(ctx)
+	_, utilized, err := d.openBook(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -842,7 +869,7 @@ func (d *DashboardStore) PortfolioSummary(ctx context.Context) (any, error) {
 		deployed += v
 	}
 
-	nav, vals, err := d.valueSeries(ctx, "", 3650)
+	nav, vals, err := d.valueSeries(ctx, userID, 3650)
 	if err != nil {
 		return nil, err
 	}
@@ -869,18 +896,15 @@ func (d *DashboardStore) PortfolioSummary(ctx context.Context) (any, error) {
 // DownFromHigh lists open positions by distance below their 52-week high
 // (§6c). window is accepted for forward compatibility; today the one
 // source is the sheet-refreshed 52-week high, so any value maps to 52w.
-func (d *DashboardStore) DownFromHigh(ctx context.Context) (any, error) {
-	res, err := d.Positions(ctx, PositionsFilter{Status: "open"})
+// userID == "" is book-wide.
+func (d *DashboardStore) DownFromHigh(ctx context.Context, userID string) (any, error) {
+	// Positions already resolved price + 52-week high (feed, else sheet)
+	// for every open row; reuse it rather than hitting Redis/signals twice.
+	res, err := d.Positions(ctx, PositionsFilter{Status: "open", ClientID: userID})
 	if err != nil {
 		return nil, err
 	}
 	rows := res.(map[string]any)["positions"].([]matrixRow)
-	syms := make([]string, 0, len(rows))
-	for _, r := range rows {
-		syms = append(syms, r.Script)
-	}
-	quotes := d.fetchQuotes(ctx, syms)
-	sheetHighs := d.w52Highs(ctx)
 	type entry struct {
 		PositionID      string  `json:"position_id"`
 		Script          string  `json:"script"`
@@ -892,78 +916,194 @@ func (d *DashboardStore) DownFromHigh(ctx context.Context) (any, error) {
 	}
 	out := make([]entry, 0, len(rows))
 	for _, r := range rows {
-		h, hd := sheetHighs[r.Script], ""
-		if q, ok := quotes[r.Script]; ok && q.Week52High > 0 {
-			h, hd = q.Week52High, q.Week52HighDate // live feed beats sheet snapshot
-		}
-		if h <= 0 || r.CurrentPrice <= 0 {
+		if r.w52High <= 0 || r.CurrentPrice <= 0 {
 			continue // no 52w high known for this symbol in feed or sheet
 		}
 		out = append(out, entry{
 			PositionID: r.PositionID, Script: r.Script, ClientID: r.ClientID,
-			CurrentPrice: r.CurrentPrice, HighPrice: round2f(h), HighDate: hd,
-			DownFromHighPct: pct(r.CurrentPrice-h, h),
+			CurrentPrice: r.CurrentPrice, HighPrice: round2f(r.w52High), HighDate: r.w52HighDate,
+			DownFromHighPct: pct(r.CurrentPrice-r.w52High, r.w52High),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DownFromHighPct < out[j].DownFromHighPct })
 	return map[string]any{"positions": out, "source": "live feed week_52_high (sheet universe fallback)"}, nil
 }
 
+// ── 15. Client dashboard (composite) ────────────────────────────────────
+
+// Standalone ?days= defaults, panel by panel. The composite reuses them so
+// that, without an explicit ?days=, each key is exactly what its own
+// endpoint would return (the TWR index and drawdown are rebased to the
+// first point of the window, so a different window is a different number).
+const (
+	daysPnLHistory      = 90
+	daysPositionHistory = 30
+	daysMTMSeries       = 30
+	daysEquityCurve     = 90
+	daysDrawdown        = 90
+)
+
+// ClientDashboard is GET /clients/{id}/dashboard: every panel of the
+// portfolio overview page, scoped to one client, in a single response.
+// Each key carries exactly the payload its standalone endpoint returns
+// (same shapes, same formulas — the frontend reuses its chart parsers).
+// days > 0 bounds every time series to that one window; days <= 0 means
+// "each panel's own default" (daysPnLHistory & co). The effective window
+// per series is echoed under "windows". The KPI blocks (summary,
+// positions_summary) are lifetime, as on the standalone endpoints.
+// Unknown client → 404.
+func (d *DashboardStore) ClientDashboard(ctx context.Context, userID string, days int) (any, error) {
+	if userID == "" {
+		return nil, errClientUnknown
+	}
+	summary, err := d.ClientSummary(ctx, userID) // also 404s unknown ids
+	if err != nil {
+		return nil, err
+	}
+	window := func(def int) int {
+		if days > 0 {
+			return days
+		}
+		return def
+	}
+	windows := map[string]int{
+		"pnl_history":      window(daysPnLHistory),
+		"position_history": window(daysPositionHistory),
+		"mtm_series":       window(daysMTMSeries),
+		"equity_curve":     window(daysEquityCurve),
+		"drawdown":         window(daysDrawdown),
+	}
+	out := map[string]any{
+		"client_id":    userID,
+		"client_code":  userID,
+		"client_name":  userID,
+		"windows":      windows,
+		"generated_at": d.now().In(d.ist).Format(time.RFC3339),
+		"summary":      summary,
+	}
+	parts := []struct {
+		key string
+		fn  func(context.Context) (any, error)
+	}{
+		{"positions_summary", func(c context.Context) (any, error) { return d.PortfolioSummary(c, userID) }},
+		{"pnl_history", func(c context.Context) (any, error) { return d.PnLHistory(c, userID, windows["pnl_history"]) }},
+		{"position_history", func(c context.Context) (any, error) {
+			return d.PositionHistory(c, userID, windows["position_history"])
+		}},
+		{"mtm_series", func(c context.Context) (any, error) { return d.MTMSeries(c, userID, windows["mtm_series"]) }},
+		{"equity_curve", func(c context.Context) (any, error) { return d.EquityCurve(c, userID, windows["equity_curve"]) }},
+		{"drawdown", func(c context.Context) (any, error) { return d.Drawdown(c, userID, windows["drawdown"]) }},
+		{"sector_breakdown", func(c context.Context) (any, error) { return d.SectorBreakdown(c, userID) }},
+		{"stock_allocation", func(c context.Context) (any, error) { return d.StockAllocation(c, userID) }},
+		{"mcap_performance", func(c context.Context) (any, error) { return d.McapPerformance(c, userID) }},
+		{"ema_allocation", func(c context.Context) (any, error) { return d.EMAAllocation(c, userID) }},
+		{"best_worst_trades", func(c context.Context) (any, error) { return d.BestWorstTrades(c, userID) }},
+		{"down_from_high", func(c context.Context) (any, error) { return d.DownFromHigh(c, userID) }},
+	}
+	for _, p := range parts {
+		v, err := p.fn(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", p.key, err)
+		}
+		out[p.key] = v
+	}
+	return out, nil
+}
+
 // ── HTTP handlers (mounted in http.go) ──────────────────────────────────
 
-func (h *HTTP) handleDashPnLHistory(w http.ResponseWriter, ar *AdminRequest) {
+// scopeParam reads the optional ?client_id= on the /portfolio/* endpoints.
+// Empty keeps the book-wide view (today's behaviour, byte-identical); a
+// non-empty id must name a known client or the request 404s — a typo must
+// not render as an empty-but-plausible dashboard.
+func (h *HTTP) scopeParam(ctx context.Context, ar *AdminRequest) (string, error) {
+	raw := ar.Request.URL.Query().Get("client_id")
+	if raw == "" {
+		return "", nil // absent or client_id= → whole book
+	}
+	uid := strings.TrimSpace(raw)
+	if uid == "" {
+		return "", errClientUnknown // whitespace is a malformed id, not "all"
+	}
+	if err := h.dashboard.requireClient(ctx, uid); err != nil {
+		return "", err
+	}
+	return uid, nil
+}
+
+// scoped wraps a per-client store call behind scopeParam.
+func (h *HTTP) scoped(w http.ResponseWriter, ar *AdminRequest, fn func(ctx context.Context, userID string) (any, error)) {
 	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.PnLHistory(ctx, "", daysParam(ar.Request, 90))
+		uid, err := h.scopeParam(ctx, ar)
+		if err != nil {
+			return nil, err
+		}
+		return fn(ctx, uid)
+	})
+}
+
+func (h *HTTP) handleDashPnLHistory(w http.ResponseWriter, ar *AdminRequest) {
+	h.scoped(w, ar, func(ctx context.Context, uid string) (any, error) {
+		return h.dashboard.PnLHistory(ctx, uid, daysParam(ar.Request, daysPnLHistory))
 	})
 }
 
 func (h *HTTP) handleDashPositionHistory(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.PositionHistory(ctx, "", daysParam(ar.Request, 30))
+	h.scoped(w, ar, func(ctx context.Context, uid string) (any, error) {
+		return h.dashboard.PositionHistory(ctx, uid, daysParam(ar.Request, daysPositionHistory))
 	})
 }
 
 func (h *HTTP) handleDashBestWorst(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, h.dashboard.BestWorstTrades)
+	h.scoped(w, ar, h.dashboard.BestWorstTrades)
 }
 
 func (h *HTTP) handleDashSectors(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, h.dashboard.SectorBreakdown)
+	h.scoped(w, ar, h.dashboard.SectorBreakdown)
 }
 
 func (h *HTTP) handleDashStockAlloc(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.StockAllocation(ctx, "")
-	})
+	h.scoped(w, ar, h.dashboard.StockAllocation)
 }
 
 func (h *HTTP) handleDashMcap(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, h.dashboard.McapPerformance)
+	h.scoped(w, ar, h.dashboard.McapPerformance)
 }
 
 func (h *HTTP) handleDashEMA(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, h.dashboard.EMAAllocation)
+	h.scoped(w, ar, h.dashboard.EMAAllocation)
 }
 
+// handleDashPositions: client_id goes through the same scopeParam as its
+// siblings (trimmed, unknown → 404). A client with positions but no live
+// strategy still resolves — see clientBase.
 func (h *HTTP) handleDashPositions(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
+	h.scoped(w, ar, func(ctx context.Context, uid string) (any, error) {
 		qp := ar.Request.URL.Query()
 		return h.dashboard.Positions(ctx, PositionsFilter{
 			Status:   qp.Get("status"),
 			Industry: qp.Get("industry"),
 			Mcap:     qp.Get("mcap"),
 			EMA:      qp.Get("ema"),
-			ClientID: qp.Get("client_id"),
+			ClientID: uid,
 		})
 	})
 }
 
 func (h *HTTP) handleDashPositionsSummary(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, h.dashboard.PortfolioSummary)
+	h.scoped(w, ar, h.dashboard.PortfolioSummary)
 }
 
 func (h *HTTP) handleDashDownFromHigh(w http.ResponseWriter, ar *AdminRequest) {
-	h.dashJSON(w, ar, h.dashboard.DownFromHigh)
+	h.scoped(w, ar, h.dashboard.DownFromHigh)
+}
+
+func (h *HTTP) handleClientDashboard(w http.ResponseWriter, ar *AdminRequest) {
+	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
+		// 0 → each panel keeps its standalone default; an explicit ?days=
+		// applies one window to every series.
+		return h.dashboard.ClientDashboard(ctx, mux.Vars(ar.Request)["client_id"], daysParam(ar.Request, 0))
+	})
 }
 
 func (h *HTTP) handleClientPnLHistory(w http.ResponseWriter, ar *AdminRequest) {
@@ -972,7 +1112,7 @@ func (h *HTTP) handleClientPnLHistory(w http.ResponseWriter, ar *AdminRequest) {
 		if err := h.dashboard.requireClient(ctx, uid); err != nil {
 			return nil, err
 		}
-		return h.dashboard.PnLHistory(ctx, uid, daysParam(ar.Request, 90))
+		return h.dashboard.PnLHistory(ctx, uid, daysParam(ar.Request, daysPnLHistory))
 	})
 }
 
@@ -982,7 +1122,7 @@ func (h *HTTP) handleClientPositionHistory(w http.ResponseWriter, ar *AdminReque
 		if err := h.dashboard.requireClient(ctx, uid); err != nil {
 			return nil, err
 		}
-		return h.dashboard.PositionHistory(ctx, uid, daysParam(ar.Request, 30))
+		return h.dashboard.PositionHistory(ctx, uid, daysParam(ar.Request, daysPositionHistory))
 	})
 }
 
@@ -1008,19 +1148,19 @@ func (h *HTTP) handleClientSummary(w http.ResponseWriter, ar *AdminRequest) {
 
 func (h *HTTP) handleClientEquityCurve(w http.ResponseWriter, ar *AdminRequest) {
 	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.EquityCurve(ctx, mux.Vars(ar.Request)["client_id"], daysParam(ar.Request, 90))
+		return h.dashboard.EquityCurve(ctx, mux.Vars(ar.Request)["client_id"], daysParam(ar.Request, daysEquityCurve))
 	})
 }
 
 func (h *HTTP) handleClientDrawdown(w http.ResponseWriter, ar *AdminRequest) {
 	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.Drawdown(ctx, mux.Vars(ar.Request)["client_id"], daysParam(ar.Request, 90))
+		return h.dashboard.Drawdown(ctx, mux.Vars(ar.Request)["client_id"], daysParam(ar.Request, daysDrawdown))
 	})
 }
 
 func (h *HTTP) handleClientMTM(w http.ResponseWriter, ar *AdminRequest) {
 	h.dashJSON(w, ar, func(ctx context.Context) (any, error) {
-		return h.dashboard.MTMSeries(ctx, mux.Vars(ar.Request)["client_id"], daysParam(ar.Request, 30))
+		return h.dashboard.MTMSeries(ctx, mux.Vars(ar.Request)["client_id"], daysParam(ar.Request, daysMTMSeries))
 	})
 }
 
@@ -1028,7 +1168,7 @@ func (h *HTTP) handleClientMTM(w http.ResponseWriter, ar *AdminRequest) {
 // result, log-and-500 on failure. ErrClientUnknown maps to a 404 envelope.
 func (h *HTTP) dashJSON(w http.ResponseWriter, ar *AdminRequest, fn func(ctx context.Context) (any, error)) {
 	data, err := fn(ar.Request.Context())
-	if err == errClientUnknown {
+	if errors.Is(err, errClientUnknown) {
 		writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "client not found")
 		return
 	}
