@@ -675,24 +675,20 @@ func (p *ProtectiveReplay) fetchEODSellableQtyMap(ctx context.Context, auth Brok
 	}
 	out := make(map[string]int, len(holdings))
 	for _, h := range holdings {
-		var key string
-		for _, s := range h.Symbol {
-			if s.Exc == "NSE" && s.DispSym != "" {
-				key = strings.ToUpper(s.DispSym)
-				break
-			}
-		}
-		if key == "" && len(h.Symbol) > 0 {
-			key = strings.ToUpper(h.Symbol[0].DispSym)
-		}
-		if key == "" {
-			continue
-		}
 		sellable := h.HoldingQty - h.UsedQty - h.PledgeQty
 		if sellable < 0 {
 			sellable = 0
 		}
-		out[key] = sellable
+		// Key by the series-agnostic base symbol (2026-10-06). A stock
+		// moved to the BE/T2T segment shows up as dispSym "BODALCHEM-BE"
+		// while our positions carry "BODALCHEM" — keying by dispSym made
+		// three live positions read as "not in holdings — likely manually
+		// exited" for weeks (BODALCHEM 13 days, LOTUSDEV 12, MODISONLTD 22)
+		// and never re-armed. baseSym is the broker's own series-free name;
+		// every key form is registered so either lookup resolves.
+		for _, k := range holdingKeys(h.Symbol) {
+			out[k] = sellable
+		}
 	}
 	p.logger.Info("fetchEODSellableQtyMap: holdings snapshot (T+1 sellable)",
 		zap.String("user", userID), zap.Int("symbols", len(out)))
@@ -1064,4 +1060,35 @@ func extractLatestRejReason(trail []map[string]interface{}) string {
 // once the API requires it).
 func orderTrailReq(ordID, _ string) indiraClient.OrderTrailRequest {
 	return indiraClient.OrderTrailRequest{OrdId: ordID, Instrument: "STK"}
+}
+
+// holdingKeys returns every uppercase name a holding may be looked up by:
+// the NSE leg's baseSym and dispSym (and the dispSym with a "-BE"/"-BZ"/"-SM"
+// style series suffix stripped), falling back to the first leg. Returned
+// in a deterministic order; duplicates are harmless.
+func holdingKeys(legs []indiraClient.HoldingSymbol) []string {
+	pick := func(s indiraClient.HoldingSymbol) []string {
+		var ks []string
+		add := func(v string) {
+			v = strings.ToUpper(strings.TrimSpace(v))
+			if v != "" {
+				ks = append(ks, v)
+			}
+		}
+		add(s.BaseSym)
+		add(s.DispSym)
+		if i := strings.LastIndex(s.DispSym, "-"); i > 0 {
+			add(s.DispSym[:i])
+		}
+		return ks
+	}
+	for _, s := range legs {
+		if s.Exc == "NSE" && (s.DispSym != "" || s.BaseSym != "") {
+			return pick(s)
+		}
+	}
+	if len(legs) > 0 {
+		return pick(legs[0])
+	}
+	return nil
 }
