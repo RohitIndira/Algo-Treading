@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 )
@@ -100,18 +101,26 @@ func seedDashFixture(t *testing.T, dbs dashDBs) {
 	pos := `INSERT INTO manthan_positions
 		(strategy_id, user_id, symbol, industry, mcap_bucket, index_name, entry_price, quantity, invested_amt,
 		 ema_alloc_pct, status, exit_price, realized_pnl, entry_time, exit_time)
-		VALUES ($1::uuid, $2, $3, $4, $5, 'NIFTY', $6, $7, $8, $9, $10, $11, $12, now() - interval '5 days', $13)`
+		VALUES ($1::uuid, $2, $3, $4, $5, 'NIFTY', $6, $7, $8, $9, $10, $11, $12, now() - interval '5 days', now() - $13::interval)`
+	// entry and exit both come from the statement's now(), so holding periods are exact whole days
 	mustExec(dbs.trading, pos, sidA, dashA, "TDASHCHEM", "Chemicals", "SMALL", 100.0, 100, 10000.0, 0.5, "ACTIVE", nil, nil, nil)
 	mustExec(dbs.trading, pos, sidA, dashA, "TDASHPHRM", "Pharmaceuticals", "MID", 200.0, 150, 30000.0, nil, "ACTIVE", nil, nil, nil)
-	mustExec(dbs.trading, pos, sidA, dashA, "TDASHWIN", "Chemicals", "SMALL", 50.0, 100, 5000.0, 0.5, "EXITED", 55.0, 500.0, time.Now().Add(-24*time.Hour))
-	mustExec(dbs.trading, pos, sidA, dashA, "TDASHLOSE", "Pharmaceuticals", "MID", 100.0, 20, 2000.0, 0.5, "EXITED", 90.0, -200.0, time.Now().Add(-48*time.Hour))
+	mustExec(dbs.trading, pos, sidA, dashA, "TDASHWIN", "Chemicals", "SMALL", 50.0, 100, 5000.0, 0.5, "EXITED", 55.0, 500.0, "1 day")
+	mustExec(dbs.trading, pos, sidA, dashA, "TDASHLOSE", "Pharmaceuticals", "MID", 100.0, 20, 2000.0, 0.5, "EXITED", 90.0, -200.0, "2 days")
 	mustExec(dbs.trading, pos, sidB, dashB, "TDASHBANK", "Banks", "LARGE", 1000.0, 50, 50000.0, 0.5, "ACTIVE", nil, nil, nil)
-	mustExec(dbs.trading, pos, sidB, dashB, "TDASHBWIN", "Banks", "LARGE", 100.0, 100, 10000.0, 0.5, "EXITED", 109.0, 900.0, time.Now().Add(-24*time.Hour))
+	mustExec(dbs.trading, pos, sidB, dashB, "TDASHBWIN", "Banks", "LARGE", 100.0, 100, 10000.0, 0.5, "EXITED", 109.0, 900.0, "1 day")
 	mustExec(dbs.trading, pos, sidC, dashC, "TDASHBANK", "Banks", "LARGE", 1000.0, 10, 10000.0, 0.5, "ACTIVE", nil, nil, nil)
+	// closed without an exit timestamp (manual exit / ghost heal shape)
+	mustExec(dbs.trading, pos, sidB, dashB, "TDASHBNOX", "Banks", "LARGE", 100.0, 10, 1000.0, 0.5, "EXITED", nil, nil, nil)
 
 	// 52-week highs: CHEM 200 (price 100 → -50%), PHRM 250 (200 → -20%), BANK 1250 (1000 → -20%).
 	mustExec(dbs.signals, `INSERT INTO manthan_stocks (symbol, status, week52_high) VALUES
 		('TDASHCHEM','ACTIVE',200), ('TDASHPHRM','ACTIVE',250), ('TDASHBANK','ACTIVE',1250)`)
+
+	// Benchmarks for the same dates: nifty50 95,100,100.1,100.1 · midcap150
+	// 100,100,99,99 · smallcap250 100,100,100.2,100.2. Existing real rows on
+	// these (id,date) pairs are snapshotted and restored on cleanup.
+	seedBenchmarks(t, dbs.perf)
 
 	// NAV: today-40 (pnl 0) then today-2..today. A: 0,300,300; B: 0,900,1500.
 	nav := `INSERT INTO strategy_nav_daily (strategy_id, user_id, date, deployed_capital, net_pnl_amount, net_pnl_pct,
@@ -126,6 +135,96 @@ func seedDashFixture(t *testing.T, dbs dashDBs) {
 	for i, p := range []int64{0, 900, 1500} {
 		mustExec(dbs.perf, nav, sidB, dashB, day(2-i), 1000000, p, 900, p-900, 1)
 	}
+}
+
+// benchFixture: close per fixture-date index (0=today-40, 1=today-2,
+// 2=today-1, 3=today). Missing indexes are deliberately ABSENT rows so the
+// comparison exercises every benchAt path: nifty50 lacks today (carry-back
+// at the end date), midcap150 lacks today-2 (first-after at a 30-day
+// start), smallcap250 has only today-40 (no rows at all in a 30-day window
+// → null outperformance; carry-back across 40 days in a 90-day window).
+var benchFixture = map[string]map[int]float64{
+	"nifty50":     {0: 95, 1: 100, 2: 100.1},
+	"midcap150":   {0: 100, 2: 99, 3: 99},
+	"smallcap250": {0: 100},
+}
+
+func fixtureDates() [4]string {
+	today := time.Now()
+	day := func(back int) string { return today.AddDate(0, 0, -back).Format("2006-01-02") }
+	return [4]string{day(40), day(2), day(1), day(0)}
+}
+
+type benchSnap struct {
+	id, date string
+	close    float64
+	ret      sql.NullFloat64
+}
+
+// seedBenchmarks upserts the fixture closes and registers a cleanup that
+// puts back whatever was there before (or deletes what wasn't).
+func seedBenchmarks(t *testing.T, perf *sql.DB) {
+	t.Helper()
+	dates := fixtureDates()
+	var snaps []benchSnap
+	var absent []benchSnap
+	for id := range benchFixture {
+		for _, dt := range dates {
+			var sn benchSnap
+			err := perf.QueryRow(`SELECT benchmark_id, date::text, close_value, return_pct FROM benchmark_daily WHERE benchmark_id=$1 AND date=$2`, id, dt).
+				Scan(&sn.id, &sn.date, &sn.close, &sn.ret)
+			switch err {
+			case nil:
+				snaps = append(snaps, sn)
+			case sql.ErrNoRows:
+				absent = append(absent, benchSnap{id: id, date: dt})
+			default:
+				t.Fatalf("snapshot benchmark: %v", err)
+			}
+		}
+	}
+	t.Cleanup(func() {
+		for _, a := range absent {
+			_, _ = perf.Exec(`DELETE FROM benchmark_daily WHERE benchmark_id=$1 AND date=$2`, a.id, a.date)
+		}
+		for _, sn := range snaps {
+			_, _ = perf.Exec(`INSERT INTO benchmark_daily (benchmark_id, date, close_value, return_pct) VALUES ($1,$2,$3,$4)
+				ON CONFLICT (benchmark_id, date) DO UPDATE SET close_value=EXCLUDED.close_value, return_pct=EXCLUDED.return_pct`,
+				sn.id, sn.date, sn.close, sn.ret)
+		}
+	})
+	for id, closes := range benchFixture {
+		for i, dt := range dates {
+			c, present := closes[i]
+			if !present {
+				if _, err := perf.Exec(`DELETE FROM benchmark_daily WHERE benchmark_id=$1 AND date=$2`, id, dt); err != nil {
+					t.Fatalf("clear benchmark: %v", err)
+				}
+				continue
+			}
+			if _, err := perf.Exec(`INSERT INTO benchmark_daily (benchmark_id, date, close_value) VALUES ($1,$2,$3)
+				ON CONFLICT (benchmark_id, date) DO UPDATE SET close_value = EXCLUDED.close_value`, id, dt, c); err != nil {
+				t.Fatalf("seed benchmark: %v", err)
+			}
+		}
+	}
+}
+
+// benchOnFixtureDates keeps only the fixture dates from a benchmark series
+// (a dev box with a fresh benchmark sync may hold real rows in the window).
+func benchOnFixtureDates(series []any) []map[string]any {
+	want := map[string]bool{}
+	for _, dt := range fixtureDates() {
+		want[dt] = true
+	}
+	out := []map[string]any{}
+	for _, p := range series {
+		m := p.(map[string]any)
+		if want[m["date"].(string)] {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func newDashStore(dbs dashDBs) *DashboardStore {
@@ -329,7 +428,8 @@ func TestDashboard_WindowsAndCompositeParity(t *testing.T) {
 	}
 	for _, k := range []string{"client_id", "client_code", "client_name", "windows", "generated_at", "summary",
 		"positions_summary", "pnl_history", "position_history", "mtm_series", "equity_curve", "drawdown",
-		"sector_breakdown", "stock_allocation", "mcap_performance", "ema_allocation", "best_worst_trades", "down_from_high"} {
+		"sector_breakdown", "stock_allocation", "mcap_performance", "ema_allocation", "best_worst_trades", "down_from_high",
+		"holding_analytics", "unique_scripts"} {
 		if _, present := comp[k]; !present {
 			t.Fatalf("composite missing %q", k)
 		}
@@ -353,6 +453,8 @@ func TestDashboard_WindowsAndCompositeParity(t *testing.T) {
 			"ema_allocation":    ok(d.EMAAllocation(ctx, dashA)),
 			"best_worst_trades": ok(d.BestWorstTrades(ctx, dashA)),
 			"down_from_high":    ok(d.DownFromHigh(ctx, dashA)),
+			"holding_analytics": ok(d.HoldingAnalytics(ctx, dashA)),
+			"unique_scripts":    ok(d.UniqueScripts(ctx, dashA)),
 		}
 		for k, v := range standalone {
 			if canon(v) != canon(comp[k]) {
@@ -502,6 +604,9 @@ func TestHTTP_ClientDashboardAndScope(t *testing.T) {
 		{"/portfolio/positions", func(u string) (any, error) { return store.Positions(ctx, PositionsFilter{ClientID: u}) }},
 		{"/portfolio/positions-summary", func(u string) (any, error) { return store.PortfolioSummary(ctx, u) }},
 		{"/portfolio/down-from-high", func(u string) (any, error) { return store.DownFromHigh(ctx, u) }},
+		{"/portfolio/holding-analytics", func(u string) (any, error) { return store.HoldingAnalytics(ctx, u) }},
+		{"/portfolio/unique-scripts", func(u string) (any, error) { return store.UniqueScripts(ctx, u) }},
+		{"/portfolio/client-equity-comparison?days=30", func(u string) (any, error) { return store.ClientEquityComparison(ctx, u, 30) }},
 	}
 	for _, rt := range routes {
 		sep := "?"
@@ -530,6 +635,10 @@ func TestHTTP_ClientDashboardAndScope(t *testing.T) {
 		}
 	}
 
+	if code, _ := get(roToken, "/api/v1/admin/portfolio/client-equity-comparison"); code != http.StatusOK {
+		t.Fatalf("read_only comparison: HTTP %d", code)
+	}
+
 	// Scoped sector check is semantically right, not just store-equal.
 	_, env = get(token, "/api/v1/admin/portfolio/sector-breakdown?client_id="+dashB)
 	secs := env["data"].(map[string]any)["sectors"].([]any)
@@ -545,4 +654,229 @@ func containsRune(s string, r rune) bool {
 		}
 	}
 	return false
+}
+
+// Change 1: buy_date mirrors entry_date; holding_period_days always resolves
+// (open → now, closed → exit_time, closed without exit_time → updated_at).
+func TestDashboard_PositionsBuyDateAndHoldingDays(t *testing.T) {
+	dbs := openDashTestDBs(t)
+	seedDashFixture(t, dbs)
+	d := newDashStore(dbs)
+	ctx := context.Background()
+	ok := okv(t)
+
+	rows := roundTrip(t, ok(d.Positions(ctx, PositionsFilter{})))["positions"].([]any)
+	want := map[string]float64{"TDASHCHEM": 5, "TDASHPHRM": 5, "TDASHWIN": 4, "TDASHLOSE": 3, "TDASHBANK": 5, "TDASHBWIN": 4, "TDASHBNOX": 5}
+	seen := 0
+	for _, r := range rows {
+		m := r.(map[string]any)
+		w, isFixture := want[m["script"].(string)]
+		if !isFixture {
+			continue
+		}
+		seen++
+		if m["buy_date"] != m["entry_date"] || m["buy_date"] == "" {
+			t.Fatalf("%s buy_date=%v entry_date=%v", m["script"], m["buy_date"], m["entry_date"])
+		}
+		if hd, present := m["holding_period_days"]; !present || hd.(float64) != w {
+			t.Fatalf("%s holding_period_days=%v want %v (status %v, exit %v)", m["script"], hd, w, m["status"], m["exit_date"])
+		}
+	}
+	if seen < len(want) {
+		t.Fatalf("saw %d fixture rows, want %d", seen, len(want))
+	}
+}
+
+// Endpoint 2: holding analytics, scoped and book-wide.
+func TestDashboard_HoldingAnalytics(t *testing.T) {
+	dbs := openDashTestDBs(t)
+	seedDashFixture(t, dbs)
+	d := newDashStore(dbs)
+	ctx := context.Background()
+	ok := okv(t)
+
+	// A: open 5,5 + closed 4,3 → avg 4.25, median 4.5; 2 open scripts, 4 all-time.
+	a := roundTrip(t, ok(d.HoldingAnalytics(ctx, dashA)))
+	ov := a["overall"].(map[string]any)
+	wantOv := map[string]float64{"avg_holding_days": 4.25, "median_holding_days": 4.5, "avg_holding_days_open": 5,
+		"avg_holding_days_closed": 3.5, "open_positions": 2, "closed_positions": 2, "total_unique_scripts": 2, "unique_scripts_all_time": 4}
+	for k, w := range wantOv {
+		if ov[k].(float64) != w {
+			t.Fatalf("A overall.%s = %v, want %v (%v)", k, ov[k], w, ov)
+		}
+	}
+	bs := a["by_script"].([]any)
+	if len(bs) != 4 {
+		t.Fatalf("A by_script = %v", bs)
+	}
+	first := bs[0].(map[string]any) // open rows first; CHEM/PHRM both open_count 1, avg 5 → alphabetical
+	if first["script"] != "TDASHCHEM" || first["open_count"].(float64) != 1 || first["avg_holding_days"].(float64) != 5 || first["clients_holding"].(float64) != 1 {
+		t.Fatalf("A by_script[0] = %v", first)
+	}
+	bst := a["by_strategy"].([]any)
+	if len(bst) != 1 {
+		t.Fatalf("A by_strategy = %v", bst)
+	}
+	ca := bst[0].(map[string]any)
+	if ca["client_id"] != dashA || ca["strategy_count"].(float64) != 1 || ca["open_positions"].(float64) != 2 ||
+		ca["closed_positions"].(float64) != 2 || ca["avg_holding_days"].(float64) != 4.25 {
+		t.Fatalf("A by_strategy[0] = %v", ca)
+	}
+
+	// Book-wide: TDASHBANK held by B and C; B appears with the no-exit-time row counted (5 days).
+	all := roundTrip(t, ok(d.HoldingAnalytics(ctx, "")))
+	var bank, bClient map[string]any
+	for _, x := range all["by_script"].([]any) {
+		if m := x.(map[string]any); m["script"] == "TDASHBANK" {
+			bank = m
+		}
+	}
+	for _, x := range all["by_strategy"].([]any) {
+		if m := x.(map[string]any); m["client_id"] == dashB {
+			bClient = m
+		}
+	}
+	if bank == nil || bank["clients_holding"].(float64) != 2 || bank["open_count"].(float64) != 2 {
+		t.Fatalf("book-wide TDASHBANK = %v", bank)
+	}
+	if bClient == nil || bClient["closed_positions"].(float64) != 2 || bClient["avg_holding_days"].(float64) != round2f((5+4+5)/3.0) {
+		t.Fatalf("book-wide B = %v", bClient)
+	}
+}
+
+// Endpoint 3: unique scripts in the open book.
+func TestDashboard_UniqueScripts(t *testing.T) {
+	dbs := openDashTestDBs(t)
+	seedDashFixture(t, dbs)
+	d := newDashStore(dbs)
+	ctx := context.Background()
+	ok := okv(t)
+
+	all := roundTrip(t, ok(d.UniqueScripts(ctx, "")))
+	var bank map[string]any
+	for _, x := range all["scripts"].([]any) {
+		if m := x.(map[string]any); m["script"] == "TDASHBANK" {
+			bank = m
+		}
+	}
+	if bank == nil || bank["clients_holding"].(float64) != 2 || bank["total_quantity"].(float64) != 60 ||
+		bank["total_value"].(float64) != 60000 || bank["total_invested"].(float64) != 60000 || bank["price"].(float64) != 1000 {
+		t.Fatalf("TDASHBANK = %v", bank)
+	}
+	if cl := bank["clients"].([]any); len(cl) != 2 || cl[0] != dashB || cl[1] != dashC {
+		t.Fatalf("TDASHBANK clients = %v", cl)
+	}
+	a := roundTrip(t, ok(d.UniqueScripts(ctx, dashA)))
+	if a["count"].(float64) != 2 || a["total_value"].(float64) != 40000 {
+		t.Fatalf("A unique scripts = %v", a)
+	}
+	if s := a["scripts"].([]any)[0].(map[string]any); s["script"] != "TDASHPHRM" || s["total_value"].(float64) != 30000 {
+		t.Fatalf("A top script = %v", s)
+	}
+	dd := roundTrip(t, ok(d.UniqueScripts(ctx, dashD)))
+	if dd["count"].(float64) != 0 || dd["scripts"] == nil {
+		t.Fatalf("D unique scripts = %v", dd)
+	}
+}
+
+// Endpoint 4: multi-client comparison against the seeded benchmarks.
+func TestDashboard_ClientEquityComparison(t *testing.T) {
+	dbs := openDashTestDBs(t)
+	seedDashFixture(t, dbs)
+	d := newDashStore(dbs)
+	ctx := context.Background()
+	ok := okv(t)
+	dates := fixtureDates()
+
+	res := roundTrip(t, ok(d.ClientEquityComparison(ctx, "", 30)))
+	if res["start_date"] != dates[1] {
+		t.Fatalf("start_date = %v, want %v", res["start_date"], dates[1])
+	}
+	// nifty has today-2 and today-1 only (today is absent by design).
+	nifty := benchOnFixtureDates(res["benchmarks"].(map[string]any)["nifty50"].([]any))
+	if len(nifty) != 2 || nifty[0]["indexed"].(float64) != 100 || nifty[1]["indexed"].(float64) != 100.1 {
+		t.Fatalf("nifty series = %v", nifty)
+	}
+	if sc := benchOnFixtureDates(res["benchmarks"].(map[string]any)["smallcap250"].([]any)); len(sc) != 0 {
+		t.Fatalf("smallcap must have no rows in a 30d window, got %v", sc)
+	}
+	byID := map[string]map[string]any{}
+	for _, c := range res["clients"].([]any) {
+		m := c.(map[string]any)
+		byID[m["client_id"].(string)] = m
+	}
+	a, b, dd := byID[dashA], byID[dashB], byID[dashD]
+	if a == nil || b == nil || dd == nil {
+		t.Fatalf("clients missing: %v", keys(byID))
+	}
+	if _, present := byID[dashC]; present {
+		t.Fatalf("C has no live strategy and must not be compared")
+	}
+	// A: TWR 100.06. Nifty: start today-2 = 100 (exact), end today → carried
+	// back to today-1 = 100.1 → not beating (-0.04). Midcap: start today-2
+	// absent → first-after today-1 = 99, end 99 → indexed 100 → +0.06.
+	// Smallcap: no rows in window → null.
+	if a["final_indexed"].(float64) != 100.06 || a["nifty_final_indexed"].(float64) != 100.1 ||
+		a["beating_nifty"].(bool) || a["outperformance_nifty_pct"].(float64) != -0.04 || a["outperformance_midcap150_pct"].(float64) != 0.06 ||
+		a["outperformance_smallcap250_pct"] != nil ||
+		a["points"].(float64) != 3 || a["start_date"] != dates[1] || a["end_date"] != dates[3] {
+		t.Fatalf("A = %v", a)
+	}
+	// B: 100.15 → beating (+0.05).
+	if b["final_indexed"].(float64) != 100.15 || !b["beating_nifty"].(bool) || b["outperformance_nifty_pct"].(float64) != 0.05 {
+		t.Fatalf("B = %v", b)
+	}
+	// D: on the roster, no NAV → empty series and null flags.
+	if dd["points"].(float64) != 0 || dd["beating_nifty"] != nil || dd["final_indexed"] != nil || len(dd["series"].([]any)) != 0 {
+		t.Fatalf("D = %v", dd)
+	}
+	sum := res["summary"].(map[string]any)
+	if sum["clients_beating_nifty"].(float64) < 1 || sum["clients_with_data"].(float64) < 2 {
+		t.Fatalf("summary = %v", sum)
+	}
+	lb := res["leaderboard"].([]any)
+	posB, posA := -1, -1
+	for i, id := range lb {
+		if id == dashB {
+			posB = i
+		}
+		if id == dashA {
+			posA = i
+		}
+	}
+	if posB < 0 || posA < 0 || posB > posA {
+		t.Fatalf("leaderboard = %v (B must rank above A)", lb)
+	}
+
+	// 90-day window reaches the today-40 rows: 4 points, benchmarks rebased at day-40.
+	res90 := roundTrip(t, ok(d.ClientEquityComparison(ctx, "", 90)))
+	if res90["start_date"] != dates[0] || len(benchOnFixtureDates(res90["benchmarks"].(map[string]any)["nifty50"].([]any))) != 3 {
+		t.Fatalf("90d start/benchmarks = %v / %v", res90["start_date"], res90["benchmarks"])
+	}
+	for _, c := range res90["clients"].([]any) {
+		if m := c.(map[string]any); m["client_id"] == dashA {
+			// nifty 95 → (carry-back) 100.1 = 105.37 indexed; A 100.06 → -5.31.
+			// smallcap: only today-40 exists → start exact, end carried back
+			// 40 days → indexed 100 → +0.06.
+			if m["points"].(float64) != 4 || m["nifty_final_indexed"].(float64) != 105.37 || m["outperformance_nifty_pct"].(float64) != -5.31 ||
+				m["outperformance_smallcap250_pct"].(float64) != 0.06 {
+				t.Fatalf("A 90d = %v", m)
+			}
+		}
+	}
+
+	// Scoped to one client: only that client on the roster.
+	only := roundTrip(t, ok(d.ClientEquityComparison(ctx, dashB, 30)))
+	if cl := only["clients"].([]any); len(cl) != 1 || cl[0].(map[string]any)["client_id"] != dashB || !cl[0].(map[string]any)["beating_nifty"].(bool) {
+		t.Fatalf("scoped comparison = %v", cl)
+	}
+}
+
+func keys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

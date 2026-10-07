@@ -565,6 +565,7 @@ type matrixRow struct {
 	BuyRate          float64  `json:"buy_rate"`
 	CurrentPrice     float64  `json:"current_price"`
 	EntryDate        string   `json:"entry_date"`
+	BuyDate          string   `json:"buy_date"` // alias of entry_date (frontend spec 2026-10-07)
 	EntryTime        string   `json:"entry_time"`
 	ExitDate         string   `json:"exit_date,omitempty"`
 	ExitTime         string   `json:"exit_time,omitempty"`
@@ -608,7 +609,7 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 	q := `SELECT id, user_id, symbol, COALESCE(industry,''), COALESCE(mcap_bucket,''),
 	             quantity, entry_price, COALESCE(invested_amt,0), entry_time, exit_time,
 	             exit_price, realized_pnl, ema_alloc_pct, status, COALESCE(signal_id::text,''),
-	             current_sl
+	             current_sl, updated_at
 	      FROM manthan_positions WHERE status IN ` + statuses
 	args := []any{}
 	add := func(cond string, v any) {
@@ -645,10 +646,11 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 		var r matrixRow
 		var id int64
 		var entryT, exitT sql.NullTime
+		var updatedT time.Time
 		var exitPx, realized, ema, csl sql.NullFloat64
 		if err := rows.Scan(&id, &r.ClientID, &r.Script, &r.Industry, &r.Mcap,
 			&r.Quantity, &r.BuyRate, &r.PnL /*invested, reused below*/, &entryT, &exitT,
-			&exitPx, &realized, &ema, &r.Status, &r.signalID, &csl); err != nil {
+			&exitPx, &realized, &ema, &r.Status, &r.signalID, &csl, &updatedT); err != nil {
 			return nil, err
 		}
 		if csl.Valid && csl.Float64 > 0 {
@@ -666,16 +668,22 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 		if entryT.Valid {
 			t := entryT.Time.In(d.ist)
 			r.EntryDate, r.EntryTime = t.Format("2006-01-02"), t.Format("15:04")
+			r.BuyDate = r.EntryDate
 		}
 		if r.Status == "EXITED" {
 			r.Status = "CLOSED"
+			// Holding period always resolves for closed rows: exit_time when
+			// recorded, else the row's last update (manual exits / ghost heals
+			// close a row without an exit timestamp).
+			endT := updatedT
 			if exitT.Valid {
+				endT = exitT.Time
 				t := exitT.Time.In(d.ist)
 				r.ExitDate, r.ExitTime = t.Format("2006-01-02"), t.Format("15:04")
 				r.ClosedDate = r.ExitDate
-				if entryT.Valid {
-					r.HoldingDays = int(exitT.Time.Sub(entryT.Time).Hours() / 24)
-				}
+			}
+			if entryT.Valid {
+				r.HoldingDays = holdingDays(entryT.Time, endT, d.ist)
 			}
 			if exitPx.Valid {
 				r.CurrentPrice = round2f(exitPx.Float64)
@@ -689,7 +697,7 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 			r.Status = "OPEN"
 			r.CurrentPrice = r.BuyRate // upgraded to LTP below when known
 			if entryT.Valid {
-				r.HoldingDays = int(nowT.Sub(entryT.Time).Hours() / 24)
+				r.HoldingDays = holdingDays(entryT.Time, nowT, d.ist)
 			}
 			openSyms = append(openSyms, r.Script)
 			_ = invested
@@ -999,6 +1007,8 @@ func (d *DashboardStore) ClientDashboard(ctx context.Context, userID string, day
 		{"ema_allocation", func(c context.Context) (any, error) { return d.EMAAllocation(c, userID) }},
 		{"best_worst_trades", func(c context.Context) (any, error) { return d.BestWorstTrades(c, userID) }},
 		{"down_from_high", func(c context.Context) (any, error) { return d.DownFromHigh(c, userID) }},
+		{"holding_analytics", func(c context.Context) (any, error) { return d.HoldingAnalytics(c, userID) }},
+		{"unique_scripts", func(c context.Context) (any, error) { return d.UniqueScripts(c, userID) }},
 	}
 	for _, p := range parts {
 		v, err := p.fn(ctx)
