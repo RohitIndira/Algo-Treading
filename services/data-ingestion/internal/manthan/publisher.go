@@ -155,6 +155,16 @@ func (p *Publisher) Publish(ctx context.Context, result *PipelineResult) (*Publi
 		}
 	}
 
+	// Has a publish already landed today? Decides the first_seen_at carry
+	// source (see loadFirstSeen). Read BEFORE this run's own audit upsert,
+	// which would otherwise answer "yes" on the day's first run. A failed
+	// read degrades to "no" — the conservative side (inherit, never re-stamp).
+	hadRunToday, err := p.hadPublishToday(ctx)
+	if err != nil {
+		p.logger.Warn("publish-today check failed — treating this as the day's first publish", zap.Error(err))
+		hadRunToday = false
+	}
+
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return stats, fmt.Errorf("begin tx: %w", err)
@@ -202,31 +212,24 @@ func (p *Publisher) Publish(ctx context.Context, result *PipelineResult) (*Publi
 		prows.Close()
 	}
 
-	// first_seen_at carry-forward (2026-08-18): a signal keeps the instant it
-	// FIRST entered its current contiguous run in the list. Capture BEFORE
-	// the DELETE below wipes today's rows: today's own value (a stock added
-	// at 12:00 must not drift to 14:00 on the next re-run) and the previous
-	// publish day's value (contiguity: present on the last publish → same
-	// run). Anything else is a brand-new signal stamped now. rules-engine
-	// compares this against strategy created_at so a strategy created after
-	// a stock appeared never acts on that stock.
-	firstSeen := map[string]time.Time{}
-	if frows, err := tx.QueryContext(ctx, `
-		SELECT symbol, first_seen_at FROM manthan_signals
-		WHERE first_seen_at IS NOT NULL
-		  AND (run_date = CURRENT_DATE
-		       OR run_date = (SELECT MAX(run_date) FROM manthan_signals WHERE run_date < CURRENT_DATE))
-		ORDER BY run_date ASC`); err == nil { // ASC: today's row (later) wins over yesterday's
-		for frows.Next() {
-			var sym string
-			var ts time.Time
-			if frows.Scan(&sym, &ts) == nil {
-				firstSeen[sym] = ts
-			}
-		}
-		frows.Close()
-	} else {
+	// first_seen_at carry-forward (2026-08-18, same-day rule 2026-10-08): a
+	// signal keeps the instant it FIRST entered its current contiguous run in
+	// the list. Captured BEFORE the DELETE below wipes today's rows. Source
+	// depends on whether a publish already landed today (hadRunToday, read
+	// before this run's own audit upsert):
+	//   - day's first publish → previous publish day's rows (present then and
+	//     present now = one run; a stock added at 12:00 must not drift on a
+	//     14:00 re-run because today's rows carry it from then on);
+	//   - any later publish today → today's latest rows ONLY, so a stock the
+	//     operator removed from the sheet (hence dropped by an earlier run
+	//     today) and re-added starts a NEW run, stamped now — migration 012's
+	//     rule — and a strategy created in between may act on it.
+	// rules-engine compares first_seen_at against strategy created_at so a
+	// strategy created after a stock appeared never acts on that stock.
+	firstSeen, err := loadFirstSeen(ctx, tx, hadRunToday)
+	if err != nil {
 		p.logger.Warn("first_seen_at lookup failed — new symbols will be stamped now (carry-forward degraded this run)", zap.Error(err))
+		firstSeen = map[string]time.Time{}
 	}
 	now := time.Now().UTC()
 	for _, s := range result.Eligible {
@@ -393,6 +396,53 @@ ON CONFLICT (run_date, symbol) DO UPDATE SET
     reason = EXCLUDED.reason`,
 		runDate, sym, d.Reason)
 	return err
+}
+
+// rowQuerier is what loadFirstSeen needs from *sql.Tx / *sql.DB.
+type rowQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// hadPublishToday reports whether any publish has written today's audit
+// rows yet (manthan_stocks is upserted by every publish, eligible or not).
+func (p *Publisher) hadPublishToday(ctx context.Context) (bool, error) {
+	var ok bool
+	err := p.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM manthan_stocks WHERE run_date = CURRENT_DATE)`).Scan(&ok)
+	return ok, err
+}
+
+// firstSeenCarryQuery is the carry-forward source for first_seen_at. See the
+// comment at the call site in Publish for the rule.
+func firstSeenCarryQuery(hadRunToday bool) string {
+	if hadRunToday {
+		return `SELECT symbol, first_seen_at FROM manthan_signals
+		        WHERE first_seen_at IS NOT NULL AND run_date = CURRENT_DATE`
+	}
+	return `SELECT symbol, first_seen_at FROM manthan_signals
+	        WHERE first_seen_at IS NOT NULL
+	          AND (run_date = CURRENT_DATE
+	               OR run_date = (SELECT MAX(run_date) FROM manthan_signals WHERE run_date < CURRENT_DATE))
+	        ORDER BY run_date ASC` // ASC: a (defensive) today row wins over yesterday's
+}
+
+// loadFirstSeen returns symbol → first_seen_at to inherit for this publish.
+func loadFirstSeen(ctx context.Context, q rowQuerier, hadRunToday bool) (map[string]time.Time, error) {
+	rows, err := q.QueryContext(ctx, firstSeenCarryQuery(hadRunToday))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var sym string
+		var ts time.Time
+		if err := rows.Scan(&sym, &ts); err != nil {
+			return nil, err
+		}
+		out[sym] = ts
+	}
+	return out, rows.Err()
 }
 
 func insertSignal(ctx context.Context, tx *sql.Tx, runDate time.Time, s *ManthanStock, firstSeen time.Time) error {
