@@ -160,6 +160,9 @@ module.exports = {
       autorestart: true, cron_restart: '30 3 * * 1-5', env: {
         ...BASE,
         MANTHAN_WATCH: '1', MANTHAN_WATCH_INTERVAL: '120',
+        // Periodic full re-run inside the window (seconds, 0 = off): picks up
+        // data fixes (LifeTimeHigh rows etc.) that don't change the Buy list.
+        MANTHAN_WATCH_FULL_RUN_EVERY: '600',
         MANTHAN_SHEET_ID: '1E_MzQNQFNvnmR8wMZMCyzPKc-SjOei4wwQp4QAey5sc',
         MANTHAN_CREDS: '/home/ubuntu/Algo-Treading/services/data-ingestion/credentials/manthan-sheet.json',
         // manthan-live writes signals via MARKET_DATA_DB_* (default port 5432 =

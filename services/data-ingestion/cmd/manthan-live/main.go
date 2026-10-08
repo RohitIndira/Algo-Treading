@@ -2,24 +2,35 @@
 // and publishes results to Postgres (all candidates) + Kafka (eligible only).
 //
 // Usage:
-//   export MANTHAN_SHEET_ID=...  (default: the live sheet ID below)
-//   export MANTHAN_CREDS=...     (default: local service-account JSON)
-//   export KAFKA_BROKERS=localhost:9092  (optional; skip Kafka if unset)
-//   go run ./services/data-ingestion/cmd/manthan-live/
+//
+//	export MANTHAN_SHEET_ID=...  (default: the live sheet ID below)
+//	export MANTHAN_CREDS=...     (default: local service-account JSON)
+//	export KAFKA_BROKERS=localhost:9092  (optional; skip Kafka if unset)
+//	go run ./services/data-ingestion/cmd/manthan-live/
 //
 // WATCH MODE (event-driven ingestion, 2026-08-18):
-//   MANTHAN_WATCH=1            → after the initial run, stay alive and poll a
-//                                fingerprint of the BuySignal tab; when the
-//                                operator edits the sheet, the pipeline re-runs
-//                                AUTOMATICALLY within one poll interval. The
-//                                publisher's per-day idempotency guarantees
-//                                only NEW symbols reach Kafka, and rules-engine
-//                                fans every new signal out to ALL active
-//                                strategies — no manual re-run needed.
-//   MANTHAN_WATCH_INTERVAL=120 → poll seconds (default 120)
-//   Watch polls only Mon–Fri 08:45–15:25 IST (outside the window edits wait
-//   for the window; the daily 09:00 IST pm2 cron_restart still guarantees the
-//   fresh-morning load).
+//
+//	MANTHAN_WATCH=1            → after the initial run, stay alive and poll a
+//	                             fingerprint of the BuySignal tab; when the
+//	                             operator edits the sheet, the pipeline re-runs
+//	                             AUTOMATICALLY within one poll interval. The
+//	                             publisher's per-day idempotency guarantees
+//	                             only NEW symbols reach Kafka, and rules-engine
+//	                             fans every new signal out to ALL active
+//	                             strategies — no manual re-run needed.
+//	MANTHAN_WATCH_INTERVAL=120 → poll seconds (default 120)
+//	MANTHAN_WATCH_FULL_RUN_EVERY=600 → also re-run the whole pipeline every N
+//	                             seconds inside the window even when the Buy
+//	                             list is unchanged (default 600, 0 = off,
+//	                             min 120). Picks up data fixes that don't
+//	                             touch the Buy list — a LifeTimeHigh row added
+//	                             for a stock that was DATA_DROPPED, a corrected
+//	                             PE/FScore — without an operator rerun. Runs
+//	                             are idempotent (first_seen_at carries, Kafka
+//	                             publishes a symbol once per day).
+//	Watch polls only Mon–Fri 08:45–15:25 IST (outside the window edits wait
+//	for the window; the daily 09:00 IST pm2 cron_restart still guarantees the
+//	fresh-morning load).
 package main
 
 import (
@@ -29,6 +40,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -273,6 +285,7 @@ func watchLoop(logger *zap.Logger) {
 			interval = n
 		}
 	}
+	fullEvery := fullRunEvery(os.Getenv("MANTHAN_WATCH_FULL_RUN_EVERY"))
 	sheetID := os.Getenv("MANTHAN_SHEET_ID")
 	if sheetID == "" {
 		sheetID = defaultSheetID
@@ -283,7 +296,7 @@ func watchLoop(logger *zap.Logger) {
 	}
 
 	logger.Info("manthan-live WATCH mode — sheet edits trigger the pipeline automatically",
-		zap.Duration("poll", interval), zap.String("sheet", sheetID))
+		zap.Duration("poll", interval), zap.Duration("full_run_every", fullEvery), zap.String("sheet", sheetID))
 
 	var lastSyms []string
 	haveBaseline := false
@@ -304,10 +317,14 @@ func watchLoop(logger *zap.Logger) {
 	}
 
 	// Initial run + baseline symbol set.
+	var lastFullRun time.Time
 	if err := runPipelineOnce(logger); err != nil {
 		logger.Error("watch: initial run failed — will retry on next change/tick", zap.Error(err))
-	} else if syms, ok := buySymbols(); ok {
-		lastSyms, haveBaseline = syms, true
+	} else {
+		lastFullRun = time.Now()
+		if syms, ok := buySymbols(); ok {
+			lastSyms, haveBaseline = syms, true
+		}
 	}
 
 	ist, _ := time.LoadLocation("Asia/Kolkata")
@@ -337,19 +354,61 @@ func watchLoop(logger *zap.Logger) {
 		} else {
 			added, removed := diffSymbols(lastSyms, syms)
 			if len(added) == 0 && len(removed) == 0 {
-				continue // price recalcs / cosmetic edits — NOT a stock change
+				// Price recalcs / cosmetic edits are NOT a stock change — but a
+				// data fix for a dropped stock looks exactly like one. The
+				// periodic full run catches those without an operator rerun.
+				if !dueForFullRun(now, lastFullRun, fullEvery) {
+					continue
+				}
+				logger.Info("watch: periodic full run — Buy list unchanged, re-evaluating data/filters",
+					zap.Duration("every", fullEvery), zap.Int("buy_symbols", len(syms)))
+			} else {
+				logger.Info("watch: BUY LIST CHANGED — running pipeline",
+					zap.Strings("added", added),
+					zap.Strings("removed", removed),
+					zap.Int("total_now", len(syms)))
 			}
-			logger.Info("watch: BUY LIST CHANGED — running pipeline",
-				zap.Strings("added", added),
-				zap.Strings("removed", removed),
-				zap.Int("total_now", len(syms)))
 		}
 		if err := runPipelineOnce(logger); err != nil {
 			logger.Error("watch: pipeline run failed — baseline kept, will retry next tick", zap.Error(err))
 			continue // lastSyms unchanged → next tick sees the same diff and retries
 		}
 		lastSyms, haveBaseline = syms, true
+		lastFullRun = time.Now()
 	}
+}
+
+// fullRunEvery parses MANTHAN_WATCH_FULL_RUN_EVERY (seconds): default 600,
+// "0" disables, anything below 120 clamps to 120, junk → default.
+func fullRunEvery(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 600 * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 600 * time.Second
+	}
+	if n == 0 {
+		return 0
+	}
+	if n < 120 {
+		n = 120
+	}
+	return time.Duration(n) * time.Second
+}
+
+// dueForFullRun reports whether a periodic full run is owed: never when
+// disabled, always when no run has completed yet, else once `every` has
+// elapsed since the last completed run (change-triggered runs count).
+func dueForFullRun(now, lastRun time.Time, every time.Duration) bool {
+	if every <= 0 {
+		return false
+	}
+	if lastRun.IsZero() {
+		return true
+	}
+	return now.Sub(lastRun) >= every
 }
 
 // diffSymbols returns (added, removed) between two SORTED symbol slices.

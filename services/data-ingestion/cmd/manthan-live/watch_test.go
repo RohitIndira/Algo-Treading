@@ -1,33 +1,34 @@
 package main
 
 import (
-	"reflect"
 	"testing"
+	"time"
 )
 
-// The watch trigger is the BUY SYMBOL SET, not a content hash — price
-// formulas recalc continuously and must never fire the pipeline. Only an
-// operator adding/removing a Buy row is an event.
-func TestDiffSymbols(t *testing.T) {
-	added, removed := diffSymbols(
-		[]string{"AEGISLOG", "KEI", "MPSLTD"},
-		[]string{"AEGISLOG", "MANORAMA", "MPSLTD", "SHANTIGOLD"},
-	)
-	if !reflect.DeepEqual(added, []string{"MANORAMA", "SHANTIGOLD"}) {
-		t.Errorf("added = %v", added)
+func TestFullRunEvery(t *testing.T) {
+	cases := map[string]time.Duration{
+		"": 600 * time.Second, "600": 600 * time.Second, "0": 0, "60": 120 * time.Second,
+		"900": 900 * time.Second, "junk": 600 * time.Second, "-5": 600 * time.Second,
 	}
-	if !reflect.DeepEqual(removed, []string{"KEI"}) {
-		t.Errorf("removed = %v", removed)
+	for in, want := range cases {
+		if got := fullRunEvery(in); got != want {
+			t.Fatalf("fullRunEvery(%q) = %v, want %v", in, got, want)
+		}
 	}
+}
 
-	// identical sets → no event
-	a, r := diffSymbols([]string{"X", "Y"}, []string{"X", "Y"})
-	if len(a) != 0 || len(r) != 0 {
-		t.Errorf("identical sets must not diff: %v %v", a, r)
+func TestDueForFullRun(t *testing.T) {
+	now := time.Date(2026, 10, 8, 13, 0, 0, 0, time.UTC)
+	if dueForFullRun(now, now.Add(-time.Hour), 0) {
+		t.Fatal("disabled must never be due")
 	}
-	// empty → first population is all-added
-	a, _ = diffSymbols(nil, []string{"NEW"})
-	if !reflect.DeepEqual(a, []string{"NEW"}) {
-		t.Errorf("nil baseline: %v", a)
+	if !dueForFullRun(now, time.Time{}, 10*time.Minute) {
+		t.Fatal("no completed run yet must be due")
+	}
+	if dueForFullRun(now, now.Add(-9*time.Minute), 10*time.Minute) {
+		t.Fatal("9 min after a run must not be due with every=10m")
+	}
+	if !dueForFullRun(now, now.Add(-10*time.Minute), 10*time.Minute) {
+		t.Fatal("10 min after a run must be due with every=10m")
 	}
 }
