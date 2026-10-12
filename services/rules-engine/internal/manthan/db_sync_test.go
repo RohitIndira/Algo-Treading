@@ -118,3 +118,72 @@ func TestSyncExitedFromDB_NoOpWhenMemoryAlreadyExited(t *testing.T) {
 		t.Fatalf("capital moved on a no-op: %v → %v", capBefore, capAfter)
 	}
 }
+
+// 2026-10-09 regression: a stale EXPIRED (never-filled) row for a symbol the
+// strategy holds again must NOT exit the live position. Once the live row is
+// gone, the same stale row releases the slot as before.
+func TestSyncExitedFromDB_IgnoresStaleRowWhileLiveRowExists(t *testing.T) {
+	db := openPersistTestDB(t)
+	defer db.Close()
+	cleanup := func() {
+		_, _ = db.Exec(`DELETE FROM manthan_positions WHERE strategy_id=$1 AND symbol=$2`, dbSyncStrategyID, dbSyncSymbol)
+	}
+	cleanup()
+	defer cleanup()
+	// Thursday's dispatch that never filled (EXPIRED, updated "now").
+	if _, err := db.Exec(`
+		INSERT INTO manthan_positions
+			(strategy_id, user_id, symbol, entry_price, quantity, invested_amt,
+			 status, exit_reason, exit_price, entry_time, updated_at)
+		VALUES ($1, 'UTEST', $2, 151.77, 131, 19881,
+		        'EXPIRED', 'ENTRY_NEVER_FILLED', NULL, now() - interval '2 days', now())`,
+		dbSyncStrategyID, dbSyncSymbol); err != nil {
+		t.Fatalf("seed expired row: %v", err)
+	}
+	// Friday's fill of the same symbol — the live row.
+	if _, err := db.Exec(`
+		INSERT INTO manthan_positions
+			(strategy_id, user_id, symbol, entry_price, quantity, invested_amt, industry, mcap_bucket, index_name,
+			 status, entry_time, updated_at)
+		VALUES ($1, 'UTEST', $2, 145.62, 134, 19513, 'Auto', 'SMALL', 'NIFTY',
+		        'ACTIVE', now() - interval '1 hour', now())`,
+		dbSyncStrategyID, dbSyncSymbol); err != nil {
+		t.Fatalf("seed live row: %v", err)
+	}
+
+	pm := NewPortfolioManager(zap.NewNop())
+	st := types.UserStrategy{StrategyID: dbSyncStrategyID, UserID: "UTEST", TotalCapital: 500000, MaxPositions: 25, StopLossPct: 20}
+	p := pm.GetOrCreate(st)
+	p.Mu.Lock()
+	p.Positions[dbSyncSymbol] = &types.Position{Symbol: dbSyncSymbol, EntryPrice: 145.62, Quantity: 134, InvestedAmt: 19513,
+		HighSinceEntry: 145.62, State: types.StateActive, Active: true}
+	p.Mu.Unlock()
+
+	synced, err := pm.SyncExitedFromDB(context.Background(), db, nil)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	p.Mu.Lock()
+	state := p.Positions[dbSyncSymbol].State
+	p.Mu.Unlock()
+	if synced != 0 || state != types.StateActive {
+		t.Fatalf("stale EXPIRED row exited a live position: synced=%d state=%s", synced, state)
+	}
+
+	// The live row disappears (e.g. admin ghost heal set it EXITED elsewhere,
+	// or it was deleted): the stale row may now release the slot.
+	if _, err := db.Exec(`DELETE FROM manthan_positions WHERE strategy_id=$1 AND symbol=$2 AND status='ACTIVE'`,
+		dbSyncStrategyID, dbSyncSymbol); err != nil {
+		t.Fatalf("drop live row: %v", err)
+	}
+	synced, err = pm.SyncExitedFromDB(context.Background(), db, nil)
+	if err != nil {
+		t.Fatalf("sync 2: %v", err)
+	}
+	p.Mu.Lock()
+	state = p.Positions[dbSyncSymbol].State
+	p.Mu.Unlock()
+	if synced != 1 || state != types.StateExited {
+		t.Fatalf("without a live row the stale row must release the slot: synced=%d state=%s", synced, state)
+	}
+}

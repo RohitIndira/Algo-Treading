@@ -628,10 +628,23 @@ func (pm *PortfolioManager) SyncExitedFromDB(ctx context.Context, db *sql.DB, rd
 	if db == nil {
 		return 0, nil
 	}
+	// A (strategy, symbol) counts as externally exited ONLY when the DB holds
+	// no live row for it at all. Rows are matched by symbol, and a strategy can
+	// legitimately carry an older EXPIRED/EXITED row for a symbol it holds
+	// again — 2026-10-09: S4450's JAMNAAUTO fill (09:44:50) was "exited" from
+	// memory 48 s later by Thursday's ENTRY_NEVER_FILLED row, leaving a funded
+	// position untrailed with no software stop. The newest terminal row per
+	// pair is the one whose exit price/reason gets booked.
 	rows, err := db.QueryContext(ctx, `
-		SELECT strategy_id, symbol, COALESCE(exit_price, 0), COALESCE(exit_reason, '')
-		FROM manthan_positions
-		WHERE status IN ('EXITED','EXPIRED') AND updated_at > now() - interval '48 hours'`)
+		SELECT DISTINCT ON (x.strategy_id, x.symbol)
+		       x.strategy_id, x.symbol, COALESCE(x.exit_price, 0), COALESCE(x.exit_reason, '')
+		FROM manthan_positions x
+		WHERE x.status IN ('EXITED','EXPIRED') AND x.updated_at > now() - interval '48 hours'
+		  AND NOT EXISTS (
+		        SELECT 1 FROM manthan_positions o
+		        WHERE o.strategy_id = x.strategy_id AND o.symbol = x.symbol
+		          AND o.status IN ('ACTIVE','EXIT_PENDING','PARTIALLY_FILLED','PENDING_ENTRY'))
+		ORDER BY x.strategy_id, x.symbol, x.updated_at DESC`)
 	if err != nil {
 		return 0, fmt.Errorf("sync exited query: %w", err)
 	}
