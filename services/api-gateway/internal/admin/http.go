@@ -54,7 +54,18 @@ type HTTP struct {
 }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
-func (h *HTTP) SetProber(p *Prober) { h.prober = p }
+func (h *HTTP) SetProber(p *Prober) {
+	h.prober = p
+	h.wireSessionHealth()
+}
+
+// wireSessionHealth gives the fleet store evidence-based session items once
+// both the fleet store and the prober are present (either order).
+func (h *HTTP) wireSessionHealth() {
+	if h.fleet != nil && h.prober != nil {
+		h.fleet.sessionItems = NewSessionHealth(h.fleet, h.prober).Items
+	}
+}
 
 // SetStrategyControl enables the M4 strategy endpoints. Call before Register.
 func (h *HTTP) SetStrategyControl(sc *StrategyControl) { h.strategies = sc }
@@ -95,7 +106,10 @@ func NewHTTP(svc *Service) *HTTP { return &HTTP{svc: svc} }
 // SetFleetStore enables the M2 fleet/attention endpoints. Call before
 // Register; a nil store leaves those routes unregistered (a loud 404, not a
 // half-working screen).
-func (h *HTTP) SetFleetStore(f *FleetStore) { h.fleet = f }
+func (h *HTTP) SetFleetStore(f *FleetStore) {
+	h.fleet = f
+	h.wireSessionHealth()
+}
 
 // ── Route registration ──────────────────────────────────────────────────
 
@@ -879,9 +893,9 @@ func (h *HTTP) handleAttention(w http.ResponseWriter, ar *AdminRequest) {
 		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "attention query failed")
 		return
 	}
-	// M3: live-probe failures from the last sweep outrank the age heuristic —
-	// prepend and keep CRITICAL-first ordering.
-	if h.prober != nil {
+	// Fallback only: with the fleet store wired, session health already
+	// produced the evidence-based items inside Attention().
+	if h.prober != nil && (h.fleet == nil || h.fleet.sessionItems == nil) {
 		if fails := h.prober.sweepFailuresAsAttention(); len(fails) > 0 {
 			items = append(fails, items...)
 		}

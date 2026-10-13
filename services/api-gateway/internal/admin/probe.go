@@ -176,6 +176,54 @@ func (p *Prober) Sweep(ctx context.Context, userIDs []string) []ProbeVerdict {
 	return out
 }
 
+// LastVerdict returns the most recent verdict recorded for a user (from a
+// sweep or an on-demand probe).
+func (p *Prober) LastVerdict(userID string) (ProbeVerdict, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	v, ok := p.lastSweep[userID]
+	return v, ok
+}
+
+// record stores a single verdict without touching the sweep timestamp.
+func (p *Prober) record(v ProbeVerdict) {
+	p.mu.Lock()
+	p.lastSweep[v.UserID] = v
+	p.mu.Unlock()
+}
+
+// canProbe rate-limits on-demand probes: at most one per user per gap.
+func (p *Prober) canProbe(userID string, gap time.Duration, now time.Time) bool {
+	v, ok := p.LastVerdict(userID)
+	return !ok || now.Sub(v.ProbedAt) >= gap
+}
+
+// ProbeNow probes one user and records the verdict for the attention queue.
+func (p *Prober) ProbeNow(ctx context.Context, userID string) ProbeVerdict {
+	v := p.Probe(ctx, userID)
+	p.record(v)
+	return v
+}
+
+// ProbeAsync is the login hook: a client just pushed a fresh token, so
+// verify it in the background and let the attention queue clear on the
+// next poll. Debounced per user; nil-receiver safe so wiring is optional.
+func (p *Prober) ProbeAsync(userID string) {
+	if p == nil || userID == "" {
+		return
+	}
+	go func() {
+		time.Sleep(2 * time.Second) // let user-config commit the new token
+		if !p.canProbe(userID, 5*time.Second, time.Now()) {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout+2*time.Second)
+		defer cancel()
+		v := p.ProbeNow(ctx, userID)
+		log.Printf("admin: post-login probe user=%s → %s %s", userID, v.Verdict, v.Detail)
+	}()
+}
+
 // LastSweep returns a copy of the most recent sweep results.
 func (p *Prober) LastSweep() (map[string]ProbeVerdict, time.Time) {
 	p.mu.Lock()
@@ -223,11 +271,16 @@ func (p *Prober) StartDailySweep(ctx context.Context, ist *time.Location, usersF
 	}()
 }
 
-// sweepFailuresAsAttention converts stale sweep knowledge into queue items.
+// sweepFailuresAsAttention is the no-fleet fallback (session health needs
+// the fleet store): stale sweep knowledge as queue items, times in IST.
 func (p *Prober) sweepFailuresAsAttention() []AttentionItem {
 	results, at := p.LastSweep()
 	if at.IsZero() {
 		return nil
+	}
+	ist, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil || ist == nil {
+		ist = time.FixedZone("IST", 5*3600+30*60)
 	}
 	var items []AttentionItem
 	for _, v := range results {
@@ -235,9 +288,9 @@ func (p *Prober) sweepFailuresAsAttention() []AttentionItem {
 			continue
 		}
 		items = append(items, AttentionItem{
-			Severity: "CRITICAL", Kind: "CREDENTIAL_PROBE_FAILED", UserID: v.UserID,
-			Detail: fmt.Sprintf("live probe %s at %s: %s", v.Verdict, at.Format("15:04"), v.Detail),
-			Module: "M3",
+			Severity: "CRITICAL", Kind: "AUTH_EXPIRED", UserID: v.UserID,
+			Detail: fmt.Sprintf("live probe %s at %s IST: %s — platform re-login required", v.Verdict, v.ProbedAt.In(ist).Format("15:04"), v.Detail),
+			Module: "session",
 		})
 	}
 	return items

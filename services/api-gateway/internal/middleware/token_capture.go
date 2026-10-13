@@ -57,6 +57,10 @@ type TokenCapture struct {
 	knownIat sync.Map
 	// inflight: map[userID]struct{} — at most one slow-path per user.
 	inflight sync.Map
+
+	// OnRefreshed, when set, runs after a successful push (same hook as the
+	// /auth/credentials handler): the admin prober re-verifies the session.
+	OnRefreshed func(userID string)
 }
 
 func NewTokenCapture(client CredentialsClient) *TokenCapture {
@@ -132,6 +136,9 @@ func (tc *TokenCapture) reconcile(claims *auth.Claims, rawJWT string, headerIat 
 	}
 	tc.knownIat.Store(userID, headerIat)
 	log.Printf("auth: auto-captured fresh broker token user=%s iat=%d (stored was %d) — USER_CREDENTIALS_UPDATED published", userID, headerIat, storedIat)
+	if tc.OnRefreshed != nil {
+		tc.OnRefreshed(userID)
+	}
 }
 
 // claimInt64 reads a numeric JWT claim (JSON numbers unmarshal as float64).

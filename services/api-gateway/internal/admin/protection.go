@@ -487,10 +487,10 @@ func (s *ScaleChecker) findingsAsAttention() []AttentionItem {
 	var items []AttentionItem
 	for _, f := range findings {
 		items = append(items, AttentionItem{
-			Severity: "HIGH", Kind: "SCALE_" + f.Kind, UserID: f.UserID,
+			Severity: "WARN", Kind: "SCALE_" + f.Kind, UserID: f.UserID,
 			Strategy: f.StrategyID, Symbol: f.Symbol,
 			Detail: fmt.Sprintf("scale check %s: %s", at.Format("15:04"), f.Detail),
-			Module: "M5",
+			Module: "scale_check",
 		})
 	}
 	return items

@@ -33,11 +33,14 @@ const credStaleAfter = 20 * time.Hour
 // (admin_* tables, grant-hardened connection): fleet reads ride the shared
 // handles until a read-only business role lands.
 type FleetStore struct {
-	tradingDB *sql.DB // strategies
-	execDB    *sql.DB // manthan_orders, user_credentials, signal_inbox, manthan_order_events
-	posDB     *sql.DB // positions
-	ist       *time.Location
-	now       func() time.Time
+	// sessionItems, when wired (SetProber), replaces the credential-age
+	// heuristic with evidence-based session health.
+	sessionItems func(context.Context) ([]AttentionItem, error)
+	tradingDB    *sql.DB // strategies
+	execDB       *sql.DB // manthan_orders, user_credentials, signal_inbox, manthan_order_events
+	posDB        *sql.DB // positions
+	ist          *time.Location
+	now          func() time.Time
 }
 
 func NewFleetStore(tradingDB, execDB, posDB *sql.DB) *FleetStore {
@@ -300,16 +303,18 @@ func (f *FleetStore) ActiveUserIDs(ctx context.Context) ([]string, error) {
 
 // ── 2.2 Attention queue ─────────────────────────────────────────────────
 
-// AttentionItem is one "needs a human" row. Severity ranks the queue:
-// CRITICAL (money exposed now) > HIGH (lost/failing work) > INFO (counters).
+// AttentionItem is one "needs a human" row. Severity ranks the queue and
+// follows the dashboard's enum: CRITICAL (money exposed now) > WARN
+// (lost/failing work) > INFO (counters). user_id matches /clients so the UI
+// can badge the client row.
 type AttentionItem struct {
-	Severity string `json:"severity"` // CRITICAL | HIGH | INFO
-	Kind     string `json:"kind"`     // DEAD_SESSION | NAKED_POSITION | AMO_GIVEUP | DLQ_SIGNAL | RECONCILER_ACTIVITY
+	Severity string `json:"severity"` // CRITICAL | WARN | INFO
+	Kind     string `json:"kind"`     // AUTH_EXPIRED | STALE_CREDENTIAL | NAKED_POSITION | AMO_GIVEUP | DLQ_SIGNAL | RECONCILER_ACTIVITY | SCALE_*
 	UserID   string `json:"user_id,omitempty"`
 	Strategy string `json:"strategy_id,omitempty"`
 	Symbol   string `json:"symbol,omitempty"`
 	Detail   string `json:"detail"`
-	Module   string `json:"module"` // deep-link hint for the UI (M3, M5, M6, M8)
+	Module   string `json:"module"` // raising module: session | protection | eod_arming | signal_pipeline | reconciler | scale_check
 }
 
 // Attention builds the ranked queue from the fleet plus the failure tables.
@@ -322,10 +327,21 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 		return nil, nil, err
 	}
 
-	// Dead sessions and naked positions fall out of the fleet rows.
+	// Session state: evidence-based (session_health.go) when the prober is
+	// wired, else the credential-age heuristic below.
+	if f.sessionItems != nil {
+		sess, err := f.sessionItems(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		items = append(items, sess...)
+	}
+
+	// Naked positions fall out of the fleet rows (and dead sessions, on the
+	// age heuristic, when no prober is wired).
 	staleSeen := map[string]bool{}
 	for _, r := range fleet {
-		if r.CredentialStale && r.Active && !staleSeen[r.UserID] {
+		if f.sessionItems == nil && r.CredentialStale && r.Active && !staleSeen[r.UserID] {
 			staleSeen[r.UserID] = true
 			age := "none stored"
 			if r.CredentialAgeHours >= 0 {
@@ -334,7 +350,7 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 			items = append(items, AttentionItem{
 				Severity: "CRITICAL", Kind: "DEAD_SESSION", UserID: r.UserID,
 				Detail: fmt.Sprintf("broker credential %s — trail modifies, entries and re-arms all fail until platform re-login", age),
-				Module: "M3",
+				Module: "session",
 			})
 		}
 		for _, sym := range r.NakedSymbols {
@@ -342,7 +358,7 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 				Severity: "CRITICAL", Kind: "NAKED_POSITION",
 				UserID: r.UserID, Strategy: r.StrategyID, Symbol: sym,
 				Detail: "open position with no standing stop and no deferral record",
-				Module: "M5",
+				Module: "protection",
 			})
 		}
 	}
@@ -368,7 +384,7 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 			giveups.Close()
 			return nil, nil, err
 		}
-		it.Severity, it.Kind, it.Module = "HIGH", "AMO_GIVEUP", "M8"
+		it.Severity, it.Kind, it.Module = "WARN", "AMO_GIVEUP", "eod_arming"
 		it.Detail = fmt.Sprintf("%d failed overnight-stop attempts in 24h — broker rejecting deterministically, needs review", n)
 		items = append(items, it)
 	}
@@ -393,7 +409,7 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 			dlq.Close()
 			return nil, nil, err
 		}
-		it.Severity, it.Kind, it.Module = "HIGH", "DLQ_SIGNAL", "M6"
+		it.Severity, it.Kind, it.Module = "WARN", "DLQ_SIGNAL", "signal_pipeline"
 		if len(lastErr) > 120 {
 			lastErr = lastErr[:120]
 		}
@@ -418,12 +434,12 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 		items = append(items, AttentionItem{
 			Severity: "INFO", Kind: "RECONCILER_ACTIVITY",
 			Detail: fmt.Sprintf("%d order-state drifts auto-synced from broker truth in 24h", reconFixed),
-			Module: "M5",
+			Module: "reconciler",
 		})
 	}
 
-	// Rank: CRITICAL, HIGH, INFO — stable within severity.
-	rank := map[string]int{"CRITICAL": 0, "HIGH": 1, "INFO": 2}
+	// Rank: CRITICAL, WARN, INFO — stable within severity.
+	rank := map[string]int{"CRITICAL": 0, "WARN": 1, "INFO": 2}
 	sort.SliceStable(items, func(i, j int) bool { return rank[items[i].Severity] < rank[items[j].Severity] })
 
 	return items, []string{"HOLDINGS_DRIFT (kafka consumer pending)", "CORP_ACTION_FLAG (detector pending)"}, nil

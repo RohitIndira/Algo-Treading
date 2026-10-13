@@ -19,6 +19,10 @@ import (
 
 type UserConfigHandler struct {
 	client *grpc_clients.UserConfigClient
+	// OnCredentialsUpdated, when set, is called (in its own goroutine) after a
+	// successful POST /auth/credentials — the admin prober verifies the fresh
+	// session so the attention queue clears within seconds of a re-login.
+	OnCredentialsUpdated func(userID string)
 }
 
 func NewUserConfigHandler(client *grpc_clients.UserConfigClient) *UserConfigHandler {
@@ -616,6 +620,9 @@ func (h *UserConfigHandler) UpdateCredentials(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	if h.OnCredentialsUpdated != nil {
+		go h.OnCredentialsUpdated(reqDTO.UserID)
+	}
 	respondWithJSON(w, http.StatusOK, map[string]any{
 		"success": true,
 		"user_id": reqDTO.UserID,

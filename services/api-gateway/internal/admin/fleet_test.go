@@ -11,7 +11,7 @@ package admin
 //	  DDD — exited yesterday, pnl −500   → total only
 //	  EEE — exited today,     pnl +300   → today + total
 //	  CCC duplicate ACTIVE row           → must dedupe (BALUFORGE defect)
-//	  FFF — 6 failed AMO attempts, never stood → AMO_GIVEUP (HIGH)
+//	  FFF — 6 failed AMO attempts, never stood → AMO_GIVEUP (WARN)
 //	  GGG — 6 failed AMO attempts + 1 SL_PLACED → NOT a give-up
 //	  one DLQ'd inbox row today          → DLQ_SIGNAL (HIGH)
 //	  credential updated 30h ago         → stale → DEAD_SESSION (CRITICAL)
@@ -208,25 +208,25 @@ func TestAttention_QueueClasses(t *testing.T) {
 	if it := find("NAKED_POSITION", "CCC"); it == nil || it.Severity != "CRITICAL" || it.Strategy != m2Strat {
 		t.Errorf("NAKED_POSITION CCC missing/wrong: %+v", it)
 	}
-	if it := find("AMO_GIVEUP", "FFF"); it == nil || it.Severity != "HIGH" {
+	if it := find("AMO_GIVEUP", "FFF"); it == nil || it.Severity != "WARN" {
 		t.Errorf("AMO_GIVEUP FFF missing/wrong: %+v", it)
 	}
 	if it := find("AMO_GIVEUP", "GGG"); it != nil {
 		t.Errorf("GGG has a standing AMO — must NOT be a give-up: %+v", it)
 	}
-	if it := find("DLQ_SIGNAL", ""); it == nil || it.Severity != "HIGH" ||
+	if it := find("DLQ_SIGNAL", ""); it == nil || it.Severity != "WARN" ||
 		!strings.Contains(it.Detail, "tadm-m2-dlq") {
 		t.Errorf("DLQ_SIGNAL missing/wrong: %+v", it)
 	}
 
-	// Ranking: no HIGH before a CRITICAL.
-	seenHigh := false
+	// Ranking: no WARN before a CRITICAL.
+	seenWarn := false
 	for _, it := range items {
-		if it.Severity == "HIGH" {
-			seenHigh = true
+		if it.Severity == "WARN" {
+			seenWarn = true
 		}
-		if it.Severity == "CRITICAL" && seenHigh {
-			t.Fatalf("severity ordering broken: CRITICAL after HIGH")
+		if it.Severity == "CRITICAL" && seenWarn {
+			t.Fatalf("severity ordering broken: CRITICAL after WARN")
 		}
 	}
 	if len(notWired) != 2 {

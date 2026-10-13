@@ -527,6 +527,10 @@ func main() {
 		prober := admin.NewProber(userConfigClient, adminIndira)
 		adminHTTP.SetProber(prober)
 		prober.StartDailySweep(context.Background(), istLoc, adminFleet.ActiveUserIDs)
+		// Re-login hooks: a fresh token (explicit POST or auto-capture) is
+		// verified live right away, so AUTH_EXPIRED clears on the next poll.
+		userConfigHandler.OnCredentialsUpdated = prober.ProbeAsync
+		tokenCapture.OnRefreshed = prober.ProbeAsync
 		log.Printf("Admin credential probe + 08:30 IST pre-market sweep enabled")
 
 		// M4: strategy control (pause/resume/delete on behalf, timeline,

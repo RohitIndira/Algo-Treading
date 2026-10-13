@@ -89,7 +89,7 @@ func TestSweep_FeedsAttention(t *testing.T) {
 
 	items := p.sweepFailuresAsAttention()
 	if len(items) != 1 || items[0].UserID != "DEAD1" ||
-		items[0].Severity != "CRITICAL" || items[0].Kind != "CREDENTIAL_PROBE_FAILED" {
+		items[0].Severity != "CRITICAL" || items[0].Kind != "AUTH_EXPIRED" {
 		t.Fatalf("attention from sweep = %+v, want one CRITICAL for DEAD1", items)
 	}
 
@@ -172,13 +172,13 @@ func TestHTTP_CredentialProbeExpireSweep_EndToEnd(t *testing.T) {
 	}
 
 	// 5. Sweep: probes the fixture user (active strategy), stores results;
-	//    attention now carries the CREDENTIAL_PROBE_FAILED CRITICAL.
+	//    attention now carries the AUTH_EXPIRED CRITICAL.
 	rec = do("POST", "/api/v1/admin/credential-sweep", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"count":`) {
 		t.Fatalf("sweep: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = do("GET", "/api/v1/admin/attention", "")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "CREDENTIAL_PROBE_FAILED") {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "AUTH_EXPIRED") {
 		t.Fatalf("attention after sweep: %d %s", rec.Code, rec.Body.String())
 	}
 
