@@ -170,11 +170,34 @@ func (r *Recovery) replaceSL(ctx context.Context, sl *ManthanOrder, auth *Broker
 
 	newBrokerID, _, _, err := r.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, sl.LimitPrice)
 	if err != nil {
-		r.logger.Error("Recovery: SL re-place FAILED — MARKET SELL",
+		r.logger.Error("Recovery: SL re-place FAILED — LIMIT exit",
 			zap.String("symbol", sl.Symbol), zap.Error(err))
-		_, _ = r.broker.PlaceMarketSell(ctx, *auth, info, sl.Qty)
-		_ = r.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL", "SL_PLACED", "EMERGENCY_SELL",
-			"", 0, sl.Qty, "recovery: SL re-place failed, emergency sell")
+		// 2026-10-22: marketable LIMIT (Market is rejected for algo orders),
+		// tracked as a PLACED exit row so the fill is confirmed, never assumed.
+		r.broker.EnrichMarketInfo(ctx, info)
+		brokerID, limit, serr := r.broker.PlaceMarketableLimitSell(ctx, *auth, info, sl.Qty)
+		if serr != nil {
+			r.logger.Error("Recovery: LIMIT exit FAILED — position has no stop; manual intervention required",
+				zap.String("symbol", sl.Symbol), zap.Error(serr))
+			_ = r.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "SL_PLACED", "SL_PLACED",
+				"", 0, sl.Qty, "recovery: SL re-place + LIMIT exit both failed: "+serr.Error())
+			return
+		}
+		_ = r.repo.UpdateOrderCancelled(ctx, sl.ID)
+		_ = r.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL", "SL_PLACED", "CANCELLED",
+			"", limit, sl.Qty, "recovery: SL re-place failed — LIMIT exit broker_id="+brokerID)
+		parent := int64(0)
+		if sl.ParentOrderID != nil {
+			parent = *sl.ParentOrderID
+		}
+		if _, ierr := r.repo.InsertExitSellPlaced(ctx, ExitSellRow{
+			StrategyID: sl.StrategyID, UserID: sl.UserID, Symbol: sl.Symbol, ISIN: sl.ISIN,
+			Info: info, OrderType: OrderTypeMarketSell, Qty: sl.Qty, LimitPrice: limit,
+			BrokerOrderID: brokerID, ParentOrderID: parent, Reason: "recovery: SL re-place failed — exit",
+		}); ierr != nil {
+			r.logger.Error("Recovery: exit placed but NOT recorded",
+				zap.String("symbol", sl.Symbol), zap.String("broker_order_id", brokerID), zap.Error(ierr))
+		}
 		return
 	}
 

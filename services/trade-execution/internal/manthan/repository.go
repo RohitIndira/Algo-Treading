@@ -887,11 +887,15 @@ func (r *Repository) ListNakedOpenBuyPositions(ctx context.Context) ([]PositionN
 		    GROUP BY strategy_id, symbol
 		),
 		sl_cover AS (
+		    -- Active stops cover the position; so does an exit sell that is
+		    -- already resting at the broker (2026-10-22): its quantity is
+		    -- locked there, and placing a stop on top would only be rejected
+		    -- "Free Qty=0" every cycle until the fill is confirmed.
 		    SELECT strategy_id, symbol, COALESCE(SUM(qty), 0) AS covered
 		    FROM manthan_orders
 		    WHERE order_side = 'SELL'
-		      AND order_type LIKE '%SL%'
-		      AND status IN ('PENDING','SL_PLACED','SL_DEFERRED_BAND')
+		      AND (   (order_type LIKE '%SL%' AND status IN ('PENDING','SL_PLACED','SL_DEFERRED_BAND'))
+		           OR (order_type IN ('MARKET_SELL','AMO_SELL') AND status IN ('PENDING','PLACED')) )
 		    GROUP BY strategy_id, symbol
 		)
 		SELECT e.id, COALESCE(e.signal_id,''), e.strategy_id, e.user_id, e.symbol,

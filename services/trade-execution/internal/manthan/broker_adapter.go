@@ -56,8 +56,9 @@ func (e *BrokerRejection) IsRetryable() bool { return e.Retryable }
 //
 // The op parameter identifies the call site so logs / audit can tell which
 // adapter method produced the rejection. Common values:
-//   "place_limit_buy", "place_market_buy", "place_sl_sell",
-//   "place_amo_sl",   "modify_sl_trigger", "cancel_sl".
+//
+//	"place_limit_buy", "place_market_buy", "place_sl_sell",
+//	"place_amo_sl",   "modify_sl_trigger", "cancel_sl".
 func parseRejection(op string, resp *indiraClient.PlaceOrderResponse) *BrokerRejection {
 	if resp == nil {
 		return nil
@@ -121,23 +122,7 @@ func (b *BrokerAdapter) ResolveSymbol(ctx context.Context, symbol, isin string) 
 		TickSize:      0.05,
 	}
 
-	raw, err := b.extRedis.Get(ctx, "market:nse:"+token).Result()
-	if err == nil {
-		var mkt struct {
-			TickSize  float64 `json:"tick_size"`
-			DPRLower  float64 `json:"dpr_lower"`
-			DPRUpper  float64 `json:"dpr_upper"`
-			FreezeQty int     `json:"freeze_qty"`
-		}
-		if json.Unmarshal([]byte(raw), &mkt) == nil {
-			if mkt.TickSize > 0 {
-				info.TickSize = mkt.TickSize
-			}
-			info.DPRLower = mkt.DPRLower
-			info.DPRUpper = mkt.DPRUpper
-			info.FreezeQty = mkt.FreezeQty
-		}
-	}
+	b.EnrichMarketInfo(ctx, info)
 
 	return info, nil
 }
@@ -260,11 +245,12 @@ func (b *BrokerAdapter) PlaceMarketBuy(ctx context.Context, auth BrokerAuth, inf
 // re-fetch from DB, and retry the broker call once.
 //
 // Indira-specific signals:
-//   HTTP 401 "Session expired"            — no Bearer / invalid shape
-//   HTTP 200 "AU004 Session data not received" — JWT signature valid but
-//                                           the server-side trading session
-//                                           was invalidated (typically by a
-//                                           newer browser login)
+//
+//	HTTP 401 "Session expired"            — no Bearer / invalid shape
+//	HTTP 200 "AU004 Session data not received" — JWT signature valid but
+//	                                        the server-side trading session
+//	                                        was invalidated (typically by a
+//	                                        newer browser login)
 func IsAuthError(err error) bool {
 	if err == nil {
 		return false
@@ -305,8 +291,15 @@ func IsOrderNotFoundError(err error) bool {
 // sits triggered-but-unfilled, our safety monitor then cancels + emergency
 // market-sells at whatever price (2026-04-22 APARINDS exit: -₹177 vs. target).
 // 0.3% gives enough slack for a falling market to fill inside.
+//
+// 2026-10-22: 0.3% was NOT enough. The open gapped through trigger AND limit
+// on several stops, the SL-L sat triggered-but-unfilled, and every fallback
+// (SL-M / Market) was rejected by the broker for algo-tagged orders. The gap
+// is now MANTHAN_SL_LIMIT_GAP_PCT (default 2%, see broker_exit.go) — the
+// TRIGGER is untouched (exact strategy stop); only how far below it the
+// limit leg may fill. The placement-time clamp floors it at the band.
 func SLLimitGap(trigger, tickSize float64) float64 {
-	pctGap := trigger * 0.003 // 0.3%
+	pctGap := trigger * slLimitGapPct / 100
 	tickGap := tickSize * 5
 	if pctGap > tickGap {
 		return pctGap
@@ -314,52 +307,27 @@ func SLLimitGap(trigger, tickSize float64) float64 {
 	return tickGap
 }
 
-// PlaceSLMSell places an SL-M (stop-loss market) SELL — no limit price, fills
-// at whatever market price is when trigger hits. Used as a fallback when SL-L
-// is stuck (trigger hit but limit price couldn't be matched). Guarantees exit
-// at cost of slippage; safer than holding an unprotected position.
+// PlaceSLMSell historically placed an SL-M (stop-loss market). The broker
+// rejects SL-M for SEBI algo-tagged orders (first seen 2026-10-22, "Market
+// order not allowed for Algo order"), so it now places an SL-LIMIT at the SAME
+// trigger with the wide limit leg (SLLimitGap, default 2%, floored at the
+// band by PlaceSLSell's clamp): fires at the trigger, fills anywhere down to
+// the limit. GTC like before; same return shape so every caller is unchanged.
 func (b *BrokerAdapter) PlaceSLMSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int, triggerPrice float64) (string, error) {
-	roundedTrigger := b.roundAndClamp(triggerPrice, info.TickSize, info.DPRLower, info.DPRUpper)
-
-	req := &indiraClient.PlaceOrderRequest{
-		Symbol:       info.IndiraSymbol,
-		ExcToken:     info.ExchangeToken,
-		Exc:          "NSE",
-		OrdAction:    "SELL",
-		OrdValidity:  "GTC",
-		OrdType:      "SL-M",
-		PrdType:      "DELIVERY",
-		TriggerPrice: indiraClient.Price2DP(roundedTrigger),
-		Qty:          qty,
-		DisQty:       0,
-		LotSize:      1,
-		Instrument:   "STK",
-		Amo:          false,
+	limit := triggerPrice - SLLimitGap(triggerPrice, info.TickSize)
+	if info.DPRLower > 0 && limit < info.DPRLower {
+		limit = info.DPRLower
 	}
-
-	resp, err := b.client.PlaceOrder(ctx, b.toIndiraAuth(auth), req)
+	orderID, roundedTrigger, roundedLimit, err := b.PlaceSLSell(ctx, auth, info, qty, triggerPrice, limit)
 	if err != nil {
 		return "", err
 	}
-
-	orderID := resp.OrderId
-	if orderID == "" {
-		orderID = resp.OrdId
-	}
-	if orderID == "" {
-		return "", fmt.Errorf("broker returned empty SL-M order ID")
-	}
-
-	if rej := parseRejection("place_slm_sell", resp); rej != nil {
-		return "", rej
-	}
-
-	b.logger.Info("SL-M SELL placed (fallback)",
+	b.logger.Info("SL-M requested → SL-L placed (SL-M is rejected for algo orders)",
 		zap.String("symbol", info.Symbol),
 		zap.Int("qty", qty),
 		zap.Float64("trigger", roundedTrigger),
+		zap.Float64("limit", roundedLimit),
 		zap.String("broker_order_id", orderID))
-
 	return orderID, nil
 }
 
@@ -483,39 +451,17 @@ func (b *BrokerAdapter) CancelOrder(ctx context.Context, auth BrokerAuth, info *
 	return b.client.CancelOrder(ctx, b.toIndiraAuth(auth), req)
 }
 
-// PlaceMarketSell places an emergency MARKET SELL (safety net).
+// PlaceMarketSell is the "sell NOW" primitive behind every emergency and
+// protective exit. Since 2026-10-22 it never sends OrdType=Market: the broker
+// rejects Market (and SL-M) orders that carry the SEBI algoId ("Market order
+// not allowed for Algo order"), which silently killed every fallback that
+// morning. It places a marketable LIMIT instead — pricing rule in
+// PlaceMarketableLimitSell (broker_exit.go). Signature kept so all call
+// sites stay source-compatible; callers that want the limit use the
+// underlying method directly.
 func (b *BrokerAdapter) PlaceMarketSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int) (string, error) {
-	req := &indiraClient.PlaceOrderRequest{
-		Symbol:     info.IndiraSymbol,
-		ExcToken:   info.ExchangeToken,
-		Exc:        "NSE",
-		OrdAction:  "SELL",
-		OrdValidity: "DAY",
-		OrdType:    "Market",
-		PrdType:    "DELIVERY",
-		Qty:        qty,
-		DisQty:     0,
-		LotSize:    1,
-		Instrument: "STK",
-		Amo:        false,
-	}
-
-	resp, err := b.client.PlaceOrder(ctx, b.toIndiraAuth(auth), req)
-	if err != nil {
-		return "", err
-	}
-
-	orderID := resp.OrderId
-	if orderID == "" {
-		orderID = resp.OrdId
-	}
-
-	b.logger.Warn("EMERGENCY MARKET SELL placed",
-		zap.String("symbol", info.Symbol),
-		zap.Int("qty", qty),
-		zap.String("broker_order_id", orderID))
-
-	return orderID, nil
+	orderID, _, err := b.PlaceMarketableLimitSell(ctx, auth, info, qty)
+	return orderID, err
 }
 
 // PlaceAMOSLSell submits an After-Market Order with SL-Limit type for overnight
@@ -597,38 +543,32 @@ func (b *BrokerAdapter) PlaceAMOSLSell(ctx context.Context, auth BrokerAuth, inf
 	return orderID, nil
 }
 
-// PlaceAMOSell places an After Market Order SELL (for lower circuit exit).
+// PlaceAMOSell queues the lower-circuit exit for the next session. Market
+// AMOs are rejected for algo-tagged orders (2026-10-22), so this is an AMO
+// LIMIT at today's lower band — the lowest price the exchange accepts today,
+// and tomorrow's band is centred on today's close so it stays inside it. If
+// the stock opens lower still, the morning protective cycle / safety monitor
+// re-prices the exit from the live LTP.
 func (b *BrokerAdapter) PlaceAMOSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int) (string, error) {
-	req := &indiraClient.PlaceOrderRequest{
-		Symbol:     info.IndiraSymbol,
-		ExcToken:   info.ExchangeToken,
-		Exc:        "NSE",
-		OrdAction:  "SELL",
-		OrdValidity: "DAY",
-		OrdType:    "Market",
-		PrdType:    "DELIVERY",
-		Qty:        qty,
-		DisQty:     0,
-		LotSize:    1,
-		Instrument: "STK",
-		Amo:        true,
+	b.EnrichMarketInfo(ctx, info)
+	price := info.DPRLower
+	if price <= 0 {
+		ltp, _ := b.FetchLTP(ctx, info.ExchangeToken)
+		p, err := exitLimitFor(ltp, info.TickSize, 0, 0, exitLimitSlippagePct)
+		if err != nil {
+			return "", fmt.Errorf("amo exit for %s: no band floor and %w", info.Symbol, err)
+		}
+		price = p
 	}
-
-	resp, err := b.client.PlaceOrder(ctx, b.toIndiraAuth(auth), req)
+	orderID, err := b.PlaceAMOLimitSell(ctx, auth, info, qty, price)
 	if err != nil {
 		return "", err
 	}
-
-	orderID := resp.OrderId
-	if orderID == "" {
-		orderID = resp.OrdId
-	}
-
-	b.logger.Warn("AMO SELL placed (lower circuit exit)",
+	b.logger.Warn("AMO LIMIT SELL queued (lower circuit exit)",
 		zap.String("symbol", info.Symbol),
 		zap.Int("qty", qty),
+		zap.Float64("limit", price),
 		zap.String("broker_order_id", orderID))
-
 	return orderID, nil
 }
 

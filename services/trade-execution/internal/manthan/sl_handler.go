@@ -655,11 +655,18 @@ func (h *SLHandler) trailDeferredSL(ctx context.Context, signal SLModifySignal, 
 	return nil
 }
 
-// EmergencySell places a MARKET SELL as safety net when SL fails.
+// EmergencySell executes a software-stop exit (rules-engine SL_EXIT signal).
+// 2026-10-22 hardening — every step below failed or was missing that morning:
+//   - symbol resolution falls back to the filled entry row when the signal
+//     has no ISIN (the payload carried none for weeks → "redis: nil" exits);
+//   - a lot the book already shows sold (broker SL filled first) is skipped;
+//   - never sells more than the order-derived net holding;
+//   - the sell itself is a marketable LIMIT with standing stops cancelled
+//     first, recorded as a PLACED exit row (see emergencySellInternal).
 func (h *SLHandler) EmergencySell(ctx context.Context, signal SLExitSignal) error {
-	info, err := h.broker.ResolveSymbol(ctx, signal.Symbol, signal.ISIN)
+	info, isin, err := h.resolveExitSymbol(ctx, signal)
 	if err != nil {
-		return fmt.Errorf("resolve symbol: %w", err)
+		return err
 	}
 
 	auth, ok := h.resolveAuth(signal.UserID, signal.Symbol, "EmergencySell")
@@ -677,7 +684,80 @@ func (h *SLHandler) EmergencySell(ctx context.Context, signal SLExitSignal) erro
 		return nil
 	}
 
-	return h.emergencySellInternal(ctx, info, auth, int(signal.Quantity), "SL triggered — emergency exit")
+	qty := int(signal.Quantity)
+	ec := exitContext{StrategyID: signal.StrategyID, SignalID: signal.OrderID, ISIN: isin}
+	if h.repo != nil {
+		net, entryID, hasEntry, perr := h.repo.NetHeldQty(ctx, signal.StrategyID, signal.Symbol)
+		switch {
+		case perr != nil:
+			h.logger.Warn("EmergencySell: net-holding lookup failed — selling the signalled qty",
+				zap.String("symbol", signal.Symbol), zap.Error(perr))
+		case hasEntry && net <= 0:
+			h.logger.Warn("EmergencySell: book shows the lot already sold (broker SL filled / manual exit) — nothing to sell",
+				zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol),
+				zap.Int32("signalled_qty", signal.Quantity), zap.Int("net", net))
+			return nil
+		case hasEntry:
+			ec.EntryOrderID = entryID
+			if net < qty {
+				h.logger.Warn("EmergencySell: signalled qty exceeds held qty — capping to the holding",
+					zap.String("symbol", signal.Symbol), zap.Int("signalled", qty), zap.Int("held", net))
+				qty = net
+			}
+		}
+	}
+	if qty <= 0 {
+		return fmt.Errorf("emergency sell %s: non-positive qty %d", signal.Symbol, qty)
+	}
+
+	return h.emergencySellInternal(ctx, ec, info, auth, qty, "SL triggered — emergency exit")
+}
+
+// resolveExitSymbol resolves the broker symbol for an exit. Order: the signal
+// ISIN → the position's filled entry row (stored token / indira symbol, else
+// its ISIN). Also returns the ISIN that worked, for bookkeeping.
+func (h *SLHandler) resolveExitSymbol(ctx context.Context, signal SLExitSignal) (*SymbolInfo, string, error) {
+	var firstErr error
+	if signal.ISIN != "" {
+		info, err := h.broker.ResolveSymbol(ctx, signal.Symbol, signal.ISIN)
+		if err == nil {
+			return info, signal.ISIN, nil
+		}
+		firstErr = err
+		h.logger.Warn("EmergencySell: ISIN resolve failed — falling back to the entry row",
+			zap.String("symbol", signal.Symbol), zap.String("isin", signal.ISIN), zap.Error(err))
+	}
+	if h.repo != nil {
+		entry, err := h.repo.GetActiveEntryBySymbol(ctx, signal.StrategyID, signal.Symbol)
+		switch {
+		case err == nil && entry != nil && entry.ExchangeToken != "":
+			info := &SymbolInfo{
+				Symbol:        signal.Symbol,
+				ExchangeToken: entry.ExchangeToken,
+				IndiraSymbol:  strDefault(entry.IndiraSymbol, fmt.Sprintf("STK_%s_EQ_NSE_%s", signal.Symbol, entry.ExchangeToken)),
+				Exchange:      "NSE",
+				TickSize:      0.05,
+			}
+			h.broker.EnrichMarketInfo(ctx, info)
+			h.logger.Info("EmergencySell: symbol resolved from the entry row",
+				zap.String("symbol", signal.Symbol), zap.String("token", entry.ExchangeToken), zap.String("isin", entry.ISIN))
+			return info, entry.ISIN, nil
+		case err == nil && entry != nil && entry.ISIN != "" && entry.ISIN != signal.ISIN:
+			info, rerr := h.broker.ResolveSymbol(ctx, signal.Symbol, entry.ISIN)
+			if rerr == nil {
+				return info, entry.ISIN, nil
+			}
+			if firstErr == nil {
+				firstErr = rerr
+			}
+		case err != nil && firstErr == nil:
+			firstErr = err
+		}
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no isin on signal and no filled entry row with a token for %s/%s", signal.StrategyID, signal.Symbol)
+	}
+	return nil, "", fmt.Errorf("resolve symbol: %w", firstErr)
 }
 
 func (h *SLHandler) emergencySell(ctx context.Context, signal ManthanSignal, info *SymbolInfo, auth BrokerAuth, qty int, reason string) {
@@ -688,43 +768,124 @@ func (h *SLHandler) emergencySell(ctx context.Context, signal ManthanSignal, inf
 			zap.String("reason", reason))
 		return
 	}
-	_ = h.emergencySellInternal(ctx, info, auth, qty, reason)
+	_ = h.emergencySellInternal(ctx, exitContext{StrategyID: signal.StrategyID, SignalID: signal.OrderID, ISIN: signal.ISIN}, info, auth, qty, reason)
 }
 
-func (h *SLHandler) emergencySellInternal(ctx context.Context, info *SymbolInfo, auth BrokerAuth, qty int, reason string) error {
-	// One emergency sell per symbol per window. A repeat inside the window
-	// means an upstream loop is re-firing on a position that is already being
-	// (or has been) closed — placing it again risks a short. Log and refuse.
+// exitContext carries the position identity an exit needs for bookkeeping.
+type exitContext struct {
+	StrategyID   string
+	SignalID     string // originating signal id (audit only)
+	EntryOrderID int64  // parent manthan_orders.id when known (0 → resolved from the book)
+	ISIN         string
+}
+
+// emergencySellInternal is the one place an immediate exit is executed:
+//  1. per-(user,symbol) latch — one exit per 10-minute window (loop guard);
+//  2. cancel OUR standing stop orders for the position first: a resting SL
+//     locks the quantity at the broker ("Free Qty=0") and the sell would be
+//     rejected — the 2026-10-22 AMO rejections were exactly this;
+//  3. lower circuit → AMO LIMIT at the band floor, else a marketable LIMIT
+//     (Market / SL-M are rejected for algo-tagged orders);
+//  4. record the sell as a PLACED exit row — confirmed FILLED from broker
+//     truth by the safety monitor / reconciler, re-priced if it rests.
+func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, info *SymbolInfo, auth BrokerAuth, qty int, reason string) error {
+	latchKey := auth.UserID + ":" + info.Symbol
 	h.emergencyMu.Lock()
-	if last, ok := h.lastEmergency[info.Symbol]; ok && time.Since(last) < emergencyLatchWindow {
+	if last, ok := h.lastEmergency[latchKey]; ok && time.Since(last) < emergencyLatchWindow {
 		h.emergencyMu.Unlock()
-		h.logger.Error("EMERGENCY SELL SUPPRESSED — already fired for symbol inside latch window; upstream loop must be investigated",
+		h.logger.Error("EMERGENCY SELL SUPPRESSED — already fired for user/symbol inside latch window; upstream loop must be investigated",
+			zap.String("user_id", auth.UserID),
 			zap.String("symbol", info.Symbol),
 			zap.Int("qty", qty),
 			zap.String("reason", reason),
 			zap.Time("last_fired", last))
 		return fmt.Errorf("emergency sell for %s suppressed: already fired at %s", info.Symbol, last.Format(time.RFC3339))
 	}
-	h.lastEmergency[info.Symbol] = time.Now()
+	h.lastEmergency[latchKey] = time.Now()
 	h.emergencyMu.Unlock()
+	// A definite broker rejection means nothing rests at the exchange, so the
+	// next retry must not be blocked for 10 minutes. Ambiguous failures
+	// (timeouts) keep the latch — the order may have gone through.
+	releaseLatchIfRejected := func(err error) {
+		var rej *BrokerRejection
+		if errors.As(err, &rej) || IsAuthError(err) {
+			h.emergencyMu.Lock()
+			delete(h.lastEmergency, latchKey)
+			h.emergencyMu.Unlock()
+		}
+	}
 
-	// Check if lower circuit — use AMO if so
+	// Step 2 — free the quantity: cancel our resting stops for this position.
+	if ec.StrategyID != "" && h.repo != nil {
+		standing, err := h.repo.ListStandingSLs(ctx, ec.StrategyID, info.Symbol)
+		if err != nil {
+			h.logger.Warn("EmergencySell: standing-SL lookup failed — selling anyway (broker rejects if the qty is locked)",
+				zap.String("symbol", info.Symbol), zap.Error(err))
+		}
+		for _, sl := range standing {
+			if sl.BrokerOrderID != "" {
+				if cerr := h.broker.CancelOrder(ctx, auth, info, sl.BrokerOrderID); cerr != nil && !IsOrderNotFoundError(cerr) {
+					h.logger.Warn("EmergencySell: standing SL cancel failed — selling anyway",
+						zap.String("symbol", info.Symbol), zap.String("broker_order_id", sl.BrokerOrderID), zap.Error(cerr))
+					continue
+				}
+			}
+			_ = h.repo.UpdateOrderCancelled(ctx, sl.ID)
+			_ = h.repo.InsertEvent(ctx, sl.ID, "SL_CANCELLED_FOR_EXIT", "SL_PLACED", "CANCELLED",
+				"", 0, sl.Qty, "stop removed ahead of the exit sell: "+reason)
+			h.logger.Info("EmergencySell: standing stop cancelled ahead of exit",
+				zap.String("symbol", info.Symbol), zap.String("broker_order_id", sl.BrokerOrderID), zap.Int("qty", sl.Qty))
+		}
+	}
+
+	// Step 3a — lower circuit: nothing trades today; queue an AMO LIMIT at the floor.
 	_, atLower, _ := h.broker.CheckCircuit(ctx, info.ExchangeToken)
 	if atLower {
-		h.logger.Warn("Lower circuit — placing AMO SELL",
-			zap.String("symbol", info.Symbol))
-		_, err := h.broker.PlaceAMOSell(ctx, auth, info, qty)
-		return err
+		h.logger.Warn("Lower circuit — queueing AMO LIMIT SELL for the next session",
+			zap.String("symbol", info.Symbol), zap.Int("qty", qty))
+		brokerID, err := h.broker.PlaceAMOSell(ctx, auth, info, qty)
+		if err != nil {
+			releaseLatchIfRejected(err)
+			h.logger.Error("EMERGENCY AMO SELL FAILED",
+				zap.String("symbol", info.Symbol), zap.Error(err))
+			return err
+		}
+		h.recordExitSell(ctx, ec, info, auth.UserID, OrderTypeAMOSell, qty, info.DPRLower, brokerID, reason)
+		return nil
 	}
 
-	// Normal MARKET SELL
-	_, err := h.broker.PlaceMarketSell(ctx, auth, info, qty)
+	// Step 3b — marketable LIMIT: fills now, bounded slippage, algo-compliant.
+	brokerID, limit, err := h.broker.PlaceMarketableLimitSell(ctx, auth, info, qty)
 	if err != nil {
-		h.logger.Error("EMERGENCY MARKET SELL FAILED",
+		releaseLatchIfRejected(err)
+		h.logger.Error("EMERGENCY LIMIT SELL FAILED",
 			zap.String("symbol", info.Symbol),
+			zap.Int("qty", qty),
 			zap.Error(err))
+		return err
 	}
-	return err
+	h.recordExitSell(ctx, ec, info, auth.UserID, OrderTypeMarketSell, qty, limit, brokerID, reason)
+	return nil
+}
+
+// recordExitSell books the exit as a PLACED row (see exit_repo.go).
+func (h *SLHandler) recordExitSell(ctx context.Context, ec exitContext, info *SymbolInfo, userID string, ot OrderType, qty int, limit float64, brokerID, reason string) {
+	if h.repo == nil {
+		return
+	}
+	if _, err := h.repo.InsertExitSellPlaced(ctx, ExitSellRow{
+		StrategyID: ec.StrategyID, UserID: userID, Symbol: info.Symbol, ISIN: ec.ISIN,
+		Info: info, OrderType: ot, Qty: qty, LimitPrice: limit, BrokerOrderID: brokerID,
+		ParentOrderID: ec.EntryOrderID, Reason: reason,
+	}); err != nil {
+		h.logger.Error("exit sell placed at broker but NOT recorded — reconciler cannot track it",
+			zap.String("symbol", info.Symbol), zap.String("broker_order_id", brokerID), zap.Error(err))
+		return
+	}
+	h.logger.Warn("EXIT SELL placed — awaiting fill confirmation",
+		zap.String("user_id", userID), zap.String("symbol", info.Symbol),
+		zap.String("type", string(ot)), zap.Int("qty", qty), zap.Float64("limit", limit),
+		zap.String("broker_order_id", brokerID), zap.String("reason", reason))
 }
 
 func (h *SLHandler) preCheck(ctx context.Context, signal SLModifySignal, info *SymbolInfo) PreCheckResult {

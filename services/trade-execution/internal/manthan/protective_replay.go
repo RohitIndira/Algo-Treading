@@ -215,9 +215,27 @@ func (p *ProtectiveReplay) Start(ctx context.Context) {
 	now := p.now()
 	if indiraClient.IsTradingDay(now) {
 		minute := now.Hour()*60 + now.Minute()
-		if minute >= 9*60+14 && minute < 10*60 {
+		switch {
+		case minute >= 9*60+14 && minute < 10*60:
 			p.logger.Info("Startup-recovery: running missed pre-open cycle")
 			go p.runOnce(ctx)
+		case minute >= 10*60 && minute < 15*60+20:
+			// 2026-10-22: a deploy/restart mid-session used to leave every
+			// unprotected or already-breached position waiting for the next
+			// scheduled pass (11:00, or tomorrow). Run one idempotent cycle
+			// shortly after boot. The delay lets the inbox worker's requeued
+			// exit signals place first, so the planner sees them in flight
+			// and does not place a second sell for the same quantity.
+			p.logger.Info("Startup-recovery: market open — scheduling an intraday protective cycle",
+				zap.Duration("delay", startupCycleDelay))
+			go func() {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(startupCycleDelay):
+					p.runOnce(ctx)
+				}
+			}()
 		}
 	}
 	go p.scheduleDaily(ctx, 9, 14, p.runOnce)
@@ -319,12 +337,16 @@ type FirePlan struct {
 type FireAction string
 
 const (
-	FireSkip            FireAction = "SKIP"        // skip + alert (freeQty=0, no auth, etc.)
+	FireSkip            FireAction = "SKIP"        // skip + alert (freeQty=0, no auth, exit already in flight, etc.)
 	FireSLLimit         FireAction = "SL_LIMIT"    // place SL-L at SafeTrigger (LTP > trigger)
-	FireSLMarket        FireAction = "SL_MARKET"   // place SL-M (gap-down already breached)
-	FireMarketSell      FireAction = "MARKET_SELL" // straight market sell (deep gap, exit now)
-	FireAMOLowerCircuit FireAction = "AMO_LC"      // lower-circuit at open, AMO is only path out
+	FireSLMarket        FireAction = "SL_MARKET"   // stop already breached → exit NOW with a marketable LIMIT (SL-M is rejected for algo orders)
+	FireMarketSell      FireAction = "MARKET_SELL" // exit now with a marketable LIMIT (Market is rejected for algo orders)
+	FireAMOLowerCircuit FireAction = "AMO_LC"      // lower-circuit at open; AMO LIMIT at the band floor is the only path out
 )
+
+// startupCycleDelay — wait before the boot-time intraday protective cycle so
+// the inbox worker's requeued exit signals place first (see Start).
+const startupCycleDelay = 90 * time.Second
 
 func (p *ProtectiveReplay) runOnce(ctx context.Context) {
 	cycleCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
@@ -544,6 +566,20 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 				zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol),
 				zap.Float64("intended", intended), zap.Float64("floor", resolved))
 			intended = resolved
+		}
+
+		// An exit sell already placed this session (software stop via the
+		// inbox worker, or an earlier pass) owns this quantity at the broker;
+		// a second sell would only be rejected "Free Qty=0".
+		if open, err := p.repo.HasOpenExitSellToday(ctx, pos.StrategyID, pos.Symbol, p.todayTradeDateIST()); err == nil && open {
+			plans = append(plans, FirePlan{
+				Pos:        pos,
+				Auth:       *auth,
+				Info:       info,
+				Action:     FireSkip,
+				SkipReason: "exit sell already in flight for this session",
+			})
+			continue
 		}
 
 		// Tick-align via broker_adapter's clamp (intended is within band here).
@@ -790,17 +826,20 @@ func (p *ProtectiveReplay) fireOne(ctx context.Context, plan FirePlan) FireResul
 	res.OrderRowID = rowID
 
 	var brokerID string
+	exitLimit := plan.SafeLimit
 	switch plan.Action {
 	case FireSLLimit:
 		// broker-real trigger/limit are reconciled into broker_trigger_price by the
 		// Reconciler's periodic sync; the AMO row keeps the intended SafeTrigger.
 		brokerID, _, _, err = p.broker.PlaceSLSell(ctx, plan.Auth, plan.Info, plan.IntendedQty, plan.SafeTrigger, plan.SafeLimit)
-	case FireSLMarket:
-		brokerID, err = p.broker.PlaceSLMSell(ctx, plan.Auth, plan.Info, plan.IntendedQty, plan.SafeTrigger)
-	case FireMarketSell:
-		brokerID, err = p.broker.PlaceMarketSell(ctx, plan.Auth, plan.Info, plan.IntendedQty)
+	case FireSLMarket, FireMarketSell:
+		// Stop already breached (LTP ≤ trigger): exit NOW with a marketable
+		// LIMIT. SL-M / Market are rejected for algo-tagged orders
+		// (2026-10-22), and a fresh stop above the LTP would never arm.
+		brokerID, exitLimit, err = p.broker.PlaceMarketableLimitSell(ctx, plan.Auth, plan.Info, plan.IntendedQty)
 	case FireAMOLowerCircuit:
 		brokerID, err = p.broker.PlaceAMOSell(ctx, plan.Auth, plan.Info, plan.IntendedQty)
+		exitLimit = plan.Info.DPRLower
 	default:
 		err = fmt.Errorf("unknown fire action: %s", plan.Action)
 	}
@@ -817,14 +856,17 @@ func (p *ProtectiveReplay) fireOne(ctx context.Context, plan FirePlan) FireResul
 	}
 
 	res.BrokerOrderID = brokerID
-	if plan.Action == FireSLLimit || plan.Action == FireSLMarket {
+	if plan.Action == FireSLLimit {
 		_ = p.repo.UpdateSLBrokerID(ctx, rowID, brokerID, plan.Pos.EntryOrderID)
 	} else {
+		// Immediate exits (marketable LIMIT / AMO LIMIT) rest as PLACED until
+		// the safety monitor or reconciler confirms the fill from broker truth.
 		_ = p.repo.UpdateOrderPlaced(ctx, rowID, brokerID)
+		_ = p.repo.UpdateOrderLimitAndParent(ctx, rowID, exitLimit, plan.Pos.EntryOrderID)
 	}
 	_ = p.repo.InsertEvent(ctx, rowID, "PROTECTIVE_FIRED", "PENDING", string(StatusSLPlaced),
 		"", plan.SafeTrigger, plan.IntendedQty,
-		fmt.Sprintf("action=%s broker_id=%s ltp=%.2f", plan.Action, brokerID, plan.LTP))
+		fmt.Sprintf("action=%s broker_id=%s ltp=%.2f limit=%.2f", plan.Action, brokerID, plan.LTP, exitLimit))
 	p.logger.Info("fireOne: placed",
 		zap.String("symbol", plan.Pos.Symbol),
 		zap.String("action", string(plan.Action)),
@@ -837,7 +879,9 @@ func (p *ProtectiveReplay) fireOne(ctx context.Context, plan FirePlan) FireResul
 
 func (p *ProtectiveReplay) insertProtectionRow(ctx context.Context, plan FirePlan) (int64, error) {
 	orderType := OrderTypeSLSell
-	if plan.Action == FireMarketSell {
+	if plan.Action == FireMarketSell || plan.Action == FireSLMarket {
+		// Both are immediate exits now (marketable LIMIT) — book them as the
+		// exit sell they are, so net-qty / in-flight checks see them.
 		orderType = OrderTypeMarketSell
 	} else if plan.Action == FireAMOLowerCircuit {
 		orderType = OrderTypeAMOSell
@@ -983,16 +1027,17 @@ func (p *ProtectiveReplay) handlePostOpenReject(ctx context.Context, auth Broker
 		string(StatusSLPlaced), string(StatusRejected),
 		"", r.Plan.SafeTrigger, r.Plan.IntendedQty, granular)
 
-	// Last-ditch fallback: SL-M at the same trigger (no limit; converts to
-	// market at next tick after trigger). Skip if original was already SL-M
-	// or a market order — would just re-fail.
+	// Last-ditch fallback: re-place the stop at the same trigger with the WIDE
+	// limit leg (PlaceSLMSell is SL-L with the 2% leg since 2026-10-22 — the
+	// broker rejects SL-M for algo orders). Skip if the original was already an
+	// immediate exit — it would just re-fail.
 	if r.Plan.Action != FireSLLimit {
 		return
 	}
-	p.logger.Warn("Hot-placing SL-M fallback after reject",
+	p.logger.Warn("Hot-placing wide-leg SL-L fallback after reject",
 		zap.String("symbol", r.Plan.Pos.Symbol), zap.String("granular_reason", granular))
 	if _, err := p.broker.PlaceSLMSell(ctx, auth, r.Plan.Info, r.Plan.IntendedQty, r.Plan.SafeTrigger); err != nil {
-		p.logger.Error("Fallback SL-M also failed — SafetyMonitor will retry",
+		p.logger.Error("Fallback SL-L also failed — SafetyMonitor will retry",
 			zap.String("symbol", r.Plan.Pos.Symbol), zap.Error(err))
 	}
 }

@@ -43,21 +43,32 @@ func TestOrderNotFoundIsNotAuthError(t *testing.T) {
 func TestEmergencySellLatchRefusesRepeat(t *testing.T) {
 	h := &SLHandler{lastEmergency: make(map[string]time.Time), logger: zap.NewNop()}
 
-	// Simulate the first emergency sell having just fired.
+	// Simulate the first emergency sell for S4450/IOLCP having just fired.
+	// The latch is keyed by user AND symbol (2026-10-22): two clients holding
+	// the same stock must each get their own exit.
 	h.emergencyMu.Lock()
-	h.lastEmergency["IOLCP"] = time.Now()
+	h.lastEmergency["S4450:IOLCP"] = time.Now()
 	h.emergencyMu.Unlock()
 
 	// A second fire inside the window must be refused before any broker call:
 	// emergencySellInternal's latch check runs first, so with a nil broker a
 	// suppressed call returns an error instead of panicking on the adapter.
-	err := h.emergencySellInternal(nil, &SymbolInfo{Symbol: "IOLCP"}, BrokerAuth{}, 121, "SL modify failed after retry")
+	err := h.emergencySellInternal(nil, exitContext{}, &SymbolInfo{Symbol: "IOLCP"}, BrokerAuth{UserID: "S4450"}, 121, "SL modify failed after retry")
 	if err == nil {
 		t.Fatal("second emergency sell inside the latch window must be suppressed")
 	}
 
-	// A different symbol is unaffected by IOLCP's latch — it proceeds past
-	// the latch (and only then fails on the nil broker in this test setup).
-	defer func() { _ = recover() }() // nil-broker panic beyond the latch is fine here
-	_ = h.emergencySellInternal(nil, &SymbolInfo{Symbol: "OTHER"}, BrokerAuth{}, 1, "test")
+	// Another client's IOLCP, and S4450's other symbol, are unaffected by
+	// that latch — they proceed past it (and only then fail on the nil broker
+	// in this test setup).
+	for _, c := range []struct{ user, symbol string }{{"ISPL19694", "IOLCP"}, {"S4450", "OTHER"}} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("%s/%s: expected to pass the latch and reach the (nil) broker", c.user, c.symbol)
+				}
+			}()
+			_ = h.emergencySellInternal(nil, exitContext{}, &SymbolInfo{Symbol: c.symbol}, BrokerAuth{UserID: c.user}, 1, "test")
+		}()
+	}
 }

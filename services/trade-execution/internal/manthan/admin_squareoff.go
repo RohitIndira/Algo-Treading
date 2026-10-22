@@ -159,7 +159,7 @@ func (h *SLHandler) AdminSquareOff(ctx context.Context, userID, strategyID, symb
 
 		// 2) Sell the net holding — same latch + lower-circuit logic as the
 		// validated emergency path.
-		brokerID, mode, serr := h.placeSquareOffSell(ctx, info, auth, pos.NetQty)
+		brokerID, mode, limit, serr := h.placeSquareOffSell(ctx, info, auth, pos.NetQty)
 		if serr != nil {
 			return fmt.Errorf("square-off sell failed (stops already cancelled — position is UNPROTECTED, re-arm or retry NOW): %w", serr)
 		}
@@ -169,10 +169,20 @@ func (h *SLHandler) AdminSquareOff(ctx context.Context, userID, strategyID, symb
 		// true fill price reconciles later via WSS/tradebook. AMO mode gets
 		// its row when the conversion confirms — inserting FILLED now would
 		// lie overnight.
-		if mode == "MARKET" {
-			slLike := &ManthanOrder{StrategyID: strategyID, UserID: userID, Symbol: symbol,
-				ISIN: pos.ISIN, IndiraSymbol: info.IndiraSymbol, ExchangeToken: info.ExchangeToken}
-			_ = h.repo.InsertEmergencySellFilled(ctx, slLike, brokerID, pos.NetQty)
+		// 2026-10-22: the sell is a LIMIT (Market is rejected for algo orders)
+		// and may rest, so it is booked as PLACED and confirmed FILLED from
+		// broker truth by the safety monitor / reconciler — never assumed.
+		ot := OrderTypeMarketSell
+		if mode != "LIMIT" {
+			ot = OrderTypeAMOSell
+		}
+		if _, ierr := h.repo.InsertExitSellPlaced(ctx, ExitSellRow{
+			StrategyID: strategyID, UserID: userID, Symbol: symbol, ISIN: pos.ISIN,
+			Info: info, OrderType: ot, Qty: pos.NetQty, LimitPrice: limit, BrokerOrderID: brokerID,
+			ParentOrderID: pos.EntryOrderID, Reason: "admin square-off",
+		}); ierr != nil {
+			h.logger.Error("admin square-off: sell placed but NOT recorded",
+				zap.String("symbol", symbol), zap.String("broker_order_id", brokerID), zap.Error(ierr))
 		}
 		_ = h.repo.InsertEvent(ctx, pos.EntryOrderID, "ADMIN_SQUAREOFF", "FILLED", "EXIT_PENDING",
 			"", 0, pos.NetQty, fmt.Sprintf("admin square-off: %s sell %s placed (%d stops cancelled first)", mode, brokerID, len(report.CancelledSLs)))
@@ -189,20 +199,24 @@ func (h *SLHandler) AdminSquareOff(ctx context.Context, userID, strategyID, symb
 // placeSquareOffSell mirrors emergencySellInternal but reports the broker
 // id + mode back to the operator (the internal path deliberately discards
 // them; an audited admin action must not).
-func (h *SLHandler) placeSquareOffSell(ctx context.Context, info *SymbolInfo, auth BrokerAuth, qty int) (string, string, error) {
+//
+// Returns (broker id, mode, limit sent, error). mode is "LIMIT" (marketable
+// LIMIT, DAY) or "AMO_LOWER_CIRCUIT" (AMO LIMIT at the band floor).
+func (h *SLHandler) placeSquareOffSell(ctx context.Context, info *SymbolInfo, auth BrokerAuth, qty int) (string, string, float64, error) {
+	latchKey := auth.UserID + ":" + info.Symbol
 	h.emergencyMu.Lock()
-	if last, ok := h.lastEmergency[info.Symbol]; ok && time.Since(last) < emergencyLatchWindow {
+	if last, ok := h.lastEmergency[latchKey]; ok && time.Since(last) < emergencyLatchWindow {
 		h.emergencyMu.Unlock()
-		return "", "", fmt.Errorf("sell for %s suppressed by emergency latch: already fired at %s — the position is likely already closing", info.Symbol, last.Format(time.RFC3339))
+		return "", "", 0, fmt.Errorf("sell for %s suppressed by emergency latch: already fired at %s — the position is likely already closing", info.Symbol, last.Format(time.RFC3339))
 	}
-	h.lastEmergency[info.Symbol] = time.Now()
+	h.lastEmergency[latchKey] = time.Now()
 	h.emergencyMu.Unlock()
 
 	_, atLower, _ := h.broker.CheckCircuit(ctx, info.ExchangeToken)
 	if atLower {
 		id, err := h.broker.PlaceAMOSell(ctx, auth, info, qty)
-		return id, "AMO_LOWER_CIRCUIT", err
+		return id, "AMO_LOWER_CIRCUIT", info.DPRLower, err
 	}
-	id, err := h.broker.PlaceMarketSell(ctx, auth, info, qty)
-	return id, "MARKET", err
+	id, limit, err := h.broker.PlaceMarketableLimitSell(ctx, auth, info, qty)
+	return id, "LIMIT", limit, err
 }

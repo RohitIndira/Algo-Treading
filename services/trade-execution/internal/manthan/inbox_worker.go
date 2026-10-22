@@ -137,6 +137,22 @@ func (w *InboxWorker) Start(ctx context.Context) {
 			zap.Int64("count", n))
 	}
 
+	// 2026-10-22: exit signals that failed earlier TODAY (ISIN resolve, dead
+	// Market/SL-M fallbacks) fire again the moment a fixed binary boots —
+	// not at the tail of a 5-minute backoff, and never left in DLQ. A
+	// stopped-out position must leave the book on the first retry after a
+	// deploy. Same-day only; EmergencySell itself skips lots already sold.
+	{
+		now := time.Now().In(istLocation())
+		todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, istLocation())
+		if n, err := w.repo.RequeueTodaysFailedExitSignals(ctx, todayStart); err != nil {
+			w.logger.Warn("Inbox boot requeue of today's failed exits failed", zap.Error(err))
+		} else if n > 0 {
+			w.logger.Warn("Inbox boot requeue: today's failed/DLQ exit signals set to retry now",
+				zap.Int64("count", n))
+		}
+	}
+
 	// Same-day expiry: entry signals never survive their trading date —
 	// yesterday's signal must not place today (prices, allocation and
 	// eligibility were computed for yesterday's session). Swept at startup
@@ -375,7 +391,12 @@ func (w *InboxWorker) dispatch(ctx context.Context, row *InboxRow) error {
 		if err := json.Unmarshal(row.Payload, &sig); err != nil {
 			return poisonErr("unmarshal MANTHAN_SL_EXIT: %v", err)
 		}
-		return w.sl.EmergencySell(ctx, sig)
+		// Same per-position lock as SL_MODIFY: the exit cancels the standing
+		// stop and sells; a concurrent trail-modify on the same position must
+		// not touch that stop mid-flight (or re-place it after the cancel).
+		return w.repo.WithPositionLock(ctx, sig.StrategyID, sig.Symbol, func(ctx context.Context) error {
+			return w.sl.EmergencySell(ctx, sig)
+		})
 	default:
 		// Unknown order types are inbox poison — they were filtered to
 		// MANTHAN_* by the consumer, so reaching here means a code path
