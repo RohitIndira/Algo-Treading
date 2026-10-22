@@ -110,12 +110,12 @@ func (r *Repository) NetHeldQty(ctx context.Context, strategyID, symbol string) 
 	return net, entry.Int64, entry.Valid, nil
 }
 
-// HasOpenExitSellToday reports whether an exit sell (immediate LIMIT or AMO
-// LIMIT) placed for this session is still open for the position — its
-// quantity is locked at the broker, so a second sell would only be rejected
-// "Free Qty=0". The window starts at the previous session's close so an AMO
-// exit queued last evening counts.
-func (r *Repository) HasOpenExitSellToday(ctx context.Context, strategyID, symbol string, tradeDate time.Time) (bool, error) {
+// HasOpenExitSell reports whether an exit sell of ours (immediate LIMIT or
+// AMO LIMIT) is still open for the position, whatever its age — a PLACED exit
+// row means the quantity is locked at the broker, so a second sell or a stop
+// on top would only be rejected "Free Qty=0". Stale rows are closed out by
+// SafetyMonitor.checkPendingExits (fill, loss, conversion), not by time.
+func (r *Repository) HasOpenExitSell(ctx context.Context, strategyID, symbol string) (bool, error) {
 	var exists bool
 	err := r.db.QueryRowContext(ctx, `
 		SELECT EXISTS (
@@ -124,8 +124,8 @@ func (r *Repository) HasOpenExitSellToday(ctx context.Context, strategyID, symbo
 		       AND order_side = 'SELL'
 		       AND order_type IN ('MARKET_SELL','AMO_SELL')
 		       AND status IN ('PENDING','PLACED')
-		       AND created_at >= $3
-		)`, strategyID, symbol, armedWindowStart(tradeDate)).Scan(&exists)
+		       AND COALESCE(broker_order_id,'') <> ''
+		)`, strategyID, symbol).Scan(&exists)
 	return exists, err
 }
 

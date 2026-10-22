@@ -196,6 +196,17 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 			continue
 		}
 
+		// An exit sell of ours is resting at the broker (today's LIMIT, or an
+		// AMO LIMIT for the next session — MODISONLTD at lower circuit,
+		// 2026-10-22): the quantity is locked, so an AMO stop on top would only
+		// be rejected "Free Qty=0" every night. The exit IS the protection.
+		if open, oerr := p.repo.HasOpenExitSell(cycleCtx, pos.StrategyID, pos.Symbol); oerr == nil && open {
+			p.logger.Info("EOD Phase A: exit sell already in flight — not arming a stop on top",
+				zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol))
+			alreadyArmed++
+			continue
+		}
+
 		// Give-up cap: if tonight's window has already burned several AMO
 		// attempts for this position, the broker is rejecting this order
 		// deterministically (ghost position with no holdings, corporate-action

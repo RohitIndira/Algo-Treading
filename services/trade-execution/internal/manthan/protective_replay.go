@@ -571,7 +571,7 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 		// An exit sell already placed this session (software stop via the
 		// inbox worker, or an earlier pass) owns this quantity at the broker;
 		// a second sell would only be rejected "Free Qty=0".
-		if open, err := p.repo.HasOpenExitSellToday(ctx, pos.StrategyID, pos.Symbol, p.todayTradeDateIST()); err == nil && open {
+		if open, err := p.repo.HasOpenExitSell(ctx, pos.StrategyID, pos.Symbol); err == nil && open {
 			plans = append(plans, FirePlan{
 				Pos:        pos,
 				Auth:       *auth,
