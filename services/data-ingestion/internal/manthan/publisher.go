@@ -49,7 +49,8 @@ type Publisher struct {
 	db           *sql.DB
 	kafkaWriter  *kafka.Writer
 	kafkaEnabled bool
-	resolver     CompanyResolver // optional — when nil, pre-flight gate is skipped
+	resolver     CompanyResolver   // optional — when nil, pre-flight gate is skipped
+	instruments  InstrumentChecker // optional — live price-feed gate (ISIN → token → live row)
 	logger       *zap.Logger
 }
 
@@ -62,13 +63,21 @@ type PublisherConfig struct {
 	// data-ingestion RedisManager (which falls back to MongoDB on miss
 	// and populates Redis as a side effect).
 	Resolver CompanyResolver
+	// Instruments enables the live price-feed gate (2026-10-22): an eligible
+	// row whose ISIN the feed does not know, whose symbol the feed maps to a
+	// different ISIN, or whose token has no live price row is downgraded to
+	// FILTER_REJECTED with the reason, before it can become a signal.
+	Instruments InstrumentChecker
 }
 
 // NewPublisher creates a new publisher. DB is mandatory; Kafka is optional.
 func NewPublisher(cfg PublisherConfig, logger *zap.Logger) *Publisher {
-	p := &Publisher{db: cfg.DB, logger: logger, resolver: cfg.Resolver}
+	p := &Publisher{db: cfg.DB, logger: logger, resolver: cfg.Resolver, instruments: cfg.Instruments}
 	if cfg.Resolver != nil {
 		logger.Info("Manthan publisher pre-flight gate ENABLED — ELIGIBLE signals will be filtered against CompanyMaster before Kafka publish")
+	}
+	if cfg.Instruments != nil {
+		logger.Info("Manthan publisher instrument gate ENABLED — ELIGIBLE signals must resolve ISIN → token → live price row in the price feed")
 	}
 	if len(cfg.KafkaBrokers) > 0 && cfg.KafkaBrokers[0] != "" {
 		topic := cfg.KafkaTopic
@@ -152,6 +161,40 @@ func (p *Publisher) Publish(ctx context.Context, result *PipelineResult) (*Publi
 			p.logger.Info("Pre-flight gate: dropped unresolvable signals",
 				zap.Int("dropped", stats.PreflightDropped),
 				zap.Int("remaining_eligible", len(result.Eligible)))
+		}
+	}
+
+	// Instrument gate (2026-10-22): the live price feed is the source every
+	// later step trades through. An eligible row the feed cannot resolve, or
+	// resolves to a different company, never becomes a signal. A feed outage
+	// (Transient) does not gate — trade-execution re-checks freshness.
+	if p.instruments != nil && len(result.Eligible) > 0 {
+		stillEligible := result.Eligible[:0]
+		transientWarned := false
+		for _, s := range result.Eligible {
+			v := p.instruments.Check(ctx, s.Symbol, s.ISIN)
+			switch {
+			case v.OK:
+				stillEligible = append(stillEligible, s)
+			case v.Transient:
+				if !transientWarned {
+					p.logger.Error("Instrument gate: price feed unreachable — NOT gating this run (operator: check the feed)",
+						zap.String("reason", v.Reason))
+					transientWarned = true
+				}
+				stillEligible = append(stillEligible, s)
+			default:
+				p.logger.Warn("Instrument gate: eligible row is NOT tradeable through the price feed — downgraded",
+					zap.String("symbol", s.Symbol), zap.String("isin", s.ISIN), zap.String("reason", v.Reason))
+				s.FilterReason = "instrument: " + v.Reason
+				result.FilteredOut = append(result.FilteredOut, s)
+				stats.InstrumentDropped++
+			}
+		}
+		result.Eligible = stillEligible
+		if stats.InstrumentDropped > 0 {
+			p.logger.Warn("Instrument gate: dropped rows the price feed cannot trade",
+				zap.Int("dropped", stats.InstrumentDropped), zap.Int("remaining_eligible", len(result.Eligible)))
 		}
 	}
 
@@ -337,6 +380,10 @@ type PublishStats struct {
 	// resolvable in Redis at trade-execution time). Always 0 when the
 	// publisher was constructed without a Resolver.
 	PreflightDropped int
+	// InstrumentDropped counts ELIGIBLE stocks downgraded by the live
+	// price-feed gate (ISIN unknown to the feed, symbol/ISIN mismatch, dead
+	// or missing price row). Always 0 without an InstrumentChecker.
+	InstrumentDropped int
 }
 
 func upsertStock(ctx context.Context, tx *sql.Tx, runDate time.Time, s *ManthanStock, status, reason string) error {

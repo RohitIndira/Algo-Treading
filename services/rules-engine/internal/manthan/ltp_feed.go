@@ -3,6 +3,8 @@ package manthan
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,7 +40,7 @@ type LTPFeed struct {
 	// mutex guards both reads and writes — a plain map here would
 	// eventually trip Go's concurrent-map panic.
 	tokenMu    sync.RWMutex
-	tokenCache map[string]string
+	tokenCache map[string]tokenEntry
 
 	// lastRedisErrLog is the unix-nano timestamp of the last rate-limited
 	// log for "external Redis Get failed". Loaded/stored atomically; only
@@ -97,7 +99,7 @@ func NewLTPFeed(
 		portfolioMgr: portfolioMgr,
 		pollInterval: interval,
 		logger:       logger,
-		tokenCache:   make(map[string]string),
+		tokenCache:   make(map[string]tokenEntry),
 	}, nil
 }
 
@@ -225,15 +227,22 @@ func (f *LTPFeed) resolveToken(ctx context.Context, isin string) (string, bool) 
 	// Cache check under a read lock — vast majority of calls take this
 	// path during a normal trading day.
 	f.tokenMu.RLock()
-	if token, ok := f.tokenCache[isin]; ok {
+	if e, ok := f.tokenCache[isin]; ok && time.Since(e.at) < tokenCacheTTL {
 		f.tokenMu.RUnlock()
-		return token, true
+		return e.token, true
 	}
 	f.tokenMu.RUnlock()
 
 	raw, err := f.extRedis.Get(ctx, "isin:"+isin).Result()
 	if err != nil {
 		f.warnRedisErr("isin Get failed", "isin:"+isin, "", err)
+		// Redis down: fall back to the last known token rather than go blind.
+		f.tokenMu.RLock()
+		e, ok := f.tokenCache[isin]
+		f.tokenMu.RUnlock()
+		if ok {
+			return e.token, true
+		}
 		return "", false
 	}
 
@@ -245,9 +254,51 @@ func (f *LTPFeed) resolveToken(ctx context.Context, isin string) (string, bool) 
 	}
 
 	f.tokenMu.Lock()
-	f.tokenCache[isin] = data.NSECode
+	if prev, ok := f.tokenCache[isin]; ok && prev.token != data.NSECode {
+		f.logger.Warn("exchange token changed for ISIN — switching to the live mapping",
+			zap.String("isin", isin), zap.String("old_token", prev.token), zap.String("new_token", data.NSECode))
+	}
+	f.tokenCache[isin] = tokenEntry{token: data.NSECode, at: time.Now()}
 	f.tokenMu.Unlock()
 	return data.NSECode, true
+}
+
+// tokenEntry is a cached ISIN → token mapping with its resolution time.
+type tokenEntry struct {
+	token string
+	at    time.Time
+}
+
+// tokenCacheTTL bounds how long a cached ISIN → token mapping is trusted. The
+// exchange does reassign tokens (BODALCHEM 25017→25021 on 2026-10-22 went
+// unnoticed for weeks because this cache had no expiry): re-resolving every
+// ten minutes costs one Redis GET per held stock and makes a move visible
+// within the session.
+const tokenCacheTTL = 10 * time.Minute
+
+// InstrumentKnown reports whether the price feed knows this ISIN (its isin:
+// key exists with an NSE token). known=false with err=nil is definitive
+// ("the feed has never heard of it"); err != nil means the feed could not be
+// asked. Used by the signal consumer to refuse allocating a stock that no
+// later step could price or trade.
+func (f *LTPFeed) InstrumentKnown(ctx context.Context, isin string) (known bool, err error) {
+	if strings.TrimSpace(isin) == "" {
+		return false, nil
+	}
+	raw, err := f.extRedis.Get(ctx, "isin:"+isin).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return false, nil
+		}
+		return false, err
+	}
+	var data struct {
+		NSECode string `json:"nsecode"`
+	}
+	if json.Unmarshal([]byte(raw), &data) != nil || strings.TrimSpace(data.NSECode) == "" {
+		return false, nil
+	}
+	return true, nil
 }
 
 // warnRedisErr emits a Warn for an external-Redis failure, but only once

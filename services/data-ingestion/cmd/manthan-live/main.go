@@ -157,11 +157,21 @@ func runPipelineOnce(logger *zap.Logger) error {
 		}
 	}
 
+	// Live price-feed gate (2026-10-22): the same external Redis every later
+	// step trades through. Without EXT_REDIS_ADDR the gate is off and says so.
+	var instruments manthan.InstrumentChecker
+	if extAddr := strings.TrimSpace(os.Getenv("EXT_REDIS_ADDR")); extAddr != "" {
+		instruments = manthan.NewRedisInstrumentChecker(extAddr, os.Getenv("EXT_REDIS_PASSWORD"), logger)
+	} else {
+		logger.Error("EXT_REDIS_ADDR not set — instrument gate DISABLED; signals will not be checked against the live price feed")
+	}
+
 	pub := manthan.NewPublisher(manthan.PublisherConfig{
 		DB:           db,
 		KafkaBrokers: brokers,
 		KafkaTopic:   "manthan.signals",
 		Resolver:     resolver,
+		Instruments:  instruments,
 	}, logger)
 	defer pub.Close()
 

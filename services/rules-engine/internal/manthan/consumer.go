@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -617,6 +618,24 @@ func (c *Consumer) processSignal(ctx context.Context, signal types.ManthanSignal
 	strategies := c.strategyFn()
 	if len(strategies) == 0 {
 		return
+	}
+
+	// Instrument gate (2026-10-22): a signal whose ISIN the live price feed
+	// does not know can never be priced, bought, stopped or exited by the
+	// steps that follow — refuse it here instead of letting an entry fail
+	// 50 times at the broker. A feed outage (err) is not a verdict: the old
+	// behaviour (sheet price, trade-execution re-checks freshness) stands.
+	if strings.TrimSpace(signal.ISIN) == "" {
+		c.logger.Error("Signal REFUSED — no ISIN on the signal (sheet row / ingestion gate must supply it)",
+			zap.String("symbol", signal.Symbol))
+		return
+	}
+	if feed := c.ltpFeed.Load(); feed != nil {
+		if known, kerr := feed.InstrumentKnown(ctx, signal.ISIN); kerr == nil && !known {
+			c.logger.Error("Signal REFUSED — ISIN unknown to the live price feed (isin: key missing); fix the sheet row",
+				zap.String("symbol", signal.Symbol), zap.String("isin", signal.ISIN))
+			return
+		}
 	}
 
 	// Override sheet price with live LTP (external Redis → local Redis → sheet fallback)
