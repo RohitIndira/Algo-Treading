@@ -399,6 +399,11 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 		freeQty map[string]int
 		fetched bool
 		fetchOK bool // false = holdings API errored (auth/network) — data absent, not "no holdings"
+		// broker order book by id, fetched at most once per user per cycle
+		// (liveness of DB-recorded stops).
+		book        map[string]indiraClient.OrderBook
+		bookFetched bool
+		bookOK      bool
 	}
 	cache := map[string]*userCache{}
 
@@ -417,24 +422,6 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 		// AMO_PENDING awaiting conversion), we have nothing to do.
 		// Placing a second SL would either double the protection (broker
 		// margin error) or race against the live one.
-		// A live stop already rests for this position (placed on the entry
-		// fill or by the naked scan — those rows carry no trade_date, so the
-		// trade_date check below cannot see them). Placing another would be
-		// rejected "Free Qty=0" or double the stop (2026-10-22 review; the
-		// mid-session boot cycle made every restart a trigger for this).
-		if standing, serr := p.repo.ListStandingSLs(ctx, pos.StrategyID, pos.Symbol); serr == nil {
-			live := 0
-			for _, s := range standing {
-				if s.BrokerOrderID != "" {
-					live++
-				}
-			}
-			if live > 0 {
-				p.logger.Info("Pre-open cycle: position already has a live stop at the broker — skipping",
-					zap.String("symbol", pos.Symbol), zap.String("user_id", pos.UserID), zap.Int("live_stops", live))
-				continue
-			}
-		}
 		if protected, perr := p.repo.HasActiveProtectionForToday(ctx, pos.EntryOrderID, istToday); perr == nil && protected {
 			p.logger.Info("Pre-open cycle: position already protected by EOD AMO — skipping",
 				zap.String("symbol", pos.Symbol),
@@ -583,6 +570,43 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 				zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol),
 				zap.Float64("intended", intended), zap.Float64("floor", resolved))
 			intended = resolved
+		}
+
+		// A stop already resting at the broker for this position (placed on the
+		// entry fill or by the naked scan — those rows carry no trade_date, so
+		// HasActiveProtectionForToday cannot see them): nothing to arm. Liveness
+		// is confirmed from the broker's own book, not the DB status — a row
+		// whose order was swept must not become phantom cover (2026-10-22
+		// review); such rows are closed here so the naked scan re-protects.
+		if standing, serr := p.repo.ListStandingSLs(ctx, pos.StrategyID, pos.Symbol); serr == nil && len(standing) > 0 {
+			if !uc.bookFetched {
+				uc.book, uc.bookOK = p.fetchUserBook(ctx, *auth)
+				uc.bookFetched = true
+			}
+			live := 0
+			for _, s := range standing {
+				if s.BrokerOrderID == "" {
+					continue
+				}
+				if !uc.bookOK {
+					live++ // cannot confirm either way — assume live (never double a stop blind)
+					continue
+				}
+				if bo, ok := uc.book[s.BrokerOrderID]; ok && !isCancelledBrokerStatus(strings.ToUpper(strings.TrimSpace(bo.Status))) && !isExecutedBrokerStatus(strings.ToUpper(strings.TrimSpace(bo.Status))) {
+					live++
+					continue
+				}
+				// Not in the book, or terminal there: the stop is gone.
+				_ = p.repo.UpdateOrderStatus(ctx, s.ID, StatusCancelled, "NOT_IN_BROKER_BOOK", 0, "planner: stop not live at broker — re-protecting")
+				_ = p.repo.InsertEvent(ctx, s.ID, "SL_LOST", string(s.Status), "CANCELLED", "", s.TriggerPrice, s.Qty, "planner: stop not live at broker")
+				p.logger.Warn("Pre-open cycle: DB stop is not live at the broker — closed, planning a fresh one",
+					zap.String("symbol", pos.Symbol), zap.String("user_id", pos.UserID), zap.String("broker_order_id", s.BrokerOrderID))
+			}
+			if live > 0 {
+				p.logger.Info("Pre-open cycle: position already has a live stop at the broker — skipping",
+					zap.String("symbol", pos.Symbol), zap.String("user_id", pos.UserID), zap.Int("live_stops", live))
+				continue
+			}
 		}
 
 		// An exit sell already placed this session (software stop via the
@@ -773,7 +797,9 @@ func (p *ProtectiveReplay) fetchLTP(ctx context.Context, info *SymbolInfo) float
 	if info == nil || info.ExchangeToken == "" {
 		return 0
 	}
-	if ltp, err := p.broker.FetchLTP(ctx, info.ExchangeToken); err == nil && ltp > 0 {
+	// Live row only (ISIN re-resolution, staleness judged): a stale row makes
+	// the planner take the conservative SL-L branch instead of an exit-now.
+	if ltp, stale, _, err := p.broker.FreshLTP(ctx, info); err == nil && !stale && ltp > 0 {
 		return ltp
 	}
 	// Redis miss — leave the fallback to live order placement which the
@@ -874,8 +900,7 @@ func (p *ProtectiveReplay) fireOne(ctx context.Context, plan FirePlan) FireResul
 		// (2026-10-22), and a fresh stop above the LTP would never arm.
 		brokerID, exitLimit, err = p.broker.PlaceMarketableLimitSell(ctx, plan.Auth, plan.Info, plan.IntendedQty)
 	case FireAMOLowerCircuit:
-		brokerID, err = p.broker.PlaceAMOSell(ctx, plan.Auth, plan.Info, plan.IntendedQty)
-		exitLimit = plan.Info.DPRLower
+		brokerID, exitLimit, err = p.broker.PlaceAMOSellPriced(ctx, plan.Auth, plan.Info, plan.IntendedQty)
 	default:
 		err = fmt.Errorf("unknown fire action: %s", plan.Action)
 	}
@@ -1063,19 +1088,32 @@ func (p *ProtectiveReplay) handlePostOpenReject(ctx context.Context, auth Broker
 		string(StatusSLPlaced), string(StatusRejected),
 		"", r.Plan.SafeTrigger, r.Plan.IntendedQty, granular)
 
-	// Last-ditch fallback: re-place the stop at the same trigger with the WIDE
-	// limit leg (PlaceSLMSell is SL-L with the 2% leg since 2026-10-22 — the
-	// broker rejects SL-M for algo orders). Skip if the original was already an
-	// immediate exit — it would just re-fail.
-	if r.Plan.Action != FireSLLimit {
-		return
-	}
-	p.logger.Warn("Hot-placing wide-leg SL-L fallback after reject",
+	// No untracked hot-place here (2026-10-22 review): the old fallback placed a
+	// second stop whose broker id was never recorded, so the DB saw no cover,
+	// the naked scan placed a third, and the untracked order locked the
+	// quantity against every exit. The naked scan re-drives placement with the
+	// band / LTP checks and records what it places.
+	p.logger.Warn("Protective stop rejected after the open — leaving re-protection to the naked scan",
 		zap.String("symbol", r.Plan.Pos.Symbol), zap.String("granular_reason", granular))
-	if _, err := p.broker.PlaceSLMSell(ctx, auth, r.Plan.Info, r.Plan.IntendedQty, r.Plan.SafeTrigger); err != nil {
-		p.logger.Error("Fallback SL-L also failed — SafetyMonitor will retry",
-			zap.String("symbol", r.Plan.Pos.Symbol), zap.Error(err))
+	notifyOps(p.authNotif, ctx, r.Plan.Pos.UserID, r.Plan.Pos.Symbol, "SL_REJECTED",
+		fmt.Sprintf("protective stop for %s rejected after the open: %s", r.Plan.Pos.Symbol, granular))
+}
+
+// fetchUserBook returns the user's broker order book keyed by order id.
+// ok=false when the fetch failed (auth/transport) — callers must not read
+// "absent" as "gone" in that case.
+func (p *ProtectiveReplay) fetchUserBook(ctx context.Context, auth BrokerAuth) (map[string]indiraClient.OrderBook, bool) {
+	orders, err := p.broker.GetOrderBook(ctx, auth)
+	if err != nil {
+		return nil, false
 	}
+	m := make(map[string]indiraClient.OrderBook, len(orders))
+	for _, o := range orders {
+		if o.OrdId != "" {
+			m[o.OrdId] = o
+		}
+	}
+	return m, true
 }
 
 // refreshFireDecision re-reads LTP and circuit state from the live token row

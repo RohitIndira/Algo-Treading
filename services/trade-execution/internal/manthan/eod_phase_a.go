@@ -206,11 +206,19 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 		// AMO LIMIT for the next session — MODISONLTD at lower circuit,
 		// 2026-10-22): the quantity is locked, so an AMO stop on top would only
 		// be rejected "Free Qty=0" every night. The exit IS the protection.
-		if open, oerr := p.repo.HasOpenExitSell(cycleCtx, pos.StrategyID, pos.Symbol); oerr == nil && open {
-			p.logger.Info("EOD Phase A: exit sell already in flight — not arming a stop on top",
+		if open, oerr := p.repo.HasOpenExitSellOfType(cycleCtx, pos.StrategyID, pos.Symbol, OrderTypeAMOSell); oerr == nil && open {
+			p.logger.Info("EOD Phase A: AMO exit already queued for the next session — not arming a stop on top",
 				zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol))
 			alreadyArmed++
 			continue
+		}
+		// A DAY exit row still PLACED after the close rests nowhere (the sweep
+		// could not close it — auth/transport): it is NOT cover. Alert and arm.
+		if open, oerr := p.repo.HasOpenExitSellOfType(cycleCtx, pos.StrategyID, pos.Symbol, OrderTypeMarketSell); oerr == nil && open {
+			p.logger.Error("EOD Phase A: a DAY exit row is still PLACED after the close — treating as NOT covered; arming a stop",
+				zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol))
+			notifyOps(p.authNotif, cycleCtx, pos.UserID, pos.Symbol, "EXIT_UNRESOLVED",
+				fmt.Sprintf("unfilled exit for %s could not be closed out at EOD (no broker session?) — stop being armed instead", pos.Symbol))
 		}
 
 		// Give-up cap: if tonight's window has already burned several AMO

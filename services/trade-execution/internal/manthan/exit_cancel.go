@@ -101,21 +101,34 @@ func (h *SLHandler) cancelOpenExitSells(ctx context.Context, auth BrokerAuth, in
 				status, filled, avg, serr = m.Status, m.TradedQty, m.Price, nil
 			}
 		}
-		if serr == nil && isFilledStatus(status) {
-			if filled <= 0 {
-				filled = row.Qty
+		book := func(st string, fq int, ap float64, note string) bool {
+			if fq <= 0 {
+				fq = row.Qty
 			}
-			_ = h.repo.UpdateOrderFilled(ctx, row.ID, filled, avg)
-			_ = h.repo.InsertEvent(ctx, row.ID, "EXIT_FILLED", "PLACED", "FILLED", status, avg, filled,
-				"confirmed while preparing a fresh exit: "+reason)
-			h.logger.Info("exit: earlier exit sell already FILLED — confirmed",
-				zap.String("symbol", info.Symbol), zap.String("broker_order_id", id), zap.Int("filled", filled))
+			if uerr := h.repo.UpdateOrderFilled(ctx, row.ID, fq, ap); uerr != nil {
+				h.logger.Error("exit: earlier exit filled at broker but the fill could not be booked",
+					zap.String("symbol", info.Symbol), zap.String("broker_order_id", id), zap.Error(uerr))
+				return false
+			}
+			_ = h.repo.InsertEvent(ctx, row.ID, "EXIT_FILLED", "PLACED", "FILLED", st, ap, fq, note)
+			h.logger.Info("exit: earlier exit sell filled — booked",
+				zap.String("symbol", info.Symbol), zap.String("broker_order_id", id), zap.Int("filled", fq))
 			confirmed++
+			return true
+		}
+		if serr == nil && isFilledStatus(strings.ToUpper(strings.TrimSpace(status))) {
+			book(status, filled, avg, "confirmed while preparing a fresh exit: "+reason)
 			continue
 		}
 		if cerr := h.broker.CancelOrder(ctx, auth, info, id); cerr != nil && !IsOrderNotFoundError(cerr) {
 			h.logger.Warn("exit: resting exit cancel failed — selling anyway",
 				zap.String("symbol", info.Symbol), zap.String("broker_order_id", id), zap.Error(cerr))
+			continue
+		}
+		// Re-read AFTER the cancel: a fill (full or partial) in the window
+		// between the first read and the cancel must be booked, never dropped.
+		if st2, fq2, ap2, serr2 := h.broker.GetOrderStatus(ctx, auth, id); serr2 == nil && (isFilledStatus(strings.ToUpper(strings.TrimSpace(st2))) || fq2 > 0) {
+			book(st2, fq2, ap2, "filled before/while being cancelled ahead of a fresh exit: "+reason)
 			continue
 		}
 		_ = h.repo.UpdateOrderCancelled(ctx, row.ID)

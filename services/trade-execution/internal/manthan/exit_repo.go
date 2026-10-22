@@ -29,6 +29,7 @@ type ExitSellRow struct {
 	BrokerOrderID string
 	ParentOrderID int64 // entry manthan_orders.id when known (0 → resolved from the book)
 	Reason        string
+	RetryCount    int // re-price lineage counter, written with the row (never a follow-up UPDATE)
 }
 
 // InsertExitSellPlaced records an exit sell as PLACED. signal_id
@@ -61,14 +62,14 @@ func (r *Repository) InsertExitSellPlaced(ctx context.Context, row ExitSellRow) 
 			order_type, order_side, product_type,
 			qty, limit_price, trigger_price,
 			indira_symbol, exchange_token, status, broker_order_id,
-			placed_at, parent_order_id, trade_date, max_retries
+			placed_at, parent_order_id, trade_date, max_retries, retry_count
 		) VALUES ($1,$2,$3,$4,$5,'NSE',$6,'SELL','DELIVERY',$7,$8,0,$9,$10,'PLACED',$11,
-			now(), NULLIF($12,0), $13, 0)
+			now(), NULLIF($12,0), $13, 0, $14)
 		ON CONFLICT (signal_id) DO NOTHING
 		RETURNING id`,
 		"exit-"+row.BrokerOrderID, row.StrategyID, row.UserID, row.Symbol, nullStr(row.ISIN),
 		string(row.OrderType), row.Qty, row.LimitPrice,
-		info.IndiraSymbol, info.ExchangeToken, row.BrokerOrderID, parent, tradeDate,
+		info.IndiraSymbol, info.ExchangeToken, row.BrokerOrderID, parent, tradeDate, row.RetryCount,
 	).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, nil // already recorded
@@ -213,9 +214,11 @@ func (r *Repository) HasOwnExitSell(ctx context.Context, strategyID, symbol stri
 	return exists, err
 }
 
-// HasOwnExitSellByBrokerID reports whether brokerOrderID is one of OUR exit
-// sells (any status). The definitive test for "this MANUAL_EXIT event is our
-// own sell seen through the whole-book path".
+// HasOwnExitSellByBrokerID reports whether brokerOrderID is one of OUR sell
+// orders — an exit sell OR a stop (SL_SELL / SL_SELL_AMO), any status. The
+// definitive test for "this MANUAL_EXIT event is our own sell seen through the
+// whole-book path"; a stop fill the positions service routed as manual must
+// not be projected twice either (2026-10-22 review).
 func (r *Repository) HasOwnExitSellByBrokerID(ctx context.Context, brokerOrderID string) (bool, error) {
 	if brokerOrderID == "" {
 		return false, nil
@@ -226,9 +229,36 @@ func (r *Repository) HasOwnExitSellByBrokerID(ctx context.Context, brokerOrderID
 		    SELECT 1 FROM manthan_orders
 		     WHERE broker_order_id = $1
 		       AND order_side = 'SELL'
-		       AND order_type IN ('MARKET_SELL','AMO_SELL')
 		)`, brokerOrderID).Scan(&exists)
 	return exists, err
+}
+
+// HasOpenExitSellOfType is HasOpenExitSell restricted to one order type —
+// EOD Phase A counts only an AMO exit (next session) as overnight cover; a
+// PLACED DAY exit after the close rests nowhere.
+func (r *Repository) HasOpenExitSellOfType(ctx context.Context, strategyID, symbol string, ot OrderType) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+		    SELECT 1 FROM manthan_orders
+		     WHERE strategy_id = $1 AND symbol = $2
+		       AND order_side = 'SELL'
+		       AND order_type = $3
+		       AND status IN ('PENDING','PLACED')
+		       AND COALESCE(broker_order_id,'') <> ''
+		)`, strategyID, symbol, string(ot)).Scan(&exists)
+	return exists, err
+}
+
+// UpdateSLIntendedOnly records a trailed stop that could NOT be sent to the
+// broker (below today's band) on a live SL row — trigger_price/limit_price are
+// the intended level, broker_* columns stay as the exchange holds them.
+func (r *Repository) UpdateSLIntendedOnly(ctx context.Context, id int64, intendedTrigger, intendedLimit float64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET trigger_price=$1, limit_price=$2, updated_at=NOW()
+		 WHERE id=$3 AND status IN ('SL_PLACED','SL_MODIFY_PENDING')`, intendedTrigger, intendedLimit, id)
+	return err
 }
 
 // SumOpenExitQty returns the quantity already committed to OTHER open exit
@@ -316,11 +346,18 @@ func (r *Repository) UpdateSymbolToken(ctx context.Context, strategyID, symbol, 
 	if token == "" {
 		return 0, nil
 	}
+	// Rows with an order still resting at the broker keep the symbol/token the
+	// order was PLACED with — Cancel/Modify requests are built from the row and
+	// the broker may validate them against the original (2026-10-22 review).
+	// Live-price reads do not depend on this: FreshLTP/ExitLimitPrice resolve
+	// the token from the ISIN key on every call.
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE manthan_orders
 		   SET exchange_token = $3, indira_symbol = $4, updated_at = now()
 		 WHERE strategy_id = $1 AND symbol = $2
-		   AND COALESCE(exchange_token,'') <> $3`,
+		   AND COALESCE(exchange_token,'') <> $3
+		   AND (COALESCE(broker_order_id,'') = ''
+		        OR status NOT IN ('PENDING','PLACED','SL_PLACED','SL_MODIFY_PENDING','AMO_PENDING','PARTIAL'))`,
 		strategyID, symbol, token, indiraSymbol)
 	if err != nil {
 		return 0, err

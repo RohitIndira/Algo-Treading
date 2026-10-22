@@ -36,19 +36,21 @@ const (
 // exitCycle caches the broker order book per user for one monitor cycle so
 // several unmatched AMO rows cost one fetch, not one each.
 type exitCycle struct {
-	books map[string][]indiraClient.OrderBook
+	books   map[string][]indiraClient.OrderBook
+	bookErr map[string]error // fetch failed for this user → "absent" must not be read as "gone"
 }
 
-func (c *exitCycle) book(ctx context.Context, m *SafetyMonitor, auth *BrokerAuth) []indiraClient.OrderBook {
+func (c *exitCycle) book(ctx context.Context, m *SafetyMonitor, auth *BrokerAuth) ([]indiraClient.OrderBook, error) {
 	if b, ok := c.books[auth.UserID]; ok {
-		return b
+		return b, c.bookErr[auth.UserID]
 	}
 	b, err := m.broker.GetOrderBook(ctx, *auth)
 	if err != nil {
 		b = nil
 	}
 	c.books[auth.UserID] = b
-	return b
+	c.bookErr[auth.UserID] = err
+	return b, err
 }
 
 // checkPendingExits confirms or chases every exit sell still PLACED at the
@@ -70,9 +72,22 @@ func (m *SafetyMonitor) checkPendingExits(ctx context.Context) {
 		m.logger.Warn("Safety monitor: open-exit query failed", zap.Error(err))
 		return
 	}
-	cyc := &exitCycle{books: map[string][]indiraClient.OrderBook{}}
+	cyc := &exitCycle{books: map[string][]indiraClient.OrderBook{}, bookErr: map[string]error{}}
 	for _, row := range rows {
-		m.checkPendingExit(ctx, cyc, row)
+		// Same per-position advisory lock as the inbox exit path and
+		// checkPosition: cancel/re-place of an exit must never interleave with
+		// EmergencySell on the same (strategy, symbol).
+		if m.repo == nil {
+			m.checkPendingExit(ctx, cyc, row)
+			continue
+		}
+		if err := m.repo.WithPositionLock(ctx, row.StrategyID, row.Symbol, func(ctx context.Context) error {
+			m.checkPendingExit(ctx, cyc, row)
+			return nil
+		}); err != nil {
+			m.logger.Warn("Safety monitor: exit-tracker position lock failed — skipping this cycle",
+				zap.String("symbol", row.Symbol), zap.Error(err))
+		}
 	}
 }
 
@@ -106,8 +121,8 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 			notifyAuthExpired(m.authNotif, ctx, row.UserID, "safety-monitor-exit")
 			return
 		}
-		if !strings.Contains(err.Error(), "not found") {
-			return
+		if !IsOrderNotInBook(err) {
+			return // transport / unknown error — never read as "vanished"
 		}
 		switch {
 		case row.OrderType == OrderTypeAMOSell:
@@ -115,7 +130,11 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 			// the converted order in the book and adopt it (next cycle
 			// confirms/chases). Unmatched past the deadline → a human must look:
 			// the converted order may rest under an id we do not know.
-			if conv := matchConvertedExit(row, cyc.book(ctx, m, auth)); conv != nil {
+			book, berr := cyc.book(ctx, m, auth)
+			if berr != nil {
+				return // could not read the book this cycle — decide nothing
+			}
+			if conv := matchConvertedExit(row, book); conv != nil {
 				if aerr := m.repo.AdoptConvertedExit(ctx, row.ID, conv.OrdId); aerr != nil {
 					m.logger.Warn("Safety monitor: AMO adoption write failed", zap.Int64("row", row.ID), zap.Error(aerr))
 					return
@@ -127,7 +146,8 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 				return
 			}
 			if m.amoAdoptionOverdue(row) {
-				m.giveUp(ctx, row, true, "AMO exit not found in the book and no converted order matched by the adoption deadline — its converted order (if any) is untracked and may still lock the quantity")
+				// Keep the row PLACED (it may still lock the quantity) and alert once.
+				m.giveUp(ctx, row, false, "AMO exit not found in the book and no converted order matched by the adoption deadline — its converted order (if any) is untracked and may still lock the quantity; a human must reconcile at the broker")
 			}
 		case age >= exitLostAfter:
 			// A DAY exit that never reached the broker's book (BODALCHEM
@@ -176,7 +196,10 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 		if filledQty > 0 {
 			// Partial fill then cancel/sweep: the filled part is real money —
 			// book it, re-place only the remainder (2026-10-22 review).
-			_ = m.repo.UpdateOrderFilled(ctx, row.ID, filledQty, avgPrice)
+			if uerr := m.repo.UpdateOrderFilled(ctx, row.ID, filledQty, avgPrice); uerr != nil {
+				m.logger.Error("Safety monitor: partial fill could not be booked — not re-placing this cycle", zap.Int64("row", row.ID), zap.Error(uerr))
+				return
+			}
 			_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_PARTIAL", "PLACED", "FILLED", st, avgPrice, filledQty,
 				"partial fill before the exit was "+st+"; remainder re-placed on a new row")
 			m.publishExitFilled(ctx, row, avgPrice, filledQty)
@@ -243,7 +266,11 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 	}
 	remaining := row.Qty
 	if serr == nil && filled2 > 0 && filled2 < row.Qty {
-		_ = m.repo.UpdateOrderFilled(ctx, row.ID, filled2, avg2)
+		if uerr := m.repo.UpdateOrderFilled(ctx, row.ID, filled2, avg2); uerr != nil {
+			m.logger.Error("Safety monitor: partial fill could not be booked after the re-price cancel — not re-placing this cycle (order is cancelled at broker; next cycle retries)",
+				zap.Int64("row", row.ID), zap.Error(uerr))
+			return
+		}
 		_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_PARTIAL", "PLACED", "FILLED", st2, avg2, filled2,
 			"partial fill before re-price; remainder re-placed on a new row")
 		m.publishExitFilled(ctx, row, avg2, filled2)
@@ -290,7 +317,10 @@ func (m *SafetyMonitor) giveUp(ctx context.Context, row *ManthanOrder, lost bool
 		_ = m.repo.UpdateOrderStatus(ctx, row.ID, StatusCancelled, "", row.RetryCount, exitChaseExhaustedMark+": "+why)
 		_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_CHASE_EXHAUSTED", "PLACED", "CANCELLED", "", row.LimitPrice, row.Qty, why)
 	} else {
-		_ = m.repo.UpdateOrderStatus(ctx, row.ID, StatusPlaced, "", row.RetryCount, exitChaseExhaustedMark+": "+why)
+		if uerr := m.repo.UpdateOrderStatus(ctx, row.ID, StatusPlaced, "", row.RetryCount, exitChaseExhaustedMark+": "+why); uerr != nil {
+			m.logger.Error("Safety monitor: give-up marker write failed — will retry next cycle", zap.Int64("row", row.ID), zap.Error(uerr))
+			return
+		}
 		_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_CHASE_EXHAUSTED", "PLACED", "PLACED", "", row.LimitPrice, row.Qty, why)
 	}
 	m.logger.Error("Safety monitor: exit lineage exhausted — manual intervention required",
@@ -341,18 +371,16 @@ func (m *SafetyMonitor) replaceExit(ctx context.Context, auth *BrokerAuth, row *
 	if row.ParentOrderID != nil {
 		parent = *row.ParentOrderID
 	}
-	newRowID, ierr := m.repo.InsertExitSellPlaced(ctx, ExitSellRow{
+	if _, ierr := m.repo.InsertExitSellPlaced(ctx, ExitSellRow{
 		StrategyID: row.StrategyID, UserID: row.UserID, Symbol: row.Symbol, ISIN: row.ISIN,
 		Info: info, OrderType: OrderTypeMarketSell, Qty: qty, LimitPrice: newLimit,
 		BrokerOrderID: newID, ParentOrderID: parent, Reason: reason,
-	})
-	if ierr != nil {
-		m.logger.Error("Safety monitor: replacement exit placed but NOT recorded",
+		RetryCount: row.RetryCount + 1, // lineage counter written WITH the row
+	}); ierr != nil {
+		m.logger.Error("Safety monitor: replacement exit placed but NOT recorded — alerting",
 			zap.String("symbol", row.Symbol), zap.String("broker_order_id", newID), zap.Error(ierr))
-		return
-	}
-	if newRowID > 0 {
-		_ = m.repo.UpdateOrderStatus(ctx, newRowID, StatusPlaced, "", row.RetryCount+1, "")
+		notifyOps(m.authNotif, ctx, row.UserID, row.Symbol, "EXIT_UNRECORDED",
+			fmt.Sprintf("replacement exit for %s placed as %s but could not be recorded: %v", row.Symbol, newID, ierr))
 	}
 }
 

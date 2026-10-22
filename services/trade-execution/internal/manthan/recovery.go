@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
@@ -27,7 +26,11 @@ type Recovery struct {
 	slHandler *SLHandler
 	logger    *zap.Logger
 	getAuth   func(userID string) *BrokerAuth
+	authNotif AuthExpiryNotifier // optional: operator alerts (OPS_ALERT)
 }
+
+// SetAuthExpiryNotifier wires the notifier used for operator alerts.
+func (r *Recovery) SetAuthExpiryNotifier(n AuthExpiryNotifier) { r.authNotif = n }
 
 func NewRecovery(
 	broker *BrokerAdapter,
@@ -196,9 +199,14 @@ func (r *Recovery) replaceSL(ctx context.Context, sl *ManthanOrder, auth *Broker
 		_ = r.repo.InsertEvent(ctx, sl.ID, "SL_LOST_PARKED", "SL_PLACED", "SL_DEFERRED_BAND", "", sl.TriggerPrice, sl.Qty, reason)
 		r.logger.Error("Recovery: lost stop could not be re-placed — parked as deferred; NO broker stop (software stop still active)",
 			zap.String("symbol", sl.Symbol), zap.String("user", sl.UserID), zap.String("reason", reason))
+		notifyOps(r.authNotif, ctx, sl.UserID, sl.Symbol, "SL_LOST",
+			fmt.Sprintf("stop for %s lost at broker and not re-placed at boot: %s", sl.Symbol, reason))
 	}
 	if lerr != nil || stale || ltp <= 0 {
-		park(fmt.Sprintf("no fresh price (stale=%v as_of=%s err=%v)", stale, asOf.Format(time.RFC3339), lerr))
+		// No fresh price at boot: leave the row for the safety monitor (which
+		// re-enters CHECK 1 every cycle) rather than parking it out of sight.
+		r.logger.Warn("Recovery: lost stop but no fresh price — leaving it to the safety monitor",
+			zap.String("symbol", sl.Symbol), zap.Bool("stale", stale), zap.Time("feed_as_of", asOf), zap.NamedError("feed_err", lerr))
 		return
 	}
 	if ltp <= sl.TriggerPrice {
@@ -214,6 +222,8 @@ func (r *Recovery) replaceSL(ctx context.Context, sl *ManthanOrder, auth *Broker
 				zap.String("symbol", sl.Symbol), zap.Error(serr))
 			_ = r.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "CANCELLED", "CANCELLED",
 				"", ltp, sl.Qty, "recovery: stop crossed, LIMIT exit failed: "+serr.Error())
+			notifyOps(r.authNotif, ctx, sl.UserID, sl.Symbol, "EXIT_FAILED",
+				fmt.Sprintf("stop for %s lost and crossed at boot; exit rejected: %v", sl.Symbol, serr))
 			return
 		}
 		_ = r.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL", "SL_PLACED", "CANCELLED",
@@ -235,14 +245,19 @@ func (r *Recovery) replaceSL(ctx context.Context, sl *ManthanOrder, auth *Broker
 	limit := sl.TriggerPrice - SLLimitGap(sl.TriggerPrice, info.TickSize)
 	newBrokerID, bt, bl, err := r.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, limit)
 	if err != nil {
-		if IsAuthError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			r.logger.Warn("Recovery: SL re-place hit auth/network — safety monitor retries", zap.String("symbol", sl.Symbol), zap.Error(err))
+		var rej *BrokerRejection
+		var biz *indiraClient.BrokerBusinessError
+		if errors.As(err, &rej) || errors.As(err, &biz) {
+			park("re-place rejected: " + err.Error())
 			return
 		}
-		park("re-place rejected: " + err.Error())
+		r.logger.Warn("Recovery: SL re-place hit a transient error — safety monitor retries", zap.String("symbol", sl.Symbol), zap.Error(err))
 		return
 	}
-	_ = r.repo.UpdateSLBrokerID(ctx, sl.ID, newBrokerID, parent)
+	if uerr := r.repo.UpdateSLBrokerID(ctx, sl.ID, newBrokerID, parent); uerr != nil {
+		r.logger.Error("Recovery: stop re-placed at broker but the row could not be updated — reconciler must re-point it",
+			zap.String("symbol", sl.Symbol), zap.String("new_broker_order_id", newBrokerID), zap.Error(uerr))
+	}
 	_ = r.repo.UpdateBrokerTrigger(ctx, sl.ID, bt, bl)
 	_ = r.repo.InsertEvent(ctx, sl.ID, "SL_REPLACED", "CANCELLED", "SL_PLACED",
 		"", sl.TriggerPrice, sl.Qty, "recovery: re-placed SL "+newBrokerID)

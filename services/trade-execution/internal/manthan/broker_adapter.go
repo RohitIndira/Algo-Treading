@@ -269,6 +269,14 @@ func IsAuthError(err error) bool {
 		strings.Contains(s, "status code 401")
 }
 
+// ErrOrderNotInBook: GetOrderStatus fetched the order book successfully and the
+// id was not in it. Typed so callers never match free text ("not found") that a
+// transport or auth error might also contain.
+var ErrOrderNotInBook = errors.New("order not in broker order book")
+
+// IsOrderNotInBook reports whether err is (or wraps) ErrOrderNotInBook.
+func IsOrderNotInBook(err error) bool { return errors.Is(err, ErrOrderNotInBook) }
+
 // IsOrderNotFoundError reports whether the broker says the order we tried to
 // modify/cancel no longer exists in its book ("AU004 Pending Order Not
 // Found"). The position is unaffected — the correct reaction is to mark our
@@ -609,7 +617,7 @@ func (b *BrokerAdapter) GetOrderStatus(ctx context.Context, auth BrokerAuth, bro
 				return o.Status, o.TradedQty, avgPx, nil
 			}
 		}
-		return "", 0, 0, fmt.Errorf("order %s not found in orderbook", brokerOrderID)
+		return "", 0, 0, fmt.Errorf("%w: order %s not found in orderbook", ErrOrderNotInBook, brokerOrderID)
 	}
 
 	// Auth failures are terminal for this poll — the raw fallback below issues
@@ -656,7 +664,7 @@ func (b *BrokerAdapter) getOrderStatusRaw(ctx context.Context, auth BrokerAuth, 
 			return o.Status, o.TradedQty, avgPx, nil
 		}
 	}
-	return "", 0, 0, fmt.Errorf("order %s not found in raw orderbook (%d orders)", brokerOrderID, len(raw.Orders))
+	return "", 0, 0, fmt.Errorf("%w: order %s not found in raw orderbook (%d orders)", ErrOrderNotInBook, brokerOrderID, len(raw.Orders))
 }
 
 // fetchAvgFillPrice returns the quantity-weighted average traded price for a

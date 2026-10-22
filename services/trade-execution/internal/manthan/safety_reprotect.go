@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
 )
 
@@ -54,31 +54,49 @@ func (m *SafetyMonitor) reprotectLostSL(ctx context.Context, auth *BrokerAuth, s
 	}
 
 	if lerr != nil || stale || ltp <= 0 {
-		park(fmt.Sprintf("no fresh price (stale=%v as_of=%s err=%v) — cannot judge band or stop", stale, asOf.Format(time.RFC3339), lerr))
+		// No fresh price: nothing can be judged this cycle. Leave the row as it
+		// is (CHECK 1 re-enters next cycle) and alert — parking it would hide
+		// it from every re-protection path for the rest of the day.
+		m.logger.Warn("Safety monitor: lost stop but no fresh price yet — retrying next cycle",
+			zap.String("user_id", sl.UserID), zap.String("symbol", sl.Symbol),
+			zap.Bool("stale", stale), zap.Time("feed_as_of", asOf), zap.NamedError("feed_err", lerr))
+		notifyOps(m.authNotif, ctx, sl.UserID, sl.Symbol, "SL_LOST",
+			fmt.Sprintf("stop for %s lost at broker (%s); no fresh price to re-protect yet", sl.Symbol, brokerStatus))
 		return
 	}
 
-	// 2. The stop was crossed: this is exactly what the stop was for.
+	// 2. The stop was crossed: this is exactly what the stop was for. Place the
+	// exit FIRST; the stop row is closed only once the exit is accepted (its
+	// exit row then makes checkPosition skip this position), so a rejected
+	// exit leaves the row for the next cycle to retry.
 	if ltp <= sl.TriggerPrice {
 		m.logger.Warn("Safety monitor: lost stop and LTP already below the trigger — exiting with a marketable LIMIT",
 			zap.String("user_id", sl.UserID), zap.String("symbol", sl.Symbol),
 			zap.Float64("ltp", ltp), zap.Float64("trigger", sl.TriggerPrice))
-		if uerr := m.repo.UpdateOrderCancelled(ctx, sl.ID); uerr != nil {
-			m.logger.Error("Safety monitor: could not mark the lost stop — not selling this cycle",
-				zap.String("symbol", sl.Symbol), zap.Error(uerr))
-			return
+		var brokerID string
+		var limit float64
+		var err error
+		ot := OrderTypeMarketSell
+		if _, atLower, cerr := m.broker.CheckCircuit(ctx, info.ExchangeToken); cerr == nil && atLower {
+			ot = OrderTypeAMOSell
+			brokerID, limit, err = m.broker.PlaceAMOSellPriced(ctx, *auth, info, sl.Qty)
+		} else {
+			brokerID, limit, err = m.broker.PlaceMarketableLimitSell(ctx, *auth, info, sl.Qty)
 		}
-		brokerID, limit, err := m.broker.PlaceMarketableLimitSell(ctx, *auth, info, sl.Qty)
 		if err != nil {
-			_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "CANCELLED", "CANCELLED",
-				"", ltp, sl.Qty, "stop lost and crossed — LIMIT exit failed: "+err.Error())
-			m.logger.Error("Safety monitor: exit after lost stop FAILED — manual intervention required",
+			_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "SL_PLACED", "SL_PLACED",
+				"", ltp, sl.Qty, "stop lost and crossed — exit rejected (will retry): "+err.Error())
+			m.logger.Error("Safety monitor: exit after lost stop FAILED — retrying next cycle; manual check advised",
 				zap.String("user_id", sl.UserID), zap.String("symbol", sl.Symbol), zap.Error(err))
 			notifyOps(m.authNotif, ctx, sl.UserID, sl.Symbol, "EXIT_FAILED",
 				fmt.Sprintf("stop for %s lost and crossed (ltp %.2f ≤ %.2f); exit rejected: %v", sl.Symbol, ltp, sl.TriggerPrice, err))
 			return
 		}
-		m.recordExit(ctx, sl, OrderTypeMarketSell, info, sl.Qty, limit, brokerID, "stop lost at broker and already crossed — exit")
+		m.recordExit(ctx, sl, ot, info, sl.Qty, limit, brokerID, "stop lost at broker and already crossed — exit")
+		if uerr := m.repo.UpdateOrderCancelled(ctx, sl.ID); uerr != nil {
+			m.logger.Error("Safety monitor: exit placed but the lost stop row could not be closed (exit row protects against a re-sell)",
+				zap.String("symbol", sl.Symbol), zap.Error(uerr))
+		}
 		return
 	}
 
@@ -90,15 +108,23 @@ func (m *SafetyMonitor) reprotectLostSL(ctx context.Context, auth *BrokerAuth, s
 	limit := sl.TriggerPrice - SLLimitGap(sl.TriggerPrice, info.TickSize)
 	newBrokerID, bt, bl, err := m.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, limit)
 	if err != nil {
-		if IsAuthError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			m.logger.Warn("Safety monitor: lost-stop re-place hit auth/network — retrying next cycle",
-				zap.String("symbol", sl.Symbol), zap.Error(err))
-			return // row stays SL_PLACED → CHECK 1 runs again next cycle
+		var rej *BrokerRejection
+		var biz *indiraClient.BrokerBusinessError
+		if errors.As(err, &rej) || errors.As(err, &biz) {
+			park("re-place rejected by broker: " + err.Error())
+			return
 		}
-		park("re-place rejected by broker: " + err.Error())
+		// Auth, context, transport, anything unclassified: retry next cycle
+		// (the row stays SL_PLACED → CHECK 1 runs again) — never park on a
+		// transient (2026-10-22 review).
+		m.logger.Warn("Safety monitor: lost-stop re-place hit a transient error — retrying next cycle",
+			zap.String("symbol", sl.Symbol), zap.Error(err))
 		return
 	}
-	_ = m.repo.UpdateSLBrokerID(ctx, sl.ID, newBrokerID, parent)
+	if uerr := m.repo.UpdateSLBrokerID(ctx, sl.ID, newBrokerID, parent); uerr != nil {
+		m.logger.Error("Safety monitor: stop re-placed at broker but the row could not be updated — reconciler must re-point it",
+			zap.String("symbol", sl.Symbol), zap.String("new_broker_order_id", newBrokerID), zap.Error(uerr))
+	}
 	_ = m.repo.UpdateBrokerTrigger(ctx, sl.ID, bt, bl)
 	_ = m.repo.InsertEvent(ctx, sl.ID, "SL_REPLACED", "CANCELLED", "SL_PLACED",
 		"", sl.TriggerPrice, sl.Qty, "re-placed by safety monitor: "+newBrokerID)

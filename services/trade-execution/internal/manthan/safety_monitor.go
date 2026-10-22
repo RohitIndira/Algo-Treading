@@ -278,8 +278,23 @@ func (m *SafetyMonitor) checkPositionLocked(ctx context.Context, sl *ManthanOrde
 			// once per active position every 15s) into one event per ~5min.
 			if errors.Is(err, indiraClient.ErrAuthExpired) {
 				notifyAuthExpired(m.authNotif, ctx, sl.UserID, "safety-monitor")
+				return
 			}
-			// Can't check — move on (next cycle will retry)
+			// The book was read fine and the stop is simply not in it (swept
+			// GTC, cancelled long ago): that is a LOST stop, not "can't check"
+			// (2026-10-22 review — such rows were never re-protected). Give the
+			// book a minute after placement before concluding.
+			placed := sl.CreatedAt
+			if sl.PlacedAt != nil {
+				placed = *sl.PlacedAt
+			}
+			if IsOrderNotInBook(err) && time.Since(placed) > exitLostAfter {
+				m.logger.Warn("Safety monitor: stop not in the broker book — re-protecting",
+					zap.String("symbol", sl.Symbol), zap.String("broker_order_id", sl.BrokerOrderID))
+				_ = m.repo.InsertEvent(ctx, sl.ID, "SL_LOST", "SL_PLACED", "CANCELLED",
+					"NOT_IN_BOOK", 0, 0, "stop absent from the broker book — re-protecting")
+				m.reprotectLostSL(ctx, auth, sl, "NOT_IN_BOOK")
+			}
 			return
 		}
 
@@ -309,6 +324,24 @@ func (m *SafetyMonitor) checkPositionLocked(ctx context.Context, sl *ManthanOrde
 		// SL was cancelled/rejected externally. REST order-book statuses are
 		// mixed case ("Cancelled" / "Rejected") — normalise before comparing.
 		if isCancelledBrokerStatus(strings.ToUpper(strings.TrimSpace(status))) {
+			if filledQty > 0 {
+				// Partly filled, then cancelled: the filled part is real money —
+				// book it; the remainder is uncovered and the naked scan places a
+				// fresh stop for exactly that quantity next cycle.
+				if uerr := m.repo.UpdateOrderFilled(ctx, sl.ID, filledQty, avgPrice); uerr != nil {
+					m.logger.Error("Safety monitor: partial stop fill could not be booked", zap.Int64("row", sl.ID), zap.Error(uerr))
+					return
+				}
+				_ = m.repo.InsertEvent(ctx, sl.ID, "SL_FILLED", "SL_PLACED", "SL_FILLED",
+					status, avgPrice, filledQty, "stop partly filled then cancelled — partial booked; remainder re-protected by the naked scan")
+				if m.eventPub != nil {
+					if entrySignalID, e := m.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); e == nil && entrySignalID != "" {
+						m.eventPub.PublishSLFilled(ctx, entrySignalID, sl.StrategyID, sl.UserID,
+							sl.Symbol, sl.BrokerOrderID, avgPrice, int32(filledQty), 0)
+					}
+				}
+				return
+			}
 			m.logger.Warn("Safety monitor: SL order missing at broker — re-protecting",
 				zap.String("symbol", sl.Symbol),
 				zap.String("broker_status", status))
@@ -402,7 +435,7 @@ func (m *SafetyMonitor) checkPositionLocked(ctx context.Context, sl *ManthanOrde
 		if atLower {
 			m.logger.Warn("Safety monitor: lower circuit — AMO LIMIT SELL at the band floor",
 				zap.String("symbol", sl.Symbol))
-			amoBrokerID, aerr := m.broker.PlaceAMOSell(ctx, *auth, info, sl.Qty)
+			amoBrokerID, amoLimit, aerr := m.broker.PlaceAMOSellPriced(ctx, *auth, info, sl.Qty)
 			if aerr != nil {
 				m.logger.Error("Safety monitor: AMO exit FAILED — position has no stop; manual intervention required",
 					zap.String("symbol", sl.Symbol), zap.Error(aerr))
@@ -411,7 +444,7 @@ func (m *SafetyMonitor) checkPositionLocked(ctx context.Context, sl *ManthanOrde
 				notifyOps(m.authNotif, ctx, sl.UserID, sl.Symbol, "EXIT_FAILED", "stop crossed, AMO exit rejected: "+aerr.Error())
 				return
 			}
-			m.recordExit(ctx, sl, OrderTypeAMOSell, info, sl.Qty, info.DPRLower, amoBrokerID, "lower circuit — AMO exit after stuck SL")
+			m.recordExit(ctx, sl, OrderTypeAMOSell, info, sl.Qty, amoLimit, amoBrokerID, "lower circuit — AMO exit after stuck SL")
 			return
 		}
 

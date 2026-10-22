@@ -122,8 +122,6 @@ func (b *BrokerAdapter) EnrichMarketInfo(ctx context.Context, info *SymbolInfo) 
 	}
 	var mkt struct {
 		TickSize  float64 `json:"tick_size"`
-		DPRLower  float64 `json:"dpr_lower"`
-		DPRUpper  float64 `json:"dpr_upper"`
 		FreezeQty int     `json:"freeze_qty"`
 	}
 	if json.Unmarshal([]byte(raw), &mkt) != nil {
@@ -132,14 +130,21 @@ func (b *BrokerAdapter) EnrichMarketInfo(ctx context.Context, info *SymbolInfo) 
 	if mkt.TickSize > 0 {
 		info.TickSize = mkt.TickSize
 	}
-	if mkt.DPRLower > 0 {
-		info.DPRLower = mkt.DPRLower
-	}
-	if mkt.DPRUpper > 0 {
-		info.DPRUpper = mkt.DPRUpper
-	}
 	if mkt.FreezeQty > 0 {
 		info.FreezeQty = mkt.FreezeQty
+	}
+	// The band comes only from a row updated today: a stale row's band would
+	// make PlaceInitialSL defer a placeable stop or send one the exchange
+	// rejects (2026-10-22 review; consistent with enrichDPR).
+	snap, err := parseMarketSnap([]byte(raw))
+	if err != nil || feedStale(snap.AsOf, time.Now()) {
+		return
+	}
+	if snap.DPRLower > 0 {
+		info.DPRLower = snap.DPRLower
+	}
+	if snap.DPRUpper > 0 {
+		info.DPRUpper = snap.DPRUpper
 	}
 }
 
@@ -218,7 +223,11 @@ func feedStale(asOf, now time.Time) bool {
 		return false
 	}
 	mod := n.Hour()*60 + n.Minute()
-	if mod < 9*60+20 || mod > 15*60+30 {
+	// Judged from the open: the pre-open auction print (~09:08) is already
+	// after today's 08:00 cut, so a row with no update today is stale from
+	// 09:15:00 — the old 09:20 grace let a weeks-old row drive the first five
+	// minutes of the session (2026-10-22 review).
+	if mod < 9*60+15 || mod > 15*60+30 {
 		return false
 	}
 	sessionStart := time.Date(n.Year(), n.Month(), n.Day(), 8, 0, 0, 0, ist)
@@ -268,6 +277,10 @@ func (b *BrokerAdapter) refreshToken(ctx context.Context, info *SymbolInfo) bool
 // missing or stale it re-resolves the token from the ISIN key and reads the
 // live row. stale=true means no live row exists under any token.
 func (b *BrokerAdapter) FreshLTP(ctx context.Context, info *SymbolInfo) (ltp float64, stale bool, asOf time.Time, err error) {
+	// ISIN key FIRST, every time (one Redis GET): the carried token is only a
+	// hint. Reading the stored-token row first would trust a drifted token
+	// whenever its dead row still looks "fresh" by timestamp (2026-10-22 review).
+	b.refreshToken(ctx, info)
 	snap, err := b.fetchMarketSnap(ctx, info.ExchangeToken)
 	if err != nil || feedStale(snap.AsOf, time.Now()) {
 		if b.refreshToken(ctx, info) {
@@ -319,6 +332,11 @@ func (b *BrokerAdapter) brokerLTP(ctx context.Context, auth BrokerAuth, symbol s
 // "broker-positions", "band-floor"). A stale feed row contributes nothing —
 // neither its LTP nor its band.
 func (b *BrokerAdapter) ExitLimitPrice(ctx context.Context, auth BrokerAuth, info *SymbolInfo) (limit, ltp float64, src string, err error) {
+	// ISIN key first, every time — the carried token is only a hint.
+	if b.refreshToken(ctx, info) {
+		info.DPRLower, info.DPRUpper = 0, 0
+		b.EnrichMarketInfo(ctx, info)
+	}
 	dprLo, dprHi := info.DPRLower, info.DPRUpper
 	snap, serr := b.fetchMarketSnap(ctx, info.ExchangeToken)
 	if serr != nil || feedStale(snap.AsOf, time.Now()) {

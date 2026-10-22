@@ -342,8 +342,14 @@ func (r *Reconciler) applyDrift(ctx context.Context, auth BrokerAuth, db *Mantha
 		return true
 	}
 
-	// Drift B: broker says Cancelled/Rejected but DB says still-placed or sl-placed
-	if isCancelledBrokerStatus(br) && (db.Status == StatusPlaced || db.Status == StatusSLPlaced) {
+	// Drift B: broker says Cancelled/Rejected but DB says still-placed or sl-placed.
+	// Exit sells (MARKET_SELL / AMO_SELL) are NOT closed here: the safety
+	// monitor's exit tracker and the 16:35 sweep own them — they re-place a
+	// cancelled/rejected exit from live prices or re-queue it for the next
+	// session, which this 5-minute ticker (no market-hours gate) would silently
+	// pre-empt by marking the row CANCELLED (2026-10-22 review).
+	if isCancelledBrokerStatus(br) && (db.Status == StatusPlaced || db.Status == StatusSLPlaced) &&
+		db.OrderType != OrderTypeMarketSell && db.OrderType != OrderTypeAMOSell {
 		// A partial fill before the cancel is real money: book it as FILLED for
 		// the traded part so net-qty arithmetic stays exact (2026-10-22 review).
 		if bOrd.TradedQty > 0 && bOrd.TradedQty > db.FilledQty {

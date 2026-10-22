@@ -47,7 +47,7 @@ func TestEmergencySellLatchRefusesRepeat(t *testing.T) {
 	// The latch is keyed by user AND symbol (2026-10-22): two clients holding
 	// the same stock must each get their own exit.
 	h.emergencyMu.Lock()
-	h.lastEmergency["S4450:IOLCP"] = time.Now()
+	h.lastEmergency["S4450::IOLCP"] = time.Now() // user:strategy:symbol (strategy empty in this test)
 	h.emergencyMu.Unlock()
 
 	// A second fire inside the window must be refused before any broker call:

@@ -364,6 +364,7 @@ func InitManthan(
 		entryHandler.SetAuthExpiryNotifier(jwtNotifier)
 		safetyMonitor.SetAuthExpiryNotifier(jwtNotifier)
 		slHandler.SetAuthExpiryNotifier(jwtNotifier)
+		recovery.SetAuthExpiryNotifier(jwtNotifier)
 		inboxWorker.SetAuthExpiryNotifier(jwtNotifier)
 		if externalDetector != nil {
 			externalDetector.SetAuthExpiryNotifier(jwtNotifier)

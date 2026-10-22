@@ -76,7 +76,8 @@ func (r *Repository) GetNetPosition(ctx context.Context, strategyID, symbol stri
 func (r *Repository) ListStandingSLs(ctx context.Context, strategyID, symbol string) ([]*ManthanOrder, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, COALESCE(broker_order_id,''), COALESCE(indira_symbol,''),
-		       COALESCE(exchange_token,''), COALESCE(isin,''), qty
+		       COALESCE(exchange_token,''), COALESCE(isin,''), qty,
+		       order_type, COALESCE(trigger_price,0), COALESCE(user_id,''), status
 		  FROM manthan_orders
 		 WHERE strategy_id = $1 AND symbol = $2
 		   AND order_type IN ('SL_SELL','SL_SELL_AMO')
@@ -89,7 +90,8 @@ func (r *Repository) ListStandingSLs(ctx context.Context, strategyID, symbol str
 	var out []*ManthanOrder
 	for rows.Next() {
 		o := &ManthanOrder{Symbol: symbol, StrategyID: strategyID}
-		if err := rows.Scan(&o.ID, &o.BrokerOrderID, &o.IndiraSymbol, &o.ExchangeToken, &o.ISIN, &o.Qty); err != nil {
+		if err := rows.Scan(&o.ID, &o.BrokerOrderID, &o.IndiraSymbol, &o.ExchangeToken, &o.ISIN, &o.Qty,
+			&o.OrderType, &o.TriggerPrice, &o.UserID, &o.Status); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -220,8 +222,8 @@ func (h *SLHandler) placeSquareOffSell(ctx context.Context, info *SymbolInfo, au
 
 	_, atLower, _ := h.broker.CheckCircuit(ctx, info.ExchangeToken)
 	if atLower {
-		id, err := h.broker.PlaceAMOSell(ctx, auth, info, qty)
-		return id, "AMO_LOWER_CIRCUIT", info.DPRLower, err
+		id, limit, err := h.broker.PlaceAMOSellPriced(ctx, auth, info, qty)
+		return id, "AMO_LOWER_CIRCUIT", limit, err
 	}
 	id, limit, err := h.broker.PlaceMarketableLimitSell(ctx, auth, info, qty)
 	return id, "LIMIT", limit, err
