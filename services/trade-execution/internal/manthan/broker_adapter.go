@@ -101,7 +101,7 @@ func firstNonEmpty(ss ...string) string {
 // 50bps inside DPR absorbs almost any realistic overnight band shift, costs
 // at most an additional 0.5% drawdown if the SL fires, and keeps the
 // algorithmic trigger when it's already comfortably inside DPR.
-const AMODprBuffer = 1.005
+const AMODprBuffer = 1.005 // RETIRED 2026-10-22: the adapter no longer biases triggers (see PlaceAMOSLSell); kept for reference only
 
 func NewBrokerAdapter(client *indiraClient.Client, extRedis *redis.Client, logger *zap.Logger) *BrokerAdapter {
 	logger.Info("Manthan pricing knobs (effective values; env blocks are whitelists — forward them in ecosystem.config.js)",
@@ -269,6 +269,10 @@ func IsAuthError(err error) bool {
 		strings.Contains(s, "status code 401")
 }
 
+// ErrTriggerOutsideBand: a stop trigger below the day's band was refused by the
+// adapter (the trigger is the exact strategy stop and is never moved).
+var ErrTriggerOutsideBand = errors.New("stop trigger outside the band")
+
 // ErrOrderNotInBook: GetOrderStatus fetched the order book successfully and the
 // id was not in it. Typed so callers never match free text ("not found") that a
 // transport or auth error might also contain.
@@ -343,6 +347,12 @@ func (b *BrokerAdapter) PlaceSLMSell(ctx context.Context, auth BrokerAuth, info 
 // DPR clamp lives here (placement-time only) — never store the clamped value as
 // the trail baseline.
 func (b *BrokerAdapter) PlaceSLSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) (brokerOrderID string, brokerTrigger float64, brokerLimit float64, err error) {
+	// HARD RULE: a trigger below today's band is refused, never clamped up to
+	// the floor (callers defer via resolveBandFloor; this is the backstop).
+	if info.DPRLower > 0 && triggerPrice < info.DPRLower {
+		return "", 0, 0, fmt.Errorf("%w: stop trigger %.2f below dpr_lower %.2f for %s",
+			ErrTriggerOutsideBand, triggerPrice, info.DPRLower, info.Symbol)
+	}
 	roundedTrigger := b.roundAndClamp(triggerPrice, info.TickSize, info.DPRLower, info.DPRUpper)
 	roundedLimit := b.roundAndClamp(limitPrice, info.TickSize, info.DPRLower, info.DPRUpper)
 
@@ -481,24 +491,17 @@ func (b *BrokerAdapter) PlaceMarketSell(ctx context.Context, auth BrokerAuth, in
 // Returns the broker's AMO queue ID (different from the live order ID that
 // gets generated at 08:50 IST conversion — Phase C swaps it).
 func (b *BrokerAdapter) PlaceAMOSLSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int, triggerPrice, limitPrice float64) (string, error) {
-	// Step 1: bias trigger 50bps inside DPR_lower to survive overnight band shift.
+	// HARD RULE (2026-10-22 review): the adapter never MOVES a trigger. A stop
+	// below the overnight safety floor is refused with a typed error — the EOD
+	// planner's resolveBandFloor gate defers such stops before reaching here,
+	// so this only catches a caller that bypassed the gate (or a sub-tick
+	// rounding edge). The old AMODprBuffer bias silently lifted the trigger.
+	if info.DPRLower > 0 && triggerPrice < info.DPRLower*DPRSafetyBuffer {
+		return "", fmt.Errorf("%w: AMO stop trigger %.2f below the overnight band floor %.2f (dpr_lower %.2f × %.3f) for %s",
+			ErrTriggerOutsideBand, triggerPrice, info.DPRLower*DPRSafetyBuffer, info.DPRLower, DPRSafetyBuffer, info.Symbol)
+	}
 	safeTrigger := triggerPrice
 	safeLimit := limitPrice
-	if info.DPRLower > 0 {
-		floor := info.DPRLower * AMODprBuffer
-		if safeTrigger < floor {
-			b.logger.Info("AMO SL trigger biased above DPR floor for overnight safety",
-				zap.String("symbol", info.Symbol),
-				zap.Float64("requested_trigger", triggerPrice),
-				zap.Float64("dpr_lower", info.DPRLower),
-				zap.Float64("safe_floor", floor))
-			safeTrigger = floor
-			safeLimit = floor - SLLimitGap(floor, info.TickSize)
-			if safeLimit < info.DPRLower {
-				safeLimit = info.DPRLower
-			}
-		}
-	}
 
 	// Step 2: tick-round + clamp inside [DPR_lower, DPR_upper].
 	roundedTrigger := b.roundAndClamp(safeTrigger, info.TickSize, info.DPRLower, info.DPRUpper)

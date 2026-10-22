@@ -247,7 +247,7 @@ func (r *Recovery) replaceSL(ctx context.Context, sl *ManthanOrder, auth *Broker
 	if err != nil {
 		var rej *BrokerRejection
 		var biz *indiraClient.BrokerBusinessError
-		if errors.As(err, &rej) || errors.As(err, &biz) {
+		if errors.As(err, &rej) || errors.As(err, &biz) || errors.Is(err, ErrTriggerOutsideBand) {
 			park("re-place rejected: " + err.Error())
 			return
 		}

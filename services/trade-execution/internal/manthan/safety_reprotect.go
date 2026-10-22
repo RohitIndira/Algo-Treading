@@ -110,8 +110,8 @@ func (m *SafetyMonitor) reprotectLostSL(ctx context.Context, auth *BrokerAuth, s
 	if err != nil {
 		var rej *BrokerRejection
 		var biz *indiraClient.BrokerBusinessError
-		if errors.As(err, &rej) || errors.As(err, &biz) {
-			park("re-place rejected by broker: " + err.Error())
+		if errors.As(err, &rej) || errors.As(err, &biz) || errors.Is(err, ErrTriggerOutsideBand) {
+			park("re-place rejected: " + err.Error())
 			return
 		}
 		// Auth, context, transport, anything unclassified: retry next cycle

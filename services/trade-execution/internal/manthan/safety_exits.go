@@ -192,6 +192,36 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 			m.giveUp(ctx, row, true, "exit "+st+" at broker after the maximum number of re-placements")
 			return
 		}
+		// WHY was it cancelled/rejected? The order book's rejReason separates
+		// (a) the broker's RMS refusing the quantity ("Free Qty", "Limit
+		// exceeded") — another sell owns it, re-placing is pointless; (b) the
+		// exchange sweeping unmatched orders ("cancelled by the system") — the
+		// 16:35 sweep re-queues it; (c) an empty reason on CANCELLED — a person
+		// cancelled it from the app/admin: re-place once, then stop and alert.
+		reason := ""
+		if book, berr := cyc.book(ctx, m, auth); berr == nil {
+			for i := range book {
+				if book[i].OrdId == row.BrokerOrderID {
+					reason = strings.ToLower(strings.TrimSpace(book[i].RejReason))
+					break
+				}
+			}
+		}
+		switch {
+		case strings.Contains(reason, "free qty") || strings.Contains(reason, "limit exceeded"):
+			m.giveUp(ctx, row, true, "broker RMS: quantity locked by another sell order ("+reason+") — not re-placing; reconcile at the broker")
+			return
+		case strings.Contains(reason, "cancelled by the system") || strings.Contains(reason, "canceled by the system"):
+			if !marketOpenNowIST() {
+				return // exchange sweep after the close — the 16:35 sweep re-queues it as an AMO exit
+			}
+		case st == "CANCELLED" && reason == "" && row.RetryCount >= 1:
+			m.giveUp(ctx, row, true, "exit cancelled externally (empty reject reason) for the second time — not re-placing; a person is overriding the strategy, operator decision needed")
+			return
+		}
+		if !marketOpenNowIST() {
+			return // nothing can be placed now; the EOD sweep / next session handles it
+		}
 		remaining := row.Qty
 		if filledQty > 0 {
 			// Partial fill then cancel/sweep: the filled part is real money —
@@ -338,6 +368,11 @@ func (m *SafetyMonitor) giveUp(ctx context.Context, row *ManthanOrder, lost bool
 // that limit so the exit stays in flight and tracked; 0 means there is
 // nothing to restore.
 func (m *SafetyMonitor) replaceExit(ctx context.Context, auth *BrokerAuth, row *ManthanOrder, info *SymbolInfo, qty int, reason string, restoreLimit float64) {
+	if !marketOpenNowIST() {
+		m.logger.Warn("Safety monitor: re-place requested outside the session — leaving it to the EOD sweep / next session",
+			zap.String("symbol", row.Symbol), zap.String("reason", reason))
+		return
+	}
 	if net, _, has, nerr := m.repo.NetHeldQty(ctx, row.StrategyID, row.Symbol); nerr == nil && has {
 		other, _ := m.repo.SumOpenExitQty(ctx, row.StrategyID, row.Symbol, row.ID)
 		if cap := net - other; cap < qty {

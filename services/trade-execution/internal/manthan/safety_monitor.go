@@ -124,9 +124,9 @@ func (m *SafetyMonitor) marketOpenForSL() bool {
 		return false // Saturday / Sunday / exchange holiday
 	}
 	mod := now.Hour()*60 + now.Minute()
-	const open = 9*60 + 15   // 09:15
-	const close = 15*60 + 30 // 15:30 (broker auto-cancels DAY SLs at close)
-	return mod >= open && mod <= close
+	const open = 9*60 + 15            // 09:15
+	const close = 15*60 + 30          // 15:30 (broker auto-cancels DAY SLs at close)
+	return mod >= open && mod < close // 15:30:xx excluded — the exchange sweeps DAY orders at 15:30:00
 }
 
 func (m *SafetyMonitor) check(ctx context.Context) {
