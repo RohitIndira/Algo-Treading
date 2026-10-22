@@ -196,8 +196,10 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 		// (a) the broker's RMS refusing the quantity ("Free Qty", "Limit
 		// exceeded") — another sell owns it, re-placing is pointless; (b) the
 		// exchange sweeping unmatched orders ("cancelled by the system") — the
-		// 16:35 sweep re-queues it; (c) an empty reason on CANCELLED — a person
-		// cancelled it from the app/admin: re-place once, then stop and alert.
+		// 16:35 sweep re-queues it; (c) anything else, including a person
+		// cancelling it from the app: the stop was hit at the live price, so
+		// the strategy sells — re-place (operator rule 2026-10-22: "if the
+		// stock hit 20% it should sell"; bounded only by exitChaseMax).
 		reason := ""
 		if book, berr := cyc.book(ctx, m, auth); berr == nil {
 			for i := range book {
@@ -215,9 +217,6 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 			if !marketOpenNowIST() {
 				return // exchange sweep after the close — the 16:35 sweep re-queues it as an AMO exit
 			}
-		case st == "CANCELLED" && reason == "" && row.RetryCount >= 1:
-			m.giveUp(ctx, row, true, "exit cancelled externally (empty reject reason) for the second time — not re-placing; a person is overriding the strategy, operator decision needed")
-			return
 		}
 		if !marketOpenNowIST() {
 			return // nothing can be placed now; the EOD sweep / next session handles it
