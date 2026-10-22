@@ -84,8 +84,8 @@ type ManthanOrder struct {
 	BrokerLimitPrice   float64 `db:"broker_limit_price"`
 	// Effective stop distance stamped by rules-engine (LARGE=10, else 20).
 	// Zero = legacy row from before migration 017 → treat as 20.
-	StopLossPct float64 `json:"stop_loss_pct"`
-	BrokerOrderID      string  `db:"broker_order_id"`
+	StopLossPct   float64 `json:"stop_loss_pct"`
+	BrokerOrderID string  `db:"broker_order_id"`
 	// TradeDate (optional) — the session a protective row belongs to. Set on
 	// AMO rows and (since 2026-08-19) on hot protective SL rows so
 	// HasActiveProtectionForToday can see them; NULL on entry/legacy rows.
@@ -189,6 +189,7 @@ type BrokerAuth struct {
 // SymbolInfo holds resolved symbol data for order placement.
 type SymbolInfo struct {
 	Symbol        string  // e.g., "GALLANTT"
+	ISIN          string  // e.g., "INE338D01028" — lets pricing re-resolve the token from the live ISIN key
 	ExchangeToken string  // e.g., "13337"
 	IndiraSymbol  string  // e.g., "STK_GALLANTT_EQ_NSE_13337"
 	Exchange      string  // e.g., "NSE"

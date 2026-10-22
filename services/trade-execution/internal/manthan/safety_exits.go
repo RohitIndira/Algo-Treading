@@ -20,6 +20,9 @@ const (
 	// exitLookback — how far back open exit rows are considered (an AMO exit
 	// queued yesterday evening converts this morning).
 	exitLookback = 48 * time.Hour
+	// exitLostAfter — a DAY exit absent from the broker's book this long after
+	// placement is treated as lost (order-book lag is seconds, not a minute).
+	exitLostAfter = 60 * time.Second
 )
 
 // checkPendingExits confirms or chases every exit sell still PLACED at the
@@ -50,15 +53,33 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, row *ManthanOrder)
 	if auth == nil {
 		return
 	}
+	info := &SymbolInfo{
+		Symbol:        row.Symbol,
+		ISIN:          row.ISIN,
+		IndiraSymbol:  row.IndiraSymbol,
+		ExchangeToken: row.ExchangeToken,
+		Exchange:      "NSE",
+		TickSize:      0.05,
+	}
+	var age time.Duration
+	if row.PlacedAt != nil {
+		age = time.Since(*row.PlacedAt)
+	}
+
 	status, filledQty, avgPrice, err := m.broker.GetOrderStatus(ctx, *auth, row.BrokerOrderID)
 	if err != nil {
 		if errors.Is(err, indiraClient.ErrAuthExpired) {
 			notifyAuthExpired(m.authNotif, ctx, row.UserID, "safety-monitor-exit")
 			return
 		}
-		// An AMO exit gets a NEW broker id at the 08:50 conversion; find the
-		// converted order in the book and adopt it (next cycle confirms/chases).
-		if row.OrderType == OrderTypeAMOSell && strings.Contains(err.Error(), "not found") {
+		if !strings.Contains(err.Error(), "not found") {
+			return
+		}
+		switch {
+		case row.OrderType == OrderTypeAMOSell:
+			// An AMO exit gets a NEW broker id at the 08:50 conversion; find
+			// the converted order in the book and adopt it (next cycle
+			// confirms/chases).
 			if book, berr := m.broker.GetOrderBook(ctx, *auth); berr == nil {
 				if conv := matchConvertedExit(row, book); conv != nil {
 					_ = m.repo.AdoptConvertedExit(ctx, row.ID, conv.OrdId)
@@ -68,6 +89,19 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, row *ManthanOrder)
 						zap.String("symbol", row.Symbol), zap.String("old", row.BrokerOrderID), zap.String("new", conv.OrdId))
 				}
 			}
+		case age >= exitLostAfter:
+			// A DAY exit that never reached the broker's book (BODALCHEM
+			// 2026-10-22: "Requested" at placement, then absent — its limit
+			// came from a stale feed row and sat far outside the band). The
+			// strategy still wants out: book the loss and place a fresh exit
+			// from LIVE prices (token re-resolved from the ISIN key).
+			m.logger.Error("Safety monitor: exit sell vanished from the broker book — re-placing from live prices",
+				zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol),
+				zap.String("broker_order_id", row.BrokerOrderID), zap.Duration("age", age))
+			_ = m.repo.UpdateOrderCancelled(ctx, row.ID)
+			_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_LOST", "PLACED", "CANCELLED", "", row.LimitPrice, row.Qty,
+				"exit order not in the broker book — re-placing from live prices")
+			m.replaceExit(ctx, auth, row, info, row.Qty, "exit vanished from the broker book", 0)
 		}
 		return
 	}
@@ -78,27 +112,32 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, row *ManthanOrder)
 	if status == "CANCELLED" || IsRejectedWSStatus(status) {
 		_ = m.repo.UpdateOrderCancelled(ctx, row.ID)
 		_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_LOST", "PLACED", "CANCELLED", status, row.LimitPrice, row.Qty,
-			"exit sell cancelled/rejected at broker — position is held again; protection paths will re-arm")
+			"exit sell cancelled/rejected at broker")
 		m.logger.Error("Safety monitor: exit sell cancelled/rejected at broker — position still held",
 			zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol),
 			zap.String("broker_order_id", row.BrokerOrderID), zap.String("broker_status", status))
+		// A broker/exchange REJECTION is technical (band, price, qty) — place a
+		// fresh exit from live prices, bounded by exitChaseMax. A CANCEL came
+		// from a person; respect it (the protection paths re-arm the stop).
+		if IsRejectedWSStatus(status) && row.RetryCount < exitChaseMax {
+			m.replaceExit(ctx, auth, row, info, row.Qty-row.FilledQty, "exit rejected at broker: "+status, 0)
+		}
 		return
 	}
 	if row.OrderType != OrderTypeMarketSell {
 		return // AMO exits wait for the next session — nothing to chase today
 	}
-	if row.PlacedAt == nil || time.Since(*row.PlacedAt) < exitChaseAfter || row.ExchangeToken == "" {
+	if age < exitChaseAfter || info.ExchangeToken == "" {
 		return
 	}
-	ltp, stale, asOf, lerr := m.broker.FeedLTP(ctx, row.ExchangeToken)
+	ltp, stale, asOf, lerr := m.broker.FreshLTP(ctx, info)
 	switch {
 	case lerr != nil:
 		return
 	case stale:
-		// The feed cannot tell us where the market is; an exit resting this
-		// long with a dead feed row is re-priced from the broker's books
-		// (BODALCHEM 2026-10-22: feed 23 days old, order 12% above market).
-		m.logger.Warn("Safety monitor: exit resting on a STALE feed row — re-pricing from the broker's books",
+		// No live row under any token: an exit resting this long on a dead
+		// feed is re-priced from whatever price source ExitLimitPrice finds.
+		m.logger.Warn("Safety monitor: exit resting on a STALE feed row — re-pricing",
 			zap.String("symbol", row.Symbol), zap.Time("feed_as_of", asOf), zap.Float64("limit", row.LimitPrice))
 	case ltp <= 0 || ltp >= row.LimitPrice:
 		return // still marketable at our price — give the exchange time
@@ -109,15 +148,6 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, row *ManthanOrder)
 			zap.Float64("limit", row.LimitPrice), zap.Float64("ltp", ltp), zap.Int("repricings", row.RetryCount))
 		return
 	}
-
-	info := &SymbolInfo{
-		Symbol:        row.Symbol,
-		IndiraSymbol:  row.IndiraSymbol,
-		ExchangeToken: row.ExchangeToken,
-		Exchange:      "NSE",
-		TickSize:      0.05,
-	}
-	m.broker.EnrichMarketInfo(ctx, info)
 
 	m.logger.Warn("Safety monitor: exit LIMIT resting below market — re-pricing",
 		zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol),
@@ -145,18 +175,28 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, row *ManthanOrder)
 		_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_REPRICE_CANCEL", "PLACED", "CANCELLED", status2, row.LimitPrice, row.Qty,
 			"resting exit cancelled for re-price")
 	}
+	m.replaceExit(ctx, auth, row, info, remaining,
+		fmt.Sprintf("re-priced exit #%d (was %.2f, ltp %.2f)", row.RetryCount+1, row.LimitPrice, ltp), row.LimitPrice)
+}
 
-	newID, newLimit, perr := m.broker.PlaceMarketableLimitSell(ctx, *auth, info, remaining)
+// replaceExit places a fresh marketable LIMIT for the remainder of a lost /
+// re-priced exit and books it as a new PLACED row carrying the lineage's
+// re-price count. restoreLimit > 0: if no price can be found (dead feed AND
+// no broker price) the previous order is put back at that limit so the exit
+// stays in flight and tracked; 0 means there is nothing to restore.
+func (m *SafetyMonitor) replaceExit(ctx context.Context, auth *BrokerAuth, row *ManthanOrder, info *SymbolInfo, qty int, reason string, restoreLimit float64) {
+	if qty <= 0 {
+		return
+	}
+	newID, newLimit, perr := m.broker.PlaceMarketableLimitSell(ctx, *auth, info, qty)
 	if perr != nil {
-		// No price to re-price from (dead feed AND no broker price): put the
-		// previous order back at its old limit so the exit stays in flight and
-		// tracked, and shout for a human.
-		m.logger.Error("Safety monitor: exit re-price FAILED — restoring the previous limit; manual intervention required",
-			zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol), zap.Int("qty", remaining), zap.Error(perr))
-		_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_REPRICE_FAILED", "CANCELLED", "CANCELLED", "", row.LimitPrice, remaining, perr.Error())
-		if row.LimitPrice > 0 {
-			if restoreID, rerr := m.broker.PlaceLimitSell(ctx, *auth, info, remaining, row.LimitPrice); rerr == nil {
-				newID, newLimit, perr = restoreID, row.LimitPrice, nil
+		m.logger.Error("Safety monitor: exit re-place FAILED — manual intervention required",
+			zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol), zap.Int("qty", qty),
+			zap.Float64("restore_limit", restoreLimit), zap.Error(perr))
+		_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_REPRICE_FAILED", "CANCELLED", "CANCELLED", "", restoreLimit, qty, perr.Error())
+		if restoreLimit > 0 {
+			if restoreID, rerr := m.broker.PlaceLimitSell(ctx, *auth, info, qty, restoreLimit); rerr == nil {
+				newID, newLimit, perr = restoreID, restoreLimit, nil
 			}
 		}
 		if perr != nil {
@@ -169,12 +209,11 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, row *ManthanOrder)
 	}
 	newRowID, ierr := m.repo.InsertExitSellPlaced(ctx, ExitSellRow{
 		StrategyID: row.StrategyID, UserID: row.UserID, Symbol: row.Symbol, ISIN: row.ISIN,
-		Info: info, OrderType: OrderTypeMarketSell, Qty: remaining, LimitPrice: newLimit,
-		BrokerOrderID: newID, ParentOrderID: parent,
-		Reason: fmt.Sprintf("re-priced exit #%d (was %.2f, ltp %.2f)", row.RetryCount+1, row.LimitPrice, ltp),
+		Info: info, OrderType: OrderTypeMarketSell, Qty: qty, LimitPrice: newLimit,
+		BrokerOrderID: newID, ParentOrderID: parent, Reason: reason,
 	})
 	if ierr != nil {
-		m.logger.Error("Safety monitor: re-priced exit placed but NOT recorded",
+		m.logger.Error("Safety monitor: replacement exit placed but NOT recorded",
 			zap.String("symbol", row.Symbol), zap.String("broker_order_id", newID), zap.Error(ierr))
 		return
 	}

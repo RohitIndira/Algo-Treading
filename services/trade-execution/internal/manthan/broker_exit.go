@@ -230,10 +230,41 @@ func (b *BrokerAdapter) fetchMarketSnap(ctx context.Context, token string) (mark
 	return parseMarketSnap([]byte(raw))
 }
 
-// FeedLTP returns the feed LTP for a token together with a staleness verdict
-// (ltp is 0 when the row is missing or stale).
-func (b *BrokerAdapter) FeedLTP(ctx context.Context, token string) (ltp float64, stale bool, asOf time.Time, err error) {
-	snap, err := b.fetchMarketSnap(ctx, token)
+// refreshToken re-resolves the exchange token from the ISIN key — the LIVE
+// mapping — and, when it differs from the token the caller carried, swaps
+// info over to it. A token stored on a DB row can be weeks stale: BODALCHEM
+// moved from 25017 to 25021 and every reader (exit pricing, the 09:14
+// planner, the safety monitor) kept staring at the dead row under 25017 —
+// the stop looked "below the band" for weeks while the stock was 25% lower.
+// Returns true when the token changed.
+func (b *BrokerAdapter) refreshToken(ctx context.Context, info *SymbolInfo) bool {
+	if info == nil || info.ISIN == "" {
+		return false
+	}
+	tok, err := b.resolveToken(ctx, info.ISIN)
+	if err != nil || tok == "" || tok == info.ExchangeToken {
+		return false
+	}
+	b.logger.Warn("exchange token changed — switching to the live mapping from the ISIN key",
+		zap.String("symbol", info.Symbol), zap.String("isin", info.ISIN),
+		zap.String("stored_token", info.ExchangeToken), zap.String("live_token", tok))
+	info.ExchangeToken = tok
+	info.IndiraSymbol = fmt.Sprintf("STK_%s_EQ_NSE_%s", info.Symbol, tok)
+	info.DPRLower, info.DPRUpper = 0, 0
+	b.EnrichMarketInfo(ctx, info)
+	return true
+}
+
+// FreshLTP is the Redis LTP for info. When the row under the carried token is
+// missing or stale it re-resolves the token from the ISIN key and reads the
+// live row. stale=true means no live row exists under any token.
+func (b *BrokerAdapter) FreshLTP(ctx context.Context, info *SymbolInfo) (ltp float64, stale bool, asOf time.Time, err error) {
+	snap, err := b.fetchMarketSnap(ctx, info.ExchangeToken)
+	if err != nil || feedStale(snap.AsOf, time.Now()) {
+		if b.refreshToken(ctx, info) {
+			snap, err = b.fetchMarketSnap(ctx, info.ExchangeToken)
+		}
+	}
 	if err != nil {
 		return 0, false, time.Time{}, err
 	}
@@ -281,6 +312,15 @@ func (b *BrokerAdapter) brokerLTP(ctx context.Context, auth BrokerAuth, symbol s
 func (b *BrokerAdapter) ExitLimitPrice(ctx context.Context, auth BrokerAuth, info *SymbolInfo) (limit, ltp float64, src string, err error) {
 	dprLo, dprHi := info.DPRLower, info.DPRUpper
 	snap, serr := b.fetchMarketSnap(ctx, info.ExchangeToken)
+	if serr != nil || feedStale(snap.AsOf, time.Now()) {
+		// Missing or stale row under the carried token: the ISIN key is the
+		// live mapping — re-resolve and read the live row (Redis stays the
+		// price source; the broker's books are only the last resort).
+		if b.refreshToken(ctx, info) {
+			snap, serr = b.fetchMarketSnap(ctx, info.ExchangeToken)
+			dprLo, dprHi = info.DPRLower, info.DPRUpper
+		}
+	}
 	switch {
 	case serr != nil:
 		// no row — keep whatever band the caller already had

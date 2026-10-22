@@ -251,3 +251,23 @@ func (r *Repository) AdoptConvertedExit(ctx context.Context, id int64, newBroker
 		 WHERE id = $1`, id, newBrokerID)
 	return err
 }
+
+// UpdateSymbolToken rewrites the exchange token / broker symbol on every row
+// of a position after the ISIN key showed the token moved (metadata only —
+// never touches status, quantities or prices). Returns rows changed.
+func (r *Repository) UpdateSymbolToken(ctx context.Context, strategyID, symbol, token, indiraSymbol string) (int64, error) {
+	if token == "" {
+		return 0, nil
+	}
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET exchange_token = $3, indira_symbol = $4, updated_at = now()
+		 WHERE strategy_id = $1 AND symbol = $2
+		   AND COALESCE(exchange_token,'') <> $3`,
+		strategyID, symbol, token, indiraSymbol)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}

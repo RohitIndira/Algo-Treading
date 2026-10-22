@@ -624,16 +624,29 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 // the position row (avoids the ISIN→token Redis lookup which can fail for
 // long-held / legacy positions where the ISIN key was never populated).
 func (p *ProtectiveReplay) resolveInfo(ctx context.Context, pos PositionNeedingProtection) *SymbolInfo {
-	if pos.IndiraSymbol == "" || pos.ExchangeToken == "" {
-		// Fall back to ISIN lookup.
-		info, err := p.broker.ResolveSymbol(ctx, pos.Symbol, pos.ISIN)
-		if err != nil {
-			return nil
+	// The ISIN key is the LIVE token mapping — prefer it (2026-10-22). The
+	// token stored on the position's rows can be weeks stale: BODALCHEM moved
+	// 25017→25021 and this planner kept reading the dead row under 25017, so
+	// the stop looked "below the band" every morning while the stock was 25%
+	// lower. When the two disagree the rows are re-pointed at the live token.
+	if pos.ISIN != "" {
+		if info, err := p.broker.ResolveSymbol(ctx, pos.Symbol, pos.ISIN); err == nil {
+			if pos.ExchangeToken != "" && pos.ExchangeToken != info.ExchangeToken {
+				p.logger.Warn("Replay: stored token differs from the live ISIN mapping — using live, re-pointing rows",
+					zap.String("symbol", pos.Symbol), zap.String("stored", pos.ExchangeToken), zap.String("live", info.ExchangeToken))
+				if _, uerr := p.repo.UpdateSymbolToken(ctx, pos.StrategyID, pos.Symbol, info.ExchangeToken, info.IndiraSymbol); uerr != nil {
+					p.logger.Warn("Replay: token re-point failed", zap.String("symbol", pos.Symbol), zap.Error(uerr))
+				}
+			}
+			return info
 		}
-		return info
+	}
+	if pos.IndiraSymbol == "" || pos.ExchangeToken == "" {
+		return nil
 	}
 	info := &SymbolInfo{
 		Symbol:        pos.Symbol,
+		ISIN:          pos.ISIN,
 		IndiraSymbol:  pos.IndiraSymbol,
 		ExchangeToken: pos.ExchangeToken,
 		Exchange:      strDefault(pos.Exchange, "NSE"),

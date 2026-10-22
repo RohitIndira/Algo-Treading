@@ -116,6 +116,7 @@ func (b *BrokerAdapter) ResolveSymbol(ctx context.Context, symbol, isin string) 
 
 	info := &SymbolInfo{
 		Symbol:        symbol,
+		ISIN:          isin,
 		ExchangeToken: token,
 		IndiraSymbol:  fmt.Sprintf("STK_%s_EQ_NSE_%s", symbol, token),
 		Exchange:      "NSE",

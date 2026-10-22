@@ -713,46 +713,63 @@ func (h *SLHandler) EmergencySell(ctx context.Context, signal SLExitSignal) erro
 	return h.emergencySellInternal(ctx, ec, info, auth, qty, "SL triggered — emergency exit")
 }
 
-// resolveExitSymbol resolves the broker symbol for an exit. Order: the signal
-// ISIN → the position's filled entry row (stored token / indira symbol, else
-// its ISIN). Also returns the ISIN that worked, for bookkeeping.
+// resolveExitSymbol resolves the broker symbol for an exit. The ISIN key in
+// Redis is the LIVE token mapping and is always preferred (signal ISIN, else
+// the entry row's ISIN); the token stored on the entry row is only a fallback
+// — it can be weeks stale (BODALCHEM 25017→25021, 2026-10-22). When the two
+// disagree the position's rows are re-pointed at the live token. Also returns
+// the ISIN used, for bookkeeping.
 func (h *SLHandler) resolveExitSymbol(ctx context.Context, signal SLExitSignal) (*SymbolInfo, string, error) {
+	var entry *ManthanOrder
+	if h.repo != nil {
+		e, err := h.repo.GetActiveEntryBySymbol(ctx, signal.StrategyID, signal.Symbol)
+		if err != nil {
+			h.logger.Warn("EmergencySell: entry row lookup failed", zap.String("symbol", signal.Symbol), zap.Error(err))
+		} else {
+			entry = e
+		}
+	}
+	isin := signal.ISIN
+	if isin == "" && entry != nil {
+		isin = entry.ISIN
+	}
+
 	var firstErr error
-	if signal.ISIN != "" {
-		info, err := h.broker.ResolveSymbol(ctx, signal.Symbol, signal.ISIN)
+	if isin != "" {
+		info, err := h.broker.ResolveSymbol(ctx, signal.Symbol, isin)
 		if err == nil {
-			return info, signal.ISIN, nil
+			if entry != nil && entry.ExchangeToken != "" && entry.ExchangeToken != info.ExchangeToken {
+				h.logger.Warn("EmergencySell: stored token differs from the live ISIN mapping — using live, re-pointing rows",
+					zap.String("symbol", signal.Symbol), zap.String("stored", entry.ExchangeToken), zap.String("live", info.ExchangeToken))
+				if h.repo != nil {
+					if n, uerr := h.repo.UpdateSymbolToken(ctx, signal.StrategyID, signal.Symbol, info.ExchangeToken, info.IndiraSymbol); uerr != nil {
+						h.logger.Warn("EmergencySell: token re-point failed", zap.String("symbol", signal.Symbol), zap.Error(uerr))
+					} else {
+						h.logger.Info("EmergencySell: position rows re-pointed at the live token", zap.String("symbol", signal.Symbol), zap.Int64("rows", n))
+					}
+				}
+			}
+			h.logger.Info("EmergencySell: symbol resolved from the live ISIN key",
+				zap.String("symbol", signal.Symbol), zap.String("isin", isin), zap.String("token", info.ExchangeToken))
+			return info, isin, nil
 		}
 		firstErr = err
-		h.logger.Warn("EmergencySell: ISIN resolve failed — falling back to the entry row",
-			zap.String("symbol", signal.Symbol), zap.String("isin", signal.ISIN), zap.Error(err))
+		h.logger.Warn("EmergencySell: ISIN resolve failed — falling back to the entry row's stored token",
+			zap.String("symbol", signal.Symbol), zap.String("isin", isin), zap.Error(err))
 	}
-	if h.repo != nil {
-		entry, err := h.repo.GetActiveEntryBySymbol(ctx, signal.StrategyID, signal.Symbol)
-		switch {
-		case err == nil && entry != nil && entry.ExchangeToken != "":
-			info := &SymbolInfo{
-				Symbol:        signal.Symbol,
-				ExchangeToken: entry.ExchangeToken,
-				IndiraSymbol:  strDefault(entry.IndiraSymbol, fmt.Sprintf("STK_%s_EQ_NSE_%s", signal.Symbol, entry.ExchangeToken)),
-				Exchange:      "NSE",
-				TickSize:      0.05,
-			}
-			h.broker.EnrichMarketInfo(ctx, info)
-			h.logger.Info("EmergencySell: symbol resolved from the entry row",
-				zap.String("symbol", signal.Symbol), zap.String("token", entry.ExchangeToken), zap.String("isin", entry.ISIN))
-			return info, entry.ISIN, nil
-		case err == nil && entry != nil && entry.ISIN != "" && entry.ISIN != signal.ISIN:
-			info, rerr := h.broker.ResolveSymbol(ctx, signal.Symbol, entry.ISIN)
-			if rerr == nil {
-				return info, entry.ISIN, nil
-			}
-			if firstErr == nil {
-				firstErr = rerr
-			}
-		case err != nil && firstErr == nil:
-			firstErr = err
+	if entry != nil && entry.ExchangeToken != "" {
+		info := &SymbolInfo{
+			Symbol:        signal.Symbol,
+			ISIN:          isin,
+			ExchangeToken: entry.ExchangeToken,
+			IndiraSymbol:  strDefault(entry.IndiraSymbol, fmt.Sprintf("STK_%s_EQ_NSE_%s", signal.Symbol, entry.ExchangeToken)),
+			Exchange:      "NSE",
+			TickSize:      0.05,
 		}
+		h.broker.EnrichMarketInfo(ctx, info)
+		h.logger.Info("EmergencySell: symbol resolved from the entry row's stored token",
+			zap.String("symbol", signal.Symbol), zap.String("token", entry.ExchangeToken), zap.String("isin", isin))
+		return info, isin, nil
 	}
 	if firstErr == nil {
 		firstErr = fmt.Errorf("no isin on signal and no filled entry row with a token for %s/%s", signal.StrategyID, signal.Symbol)
