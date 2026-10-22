@@ -3,9 +3,12 @@ package manthan
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
@@ -131,17 +134,188 @@ func (b *BrokerAdapter) EnrichMarketInfo(ctx context.Context, info *SymbolInfo) 
 	}
 }
 
+// ─── Feed freshness (2026-10-22, BODALCHEM) ─────────────────────────────────
+//
+// The market feed row for a token can go stale for weeks (BODALCHEM's row
+// last ticked 2026-09-29; the exit priced 2% under a price the stock had
+// left 23 days earlier and rested above the market all morning, and the
+// chase never fired because the "LTP" still looked higher than our limit).
+// An exit must never be priced from a stale row: when the row was not
+// updated during today's session (or is older than MANTHAN_FEED_STALE_AFTER
+// while the market is open) its LTP AND band are discarded and the price
+// comes from the broker's own books instead (holdings, then position book).
+
+// feedStaleAfter — a row older than this while the market is open is stale
+// even if it was touched earlier today (mid-session feed death).
+var feedStaleAfter = envDuration("MANTHAN_FEED_STALE_AFTER", 6*time.Hour, time.Minute, 24*time.Hour)
+
+func envDuration(name string, def, lo, hi time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < lo || d > hi {
+		return def
+	}
+	return d
+}
+
+// marketSnap is one market:nse:<token> row with its freshness stamp.
+type marketSnap struct {
+	LTP, DPRLower, DPRUpper, TickSize float64
+	AsOf                              time.Time // zero when the producer stamped nothing
+}
+
+func parseMarketSnap(raw []byte) (marketSnap, error) {
+	var mkt struct {
+		LTP         float64 `json:"ltp"`
+		DPRLower    float64 `json:"dpr_lower"`
+		DPRUpper    float64 `json:"dpr_upper"`
+		TickSize    float64 `json:"tick_size"`
+		TimestampMs int64   `json:"timestamp"`
+		LastUpdated string  `json:"last_updated"`
+	}
+	if err := json.Unmarshal(raw, &mkt); err != nil {
+		return marketSnap{}, err
+	}
+	snap := marketSnap{LTP: mkt.LTP, DPRLower: mkt.DPRLower, DPRUpper: mkt.DPRUpper, TickSize: mkt.TickSize}
+	switch {
+	case mkt.TimestampMs > 1e12: // epoch milliseconds
+		snap.AsOf = time.UnixMilli(mkt.TimestampMs)
+	case mkt.TimestampMs > 1e9: // epoch seconds
+		snap.AsOf = time.Unix(mkt.TimestampMs, 0)
+	case mkt.LastUpdated != "":
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.999999999Z07:00", "2006-01-02 15:04:05"} {
+			if t, err := time.Parse(layout, strings.TrimSpace(mkt.LastUpdated)); err == nil {
+				snap.AsOf = t
+				break
+			}
+		}
+	}
+	return snap, nil
+}
+
+// feedStale decides whether a row stamped asOf can price an exit at `now`.
+// Judged only on a trading day between 09:20 and 15:30 IST (before the open
+// the last tick is legitimately yesterday's). Unstamped rows are trusted.
+func feedStale(asOf, now time.Time) bool {
+	if asOf.IsZero() {
+		return false
+	}
+	ist := istLocation()
+	n := now.In(ist)
+	if !indiraClient.IsTradingDay(n) {
+		return false
+	}
+	mod := n.Hour()*60 + n.Minute()
+	if mod < 9*60+20 || mod > 15*60+30 {
+		return false
+	}
+	sessionStart := time.Date(n.Year(), n.Month(), n.Day(), 8, 0, 0, 0, ist)
+	if asOf.Before(sessionStart) {
+		return true
+	}
+	return n.Sub(asOf) > feedStaleAfter
+}
+
+func (b *BrokerAdapter) fetchMarketSnap(ctx context.Context, token string) (marketSnap, error) {
+	if token == "" || b.extRedis == nil {
+		return marketSnap{}, fmt.Errorf("no token / feed")
+	}
+	raw, err := b.extRedis.Get(ctx, "market:nse:"+token).Result()
+	if err != nil {
+		return marketSnap{}, err
+	}
+	return parseMarketSnap([]byte(raw))
+}
+
+// FeedLTP returns the feed LTP for a token together with a staleness verdict
+// (ltp is 0 when the row is missing or stale).
+func (b *BrokerAdapter) FeedLTP(ctx context.Context, token string) (ltp float64, stale bool, asOf time.Time, err error) {
+	snap, err := b.fetchMarketSnap(ctx, token)
+	if err != nil {
+		return 0, false, time.Time{}, err
+	}
+	if feedStale(snap.AsOf, time.Now()) {
+		return 0, true, snap.AsOf, nil
+	}
+	return snap.LTP, false, snap.AsOf, nil
+}
+
+// brokerLTP asks the broker's own books for the last traded price of a
+// holding — fresh by construction. Holdings first (DELIVERY lots), then the
+// position book (today's trades). Note: a holding whose quantity is locked by
+// a resting SELL is hidden from v2/holdings, so callers cancel first.
+func (b *BrokerAdapter) brokerLTP(ctx context.Context, auth BrokerAuth, symbol string) (float64, string, error) {
+	want := strings.ToUpper(strings.TrimSpace(symbol))
+	if holdings, err := b.client.GetHoldings(ctx, b.toIndiraAuth(auth)); err == nil {
+		for _, h := range holdings {
+			for _, s := range h.Symbol {
+				if strings.EqualFold(s.DispSym, want) || strings.EqualFold(s.BaseSym, want) {
+					if h.LTP > 0 {
+						return h.LTP, "broker-holdings", nil
+					}
+				}
+			}
+		}
+	} else if errors.Is(err, indiraClient.ErrAuthExpired) || IsAuthError(err) {
+		return 0, "", err
+	}
+	if positions, err := b.client.GetPositions(ctx, b.toIndiraAuth(auth)); err == nil {
+		for _, p := range positions {
+			if strings.EqualFold(p.Symbol.DispSym, want) || strings.EqualFold(p.Symbol.BaseSym, want) {
+				if p.LTP > 0 {
+					return p.LTP, "broker-positions", nil
+				}
+			}
+		}
+	}
+	return 0, "", fmt.Errorf("broker books have no price for %s", symbol)
+}
+
 // ExitLimitPrice returns the marketable exit limit for info plus the LTP it
-// was derived from (0 when the feed had none).
-func (b *BrokerAdapter) ExitLimitPrice(ctx context.Context, info *SymbolInfo) (limit, ltp float64, err error) {
-	if info.DPRLower <= 0 || info.TickSize <= 0 {
-		b.EnrichMarketInfo(ctx, info)
+// was derived from and where that LTP came from ("feed", "broker-holdings",
+// "broker-positions", "band-floor"). A stale feed row contributes nothing —
+// neither its LTP nor its band.
+func (b *BrokerAdapter) ExitLimitPrice(ctx context.Context, auth BrokerAuth, info *SymbolInfo) (limit, ltp float64, src string, err error) {
+	dprLo, dprHi := info.DPRLower, info.DPRUpper
+	snap, serr := b.fetchMarketSnap(ctx, info.ExchangeToken)
+	switch {
+	case serr != nil:
+		// no row — keep whatever band the caller already had
+	case feedStale(snap.AsOf, time.Now()):
+		b.logger.Warn("exit pricing: market feed row is STALE — ignoring its LTP and band, asking the broker for a price",
+			zap.String("symbol", info.Symbol), zap.String("token", info.ExchangeToken),
+			zap.Time("feed_as_of", snap.AsOf), zap.Float64("stale_ltp", snap.LTP))
+		dprLo, dprHi = 0, 0
+		if snap.TickSize > 0 {
+			info.TickSize = snap.TickSize
+		}
+	default:
+		ltp, src = snap.LTP, "feed"
+		if snap.TickSize > 0 {
+			info.TickSize = snap.TickSize
+		}
+		if snap.DPRLower > 0 {
+			dprLo, info.DPRLower = snap.DPRLower, snap.DPRLower
+		}
+		if snap.DPRUpper > 0 {
+			dprHi, info.DPRUpper = snap.DPRUpper, snap.DPRUpper
+		}
 	}
-	if info.ExchangeToken != "" {
-		ltp, _ = b.FetchLTP(ctx, info.ExchangeToken)
+	if ltp <= 0 {
+		if bl, bsrc, berr := b.brokerLTP(ctx, auth, info.Symbol); berr == nil && bl > 0 {
+			ltp, src = bl, bsrc
+		} else if berr != nil {
+			b.logger.Warn("exit pricing: broker price lookup failed", zap.String("symbol", info.Symbol), zap.Error(berr))
+		}
 	}
-	limit, err = exitLimitFor(ltp, info.TickSize, info.DPRLower, info.DPRUpper, exitLimitSlippagePct)
-	return limit, ltp, err
+	if ltp <= 0 && dprLo > 0 {
+		src = "band-floor"
+	}
+	limit, err = exitLimitFor(ltp, info.TickSize, dprLo, dprHi, exitLimitSlippagePct)
+	return limit, ltp, src, err
 }
 
 // PlaceLimitSell places a plain DAY LIMIT SELL (DELIVERY) — the only order
@@ -215,7 +389,7 @@ func (b *BrokerAdapter) placeLimitSell(ctx context.Context, auth BrokerAuth, inf
 // the live LTP (or the band floor) and places it. Returns the broker id and
 // the limit actually sent so callers can persist it on the exit row.
 func (b *BrokerAdapter) PlaceMarketableLimitSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int) (string, float64, error) {
-	limit, ltp, err := b.ExitLimitPrice(ctx, info)
+	limit, ltp, src, err := b.ExitLimitPrice(ctx, auth, info)
 	if err != nil {
 		return "", 0, fmt.Errorf("%s: %w", info.Symbol, err)
 	}
@@ -223,6 +397,7 @@ func (b *BrokerAdapter) PlaceMarketableLimitSell(ctx context.Context, auth Broke
 		zap.String("symbol", info.Symbol),
 		zap.Int("qty", qty),
 		zap.Float64("ltp", ltp),
+		zap.String("ltp_source", src),
 		zap.Float64("limit", limit),
 		zap.Float64("slippage_pct", exitLimitSlippagePct),
 		zap.Float64("dpr_lower", info.DPRLower))

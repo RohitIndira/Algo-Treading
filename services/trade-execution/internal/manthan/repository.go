@@ -1746,7 +1746,7 @@ func (r *Repository) InsertManualExitLedgerSell(ctx context.Context, e ManualExi
 		INSERT INTO manthan_orders
 			(signal_id, strategy_id, user_id, symbol, order_type, order_side,
 			 qty, filled_qty, status, avg_fill_price, exchange, filled_at, last_error)
-		VALUES ($1, $2, $3, $4, 'MARKET_SELL', 'SELL', $5, $5, 'FILLED', NULLIF($6, 0), 'NSE', now(),
+		VALUES ($1, $2, $3, $4, 'MARKET_SELL', 'SELL', $5, $5, 'FILLED', NULLIF($6::double precision, 0), 'NSE', now(),
 		        'manual-exit ledger projection: user sold via broker app (event '||$7||', broker order '||COALESCE(NULLIF($8,''),'?')||')')
 		ON CONFLICT (signal_id) DO NOTHING`,
 		e.SignalID, e.StrategyID, e.UserID, e.Symbol, e.Qty, e.ExitPrice,

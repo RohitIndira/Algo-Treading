@@ -190,3 +190,64 @@ func (r *Repository) UpdateOrderLimitAndParent(ctx context.Context, id int64, li
 		 WHERE id = $1`, id, limit, parentID)
 	return err
 }
+
+// HasOwnExitSell reports whether this service itself placed an exit sell for
+// the lot recently (same strategy, symbol and quantity; 48 h window). The
+// manual-exit ledger uses it to tell OUR sell — seen by positions svc through
+// the whole-book path and labelled MANUAL_EXIT — from a real manual sale.
+func (r *Repository) HasOwnExitSell(ctx context.Context, strategyID, symbol string, qty int) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+		    SELECT 1 FROM manthan_orders
+		     WHERE strategy_id = $1 AND symbol = $2
+		       AND order_side = 'SELL'
+		       AND order_type IN ('MARKET_SELL','AMO_SELL')
+		       AND COALESCE(broker_order_id,'') <> ''
+		       AND status IN ('PENDING','PLACED','FILLED')
+		       AND (qty = $3 OR filled_qty = $3)
+		       AND created_at >= now() - interval '2 days'
+		)`, strategyID, symbol, qty).Scan(&exists)
+	return exists, err
+}
+
+// ListOpenExitSellsForPosition returns every exit sell of ours still open
+// for the position, any age — a last-evening AMO LIMIT that converted this
+// morning (new broker id) still locks the quantity and must be found.
+func (r *Repository) ListOpenExitSellsForPosition(ctx context.Context, strategyID, symbol string) ([]*ManthanOrder, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, signal_id, strategy_id, user_id, symbol, isin, exchange,
+		       order_type, order_side, product_type, qty, filled_qty,
+		       limit_price, trigger_price, avg_fill_price,
+		       broker_order_id, broker_status, indira_symbol, exchange_token,
+		       status, retry_count, max_retries, last_error, parent_order_id,
+		       created_at, placed_at, filled_at, cancelled_at, updated_at
+		FROM manthan_orders
+		WHERE strategy_id = $1 AND symbol = $2
+		  AND order_side = 'SELL'
+		  AND order_type IN ('MARKET_SELL','AMO_SELL')
+		  AND status IN ('PENDING','PLACED')
+		  AND COALESCE(broker_order_id,'') <> ''
+		ORDER BY created_at`, strategyID, symbol)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOrders(rows)
+}
+
+// AdoptConvertedExit re-points an AMO exit row at the broker id its order
+// received at the 08:50 AMO conversion. From here on it is an ordinary DAY
+// LIMIT (chaseable), so the type flips to MARKET_SELL and the chase timer
+// restarts.
+func (r *Repository) AdoptConvertedExit(ctx context.Context, id int64, newBrokerID string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET last_error      = 'adopted converted AMO exit (was ' || COALESCE(broker_order_id,'') || ')',
+		       broker_order_id = $2,
+		       order_type      = 'MARKET_SELL',
+		       placed_at       = now(),
+		       updated_at      = now()
+		 WHERE id = $1`, id, newBrokerID)
+	return err
+}

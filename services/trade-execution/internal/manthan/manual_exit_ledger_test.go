@@ -19,6 +19,11 @@ type fakeLedger struct {
 	rows      []ManualExitLedgerRow
 	insertErr error
 	dupNext   bool // next insert reports already-present
+	ownExit   bool // HasOwnExitSell answer: the lot's sell was placed by us
+}
+
+func (f *fakeLedger) HasOwnExitSell(_ context.Context, _, _ string, _ int) (bool, error) {
+	return f.ownExit, nil
 }
 
 func (f *fakeLedger) InsertManualExitLedgerSell(_ context.Context, e ManualExitLedgerRow) (bool, error) {
@@ -174,5 +179,34 @@ func TestManthanEventPublisher_RemainsRetiredNoOp(t *testing.T) {
 	p := NewManthanEventPublisher([]string{"localhost:9092"}, zap.NewNop())
 	if p.writer != nil {
 		t.Fatal("ManthanEventPublisher constructed a live writer — the retired manthan.execution.events path must stay a no-op (see event_publisher.go)")
+	}
+}
+
+// 2026-10-22: positions svc labels OUR exit sells MANUAL_EXIT as well (they
+// reach it through the whole-book path). When an exit row of ours exists for
+// the lot, the ledger must not add a synthetic SELL on top — that
+// double-counted APARINDS (net −1).
+func TestManualExitLedger_SkipsOurOwnExit(t *testing.T) {
+	l := &fakeLedger{ownExit: true}
+	c := ledgerConsumer(l)
+	if err := c.HandleMessage(context.Background(), manualExitJSON(nil)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(l.rows) != 0 {
+		t.Fatalf("synthetic SELL recorded for our own exit: %+v", l.rows)
+	}
+}
+
+// A deterministic DB rejection must be dropped (offset committed), not
+// re-delivered forever — it blocked every later position event on 2026-10-22.
+func TestManualExitLedger_DropsNonRetryableInsertError(t *testing.T) {
+	l := &fakeLedger{insertErr: errors.New(`InsertManualExitLedgerSell: pq: invalid input syntax for type integer: "204.33"`)}
+	c := ledgerConsumer(l)
+	if err := c.HandleMessage(context.Background(), manualExitJSON(nil)); err != nil {
+		t.Fatalf("non-retryable insert error must be dropped, got %v", err)
+	}
+	l2 := &fakeLedger{insertErr: errors.New("dial tcp: connection refused")}
+	if err := ledgerConsumer(l2).HandleMessage(context.Background(), manualExitJSON(nil)); err == nil {
+		t.Fatal("transient insert error must still be returned for re-delivery")
 	}
 }

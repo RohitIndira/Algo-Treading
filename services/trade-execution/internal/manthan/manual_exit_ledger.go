@@ -69,6 +69,12 @@ type manualExitEnvelope struct {
 // satisfies it via InsertManualExitLedgerSell).
 type manualExitLedger interface {
 	InsertManualExitLedgerSell(ctx context.Context, e ManualExitLedgerRow) (bool, error)
+	// HasOwnExitSell reports whether this service itself placed an exit sell
+	// for the lot recently. positions svc sees OUR sells through the
+	// whole-book path and labels them MANUAL_EXIT too (2026-10-22); such a
+	// lot is already in the ledger as a PLACED→FILLED exit row, so no
+	// synthetic SELL may be added on top (it double-counted APARINDS).
+	HasOwnExitSell(ctx context.Context, strategyID, symbol string, qty int) (bool, error)
 }
 
 // ManualExitLedgerRow is the synthetic SELL to record.
@@ -196,6 +202,15 @@ func (c *ManualExitLedgerConsumer) HandleMessage(ctx context.Context, value []by
 		return nil
 	}
 
+	if own, oerr := c.ledger.HasOwnExitSell(ctx, ev.StrategyID, ev.Symbol, ev.Quantity); oerr != nil {
+		c.logger.Warn("manual-exit ledger: own-exit lookup failed — projecting anyway", zap.Error(oerr))
+	} else if own {
+		c.logger.Info("manual-exit ledger: exit is OUR sell (exit row exists) — not projecting a synthetic SELL",
+			zap.String("user_id", ev.UserID), zap.String("symbol", ev.Symbol),
+			zap.Int("qty", ev.Quantity), zap.String("position_id", ev.PositionID))
+		return nil
+	}
+
 	row := ManualExitLedgerRow{
 		SignalID:      "manualexit-" + ev.PositionID,
 		StrategyID:    ev.StrategyID,
@@ -208,6 +223,15 @@ func (c *ManualExitLedgerConsumer) HandleMessage(ctx context.Context, value []by
 	}
 	inserted, err := c.ledger.InsertManualExitLedgerSell(ctx, row)
 	if err != nil {
+		if isNonRetryableLedgerError(err) {
+			// A deterministic DB rejection would be re-delivered forever and
+			// block every later position event (2026-10-22: a float price hit
+			// an integer cast and the consumer sat on offset 323 all morning).
+			c.logger.Error("manual-exit ledger: insert rejected permanently — dropping event (operator: reconcile this lot by hand)",
+				zap.String("event_id", ev.EventID), zap.String("user_id", ev.UserID),
+				zap.String("symbol", ev.Symbol), zap.Int("qty", ev.Quantity), zap.Error(err))
+			return nil
+		}
 		return fmt.Errorf("manual-exit ledger insert: %w", err)
 	}
 	if inserted {
@@ -221,4 +245,22 @@ func (c *ManualExitLedgerConsumer) HandleMessage(ctx context.Context, value []by
 			zap.String("signal_id", row.SignalID))
 	}
 	return nil
+}
+
+// isNonRetryableLedgerError recognises Postgres data/constraint rejections
+// that no retry can fix (bad cast, invalid syntax, not-null, check).
+func isNonRetryableLedgerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, needle := range []string{
+		"invalid input syntax", "22P02", "numeric field overflow", "22003",
+		"null value in column", "23502", "violates check constraint", "23514",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }

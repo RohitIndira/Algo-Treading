@@ -838,6 +838,24 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 		}
 	}
 
+	// Step 2b — an exit of ours still resting (today's DAY LIMIT, or last
+	// evening's AMO LIMIT under its post-conversion id) also locks the qty.
+	if confirmed := h.cancelOpenExitSells(ctx, auth, info, ec.StrategyID, reason); confirmed > 0 && h.repo != nil {
+		if net, _, has, nerr := h.repo.NetHeldQty(ctx, ec.StrategyID, info.Symbol); nerr == nil && has {
+			if net <= 0 {
+				h.logger.Warn("EmergencySell: the earlier exit had already filled — nothing left to sell",
+					zap.String("user_id", auth.UserID), zap.String("symbol", info.Symbol))
+				h.emergencyMu.Lock()
+				delete(h.lastEmergency, latchKey)
+				h.emergencyMu.Unlock()
+				return nil
+			}
+			if net < qty {
+				qty = net
+			}
+		}
+	}
+
 	// Step 3a — lower circuit: nothing trades today; queue an AMO LIMIT at the floor.
 	_, atLower, _ := h.broker.CheckCircuit(ctx, info.ExchangeToken)
 	if atLower {
