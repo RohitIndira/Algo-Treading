@@ -26,6 +26,10 @@ func (f *fakeLedger) HasOwnExitSell(_ context.Context, _, _ string, _ int) (bool
 	return f.ownExit, nil
 }
 
+func (f *fakeLedger) HasOwnExitSellByBrokerID(_ context.Context, _ string) (bool, error) {
+	return f.ownExit, nil
+}
+
 func (f *fakeLedger) InsertManualExitLedgerSell(_ context.Context, e ManualExitLedgerRow) (bool, error) {
 	if f.insertErr != nil {
 		return false, f.insertErr

@@ -895,7 +895,8 @@ func (r *Repository) ListNakedOpenBuyPositions(ctx context.Context) ([]PositionN
 		    FROM manthan_orders
 		    WHERE order_side = 'SELL'
 		      AND (   (order_type LIKE '%SL%' AND status IN ('PENDING','SL_PLACED','SL_DEFERRED_BAND'))
-		           OR (order_type IN ('MARKET_SELL','AMO_SELL') AND status IN ('PENDING','PLACED')) )
+		           OR (order_type IN ('MARKET_SELL','AMO_SELL') AND status IN ('PENDING','PLACED')
+		               AND COALESCE(broker_order_id,'') <> '') )
 		    GROUP BY strategy_id, symbol
 		)
 		SELECT e.id, COALESCE(e.signal_id,''), e.strategy_id, e.user_id, e.symbol,

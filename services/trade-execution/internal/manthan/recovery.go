@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
+	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
@@ -134,7 +137,7 @@ func (r *Recovery) Run(ctx context.Context) error {
 		}
 
 		// SL was CANCELLED or REJECTED (broker cleared it)
-		if status == "CANCELLED" || IsRejectedWSStatus(status) {
+		if isCancelledBrokerStatus(strings.ToUpper(strings.TrimSpace(status))) {
 			r.logger.Warn("Recovery: SL was cancelled/rejected — re-placing!",
 				zap.String("symbol", sl.Symbol),
 				zap.String("broker_status", status))
@@ -160,48 +163,87 @@ func (r *Recovery) Run(ctx context.Context) error {
 }
 
 func (r *Recovery) replaceSL(ctx context.Context, sl *ManthanOrder, auth *BrokerAuth) {
+	// 2026-10-22 review: this path used to re-place the stop with the stored
+	// token and no band, and on ANY failure sold the whole position. It now
+	// mirrors SafetyMonitor.reprotectLostSL: live token, fresh band, exit
+	// only when the stop is actually crossed, defer when outside the band,
+	// park + alert on a rejection — never a sell on a failure, and nothing
+	// at all outside the regular session.
+	if !marketOpenNowIST() {
+		r.logger.Warn("Recovery: SL missing at broker but the market is closed — leaving it for the 09:14 cycle / naked scan",
+			zap.String("symbol", sl.Symbol), zap.String("user", sl.UserID))
+		return
+	}
 	info := &SymbolInfo{
 		Symbol:        sl.Symbol,
+		ISIN:          sl.ISIN,
 		IndiraSymbol:  sl.IndiraSymbol,
 		ExchangeToken: sl.ExchangeToken,
 		Exchange:      "NSE",
 		TickSize:      0.05,
 	}
-
-	newBrokerID, _, _, err := r.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, sl.LimitPrice)
-	if err != nil {
-		r.logger.Error("Recovery: SL re-place FAILED — LIMIT exit",
-			zap.String("symbol", sl.Symbol), zap.Error(err))
-		// 2026-10-22: marketable LIMIT (Market is rejected for algo orders),
-		// tracked as a PLACED exit row so the fill is confirmed, never assumed.
-		r.broker.EnrichMarketInfo(ctx, info)
+	ltp, stale, asOf, lerr := r.broker.FreshLTP(ctx, info)
+	if info.ExchangeToken != "" && info.ExchangeToken != sl.ExchangeToken {
+		_, _ = r.repo.UpdateSymbolToken(ctx, sl.StrategyID, sl.Symbol, info.ExchangeToken, info.IndiraSymbol)
+	}
+	r.broker.EnrichMarketInfo(ctx, info)
+	parent := int64(0)
+	if sl.ParentOrderID != nil {
+		parent = *sl.ParentOrderID
+	}
+	park := func(reason string) {
+		_ = r.repo.MarkSLDeferredBand(ctx, sl.ID, parent)
+		_ = r.repo.InsertEvent(ctx, sl.ID, "SL_LOST_PARKED", "SL_PLACED", "SL_DEFERRED_BAND", "", sl.TriggerPrice, sl.Qty, reason)
+		r.logger.Error("Recovery: lost stop could not be re-placed — parked as deferred; NO broker stop (software stop still active)",
+			zap.String("symbol", sl.Symbol), zap.String("user", sl.UserID), zap.String("reason", reason))
+	}
+	if lerr != nil || stale || ltp <= 0 {
+		park(fmt.Sprintf("no fresh price (stale=%v as_of=%s err=%v)", stale, asOf.Format(time.RFC3339), lerr))
+		return
+	}
+	if ltp <= sl.TriggerPrice {
+		r.logger.Warn("Recovery: stop lost and LTP already below the trigger — exiting with a marketable LIMIT",
+			zap.String("symbol", sl.Symbol), zap.Float64("ltp", ltp), zap.Float64("trigger", sl.TriggerPrice))
+		if uerr := r.repo.UpdateOrderCancelled(ctx, sl.ID); uerr != nil {
+			r.logger.Error("Recovery: could not mark the lost stop — not selling", zap.Error(uerr))
+			return
+		}
 		brokerID, limit, serr := r.broker.PlaceMarketableLimitSell(ctx, *auth, info, sl.Qty)
 		if serr != nil {
 			r.logger.Error("Recovery: LIMIT exit FAILED — position has no stop; manual intervention required",
 				zap.String("symbol", sl.Symbol), zap.Error(serr))
-			_ = r.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "SL_PLACED", "SL_PLACED",
-				"", 0, sl.Qty, "recovery: SL re-place + LIMIT exit both failed: "+serr.Error())
+			_ = r.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "CANCELLED", "CANCELLED",
+				"", ltp, sl.Qty, "recovery: stop crossed, LIMIT exit failed: "+serr.Error())
 			return
 		}
-		_ = r.repo.UpdateOrderCancelled(ctx, sl.ID)
 		_ = r.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL", "SL_PLACED", "CANCELLED",
-			"", limit, sl.Qty, "recovery: SL re-place failed — LIMIT exit broker_id="+brokerID)
-		parent := int64(0)
-		if sl.ParentOrderID != nil {
-			parent = *sl.ParentOrderID
-		}
+			"", limit, sl.Qty, "recovery: stop lost and crossed — LIMIT exit broker_id="+brokerID)
 		if _, ierr := r.repo.InsertExitSellPlaced(ctx, ExitSellRow{
 			StrategyID: sl.StrategyID, UserID: sl.UserID, Symbol: sl.Symbol, ISIN: sl.ISIN,
 			Info: info, OrderType: OrderTypeMarketSell, Qty: sl.Qty, LimitPrice: limit,
-			BrokerOrderID: brokerID, ParentOrderID: parent, Reason: "recovery: SL re-place failed — exit",
+			BrokerOrderID: brokerID, ParentOrderID: parent, Reason: "recovery: stop lost and crossed — exit",
 		}); ierr != nil {
 			r.logger.Error("Recovery: exit placed but NOT recorded",
 				zap.String("symbol", sl.Symbol), zap.String("broker_order_id", brokerID), zap.Error(ierr))
 		}
 		return
 	}
-
-	_ = r.repo.UpdateOrderPlaced(ctx, sl.ID, newBrokerID)
+	if _, _, deferWhy := resolveBandFloor(sl.TriggerPrice, info.DPRLower); deferWhy != "" {
+		park("intended stop outside today's band — deferred: " + deferWhy)
+		return
+	}
+	limit := sl.TriggerPrice - SLLimitGap(sl.TriggerPrice, info.TickSize)
+	newBrokerID, bt, bl, err := r.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, limit)
+	if err != nil {
+		if IsAuthError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			r.logger.Warn("Recovery: SL re-place hit auth/network — safety monitor retries", zap.String("symbol", sl.Symbol), zap.Error(err))
+			return
+		}
+		park("re-place rejected: " + err.Error())
+		return
+	}
+	_ = r.repo.UpdateSLBrokerID(ctx, sl.ID, newBrokerID, parent)
+	_ = r.repo.UpdateBrokerTrigger(ctx, sl.ID, bt, bl)
 	_ = r.repo.InsertEvent(ctx, sl.ID, "SL_REPLACED", "CANCELLED", "SL_PLACED",
 		"", sl.TriggerPrice, sl.Qty, "recovery: re-placed SL "+newBrokerID)
 

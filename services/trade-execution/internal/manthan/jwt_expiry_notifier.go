@@ -34,6 +34,9 @@ type JWTExpiryNotifier struct {
 	writer  *kafka.Writer
 	enabled bool
 
+	// lastOpsAlertAt dedups OPS_ALERT per (user, symbol, kind) — 5 min.
+	lastOpsAlertAt map[string]time.Time
+
 	// activeUserIDs returns the users currently holding live Manthan orders.
 	// Same provider used by Reconciler — no need to enumerate dormant users.
 	activeUserIDs func() []string
@@ -406,4 +409,67 @@ func decodeJWTExp(token string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("no exp claim")
 	}
 	return time.Unix(claims.Exp, 0), nil
+}
+
+// PublishOpsAlert emits an OPS_ALERT on manthan.notifications for a condition
+// that needs a human: a stop that could not be re-placed, an exit lost or
+// rejected at the broker, a chase that gave up. Same stream and shape as
+// SESSION_EXPIRED / JWT_EXPIRING so the app and the admin console render it
+// without a contract change. Dedup 5 min per (user, symbol, kind).
+func (n *JWTExpiryNotifier) PublishOpsAlert(ctx context.Context, userID, symbol, kind, message string) {
+	if n == nil || n.writer == nil {
+		return
+	}
+	key := userID + "|" + symbol + "|" + kind
+	n.dedupMu.Lock()
+	if last, ok := n.lastOpsAlertAt[key]; ok && time.Since(last) < 5*time.Minute {
+		n.dedupMu.Unlock()
+		return
+	}
+	if n.lastOpsAlertAt == nil {
+		n.lastOpsAlertAt = map[string]time.Time{}
+	}
+	n.lastOpsAlertAt[key] = time.Now()
+	n.dedupMu.Unlock()
+
+	notif := struct {
+		Type       string `json:"type"`
+		Severity   string `json:"severity"`
+		UserID     string `json:"user_id"`
+		Symbol     string `json:"symbol"`
+		Kind       string `json:"kind"`
+		Title      string `json:"title"`
+		Message    string `json:"message"`
+		ActionHint string `json:"action_hint"`
+		Timestamp  string `json:"timestamp"`
+	}{
+		Type:       "OPS_ALERT",
+		Severity:   "critical",
+		UserID:     userID,
+		Symbol:     symbol,
+		Kind:       kind,
+		Title:      "Manthan needs attention: " + kind,
+		Message:    message,
+		ActionHint: "Check the position at the broker and in the admin console",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	body, err := json.Marshal(notif)
+	if err != nil {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := n.writer.WriteMessages(writeCtx, kafka.Message{
+		Key:   []byte(userID),
+		Value: body,
+		Headers: []kafka.Header{
+			{Key: "type", Value: []byte("OPS_ALERT")},
+			{Key: "severity", Value: []byte("critical")},
+			{Key: "user_id", Value: []byte(userID)},
+		},
+	}); err != nil {
+		n.logger.Warn("OPS_ALERT publish failed", zap.String("user", userID), zap.String("kind", kind), zap.Error(err))
+		return
+	}
+	n.logger.Warn("OPS_ALERT published", zap.String("user", userID), zap.String("symbol", symbol), zap.String("kind", kind))
 }

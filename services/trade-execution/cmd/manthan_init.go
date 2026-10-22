@@ -301,6 +301,12 @@ func InitManthan(
 	// builds plans → fires SL/MARKET at 09:15:00.1 → reconciles at 09:15:30.
 	// No AMO. Off by default; enable with MANTHAN_PROTECTIVE_REPLAY_ENABLED=true
 	// once migrations 011 + 007_manthan_protective_audit are applied.
+	if ist, lerr := time.LoadLocation("Asia/Kolkata"); lerr == nil {
+		if y := time.Now().In(ist).Year(); !indiraPkg.HolidayCalendarCoversYear(y) {
+			log.Printf("[manthan] WARNING: the NSE holiday list has NO entries for %d — every weekday will be treated as a trading day until pkg/indira/calendar.go is updated", y)
+		}
+	}
+
 	var protectiveReplay *manthan.ProtectiveReplay
 	if os.Getenv("MANTHAN_PROTECTIVE_REPLAY_ENABLED") == "true" {
 		protectiveReplay = manthan.NewProtectiveReplay(broker, repo, getAuth, logger)
@@ -357,6 +363,7 @@ func InitManthan(
 		reconciler.SetAuthExpiryNotifier(jwtNotifier)
 		entryHandler.SetAuthExpiryNotifier(jwtNotifier)
 		safetyMonitor.SetAuthExpiryNotifier(jwtNotifier)
+		slHandler.SetAuthExpiryNotifier(jwtNotifier)
 		inboxWorker.SetAuthExpiryNotifier(jwtNotifier)
 		if externalDetector != nil {
 			externalDetector.SetAuthExpiryNotifier(jwtNotifier)

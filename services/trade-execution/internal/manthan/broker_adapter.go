@@ -104,6 +104,11 @@ func firstNonEmpty(ss ...string) string {
 const AMODprBuffer = 1.005
 
 func NewBrokerAdapter(client *indiraClient.Client, extRedis *redis.Client, logger *zap.Logger) *BrokerAdapter {
+	logger.Info("Manthan pricing knobs (effective values; env blocks are whitelists — forward them in ecosystem.config.js)",
+		zap.Float64("MANTHAN_EXIT_LIMIT_SLIPPAGE_PCT", exitLimitSlippagePct),
+		zap.Float64("MANTHAN_SL_LIMIT_GAP_PCT", slLimitGapPct),
+		zap.Float64("MANTHAN_ENTRY_LIMIT_SLIPPAGE_PCT", entryLimitSlippagePct),
+		zap.Duration("MANTHAN_FEED_STALE_AFTER", feedStaleAfter))
 	return &BrokerAdapter{client: client, extRedis: extRedis, logger: logger}
 }
 
@@ -199,44 +204,35 @@ func (b *BrokerAdapter) PlaceLimitBuy(ctx context.Context, auth BrokerAuth, info
 // PlaceMarketBuy places a MARKET BUY order for DELIVERY — used as the
 // guaranteed-fill fallback when LIMIT retries fail on an illiquid stock.
 // Sizing caller's responsibility (allocator sets qty based on per_call).
+//
+// 2026-10-22: the broker rejects OrdType "Market" for SEBI algo-tagged orders
+// ("Market order not allowed for Algo order"), so this is now a marketable
+// LIMIT BUY: LTP × (1 + MANTHAN_ENTRY_LIMIT_SLIPPAGE_PCT, default 1%), capped
+// at the upper band, priced from the LIVE Redis row (token re-resolved from
+// the ISIN key when the carried row is missing/stale). Returns ErrUnpriced
+// when no fresh price exists — nothing is sent blind. Name kept for the two
+// call sites (LIMIT-retries-exhausted fallback, partial-fill top-up).
 func (b *BrokerAdapter) PlaceMarketBuy(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int) (string, error) {
-	req := &indiraClient.PlaceOrderRequest{
-		Symbol:      info.IndiraSymbol,
-		ExcToken:    info.ExchangeToken,
-		Exc:         "NSE",
-		OrdAction:   "BUY",
-		OrdValidity: "DAY",
-		OrdType:     "Market",
-		PrdType:     "DELIVERY",
-		Qty:         qty,
-		DisQty:      0,
-		LotSize:     1,
-		Instrument:  "STK",
-		Amo:         false,
+	ltp, stale, asOf, err := b.FreshLTP(ctx, info)
+	if err != nil || stale || ltp <= 0 {
+		return "", fmt.Errorf("%w: marketable BUY %s: no fresh LTP (stale=%v as_of=%s err=%v)",
+			ErrUnpriced, info.Symbol, stale, asOf.Format(time.RFC3339), err)
 	}
-
-	resp, err := b.client.PlaceOrder(ctx, b.toIndiraAuth(auth), req)
+	b.EnrichMarketInfo(ctx, info)
+	price := ltp * (1 + entryLimitSlippagePct/100)
+	if info.DPRUpper > 0 && price > info.DPRUpper {
+		price = info.DPRUpper
+	}
+	orderID, err := b.PlaceLimitBuy(ctx, auth, info, qty, price)
 	if err != nil {
 		return "", err
 	}
-
-	orderID := resp.OrderId
-	if orderID == "" {
-		orderID = resp.OrdId
-	}
-	if orderID == "" {
-		return "", fmt.Errorf("broker returned empty market-buy order ID")
-	}
-
-	if rej := parseRejection("place_market_buy", resp); rej != nil {
-		return "", rej
-	}
-
-	b.logger.Info("MARKET BUY placed (LIMIT fallback)",
+	b.logger.Info("MARKET BUY requested → marketable LIMIT BUY placed (Market is rejected for algo orders)",
 		zap.String("symbol", info.Symbol),
 		zap.Int("qty", qty),
+		zap.Float64("ltp", ltp),
+		zap.Float64("limit", price),
 		zap.String("broker_order_id", orderID))
-
 	return orderID, nil
 }
 
@@ -551,26 +547,31 @@ func (b *BrokerAdapter) PlaceAMOSLSell(ctx context.Context, auth BrokerAuth, inf
 // the stock opens lower still, the morning protective cycle / safety monitor
 // re-prices the exit from the live LTP.
 func (b *BrokerAdapter) PlaceAMOSell(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int) (string, error) {
-	b.EnrichMarketInfo(ctx, info)
-	price := info.DPRLower
-	if price <= 0 {
-		ltp, _ := b.FetchLTP(ctx, info.ExchangeToken)
-		p, err := exitLimitFor(ltp, info.TickSize, 0, 0, exitLimitSlippagePct)
-		if err != nil {
-			return "", fmt.Errorf("amo exit for %s: no band floor and %w", info.Symbol, err)
-		}
-		price = p
+	id, _, err := b.PlaceAMOSellPriced(ctx, auth, info, qty)
+	return id, err
+}
+
+// PlaceAMOSellPriced is PlaceAMOSell returning the limit actually queued. The
+// price comes from ExitLimitPrice — live token (ISIN key), stale rows ignored:
+// at lower circuit LTP == lower band so the limit is the band floor; for an
+// unfilled DAY exit re-queued at 16:35 it is LTP − slippage floored at the band.
+func (b *BrokerAdapter) PlaceAMOSellPriced(ctx context.Context, auth BrokerAuth, info *SymbolInfo, qty int) (string, float64, error) {
+	price, ltp, src, err := b.ExitLimitPrice(ctx, auth, info)
+	if err != nil {
+		return "", 0, fmt.Errorf("amo exit for %s: %w", info.Symbol, err)
 	}
 	orderID, err := b.PlaceAMOLimitSell(ctx, auth, info, qty, price)
 	if err != nil {
-		return "", err
+		return "", price, err
 	}
-	b.logger.Warn("AMO LIMIT SELL queued (lower circuit exit)",
+	b.logger.Warn("AMO LIMIT SELL queued for the next session",
 		zap.String("symbol", info.Symbol),
 		zap.Int("qty", qty),
+		zap.Float64("ltp", ltp),
+		zap.String("ltp_source", src),
 		zap.Float64("limit", price),
 		zap.String("broker_order_id", orderID))
-	return orderID, nil
+	return orderID, price, nil
 }
 
 // GetOrderStatus fetches current order status from broker orderbook.
@@ -721,15 +722,17 @@ func (b *BrokerAdapter) CheckCircuit(ctx context.Context, token string) (atUpper
 	if err != nil {
 		return false, false, err
 	}
-	var mkt struct {
-		LTP      float64 `json:"ltp"`
-		DPRUpper float64 `json:"dpr_upper"`
-		DPRLower float64 `json:"dpr_lower"`
-	}
-	if err := json.Unmarshal([]byte(raw), &mkt); err != nil {
+	snap, err := parseMarketSnap([]byte(raw))
+	if err != nil {
 		return false, false, err
 	}
-	return evalCircuit(mkt.LTP, mkt.DPRUpper, mkt.DPRLower)
+	// A row that has not ticked today cannot say anything about today's
+	// circuit state (2026-10-22: BODALCHEM's dead row would have reported
+	// "no circuit" at a price the stock left weeks earlier).
+	if feedStale(snap.AsOf, time.Now()) {
+		return false, false, fmt.Errorf("circuit eval: feed row for token %s is stale (as of %s)", token, snap.AsOf.Format(time.RFC3339))
+	}
+	return evalCircuit(snap.LTP, snap.DPRUpper, snap.DPRLower)
 }
 
 // evalCircuit decides band state from a market snapshot. Pure — unit-tested.

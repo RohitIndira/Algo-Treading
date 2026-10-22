@@ -48,7 +48,16 @@ var (
 	exitLimitSlippagePct = envPct("MANTHAN_EXIT_LIMIT_SLIPPAGE_PCT", defaultExitLimitSlippagePct, 0.1, 10)
 	// slLimitGapPct — percent below the stop trigger for the SL-L limit leg.
 	slLimitGapPct = envPct("MANTHAN_SL_LIMIT_GAP_PCT", defaultSLLimitGapPct, 0.3, 10)
+	// entryLimitSlippagePct — percent ABOVE LTP for a marketable entry LIMIT
+	// (the former Market BUY fallback / top-up; Market is rejected for algo
+	// orders).
+	entryLimitSlippagePct = envPct("MANTHAN_ENTRY_LIMIT_SLIPPAGE_PCT", 1.0, 0.1, 10)
 )
+
+// ErrUnpriced marks an order that could not be priced at all (no fresh LTP
+// from Redis under any token, no band, no broker-side price). Nothing was sent
+// to the broker, so callers may release loop guards and retry.
+var ErrUnpriced = errors.New("order could not be priced")
 
 // envPct reads a percentage from the environment with a default and a sane
 // range; anything unparsable or out of range falls back to the default so a
@@ -329,6 +338,11 @@ func (b *BrokerAdapter) ExitLimitPrice(ctx context.Context, auth BrokerAuth, inf
 			zap.String("symbol", info.Symbol), zap.String("token", info.ExchangeToken),
 			zap.Time("feed_as_of", snap.AsOf), zap.Float64("stale_ltp", snap.LTP))
 		dprLo, dprHi = 0, 0
+		// The caller's info may carry the same stale band (EnrichMarketInfo on
+		// the dead row); placeLimitSell re-clamps with info.DPR*, so clear it
+		// here too or the broker-priced limit is dragged back into a band the
+		// stock has left (2026-10-22 review).
+		info.DPRLower, info.DPRUpper = 0, 0
 		if snap.TickSize > 0 {
 			info.TickSize = snap.TickSize
 		}
@@ -355,7 +369,22 @@ func (b *BrokerAdapter) ExitLimitPrice(ctx context.Context, auth BrokerAuth, inf
 		src = "band-floor"
 	}
 	limit, err = exitLimitFor(ltp, info.TickSize, dprLo, dprHi, exitLimitSlippagePct)
+	if err != nil {
+		err = fmt.Errorf("%w: %v", ErrUnpriced, err)
+	}
 	return limit, ltp, src, err
+}
+
+// marketOpenNowIST reports whether NSE is in its regular session right now
+// (trading day, 09:15–15:30 IST). Shared gate for every path that places or
+// cancels a non-AMO order.
+func marketOpenNowIST() bool {
+	n := time.Now().In(istLocation())
+	if !indiraClient.IsTradingDay(n) {
+		return false
+	}
+	mod := n.Hour()*60 + n.Minute()
+	return mod >= 9*60+15 && mod <= 15*60+30
 }
 
 // PlaceLimitSell places a plain DAY LIMIT SELL (DELIVERY) — the only order

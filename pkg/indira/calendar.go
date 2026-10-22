@@ -1,6 +1,10 @@
 package indira
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // NSE / BSE trading calendar.
 //
@@ -95,4 +99,18 @@ func IsMarketOpen(t time.Time) bool {
 	const open = 9*60 + 15   // 09:15 IST
 	const close = 15*60 + 30 // 15:30 IST
 	return mins >= open && mins <= close
+}
+
+// HolidayCalendarCoversYear reports whether the hard-coded NSE holiday list
+// has any entry for the given year. Every session gate relies on
+// IsTradingDay; a year with no entries silently treats every weekday as a
+// trading day, so callers warn loudly at startup when this is false.
+func HolidayCalendarCoversYear(year int) bool {
+	prefix := fmt.Sprintf("%04d-", year)
+	for day := range nseHolidays2026 {
+		if strings.HasPrefix(day, prefix) {
+			return true
+		}
+	}
+	return false
 }

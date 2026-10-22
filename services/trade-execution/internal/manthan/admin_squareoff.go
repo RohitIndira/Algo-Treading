@@ -118,16 +118,22 @@ func (h *SLHandler) AdminSquareOff(ctx context.Context, userID, strategyID, symb
 		if !ok {
 			return fmt.Errorf("no working broker credentials for %s — square-off needs a live session", userID)
 		}
-		info := &SymbolInfo{
-			Symbol: pos.Symbol, IndiraSymbol: pos.IndiraSymbol,
-			ExchangeToken: pos.ExchangeToken, Exchange: pos.Exchange,
-		}
-		if info.IndiraSymbol == "" || info.ExchangeToken == "" {
-			resolved, rerr := h.broker.ResolveSymbol(ctx, pos.Symbol, pos.ISIN)
-			if rerr != nil {
+		// Live token from the ISIN key first (2026-10-22: stored tokens drift);
+		// the stored token is only a fallback when the key is missing.
+		info, rerr := h.broker.ResolveSymbol(ctx, pos.Symbol, pos.ISIN)
+		if rerr != nil {
+			if pos.IndiraSymbol == "" || pos.ExchangeToken == "" {
 				return fmt.Errorf("resolve symbol: %w", rerr)
 			}
-			info = resolved
+			h.logger.Warn("AdminSquareOff: ISIN resolve failed — using the stored token",
+				zap.String("symbol", pos.Symbol), zap.Error(rerr))
+			info = &SymbolInfo{
+				Symbol: pos.Symbol, ISIN: pos.ISIN, IndiraSymbol: pos.IndiraSymbol,
+				ExchangeToken: pos.ExchangeToken, Exchange: strDefault(pos.Exchange, "NSE"), TickSize: 0.05,
+			}
+			h.broker.EnrichMarketInfo(ctx, info)
+		} else if pos.ExchangeToken != "" && pos.ExchangeToken != info.ExchangeToken {
+			_, _ = h.repo.UpdateSymbolToken(ctx, strategyID, symbol, info.ExchangeToken, info.IndiraSymbol)
 		}
 
 		report = &SquareOffReport{UserID: userID, StrategyID: strategyID, Symbol: symbol, Qty: pos.NetQty}

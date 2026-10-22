@@ -75,6 +75,9 @@ type manualExitLedger interface {
 	// lot is already in the ledger as a PLACED→FILLED exit row, so no
 	// synthetic SELL may be added on top (it double-counted APARINDS).
 	HasOwnExitSell(ctx context.Context, strategyID, symbol string, qty int) (bool, error)
+	// HasOwnExitSellByBrokerID: the event names the broker order that sold the
+	// lot — if it is one of OUR exit rows, this is our sell, not a manual one.
+	HasOwnExitSellByBrokerID(ctx context.Context, brokerOrderID string) (bool, error)
 }
 
 // ManualExitLedgerRow is the synthetic SELL to record.
@@ -202,7 +205,17 @@ func (c *ManualExitLedgerConsumer) HandleMessage(ctx context.Context, value []by
 		return nil
 	}
 
-	if own, oerr := c.ledger.HasOwnExitSell(ctx, ev.StrategyID, ev.Symbol, ev.Quantity); oerr != nil {
+	// Ours? Decide by the broker order id when the event carries one (exact);
+	// fall back to "we have a FILLED exit of that qty" only when it does not.
+	// A PLACED exit of ours never masks a real manual sale (2026-10-22 review).
+	var own bool
+	var oerr error
+	if ev.BrokerOrderID != "" {
+		own, oerr = c.ledger.HasOwnExitSellByBrokerID(ctx, ev.BrokerOrderID)
+	} else {
+		own, oerr = c.ledger.HasOwnExitSell(ctx, ev.StrategyID, ev.Symbol, ev.Quantity)
+	}
+	if oerr != nil {
 		c.logger.Warn("manual-exit ledger: own-exit lookup failed — projecting anyway", zap.Error(oerr))
 	} else if own {
 		c.logger.Info("manual-exit ledger: exit is OUR sell (exit row exists) — not projecting a synthetic SELL",

@@ -7,13 +7,14 @@ package manthan
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
 )
 
-// SafetyMonitor runs every 2 seconds checking ALL active Manthan positions.
+// SafetyMonitor runs every poll interval (15 s in production) checking ALL active Manthan positions.
 //
 // Checks:
 //  1. Position has SL order on broker? If not → re-place immediately
@@ -193,9 +194,17 @@ func (m *SafetyMonitor) checkNakedPositions(ctx context.Context) {
 		}
 		info, rerr := m.broker.ResolveSymbol(ctx, pos.Symbol, pos.ISIN)
 		if rerr != nil || info == nil {
-			m.logger.Warn("Safety monitor: naked position — symbol resolve failed, will retry next cycle",
-				zap.String("symbol", pos.Symbol), zap.Error(rerr))
-			continue
+			if pos.ExchangeToken == "" {
+				m.logger.Warn("Safety monitor: naked position — symbol resolve failed and no stored token, will retry next cycle",
+					zap.String("symbol", pos.Symbol), zap.Error(rerr))
+				continue
+			}
+			// No ISIN key (legacy row): fall back to the stored token.
+			info = &SymbolInfo{
+				Symbol: pos.Symbol, ISIN: pos.ISIN, IndiraSymbol: pos.IndiraSymbol,
+				ExchangeToken: pos.ExchangeToken, Exchange: "NSE", TickSize: 0.05,
+			}
+			m.broker.EnrichMarketInfo(ctx, info)
 		}
 		// Baseline protection: 20% below the entry fill. If rules-engine has
 		// trailed higher, its next SL_MODIFY ratchets up (the ratchet guard
@@ -223,7 +232,24 @@ func (m *SafetyMonitor) checkNakedPositions(ctx context.Context) {
 	}
 }
 
+// checkPosition runs the per-stop checks under the position's advisory lock
+// so they serialise with the inbox exit path (which cancels the stop and
+// sells) — the two must never act on the same quantity at once.
 func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
+	if m.repo == nil {
+		m.checkPositionLocked(ctx, sl)
+		return
+	}
+	if err := m.repo.WithPositionLock(ctx, sl.StrategyID, sl.Symbol, func(ctx context.Context) error {
+		m.checkPositionLocked(ctx, sl)
+		return nil
+	}); err != nil {
+		m.logger.Warn("Safety monitor: position lock failed — skipping this cycle",
+			zap.String("symbol", sl.Symbol), zap.Error(err))
+	}
+}
+
+func (m *SafetyMonitor) checkPositionLocked(ctx context.Context, sl *ManthanOrder) {
 	// Gate: a recent AU004 keeps this user "expired" for 5 min. Skip silently
 	// — every other position for the same user will hit the same dead JWT,
 	// so attempting them just spams the HTTP layer with identical AU004s.
@@ -233,6 +259,13 @@ func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
 	auth := m.getAuth(sl.UserID)
 	if auth == nil {
 		return // no auth available — skip this cycle
+	}
+
+	// An exit sell of ours already owns this position's quantity: the exit
+	// path (checkPendingExits) confirms or chases it. Touching the stop or
+	// selling again here would double-sell or be rejected "Free Qty=0".
+	if open, oerr := m.repo.HasOpenExitSell(ctx, sl.StrategyID, sl.Symbol); oerr == nil && open {
+		return
 	}
 
 	// CHECK 1: Does SL order still exist on broker?
@@ -273,202 +306,125 @@ func (m *SafetyMonitor) checkPosition(ctx context.Context, sl *ManthanOrder) {
 			return
 		}
 
-		// SL was cancelled/rejected externally
-		if status == "CANCELLED" || IsRejectedWSStatus(status) {
-			m.logger.Warn("Safety monitor: SL order missing — re-placing!",
+		// SL was cancelled/rejected externally. REST order-book statuses are
+		// mixed case ("Cancelled" / "Rejected") — normalise before comparing.
+		if isCancelledBrokerStatus(strings.ToUpper(strings.TrimSpace(status))) {
+			m.logger.Warn("Safety monitor: SL order missing at broker — re-protecting",
 				zap.String("symbol", sl.Symbol),
 				zap.String("broker_status", status))
-
 			_ = m.repo.InsertEvent(ctx, sl.ID, "SL_LOST", "SL_PLACED", "CANCELLED",
-				status, 0, 0, "SL cancelled/rejected externally — re-placing")
-
-			// Get entry order for fill price
-			entry, err := m.repo.GetActiveEntryBySymbol(ctx, sl.StrategyID, sl.Symbol)
-			if err != nil || entry == nil {
-				m.logger.Error("Safety monitor: can't find entry — EMERGENCY SELL",
-					zap.String("symbol", sl.Symbol))
-				info := &SymbolInfo{
-					Symbol:        sl.Symbol,
-					IndiraSymbol:  sl.IndiraSymbol,
-					ExchangeToken: sl.ExchangeToken,
-					Exchange:      "NSE",
-					TickSize:      0.05,
-				}
-				m.broker.EnrichMarketInfo(ctx, info)
-				mkBrokerID, limit, mkErr := m.broker.PlaceMarketableLimitSell(ctx, *auth, info, sl.Qty)
-				if mkErr != nil {
-					m.logger.Error("EMERGENCY LIMIT SELL FAILED — manual intervention required",
-						zap.String("symbol", sl.Symbol), zap.Error(mkErr))
-					_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "SL_PLACED", "SL_PLACED",
-						"", 0, sl.Qty, "no entry row + LIMIT exit failed: "+mkErr.Error())
-				} else {
-					// The stop is gone at the broker: close its row so this loop
-					// does not sell again next cycle, and book the exit as PLACED
-					// (confirmed FILLED from broker truth by checkPendingExits —
-					// a LIMIT can rest, so it is never assumed filled).
-					_ = m.repo.UpdateOrderCancelled(ctx, sl.ID)
-					_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL", "SL_PLACED", "CANCELLED",
-						"", limit, sl.Qty, "no entry row — LIMIT exit broker_id="+mkBrokerID)
-					m.recordExit(ctx, sl, OrderTypeMarketSell, info, sl.Qty, limit, mkBrokerID, "SL lost at broker, no entry row — exit")
-				}
-				return
-			}
-
-			// Re-place SL at current trigger level
-			info := &SymbolInfo{
-				Symbol:        sl.Symbol,
-				IndiraSymbol:  sl.IndiraSymbol,
-				ExchangeToken: sl.ExchangeToken,
-				Exchange:      "NSE",
-				TickSize:      0.05,
-			}
-			newBrokerID, _, _, placeErr := m.broker.PlaceSLSell(ctx, *auth, info, sl.Qty, sl.TriggerPrice, sl.LimitPrice)
-			if placeErr != nil {
-				m.logger.Error("Safety monitor: SL re-place FAILED — LIMIT exit",
-					zap.String("symbol", sl.Symbol), zap.Error(placeErr))
-				m.broker.EnrichMarketInfo(ctx, info)
-				mkBrokerID, limit, mkErr := m.broker.PlaceMarketableLimitSell(ctx, *auth, info, sl.Qty)
-				if mkErr != nil {
-					m.logger.Error("EMERGENCY LIMIT SELL FAILED — manual intervention required",
-						zap.String("symbol", sl.Symbol), zap.Error(mkErr))
-					_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "SL_PLACED", "SL_PLACED",
-						"", 0, sl.Qty, "SL re-place + LIMIT exit both failed: "+mkErr.Error())
-				} else {
-					_ = m.repo.UpdateOrderCancelled(ctx, sl.ID)
-					_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL", "SL_PLACED", "CANCELLED",
-						"", limit, sl.Qty, "SL re-place failed — LIMIT exit broker_id="+mkBrokerID)
-					m.recordExit(ctx, sl, OrderTypeMarketSell, info, sl.Qty, limit, mkBrokerID, "SL lost at broker, re-place failed — exit")
-				}
-				return
-			}
-			_ = m.repo.UpdateOrderPlaced(ctx, sl.ID, newBrokerID)
-			_ = m.repo.InsertEvent(ctx, sl.ID, "SL_REPLACED", "CANCELLED", "SL_PLACED",
-				"", sl.TriggerPrice, sl.Qty, "re-placed by safety monitor: "+newBrokerID)
-
-			// Tell rules-engine the SL is back at the broker with a new
-			// broker_order_id and the (still-our-requested) trigger. Without
-			// this, rules-engine's `manthan_positions.broker_order_id` would
-			// keep pointing at the cancelled order, and any reconciler /
-			// audit query would show a dangling row. Emits SL_PLACED — same
-			// envelope shape as the initial placement — so the projector's
-			// existing UPSERT path handles it.
-			if m.eventPub != nil {
-				if entrySignalID, err := m.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); err == nil && entrySignalID != "" {
-					m.eventPub.PublishSLPlaced(ctx,
-						ManthanSignal{
-							OrderID: entrySignalID, UserID: sl.UserID,
-							StrategyID: sl.StrategyID, Symbol: sl.Symbol,
-							TradingMode: "LIVE",
-						},
-						newBrokerID, sl.TriggerPrice, sl.LimitPrice)
-				}
-			}
+				status, 0, 0, "SL cancelled/rejected externally — re-protecting")
+			m.reprotectLostSL(ctx, auth, sl, status)
 			return
 		}
 	}
 
-	// CHECK 2: LTP below SL trigger? (backup for WSS lag)
-	if sl.ExchangeToken != "" && sl.TriggerPrice > 0 {
-		ltp, err := m.broker.FetchLTP(ctx, sl.ExchangeToken)
-		if err != nil {
+	// CHECK 2: LTP below SL trigger? (backup for WSS lag). The price comes from
+	// the LIVE token row (ISIN key); a stale row (dead token) never drives this.
+	if sl.TriggerPrice > 0 && sl.Status == StatusSLPlaced {
+		info := &SymbolInfo{
+			Symbol:        sl.Symbol,
+			ISIN:          sl.ISIN,
+			IndiraSymbol:  sl.IndiraSymbol,
+			ExchangeToken: sl.ExchangeToken,
+			Exchange:      "NSE",
+			TickSize:      0.05,
+		}
+		ltp, stale, _, lerr := m.broker.FreshLTP(ctx, info)
+		if lerr != nil || stale || ltp <= 0 {
+			return
+		}
+		if info.ExchangeToken != "" && info.ExchangeToken != sl.ExchangeToken {
+			_, _ = m.repo.UpdateSymbolToken(ctx, sl.StrategyID, sl.Symbol, info.ExchangeToken, info.IndiraSymbol)
+		}
+		if ltp > sl.TriggerPrice {
 			return
 		}
 
-		if ltp <= sl.TriggerPrice && sl.Status == StatusSLPlaced {
-			// SL should have triggered — check if it filled
-			status, filledQty, avgPrice, _ := m.broker.GetOrderStatus(ctx, *auth, sl.BrokerOrderID)
-			if isFilledStatus(status) {
-				_ = m.repo.UpdateOrderFilled(ctx, sl.ID, filledQty, avgPrice)
-				_ = m.repo.InsertEvent(ctx, sl.ID, "SL_FILLED", "SL_PLACED", "SL_FILLED",
-					status, avgPrice, filledQty, "LTP below trigger — confirmed filled by safety monitor")
-				if m.eventPub != nil {
-					if entrySignalID, err := m.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); err == nil && entrySignalID != "" {
-						m.eventPub.PublishSLFilled(ctx, entrySignalID, sl.StrategyID, sl.UserID,
-							sl.Symbol, sl.BrokerOrderID, avgPrice, int32(filledQty), 0)
-					}
+		// SL should have triggered — check if it filled
+		status, filledQty, avgPrice, _ := m.broker.GetOrderStatus(ctx, *auth, sl.BrokerOrderID)
+		if isFilledStatus(status) {
+			_ = m.repo.UpdateOrderFilled(ctx, sl.ID, filledQty, avgPrice)
+			_ = m.repo.InsertEvent(ctx, sl.ID, "SL_FILLED", "SL_PLACED", "SL_FILLED",
+				status, avgPrice, filledQty, "LTP below trigger — confirmed filled by safety monitor")
+			if m.eventPub != nil {
+				if entrySignalID, err := m.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); err == nil && entrySignalID != "" {
+					m.eventPub.PublishSLFilled(ctx, entrySignalID, sl.StrategyID, sl.UserID,
+						sl.Symbol, sl.BrokerOrderID, avgPrice, int32(filledQty), 0)
 				}
-				return
 			}
-
-			// SL-L triggered but NOT filled (limit leg blown through by a fast
-			// down-move), or the feed shows the stop crossed and the resting
-			// order never triggered. Escalation (2026-10-22 revision):
-			//   1. Cancel the stuck SL-L (frees the quantity at the broker)
-			//   2. Lower circuit → AMO LIMIT at the band floor (only exit path)
-			//   3. Else a marketable LIMIT sell NOW (LTP − slippage, floored at
-			//      the band). SL-M and Market orders are rejected for
-			//      algo-tagged orders — the dead fallbacks that left seven
-			//      positions open on 2026-10-22.
-			// The sell is booked as a PLACED exit row; checkPendingExits
-			// confirms the fill or re-prices it if it rests.
-			m.logger.Warn("Safety monitor: LTP below SL but not filled — escalating exit",
-				zap.String("symbol", sl.Symbol),
-				zap.Float64("ltp", ltp),
-				zap.Float64("trigger", sl.TriggerPrice))
-
-			info := &SymbolInfo{
-				Symbol:        sl.Symbol,
-				IndiraSymbol:  sl.IndiraSymbol,
-				ExchangeToken: sl.ExchangeToken,
-				Exchange:      "NSE",
-				TickSize:      0.05,
-			}
-			m.broker.EnrichMarketInfo(ctx, info)
-
-			// Step 1: cancel the stuck stop. If the cancel fails the quantity
-			// is still locked by it — retry next cycle rather than fire a sell
-			// the broker will reject.
-			if cerr := m.broker.CancelOrder(ctx, *auth, info, sl.BrokerOrderID); cerr != nil && !IsOrderNotFoundError(cerr) {
-				m.logger.Error("Safety monitor: stuck SL cancel failed — retrying next cycle",
-					zap.String("symbol", sl.Symbol), zap.Error(cerr))
-				return
-			}
-			// The cancel may have raced a fill at the exchange — re-check first.
-			if st, fq, ap, serr := m.broker.GetOrderStatus(ctx, *auth, sl.BrokerOrderID); serr == nil && isFilledStatus(st) {
-				_ = m.repo.UpdateOrderFilled(ctx, sl.ID, fq, ap)
-				_ = m.repo.InsertEvent(ctx, sl.ID, "SL_FILLED", "SL_PLACED", "SL_FILLED",
-					st, ap, fq, "filled during escalation cancel")
-				if m.eventPub != nil {
-					if entrySignalID, err := m.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); err == nil && entrySignalID != "" {
-						m.eventPub.PublishSLFilled(ctx, entrySignalID, sl.StrategyID, sl.UserID,
-							sl.Symbol, sl.BrokerOrderID, ap, int32(fq), 0)
-					}
-				}
-				return
-			}
-			_ = m.repo.UpdateOrderCancelled(ctx, sl.ID)
-			_ = m.repo.InsertEvent(ctx, sl.ID, "SL_ESCALATED", "SL_PLACED", "CANCELLED",
-				"", ltp, sl.Qty, "stop crossed but unfilled — cancelled; exiting with a marketable LIMIT")
-
-			// Step 2: Lower circuit → AMO LIMIT (only path through a circuit freeze)
-			_, atLower, _ := m.broker.CheckCircuit(ctx, sl.ExchangeToken)
-			if atLower {
-				m.logger.Warn("Safety monitor: lower circuit — AMO LIMIT SELL at the band floor",
-					zap.String("symbol", sl.Symbol))
-				amoBrokerID, aerr := m.broker.PlaceAMOSell(ctx, *auth, info, sl.Qty)
-				if aerr != nil {
-					m.logger.Error("Safety monitor: AMO exit FAILED — position has no stop; manual intervention required",
-						zap.String("symbol", sl.Symbol), zap.Error(aerr))
-					_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "CANCELLED", "CANCELLED",
-						"", ltp, sl.Qty, "lower circuit AMO exit failed: "+aerr.Error())
-					return
-				}
-				m.recordExit(ctx, sl, OrderTypeAMOSell, info, sl.Qty, info.DPRLower, amoBrokerID, "lower circuit — AMO exit after stuck SL")
-				return
-			}
-
-			// Step 3: marketable LIMIT sell. Track the broker_order_id on an exit
-			// row (an untracked exit is what hid the 2026-04-22 sells).
-			mkBrokerID, limit, mkErr := m.broker.PlaceMarketableLimitSell(ctx, *auth, info, sl.Qty)
-			if mkErr != nil {
-				m.logger.Error("EMERGENCY LIMIT SELL FAILED — position has no stop; manual intervention required",
-					zap.String("symbol", sl.Symbol),
-					zap.Int("qty", sl.Qty), zap.Error(mkErr))
-				_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "CANCELLED", "CANCELLED",
-					"", ltp, sl.Qty, "LIMIT exit failed: "+mkErr.Error())
-				return
-			}
-			m.recordExit(ctx, sl, OrderTypeMarketSell, info, sl.Qty, limit, mkBrokerID, "LTP below trigger, stop unfilled → marketable LIMIT exit")
+			return
 		}
+
+		// SL-L triggered but NOT filled (limit leg blown through by a fast
+		// down-move), or the feed shows the stop crossed and the resting
+		// order never triggered. Escalation (2026-10-22 revision):
+		//   1. Cancel the stuck SL-L (frees the quantity at the broker)
+		//   2. Lower circuit → AMO LIMIT at the band floor (only exit path)
+		//   3. Else a marketable LIMIT sell NOW (LTP − slippage, floored at
+		//      the band). SL-M and Market orders are rejected for
+		//      algo-tagged orders.
+		// The sell is booked as a PLACED exit row; checkPendingExits
+		// confirms the fill or re-prices it if it rests.
+		m.logger.Warn("Safety monitor: LTP below SL but not filled — escalating exit",
+			zap.String("symbol", sl.Symbol),
+			zap.Float64("ltp", ltp),
+			zap.Float64("trigger", sl.TriggerPrice))
+		m.broker.EnrichMarketInfo(ctx, info)
+
+		if cerr := m.broker.CancelOrder(ctx, *auth, info, sl.BrokerOrderID); cerr != nil && !IsOrderNotFoundError(cerr) {
+			m.logger.Error("Safety monitor: stuck SL cancel failed — retrying next cycle",
+				zap.String("symbol", sl.Symbol), zap.Error(cerr))
+			return
+		}
+		// The cancel may have raced a fill at the exchange — re-check first.
+		if st, fq, ap, serr := m.broker.GetOrderStatus(ctx, *auth, sl.BrokerOrderID); serr == nil && isFilledStatus(st) {
+			_ = m.repo.UpdateOrderFilled(ctx, sl.ID, fq, ap)
+			_ = m.repo.InsertEvent(ctx, sl.ID, "SL_FILLED", "SL_PLACED", "SL_FILLED",
+				st, ap, fq, "filled during escalation cancel")
+			if m.eventPub != nil {
+				if entrySignalID, err := m.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); err == nil && entrySignalID != "" {
+					m.eventPub.PublishSLFilled(ctx, entrySignalID, sl.StrategyID, sl.UserID,
+						sl.Symbol, sl.BrokerOrderID, ap, int32(fq), 0)
+				}
+			}
+			return
+		}
+		if uerr := m.repo.UpdateOrderCancelled(ctx, sl.ID); uerr != nil {
+			m.logger.Error("Safety monitor: could not mark the cancelled stop — not selling this cycle",
+				zap.String("symbol", sl.Symbol), zap.Error(uerr))
+			return
+		}
+		_ = m.repo.InsertEvent(ctx, sl.ID, "SL_ESCALATED", "SL_PLACED", "CANCELLED",
+			"", ltp, sl.Qty, "stop crossed but unfilled — cancelled; exiting with a marketable LIMIT")
+
+		_, atLower, _ := m.broker.CheckCircuit(ctx, info.ExchangeToken)
+		if atLower {
+			m.logger.Warn("Safety monitor: lower circuit — AMO LIMIT SELL at the band floor",
+				zap.String("symbol", sl.Symbol))
+			amoBrokerID, aerr := m.broker.PlaceAMOSell(ctx, *auth, info, sl.Qty)
+			if aerr != nil {
+				m.logger.Error("Safety monitor: AMO exit FAILED — position has no stop; manual intervention required",
+					zap.String("symbol", sl.Symbol), zap.Error(aerr))
+				_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "CANCELLED", "CANCELLED",
+					"", ltp, sl.Qty, "lower circuit AMO exit failed: "+aerr.Error())
+				notifyOps(m.authNotif, ctx, sl.UserID, sl.Symbol, "EXIT_FAILED", "stop crossed, AMO exit rejected: "+aerr.Error())
+				return
+			}
+			m.recordExit(ctx, sl, OrderTypeAMOSell, info, sl.Qty, info.DPRLower, amoBrokerID, "lower circuit — AMO exit after stuck SL")
+			return
+		}
+
+		mkBrokerID, limit, mkErr := m.broker.PlaceMarketableLimitSell(ctx, *auth, info, sl.Qty)
+		if mkErr != nil {
+			m.logger.Error("EMERGENCY LIMIT SELL FAILED — position has no stop; manual intervention required",
+				zap.String("symbol", sl.Symbol),
+				zap.Int("qty", sl.Qty), zap.Error(mkErr))
+			_ = m.repo.InsertEvent(ctx, sl.ID, "EMERGENCY_SELL_FAILED", "CANCELLED", "CANCELLED",
+				"", ltp, sl.Qty, "LIMIT exit failed: "+mkErr.Error())
+			notifyOps(m.authNotif, ctx, sl.UserID, sl.Symbol, "EXIT_FAILED", "stop crossed, LIMIT exit rejected: "+mkErr.Error())
+			return
+		}
+		m.recordExit(ctx, sl, OrderTypeMarketSell, info, sl.Qty, limit, mkBrokerID, "LTP below trigger, stop unfilled → marketable LIMIT exit")
 	}
 }

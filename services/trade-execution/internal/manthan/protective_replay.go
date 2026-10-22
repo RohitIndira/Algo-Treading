@@ -3,7 +3,6 @@ package manthan
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -418,6 +417,24 @@ func (p *ProtectiveReplay) buildPlans(ctx context.Context) []FirePlan {
 		// AMO_PENDING awaiting conversion), we have nothing to do.
 		// Placing a second SL would either double the protection (broker
 		// margin error) or race against the live one.
+		// A live stop already rests for this position (placed on the entry
+		// fill or by the naked scan — those rows carry no trade_date, so the
+		// trade_date check below cannot see them). Placing another would be
+		// rejected "Free Qty=0" or double the stop (2026-10-22 review; the
+		// mid-session boot cycle made every restart a trigger for this).
+		if standing, serr := p.repo.ListStandingSLs(ctx, pos.StrategyID, pos.Symbol); serr == nil {
+			live := 0
+			for _, s := range standing {
+				if s.BrokerOrderID != "" {
+					live++
+				}
+			}
+			if live > 0 {
+				p.logger.Info("Pre-open cycle: position already has a live stop at the broker — skipping",
+					zap.String("symbol", pos.Symbol), zap.String("user_id", pos.UserID), zap.Int("live_stops", live))
+				continue
+			}
+		}
 		if protected, perr := p.repo.HasActiveProtectionForToday(ctx, pos.EntryOrderID, istToday); perr == nil && protected {
 			p.logger.Info("Pre-open cycle: position already protected by EOD AMO — skipping",
 				zap.String("symbol", pos.Symbol),
@@ -817,6 +834,12 @@ func (p *ProtectiveReplay) fireAll(ctx context.Context, plans []FirePlan) []Fire
 }
 
 func (p *ProtectiveReplay) fireOne(ctx context.Context, plan FirePlan) FireResult {
+	// The plan was built at ~09:14 from pre-open data (or minutes ago on a
+	// late pass). Re-decide SL-L vs exit-now vs AMO from a LIVE tick right
+	// before placing (2026-10-22 review): yesterday's close must not sell a
+	// position that opened above its stop, nor queue an AMO because the stock
+	// closed at lower circuit yesterday.
+	plan = p.refreshFireDecision(ctx, plan)
 	res := FireResult{Plan: plan, Action: plan.Action}
 
 	if plan.Action == FireSkip {
@@ -1055,6 +1078,42 @@ func (p *ProtectiveReplay) handlePostOpenReject(ctx context.Context, auth Broker
 	}
 }
 
+// refreshFireDecision re-reads LTP and circuit state from the live token row
+// and recomputes the fire action when the row was updated after today's
+// 09:15:00 open; otherwise the planned action stands.
+func (p *ProtectiveReplay) refreshFireDecision(ctx context.Context, plan FirePlan) FirePlan {
+	if plan.Action == FireSkip || plan.Info == nil {
+		return plan
+	}
+	ltp, stale, asOf, err := p.broker.FreshLTP(ctx, plan.Info)
+	if err != nil || stale || ltp <= 0 {
+		return plan
+	}
+	n := p.now()
+	openToday := time.Date(n.Year(), n.Month(), n.Day(), 9, 15, 0, 0, p.ist)
+	if !asOf.IsZero() && asOf.Before(openToday) {
+		return plan // pre-open print — keep the conservative plan
+	}
+	_, atLower, cerr := p.broker.CheckCircuit(ctx, plan.Info.ExchangeToken)
+	next := plan.Action
+	switch {
+	case cerr == nil && atLower:
+		next = FireAMOLowerCircuit
+	case ltp <= plan.SafeTrigger:
+		next = FireSLMarket
+	default:
+		next = FireSLLimit
+	}
+	if next != plan.Action {
+		p.logger.Warn("fireOne: live tick changed the decision",
+			zap.String("symbol", plan.Pos.Symbol), zap.String("planned", string(plan.Action)),
+			zap.String("live", string(next)), zap.Float64("ltp", ltp), zap.Float64("trigger", plan.SafeTrigger))
+		plan.Action = next
+	}
+	plan.LTP = ltp
+	return plan
+}
+
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 // strDefault returns def when s is empty.
@@ -1075,19 +1134,26 @@ func (p *ProtectiveReplay) enrichDPR(ctx context.Context, info *SymbolInfo) {
 	if err != nil {
 		return
 	}
-	var mkt struct {
-		TickSize float64 `json:"tick_size"`
-		DPRLower float64 `json:"dpr_lower"`
-		DPRUpper float64 `json:"dpr_upper"`
-	}
-	if err := json.Unmarshal([]byte(raw), &mkt); err != nil {
+	snap, err := parseMarketSnap([]byte(raw))
+	if err != nil {
 		return
 	}
-	if mkt.TickSize > 0 {
-		info.TickSize = mkt.TickSize
+	if snap.TickSize > 0 {
+		info.TickSize = snap.TickSize
 	}
-	info.DPRLower = mkt.DPRLower
-	info.DPRUpper = mkt.DPRUpper
+	// A row that has not ticked today carries yesterday's (or last month's)
+	// band: leave the band unknown rather than defer/clamp on it.
+	if feedStale(snap.AsOf, time.Now()) {
+		p.logger.Warn("Replay: band row is STALE — band left unknown for this position",
+			zap.String("symbol", info.Symbol), zap.String("token", info.ExchangeToken), zap.Time("feed_as_of", snap.AsOf))
+		return
+	}
+	if snap.DPRLower > 0 {
+		info.DPRLower = snap.DPRLower
+	}
+	if snap.DPRUpper > 0 {
+		info.DPRUpper = snap.DPRUpper
+	}
 }
 
 func countAction(plans []FirePlan, a FireAction) int {

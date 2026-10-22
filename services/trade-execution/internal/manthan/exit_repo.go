@@ -129,9 +129,11 @@ func (r *Repository) HasOpenExitSell(ctx context.Context, strategyID, symbol str
 	return exists, err
 }
 
-// ListOpenExitSells returns exit sells still PLACED at the broker (created
-// since `since`) for fill confirmation / price chasing.
-func (r *Repository) ListOpenExitSells(ctx context.Context, since time.Time) ([]*ManthanOrder, error) {
+// ListOpenExitSells returns every exit sell still PLACED at the broker, for
+// fill confirmation / price chasing. No age cut (2026-10-22 review): a PLACED
+// row counts as cover everywhere, so it must stay under watch until the
+// broker's truth closes it — an AMO exit queued Friday converts Monday.
+func (r *Repository) ListOpenExitSells(ctx context.Context) ([]*ManthanOrder, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, signal_id, strategy_id, user_id, symbol, isin, exchange,
 		       order_type, order_side, product_type, qty, filled_qty,
@@ -144,8 +146,7 @@ func (r *Repository) ListOpenExitSells(ctx context.Context, since time.Time) ([]
 		  AND order_type IN ('MARKET_SELL','AMO_SELL')
 		  AND status = 'PLACED'
 		  AND broker_order_id != ''
-		  AND created_at >= $1
-		ORDER BY created_at`, since)
+		ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -191,10 +192,11 @@ func (r *Repository) UpdateOrderLimitAndParent(ctx context.Context, id int64, li
 	return err
 }
 
-// HasOwnExitSell reports whether this service itself placed an exit sell for
-// the lot recently (same strategy, symbol and quantity; 48 h window). The
-// manual-exit ledger uses it to tell OUR sell — seen by positions svc through
-// the whole-book path and labelled MANUAL_EXIT — from a real manual sale.
+// HasOwnExitSell reports whether this service itself SOLD the lot recently
+// (a FILLED exit row of ours with that quantity; 48 h window). Used by the
+// manual-exit ledger only when the position event carries no broker order id.
+// A PLACED (unfilled) exit of ours does not count: if the user sold the lot
+// from the app while our LIMIT rested, that sale is real and must be booked.
 func (r *Repository) HasOwnExitSell(ctx context.Context, strategyID, symbol string, qty int) (bool, error) {
 	var exists bool
 	err := r.db.QueryRowContext(ctx, `
@@ -204,11 +206,66 @@ func (r *Repository) HasOwnExitSell(ctx context.Context, strategyID, symbol stri
 		       AND order_side = 'SELL'
 		       AND order_type IN ('MARKET_SELL','AMO_SELL')
 		       AND COALESCE(broker_order_id,'') <> ''
-		       AND status IN ('PENDING','PLACED','FILLED')
-		       AND (qty = $3 OR filled_qty = $3)
+		       AND status = 'FILLED'
+		       AND filled_qty = $3
 		       AND created_at >= now() - interval '2 days'
 		)`, strategyID, symbol, qty).Scan(&exists)
 	return exists, err
+}
+
+// HasOwnExitSellByBrokerID reports whether brokerOrderID is one of OUR exit
+// sells (any status). The definitive test for "this MANUAL_EXIT event is our
+// own sell seen through the whole-book path".
+func (r *Repository) HasOwnExitSellByBrokerID(ctx context.Context, brokerOrderID string) (bool, error) {
+	if brokerOrderID == "" {
+		return false, nil
+	}
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+		    SELECT 1 FROM manthan_orders
+		     WHERE broker_order_id = $1
+		       AND order_side = 'SELL'
+		       AND order_type IN ('MARKET_SELL','AMO_SELL')
+		)`, brokerOrderID).Scan(&exists)
+	return exists, err
+}
+
+// SumOpenExitQty returns the quantity already committed to OTHER open exit
+// rows of the position (excluding excludeID) — a re-place must never sell
+// more than net holding minus what is already resting at the broker.
+func (r *Repository) SumOpenExitQty(ctx context.Context, strategyID, symbol string, excludeID int64) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(qty - COALESCE(filled_qty,0)), 0)
+		  FROM manthan_orders
+		 WHERE strategy_id = $1 AND symbol = $2 AND id <> $3
+		   AND order_side = 'SELL'
+		   AND order_type IN ('MARKET_SELL','AMO_SELL')
+		   AND status IN ('PENDING','PLACED')
+		   AND COALESCE(broker_order_id,'') <> ''`, strategyID, symbol, excludeID).Scan(&n)
+	return n, err
+}
+
+// ExpireOrphanPendingExits closes exit rows that were inserted but never got
+// a broker id (process died / ctx expired between INSERT and the broker
+// call). Such a row would otherwise count as cover in the naked scan forever.
+func (r *Repository) ExpireOrphanPendingExits(ctx context.Context, olderThan time.Duration) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET status = 'CANCELLED', cancelled_at = now(), updated_at = now(),
+		       last_error = 'orphan: no broker id ' || $1::text || ' after insert'
+		 WHERE order_side = 'SELL'
+		   AND order_type IN ('MARKET_SELL','AMO_SELL')
+		   AND status = 'PENDING'
+		   AND COALESCE(broker_order_id,'') = ''
+		   AND created_at < now() - ($1::interval)`,
+		fmt.Sprintf("%d seconds", int(olderThan.Seconds())))
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // ListOpenExitSellsForPosition returns every exit sell of ours still open

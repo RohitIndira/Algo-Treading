@@ -39,6 +39,9 @@ const (
 	// 09:15:10 IST, no attempt burn. 2026-08-17: 26 FIV99 entries were
 	// DLQ'd on attempt 1 by the generic "pre-check:"→POISON rule.
 	InboxErrPreOpen = "PRE_OPEN"
+	// InboxErrStaleFeed — the symbol's market-data row has not ticked today;
+	// no fresh price to act on. Hold (no attempt burn), re-check every 2 min.
+	InboxErrStaleFeed = "STALE_FEED"
 )
 
 // InboxRow mirrors a row of signal_inbox. Payload is kept as []byte so

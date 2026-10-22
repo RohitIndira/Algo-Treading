@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
 )
 
@@ -27,6 +28,10 @@ type SLHandler struct {
 	// eventPub publishes SL_PLACED / SL_MODIFIED / SL_REJECTED to
 	// manthan.execution.events. Optional — nil-safe.
 	eventPub *ManthanEventPublisher
+
+	// opsNotif (optional) carries operator alerts (OPS_ALERT) for conditions
+	// that need a human — a stop that could not be placed, an exit that failed.
+	opsNotif AuthExpiryNotifier
 	logger   *zap.Logger
 
 	// Cooldown: min 30s between SL modifications per symbol
@@ -79,6 +84,11 @@ func (h *SLHandler) SetRefreshAuth(rp AuthProvider) {
 // SL_MODIFIED, SL_REJECTED to manthan.execution.events.
 func (h *SLHandler) SetEventPublisher(p *ManthanEventPublisher) {
 	h.eventPub = p
+}
+
+// SetAuthExpiryNotifier wires the notifier used for operator alerts.
+func (h *SLHandler) SetAuthExpiryNotifier(n AuthExpiryNotifier) {
+	h.opsNotif = n
 }
 
 // resolveAuth fetches broker creds at-edge via authProvider (user-config gRPC
@@ -256,12 +266,18 @@ func (h *SLHandler) PlaceInitialSL(ctx context.Context, entryOrderID int64, sign
 			h.logger.Warn("SL placement failed due to auth — will retry via safety monitor",
 				zap.String("symbol", signal.Symbol), zap.Error(err))
 		} else {
-			h.logger.Error("SL placement FAILED — EMERGENCY MARKET SELL",
+			// A broker/exchange rejection of the stop is NOT a reason to sell a
+			// position bought seconds ago (2026-10-22 review; the old path
+			// market-sold it). The lot stays held: the safety monitor's naked
+			// scan re-drives PlaceInitialSL every cycle (band permitting) and
+			// the rules-engine software stop remains in force. Alert a human.
+			h.logger.Error("SL placement REJECTED — position is NAKED; naked scan keeps re-trying (no exit sell)",
 				zap.String("symbol", signal.Symbol), zap.Error(err))
 			if h.eventPub != nil {
 				h.eventPub.PublishSLRejected(ctx, signal, "", errMsg)
 			}
-			h.emergencySell(ctx, signal, info, auth, qty, "SL placement failed")
+			notifyOps(h.opsNotif, ctx, signal.UserID, signal.Symbol, "SL_REJECTED",
+				fmt.Sprintf("initial stop for %s rejected by broker: %s — position held without a broker stop", signal.Symbol, errMsg))
 		}
 		return fmt.Errorf("PlaceInitialSL: broker place SL for %s: %w", signal.Symbol, err)
 	}
@@ -351,13 +367,29 @@ func (h *SLHandler) MergeTopupSL(
 		zap.Float64("old_trigger", parentSL.TriggerPrice),
 		zap.Float64("new_trigger", newTrigger))
 
+	// HARD RULE: the trigger is never clamped to the band floor. If the merged
+	// intended stop is below today's band, keep the broker's resting trigger
+	// (already inside the band) and extend the quantity only; the intended
+	// level is recorded below and the trail / daily replay places it when the
+	// band allows (2026-10-22 review — ModifySLOrder's clamp would otherwise
+	// park the whole combined lot at today's lower circuit).
+	modTrigger, modLimit := newTrigger, newLimit
+	if _, _, deferWhy := resolveBandFloor(newTrigger, info.DPRLower); deferWhy != "" && parentSL.BrokerTriggerPrice > 0 {
+		modTrigger, modLimit = parentSL.BrokerTriggerPrice, parentSL.BrokerLimitPrice
+		if modLimit <= 0 {
+			modLimit = modTrigger - SLLimitGap(modTrigger, info.TickSize)
+		}
+		h.logger.Warn("Top-up SL merge: merged stop is below today's band — extending qty only, resting trigger kept",
+			zap.String("symbol", signal.Symbol), zap.Float64("intended", newTrigger),
+			zap.Float64("resting_trigger", modTrigger), zap.String("why", deferWhy))
+	}
 	brokerTrig, brokerLim, modErr := h.broker.ModifySLOrder(ctx, auth, info, parentSL.BrokerOrderID,
-		combinedQty, newTrigger, newLimit)
+		combinedQty, modTrigger, modLimit)
 	if IsAuthError(modErr) && h.refreshAuth != nil {
 		if fresh := h.refreshAuth(signal.UserID); fresh != nil {
 			auth = *fresh
 			brokerTrig, brokerLim, modErr = h.broker.ModifySLOrder(ctx, auth, info, parentSL.BrokerOrderID,
-				combinedQty, newTrigger, newLimit)
+				combinedQty, modTrigger, modLimit)
 		}
 	}
 	if modErr != nil {
@@ -442,6 +474,11 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 	info, err := h.broker.ResolveSymbol(ctx, signal.Symbol, isin)
 	if err != nil {
 		return fmt.Errorf("resolve symbol: %w", err)
+	}
+	if targetSL.ExchangeToken != "" && targetSL.ExchangeToken != info.ExchangeToken {
+		h.logger.Warn("ModifyTrail: stored token differs from the live ISIN mapping — re-pointing rows",
+			zap.String("symbol", signal.Symbol), zap.String("stored", targetSL.ExchangeToken), zap.String("live", info.ExchangeToken))
+		_, _ = h.repo.UpdateSymbolToken(ctx, signal.StrategyID, signal.Symbol, info.ExchangeToken, info.IndiraSymbol)
 	}
 
 	// Pre-check
@@ -664,6 +701,12 @@ func (h *SLHandler) trailDeferredSL(ctx context.Context, signal SLModifySignal, 
 //   - the sell itself is a marketable LIMIT with standing stops cancelled
 //     first, recorded as a PLACED exit row (see emergencySellInternal).
 func (h *SLHandler) EmergencySell(ctx context.Context, signal SLExitSignal) error {
+	// A LIVE exit is a DAY LIMIT and cancels the standing stop first; outside
+	// the regular session it cannot execute and would strip tonight's AMO
+	// stop (2026-10-22 review). Hold it: the inbox wakes it at 09:15:10.
+	if signal.TradingMode != "PAPER" && !marketOpenNowIST() {
+		return fmt.Errorf("%w: exit sell for %s outside the regular session — held until 09:15:10 IST", ErrPreOpenHold, signal.Symbol)
+	}
 	info, isin, err := h.resolveExitSymbol(ctx, signal)
 	if err != nil {
 		return err
@@ -825,7 +868,8 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 	// (timeouts) keep the latch — the order may have gone through.
 	releaseLatchIfRejected := func(err error) {
 		var rej *BrokerRejection
-		if errors.As(err, &rej) || IsAuthError(err) {
+		var biz *indiraClient.BrokerBusinessError
+		if errors.As(err, &rej) || errors.As(err, &biz) || IsAuthError(err) || errors.Is(err, ErrUnpriced) {
 			h.emergencyMu.Lock()
 			delete(h.lastEmergency, latchKey)
 			h.emergencyMu.Unlock()
@@ -833,6 +877,7 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 	}
 
 	// Step 2 — free the quantity: cancel our resting stops for this position.
+	confirmed := 0
 	if ec.StrategyID != "" && h.repo != nil {
 		standing, err := h.repo.ListStandingSLs(ctx, ec.StrategyID, info.Symbol)
 		if err != nil {
@@ -846,6 +891,27 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 						zap.String("symbol", info.Symbol), zap.String("broker_order_id", sl.BrokerOrderID), zap.Error(cerr))
 					continue
 				}
+				// The broker stop fires on the same LTP cross as the software
+				// stop: if it already EXECUTED, the cancel is moot and its fill
+				// must be booked FILLED — marking it CANCELLED would drop the
+				// fill from the ledger and leave a ghost lot (2026-10-22 review).
+				if st, fq, ap, serr := h.broker.GetOrderStatus(ctx, auth, sl.BrokerOrderID); serr == nil && isFilledStatus(st) {
+					if fq <= 0 {
+						fq = sl.Qty
+					}
+					_ = h.repo.UpdateOrderFilled(ctx, sl.ID, fq, ap)
+					_ = h.repo.InsertEvent(ctx, sl.ID, "SL_FILLED", "SL_PLACED", "SL_FILLED", st, ap, fq,
+						"stop filled at the exchange before the exit sell could cancel it")
+					if h.eventPub != nil {
+						if esid, e := h.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); e == nil && esid != "" {
+							h.eventPub.PublishSLFilled(ctx, esid, ec.StrategyID, auth.UserID, info.Symbol, sl.BrokerOrderID, ap, int32(fq), 0)
+						}
+					}
+					h.logger.Warn("EmergencySell: standing stop had already FILLED — booked, not cancelled",
+						zap.String("symbol", info.Symbol), zap.String("broker_order_id", sl.BrokerOrderID), zap.Int("filled", fq))
+					confirmed++
+					continue
+				}
 			}
 			_ = h.repo.UpdateOrderCancelled(ctx, sl.ID)
 			_ = h.repo.InsertEvent(ctx, sl.ID, "SL_CANCELLED_FOR_EXIT", "SL_PLACED", "CANCELLED",
@@ -857,7 +923,8 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 
 	// Step 2b — an exit of ours still resting (today's DAY LIMIT, or last
 	// evening's AMO LIMIT under its post-conversion id) also locks the qty.
-	if confirmed := h.cancelOpenExitSells(ctx, auth, info, ec.StrategyID, reason); confirmed > 0 && h.repo != nil {
+	confirmed += h.cancelOpenExitSells(ctx, auth, info, ec.StrategyID, reason)
+	if confirmed > 0 && h.repo != nil {
 		if net, _, has, nerr := h.repo.NetHeldQty(ctx, ec.StrategyID, info.Symbol); nerr == nil && has {
 			if net <= 0 {
 				h.logger.Warn("EmergencySell: the earlier exit had already filled — nothing left to sell",

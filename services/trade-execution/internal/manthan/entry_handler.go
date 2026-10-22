@@ -28,6 +28,11 @@ var ErrUpperCircuitHold = errors.New("upper-circuit hold")
 // than DLQ-ing as POISON. Message never contains classifier tokens.
 var ErrPreOpenHold = errors.New("pre-open hold")
 
+// ErrStaleFeedHold marks an entry whose market-data row has not ticked today:
+// there is no fresh price to buy against. Held (not failed) — the inbox
+// retries every couple of minutes without burning attempts.
+var ErrStaleFeedHold = errors.New("stale feed hold")
+
 // EntryHandler manages LIMIT BUY order placement with WSS-based fill detection.
 //
 // LIVE mode flow:
@@ -224,13 +229,20 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 		return 0, fmt.Errorf("pre-check: %s", check.Reason)
 	}
 
-	// 3. Fetch live LTP
-	ltp, err := h.broker.FetchLTP(ctx, info.ExchangeToken)
+	// 3. Fetch live LTP — from the LIVE Redis row (token re-resolved from the
+	// ISIN key if the carried row is missing/stale). A row that has not ticked
+	// today must never price an entry (2026-10-22 review): hold and retry.
+	ltp, stale, asOf, err := h.broker.FreshLTP(ctx, info)
 	if err != nil {
 		if h.eventPub != nil {
 			h.eventPub.PublishEntryRejected(ctx, signal, "", fmt.Sprintf("fetch_ltp: %v", err), "TRADE_EXEC")
 		}
 		return 0, fmt.Errorf("fetch LTP: %w", err)
+	}
+	if stale || ltp <= 0 {
+		h.logger.Warn("Entry held — market feed row is stale, no fresh LTP to price against",
+			zap.String("symbol", signal.Symbol), zap.String("token", info.ExchangeToken), zap.Time("feed_as_of", asOf))
+		return 0, fmt.Errorf("%w: feed row for %s stale (as of %s)", ErrStaleFeedHold, signal.Symbol, asOf.Format(time.RFC3339))
 	}
 
 	// 4. Calculate entry price = LTP + 2 ticks
@@ -810,8 +822,9 @@ func (h *EntryHandler) handleTimeout(ctx context.Context, brokerID string, auth 
 	}
 
 	// Fetch current LTP first — needed both for escalation math and MARKET fallback sizing check.
-	currentLTP, ltpErr := h.broker.FetchLTP(ctx, info.ExchangeToken)
-	if ltpErr != nil {
+	// Live row only: a stale row (drift = 0 forever) must not drive the ladder.
+	currentLTP, ltpStale, _, ltpErr := h.broker.FreshLTP(ctx, info)
+	if ltpErr != nil || ltpStale || currentLTP <= 0 {
 		return fillResult{action: actionRetry}
 	}
 

@@ -275,7 +275,7 @@ func (r *Reconciler) reconcileUser(ctx context.Context, userID string, auth Brok
 				zap.String("db_status", string(dbOrd.Status)))
 			continue
 		}
-		if r.applyDrift(ctx, dbOrd, bOrd) {
+		if r.applyDrift(ctx, auth, dbOrd, bOrd) {
 			fixed++
 		}
 	}
@@ -291,7 +291,7 @@ func (r *Reconciler) reconcileUser(ctx context.Context, userID string, auth Brok
 
 // applyDrift compares one DB order to its broker counterpart and fixes any
 // observed mismatch. Returns true if a DB write was performed.
-func (r *Reconciler) applyDrift(ctx context.Context, db *ManthanOrder, bOrd *indiraClient.OrderBook) bool {
+func (r *Reconciler) applyDrift(ctx context.Context, auth BrokerAuth, db *ManthanOrder, bOrd *indiraClient.OrderBook) bool {
 	br := strings.ToUpper(strings.TrimSpace(bOrd.Status))
 
 	// SSOT sync: mirror the broker's actual resting SL trigger/limit into the DB
@@ -311,10 +311,16 @@ func (r *Reconciler) applyDrift(ctx context.Context, db *ManthanOrder, bOrd *ind
 			tradedQty = db.Qty // some broker rows carry 0 tradedQty after EOD consolidation
 		}
 		// Broker's OrderBook response doesn't expose avg-fill-price; `price`
-		// (the submitted limit price, per Indira API doc page 14) is the
-		// best approximation for marketable-limit fills. Exchange fills never
-		// cross the limit on a BUY, so this is an upper bound.
+		// is the submitted LIMIT. For a SELL exit that is a LOWER bound on the
+		// real fill (2026-10-22: fills were 1.6–2% above the limit), so ask the
+		// trade book for the qty-weighted average first and fall back to the
+		// limit only when the trade book has no rows yet.
 		avgPrice := bOrd.Price
+		if tradedQty > 0 {
+			if tradeAvg, terr := r.broker.fetchAvgFillPrice(ctx, auth, db.BrokerOrderID); terr == nil && tradeAvg > 0 {
+				avgPrice = tradeAvg
+			}
+		}
 		_ = r.repo.UpdateOrderFilled(ctx, db.ID, tradedQty, avgPrice)
 		_ = r.repo.InsertEvent(ctx, db.ID, "RECONCILER_FIXED", string(db.Status), "FILLED",
 			bOrd.Status, avgPrice, tradedQty,
@@ -338,6 +344,23 @@ func (r *Reconciler) applyDrift(ctx context.Context, db *ManthanOrder, bOrd *ind
 
 	// Drift B: broker says Cancelled/Rejected but DB says still-placed or sl-placed
 	if isCancelledBrokerStatus(br) && (db.Status == StatusPlaced || db.Status == StatusSLPlaced) {
+		// A partial fill before the cancel is real money: book it as FILLED for
+		// the traded part so net-qty arithmetic stays exact (2026-10-22 review).
+		if bOrd.TradedQty > 0 && bOrd.TradedQty > db.FilledQty {
+			avg := bOrd.Price
+			if tradeAvg, terr := r.broker.fetchAvgFillPrice(ctx, auth, db.BrokerOrderID); terr == nil && tradeAvg > 0 {
+				avg = tradeAvg
+			}
+			_ = r.repo.UpdateOrderFilled(ctx, db.ID, bOrd.TradedQty, avg)
+			_ = r.repo.InsertEvent(ctx, db.ID, "RECONCILER_FIXED", string(db.Status), "FILLED",
+				bOrd.Status, avg, bOrd.TradedQty,
+				fmt.Sprintf("reconciler: broker=%s with traded_qty=%d → booked the partial fill (remainder %d cancelled at broker)",
+					bOrd.Status, bOrd.TradedQty, db.Qty-bOrd.TradedQty))
+			r.logger.Warn("Reconciler booked a partial fill on a cancelled order",
+				zap.Int64("order_id", db.ID), zap.String("symbol", db.Symbol),
+				zap.Int("traded_qty", bOrd.TradedQty), zap.Int("qty", db.Qty))
+			return true
+		}
 		_ = r.repo.UpdateOrderCancelled(ctx, db.ID)
 		rej := strings.TrimSpace(bOrd.RejReason)
 		if rej != "" {
@@ -349,7 +372,12 @@ func (r *Reconciler) applyDrift(ctx context.Context, db *ManthanOrder, bOrd *ind
 		_ = r.repo.InsertEvent(ctx, db.ID, "RECONCILER_FIXED", string(db.Status), "CANCELLED",
 			bOrd.Status, 0, 0,
 			fmt.Sprintf("reconciler: broker=%s but DB=%s → synced%s", bOrd.Status, db.Status,
-				func() string { if rej != "" { return " — " + rej }; return "" }()))
+				func() string {
+					if rej != "" {
+						return " — " + rej
+					}
+					return ""
+				}()))
 		r.logger.Warn("Reconciler fixed order → CANCELLED",
 			zap.Int64("order_id", db.ID),
 			zap.String("symbol", db.Symbol),

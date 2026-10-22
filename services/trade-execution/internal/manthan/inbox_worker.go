@@ -470,6 +470,9 @@ func classifyHandlerErr(err error) string {
 	if errors.Is(err, ErrPreOpenHold) {
 		return InboxErrPreOpen
 	}
+	if errors.Is(err, ErrStaleFeedHold) {
+		return InboxErrStaleFeed
+	}
 	var pe poisonError
 	if errors.As(err, &pe) {
 		return InboxErrPoison
@@ -519,6 +522,10 @@ func backoffFor(class string, attempts int) time.Duration {
 	if class == InboxErrPreOpen {
 		return untilMarketOpen(time.Now())
 	}
+	// Stale-feed holds: the producer may resume any minute; re-check every 2 min.
+	if class == InboxErrStaleFeed {
+		return 2 * time.Minute
+	}
 	const cap = 5 * time.Minute
 	exp := attempts
 	if exp > 8 {
@@ -542,7 +549,7 @@ func isHoldClass(class string) bool {
 	// the same-day expiry sweep dead-letters entry rows at the next IST day,
 	// and the market-hours pre-check poisons them after the entry cutoff.
 	return class == InboxErrUpperCircuit || class == InboxErrPreOpen ||
-		class == InboxErrAuthExpired
+		class == InboxErrAuthExpired || class == InboxErrStaleFeed
 }
 
 // entryAttemptIsTerminalFailure reports whether an existing manthan_orders
@@ -572,6 +579,13 @@ func istLocation() *time.Location {
 func untilMarketOpen(now time.Time) time.Duration {
 	n := now.In(istLocation())
 	open := time.Date(n.Year(), n.Month(), n.Day(), 9, 15, 10, 0, istLocation())
+	// After the close, or on a non-trading day, the next chance is the next
+	// session's open — not 30 s from now all night (2026-10-22 review: exit
+	// signals held outside the session).
+	if !indiraClient.IsTradingDay(n) || n.After(time.Date(n.Year(), n.Month(), n.Day(), 15, 30, 0, 0, istLocation())) {
+		next := indiraClient.NextTradingDay(n)
+		open = time.Date(next.Year(), next.Month(), next.Day(), 9, 15, 10, 0, istLocation())
+	}
 	d := open.Sub(n)
 	if d < 30*time.Second {
 		return 30 * time.Second

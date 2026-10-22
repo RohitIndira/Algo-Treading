@@ -112,6 +112,15 @@ module.exports = {
         // code change. Env blocks are whitelists — must be forwarded here.
         MANTHAN_ALGO_ID: ENV.MANTHAN_ALGO_ID || '',
         MANTHAN_ALGO_CATEGORY: ENV.MANTHAN_ALGO_CATEGORY || '',
+        // Exit / stop pricing knobs (2026-10-22 exit redesign). Empty →
+        // code defaults: exit LIMIT 2% under LTP, SL limit leg 2% under the
+        // trigger, feed row stale after 6h, entry LIMIT 1% over LTP. The
+        // effective values are logged once at startup. Env blocks are
+        // whitelists — must be forwarded here to reach the process.
+        MANTHAN_EXIT_LIMIT_SLIPPAGE_PCT: ENV.MANTHAN_EXIT_LIMIT_SLIPPAGE_PCT || '',
+        MANTHAN_SL_LIMIT_GAP_PCT: ENV.MANTHAN_SL_LIMIT_GAP_PCT || '',
+        MANTHAN_FEED_STALE_AFTER: ENV.MANTHAN_FEED_STALE_AFTER || '',
+        MANTHAN_ENTRY_LIMIT_SLIPPAGE_PCT: ENV.MANTHAN_ENTRY_LIMIT_SLIPPAGE_PCT || '',
         // Price client (paper monitor, OCO trailing SL, price-monitor fallback)
         // reads market:nse:{token} LTP — point REDIS_HOST/PORT at the external
         // market feed, NOT the empty local redis. EXT_REDIS_ADDR (broker adapter)

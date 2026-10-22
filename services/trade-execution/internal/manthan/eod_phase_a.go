@@ -98,6 +98,12 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 		return
 	}
 
+	// Close out the day's exit sells first: an unfilled DAY LIMIT was swept by
+	// the exchange at 15:30 but its row is still PLACED — it would block the
+	// arming below ("exit in flight") all night with nothing resting at the
+	// broker. Each such exit is re-queued as an AMO LIMIT for the next session.
+	p.sweepUnfilledExits(cycleCtx)
+
 	positions, err := p.repo.ListPositionsNeedingProtection(cycleCtx)
 	if err != nil {
 		p.logger.Error("EOD Phase A: list positions failed", zap.Error(err))
