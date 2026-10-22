@@ -438,9 +438,68 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 		})
 	}
 
+	// Operator alerts from the exit / protection engine (2026-10-22): the
+	// conditions trade-execution raises as OPS_ALERT — an exit that could not
+	// be re-placed or gave up, a lost stop that could not be re-armed, an
+	// unfilled exit that could not be re-queued for the next session. Taken
+	// from the durable audit trail (manthan_order_events), not the
+	// fire-and-forget notification stream, so an alert survives until the
+	// position is actually resolved: it drops out once a later EXIT_FILLED /
+	// SL_PLACED / SL_REPLACED event exists for the same (strategy, symbol).
+	ops, err := f.execDB.QueryContext(ctx, `
+		SELECT e.event_type, o.user_id, o.strategy_id, o.symbol,
+		       COALESCE(e.detail, ''), e.created_at
+		  FROM manthan_order_events e
+		  JOIN manthan_orders o ON o.id = e.order_id
+		 WHERE e.event_type IN ('EXIT_CHASE_EXHAUSTED','EXIT_REPRICE_FAILED','EMERGENCY_SELL_FAILED',
+		                        'EXIT_AMO_FAILED','SL_LOST_PARKED','EXIT_UNRECORDED','SL_MODIFY_FAILED','EXIT_EXPIRED')
+		   AND e.created_at >= now() - interval '24 hours'
+		   AND NOT EXISTS (
+		       SELECT 1 FROM manthan_order_events f
+		         JOIN manthan_orders fo ON fo.id = f.order_id
+		        WHERE fo.strategy_id = o.strategy_id AND fo.symbol = o.symbol
+		          AND f.event_type IN ('EXIT_FILLED','SL_FILLED','SL_PLACED','SL_REPLACED','PROTECTIVE_FIRED','EXIT_SELL_PLACED')
+		          AND f.created_at > e.created_at)
+		 ORDER BY e.created_at DESC
+		 LIMIT 100`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("attention ops alerts: %w", err)
+	}
+	seenOps := map[string]bool{}
+	for ops.Next() {
+		var evType, userID, strategyID, symbol, detail string
+		var at time.Time
+		if err := ops.Scan(&evType, &userID, &strategyID, &symbol, &detail, &at); err != nil {
+			ops.Close()
+			return nil, nil, err
+		}
+		key := strategyID + "|" + symbol + "|" + evType
+		if seenOps[key] {
+			continue // newest per (position, kind) is enough
+		}
+		seenOps[key] = true
+		if len(detail) > 220 {
+			detail = detail[:220] + "…"
+		}
+		items = append(items, AttentionItem{
+			Severity: "CRITICAL", Kind: "OPS_ALERT", UserID: userID, Strategy: strategyID, Symbol: symbol,
+			Detail: fmt.Sprintf("%s at %s IST — %s", evType, at.In(istLoc()).Format("02 Jan 15:04"), detail),
+			Module: "exit",
+		})
+	}
+	ops.Close()
+
 	// Rank: CRITICAL, WARN, INFO — stable within severity.
 	rank := map[string]int{"CRITICAL": 0, "WARN": 1, "INFO": 2}
 	sort.SliceStable(items, func(i, j int) bool { return rank[items[i].Severity] < rank[items[j].Severity] })
 
 	return items, []string{"HOLDINGS_DRIFT (kafka consumer pending)", "CORP_ACTION_FLAG (detector pending)"}, nil
+}
+
+// istLoc returns Asia/Kolkata (fixed +05:30 fallback).
+func istLoc() *time.Location {
+	if loc, err := time.LoadLocation("Asia/Kolkata"); err == nil {
+		return loc
+	}
+	return time.FixedZone("IST", 5*3600+1800)
 }
