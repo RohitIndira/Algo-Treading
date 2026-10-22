@@ -123,12 +123,17 @@ type SLModifyOrder struct {
 
 // SLExitOrder is published when trailing SL is triggered.
 type SLExitOrder struct {
-	OrderID     string  `json:"order_id"`
-	UserID      string  `json:"user_id"`
-	StrategyID  string  `json:"strategy_id"`
-	Symbol      string  `json:"symbol"`
+	OrderID    string `json:"order_id"`
+	UserID     string `json:"user_id"`
+	StrategyID string `json:"strategy_id"`
+	Symbol     string `json:"symbol"`
+	// ISIN is REQUIRED downstream: trade-execution resolves the exchange token
+	// from `isin:<ISIN>` before it can place the sell. A payload without it
+	// was the 2026-10-22 root cause — every software-stop exit since late
+	// September died with "isin lookup failed: redis: nil".
+	ISIN        string  `json:"isin"`
 	Exchange    string  `json:"exchange"`
-	OrderType   string  `json:"order_type"`   // MARKET
+	OrderType   string  `json:"order_type"`   // MARKET (trade-execution executes it as a marketable LIMIT)
 	OrderSide   string  `json:"order_side"`   // SELL
 	ProductType string  `json:"product_type"` // DELIVERY
 	Quantity    int32   `json:"quantity"`
@@ -250,6 +255,7 @@ func (g *OrderGenerator) GenerateSLExit(
 		UserID:      strategy.UserID,
 		StrategyID:  strategy.StrategyID,
 		Symbol:      pos.Symbol,
+		ISIN:        pos.ISIN,
 		Exchange:    "NSE",
 		OrderType:   "MARKET",
 		OrderSide:   "SELL",
