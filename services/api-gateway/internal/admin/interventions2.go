@@ -215,21 +215,26 @@ type GhostEvidence struct {
 
 // GhostPlan is the previewed heal.
 type GhostPlan struct {
-	UserID           string        `json:"user_id"`
-	Symbol           string        `json:"symbol"`
-	BookRows         int           `json:"book_rows"`
-	BookQty          int           `json:"book_qty"`
-	LedgerNetQty     int           `json:"ledger_net_qty"` // manthan_orders net; >0 gets the FIX-5 SELL row
-	LedgerOnly       bool          `json:"ledger_only"`    // no ACTIVE book row; only the execution ledger still holds the lot
-	StrategyID       string        `json:"strategy_id,omitempty"`
-	Evidence         GhostEvidence `json:"evidence"`
-	ExitPrice        float64       `json:"exit_price,omitempty"` // tradebook-backed; 0 = reconciled later
-	ConfirmationText string        `json:"confirmation_text"`
+	UserID       string `json:"user_id"`
+	Symbol       string `json:"symbol"`
+	BookRows     int    `json:"book_rows"`
+	BookQty      int    `json:"book_qty"`
+	LedgerNetQty int    `json:"ledger_net_qty"` // manthan_orders net; >0 gets the FIX-5 SELL row
+	LedgerOnly   bool   `json:"ledger_only"`    // no ACTIVE book row; only the execution ledger still holds the lot
+	// OtherStrategiesHolding — further strategies of this user whose ledger
+	// still holds the symbol (each needs its own heal); ledger-only plans.
+	OtherStrategiesHolding int           `json:"other_strategies_holding,omitempty"`
+	StrategyID             string        `json:"strategy_id,omitempty"`
+	Evidence               GhostEvidence `json:"evidence"`
+	ExitPrice              float64       `json:"exit_price,omitempty"` // tradebook-backed; 0 = reconciled later
+	ConfirmationText       string        `json:"confirmation_text"`
 }
 
 func ghostConfirmation(p *GhostPlan) string {
 	if p.LedgerOnly {
-		return fmt.Sprintf("HEAL GHOST %s FOR %s — CLOSE LEDGER ×%d", p.Symbol, p.UserID, p.LedgerNetQty)
+		// The strategy is part of the text: two strategies of one user can
+		// hold the same symbol, and the heal must name the one it closes.
+		return fmt.Sprintf("HEAL GHOST %s FOR %s — CLOSE LEDGER ×%d OF STRATEGY %s", p.Symbol, p.UserID, p.LedgerNetQty, shortID(p.StrategyID))
 	}
 	return fmt.Sprintf("HEAL GHOST %s FOR %s — CLOSE %d BOOK ROWS ×%d", p.Symbol, p.UserID, p.BookRows, p.BookQty)
 }
@@ -258,29 +263,37 @@ func (a *Actions) GhostPreview(ctx context.Context, userID, symbol string) (*Gho
 		// protecting — and trying to exit — a lot the broker does not hold
 		// (79 rejected stop re-placements in 20 minutes). Heal from the ledger
 		// side under the same broker-verified evidence as a book ghost.
-		var oldest sql.NullTime
+		// Settlement anchor = the NEWEST filled BUY of the strategy: a lot
+		// bought yesterday (T+1, hidden by freeQty=0) must never pass as
+		// "past settlement" on the strength of a round-trip closed months ago.
+		var newest sql.NullTime
 		lerr := a.fleet.execDB.QueryRowContext(ctx, `
-			SELECT strategy_id, net, first_buy FROM (
+			SELECT strategy_id, net, last_buy, (SELECT COUNT(*) - 1 FROM (
+			           SELECT strategy_id FROM manthan_orders
+			            WHERE user_id = $1 AND UPPER(symbol) = $2 AND status = 'FILLED'
+			            GROUP BY strategy_id
+			           HAVING SUM(CASE WHEN order_side='BUY' THEN filled_qty ELSE -filled_qty END) > 0) o) AS others
+			  FROM (
 			    SELECT strategy_id,
 			           SUM(CASE WHEN order_side='BUY'  AND status='FILLED' THEN filled_qty
 			                    WHEN order_side='SELL' AND status='FILLED' THEN -filled_qty
 			                    ELSE 0 END) AS net,
-			           MIN(CASE WHEN order_side='BUY' AND status='FILLED'
-			                    THEN COALESCE(filled_at, created_at) END) AS first_buy
+			           MAX(CASE WHEN order_side='BUY' AND status='FILLED'
+			                    THEN COALESCE(filled_at, created_at) END) AS last_buy
 			      FROM manthan_orders
 			     WHERE user_id = $1 AND UPPER(symbol) = $2
 			     GROUP BY strategy_id) t
 			 WHERE net > 0
-			 ORDER BY net DESC
-			 LIMIT 1`, userID, symbol).Scan(&p.StrategyID, &p.LedgerNetQty, &oldest)
+			 ORDER BY net DESC, strategy_id
+			 LIMIT 1`, userID, symbol).Scan(&p.StrategyID, &p.LedgerNetQty, &newest, &p.OtherStrategiesHolding)
 		if lerr == sql.ErrNoRows {
 			return nil, &refusal{code: 422, msg: fmt.Sprintf("no ACTIVE book rows and no ledger holding for %s/%s — nothing to heal", userID, symbol)}
 		}
 		if lerr != nil {
 			return nil, fmt.Errorf("ghost ledger: %w", lerr)
 		}
-		if oldest.Valid {
-			t := oldest.Time
+		if newest.Valid {
+			t := newest.Time
 			p.Evidence.OldestEntry = &t
 		}
 		p.LedgerOnly = true
@@ -308,9 +321,14 @@ func (a *Actions) GhostPreview(ctx context.Context, userID, symbol string) (*Gho
 	if err != nil {
 		return nil, fmt.Errorf("ghost holdings: %w", err)
 	}
-	totals := holdingsTotals(holdings)
+	// Keyed by EVERY name a holding can carry (baseSym, dispSym, dispSym with
+	// its series suffix stripped): a BE/BZ/SM-series lot shows as
+	// "SPECIALITY-BE" while our book says "SPECIALITY" — keyed by dispSym
+	// alone it read as "holds 0" and a REAL holding could be healed away
+	// (2026-10-23 review).
+	totals := holdingsTotalsAllKeys(holdings)
 	if book, berr := a.broker.GetOrderBook(ctx, auth); berr == nil {
-		addOpenSellCommitments(totals, book) // SL-committed qty is HELD (the intraday freeQty=0 trap)
+		addOpenSellCommitmentsAllKeys(totals, book) // SL-committed qty is HELD (the intraday freeQty=0 trap)
 	}
 	p.Evidence.BrokerQty = totals[symbol]
 	p.Evidence.HoldingsAbsent = p.Evidence.BrokerQty == 0
@@ -372,7 +390,7 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 	res, err := a.fleet.posDB.ExecContext(ctx, `
 		UPDATE positions
 		   SET status = 'EXITED', exit_time = now(), exit_reason = 'ADMIN_GHOST_CLEANUP',
-		       exit_price = NULLIF($3, 0)
+		       exit_price = NULLIF($3::numeric, 0)
 		 WHERE user_id = $1 AND UPPER(symbol) = $2 AND status = 'ACTIVE'`,
 		p.UserID, p.Symbol, p.ExitPrice)
 	if err != nil {
@@ -380,16 +398,20 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 	}
 	closed, _ := res.RowsAffected()
 
-	ledgerRow := false
+	ledgerRow, eventWritten := false, false
 	var stopRows int64
+	var stopRowsLive []string
 	if p.StrategyID != "" && p.LedgerNetQty > 0 {
-		sig := fmt.Sprintf("adminghost-%s-%s-%s", p.UserID, p.Symbol, time.Now().Format("20060102"))
+		// One synthetic SELL per (user, strategy, symbol, day): without the
+		// strategy in the key a second strategy's heal on the same day
+		// silently wrote nothing (2026-10-23 review).
+		sig := fmt.Sprintf("adminghost-%s-%s-%s-%s", p.UserID, shortID(p.StrategyID), p.Symbol, time.Now().Format("20060102"))
 		var ledgerID int64
 		err := a.fleet.execDB.QueryRowContext(ctx, `
 			INSERT INTO manthan_orders
 				(signal_id, strategy_id, user_id, symbol, order_type, order_side,
 				 qty, filled_qty, status, avg_fill_price, exchange, filled_at, last_error)
-			VALUES ($1, $2, $3, $4, 'MARKET_SELL', 'SELL', $5, $5, 'FILLED', NULLIF($6,0), 'NSE', now(),
+			VALUES ($1, $2, $3, $4, 'MARKET_SELL', 'SELL', $5, $5, 'FILLED', NULLIF($6::numeric, 0), 'NSE', now(),
 			        'admin ghost cleanup: broker-verified missing SELL recorded (FIX-5 pattern)')
 			ON CONFLICT (signal_id) DO NOTHING
 			RETURNING id`,
@@ -397,33 +419,35 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 		if err != nil && err != sql.ErrNoRows {
 			return nil, fmt.Errorf("ghost heal ledger: %w", err)
 		}
-		ledgerRow = true
-		if ledgerID > 0 {
-			// Durable trail: resolves the GHOST_SUSPECT / EXIT_CHASE_EXHAUSTED
-			// rows in /admin/attention for this position.
-			_, _ = a.fleet.execDB.ExecContext(ctx, `
-				INSERT INTO manthan_order_events (order_id, event_type, old_status, new_status, broker_status, price, qty, detail)
-				VALUES ($1, 'GHOST_HEALED', '', 'FILLED', 'ADMIN', $2, $3, $4)`,
-				ledgerID, p.ExitPrice, p.LedgerNetQty,
-				fmt.Sprintf("admin ghost heal: broker holds 0 (holdings absent, no open SELL, past settlement=%v, tradebook sell=%v)",
-					p.Evidence.PastSettlement, p.Evidence.TradebookSell))
+		ledgerRow = ledgerID > 0
+		if !ledgerRow {
+			// Same key already used today and the net is STILL > 0: nothing was
+			// written — say so, and leave the stop rows alone (a parked
+			// GHOST_SUSPECT row is what keeps Phase A from re-arming the ghost).
+			return nil, &refusal{code: 409, msg: fmt.Sprintf(
+				"a ghost-heal SELL for %s/%s/%s was already recorded today (%s) yet the ledger net is still %d — inspect manthan_orders before healing again",
+				p.UserID, shortID(p.StrategyID), p.Symbol, sig, p.LedgerNetQty)}
+		}
+		// Durable trail: resolves the GHOST_SUSPECT / EXIT_CHASE_EXHAUSTED
+		// rows in /admin/attention for this position.
+		if _, eerr := a.fleet.execDB.ExecContext(ctx, `
+			INSERT INTO manthan_order_events (order_id, event_type, old_status, new_status, broker_status, price, qty, detail)
+			VALUES ($1, 'GHOST_HEALED', '', 'FILLED', 'ADMIN', $2, $3, $4)`,
+			ledgerID, p.ExitPrice, p.LedgerNetQty,
+			fmt.Sprintf("admin ghost heal: broker holds 0 (holdings absent, no open SELL, past settlement=%v, tradebook sell=%v)",
+				p.Evidence.PastSettlement, p.Evidence.TradebookSell)); eerr == nil {
+			eventWritten = true
 		}
 		// Stale protection rows of the lot (parked GHOST_SUSPECT, deferred,
 		// placed-but-dead) would keep counting as "cover" and could be
-		// promoted again by the trail or Phase A. The preview verified no open
-		// SELL stands at the broker for the scrip, so nothing live is lost.
-		res, serr := a.fleet.execDB.ExecContext(ctx, `
-			UPDATE manthan_orders
-			   SET status = 'CANCELLED', broker_status = 'GHOST_HEALED', cancelled_at = now(), updated_at = now(),
-			       last_error = 'admin ghost cleanup: stale stop row closed (broker holds nothing)'
-			 WHERE strategy_id = $1 AND UPPER(symbol) = $2 AND order_side = 'SELL'
-			   AND order_type IN ('SL_SELL','SL_SELL_AMO')
-			   AND status IN ('PENDING','SL_PLACED','SL_MODIFY_PENDING','SL_DEFERRED_BAND','AMO_PENDING')`,
-			p.StrategyID, p.Symbol)
-		if serr != nil {
-			stopRows = -1
+		// promoted again by the trail or Phase A. A row whose broker order is
+		// STILL LIVE in the book is never closed here — that would hide a
+		// real order from the reconciler and the monitor; it is reported.
+		auth, aerr := a.authFor(ctx, p.UserID)
+		if aerr != nil {
+			stopRows = -1 // cannot prove the orders dead — close nothing
 		} else {
-			stopRows, _ = res.RowsAffected()
+			stopRows, stopRowsLive = a.closeStaleStopRows(ctx, auth, p.StrategyID, p.Symbol)
 		}
 	}
 
@@ -447,9 +471,81 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 			slotRows, _ = res.RowsAffected()
 		}
 	}
-	return map[string]any{"book_rows_closed": closed, "ledger_sell_written": ledgerRow,
-		"stop_rows_closed": stopRows, "ledger_only": p.LedgerOnly,
-		"exit_price": p.ExitPrice, "slot_rows_marked": slotRows}, nil
+	return map[string]any{"book_rows_closed": closed, "ledger_sell_written": ledgerRow, "event_written": eventWritten,
+		"stop_rows_closed": stopRows, "stop_rows_left_live_at_broker": stopRowsLive, "ledger_only": p.LedgerOnly,
+		"other_strategies_holding": p.OtherStrategiesHolding,
+		"exit_price":               p.ExitPrice, "slot_rows_marked": slotRows}, nil
+}
+
+// closeStaleStopRows cancels the lot's protection rows in the ledger — only
+// those whose broker order is absent from the book or terminal there. Rows
+// whose order is still live are left untouched and returned by broker id.
+// -1 rows means the ledger read/write itself failed.
+func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.AuthContext, strategyID, symbol string) (int64, []string) {
+	rows, err := a.fleet.execDB.QueryContext(ctx, `
+		SELECT id, COALESCE(broker_order_id, '')
+		  FROM manthan_orders
+		 WHERE strategy_id = $1 AND UPPER(symbol) = $2 AND order_side = 'SELL'
+		   AND order_type IN ('SL_SELL','SL_SELL_AMO')
+		   AND status IN ('PENDING','SL_PLACED','SL_MODIFY_PENDING','SL_DEFERRED_BAND','AMO_PENDING')`,
+		strategyID, symbol)
+	if err != nil {
+		return -1, nil
+	}
+	type stopRow struct {
+		id       int64
+		brokerID string
+	}
+	var candidates []stopRow
+	for rows.Next() {
+		var r stopRow
+		if rows.Scan(&r.id, &r.brokerID) == nil {
+			candidates = append(candidates, r)
+		}
+	}
+	rows.Close()
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+	live := map[string]bool{}
+	needBook := false
+	for _, c := range candidates {
+		if c.brokerID != "" {
+			needBook = true
+		}
+	}
+	if needBook {
+		book, berr := a.broker.GetOrderBook(ctx, auth)
+		if berr != nil {
+			return -1, nil // cannot prove the orders dead — close nothing
+		}
+		for _, ob := range book {
+			st := strings.ToUpper(strings.TrimSpace(ob.Status))
+			if st == "EXECUTED" || st == "CANCELLED" || st == "CANCELED" || st == "REJECTED" || st == "EXPIRED" {
+				continue
+			}
+			live[ob.OrdId] = true
+		}
+	}
+	var closed int64
+	var left []string
+	for _, c := range candidates {
+		if c.brokerID != "" && live[c.brokerID] {
+			left = append(left, c.brokerID)
+			continue
+		}
+		res, uerr := a.fleet.execDB.ExecContext(ctx, `
+			UPDATE manthan_orders
+			   SET status = 'CANCELLED', broker_status = 'GHOST_HEALED', cancelled_at = now(), updated_at = now(),
+			       last_error = 'admin ghost cleanup: stale stop row closed (broker holds nothing; order not live in the book)'
+			 WHERE id = $1`, c.id)
+		if uerr != nil {
+			return -1, left
+		}
+		n, _ := res.RowsAffected()
+		closed += n
+	}
+	return closed, left
 }
 
 // tradeSymbolMatches digs the display symbol out of the tradebook's
@@ -460,8 +556,13 @@ func tradeSymbolMatches(tr indiraClient.TradeBook, symbol string) bool {
 		return false
 	}
 	for _, k := range []string{"dispSym", "baseSym"} {
-		if s, ok := m[k].(string); ok && strings.EqualFold(s, symbol) {
-			return true
+		if s, ok := m[k].(string); ok {
+			if strings.EqualFold(s, symbol) {
+				return true
+			}
+			if i := strings.LastIndex(s, "-"); i > 0 && strings.EqualFold(s[:i], symbol) {
+				return true // "SPECIALITY-BE" is SPECIALITY
+			}
 		}
 	}
 	return false

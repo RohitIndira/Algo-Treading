@@ -235,6 +235,93 @@ func (rs *ReconStore) brokerTotalsWithAuth(ctx context.Context, auth *indiraClie
 	return totals, nil
 }
 
+// holdingNames lists every name one holding leg can be known by: baseSym,
+// dispSym and dispSym without its series suffix ("SPECIALITY-BE" → SPECIALITY),
+// upper-cased. Mirrors trade-execution's holdingKeys.
+func holdingNames(legs []indiraClient.HoldingSymbol) []string {
+	pick := func(l indiraClient.HoldingSymbol) []string {
+		var ks []string
+		seen := map[string]bool{}
+		add := func(v string) {
+			v = strings.ToUpper(strings.TrimSpace(v))
+			if v != "" && !seen[v] {
+				seen[v] = true
+				ks = append(ks, v)
+			}
+		}
+		add(l.BaseSym)
+		add(l.DispSym)
+		if i := strings.LastIndex(l.DispSym, "-"); i > 0 {
+			add(l.DispSym[:i])
+		}
+		return ks
+	}
+	for _, l := range legs {
+		if l.Exc == "NSE" && (l.DispSym != "" || l.BaseSym != "") {
+			return pick(l)
+		}
+	}
+	if len(legs) > 0 {
+		return pick(legs[0])
+	}
+	return nil
+}
+
+// holdingsTotalsAllKeys is holdingsTotals keyed by EVERY name a holding can
+// carry, so a lookup by our series-free symbol finds a BE/BZ/SM-series lot.
+// For the ghost gate only — Reconcile's UNKNOWN_HOLDING pass keeps the
+// one-key map (alias keys would read as extra unknown holdings).
+func holdingsTotalsAllKeys(holdings []indiraClient.Holding) map[string]int {
+	out := make(map[string]int, len(holdings)*3)
+	for _, h := range holdings {
+		total := h.Qty
+		if total == 0 {
+			total = h.HoldingQty + h.UsedQty + h.BTST + h.PledgeQty
+		}
+		if total <= 0 {
+			continue
+		}
+		for _, k := range holdingNames(h.Symbol) {
+			out[k] += total
+		}
+	}
+	return out
+}
+
+// addOpenSellCommitmentsAllKeys is addOpenSellCommitments under every name
+// form of the order's symbol (dispSym, baseSym, series-stripped dispSym).
+func addOpenSellCommitmentsAllKeys(totals map[string]int, book []indiraClient.OrderBook) {
+	for _, ob := range book {
+		if !strings.EqualFold(ob.OrdAction, "SELL") || !ob.Cancellable {
+			continue
+		}
+		qty := ob.RemainQty
+		if qty == 0 {
+			qty = ob.Qty - ob.TradedQty
+		}
+		if qty <= 0 {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, raw := range []string{ob.Symbol.DispSym, ob.Symbol.BaseSym} {
+			v := strings.ToUpper(strings.TrimSpace(raw))
+			if v == "" {
+				continue
+			}
+			names := []string{v}
+			if i := strings.LastIndex(v, "-"); i > 0 {
+				names = append(names, v[:i])
+			}
+			for _, n := range names {
+				if !seen[n] {
+					seen[n] = true
+					totals[n] += qty
+				}
+			}
+		}
+	}
+}
+
 // addOpenSellCommitments folds open (cancellable) SELL orders' remaining
 // qty into the totals — those shares exist, they are just spoken for.
 func addOpenSellCommitments(totals map[string]int, book []indiraClient.OrderBook) {

@@ -312,3 +312,74 @@ func TestM7B_Rebalance(t *testing.T) {
 		t.Fatalf("trigger args: %v", last)
 	}
 }
+
+// Ledger-only ghost (IOLCP 2026-10-23): positions_db has NO ACTIVE row, the
+// execution ledger still holds the lot, the broker holds nothing. The heal
+// writes the FIX-5 SELL (strategy-scoped id), a GHOST_HEALED event and closes
+// the lot's stale stop rows; a second heal finds no ledger holding → 422.
+func TestM7B_GhostLedgerOnlyHeal(t *testing.T) {
+	broker := &m7Broker{} // holds nothing, empty book, no tradebook sells
+	env := newM7BEnv(t, broker, "http://127.0.0.1:1")
+	mustExec(t, env.exec, `INSERT INTO manthan_orders (signal_id, strategy_id, user_id, symbol, order_type, order_side, qty, filled_qty, status, filled_at, created_at)
+		VALUES ('tadm-m7b-ledger-buy', $1, $2, 'LEDGERG', 'LIMIT_BUY', 'BUY', 121, 121, 'FILLED', now() - interval '60 days', now() - interval '60 days')`,
+		m2Strat, m2User)
+	// A parked GHOST_SUSPECT stop (no broker id) and a dead SL_PLACED row whose
+	// broker id is NOT in the (empty) book → both closed by the heal.
+	mustExec(t, env.exec, `INSERT INTO manthan_orders (signal_id, strategy_id, user_id, symbol, order_type, order_side, qty, filled_qty, status, broker_status, created_at)
+		VALUES ('tadm-m7b-ledger-sl-parked', $1, $2, 'LEDGERG', 'SL_SELL', 'SELL', 121, 0, 'SL_DEFERRED_BAND', 'GHOST_SUSPECT', now() - interval '1 day')`,
+		m2Strat, m2User)
+	mustExec(t, env.exec, `INSERT INTO manthan_orders (signal_id, strategy_id, user_id, symbol, order_type, order_side, qty, filled_qty, status, broker_order_id, created_at)
+		VALUES ('tadm-m7b-ledger-sl-dead', $1, $2, 'LEDGERG', 'SL_SELL', 'SELL', 121, 0, 'SL_PLACED', 'DEAD-1', now() - interval '2 days')`,
+		m2Strat, m2User)
+
+	rec := m4do(t, env.root, env.token, "GET", "/api/v1/admin/users/"+m2User+"/ghosts/LEDGERG", "")
+	want := fmt.Sprintf("HEAL GHOST LEDGERG FOR %s — CLOSE LEDGER ×121 OF STRATEGY %s", m2User, shortID(m2Strat))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), want) || !strings.Contains(rec.Body.String(), `"ledger_only":true`) {
+		t.Fatalf("ledger-only preview: %d %.500s (want %q)", rec.Code, rec.Body.String(), want)
+	}
+	healURL := "/api/v1/admin/users/" + m2User + "/ghosts/LEDGERG/heal"
+	rec = m4do(t, env.root, env.token, "POST", healURL, fmt.Sprintf(`{"confirmation_text":%q}`, want))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"ledger_sell_written":true`) ||
+		!strings.Contains(rec.Body.String(), `"event_written":true`) || !strings.Contains(rec.Body.String(), `"stop_rows_closed":2`) {
+		t.Fatalf("ledger-only heal: %d %s", rec.Code, rec.Body.String())
+	}
+	var net int
+	if err := env.exec.QueryRow(`SELECT COALESCE(SUM(CASE WHEN order_side='BUY' THEN filled_qty ELSE -filled_qty END),0)
+		FROM manthan_orders WHERE strategy_id=$1 AND symbol='LEDGERG' AND status='FILLED'`, m2Strat).Scan(&net); err != nil || net != 0 {
+		t.Fatalf("ledger net after heal: %v %d", err, net)
+	}
+	var healed int
+	if err := env.exec.QueryRow(`SELECT COUNT(*) FROM manthan_order_events e JOIN manthan_orders o ON o.id=e.order_id
+		WHERE o.symbol='LEDGERG' AND o.user_id=$1 AND e.event_type='GHOST_HEALED'`, m2User).Scan(&healed); err != nil || healed != 1 {
+		t.Fatalf("GHOST_HEALED event: %v n=%d", err, healed)
+	}
+	var openStops int
+	if err := env.exec.QueryRow(`SELECT COUNT(*) FROM manthan_orders WHERE strategy_id=$1 AND symbol='LEDGERG' AND order_type='SL_SELL'
+		AND status <> 'CANCELLED'`, m2Strat).Scan(&openStops); err != nil || openStops != 0 {
+		t.Fatalf("stale stop rows left open: %v n=%d", err, openStops)
+	}
+	// Nothing left in the ledger → the next preview refuses.
+	if rec := m4do(t, env.root, env.token, "GET", "/api/v1/admin/users/"+m2User+"/ghosts/LEDGERG", ""); rec.Code != 422 ||
+		!strings.Contains(rec.Body.String(), "no ledger holding") {
+		t.Fatalf("second preview: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A BE/BZ/SM-series holding shows as "SPECIALITY-BE" at the broker while our
+// book says SPECIALITY: keyed by display symbol alone it read as "holds 0" and
+// a REAL holding could be healed away. Every name form must count.
+func TestM7B_GhostSeriesSuffixedHoldingIsNotAGhost(t *testing.T) {
+	broker := &m7Broker{stubBroker: stubBroker{holdings: []indiraClient.Holding{{
+		Symbol: []indiraClient.HoldingSymbol{{Exc: "NSE", DispSym: "SPECIALITY-BE", BaseSym: "SPECIALITY"}},
+		Qty:    40,
+	}}}}
+	env := newM7BEnv(t, broker, "http://127.0.0.1:1")
+	mustExec(t, env.pos, `INSERT INTO positions (position_id, origin, user_id, strategy_id, signal_id, symbol, exchange,
+			status, entry_price, entry_time, quantity, invested_amount)
+		VALUES ('aaaaaaaa-1111-2222-3333-000000000b01', 'MANTHAN', $1, $2, 'aaaaaaaa-1111-4444-3333-000000000b01', 'SPECIALITY', 'NSE',
+			'ACTIVE', 100, now() - interval '30 days', 40, 4000)`, m2User, m2Strat)
+	rec := m4do(t, env.root, env.token, "GET", "/api/v1/admin/users/"+m2User+"/ghosts/SPECIALITY", "")
+	if rec.Code != 422 || !strings.Contains(rec.Body.String(), "not a ghost") {
+		t.Fatalf("BE-series holding must refuse: %d %s", rec.Code, rec.Body.String())
+	}
+}

@@ -460,7 +460,7 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 		         JOIN manthan_orders fo ON fo.id = f.order_id
 		        WHERE fo.strategy_id = o.strategy_id AND fo.symbol = o.symbol
 		          AND f.event_type IN ('EXIT_FILLED','SL_FILLED','SL_PLACED','SL_REPLACED','PROTECTIVE_FIRED','EXIT_SELL_PLACED',
-		                               'EXIT_SUPERSEDED','GHOST_HEALED')
+		                               'EXIT_SUPERSEDED_BY_STOP','GHOST_HEALED')
 		          AND f.created_at > e.created_at)
 		 ORDER BY e.created_at DESC
 		 LIMIT 100`)
