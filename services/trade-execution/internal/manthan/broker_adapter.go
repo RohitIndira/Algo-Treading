@@ -635,6 +635,12 @@ func (b *BrokerAdapter) GetOrderStatus(ctx context.Context, auth BrokerAuth, bro
 	return b.getOrderStatusRaw(ctx, auth, brokerOrderID)
 }
 
+// TradeBookAvg returns the quantity-weighted average price of the trades the
+// broker's trade book shows for one order; (0, nil) when it shows none yet.
+func (b *BrokerAdapter) TradeBookAvg(ctx context.Context, auth BrokerAuth, brokerOrderID string) (float64, error) {
+	return b.fetchAvgFillPrice(ctx, auth, brokerOrderID)
+}
+
 // GetOrderRejectReason returns the order book's rejReason for one order (the
 // RMS "Limit exceeded Set= …" text, an exchange validation message, …).
 // Empty with a nil error when the order is in the book without a reason;

@@ -3,6 +3,8 @@ package manthan
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -19,17 +21,25 @@ import (
 //     (FILATEX 2026-10-23: the stop filled at 10:14:50, the exit was rejected
 //     at 10:14:50, and the fill was booked only after the exit gave up).
 func (m *SafetyMonitor) exitSuperseded(ctx context.Context, auth *BrokerAuth, row *ManthanOrder, reason string) bool {
+	// A lot with no FILLED BUY row (legacy / hand-resurrected) is LIVE, not
+	// "nothing held" (NetHeldQty's contract): only has && net ≤ 0 supersedes.
 	net, _, has, nerr := m.repo.NetHeldQty(ctx, row.StrategyID, row.Symbol)
-	if nerr == nil && (!has || net <= 0) {
+	if nerr == nil && has && net <= 0 {
 		m.supersedeExit(ctx, row, fmt.Sprintf("position already sold in the ledger (net %d) — exit not needed (%s)", net, reason))
 		return true
 	}
 
+	// Stops to read: the standing ones, plus the ones THIS session's exit
+	// path closed ahead of the sell (SL_CANCELLED_FOR_EXIT / SL_ESCALATED) —
+	// their broker order may have executed before the cancel landed.
 	standing, serr := m.repo.ListStandingSLs(ctx, row.StrategyID, row.Symbol)
 	if serr != nil {
 		m.logger.Warn("Safety monitor: standing-stop lookup failed while judging a rejected exit",
 			zap.String("symbol", row.Symbol), zap.Error(serr))
 		return false
+	}
+	if closed, cerr := m.repo.ListRecentlyClosedStopsWithBroker(ctx, row.StrategyID, row.Symbol, time.Now().Add(-sessionLookback)); cerr == nil {
+		standing = append(standing, closed...)
 	}
 	booked := 0
 	for _, sl := range standing {
@@ -37,7 +47,15 @@ func (m *SafetyMonitor) exitSuperseded(ctx context.Context, auth *BrokerAuth, ro
 			continue
 		}
 		st, fq, ap, gerr := m.broker.GetOrderStatus(ctx, *auth, sl.BrokerOrderID)
-		if gerr != nil || fq <= 0 || !(isFilledStatus(st) || isFilledOrPartialBrokerStatus(st)) {
+		if gerr != nil || fq <= 0 {
+			continue
+		}
+		// Book only a TERMINAL order (executed, or cancelled/rejected with a
+		// partial fill). A partially executed stop whose remainder still rests
+		// stays SL_PLACED — UpdateOrderFilled would mark it FILLED and its
+		// later fill would never be booked.
+		up := strings.ToUpper(strings.TrimSpace(st))
+		if !(isFilledStatus(up) || isCancelledBrokerStatus(up)) {
 			continue
 		}
 		if uerr := m.repo.UpdateOrderFilled(ctx, sl.ID, fq, ap); uerr != nil {
@@ -62,7 +80,7 @@ func (m *SafetyMonitor) exitSuperseded(ctx context.Context, auth *BrokerAuth, ro
 		return false
 	}
 	net, _, has, nerr = m.repo.NetHeldQty(ctx, row.StrategyID, row.Symbol)
-	if nerr == nil && (!has || net <= 0) {
+	if nerr == nil && has && net <= 0 {
 		m.supersedeExit(ctx, row, fmt.Sprintf("stop filled %d at the exchange first — exit not needed (%s)", booked, reason))
 		return true
 	}
@@ -77,7 +95,7 @@ func (m *SafetyMonitor) supersedeExit(ctx context.Context, row *ManthanOrder, wh
 		return
 	}
 	_ = m.repo.UpdateOrderStatus(ctx, row.ID, StatusCancelled, "SUPERSEDED", row.RetryCount, "superseded: "+why)
-	_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_SUPERSEDED", "PLACED", "CANCELLED", "", row.LimitPrice, row.Qty, why)
+	_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_SUPERSEDED_BY_STOP", "PLACED", "CANCELLED", "SUPERSEDED", row.LimitPrice, row.Qty, why)
 	m.logger.Info("Safety monitor: exit superseded by the position's own stop fill — no action, no alert",
 		zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol), zap.Int("qty", row.Qty), zap.String("why", why))
 }

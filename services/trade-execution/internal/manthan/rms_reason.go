@@ -108,9 +108,12 @@ const reprotectBudgetPerDay = 3
 // was rejected, (c) how many re-placements this row already had today.
 //
 // netKnown=false (ledger query failed) never blocks protection: the position
-// is treated as live.
+// is treated as live. hasEntry=false (no FILLED BUY row at all — a legacy or
+// hand-resurrected lot) is NOT "nothing held" either (NetHeldQty's contract;
+// EmergencySell sells such lots): only a ledger that HAS the entry and shows
+// net ≤ 0 makes the row an orphan.
 func classifyLostStop(net int, hasEntry, netKnown bool, rejReason string, replacedToday int) lostStopAction {
-	if netKnown && (!hasEntry || net <= 0) {
+	if netKnown && hasEntry && net <= 0 {
 		return lostStopOrphan
 	}
 	if rmsSaysNoHolding(rejReason) {

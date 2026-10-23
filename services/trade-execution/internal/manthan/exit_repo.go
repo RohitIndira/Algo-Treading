@@ -419,10 +419,98 @@ func (r *Repository) ParkLatestStopRowForPosition(ctx context.Context, strategyI
 		 WHERE id = (SELECT id FROM manthan_orders
 		              WHERE strategy_id=$1 AND symbol=$2
 		                AND order_side='SELL' AND order_type IN ('SL_SELL','SL_SELL_AMO')
+		                -- never a FILLED row (that is ledger truth) nor a live stop
+		                -- (SL_PLACED/SL_MODIFY_PENDING — its fill must stay bookable)
+		                AND status IN ('CANCELLED','REJECTED','EXPIRED','SL_DEFERRED_BAND')
 		              ORDER BY id DESC LIMIT 1)
 		 RETURNING id`, strategyID, symbol, tag, note).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
 	return id, err
+}
+
+// HasGhostSuspectStop reports whether the position carries a stop row parked
+// GHOST_SUSPECT (the broker's RMS said it holds nothing of the scrip). Any
+// stop type — the trail skip and the exit gate must both see it.
+func (r *Repository) HasGhostSuspectStop(ctx context.Context, strategyID, symbol string) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+		    SELECT 1 FROM manthan_orders
+		     WHERE strategy_id = $1 AND symbol = $2
+		       AND order_type IN ('SL_SELL','SL_SELL_AMO')
+		       AND status = 'SL_DEFERRED_BAND' AND broker_status = 'GHOST_SUSPECT')`,
+		strategyID, symbol).Scan(&exists)
+	return exists, err
+}
+
+// ListRecentlyClosedStopsWithBroker returns the position's stop rows marked
+// CANCELLED since `since` that still carry a broker id — rows the exit path
+// itself closed ahead of a sell (SL_CANCELLED_FOR_EXIT / SL_ESCALATED). Their
+// broker order may have (partly) EXECUTED before the cancel landed; that fill
+// is ledger money and must be booked.
+func (r *Repository) ListRecentlyClosedStopsWithBroker(ctx context.Context, strategyID, symbol string, since time.Time) ([]*ManthanOrder, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, COALESCE(broker_order_id,''), qty, order_type, COALESCE(user_id,''), status
+		  FROM manthan_orders
+		 WHERE strategy_id = $1 AND symbol = $2
+		   AND order_type IN ('SL_SELL','SL_SELL_AMO')
+		   AND status = 'CANCELLED'
+		   AND COALESCE(broker_order_id,'') <> ''
+		   AND updated_at >= $3
+		 ORDER BY id`, strategyID, symbol, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ManthanOrder
+	for rows.Next() {
+		o := &ManthanOrder{Symbol: symbol, StrategyID: strategyID}
+		if err := rows.Scan(&o.ID, &o.BrokerOrderID, &o.Qty, &o.OrderType, &o.UserID, &o.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// ListFilledSellsForAvgCheck returns SELL rows FILLED since `since` whose
+// average fill has not yet been verified against the broker's trade book
+// (no AVG_FILL_VERIFIED event). The fill-time read falls back to the order's
+// LIMIT price when the trade book lags the order book; the verifier
+// replaces it with the true average once the trades show.
+func (r *Repository) ListFilledSellsForAvgCheck(ctx context.Context, since time.Time) ([]*ManthanOrder, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT o.id, COALESCE(o.user_id,''), o.symbol, COALESCE(o.broker_order_id,''),
+		       COALESCE(o.filled_qty,0), COALESCE(o.avg_fill_price,0), COALESCE(o.limit_price,0), o.order_type
+		  FROM manthan_orders o
+		 WHERE o.order_side = 'SELL' AND o.status = 'FILLED'
+		   AND COALESCE(o.broker_order_id,'') <> ''
+		   AND o.filled_at >= $1
+		   AND NOT EXISTS (SELECT 1 FROM manthan_order_events e
+		                    WHERE e.order_id = o.id AND e.event_type = 'AVG_FILL_VERIFIED')
+		 ORDER BY o.id`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ManthanOrder
+	for rows.Next() {
+		o := &ManthanOrder{}
+		if err := rows.Scan(&o.ID, &o.UserID, &o.Symbol, &o.BrokerOrderID, &o.FilledQty, &o.AvgFillPrice, &o.LimitPrice, &o.OrderType); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// UpdateAvgFillPrice replaces a FILLED row's average fill (status, filled_at
+// and filled_qty untouched).
+func (r *Repository) UpdateAvgFillPrice(ctx context.Context, id int64, avg float64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders SET avg_fill_price = $1, updated_at = NOW()
+		 WHERE id = $2 AND status = 'FILLED'`, avg, id)
+	return err
 }

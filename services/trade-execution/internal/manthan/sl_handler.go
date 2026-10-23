@@ -458,16 +458,16 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 		// the eventual placement is at the trailed 20% — and place it the moment
 		// the intended rises into the band. Returns nil (handled) so the inbox
 		// doesn't retry this signal forever.
+		// The broker said it holds nothing of this scrip ("Set= 0", any stop
+		// type parked GHOST_SUSPECT): trailing or promoting the parked row would
+		// only place a stop the RMS rejects again. Handled (not retried); the
+		// operator heals the ledger via the admin ghost endpoint.
+		if ghost, gerr := h.repo.HasGhostSuspectStop(ctx, signal.StrategyID, signal.Symbol); gerr == nil && ghost {
+			h.logger.Warn("SL_MODIFY ignored — position is a ghost suspect (broker holds 0); ledger needs healing",
+				zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol))
+			return nil
+		}
 		if deferred, derr := h.repo.GetDeferredSLBySymbol(ctx, signal.StrategyID, signal.Symbol); derr == nil && deferred != nil {
-			if deferred.BrokerStatus == "GHOST_SUSPECT" {
-				// The broker said it holds nothing of this scrip ("Set= 0"):
-				// trailing or promoting the parked row would only place a stop
-				// the RMS rejects again. Handled (not retried); the operator
-				// heals the ledger via the admin ghost endpoint.
-				h.logger.Warn("SL_MODIFY ignored — position is a ghost suspect (broker holds 0); ledger needs healing",
-					zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol), zap.Int64("row", deferred.ID))
-				return nil
-			}
 			return h.trailDeferredSL(ctx, signal, deferred)
 		}
 		return fmt.Errorf("no active SL order found for %s", signal.Symbol)
@@ -758,6 +758,15 @@ func (h *SLHandler) EmergencySell(ctx context.Context, signal SLExitSignal) erro
 	qty := int(signal.Quantity)
 	ec := exitContext{StrategyID: signal.StrategyID, SignalID: signal.OrderID, ISIN: isin}
 	if h.repo != nil {
+		// The broker's RMS already said it holds nothing of this scrip for the
+		// position ("Set= 0" → GHOST_SUSPECT parked stop): another sell can only
+		// be rejected and page the operator again. POISON → the inbox parks
+		// the signal; the admin ghost heal is the way out (2026-10-23 review).
+		if ghost, gerr := h.repo.HasGhostSuspectStop(ctx, signal.StrategyID, signal.Symbol); gerr == nil && ghost {
+			h.logger.Error("EmergencySell refused — position is a ghost suspect (broker holds 0); heal the ledger via the admin ghost endpoint",
+				zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol), zap.Int32("qty", signal.Quantity))
+			return poisonErr("pre-check: %s is a ghost suspect (broker holds 0 of the scrip) — not selling; heal via admin ghost endpoint", signal.Symbol)
+		}
 		net, entryID, hasEntry, perr := h.repo.NetHeldQty(ctx, signal.StrategyID, signal.Symbol)
 		switch {
 		case perr != nil:
@@ -937,7 +946,12 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 				// order is read whatever the cancel said, and the read decides.
 				st, fq, ap, serr := h.broker.GetOrderStatus(ctx, auth, id)
 				if serr != nil && looksExecutedCancelError(cerr) {
-					time.Sleep(time.Second) // the book lags the cancel reply by a moment
+					// The book lags the cancel reply by a moment. Bounded, ctx-aware
+					// (this runs under the position lock).
+					select {
+					case <-time.After(time.Second):
+					case <-ctx.Done():
+					}
 					st, fq, ap, serr = h.broker.GetOrderStatus(ctx, auth, id)
 				}
 				if serr == nil && (isFilledStatus(st) || fq > 0) {
@@ -945,6 +959,16 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 						return berr
 					}
 					confirmed++
+					continue
+				}
+				if serr != nil && (cerr == nil || IsOrderNotFoundError(cerr)) {
+					// Cancel went through but the order could not be read: its fill
+					// (if any) is unverified. Leave the row SL_PLACED so CHECK 1
+					// re-reads and books it; marking it CANCELLED here would drop
+					// a real fill from the ledger. The exit proceeds — the RMS
+					// refuses it if the quantity is in fact sold.
+					h.logger.Warn("EmergencySell: stop cancelled but its status could not be read — row left for the monitor to book",
+						zap.String("symbol", info.Symbol), zap.String("broker_order_id", id), zap.Error(serr))
 					continue
 				}
 				if cerr != nil && !IsOrderNotFoundError(cerr) {

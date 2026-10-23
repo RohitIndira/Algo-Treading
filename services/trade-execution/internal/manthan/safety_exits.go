@@ -226,6 +226,22 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 				m.giveUpGhost(ctx, row, reason)
 				return
 			}
+			// Set − Prev > 0: part of the holding IS free (a stop partly filled
+			// before it was cancelled, say) and only the over-sized order was
+			// refused — sell the free part; the strategy still wants out.
+			if l, ok := parseRMSLimit(reason); ok && l.Set > l.Prev && l.Set-l.Prev < row.Qty && marketOpenNowIST() {
+				free := l.Set - l.Prev
+				if uerr := m.repo.UpdateOrderCancelled(ctx, row.ID); uerr != nil {
+					m.logger.Error("Safety monitor: could not mark the rejected exit — not re-placing this cycle", zap.Int64("row", row.ID), zap.Error(uerr))
+					return
+				}
+				_ = m.repo.InsertEvent(ctx, row.ID, "EXIT_RESIZED", "PLACED", "CANCELLED", st, row.LimitPrice, free,
+					fmt.Sprintf("RMS: only %d of %d free (%s) — re-placing the exit for the free quantity", free, row.Qty, reason))
+				m.logger.Warn("Safety monitor: exit refused for the full quantity — re-placing for the free part",
+					zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol), zap.Int("requested", row.Qty), zap.Int("free", free))
+				m.replaceExit(ctx, auth, row, info, free, "RMS free-quantity resize", 0)
+				return
+			}
 			m.giveUp(ctx, row, true, "broker RMS: quantity committed to another sell order ("+reason+") — not re-placing; reconcile at the broker")
 			return
 		case strings.Contains(reason, "cancelled by the system") || strings.Contains(reason, "canceled by the system"):
