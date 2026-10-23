@@ -30,6 +30,10 @@ import (
 const (
 	EventPositionOpened = "POSITION_OPENED"
 	EventPositionExited = "POSITION_EXITED"
+	// EventPositionExitCorrected — an EXITED lot was re-booked at the
+	// broker-authoritative fill (exit_price / realized_pnl only; status and
+	// quantity unchanged). Consumers must NOT treat it as a new exit.
+	EventPositionExitCorrected = "POSITION_EXIT_CORRECTED"
 	EventSLTrailed      = "SL_TRAILED"
 	EventManualInterrupt = "MANUAL_INTERRUPT" // reserved for future partial user activity
 )

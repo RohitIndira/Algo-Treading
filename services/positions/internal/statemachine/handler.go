@@ -707,14 +707,33 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 		return nil // don't block the offset commit; drift alert path handles it later
 	}
 
-	exitPrice := ev.TradedPrice
+	// Exit price precedence (2026-10-23):
+	//   1. meta.AvgFillPrice — trade-execution's ledger avg (trade book);
+	//   2. ev.TradedPrice   — a priced fill event;
+	//   3. ev.OrderPrice    — the order's LIMIT leg: PROVISIONAL. A stop's
+	//      first FILLED event comes from the REST order book with no traded
+	//      price, so this is what every stop-out used to be booked at
+	//      (1–2 % below the real fill). The lot still EXITS now — a sold
+	//      position must never stay ACTIVE — and the exit-price sweeper
+	//      re-books it at the ledger fill once trade-execution has it.
+	exitPrice := meta.AvgFillPrice
+	priceSource := "ledger_avg_fill"
+	if exitPrice == 0 {
+		exitPrice = ev.TradedPrice
+		priceSource = "event_traded_price"
+	}
 	if exitPrice == 0 {
 		exitPrice = ev.OrderPrice
+		priceSource = "order_limit_price_provisional"
 	}
 	if exitPrice == 0 {
 		h.logger.Warn("state-machine: Manthan SELL with 0 exit_price — skipping",
 			zap.String("event_id", ev.EventID))
 		return nil
+	}
+	if priceSource == "order_limit_price_provisional" {
+		h.logger.Info("state-machine: Manthan SELL booked at the order's limit price (provisional) — exit-price sweeper re-books at the fill",
+			zap.String("broker_order_id", ev.BrokerOrderID), zap.String("symbol", pos.Symbol), zap.Float64("limit_price", exitPrice))
 	}
 
 	// realized_pnl = (exit - entry) × qty_being_closed.

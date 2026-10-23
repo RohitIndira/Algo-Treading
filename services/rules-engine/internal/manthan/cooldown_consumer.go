@@ -38,6 +38,7 @@ type CooldownConsumer struct {
 	// pending forever and day-2 signals re-bought held symbols).
 	confirmFill   func(strategyID, symbol string, price float64, qty int32)
 	exitConfirmed func(strategyID, symbol string, exitPrice float64, reason string)
+	exitCorrected func(strategyID, symbol string, exitPrice, pnl float64)
 }
 
 // CooldownConsumerConfig — Kafka wiring for the position.events subscription.
@@ -53,6 +54,12 @@ type CooldownConsumerConfig struct {
 	// The trail-cross in tick_handler only ORDERS the exit; this confirms it
 	// (2026-08-18: cross-time booking exited 4 positions that never sold).
 	ExitConfirmed func(strategyID, symbol string, exitPrice float64, reason string)
+	// ExitCorrected — invoked on MANTHAN POSITION_EXIT_CORRECTED: positions
+	// svc re-booked an already-EXITED lot at the broker-authoritative fill
+	// (2026-10-23: stop-outs were first booked at the stop's LIMIT leg).
+	// Corrects exit_price / realized_pnl on the EXITED trading_db row only —
+	// it is NOT a new exit (no release, no cooldown change). Nil-safe.
+	ExitCorrected func(strategyID, symbol string, exitPrice, pnl float64)
 }
 
 // positionEventEnvelope mirrors the JSON published by positions svc's
@@ -102,6 +109,7 @@ func NewCooldownConsumer(cfg CooldownConsumerConfig, db *sql.DB, logger *zap.Log
 		logger:        logger,
 		confirmFill:   cfg.ConfirmFill,
 		exitConfirmed: cfg.ExitConfirmed,
+		exitCorrected: cfg.ExitCorrected,
 	}
 }
 
@@ -205,6 +213,16 @@ func (c *CooldownConsumer) handleMessage(ctx context.Context, msg kafka.Message)
 				zap.String("symbol", ev.Symbol),
 				zap.Float64("price", ev.Price),
 				zap.Int("qty", ev.Quantity))
+		}
+		return nil
+	}
+	if strings.EqualFold(ev.EventType, "POSITION_EXIT_CORRECTED") {
+		// Price correction of an exit already booked — never a new exit.
+		if c.exitCorrected != nil && ev.StrategyID != "" && ev.Symbol != "" && ev.Price > 0 {
+			c.exitCorrected(ev.StrategyID, ev.Symbol, ev.Price, ev.RealizedPnL)
+			c.logger.Info("exit price corrected from position.events",
+				zap.String("strategy_id", ev.StrategyID), zap.String("symbol", ev.Symbol),
+				zap.Float64("exit_price", ev.Price), zap.Float64("realized_pnl", ev.RealizedPnL))
 		}
 		return nil
 	}

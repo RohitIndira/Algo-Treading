@@ -23,6 +23,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/consumer"
+	"github.com/RohitIndira/Algo-Treading/services/positions/internal/exitprice"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/reconciler"
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/statemachine"
@@ -194,6 +195,21 @@ func main() {
 		logger.Info("reconciler ticker started", zap.Duration("interval", interval))
 	} else {
 		logger.Info("reconciler ticker OFF (set RECONCILER_ENABLED=true to activate)")
+	}
+
+	// ── exit-price sweeper (2026-10-23) ────────────────────────────────
+	// Re-books recent Manthan exits at trade-execution's ledger average fill
+	// (a stop's first FILLED event carries only the LIMIT leg). Publishes
+	// POSITION_EXIT_CORRECTED so the rules-engine corrects trading_db too.
+	// Default ON; EXIT_PRICE_SWEEP_ENABLED=false turns it off.
+	if getEnv("EXIT_PRICE_SWEEP_ENABLED", "true") != "false" {
+		interval := parseIntervalSec(getEnv("EXIT_PRICE_SWEEP_INTERVAL_SEC", "60"))
+		lookback := parseIntervalSec(getEnv("EXIT_PRICE_SWEEP_LOOKBACK_SEC", "86400"))
+		sweepCtx, sweepCancel := context.WithCancel(context.Background())
+		defer sweepCancel()
+		go exitprice.New(positionStore, tradeExecClient, positionEventsPub, lookback, logger).RunTicker(sweepCtx, interval)
+	} else {
+		logger.Info("exit-price sweeper OFF (EXIT_PRICE_SWEEP_ENABLED=false)")
 	}
 
 	logger.Info("positions svc ready",

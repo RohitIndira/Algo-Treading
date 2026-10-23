@@ -362,6 +362,13 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 					zap.Float64("exit_price", exitPrice), zap.Float64("pnl", pnl),
 					zap.String("reason", reason))
 			},
+			// A later, broker-authoritative fill price for an exit already
+			// booked (2026-10-23: stop-outs were first booked at the stop's
+			// LIMIT leg). trading_db row only — the in-memory capital keeps
+			// the provisional P&L until the next rehydrate; not a new exit.
+			ExitCorrected: func(strategyID, symbol string, exitPrice, pnl float64) {
+				_ = m.publisher.PersistExitCorrection(context.Background(), strategyID, symbol, exitPrice, pnl)
+			},
 		},
 		deps.ManthanDB,
 		logger,

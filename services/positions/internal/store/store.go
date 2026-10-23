@@ -638,3 +638,56 @@ func nullInt64(v int64) interface{} {
 }
 
 var _ = time.Now // keep time import in case future SQL uses it directly
+
+// ListManthanExitsSince returns MANTHAN lots EXITED at or after `since` that
+// carry an exit broker order id — the exit-price sweeper's work list.
+func (s *Store) ListManthanExitsSince(ctx context.Context, since time.Time) ([]*Position, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+positionColumns+`
+		FROM positions
+		WHERE origin = 'MANTHAN'
+		  AND status = 'EXITED'
+		  AND exit_time >= $1
+		  AND COALESCE(exit_broker_order_id, '') <> ''
+		ORDER BY exit_time`, since)
+	if err != nil {
+		return nil, fmt.Errorf("ListManthanExitsSince: %w", err)
+	}
+	defer rows.Close()
+	var out []*Position
+	for rows.Next() {
+		p, err := scanPosition(rows)
+		if err != nil {
+			return nil, fmt.Errorf("ListManthanExitsSince scan: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// CorrectExitPriceWithEvent re-books an EXITED lot's exit_price / realized_pnl
+// to the broker-authoritative fill and audits it. Only EXITED rows change;
+// returns false when the row was not EXITED (nothing written, audit skipped).
+func (s *Store) CorrectExitPriceWithEvent(ctx context.Context, positionID uuid.UUID, exitPrice, realizedPnL float64, ev *PositionEvent) (bool, error) {
+	changed := false
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET exit_price   = $1,
+			    realized_pnl = $2,
+			    updated_at   = NOW()
+			WHERE position_id = $3
+			  AND status = 'EXITED'`, exitPrice, realizedPnL, positionID)
+		if err != nil {
+			return fmt.Errorf("correct exit price: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return nil
+		}
+		changed = true
+		ev.PositionID = positionID
+		return insertEventTx(ctx, tx, ev)
+	})
+	return changed, err
+}

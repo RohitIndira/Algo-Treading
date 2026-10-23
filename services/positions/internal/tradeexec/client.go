@@ -115,8 +115,22 @@ func (c *Client) LookupOrderMeta(ctx context.Context, brokerOrderID string) (Ord
 			return meta, nil
 		}
 	}
+	return c.fetchOrderMeta(ctx, brokerOrderID)
+}
 
-	// Cache miss — RPC
+// LookupOrderMetaFresh bypasses the cache: one RPC, result re-cached. Used
+// by the exit-price sweeper, which needs the row's CURRENT avg_fill_price —
+// the cached copy was taken when the fill had not been booked yet (0) and
+// would otherwise stay stale for the 24 h found-TTL (2026-10-23).
+func (c *Client) LookupOrderMetaFresh(ctx context.Context, brokerOrderID string) (OrderMeta, error) {
+	if brokerOrderID == "" {
+		return OrderMeta{}, fmt.Errorf("brokerOrderID is required")
+	}
+	return c.fetchOrderMeta(ctx, brokerOrderID)
+}
+
+// fetchOrderMeta is the RPC behind both lookups; it refreshes the cache.
+func (c *Client) fetchOrderMeta(ctx context.Context, brokerOrderID string) (OrderMeta, error) {
 	resp, err := c.rpc.LookupOrderMeta(ctx, &pb.LookupOrderMetaRequest{
 		BrokerOrderId: brokerOrderID,
 	})

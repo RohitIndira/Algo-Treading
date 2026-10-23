@@ -102,3 +102,10 @@ type PositionEvent struct {
 	SourceOffset   int64
 	SourceEventID  string // idempotency key
 }
+
+// EventTypeExitPriceCorrected — the exit was first booked at a provisional
+// price (the stop's LIMIT leg from a REST order-book event with no traded
+// price) and later corrected to the broker-authoritative average fill from
+// trade-execution's ledger (2026-10-23: all ten stop-outs that day were
+// booked 1–2 % below their real fills).
+const EventTypeExitPriceCorrected = "EXIT_PRICE_CORRECTED"
