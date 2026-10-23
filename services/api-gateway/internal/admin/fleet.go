@@ -452,13 +452,15 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 		  FROM manthan_order_events e
 		  JOIN manthan_orders o ON o.id = e.order_id
 		 WHERE e.event_type IN ('EXIT_CHASE_EXHAUSTED','EXIT_REPRICE_FAILED','EMERGENCY_SELL_FAILED',
-		                        'EXIT_AMO_FAILED','SL_LOST_PARKED','EXIT_UNRECORDED','SL_MODIFY_FAILED','EXIT_EXPIRED')
+		                        'EXIT_AMO_FAILED','SL_LOST_PARKED','EXIT_UNRECORDED','SL_MODIFY_FAILED','EXIT_EXPIRED',
+		                        'SL_GHOST_SUSPECT','EXIT_GHOST_SUSPECT')
 		   AND e.created_at >= now() - interval '24 hours'
 		   AND NOT EXISTS (
 		       SELECT 1 FROM manthan_order_events f
 		         JOIN manthan_orders fo ON fo.id = f.order_id
 		        WHERE fo.strategy_id = o.strategy_id AND fo.symbol = o.symbol
-		          AND f.event_type IN ('EXIT_FILLED','SL_FILLED','SL_PLACED','SL_REPLACED','PROTECTIVE_FIRED','EXIT_SELL_PLACED')
+		          AND f.event_type IN ('EXIT_FILLED','SL_FILLED','SL_PLACED','SL_REPLACED','PROTECTIVE_FIRED','EXIT_SELL_PLACED',
+		                               'EXIT_SUPERSEDED','GHOST_HEALED')
 		          AND f.created_at > e.created_at)
 		 ORDER BY e.created_at DESC
 		 LIMIT 100`)

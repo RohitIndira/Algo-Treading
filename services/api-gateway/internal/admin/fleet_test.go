@@ -59,6 +59,10 @@ func openFleetDBs(t *testing.T) (trading, exec, pos *sql.DB) {
 func cleanupFleet(t *testing.T, trading, exec, pos *sql.DB) {
 	t.Helper()
 	_, _ = trading.Exec(`DELETE FROM strategies WHERE user_id = $1`, m2User)
+	// Events reference orders (FK, no cascade): a ghost heal writes a
+	// GHOST_HEALED event, which would otherwise block the order delete and
+	// leave seed rows behind for the next test.
+	_, _ = exec.Exec(`DELETE FROM manthan_order_events WHERE order_id IN (SELECT id FROM manthan_orders WHERE user_id = $1)`, m2User)
 	_, _ = exec.Exec(`DELETE FROM manthan_orders WHERE user_id = $1`, m2User)
 	_, _ = exec.Exec(`DELETE FROM user_credentials WHERE user_id = $1`, m2User)
 	_, _ = exec.Exec(`DELETE FROM signal_inbox WHERE user_id = $1`, m2User)
