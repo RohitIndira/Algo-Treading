@@ -436,12 +436,48 @@ func matchConvertedAMO(db *ManthanOrder, book []indiraClient.OrderBook, claimed 
 		if !placedTodayIST(o.OrdDate) {
 			continue
 		}
+		// The converted order is born at the 08:50 release, AFTER the AMO was
+		// queued. Without this, an AMO queued at 16:00 matched the morning's
+		// rejected conversion of the PREVIOUS night's AMO (same qty, same
+		// carried trigger) and was marked REJECTED while it sat live at the
+		// broker (EBGNG 2026-10-23).
+		if !placedAfterIST(o.OrdDate, db.CreatedAt) {
+			continue
+		}
 		if found != nil {
 			return nil // ambiguous — leave it for a human
 		}
 		found = o
 	}
 	return found
+}
+
+// placedAfterIST reports whether an order-book date string falls strictly
+// after `after`. Unparseable → false (never match on a guess); a zero
+// `after` (row without created_at) → true.
+func placedAfterIST(ordDate string, after time.Time) bool {
+	if after.IsZero() {
+		return true
+	}
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	if ist == nil {
+		ist = time.FixedZone("IST", 5*3600+1800)
+	}
+	s := strings.TrimSpace(ordDate)
+	for _, layout := range []string{"2006-01-02 15:04:05", "02-Jan-2006 15:04:05"} {
+		if t, err := time.ParseInLocation(layout, s, ist); err == nil {
+			return t.After(after)
+		}
+	}
+	// Date-only strings cannot be ordered within a day: accept only when the
+	// day itself is later than the AMO's day.
+	for _, layout := range []string{"2006-01-02", "02-Jan-2006"} {
+		if t, err := time.ParseInLocation(layout, s, ist); err == nil {
+			a := after.In(ist)
+			return t.After(time.Date(a.Year(), a.Month(), a.Day(), 0, 0, 0, 0, ist))
+		}
+	}
+	return false
 }
 
 // placedTodayIST reports whether an order-book date string ("2026-08-19

@@ -45,8 +45,8 @@ func matchConvertedExit(row *ManthanOrder, book []indiraClient.OrderBook) *indir
 		if o.Qty != row.Qty || math.Abs(o.Price-row.LimitPrice) > 0.011 {
 			continue
 		}
-		if !placedTodayIST(o.OrdDate) {
-			continue
+		if !placedTodayIST(o.OrdDate) || !placedAfterIST(o.OrdDate, row.CreatedAt) {
+			continue // the converted order is born at the 08:50 release, after the AMO was queued
 		}
 		if found != nil {
 			return nil // ambiguous — leave it for a human

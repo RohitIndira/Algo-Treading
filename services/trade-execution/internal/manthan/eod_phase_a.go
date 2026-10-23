@@ -234,6 +234,34 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 			p.logger.Warn("EOD Phase A: attempt-cap count failed — proceeding without cap",
 				zap.String("symbol", pos.Symbol), zap.Error(cerr))
 		}
+		// What kind of rejections did tonight's attempts get? (2026-10-23)
+		//   ghost — RMS "Set= 0": the broker holds nothing of the scrip. Park
+		//           the stop row GHOST_SUSPECT (the list query then excludes
+		//           the position), page once, never try again tonight.
+		//   lock  — RMS "Set= N, Prev= N": the day's swept stop still holds
+		//           the quantity. EXPECTED until the evening release; these
+		//           pace the retries (spacing below) but never spend the cap.
+		//   hard  — anything else (band, invalid data, freeze): deterministic;
+		//           counted against the cap.
+		errs, eerr := p.repo.ListAMOAttemptErrorsToday(cycleCtx, pos.EntryOrderID, tradeDate)
+		hard, lock, ghost := classifyAMOAttemptErrors(errs)
+		if eerr == nil && ghost > 0 {
+			p.parkGhostAtEOD(cycleCtx, pos, errs)
+			skipped++
+			continue
+		}
+		if eerr == nil && hard >= maxAMOAttempts {
+			attempts = hard
+		} else if eerr == nil {
+			// Only hard rejections exhaust the cap. A night of lock rejections
+			// keeps retrying on the spacing ladder (last gap 90 min) until the
+			// AMO window closes.
+			if attempts >= maxAMOAttempts && hard < maxAMOAttempts {
+				p.logger.Info("EOD Phase A: attempts so far were quantity-lock rejections — not counting them against the cap",
+					zap.String("symbol", pos.Symbol), zap.Int("attempts", attempts), zap.Int("lock", lock), zap.Int("hard", hard))
+				attempts = hard
+			}
+		}
 		if cerr == nil && attempts >= maxAMOAttempts {
 			p.logger.Error("EOD Phase A: AMO attempt cap reached — GIVING UP for tonight; position needs manual review",
 				zap.String("symbol", pos.Symbol),
@@ -263,8 +291,12 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 		if last, ok, lerr := p.repo.LastAMOAttemptAt(cycleCtx, pos.EntryOrderID, tradeDate); lerr == nil && ok {
 			gaps := []time.Duration{0, 10 * time.Minute, 30 * time.Minute, 60 * time.Minute, 90 * time.Minute}
 			gap := gaps[len(gaps)-1]
-			if attempts < len(gaps) {
-				gap = gaps[attempts]
+			total := len(errs) // every attempt tonight, whatever its rejection, paces the next one
+			if total < attempts {
+				total = attempts
+			}
+			if total < len(gaps) {
+				gap = gaps[total]
 			}
 			if since := time.Since(last); since < gap {
 				p.logger.Info("EOD Phase A: attempt spacing — waiting for broker qty release",

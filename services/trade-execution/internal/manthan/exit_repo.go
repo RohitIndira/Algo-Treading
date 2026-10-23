@@ -523,3 +523,30 @@ func (r *Repository) UpdateAvgFillPrice(ctx context.Context, id int64, avg float
 		 WHERE id = $2 AND status = 'FILLED'`, avg, id)
 	return err
 }
+
+// ListAMOAttemptErrorsToday returns the rejection text ("" while pending) of
+// every overnight AMO attempt for the position in tonight's window, oldest
+// first — the EOD cap counts only deterministic rejections.
+func (r *Repository) ListAMOAttemptErrorsToday(ctx context.Context, parentEntryOrderID int64, tradeDate time.Time) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT CASE WHEN status IN ('CANCELLED','REJECTED','EXPIRED','AMO_REJECTED') THEN COALESCE(last_error,'') ELSE '' END
+		  FROM manthan_orders
+		 WHERE parent_order_id = $1
+		   AND trade_date = $2
+		   AND order_type = 'SL_SELL_AMO'
+		   AND created_at >= $3
+		 ORDER BY id`, parentEntryOrderID, tradeDate, armedWindowStart(tradeDate))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var e string
+		if err := rows.Scan(&e); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}

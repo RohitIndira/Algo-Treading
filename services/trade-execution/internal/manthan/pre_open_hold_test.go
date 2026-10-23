@@ -76,9 +76,11 @@ func TestUntilMarketOpen_WakesJustAfterBell(t *testing.T) {
 
 func TestBackoff_PreOpenUsesPreciseWake(t *testing.T) {
 	// Whatever "now" is, the pre-open backoff is bounded by the 30 s floor
-	// and the longest possible hold (08:45 watch-window start → 09:15:10).
+	// and the longest possible hold: since 2026-10-22 a hold set after the
+	// close wakes at the NEXT session's bell, which from a Friday evening or
+	// ahead of a long weekend is up to several days away.
 	d := backoffFor(InboxErrPreOpen, 7)
-	if d < 30*time.Second || d > 24*time.Hour {
+	if d < 30*time.Second || d > 5*24*time.Hour {
 		t.Fatalf("pre-open backoff %v out of sane range", d)
 	}
 }
