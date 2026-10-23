@@ -691,3 +691,32 @@ func (s *Store) CorrectExitPriceWithEvent(ctx context.Context, positionID uuid.U
 	})
 	return changed, err
 }
+
+// ListRecentlyCorrectedExits returns EXITED MANTHAN lots that received an
+// EXIT_PRICE_CORRECTED audit row at or after `since` — the sweeper re-publishes
+// their correction event so a publish lost between the DB write and the send
+// still reaches the rules-engine (idempotent on its side).
+func (s *Store) ListRecentlyCorrectedExits(ctx context.Context, since time.Time) ([]*Position, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+positionColumns+`
+		FROM positions
+		WHERE origin = 'MANTHAN'
+		  AND status = 'EXITED'
+		  AND position_id IN (
+		      SELECT position_id FROM position_events
+		       WHERE event_type = $1 AND observed_at >= $2)
+		ORDER BY exit_time`, EventTypeExitPriceCorrected, since)
+	if err != nil {
+		return nil, fmt.Errorf("ListRecentlyCorrectedExits: %w", err)
+	}
+	defer rows.Close()
+	var out []*Position
+	for rows.Next() {
+		p, err := scanPosition(rows)
+		if err != nil {
+			return nil, fmt.Errorf("ListRecentlyCorrectedExits scan: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}

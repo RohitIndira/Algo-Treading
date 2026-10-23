@@ -7,7 +7,8 @@
 // (FILATEX 89.30 booked vs 91.08 filled), and a later priced event — if one
 // arrives at all — is dropped because the lot is no longer ACTIVE. The true
 // average lives in trade-execution's ledger (manthan_orders.avg_fill_price,
-// from the broker's trade book) and is reachable through LookupOrderMeta.
+// from the broker's trade book, back-filled by trade-execution when the trade
+// book lagged the poll) and is reachable through LookupOrderMeta.
 //
 // The sweeper re-reads that value for every recent exit and corrects the
 // lot (exit_price, realized_pnl), audits EXIT_PRICE_CORRECTED and publishes
@@ -20,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/RohitIndira/Algo-Treading/services/positions/internal/publisher"
@@ -29,12 +31,27 @@ import (
 	"go.uber.org/zap"
 )
 
-// priceEpsilon — differences below half a paisa are rounding, not a correction.
-const priceEpsilon = 0.005
+const (
+	// priceEpsilon — differences below half a paisa are rounding, not a correction.
+	priceEpsilon = 0.005
+	// callTimeout bounds every DB / gRPC call so a hung dependency cannot
+	// stall the sweep loop (ticks are dropped while a sweep blocks).
+	callTimeout = 5 * time.Second
+	// republishWindow — corrections younger than this are re-published every
+	// sweep: the DB write and the Kafka publish are not atomic, so a dropped
+	// publish would otherwise leave trading_db diverged for good. The
+	// rules-engine applies the same values idempotently.
+	republishWindow = 10 * time.Minute
+	// notFoundMemo — an exit whose broker order id is not a Manthan order
+	// (a user's own sell that closed the lot) is skipped for this long
+	// instead of being asked of trade-execution every minute.
+	notFoundMemo = 24 * time.Hour
+)
 
 // Store is the slice of the positions store the sweeper uses.
 type Store interface {
 	ListManthanExitsSince(ctx context.Context, since time.Time) ([]*store.Position, error)
+	ListRecentlyCorrectedExits(ctx context.Context, since time.Time) ([]*store.Position, error)
 	CorrectExitPriceWithEvent(ctx context.Context, positionID uuid.UUID, exitPrice, realizedPnL float64, ev *store.PositionEvent) (bool, error)
 }
 
@@ -55,6 +72,11 @@ type Sweeper struct {
 	pub      Publisher
 	logger   *zap.Logger
 	lookback time.Duration
+
+	mu       sync.Mutex
+	notFound map[string]time.Time // exit broker order id → when trade-execution said "not ours"
+
+	done chan struct{}
 }
 
 // New builds a sweeper. lookback bounds how far back exits are re-checked
@@ -64,11 +86,17 @@ func New(st Store, lookup Lookup, pub Publisher, lookback time.Duration, logger 
 	if lookback <= 0 {
 		lookback = 24 * time.Hour
 	}
-	return &Sweeper{store: st, lookup: lookup, pub: pub, logger: logger, lookback: lookback}
+	return &Sweeper{
+		store: st, lookup: lookup, pub: pub, logger: logger, lookback: lookback,
+		notFound: map[string]time.Time{},
+		done:     make(chan struct{}),
+	}
 }
 
-// RunTicker sweeps once immediately, then every interval until ctx ends.
+// RunTicker sweeps once immediately, then every interval until ctx ends. The
+// in-flight sweep finishes before it returns; Wait reports that.
 func (s *Sweeper) RunTicker(ctx context.Context, interval time.Duration) {
+	defer close(s.done)
 	if interval <= 0 {
 		interval = time.Minute
 	}
@@ -87,22 +115,45 @@ func (s *Sweeper) RunTicker(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// Wait blocks until RunTicker has returned or the timeout passes — lets a
+// shutdown finish the in-flight sweep (DB write + publish) before the Kafka
+// writer and the gRPC client are closed.
+func (s *Sweeper) Wait(timeout time.Duration) {
+	select {
+	case <-s.done:
+	case <-time.After(timeout):
+		s.logger.Warn("exit-price sweeper did not stop within the shutdown timeout")
+	}
+}
+
 // SweepOnce runs one pass. Returns the number of lots corrected.
 func (s *Sweeper) SweepOnce(ctx context.Context) int {
-	exits, err := s.store.ListManthanExitsSince(ctx, time.Now().Add(-s.lookback))
+	lctx, cancel := context.WithTimeout(ctx, callTimeout)
+	exits, err := s.store.ListManthanExitsSince(lctx, time.Now().Add(-s.lookback))
+	cancel()
 	if err != nil {
 		s.logger.Warn("exit-price sweep: list failed", zap.Error(err))
 		return 0
 	}
-	corrected := 0
+	corrected, lookupFailed := 0, 0
+	var lastLookupErr error
 	for _, pos := range exits {
 		if ctx.Err() != nil {
 			return corrected
 		}
-		meta, err := s.lookup.LookupOrderMetaFresh(ctx, pos.ExitBrokerOrderID)
+		if s.skipNotFound(pos.ExitBrokerOrderID) {
+			continue
+		}
+		mctx, mcancel := context.WithTimeout(ctx, callTimeout)
+		meta, err := s.lookup.LookupOrderMetaFresh(mctx, pos.ExitBrokerOrderID)
+		mcancel()
 		if err != nil {
-			s.logger.Debug("exit-price sweep: meta lookup failed",
-				zap.String("symbol", pos.Symbol), zap.String("exit_broker_order_id", pos.ExitBrokerOrderID), zap.Error(err))
+			lookupFailed++
+			lastLookupErr = err
+			continue
+		}
+		if !meta.Found {
+			s.rememberNotFound(pos.ExitBrokerOrderID)
 			continue
 		}
 		newPrice, newPnL, ok := Correction(pos, meta)
@@ -110,7 +161,9 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 			continue
 		}
 		ev := correctionEvent(pos, meta, newPrice, newPnL)
-		changed, err := s.store.CorrectExitPriceWithEvent(ctx, pos.PositionID, newPrice, newPnL, ev)
+		wctx, wcancel := context.WithTimeout(ctx, callTimeout)
+		changed, err := s.store.CorrectExitPriceWithEvent(wctx, pos.PositionID, newPrice, newPnL, ev)
+		wcancel()
 		if err != nil {
 			s.logger.Warn("exit-price sweep: correction write failed",
 				zap.String("symbol", pos.Symbol), zap.String("position_id", pos.PositionID.String()), zap.Error(err))
@@ -125,25 +178,77 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 			zap.String("position_id", pos.PositionID.String()), zap.String("exit_broker_order_id", pos.ExitBrokerOrderID),
 			zap.Float64("booked", pos.ExitPrice), zap.Float64("fill", newPrice),
 			zap.Float64("pnl_before", pos.RealizedPnL), zap.Float64("pnl_after", newPnL))
-		if s.pub != nil {
-			s.pub.Publish(ctx, &publisher.PositionEvent{
-				EventType:     publisher.EventPositionExitCorrected,
-				PositionID:    pos.PositionID.String(),
-				Origin:        pos.Origin,
-				UserID:        pos.UserID,
-				StrategyID:    pos.StrategyID,
-				SignalID:      pos.SignalID,
-				Symbol:        pos.Symbol,
-				Action:        publisher.ActionExit,
-				Price:         newPrice,
-				Quantity:      pos.Quantity,
-				ExitReason:    pos.ExitReason,
-				RealizedPnL:   newPnL,
-				BrokerOrderID: pos.ExitBrokerOrderID,
-			})
-		}
+		pos.ExitPrice, pos.RealizedPnL = newPrice, newPnL
+		s.publish(ctx, pos)
 	}
+	if lookupFailed > 0 {
+		// One line per sweep, at Warn: a dead gRPC path to trade-execution
+		// must be visible — every stop-out would otherwise stay at its limit leg.
+		s.logger.Warn("exit-price sweep: meta lookups failed this pass",
+			zap.Int("failed", lookupFailed), zap.Int("lots", len(exits)), zap.NamedError("last_error", lastLookupErr))
+	}
+	s.republishRecent(ctx)
 	return corrected
+}
+
+// republishRecent re-sends POSITION_EXIT_CORRECTED for lots corrected inside
+// republishWindow (the rules-engine write is idempotent), so a publish lost to
+// a Kafka hiccup or a restart between the DB write and the send still lands.
+func (s *Sweeper) republishRecent(ctx context.Context) {
+	if s.pub == nil {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, callTimeout)
+	recent, err := s.store.ListRecentlyCorrectedExits(rctx, time.Now().Add(-republishWindow))
+	cancel()
+	if err != nil {
+		s.logger.Warn("exit-price sweep: recent-corrections list failed", zap.Error(err))
+		return
+	}
+	for _, pos := range recent {
+		s.publish(ctx, pos)
+	}
+}
+
+func (s *Sweeper) publish(ctx context.Context, pos *store.Position) {
+	if s.pub == nil {
+		return
+	}
+	s.pub.Publish(ctx, &publisher.PositionEvent{
+		EventType:     publisher.EventPositionExitCorrected,
+		PositionID:    pos.PositionID.String(),
+		Origin:        pos.Origin,
+		UserID:        pos.UserID,
+		StrategyID:    pos.StrategyID,
+		SignalID:      pos.SignalID,
+		Symbol:        pos.Symbol,
+		Action:        publisher.ActionExit,
+		Price:         pos.ExitPrice,
+		Quantity:      pos.Quantity,
+		ExitReason:    pos.ExitReason,
+		RealizedPnL:   pos.RealizedPnL,
+		BrokerOrderID: pos.ExitBrokerOrderID,
+	})
+}
+
+func (s *Sweeper) skipNotFound(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.notFound[id]
+	if !ok {
+		return false
+	}
+	if time.Since(at) > notFoundMemo {
+		delete(s.notFound, id)
+		return false
+	}
+	return true
+}
+
+func (s *Sweeper) rememberNotFound(id string) {
+	s.mu.Lock()
+	s.notFound[id] = time.Now()
+	s.mu.Unlock()
 }
 
 // correctionEvent builds the EXIT_PRICE_CORRECTED audit row. raw_source_event

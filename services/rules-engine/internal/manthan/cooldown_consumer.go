@@ -38,7 +38,7 @@ type CooldownConsumer struct {
 	// pending forever and day-2 signals re-bought held symbols).
 	confirmFill   func(strategyID, symbol string, price float64, qty int32)
 	exitConfirmed func(strategyID, symbol string, exitPrice float64, reason string)
-	exitCorrected func(strategyID, symbol string, exitPrice, pnl float64)
+	exitCorrected func(strategyID, symbol, signalID string, exitPrice float64)
 }
 
 // CooldownConsumerConfig — Kafka wiring for the position.events subscription.
@@ -59,7 +59,7 @@ type CooldownConsumerConfig struct {
 	// (2026-10-23: stop-outs were first booked at the stop's LIMIT leg).
 	// Corrects exit_price / realized_pnl on the EXITED trading_db row only —
 	// it is NOT a new exit (no release, no cooldown change). Nil-safe.
-	ExitCorrected func(strategyID, symbol string, exitPrice, pnl float64)
+	ExitCorrected func(strategyID, symbol, signalID string, exitPrice float64)
 }
 
 // positionEventEnvelope mirrors the JSON published by positions svc's
@@ -219,7 +219,7 @@ func (c *CooldownConsumer) handleMessage(ctx context.Context, msg kafka.Message)
 	if strings.EqualFold(ev.EventType, "POSITION_EXIT_CORRECTED") {
 		// Price correction of an exit already booked — never a new exit.
 		if c.exitCorrected != nil && ev.StrategyID != "" && ev.Symbol != "" && ev.Price > 0 {
-			c.exitCorrected(ev.StrategyID, ev.Symbol, ev.Price, ev.RealizedPnL)
+			c.exitCorrected(ev.StrategyID, ev.Symbol, ev.SignalID, ev.Price)
 			c.logger.Info("exit price corrected from position.events",
 				zap.String("strategy_id", ev.StrategyID), zap.String("symbol", ev.Symbol),
 				zap.Float64("exit_price", ev.Price), zap.Float64("realized_pnl", ev.RealizedPnL))

@@ -364,10 +364,12 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			},
 			// A later, broker-authoritative fill price for an exit already
 			// booked (2026-10-23: stop-outs were first booked at the stop's
-			// LIMIT leg). trading_db row only — the in-memory capital keeps
-			// the provisional P&L until the next rehydrate; not a new exit.
-			ExitCorrected: func(strategyID, symbol string, exitPrice, pnl float64) {
-				_ = m.publisher.PersistExitCorrection(context.Background(), strategyID, symbol, exitPrice, pnl)
+			// LIMIT leg). trading_db row only, matched by signal_id — not a new
+			// exit. The in-memory CurrentCapital keeps the provisional P&L for
+			// the process lifetime (rehydrate does not recompute it from
+			// realized_pnl); the difference is paise-to-rupees per share.
+			ExitCorrected: func(strategyID, symbol, signalID string, exitPrice float64) {
+				_ = m.publisher.PersistExitCorrection(context.Background(), strategyID, symbol, signalID, exitPrice)
 			},
 		},
 		deps.ManthanDB,

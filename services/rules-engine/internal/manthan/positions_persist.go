@@ -2,6 +2,7 @@ package manthan
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -183,35 +184,54 @@ func (p *ManthanPublisher) PersistExit(ctx context.Context, strategyID, symbol s
 	return err
 }
 
-// PersistExitCorrection re-books the most recent EXITED row of (strategy,
-// symbol) at the broker-authoritative fill (positions svc's
-// POSITION_EXIT_CORRECTED, 2026-10-23). PersistExit cannot do this — its
-// status guard only touches ACTIVE/PENDING_ENTRY rows. Only exit_price and
-// realized_pnl change; status, exit_time, exit_reason and the in-memory book
-// are left alone (the correction is a few paise to rupees per share and is
-// reported, not traded on). Bounded to exits of the last 3 days so a replayed
-// event can never rewrite history.
-func (p *ManthanPublisher) PersistExitCorrection(ctx context.Context, strategyID, symbol string, exitPrice, pnl float64) error {
-	if p.db == nil {
+// PersistExitCorrection re-books an EXITED row at the broker-authoritative
+// fill (positions svc's POSITION_EXIT_CORRECTED, 2026-10-23). PersistExit
+// cannot do this — its status guard only touches ACTIVE/PENDING_ENTRY rows.
+//
+// The row is matched by signal_id (UNIQUE on manthan_positions) so a lot
+// re-entered and exited again on the same symbol can never receive the
+// previous lot's price; the (strategy, symbol, last 3 days) match is only the
+// fallback for an event without a signal_id. realized_pnl is recomputed from
+// the ROW'S OWN entry_price and quantity — positions_db's P&L basis (VWAP
+// top-ups, partial-fill fixes) can differ from this book's. Only exit_price
+// and realized_pnl change; status, exit_time, exit_reason and the in-memory
+// book are left alone (the correction is reported, not traded on).
+func (p *ManthanPublisher) PersistExitCorrection(ctx context.Context, strategyID, symbol, signalID string, exitPrice float64) error {
+	if p.db == nil || exitPrice <= 0 {
 		return nil
 	}
-	res, err := p.db.ExecContext(ctx, `
-		UPDATE manthan_positions
-		   SET exit_price = $1, realized_pnl = $2, updated_at = now()
-		 WHERE id = (SELECT id FROM manthan_positions
-		              WHERE strategy_id = $3 AND symbol = $4 AND status = 'EXITED'
-		                AND exit_time >= now() - interval '3 days'
-		              ORDER BY exit_time DESC NULLS LAST, id DESC
-		              LIMIT 1)`,
-		exitPrice, pnl, strategyID, symbol)
+	var res sql.Result
+	var err error
+	if signalID != "" {
+		res, err = p.db.ExecContext(ctx, `
+			UPDATE manthan_positions
+			   SET exit_price = $1, realized_pnl = ($1 - entry_price) * quantity, updated_at = now()
+			 WHERE signal_id = $2::uuid AND status = 'EXITED'`, exitPrice, signalID)
+		if err == nil {
+			if n, _ := res.RowsAffected(); n > 0 {
+				return nil
+			}
+		}
+	}
+	if err == nil {
+		res, err = p.db.ExecContext(ctx, `
+			UPDATE manthan_positions
+			   SET exit_price = $1, realized_pnl = ($1 - entry_price) * quantity, updated_at = now()
+			 WHERE id = (SELECT id FROM manthan_positions
+			              WHERE strategy_id = $2 AND symbol = $3 AND status = 'EXITED'
+			                AND exit_time >= now() - interval '3 days'
+			              ORDER BY exit_time DESC NULLS LAST, id DESC
+			              LIMIT 1)`,
+			exitPrice, strategyID, symbol)
+	}
 	if err != nil {
 		p.logger.Warn("PersistExitCorrection failed — trading_db keeps the provisional exit price",
-			zap.String("symbol", symbol), zap.Error(err))
+			zap.String("symbol", symbol), zap.String("signal_id", signalID), zap.Error(err))
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		p.logger.Warn("PersistExitCorrection: no recent EXITED row to correct",
-			zap.String("strategy_id", strategyID), zap.String("symbol", symbol), zap.Float64("exit_price", exitPrice))
+			zap.String("strategy_id", strategyID), zap.String("symbol", symbol), zap.String("signal_id", signalID), zap.Float64("exit_price", exitPrice))
 	}
 	return nil
 }

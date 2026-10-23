@@ -68,6 +68,7 @@ func TestCorrection_Idempotent(t *testing.T) {
 
 type fakeStore struct {
 	exits     []*store.Position
+	recent    []*store.Position
 	corrected []*store.PositionEvent
 	prices    []float64
 }
@@ -75,6 +76,11 @@ type fakeStore struct {
 func (f *fakeStore) ListManthanExitsSince(ctx context.Context, since time.Time) ([]*store.Position, error) {
 	return f.exits, nil
 }
+
+func (f *fakeStore) ListRecentlyCorrectedExits(ctx context.Context, since time.Time) ([]*store.Position, error) {
+	return f.recent, nil
+}
+
 func (f *fakeStore) CorrectExitPriceWithEvent(ctx context.Context, id uuid.UUID, price, pnl float64, ev *store.PositionEvent) (bool, error) {
 	if len(ev.RawSourceEvent) == 0 || !json.Valid(ev.RawSourceEvent) {
 		return false, errors.New("pq: invalid input syntax for type json") // what the DB says to an empty jsonb
@@ -88,10 +94,15 @@ func (f *fakeStore) CorrectExitPriceWithEvent(ctx context.Context, id uuid.UUID,
 }
 
 type fakeLookup struct {
-	meta map[string]tradeexec.OrderMeta
+	meta  map[string]tradeexec.OrderMeta
+	calls map[string]int
 }
 
-func (f fakeLookup) LookupOrderMetaFresh(ctx context.Context, id string) (tradeexec.OrderMeta, error) {
+func (f *fakeLookup) LookupOrderMetaFresh(ctx context.Context, id string) (tradeexec.OrderMeta, error) {
+	if f.calls == nil {
+		f.calls = map[string]int{}
+	}
+	f.calls[id]++
 	return f.meta[id], nil
 }
 
@@ -111,7 +122,7 @@ func TestSweepOnce_CorrectsAndPublishes(t *testing.T) {
 		PositionID: uuid.New(), Origin: "MANTHAN", Symbol: "ALREADYOK", EntryPrice: 100, Quantity: 10, ExitPrice: 97,
 		ExitBrokerOrderID: "OK1",
 	}}}
-	lk := fakeLookup{meta: map[string]tradeexec.OrderMeta{
+	lk := &fakeLookup{meta: map[string]tradeexec.OrderMeta{
 		"NYMZX00014G:": {Found: true, OrderType: "SL_SELL", AvgFillPrice: 91.084},
 		"OK1":          {Found: true, OrderType: "SL_SELL", AvgFillPrice: 97},
 	}}
@@ -125,7 +136,33 @@ func TestSweepOnce_CorrectsAndPublishes(t *testing.T) {
 		t.Fatalf("audit row: %+v", ev)
 	}
 	if len(pub.events) != 1 || pub.events[0].EventType != publisher.EventPositionExitCorrected ||
-		pub.events[0].Price != 91.084 || pub.events[0].PositionID != pid.String() || pub.events[0].ExitReason != "SL_TRIGGER" {
+		pub.events[0].Price != 91.084 || pub.events[0].PositionID != pid.String() || pub.events[0].ExitReason != "SL_TRIGGER" ||
+		pub.events[0].SignalID != "sig" {
 		t.Fatalf("published: %+v", pub.events)
+	}
+}
+
+// A user's own sell that closed a lot is not a Manthan order: trade-execution
+// answers Found=false once and the sweeper stops asking for 24 h. Lots
+// corrected recently are re-published on every pass with their CURRENT values.
+func TestSweepOnce_NotFoundIsRememberedAndRepublishRecent(t *testing.T) {
+	manual := &store.Position{PositionID: uuid.New(), Origin: "MANTHAN", Symbol: "USERSOLD", EntryPrice: 10, Quantity: 5, ExitPrice: 9, ExitBrokerOrderID: "USER-1"}
+	already := &store.Position{PositionID: uuid.New(), Origin: "MANTHAN", UserID: "S4450", StrategyID: "strat", SignalID: "sig",
+		Symbol: "FIXED", EntryPrice: 100, Quantity: 10, ExitPrice: 97.5, RealizedPnL: -25, ExitReason: "SL_TRIGGER", ExitBrokerOrderID: "OK-2"}
+	st := &fakeStore{exits: []*store.Position{manual}, recent: []*store.Position{already}}
+	lk := &fakeLookup{meta: map[string]tradeexec.OrderMeta{"USER-1": {Found: false}}}
+	pub := &fakePub{}
+	sw := New(st, lk, pub, 0, zap.NewNop())
+	sw.SweepOnce(context.Background())
+	sw.SweepOnce(context.Background())
+	if lk.calls["USER-1"] != 1 {
+		t.Fatalf("not-found id asked %d times, want 1", lk.calls["USER-1"])
+	}
+	if len(st.corrected) != 0 {
+		t.Fatalf("nothing should be corrected: %+v", st.corrected)
+	}
+	if len(pub.events) != 2 || pub.events[0].Symbol != "FIXED" || pub.events[0].Price != 97.5 || pub.events[0].RealizedPnL != -25 ||
+		pub.events[0].EventType != publisher.EventPositionExitCorrected {
+		t.Fatalf("republish: %+v", pub.events)
 	}
 }

@@ -206,8 +206,15 @@ func main() {
 		interval := parseIntervalSec(getEnv("EXIT_PRICE_SWEEP_INTERVAL_SEC", "60"))
 		lookback := parseIntervalSec(getEnv("EXIT_PRICE_SWEEP_LOOKBACK_SEC", "86400"))
 		sweepCtx, sweepCancel := context.WithCancel(context.Background())
-		defer sweepCancel()
-		go exitprice.New(positionStore, tradeExecClient, positionEventsPub, lookback, logger).RunTicker(sweepCtx, interval)
+		sweeper := exitprice.New(positionStore, tradeExecClient, positionEventsPub, lookback, logger)
+		go sweeper.RunTicker(sweepCtx, interval)
+		// Stop the sweeper FIRST on shutdown (defers run LIFO) and wait for the
+		// in-flight pass, so its DB write + publish finish before the Kafka
+		// writer and the gRPC client are closed.
+		defer func() {
+			sweepCancel()
+			sweeper.Wait(3 * time.Second)
+		}()
 	} else {
 		logger.Info("exit-price sweeper OFF (EXIT_PRICE_SWEEP_ENABLED=false)")
 	}
