@@ -365,3 +365,64 @@ func (r *Repository) UpdateSymbolToken(ctx context.Context, strategyID, symbol, 
 	n, _ := res.RowsAffected()
 	return n, nil
 }
+
+// CountOrderEventsSince counts events of one type for an order newer than
+// `since`. Used as the safety monitor's per-row re-protect budget: each
+// re-placement writes an SL_REPLACED event, so the count survives restarts.
+func (r *Repository) CountOrderEventsSince(ctx context.Context, orderID int64, eventType string, since time.Time) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM manthan_order_events
+		 WHERE order_id = $1 AND event_type = $2 AND created_at >= $3`,
+		orderID, eventType, since).Scan(&n)
+	return n, err
+}
+
+// ParkStopRow puts a stop row into SL_DEFERRED_BAND with a broker_status tag
+// and a last_error note. A parked row still counts as cover for the naked
+// scan (so no fresh stop is placed for the position every cycle) and is not
+// visited by the monitor's CHECK 1 — it is a deliberate "hands off, human
+// decides" state. Used for ghost suspects (broker holds nothing) and for rows
+// whose re-protect budget is spent.
+func (r *Repository) ParkStopRow(ctx context.Context, id int64, parentID int64, tag, note string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET status='SL_DEFERRED_BAND', broker_status=$1, last_error=$2,
+		       parent_order_id=CASE WHEN $3 > 0 THEN $3 ELSE parent_order_id END,
+		       updated_at=NOW()
+		 WHERE id=$4`, tag, note, parentID, id)
+	return err
+}
+
+// CloseOrphanStopRow closes a stop row that belongs to a position our ledger
+// shows fully sold (net ≤ 0): status CANCELLED with a note, nothing at the
+// broker is touched.
+func (r *Repository) CloseOrphanStopRow(ctx context.Context, id int64, note string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE manthan_orders
+		   SET status='CANCELLED', broker_status='ORPHAN', last_error=$1,
+		       cancelled_at=NOW(), updated_at=NOW()
+		 WHERE id=$2`, note, id)
+	return err
+}
+
+// ParkLatestStopRowForPosition parks the most recent stop row of a position
+// (any status) as SL_DEFERRED_BAND with a tag — used when an exit was rejected
+// "Set= 0" (the broker holds nothing): the parked row counts as cover so the
+// naked scan stops placing stops for a position that does not exist at the
+// broker. Returns the parked row id (0 when the position has no stop row).
+func (r *Repository) ParkLatestStopRowForPosition(ctx context.Context, strategyID, symbol, tag, note string) (int64, error) {
+	var id int64
+	err := r.db.QueryRowContext(ctx, `
+		UPDATE manthan_orders
+		   SET status='SL_DEFERRED_BAND', broker_status=$3, last_error=$4, updated_at=NOW()
+		 WHERE id = (SELECT id FROM manthan_orders
+		              WHERE strategy_id=$1 AND symbol=$2
+		                AND order_side='SELL' AND order_type IN ('SL_SELL','SL_SELL_AMO')
+		              ORDER BY id DESC LIMIT 1)
+		 RETURNING id`, strategyID, symbol, tag, note).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return id, err
+}

@@ -141,6 +141,41 @@ func (r *Recovery) Run(ctx context.Context) error {
 
 		// SL was CANCELLED or REJECTED (broker cleared it)
 		if isCancelledBrokerStatus(strings.ToUpper(strings.TrimSpace(status))) {
+			// Same three questions as the safety monitor's CHECK 1 (2026-10-23):
+			// a stale row of a position our ledger shows sold is closed, a stop
+			// the RMS rejected with "Set= 0" (broker holds nothing) is parked —
+			// neither is re-placed.
+			reason := ""
+			if strings.EqualFold(strings.TrimSpace(status), "REJECTED") {
+				if rr, rerr := r.broker.GetOrderRejectReason(ctx, *auth, sl.BrokerOrderID); rerr == nil {
+					reason = rr
+				}
+			}
+			net, _, hasEntry, nerr := r.repo.NetHeldQty(ctx, sl.StrategyID, sl.Symbol)
+			switch classifyLostStop(net, hasEntry, nerr == nil, reason, 0) {
+			case lostStopOrphan:
+				note := fmt.Sprintf("orphan stop row: ledger net %d — closed at boot (broker status %s)", net, status)
+				if cerr := r.repo.CloseOrphanStopRow(ctx, sl.ID, note); cerr == nil {
+					_ = r.repo.InsertEvent(ctx, sl.ID, "SL_ORPHAN_CLOSED", "SL_PLACED", "CANCELLED", status, sl.TriggerPrice, sl.Qty, note)
+					r.logger.Warn("Recovery: stale stop row of an already-sold position closed — not re-placing",
+						zap.String("symbol", sl.Symbol), zap.Int("ledger_net", net))
+				}
+				continue
+			case lostStopGhost:
+				parent := int64(0)
+				if sl.ParentOrderID != nil {
+					parent = *sl.ParentOrderID
+				}
+				note := fmt.Sprintf("GHOST_SUSPECT: broker holds 0 of %s (%s) while the ledger holds %d — not re-placing; heal via admin ghost endpoint", sl.Symbol, reason, net)
+				if perr := r.repo.ParkStopRow(ctx, sl.ID, parent, "GHOST_SUSPECT", note); perr == nil {
+					_ = r.repo.InsertEvent(ctx, sl.ID, "SL_GHOST_SUSPECT", "SL_PLACED", "SL_DEFERRED_BAND", status, sl.TriggerPrice, sl.Qty, note)
+					r.logger.Error("Recovery: broker holds NOTHING of this position — ghost suspect parked, not re-placing",
+						zap.String("symbol", sl.Symbol), zap.Int("ledger_net", net), zap.String("rms", reason))
+					notifyOps(r.authNotif, ctx, sl.UserID, sl.Symbol, "GHOST_SUSPECT",
+						fmt.Sprintf("broker holds 0 of %s but our ledger holds %d (RMS: %s) — stop parked at boot; heal via the admin ghost endpoint", sl.Symbol, net, reason))
+				}
+				continue
+			}
 			r.logger.Warn("Recovery: SL was cancelled/rejected — re-placing!",
 				zap.String("symbol", sl.Symbol),
 				zap.String("broker_status", status))

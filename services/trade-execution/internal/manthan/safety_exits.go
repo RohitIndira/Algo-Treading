@@ -210,8 +210,23 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 			}
 		}
 		switch {
-		case strings.Contains(reason, "free qty") || strings.Contains(reason, "limit exceeded"):
-			m.giveUp(ctx, row, true, "broker RMS: quantity locked by another sell order ("+reason+") — not re-placing; reconcile at the broker")
+		case isRMSQtyRejection(reason):
+			// The RMS refused the quantity. Three situations share that text
+			// (2026-10-23, seven stop-outs + one ghost):
+			//   a) our own stop sold the position on the same tick ("Set= N,
+			//      Prev= N") → the exit is superseded: book the stop, no alert;
+			//   b) the broker holds NOTHING ("Set= 0") → the position is a ghost
+			//      in our book → stop here, alert once as GHOST_SUSPECT;
+			//   c) the quantity is committed to a sell we cannot see → a human
+			//      reconciles at the broker.
+			if m.exitSuperseded(ctx, auth, row, reason) {
+				return
+			}
+			if rmsSaysNoHolding(reason) {
+				m.giveUpGhost(ctx, row, reason)
+				return
+			}
+			m.giveUp(ctx, row, true, "broker RMS: quantity committed to another sell order ("+reason+") — not re-placing; reconcile at the broker")
 			return
 		case strings.Contains(reason, "cancelled by the system") || strings.Contains(reason, "canceled by the system"):
 			if !marketOpenNowIST() {

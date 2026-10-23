@@ -635,6 +635,23 @@ func (b *BrokerAdapter) GetOrderStatus(ctx context.Context, auth BrokerAuth, bro
 	return b.getOrderStatusRaw(ctx, auth, brokerOrderID)
 }
 
+// GetOrderRejectReason returns the order book's rejReason for one order (the
+// RMS "Limit exceeded Set= …" text, an exchange validation message, …).
+// Empty with a nil error when the order is in the book without a reason;
+// ErrOrderNotInBook when the book was read and the order is absent.
+func (b *BrokerAdapter) GetOrderRejectReason(ctx context.Context, auth BrokerAuth, brokerOrderID string) (string, error) {
+	orders, err := b.client.GetOrderBook(ctx, b.toIndiraAuth(auth))
+	if err != nil {
+		return "", err
+	}
+	for _, o := range orders {
+		if o.OrdId == brokerOrderID {
+			return strings.TrimSpace(o.RejReason), nil
+		}
+	}
+	return "", fmt.Errorf("%w: order %s not found in orderbook", ErrOrderNotInBook, brokerOrderID)
+}
+
 // getOrderStatusRaw does a raw HTTP call and parses the orderbook JSON manually.
 func (b *BrokerAdapter) getOrderStatusRaw(ctx context.Context, auth BrokerAuth, brokerOrderID string) (string, int, float64, error) {
 	resp, err := b.client.GetOrderBookRaw(ctx, b.toIndiraAuth(auth))

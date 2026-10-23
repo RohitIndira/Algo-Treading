@@ -459,6 +459,15 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 		// the intended rises into the band. Returns nil (handled) so the inbox
 		// doesn't retry this signal forever.
 		if deferred, derr := h.repo.GetDeferredSLBySymbol(ctx, signal.StrategyID, signal.Symbol); derr == nil && deferred != nil {
+			if deferred.BrokerStatus == "GHOST_SUSPECT" {
+				// The broker said it holds nothing of this scrip ("Set= 0"):
+				// trailing or promoting the parked row would only place a stop
+				// the RMS rejects again. Handled (not retried); the operator
+				// heals the ledger via the admin ghost endpoint.
+				h.logger.Warn("SL_MODIFY ignored — position is a ghost suspect (broker holds 0); ledger needs healing",
+					zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol), zap.Int64("row", deferred.ID))
+				return nil
+			}
 			return h.trailDeferredSL(ctx, signal, deferred)
 		}
 		return fmt.Errorf("no active SL order found for %s", signal.Symbol)
@@ -918,33 +927,40 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 						cerr = h.broker.CancelOrder(ctx, auth, info, id)
 					}
 				}
-				if cerr != nil && !IsOrderNotFoundError(cerr) {
-					h.logger.Warn("EmergencySell: standing SL cancel failed — selling anyway",
-						zap.String("symbol", info.Symbol), zap.String("broker_order_id", id), zap.Error(cerr))
-					continue
-				}
 				// The broker stop fires on the same LTP cross as the software
 				// stop: if it already EXECUTED (fully or partly), the fill must be
 				// booked — marking it CANCELLED would drop it from the ledger and
-				// leave a ghost lot (2026-10-22 review).
+				// leave a ghost lot (2026-10-22 review). A cancel can FAIL for
+				// exactly that reason ("FULLY_EXECUTED order not allowed to
+				// CANCEL" — FILATEX 2026-10-23, which then placed a second sell
+				// the RMS rejected and paged the operator for nothing). So the
+				// order is read whatever the cancel said, and the read decides.
 				st, fq, ap, serr := h.broker.GetOrderStatus(ctx, auth, id)
-				if serr == nil && (isFilledStatus(strings.ToUpper(strings.TrimSpace(st))) || fq > 0) {
-					if fq <= 0 {
-						fq = sl.Qty
+				if serr != nil && looksExecutedCancelError(cerr) {
+					time.Sleep(time.Second) // the book lags the cancel reply by a moment
+					st, fq, ap, serr = h.broker.GetOrderStatus(ctx, auth, id)
+				}
+				if serr == nil && (isFilledStatus(st) || fq > 0) {
+					if berr := h.bookStandingStopFill(ctx, ec, auth, info, sl, id, st, fq, ap); berr != nil {
+						return berr
 					}
-					if uerr := h.repo.UpdateOrderFilled(ctx, sl.ID, fq, ap); uerr != nil {
-						return fmt.Errorf("standing stop %s filled %d at broker but the fill could not be booked (%v) — not selling blind", id, fq, uerr)
-					}
-					_ = h.repo.InsertEvent(ctx, sl.ID, "SL_FILLED", "SL_PLACED", "SL_FILLED", st, ap, fq,
-						"stop (partly) filled at the exchange before the exit sell could cancel it")
-					if h.eventPub != nil {
-						if esid, e := h.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); e == nil && esid != "" {
-							h.eventPub.PublishSLFilled(ctx, esid, ec.StrategyID, auth.UserID, info.Symbol, id, ap, int32(fq), 0)
-						}
-					}
-					h.logger.Warn("EmergencySell: standing stop had already filled — booked, not cancelled",
-						zap.String("symbol", info.Symbol), zap.String("broker_order_id", id), zap.Int("filled", fq), zap.Int("qty", sl.Qty))
 					confirmed++
+					continue
+				}
+				if cerr != nil && !IsOrderNotFoundError(cerr) {
+					if looksExecutedCancelError(cerr) {
+						// The broker says the stop executed but the fill could not be
+						// read: nothing is left to sell and nothing can be booked here.
+						// The safety monitor books the fill on its next pass; a second
+						// sell would only be rejected ("Set= N, Prev= N").
+						h.emergencyMu.Lock()
+						delete(h.lastEmergency, latchKey)
+						h.emergencyMu.Unlock()
+						return fmt.Errorf("%w: stop %s for %s reported executed by the broker (%v) but its fill could not be read (%v) — not selling; the safety monitor books the fill",
+							ErrStopAlreadyFilled, id, info.Symbol, cerr, serr)
+					}
+					h.logger.Warn("EmergencySell: standing SL cancel failed — selling anyway (the RMS rejects the sell if the qty is still locked)",
+						zap.String("symbol", info.Symbol), zap.String("broker_order_id", id), zap.Error(cerr))
 					continue
 				}
 			}
@@ -1002,6 +1018,35 @@ func (h *SLHandler) emergencySellInternal(ctx context.Context, ec exitContext, i
 		return err
 	}
 	h.recordExitSell(ctx, ec, info, auth.UserID, OrderTypeMarketSell, qty, limit, brokerID, reason)
+	return nil
+}
+
+// ErrStopAlreadyFilled: the standing stop executed at the exchange before the
+// exit could cancel it and its fill could not be read in time — the position
+// is sold, nothing may be placed; the safety monitor books the fill.
+var ErrStopAlreadyFilled = errors.New("standing stop already executed at the broker")
+
+// bookStandingStopFill books a standing stop that (partly) executed at the
+// exchange before the exit sell could cancel it: ledger FILLED, SL_FILLED
+// event, SL_FILLED published. A booking failure is returned so the caller
+// never sells blind on top of an unbooked fill.
+func (h *SLHandler) bookStandingStopFill(ctx context.Context, ec exitContext, auth BrokerAuth, info *SymbolInfo, sl *ManthanOrder, id, st string, fq int, ap float64) error {
+	if fq <= 0 {
+		fq = sl.Qty
+	}
+	if uerr := h.repo.UpdateOrderFilled(ctx, sl.ID, fq, ap); uerr != nil {
+		return fmt.Errorf("standing stop %s filled %d at broker but the fill could not be booked (%v) — not selling blind", id, fq, uerr)
+	}
+	_ = h.repo.InsertEvent(ctx, sl.ID, "SL_FILLED", "SL_PLACED", "SL_FILLED", st, ap, fq,
+		"stop (partly) filled at the exchange before the exit sell could cancel it")
+	if h.eventPub != nil {
+		if esid, e := h.repo.GetEntrySignalIDByOrderID(ctx, sl.ID); e == nil && esid != "" {
+			h.eventPub.PublishSLFilled(ctx, esid, ec.StrategyID, auth.UserID, info.Symbol, id, ap, int32(fq), 0)
+		}
+	}
+	h.logger.Warn("EmergencySell: standing stop had already filled — booked, not cancelled, not re-sold",
+		zap.String("user_id", auth.UserID), zap.String("symbol", info.Symbol), zap.String("broker_order_id", id),
+		zap.Int("filled", fq), zap.Int("qty", sl.Qty), zap.Float64("avg_price", ap))
 	return nil
 }
 

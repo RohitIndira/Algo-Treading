@@ -770,7 +770,17 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		FROM   live_buys b
 		JOIN   net_qty   n ON n.strategy_id = b.strategy_id AND n.symbol = b.symbol
 		LEFT JOIN latest_sl l ON l.strategy_id = b.strategy_id AND l.symbol = b.symbol
-		WHERE  n.net > 0`)
+		WHERE  n.net > 0
+		  -- A position whose stop was parked GHOST_SUSPECT (the broker's RMS
+		  -- answered "Set= 0": it holds nothing) is not armed overnight either —
+		  -- the AMO would only be rejected again at 09:15. The operator heals
+		  -- the ledger via the admin ghost endpoint (2026-10-23).
+		  AND NOT EXISTS (
+		      SELECT 1 FROM manthan_orders g
+		       WHERE g.strategy_id = b.strategy_id AND g.symbol = b.symbol
+		         AND g.order_type IN ('SL_SELL','SL_SELL_AMO')
+		         AND g.status = 'SL_DEFERRED_BAND'
+		         AND g.broker_status = 'GHOST_SUSPECT')`)
 	if err != nil {
 		return nil, err
 	}

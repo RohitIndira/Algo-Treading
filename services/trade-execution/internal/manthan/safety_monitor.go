@@ -293,7 +293,7 @@ func (m *SafetyMonitor) checkPositionLocked(ctx context.Context, sl *ManthanOrde
 					zap.String("symbol", sl.Symbol), zap.String("broker_order_id", sl.BrokerOrderID))
 				_ = m.repo.InsertEvent(ctx, sl.ID, "SL_LOST", "SL_PLACED", "CANCELLED",
 					"NOT_IN_BOOK", 0, 0, "stop absent from the broker book — re-protecting")
-				m.reprotectLostSL(ctx, auth, sl, "NOT_IN_BOOK")
+				m.handleLostStop(ctx, auth, sl, "NOT_IN_BOOK")
 			}
 			return
 		}
@@ -347,7 +347,7 @@ func (m *SafetyMonitor) checkPositionLocked(ctx context.Context, sl *ManthanOrde
 				zap.String("broker_status", status))
 			_ = m.repo.InsertEvent(ctx, sl.ID, "SL_LOST", "SL_PLACED", "CANCELLED",
 				status, 0, 0, "SL cancelled/rejected externally — re-protecting")
-			m.reprotectLostSL(ctx, auth, sl, status)
+			m.handleLostStop(ctx, auth, sl, status)
 			return
 		}
 	}
