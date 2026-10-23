@@ -55,12 +55,29 @@ func TestCorrection_NoOps(t *testing.T) {
 // A second sweep after a correction sees the booked price equal to the fill
 // and does nothing — the sweeper converges.
 func TestCorrection_Idempotent(t *testing.T) {
-	pos := &store.Position{EntryPrice: 83.37, Quantity: 239, ExitPrice: 89.30}
+	pos := &store.Position{EntryPrice: 83.37, Quantity: 239, ExitPrice: 89.30, RealizedPnL: (89.30 - 83.37) * 239}
 	meta := tradeexec.OrderMeta{Found: true, AvgFillPrice: 91.084}
 	price, pnl, _ := Correction(pos, meta)
 	pos.ExitPrice, pos.RealizedPnL = price, pnl
 	if _, _, ok := Correction(pos, meta); ok {
 		t.Fatal("second pass must be a no-op")
+	}
+}
+
+// A lot closed in two fills: the first partial (60 sh at 90) is already in
+// realized_pnl; the close (179 sh) was booked at the limit leg 89.30 and the
+// ledger says 91.084 — only the closing part moves.
+func TestCorrection_PreservesEarlierPartials(t *testing.T) {
+	partial := (90.0 - 83.37) * 60
+	closePart := (89.30 - 83.37) * 179
+	pos := &store.Position{EntryPrice: 83.37, Quantity: 179, ExitPrice: 89.30, RealizedPnL: partial + closePart}
+	_, pnl, ok := Correction(pos, tradeexec.OrderMeta{Found: true, AvgFillPrice: 91.084})
+	if !ok {
+		t.Fatal("must correct")
+	}
+	want := partial + (91.084-83.37)*179
+	if d := pnl - want; d > 1e-6 || d < -1e-6 {
+		t.Fatalf("pnl=%v want %v", pnl, want)
 	}
 }
 

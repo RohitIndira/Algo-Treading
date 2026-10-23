@@ -736,10 +736,45 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 			zap.String("broker_order_id", ev.BrokerOrderID), zap.String("symbol", pos.Symbol), zap.Float64("limit_price", exitPrice))
 	}
 
-	// realized_pnl = (exit - entry) × qty_being_closed.
-	// For the specific-lot Manthan branch, we close the WHOLE lot in one shot.
-	qtyClosed := pos.Quantity
+	exitReason := strategyExitReason(meta)
+
+	// Quantity: a stop fills the whole lot; a strategy exit can fill in parts
+	// (the exit tracker re-places a remainder on a new broker order). A fill
+	// smaller than the lot reduces it and the lot stays ACTIVE; the fill that
+	// reaches the remainder closes it. The final realized_pnl carries every
+	// earlier partial (sum of the lot's negative-delta audit rows).
+	qtyClosed := ev.FilledQty
+	if qtyClosed <= 0 {
+		qtyClosed = ev.Quantity
+	}
+	if qtyClosed <= 0 || qtyClosed > pos.Quantity {
+		qtyClosed = pos.Quantity
+	}
 	realizedPnL := (exitPrice - pos.EntryPrice) * float64(qtyClosed)
+	if qtyClosed < pos.Quantity {
+		partialEvent := &store.PositionEvent{
+			EventType:        store.EventTypeStrategyPartialExit,
+			BrokerOrderID:    ev.BrokerOrderID,
+			SignalID:         meta.EntrySignalID,
+			DeltaQty:         -qtyClosed,
+			FillPrice:        exitPrice,
+			RealizedPnLDelta: realizedPnL,
+			Reason:           fmt.Sprintf("strategy exit filled %d of %d (%s) — lot reduced, remainder still held", qtyClosed, pos.Quantity, exitReason),
+			RawSourceEvent:   ev.RawMessage,
+			SourceEventID:    ev.EventID,
+		}
+		if err := h.store.UpdatePartialExitWithEvent(ctx, pos.PositionID, qtyClosed, partialEvent); err != nil {
+			return fmt.Errorf("Manthan SELL partial: %w", err)
+		}
+		h.logger.Warn("state-machine: Manthan lot PARTIALLY exited by a strategy sell — remainder still ACTIVE",
+			zap.String("position_id", pos.PositionID.String()), zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol),
+			zap.Int("qty_closed", qtyClosed), zap.Int("qty_remaining", pos.Quantity-qtyClosed),
+			zap.Float64("exit_price", exitPrice), zap.Float64("realized_pnl_delta", realizedPnL))
+		return nil
+	}
+	if prior, perr := h.store.SumRealizedPartials(ctx, pos.PositionID); perr == nil && prior != 0 {
+		realizedPnL += prior
+	}
 
 	// Audit row's signal_id references the POSITION's signal_id (the parent
 	// BUY's UUID), not the SL order's own signal_id (which trade-execution
@@ -758,11 +793,12 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 	}
 
 	if err := h.store.UpdateExitWithEvent(ctx, pos.PositionID, exitPrice, ev.BrokerOrderID,
-		store.ExitReasonSLTrigger, realizedPnL, auditEvent); err != nil {
+		exitReason, realizedPnL, auditEvent); err != nil {
 		return fmt.Errorf("Manthan SELL update: %w", err)
 	}
 
 	h.logger.Info("state-machine: Manthan lot EXITED",
+		zap.String("exit_reason", exitReason),
 		zap.String("position_id", pos.PositionID.String()),
 		zap.String("user_id", pos.UserID),
 		zap.String("symbol", pos.Symbol),
@@ -783,7 +819,7 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 			Action:        publisher.ActionExit,
 			Price:         exitPrice,
 			Quantity:      qtyClosed,
-			ExitReason:    store.ExitReasonSLTrigger,
+			ExitReason:    exitReason,
 			RealizedPnL:   realizedPnL,
 			BrokerOrderID: ev.BrokerOrderID,
 		})
@@ -890,7 +926,10 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 		}
 
 		if delta == lot.Quantity {
-			// Full close.
+			// Full close — realized_pnl on the row carries the earlier partials.
+			if prior, perr := h.store.SumRealizedPartials(ctx, lot.PositionID); perr == nil && prior != 0 {
+				realizedPnL += prior
+			}
 			if err := h.store.UpdateExitWithEvent(ctx, lot.PositionID, exitPrice,
 				ev.BrokerOrderID, store.ExitReasonManualExit, realizedPnL, auditEvent); err != nil {
 				return fmt.Errorf("manual SELL close lot: %w", err)
@@ -976,10 +1015,26 @@ func (h *Handler) handleManualSellFill(ctx context.Context, ev *consumer.OrderEv
 // manual-sell branch in §7.2.
 func isSellOrderType(t string) bool {
 	switch strings.ToUpper(strings.TrimSpace(t)) {
-	case "SL_SELL", "EXIT", "MANTHAN_SL_EXIT", "MANTHAN_EXIT":
+	case "SL_SELL", "SL_SELL_AMO", "EXIT", "MANTHAN_SL_EXIT", "MANTHAN_EXIT",
+		// 2026-10-23 (operator rule): the strategy's own exit orders — the
+		// software stop's marketable LIMIT, the lower-circuit AMO LIMIT, the
+		// monitor's escalation, the admin square-off — are STRATEGY sells.
+		// MANUAL_EXIT is reserved for a sell the user placed by hand because
+		// the software did not sell.
+		"MARKET_SELL", "AMO_SELL":
 		return true
 	}
 	return false
+}
+
+// strategyExitReason maps a Manthan sell order to the lot's exit_reason:
+// an admin square-off (signal_id "squareoff-<broker id>") is STRATEGY_EXIT
+// (no cooldown); every stop-driven sell is SL_TRIGGER (cooldown applies).
+func strategyExitReason(meta tradeexec.OrderMeta) string {
+	if strings.HasPrefix(strings.ToLower(meta.SignalID), "squareoff-") {
+		return store.ExitReasonStrategyExit
+	}
+	return store.ExitReasonSLTrigger
 }
 
 // canonicalSignalUUID returns the PARENT signal's UUID for a Manthan order's

@@ -347,3 +347,75 @@ func TestManualSellFIFOAcrossOrigins(t *testing.T) {
 		t.Errorf("MANTHAN partial-exit realized_pnl_delta: got %v, want 100.00", manthanPnLDelta.Float64)
 	}
 }
+
+// 2026-10-23 operator rule: the strategy's own exit orders (MARKET_SELL /
+// AMO_SELL rows) are strategy exits → SL_TRIGGER; an admin square-off
+// ("squareoff-" signal) → STRATEGY_EXIT; MANUAL_EXIT is only a user's own sell.
+// A partial fill reduces the lot; the closing fill carries the total P&L.
+func TestStrategyExitRoutingAndPartials(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	const (
+		entryA, exitA1, exitA2 = "TB-ENTRY-A", "TB-EXIT-A1", "TB-EXIT-A2"
+		entryB, sqB            = "TB-ENTRY-B2", "TB-SQ-B"
+		sigA                   = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+		sigB                   = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+		strat                  = "22222222-2222-2222-2222-222222222222"
+	)
+	stub := map[string]tradeexec.OrderMeta{
+		entryA: {Found: true, SignalID: sigA, OrderType: "ENTRY", StrategyID: strat, UserID: "S4450", EntrySignalID: sigA, EntryBrokerOrderID: entryA},
+		exitA1: {Found: true, SignalID: "exit-" + exitA1, OrderType: "MARKET_SELL", StrategyID: strat, UserID: "S4450", EntrySignalID: sigA, EntryBrokerOrderID: entryA},
+		exitA2: {Found: true, SignalID: "exit-" + exitA2, OrderType: "MARKET_SELL", StrategyID: strat, UserID: "S4450", EntrySignalID: sigA, EntryBrokerOrderID: entryA},
+		entryB: {Found: true, SignalID: sigB, OrderType: "ENTRY", StrategyID: strat, UserID: "S4450", EntrySignalID: sigB, EntryBrokerOrderID: entryB},
+		sqB:    {Found: true, SignalID: "squareoff-" + sqB, OrderType: "MARKET_SELL", StrategyID: strat, UserID: "S4450", EntrySignalID: sigB, EntryBrokerOrderID: entryB},
+	}
+	h := newHandler(t, db, stub)
+	ctx := context.Background()
+
+	// Lot A: 100 @ 100. Our LIMIT exit fills 60 @ 90, then the re-placed remainder 40 @ 88.
+	if err := h.Handle(ctx, fillEvent("a-buy", entryA, "S4450", "LOTA", "1", 100, 100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle(ctx, fillEvent("a-exit1", exitA1, "S4450", "LOTA", "2", 60, 90)); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var qty int
+	if err := db.QueryRow(`SELECT status, quantity FROM positions WHERE entry_broker_order_id=$1`, entryA).Scan(&status, &qty); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.StatusActive || qty != 40 {
+		t.Fatalf("after partial: status=%s qty=%d, want ACTIVE 40", status, qty)
+	}
+	if err := h.Handle(ctx, fillEvent("a-exit2", exitA2, "S4450", "LOTA", "2", 40, 88)); err != nil {
+		t.Fatal(err)
+	}
+	var reason sql.NullString
+	var pnl, exitPx sql.NullFloat64
+	if err := db.QueryRow(`SELECT status, exit_reason, realized_pnl, exit_price FROM positions WHERE entry_broker_order_id=$1`, entryA).
+		Scan(&status, &reason, &pnl, &exitPx); err != nil {
+		t.Fatal(err)
+	}
+	wantPnL := (90.0-100)*60 + (88.0-100)*40
+	if status != store.StatusExited || reason.String != store.ExitReasonSLTrigger || exitPx.Float64 != 88 {
+		t.Fatalf("lot A close: status=%s reason=%s exit=%v", status, reason.String, exitPx.Float64)
+	}
+	if d := pnl.Float64 - wantPnL; d > 0.01 || d < -0.01 {
+		t.Fatalf("lot A realized_pnl=%v want %v (partial must be kept)", pnl.Float64, wantPnL)
+	}
+
+	// Lot B: admin square-off → STRATEGY_EXIT, never MANUAL_EXIT.
+	if err := h.Handle(ctx, fillEvent("b-buy", entryB, "S4450", "LOTB", "1", 10, 50)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle(ctx, fillEvent("b-sq", sqB, "S4450", "LOTB", "2", 10, 55)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status, exit_reason FROM positions WHERE entry_broker_order_id=$1`, entryB).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.StatusExited || reason.String != store.ExitReasonStrategyExit {
+		t.Fatalf("square-off: status=%s reason=%s want EXITED STRATEGY_EXIT", status, reason.String)
+	}
+}

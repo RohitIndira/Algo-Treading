@@ -281,7 +281,9 @@ func correctionEvent(pos *store.Position, meta tradeexec.OrderMeta, newPrice, ne
 
 // Correction decides whether a lot's booked exit must move to the ledger's
 // average fill. ok=false when the ledger has no fill yet (0), the order is
-// not a Manthan order, or the booked price already matches.
+// not a Manthan order, or the booked price already matches. The P&L moves by
+// (new − booked) × quantity-at-close, so partial exits booked earlier on the
+// same lot are preserved.
 func Correction(pos *store.Position, meta tradeexec.OrderMeta) (newPrice, newPnL float64, ok bool) {
 	if pos == nil || !meta.Found || meta.AvgFillPrice <= 0 || pos.Quantity <= 0 {
 		return 0, 0, false
@@ -290,6 +292,6 @@ func Correction(pos *store.Position, meta tradeexec.OrderMeta) (newPrice, newPnL
 		return 0, 0, false
 	}
 	newPrice = meta.AvgFillPrice
-	newPnL = (newPrice - pos.EntryPrice) * float64(pos.Quantity)
+	newPnL = pos.RealizedPnL + (newPrice-pos.ExitPrice)*float64(pos.Quantity)
 	return newPrice, newPnL, true
 }

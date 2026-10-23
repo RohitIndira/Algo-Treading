@@ -30,6 +30,12 @@ type ExitSellRow struct {
 	ParentOrderID int64 // entry manthan_orders.id when known (0 → resolved from the book)
 	Reason        string
 	RetryCount    int // re-price lineage counter, written with the row (never a follow-up UPDATE)
+	// SignalIDPrefix distinguishes WHY the exit was placed for downstream
+	// consumers that only see the row's signal_id (positions svc books the
+	// lot's exit_reason from it): "exit-" (default) = the strategy's stop
+	// exit → SL_TRIGGER (cooldown applies); "squareoff-" = an admin
+	// square-off → STRATEGY_EXIT. A user's own sell never has a row here.
+	SignalIDPrefix string
 }
 
 // InsertExitSellPlaced records an exit sell as PLACED. signal_id
@@ -41,6 +47,9 @@ func (r *Repository) InsertExitSellPlaced(ctx context.Context, row ExitSellRow) 
 	}
 	if row.OrderType == "" {
 		row.OrderType = OrderTypeMarketSell
+	}
+	if row.SignalIDPrefix == "" {
+		row.SignalIDPrefix = "exit-"
 	}
 	parent := row.ParentOrderID
 	if parent == 0 {
@@ -67,7 +76,7 @@ func (r *Repository) InsertExitSellPlaced(ctx context.Context, row ExitSellRow) 
 			now(), NULLIF($12,0), $13, 0, $14)
 		ON CONFLICT (signal_id) DO NOTHING
 		RETURNING id`,
-		"exit-"+row.BrokerOrderID, row.StrategyID, row.UserID, row.Symbol, nullStr(row.ISIN),
+		row.SignalIDPrefix+row.BrokerOrderID, row.StrategyID, row.UserID, row.Symbol, nullStr(row.ISIN),
 		string(row.OrderType), row.Qty, row.LimitPrice,
 		info.IndiraSymbol, info.ExchangeToken, row.BrokerOrderID, parent, tradeDate, row.RetryCount,
 	).Scan(&id)

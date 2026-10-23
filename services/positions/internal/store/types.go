@@ -109,3 +109,8 @@ type PositionEvent struct {
 // trade-execution's ledger (2026-10-23: all ten stop-outs that day were
 // booked 1–2 % below their real fills).
 const EventTypeExitPriceCorrected = "EXIT_PRICE_CORRECTED"
+
+// EventTypeStrategyPartialExit — one of the strategy's own exit orders filled
+// less than the lot (the exit tracker re-places the remainder on a new broker
+// order); the lot is reduced and stays ACTIVE. Not user activity.
+const EventTypeStrategyPartialExit = "STRATEGY_EXIT_PARTIAL"

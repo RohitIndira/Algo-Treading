@@ -188,6 +188,7 @@ func (h *SLHandler) AdminSquareOff(ctx context.Context, userID, strategyID, symb
 			StrategyID: strategyID, UserID: userID, Symbol: symbol, ISIN: pos.ISIN,
 			Info: info, OrderType: ot, Qty: pos.NetQty, LimitPrice: limit, BrokerOrderID: brokerID,
 			ParentOrderID: pos.EntryOrderID, Reason: "admin square-off",
+			SignalIDPrefix: "squareoff-", // positions svc books STRATEGY_EXIT, not a stop
 		}); ierr != nil {
 			h.logger.Error("admin square-off: sell placed but NOT recorded",
 				zap.String("symbol", symbol), zap.String("broker_order_id", brokerID), zap.Error(ierr))

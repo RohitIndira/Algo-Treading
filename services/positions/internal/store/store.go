@@ -720,3 +720,15 @@ func (s *Store) ListRecentlyCorrectedExits(ctx context.Context, since time.Time)
 	}
 	return out, rows.Err()
 }
+
+// SumRealizedPartials returns the realized P&L already booked by the lot's
+// partial exits (audit rows with a negative delta_qty), so the final close can
+// write the lot's TOTAL realized_pnl rather than the last fill's share.
+func (s *Store) SumRealizedPartials(ctx context.Context, positionID uuid.UUID) (float64, error) {
+	var sum float64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(realized_pnl_delta), 0)
+		  FROM position_events
+		 WHERE position_id = $1 AND delta_qty < 0`, positionID).Scan(&sum)
+	return sum, err
+}
