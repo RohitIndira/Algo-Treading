@@ -17,6 +17,7 @@ package exitprice
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
@@ -108,16 +109,7 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 		if !ok {
 			continue
 		}
-		ev := &store.PositionEvent{
-			EventType:        store.EventTypeExitPriceCorrected,
-			BrokerOrderID:    pos.ExitBrokerOrderID,
-			SignalID:         pos.SignalID,
-			FillPrice:        newPrice,
-			RealizedPnLDelta: newPnL - pos.RealizedPnL,
-			Reason:           fmt.Sprintf("exit re-booked from %.2f to the ledger avg fill %.2f (trade-execution avg_fill_price)", pos.ExitPrice, newPrice),
-			SourceTopic:      "exit-price-sweeper",
-			SourceEventID:    fmt.Sprintf("exitfix-%s-%.2f", pos.ExitBrokerOrderID, newPrice),
-		}
+		ev := correctionEvent(pos, meta, newPrice, newPnL)
 		changed, err := s.store.CorrectExitPriceWithEvent(ctx, pos.PositionID, newPrice, newPnL, ev)
 		if err != nil {
 			s.logger.Warn("exit-price sweep: correction write failed",
@@ -152,6 +144,34 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 		}
 	}
 	return corrected
+}
+
+// correctionEvent builds the EXIT_PRICE_CORRECTED audit row. raw_source_event
+// is a NOT NULL jsonb column: the "source event" here is the sweeper's own
+// observation, written as a small JSON document (the first deploy on
+// 2026-10-23 failed every write with "invalid input syntax for type json"
+// because this was left empty).
+func correctionEvent(pos *store.Position, meta tradeexec.OrderMeta, newPrice, newPnL float64) *store.PositionEvent {
+	raw, _ := json.Marshal(map[string]any{
+		"source":               "exit-price-sweeper",
+		"exit_broker_order_id": pos.ExitBrokerOrderID,
+		"booked_exit_price":    pos.ExitPrice,
+		"ledger_avg_fill":      meta.AvgFillPrice,
+		"booked_realized_pnl":  pos.RealizedPnL,
+		"corrected_pnl":        newPnL,
+		"meta_order_type":      meta.OrderType,
+	})
+	return &store.PositionEvent{
+		EventType:        store.EventTypeExitPriceCorrected,
+		BrokerOrderID:    pos.ExitBrokerOrderID,
+		SignalID:         pos.SignalID,
+		FillPrice:        newPrice,
+		RealizedPnLDelta: newPnL - pos.RealizedPnL,
+		Reason:           fmt.Sprintf("exit re-booked from %.2f to the ledger avg fill %.2f (trade-execution avg_fill_price)", pos.ExitPrice, newPrice),
+		RawSourceEvent:   raw,
+		SourceTopic:      "exit-price-sweeper",
+		SourceEventID:    fmt.Sprintf("exitfix-%s-%.2f", pos.ExitBrokerOrderID, newPrice),
+	}
 }
 
 // Correction decides whether a lot's booked exit must move to the ledger's
