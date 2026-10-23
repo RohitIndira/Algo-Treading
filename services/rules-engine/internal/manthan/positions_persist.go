@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -197,9 +198,56 @@ func (p *ManthanPublisher) PersistExit(ctx context.Context, strategyID, symbol s
 // and realized_pnl change; status, exit_time, exit_reason and the in-memory
 // book are left alone (the correction is reported, not traded on).
 func (p *ManthanPublisher) PersistExitCorrection(ctx context.Context, strategyID, symbol, signalID string, exitPrice float64) error {
+	_, _, err := p.PersistExitCorrectionDelta(ctx, strategyID, symbol, signalID, exitPrice)
+	return err
+}
+
+// PersistExitCorrectionDelta is PersistExitCorrection that also reports the
+// P&L change it produced ((new − old exit price) × quantity) so the caller
+// can move the in-memory capital by the same amount. changed=false when no
+// row was corrected.
+func (p *ManthanPublisher) PersistExitCorrectionDelta(ctx context.Context, strategyID, symbol, signalID string, exitPrice float64) (pnlDelta float64, changed bool, err error) {
 	if p.db == nil || exitPrice <= 0 {
-		return nil
+		return 0, false, nil
 	}
+	// Read the row's current exit price and quantity first (by signal_id,
+	// else the most recent EXITED row) so the delta is exact.
+	var oldPrice sql.NullFloat64
+	var qty int
+	if signalID != "" {
+		err = p.db.QueryRowContext(ctx, `
+			SELECT exit_price, quantity FROM manthan_positions
+			 WHERE signal_id = $1::uuid AND status = 'EXITED'`, signalID).Scan(&oldPrice, &qty)
+	}
+	if signalID == "" || err == sql.ErrNoRows {
+		err = p.db.QueryRowContext(ctx, `
+			SELECT exit_price, quantity FROM manthan_positions
+			 WHERE strategy_id = $1 AND symbol = $2 AND status = 'EXITED'
+			   AND exit_time >= now() - interval '3 days'
+			 ORDER BY exit_time DESC NULLS LAST, id DESC
+			 LIMIT 1`, strategyID, symbol).Scan(&oldPrice, &qty)
+	}
+	if err == sql.ErrNoRows {
+		p.logger.Warn("PersistExitCorrection: no recent EXITED row to correct",
+			zap.String("strategy_id", strategyID), zap.String("symbol", symbol), zap.String("signal_id", signalID), zap.Float64("exit_price", exitPrice))
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if oldPrice.Valid && math.Abs(oldPrice.Float64-exitPrice) < 0.005 {
+		return 0, false, nil // already at the corrected price (re-published event)
+	}
+	if err := p.persistExitCorrectionWrite(ctx, strategyID, symbol, signalID, exitPrice); err != nil {
+		return 0, false, err
+	}
+	if oldPrice.Valid {
+		pnlDelta = (exitPrice - oldPrice.Float64) * float64(qty)
+	}
+	return pnlDelta, true, nil
+}
+
+func (p *ManthanPublisher) persistExitCorrectionWrite(ctx context.Context, strategyID, symbol, signalID string, exitPrice float64) error {
 	var res sql.Result
 	var err error
 	if signalID != "" {
@@ -234,6 +282,25 @@ func (p *ManthanPublisher) PersistExitCorrection(ctx context.Context, strategyID
 			zap.String("strategy_id", strategyID), zap.String("symbol", symbol), zap.String("signal_id", signalID), zap.Float64("exit_price", exitPrice))
 	}
 	return nil
+}
+
+// UpdateCooldownExitPrice moves an open cooldown row's exit price (and the
+// re-entry gate derived from it, ATH × 0.80 per the Manthan spec) to the
+// broker-authoritative fill. Only the price inputs change; the rule does not.
+func (p *ManthanPublisher) UpdateCooldownExitPrice(ctx context.Context, strategyID, symbol string, exitPrice float64) error {
+	if p.db == nil || exitPrice <= 0 {
+		return nil
+	}
+	_, err := p.db.ExecContext(ctx, `
+		UPDATE manthan_cooldown
+		   SET exit_price = $1, ath_at_exit = $1, reentry_below = $1 * 0.80
+		 WHERE strategy_id = $2::uuid AND symbol = $3 AND cleared = FALSE
+		   AND exit_time >= now() - interval '3 days'`, exitPrice, strategyID, symbol)
+	if err != nil {
+		p.logger.Warn("UpdateCooldownExitPrice failed — cooldown keeps the provisional exit price",
+			zap.String("symbol", symbol), zap.Error(err))
+	}
+	return err
 }
 
 // ExpireStalePendingEntries EXPIREs PENDING_ENTRY rows older than maxAge —

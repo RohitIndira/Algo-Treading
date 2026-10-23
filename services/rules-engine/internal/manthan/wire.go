@@ -364,12 +364,19 @@ func Wire(ctx context.Context, deps Deps) (*Manthan, error) {
 			},
 			// A later, broker-authoritative fill price for an exit already
 			// booked (2026-10-23: stop-outs were first booked at the stop's
-			// LIMIT leg). trading_db row only, matched by signal_id — not a new
-			// exit. The in-memory CurrentCapital keeps the provisional P&L for
-			// the process lifetime (rehydrate does not recompute it from
-			// realized_pnl); the difference is paise-to-rupees per share.
+			// LIMIT leg). Not a new exit: the trading_db row (by signal_id),
+			// the open cooldown row's price inputs and the in-memory capital
+			// move by exactly the price difference; no state changes.
 			ExitCorrected: func(strategyID, symbol, signalID string, exitPrice float64) {
-				_ = m.publisher.PersistExitCorrection(context.Background(), strategyID, symbol, signalID, exitPrice)
+				delta, changed, err := m.publisher.PersistExitCorrectionDelta(context.Background(), strategyID, symbol, signalID, exitPrice)
+				if err != nil || !changed {
+					return
+				}
+				m.portfolioMgr.AdjustCapital(strategyID, delta)
+				_ = m.publisher.UpdateCooldownExitPrice(context.Background(), strategyID, symbol, exitPrice)
+				logger.Info("Exit correction applied to capital and cooldown",
+					zap.String("strategy", strategyID), zap.String("symbol", symbol),
+					zap.Float64("exit_price", exitPrice), zap.Float64("pnl_delta", delta))
 			},
 		},
 		deps.ManthanDB,

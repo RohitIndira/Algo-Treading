@@ -362,6 +362,28 @@ func exitReasonInstallsCooldown(reason string) bool {
 	return r == "" || r == "SL_TRIGGER" || r == "TSL_HIT" || strings.Contains(r, "SL")
 }
 
+// AdjustCapital moves a strategy's CurrentCapital (and the per-stock base
+// derived from it) by a realized-P&L correction: positions svc re-booked an
+// exit at the broker-authoritative fill after the provisional booking was
+// already credited here (2026-10-23). No position state changes.
+func (pm *PortfolioManager) AdjustCapital(strategyID string, delta float64) {
+	if delta == 0 {
+		return
+	}
+	pm.mu.RLock()
+	p, ok := pm.portfolios[strategyID]
+	pm.mu.RUnlock()
+	if !ok {
+		return
+	}
+	p.Mu.Lock()
+	defer p.Mu.Unlock()
+	p.CurrentCapital += delta
+	if p.MaxPositions > 0 {
+		p.PerStockBase = p.CurrentCapital / float64(p.MaxPositions)
+	}
+}
+
 // ExitPositionWithReason is ExitPosition with the broker-reported exit
 // reason: capital is always rebalanced by the realized P&L (it really
 // changed), the cooldown only for SL-driven exits.
