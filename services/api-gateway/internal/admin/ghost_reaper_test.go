@@ -88,8 +88,19 @@ func newTestReaper(mode string, g *fakeGate, s *fakeScanner, u *fakeUsers, a *fa
 	ist := time.FixedZone("IST", 5*3600+30*60)
 	r := NewGhostReaper(mode, g, s, u, a, ist)
 	r.now = func() time.Time { return time.Date(2026, 9, 3, 12, 0, 0, 0, ist) }
-	r.inWindow = func(time.Time) bool { return true } // Thursday noon — inside the action window anyway
+	r.inWindow = func(time.Time) bool { return true }    // Thursday noon — inside the action window anyway
+	r.startedAt = time.Date(2026, 9, 3, 9, 0, 0, 0, ist) // process up since the morning
 	return r
+}
+
+// ghostVerdicts builds confirmed NOT_HELD verdicts for the legacy tests (the
+// GHOST class alone no longer nominates — every nomination is a verdict).
+func ghostVerdicts(u string, syms ...string) []Verdict {
+	var out []Verdict
+	for _, s := range syms {
+		out = append(out, confirmedVerdict(u, s, BrokerStateNotHeld))
+	}
+	return out
 }
 
 func ghostMismatch(sym string) Mismatch { return Mismatch{Class: "GHOST", Symbol: sym} }
@@ -103,7 +114,7 @@ func TestReaper_RefusedCandidateNeverHealed(t *testing.T) {
 		"U1/KEI": errors.New("broker HOLDS 3 of KEI — this is not a ghost"),
 	}}
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {BrokerLeg: "OK", Mismatches: []Mismatch{ghostMismatch("KEI")}},
+		"U1": {UserID: "U1", BrokerLeg: "OK", Verdicts: ghostVerdicts("U1", "KEI")},
 	}}
 	audit := &fakeAudit{}
 	rep := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"U1"}}, audit).
@@ -128,7 +139,7 @@ func TestReaper_DryRunNeverHeals(t *testing.T) {
 			ConfirmationText: "HEAL GHOST SHANTIGOLD FOR U1 — CLOSE 1 BOOK ROWS ×149"},
 	}}
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {BrokerLeg: "OK", Mismatches: []Mismatch{ghostMismatch("SHANTIGOLD")}},
+		"U1": {UserID: "U1", BrokerLeg: "OK", Verdicts: ghostVerdicts("U1", "SHANTIGOLD")},
 	}}
 	audit := &fakeAudit{}
 	rep := newTestReaper(ReaperModeDryRun, gate, scan, &fakeUsers{[]string{"U1"}}, audit).
@@ -151,7 +162,7 @@ func TestReaper_EnabledHealsPassingPlan(t *testing.T) {
 		"U1/SHANTIGOLD": {UserID: "U1", Symbol: "SHANTIGOLD", BookRows: 1, BookQty: 149},
 	}}
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {BrokerLeg: "OK", Mismatches: []Mismatch{ghostMismatch("SHANTIGOLD")}},
+		"U1": {UserID: "U1", BrokerLeg: "OK", Verdicts: ghostVerdicts("U1", "SHANTIGOLD")},
 	}}
 	audit := &fakeAudit{}
 	rep := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"U1"}}, audit).
@@ -176,7 +187,7 @@ func TestReaper_SecondSweepIsNoOp(t *testing.T) {
 		"U1/SHANTIGOLD": {UserID: "U1", Symbol: "SHANTIGOLD", BookRows: 1, BookQty: 149},
 	}}
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {BrokerLeg: "OK", Mismatches: []Mismatch{ghostMismatch("SHANTIGOLD")}},
+		"U1": {UserID: "U1", BrokerLeg: "OK", Verdicts: ghostVerdicts("U1", "SHANTIGOLD")},
 	}}
 	audit := &fakeAudit{}
 	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"U1"}}, audit)
@@ -186,8 +197,8 @@ func TestReaper_SecondSweepIsNoOp(t *testing.T) {
 		t.Fatalf("first sweep: %+v", rep1)
 	}
 
-	// After the heal: reconcile shows no GHOST any more…
-	scan.results["U1"] = &ReconResult{BrokerLeg: "OK", Mismatches: []Mismatch{}}
+	// After the heal: reconcile shows no NOT_HELD lot any more…
+	scan.results["U1"] = &ReconResult{UserID: "U1", BrokerLeg: "OK"}
 	// …and even if it somehow did, the gate now refuses.
 	delete(gate.previews, "U1/SHANTIGOLD")
 
@@ -205,7 +216,7 @@ func TestReaper_SecondSweepIsNoOp(t *testing.T) {
 func TestReaper_BrokerLegDownSkipsUser(t *testing.T) {
 	gate := &fakeGate{}
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {BrokerLeg: "AUTH_EXPIRED", Mismatches: []Mismatch{ghostMismatch("SHANTIGOLD")}},
+		"U1": {UserID: "U1", BrokerLeg: "AUTH_EXPIRED", Verdicts: ghostVerdicts("U1", "SHANTIGOLD")},
 	}}
 	audit := &fakeAudit{}
 	rep := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"U1"}}, audit).
@@ -233,7 +244,7 @@ func TestReaper_HealErrorAuditedAndContinues(t *testing.T) {
 		healErr: errors.New("db write failed"),
 	}
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {BrokerLeg: "OK", Mismatches: []Mismatch{ghostMismatch("A"), ghostMismatch("B")}},
+		"U1": {UserID: "U1", BrokerLeg: "OK", Verdicts: ghostVerdicts("U1", "A", "B")},
 	}}
 	audit := &fakeAudit{}
 	rep := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"U1"}}, audit).
@@ -256,15 +267,15 @@ func TestReaper_HealErrorAuditedAndContinues(t *testing.T) {
 // deferred (audited), never silently dropped, and heal on later sweeps.
 func TestReaper_CapDefersExcess(t *testing.T) {
 	gate := &fakeGate{previews: map[string]*GhostPlan{}}
-	var mismatches []Mismatch
+	var vs []Verdict
 	const over = 2 // two more candidates than the per-sweep cap
 	for i := 0; i < maxHealsPerSweep+over; i++ {
 		s := fmt.Sprintf("SYM%02d", i)
 		gate.previews["U1/"+s] = &GhostPlan{UserID: "U1", Symbol: s, BookRows: 1}
-		mismatches = append(mismatches, ghostMismatch(s))
+		vs = append(vs, confirmedVerdict("U1", s, BrokerStateNotHeld))
 	}
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {BrokerLeg: "OK", Mismatches: mismatches},
+		"U1": {UserID: "U1", BrokerLeg: "OK", Verdicts: vs},
 	}}
 	audit := &fakeAudit{}
 	rep := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"U1"}}, audit).
@@ -292,10 +303,11 @@ func TestReaper_CapDefersExcess(t *testing.T) {
 func TestReaper_IgnoresNonGhostClasses(t *testing.T) {
 	gate := &fakeGate{}
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {BrokerLeg: "OK", Mismatches: []Mismatch{
+		"U1": {UserID: "U1", BrokerLeg: "OK", Mismatches: []Mismatch{
 			{Class: "QTY_MISMATCH", Symbol: "IDEA"},
 			{Class: "DUPLICATE_BOOK_ROWS", Symbol: "BALUFORGE"},
 			{Class: "UNLEDGERED_EXIT", Symbol: "IOLCP"},
+			ghostMismatch("MANUALLOT"), // a USER_MANUAL lot: the class alone never nominates
 		}},
 	}}
 	audit := &fakeAudit{}
@@ -329,25 +341,27 @@ func (f *fakeLedger) GhostSuspectCandidates(context.Context) ([]LedgerGhost, err
 	return f.parks, nil
 }
 
-// A trade-execution GHOST_SUSPECT park (broker RMS "Set= 0") is a candidate
-// even when the reconciler lists no GHOST for it (ledger-only ghost); it still
-// goes through the gate, and a user without broker truth is skipped entirely.
-func TestReaper_LedgerSuspectsAreCandidates(t *testing.T) {
+// A trade-execution GHOST_SUSPECT park nominates nothing by itself any more:
+// the ledger-only lot it refers to carries its own (confirmed) verdict, which
+// is what goes through the gate; a user without broker truth is skipped.
+func TestReaper_LedgerSuspectsNominateOnlyViaVerdicts(t *testing.T) {
 	gate := &fakeGate{previews: map[string]*GhostPlan{"U1/IOLCP": {UserID: "U1", Symbol: "IOLCP", LedgerOnly: true, LedgerNetQty: 121}}}
+	iolcp := confirmedVerdict("U1", "IOLCP", BrokerStateNotHeld)
+	iolcp.LedgerOnly, iolcp.PositionIDs = true, nil
 	scan := &fakeScanner{results: map[string]*ReconResult{
-		"U1": {UserID: "U1", BrokerLeg: "OK"},
+		"U1": {UserID: "U1", BrokerLeg: "OK", Verdicts: []Verdict{iolcp}},
 		"U2": {UserID: "U2", BrokerLeg: "AUTH_EXPIRED"},
 	}}
 	users := &fakeUsers{users: []string{"U1", "U2"}}
 	audit := &fakeAudit{}
 	r := newTestReaper(ReaperModeEnabled, gate, scan, users, audit)
-	r.SetLedgerSource(&fakeLedger{parks: []LedgerGhost{{"U1", "IOLCP"}, {"U2", "DIFFNKG"}}})
+	r.SetLedgerSource(&fakeLedger{parks: []LedgerGhost{{"U1", "IOLCP"}, {"U1", "NOVERDICT"}, {"U2", "DIFFNKG"}}})
 	rep := r.SweepOnce(context.Background())
 	if rep.Candidates != 1 || rep.Healed != 1 || rep.SkippedUser != 1 {
 		t.Fatalf("report: %s", rep.String())
 	}
-	if len(gate.healCalls) != 1 || gate.healCalls[0] != "U1/IOLCP" {
-		t.Fatalf("healed: %v", gate.healCalls)
+	if len(gate.previewCalls) != 1 || gate.previewCalls[0] != "U1/IOLCP" {
+		t.Fatalf("previews: %v (a park without a verdict must not be nominated)", gate.previewCalls)
 	}
 }
 
@@ -537,7 +551,7 @@ func TestReconciler_OutOfWindowPersistsOnly(t *testing.T) {
 	if len(gate.healCalls)+len(gate.previewCalls)+len(actor.pledged)+len(actor.unpledged) != 0 {
 		t.Fatalf("acted outside the window: heals=%v previews=%v pledged=%v unpledged=%v", gate.healCalls, gate.previewCalls, actor.pledged, actor.unpledged)
 	}
-	if rep.Persisted != 4 || rep.OutOfWindow != 4 {
+	if rep.Persisted != 4 || rep.OutOfWindow != 2 || rep.AwaitConfirm != 1 {
 		t.Fatalf("report: %s", rep.String())
 	}
 	// Default window: a trading-day 12:00 is in, 15:50 and Saturday are out.
@@ -632,8 +646,37 @@ func TestReconciler_SeenFromEveryVerdict(t *testing.T) {
 	r.SetBookActor(actor)
 	r.SetLedgerSource(&fakeLedger{parks: []LedgerGhost{{"FIV99", "FRESH"}, {"FIV99", "ORPH"}}})
 	rep := r.SweepOnce(context.Background())
-	if len(gate.previewCalls) != 1 || gate.previewCalls[0] != "FIV99/ORPH" || rep.Candidates != 1 {
-		t.Fatalf("only the unjudged symbol may be nominated: %v (%s)", gate.previewCalls, rep.String())
+	if len(gate.previewCalls) != 0 || rep.Candidates != 0 {
+		t.Fatalf("GHOST class / parks must not nominate past the verdicts: %v (%s)", gate.previewCalls, rep.String())
+	}
+}
+
+// SOLD_TODAY needs the confirming read too; a verdict whose previous read
+// predates this process (mode flip / restart) never confirms.
+func TestReconciler_SoldTodayTwoReadsAndStartBound(t *testing.T) {
+	gate := &fakeGate{previews: map[string]*GhostPlan{"FIV99/SHREE": {UserID: "FIV99", Symbol: "SHREE", BookRows: 1}}}
+	audit, actor := &fakeAudit{}, &fakeActor{}
+	first := verdict("FIV99", "SHREE", BrokerStateSoldToday, "")
+	first.ExitPrice = 105
+	scan := &fakeScanner{results: map[string]*ReconResult{"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{first}}}}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+	if rep := r.SweepOnce(context.Background()); rep.Healed != 0 || rep.AwaitConfirm != 1 {
+		t.Fatalf("first SOLD_TODAY sighting must wait: %s", rep.String())
+	}
+	sold := confirmedVerdict("FIV99", "SHREE", BrokerStateSoldToday)
+	sold.ExitPrice = 105
+	scan.results["FIV99"].Verdicts = []Verdict{sold}
+	if rep := r.SweepOnce(context.Background()); rep.Healed != 1 {
+		t.Fatalf("confirmed SOLD_TODAY must close: %s", rep.String())
+	}
+	// Previous read before this process started (flip day) → not confirmed.
+	gate.healCalls = nil
+	stale := confirmedVerdict("FIV99", "SHREE", BrokerStateSoldToday)
+	stale.PrevCheckedAt = r.startedAt.Add(-time.Hour)
+	scan.results["FIV99"].Verdicts = []Verdict{stale}
+	if rep := r.SweepOnce(context.Background()); rep.Healed != 0 || rep.AwaitConfirm != 1 {
+		t.Fatalf("a pre-start verdict must not confirm: %s", rep.String())
 	}
 }
 
@@ -727,7 +770,7 @@ func TestReconciler_ClosureReasons(t *testing.T) {
 		"FIV99/SHREE": {UserID: "FIV99", Symbol: "SHREE", BookRows: 1},
 	}}
 	audit, actor := &fakeAudit{}, &fakeActor{}
-	sold := verdict("FIV99", "SHREE", BrokerStateSoldToday, "")
+	sold := confirmedVerdict("FIV99", "SHREE", BrokerStateSoldToday)
 	sold.ExitPrice = 105
 	scan := &fakeScanner{results: map[string]*ReconResult{
 		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{confirmedVerdict("FIV99", "AERO", BrokerStateNotHeld), sold}},

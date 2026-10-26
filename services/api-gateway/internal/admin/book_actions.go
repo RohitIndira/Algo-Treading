@@ -177,11 +177,13 @@ func (a *Actions) Pledge(ctx context.Context, v Verdict, live *liveBook) (map[st
 				 ORDER BY id DESC LIMIT 1`, v.StrategyID, v.Symbol).Scan(&parkedID)
 		}
 
-		// No stop row to park and nothing live: insert a marker row so the
-		// naked scan, the 09:14 planner and EOD Phase A all see the lot as
-		// covered (SL_DEFERRED_BAND) and tagged PLEDGED. Carries the latest
-		// trailed trigger so protection resumes at the trailed level.
-		if parkedID == 0 && len(left) == 0 {
+		// No parked row for the lot: insert a marker row so the naked scan,
+		// the 09:14 planner and EOD Phase A all see the lot as covered
+		// (SL_DEFERRED_BAND) and tagged PLEDGED — also when a stop row had to
+		// be left alone because its broker order still stands (the planner
+		// must still skip the lot). Carries the latest trailed trigger so
+		// protection resumes at the trailed level.
+		if parkedID == 0 {
 			var trig, lim sql.NullFloat64
 			var isin, tok, isym sql.NullString
 			_ = a.fleet.execDB.QueryRowContext(ctx, `

@@ -166,6 +166,11 @@ type GhostReaper struct {
 	// inWindow decides whether actions may run right now (test seam).
 	inWindow func(time.Time) bool
 
+	// startedAt: verdicts persisted before this process started (another
+	// mode, yesterday) never confirm today's — a mode flip starts the
+	// two-read clock afresh.
+	startedAt time.Time
+
 	mu       sync.Mutex
 	lastUser map[string]time.Time // login debounce
 	seen     map[string]firstSeen // hysteresis fallback: user|strategy|symbol
@@ -183,7 +188,7 @@ func NewGhostReaper(mode string, gate ghostGate, scan ghostScanner,
 	users reaperUserSource, audit reaperAuditor, ist *time.Location) *GhostReaper {
 	g := &GhostReaper{
 		mode: mode, gate: gate, scan: scan, users: users, audit: audit,
-		ist: ist, now: time.Now, sleep: time.Sleep,
+		ist: ist, now: time.Now, sleep: time.Sleep, startedAt: time.Now(),
 		lastUser: map[string]time.Time{}, seen: map[string]firstSeen{},
 	}
 	g.inWindow = g.defaultInWindow
@@ -306,11 +311,19 @@ func (g *GhostReaper) debounce(userID string) bool {
 }
 
 // confirmed implements the hysteresis: the SAME state on two reads ≥ 15 min
-// apart. Persisted history first (survives restarts); otherwise the
-// in-memory record (ledger-only lots), which this call also updates.
+// apart, on the same IST day, both read by THIS process (a verdict persisted
+// under another mode / before a restart never confirms — the flip day starts
+// the clock afresh; see the ops note in the package comment). Persisted
+// history first; otherwise the in-memory record (ledger-only lots), which
+// this call also updates.
+//
+// Ops: to restart the clock by hand for the flip day —
+//
+//	UPDATE positions SET broker_checked_at = NULL
+//	 WHERE status = 'ACTIVE' AND broker_state IN ('NOT_HELD','SOLD_TODAY','PLEDGED');
 func (g *GhostReaper) confirmed(v Verdict) bool {
 	if !v.PrevCheckedAt.IsZero() {
-		return v.Confirmed()
+		return v.Confirmed() && !v.PrevCheckedAt.Before(g.startedAt)
 	}
 	key := v.UserID + "|" + v.StrategyID + "|" + v.Symbol
 	g.mu.Lock()
@@ -422,6 +435,13 @@ func (g *GhostReaper) sweepUser(ctx context.Context, uid, source string, ledgerP
 			rep.Candidates++
 			g.processCandidate(ctx, uid, v.Symbol, res, &v, rep)
 		case BrokerStateSoldToday:
+			if !g.confirmed(v) {
+				rep.AwaitConfirm++
+				if v.Changed() {
+					g.auditRow(ctx, auditActionReconcile, uid, v.Symbol, "VERDICT_SOLD_TODAY", v.Reason+" — awaiting the confirming read", map[string]any{"evidence": v.Evidence})
+				}
+				continue
+			}
 			if !open {
 				rep.OutOfWindow++
 				continue
@@ -458,32 +478,13 @@ func (g *GhostReaper) sweepUser(ctx context.Context, uid, source string, ledgerP
 			}
 		}
 	}
-	// Legacy class view + trade-execution's parks: only symbols the verdicts
-	// did not cover; the gate decides.
-	for _, m := range res.Mismatches {
-		if m.Class != "GHOST" || seen[m.Symbol] {
-			continue
-		}
-		seen[m.Symbol] = true
-		if !open {
-			rep.OutOfWindow++
-			continue
-		}
-		rep.Candidates++
-		g.processCandidate(ctx, uid, m.Symbol, res, nil, rep)
-	}
-	for _, sym := range ledgerParks {
-		if seen[sym] {
-			continue
-		}
-		seen[sym] = true
-		if !open {
-			rep.OutOfWindow++
-			continue
-		}
-		rep.Candidates++
-		g.processCandidate(ctx, uid, sym, res, nil, rep)
-	}
+	// Every nomination now comes from a verdict: the verdicts cover every
+	// origin='MANTHAN' book lot and every ledger-only lot, and they alone
+	// carry the two-read hysteresis. The legacy GHOST class (which also lists
+	// USER_MANUAL lots) and trade-execution's GHOST_SUSPECT parks are
+	// informational here — a park whose symbol carries no verdict has no
+	// ledger net left to heal.
+	_ = ledgerParks
 }
 
 func detailSuffix(d string) string {

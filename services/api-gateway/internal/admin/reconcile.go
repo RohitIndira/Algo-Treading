@@ -389,8 +389,9 @@ type brokerRead struct {
 	book        []indiraClient.OrderBook
 	trades      []indiraClient.TradeBook
 	ourOrderIDs map[string]bool
-	tradesOK    bool // trade book read
-	oursOK      bool // our-order-id attribution read
+	ourShapes   []sellShape // our SELL rows touched today as (symbol, qty)
+	tradesOK    bool        // trade book read
+	oursOK      bool        // our-order-id attribution read
 	live        *liveBook
 	snap        *BrokerSnapshot
 }
@@ -399,7 +400,7 @@ type brokerRead struct {
 // the snapshot so every verdict reads UNVERIFIED with the reason attached.
 func (r *brokerRead) degrade(detail string) {
 	r.leg, r.detail = "UNVERIFIED", detail
-	r.snap = BuildSnapshot(r.leg, r.detail, nil, nil, nil, nil, false, false, time.Now())
+	r.snap = BuildSnapshot(r.leg, r.detail, snapshotInputs{}, time.Now())
 }
 
 // readBroker performs the per-user broker reads once: holdings, order book,
@@ -411,7 +412,7 @@ func (rs *ReconStore) readBroker(ctx context.Context, userID string) *brokerRead
 	auth, legStatus, legDetail := rs.authFor(ctx, userID)
 	r.leg, r.detail, r.auth = legStatus, legDetail, auth
 	if legStatus != "OK" {
-		r.snap = BuildSnapshot(r.leg, r.detail, nil, nil, nil, nil, false, false, time.Now())
+		r.snap = BuildSnapshot(r.leg, r.detail, snapshotInputs{}, time.Now())
 		return r
 	}
 	holdings, err := rs.broker.GetHoldings(ctx, auth)
@@ -435,21 +436,35 @@ func (rs *ReconStore) readBroker(ctx context.Context, userID string) *brokerRead
 		if ids, oerr := ourBrokerOrderIDs(ctx, rs.fleet.execDB, userID); oerr == nil {
 			r.ourOrderIDs, r.oursOK = ids, true
 		}
+		if rows, serr := rs.ourSellRowsToday(ctx, userID); serr == nil {
+			for _, o := range rows {
+				names := map[string]bool{}
+				for _, n := range symbolNames(o.symbol) {
+					names[n] = true
+				}
+				r.ourShapes = append(r.ourShapes, sellShape{names: names, qty: o.qty})
+			}
+		} else {
+			r.oursOK = false
+		}
 		r.live = liveBookFrom(r.book)
 	}
-	r.snap = BuildSnapshot(r.leg, r.detail, r.holdings, r.book, r.trades, r.ourOrderIDs, r.tradesOK, r.oursOK, time.Now())
+	r.snap = BuildSnapshot(r.leg, r.detail, snapshotInputs{
+		holdings: r.holdings, book: r.book, trades: r.trades,
+		ourIDs: r.ourOrderIDs, ourShape: r.ourShapes, tradesOK: r.tradesOK, oursOK: r.oursOK,
+	}, time.Now())
 	return r
 }
 
-// ourBrokerOrderIDs lists the broker order ids of the user's recent
+// ourBrokerOrderIDs lists the broker order ids of ALL the user's
 // manthan_orders SELL rows — a SELL carrying one of them was placed by the
 // strategy, not by the client. Shared by the reconciler and the ghost gate.
+// No time filter: an old stop's id can still appear in today's book.
 func ourBrokerOrderIDs(ctx context.Context, execDB *sql.DB, userID string) (map[string]bool, error) {
 	rows, err := execDB.QueryContext(ctx, `
 		SELECT broker_order_id FROM manthan_orders
 		 WHERE user_id = $1 AND order_side = 'SELL'
-		   AND broker_order_id IS NOT NULL AND broker_order_id <> ''
-		   AND updated_at >= now() - interval '3 days'`, userID)
+		   AND broker_order_id IS NOT NULL AND broker_order_id <> ''`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -470,13 +485,14 @@ type ledgerLiveOrder struct {
 	qty              int
 }
 
-// ourLiveOrdersToday lists our SL_PLACED / PLACED rows with a broker id
-// touched today — if one of them is missing from the order book entirely, the
-// book read was partial and nothing may be concluded from it (tripwire 1c).
+// ourLiveOrdersToday lists our rows with a broker id touched today, in ANY
+// status (a REJECTED converted AMO adopted onto our row counts too) — if one
+// of them is missing from the order book entirely, the book read was partial
+// and nothing may be concluded from it (tripwire 1c).
 func (rs *ReconStore) ourLiveOrdersToday(ctx context.Context, userID string) ([]ledgerLiveOrder, error) {
 	rows, err := rs.fleet.execDB.QueryContext(ctx, `
 		SELECT broker_order_id, UPPER(symbol), qty FROM manthan_orders
-		 WHERE user_id = $1 AND status IN ('SL_PLACED','PLACED')
+		 WHERE user_id = $1
 		   AND broker_order_id IS NOT NULL AND broker_order_id <> ''
 		   AND broker_order_id NOT LIKE 'PAPER-%'
 		   AND updated_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'`, userID)
@@ -492,6 +508,49 @@ func (rs *ReconStore) ourLiveOrdersToday(ctx context.Context, userID string) ([]
 		}
 	}
 	return out, rows.Err()
+}
+
+// ourSellRowsToday lists our SELL rows touched today (any status, any id) as
+// (symbol, qty) shapes — an EXECUTED SELL in the order book with the same
+// shape is ours even under a broker id we never saw (AMO conversion).
+func (rs *ReconStore) ourSellRowsToday(ctx context.Context, userID string) ([]ledgerLiveOrder, error) {
+	rows, err := rs.fleet.execDB.QueryContext(ctx, `
+		SELECT COALESCE(broker_order_id, ''), UPPER(symbol), qty FROM manthan_orders
+		 WHERE user_id = $1 AND order_side = 'SELL' AND qty > 0
+		   AND updated_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ledgerLiveOrder
+	for rows.Next() {
+		var o ledgerLiveOrder
+		if rows.Scan(&o.brokerID, &o.symbol, &o.qty) == nil {
+			out = append(out, o)
+		}
+	}
+	return out, rows.Err()
+}
+
+// lotISINs maps UPPER(symbol) → ISIN from the user's manthan_orders, so a
+// holding listed under a name form we do not know is still found.
+func (rs *ReconStore) lotISINs(ctx context.Context, userID string) map[string]string {
+	out := map[string]string{}
+	rows, err := rs.fleet.execDB.QueryContext(ctx, `
+		SELECT DISTINCT ON (UPPER(symbol)) UPPER(symbol), isin FROM manthan_orders
+		 WHERE user_id = $1 AND isin IS NOT NULL AND isin <> ''
+		 ORDER BY UPPER(symbol), id DESC`, userID)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sym, isin string
+		if rows.Scan(&sym, &isin) == nil {
+			out[sym] = isin
+		}
+	}
+	return out
 }
 
 // inOrderBookAtAll matches by broker id, exchange order id, or (symbol, qty,
@@ -655,6 +714,12 @@ func (rs *ReconStore) Reconcile(ctx context.Context, userID string) (*ReconResul
 		return nil, err
 	}
 	lots = append(lots, ledgerLots...)
+	isins := rs.lotISINs(ctx, userID)
+	for i := range lots {
+		if lots[i].ISIN == "" {
+			lots[i].ISIN = isins[lots[i].Symbol]
+		}
+	}
 
 	// Leg 3: broker — ONE read, shared by the class view and the verdicts.
 	res.read = rs.readBroker(ctx, userID)

@@ -229,6 +229,10 @@ func TestBookActions_PledgeMarkerAndLiveOrder(t *testing.T) {
 	if res["stop_rows_parked"].(int64) != 0 || len(left) != 1 || left[0] != "BRK-LIVE-1" {
 		t.Fatalf("live order must be left alone: %v", res)
 	}
+	// …but a marker row is still inserted so the planner / EOD skip the lot.
+	if _, ok := res["marker_row"]; !ok {
+		t.Fatalf("marker row expected when a live stop row was left: %v", res)
+	}
 	var st string
 	_ = execDB.QueryRow(`SELECT status FROM manthan_orders WHERE signal_id='tadm-m2-sl-aaa'`).Scan(&st)
 	if st != "SL_PLACED" {
@@ -387,6 +391,8 @@ func TestReconcile_VerdictsFromSnapshot(t *testing.T) {
 	// Ledger-only lot: a filled BUY of ZZZ with no book row.
 	mustExec(t, execDB, `INSERT INTO manthan_orders (signal_id, strategy_id, user_id, symbol, order_type, order_side, qty, filled_qty, status, broker_order_id, filled_at, created_at)
 		VALUES ('tadm-m2-buy-zzz', $1, $2, 'ZZZ', 'LIMIT_BUY', 'BUY', 5, 5, 'FILLED', 'NB-ZZZ', now() - interval '10 days', now() - interval '10 days')`, m2Strat, m2User)
+	// An old row (not touched today) must not trip the order-book tripwire.
+	mustExec(t, execDB, `UPDATE manthan_orders SET updated_at = now() - interval '10 days' WHERE signal_id = 'tadm-m2-buy-zzz'`)
 
 	broker := stubBroker{
 		holdings: []indiraClient.Holding{

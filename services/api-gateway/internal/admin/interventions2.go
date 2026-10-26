@@ -412,21 +412,44 @@ func (a *Actions) ghostPreview(ctx context.Context, userID, symbol string, read 
 	// open sell-side order at the broker is proof of holding: refuse.
 	// The same pass records every live order for the heal's stale-row close
 	// (a ledger row whose broker order is STILL LIVE is never closed), and
-	// refuses when a SELL of OURS stood in today's book in any status but
-	// REJECTED: the quantity was reserved today (post-close window), so an
-	// empty holdings row proves nothing — unless the client sold it by hand.
+	// refuses when a SELL of OURS stood in today's book in ANY status — the
+	// quantity was reserved or locked today (post-close window), so an empty
+	// holdings row proves nothing — unless the client sold the whole lot by
+	// hand. The one exception is a REJECTED order whose RMS text says
+	// "Set= 0" (the broker's own statement that it holds nothing); an RMS
+	// "Set= N>0" is positive evidence the broker HOLDS ≥ N → not a ghost.
+	// A SELL of the symbol by someone else standing in today's book (not a
+	// whole-lot fill) means the holding is in flux → refuse too.
 	p.live = liveBookFrom(book)
+	theirs := theirSellQtyToday(trades, book, ourIDs, symbol)
 	for _, ob := range book {
-		if strings.EqualFold(ob.OrdAction, "SELL") && ourIDs != nil &&
-			(ourIDs[ob.OrdId] || ourIDs[rawString(ob.ExchOrdId)]) &&
-			!strings.EqualFold(strings.TrimSpace(ob.Status), "REJECTED") &&
-			(strings.EqualFold(ob.Symbol.DispSym, symbol) || strings.EqualFold(ob.Symbol.BaseSym, symbol) ||
-				strings.EqualFold(strings.Split(ob.Symbol.DispSym, "-")[0], symbol)) {
-			if !theirSellToday(trades, book, ourIDs, symbol) {
+		if !strings.EqualFold(ob.OrdAction, "SELL") || !orderMatchesSymbol(ob, symbol) || ob.Cancellable {
+			continue // a cancellable (open) SELL is refused by the standing-order check below
+		}
+		st := strings.ToUpper(strings.TrimSpace(ob.Status))
+		mine := ourIDs != nil && (ourIDs[ob.OrdId] || ourIDs[rawString(ob.ExchOrdId)])
+		if st == "REJECTED" {
+			if set, ok := parseRMSSet(ob.RejReason); ok && set > 0 {
 				return nil, &refusal{code: 422, msg: fmt.Sprintf(
-					"our own SELL order %s (%s) stood in today's order book for %s — the quantity was reserved today, an empty holdings row proves nothing; recheck on the next session", ob.OrdId, ob.Status, symbol)}
+					"the broker's RMS rejected %s today with Set= %d for %s — the broker HOLDS %d (quantity locked, row hidden); NOT a ghost", ob.OrdId, set, symbol, set)}
+			} else if ok && set == 0 {
+				continue // "Set= 0": no reservation evidence
+			}
+			if !mine {
+				continue
 			}
 		}
+		if mine {
+			if theirs < lotQtyForGate(p) {
+				return nil, &refusal{code: 422, msg: fmt.Sprintf(
+					"our own SELL order %s (%s) stood in today's order book for %s — the quantity was reserved or locked today, an empty holdings row proves nothing; recheck on the next session", ob.OrdId, st, symbol)}
+			}
+		} else if theirs < lotQtyForGate(p) {
+			return nil, &refusal{code: 422, msg: fmt.Sprintf(
+				"a SELL order %s (%s) of %s by the client stands in today's order book without filling the whole lot — the holding is in flux; NOT a ghost", ob.OrdId, st, symbol)}
+		}
+	}
+	for _, ob := range book {
 		if strings.EqualFold(ob.OrdAction, "SELL") && ob.Cancellable &&
 			(strings.EqualFold(ob.Symbol.DispSym, symbol) || strings.EqualFold(ob.Symbol.BaseSym, symbol)) {
 			p.Evidence.OpenSellOrder = ob.OrdId
@@ -453,6 +476,11 @@ func (a *Actions) ghostPreview(ctx context.Context, userID, symbol string, read 
 	}
 	if p.Evidence.TradebookSell {
 		p.ExitPrice = p.Evidence.TradebookPrice
+		// A partial manual sale never closes the whole lot.
+		if p.Evidence.TradebookQty < lotQtyForGate(p) {
+			return nil, &refusal{code: 422, msg: fmt.Sprintf(
+				"today's trade book shows only %d of %d %s sold by hand — a partial sale; the rest may be unsettled or hidden. Review, do not heal", p.Evidence.TradebookQty, lotQtyForGate(p), symbol)}
+		}
 	}
 
 	if !p.Evidence.TradebookSell && !p.Evidence.PastSettlement {
@@ -479,6 +507,9 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 	// realized_pnl is set only when the exit price is KNOWN (a tradebook
 	// price); an unknown price stays NULL on both columns so totals and the
 	// trade list agree.
+	// Scope: Manthan lots only, and the plan's strategy when known (the
+	// preview always resolves one — a second strategy's lot on the same
+	// symbol gets its own plan and its own heal).
 	res, err := a.fleet.posDB.ExecContext(ctx, `
 		UPDATE positions
 		   SET status = 'EXITED', exit_time = now(), exit_reason = $4,
@@ -486,8 +517,9 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 		       realized_pnl = CASE WHEN $3::numeric > 0 THEN ($3::numeric - entry_price) * quantity ELSE NULL END,
 		       broker_state = $5, broker_state_reason = $6, broker_checked_at = now(), broker_state_stale = false,
 		       updated_at = now()
-		 WHERE user_id = $1 AND UPPER(symbol) = $2 AND status = 'ACTIVE'`,
-		p.UserID, p.Symbol, p.ExitPrice, reason, state, note)
+		 WHERE user_id = $1 AND UPPER(symbol) = $2 AND status = 'ACTIVE' AND origin = 'MANTHAN'
+		   AND ($7 = '' OR strategy_id::text = $7)`,
+		p.UserID, p.Symbol, p.ExitPrice, reason, state, note, p.StrategyID)
 	if err != nil {
 		return nil, fmt.Errorf("ghost heal book: %w", err)
 	}
@@ -644,47 +676,59 @@ func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.Aut
 	return closed, left
 }
 
-// theirSellToday reports a SELL of the symbol today that was NOT placed by
-// us — in the trade book, or EXECUTED in the order book.
-func theirSellToday(trades []indiraClient.TradeBook, book []indiraClient.OrderBook, ourIDs map[string]bool, symbol string) bool {
-	for _, tr := range trades {
-		if strings.EqualFold(tr.OrdAction, "SELL") && tr.TradedQty > 0 && !ourIDs[tr.OrdId] && tradeSymbolMatches(tr, symbol) {
-			return true
-		}
+// lotQtyForGate is the quantity a heal would close.
+func lotQtyForGate(p *GhostPlan) int {
+	if p.LedgerOnly {
+		return p.LedgerNetQty
 	}
-	for _, ob := range book {
-		if !strings.EqualFold(ob.OrdAction, "SELL") || ob.TradedQty <= 0 || ourIDs[ob.OrdId] || ourIDs[rawString(ob.ExchOrdId)] {
-			continue
-		}
-		st := strings.ToUpper(strings.TrimSpace(ob.Status))
-		if st != "EXECUTED" && st != "COMPLETE" && st != "TRADED" {
-			continue
-		}
-		for _, n := range orderNames(ob.Symbol.DispSym, ob.Symbol.BaseSym) {
-			for _, m := range symbolNames(symbol) {
-				if n == m {
-					return true
-				}
+	return p.BookQty
+}
+
+// orderMatchesSymbol: the order's dispSym/baseSym (series-stripped) is the
+// book symbol.
+func orderMatchesSymbol(ob indiraClient.OrderBook, symbol string) bool {
+	for _, n := range orderNames(ob.Symbol.DispSym, ob.Symbol.BaseSym) {
+		for _, m := range symbolNames(symbol) {
+			if n == m {
+				return true
 			}
 		}
 	}
 	return false
 }
 
+// theirSellQtyToday sums today's SELL quantity of the symbol NOT placed by
+// us — in the trade book, plus EXECUTED order-book orders the trade book did
+// not list.
+func theirSellQtyToday(trades []indiraClient.TradeBook, book []indiraClient.OrderBook, ourIDs map[string]bool, symbol string) int {
+	qty := 0
+	seen := map[string]bool{}
+	for _, tr := range trades {
+		if strings.EqualFold(tr.OrdAction, "SELL") && tr.TradedQty > 0 && !ourIDs[tr.OrdId] && tradeSymbolMatches(tr, symbol) {
+			qty += tr.TradedQty
+			seen[tr.OrdId] = true
+		}
+	}
+	for _, ob := range book {
+		if !strings.EqualFold(ob.OrdAction, "SELL") || ob.TradedQty <= 0 || seen[ob.OrdId] || ourIDs[ob.OrdId] || ourIDs[rawString(ob.ExchOrdId)] {
+			continue
+		}
+		st := strings.ToUpper(strings.TrimSpace(ob.Status))
+		if (st == "EXECUTED" || st == "COMPLETE" || st == "TRADED") && orderMatchesSymbol(ob, symbol) {
+			qty += ob.TradedQty
+		}
+	}
+	return qty
+}
+
 // tradeSymbolMatches digs the display symbol out of the tradebook's
 // loosely-typed symbol object.
 func tradeSymbolMatches(tr indiraClient.TradeBook, symbol string) bool {
-	m, ok := tr.Symbol.(map[string]any)
-	if !ok {
-		return false
-	}
-	for _, k := range []string{"dispSym", "baseSym"} {
-		if s, ok := m[k].(string); ok {
-			if strings.EqualFold(s, symbol) {
+	// Object, array of objects, or plain string — every name form.
+	for _, n := range tradeSymbolForms(tr.Symbol) {
+		for _, m := range symbolNames(symbol) {
+			if n == m {
 				return true
-			}
-			if i := strings.LastIndex(s, "-"); i > 0 && strings.EqualFold(s[:i], symbol) {
-				return true // "SPECIALITY-BE" is SPECIALITY
 			}
 		}
 	}

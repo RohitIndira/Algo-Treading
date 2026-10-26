@@ -16,7 +16,12 @@ import (
 var classifyNow = time.Date(2026, 10, 26, 11, 0, 0, 0, time.FixedZone("IST", 5*3600+30*60))
 
 func okSnap(holdings []indiraClient.Holding, book []indiraClient.OrderBook, trades []indiraClient.TradeBook, ours map[string]bool) *BrokerSnapshot {
-	return BuildSnapshot("OK", "", holdings, book, trades, ours, true, true, classifyNow)
+	return BuildSnapshot("OK", "", snapshotInputs{holdings: holdings, book: book, trades: trades, ourIDs: ours, tradesOK: true, oursOK: true}, classifyNow)
+}
+
+func ourSell(id, disp, status, rej string, qty int) indiraClient.OrderBook {
+	return indiraClient.OrderBook{OrdId: id, OrdAction: "SELL", Status: status, RejReason: rej, Qty: qty,
+		Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: disp, BaseSym: disp}}
 }
 
 func hold(disp, base string, qty, free, pledge, used, btst int) indiraClient.Holding {
@@ -154,22 +159,86 @@ func TestClassify_Table(t *testing.T) {
 			wantState: BrokerStateSoldToday, wantPrice: 99,
 		},
 		{
-			name: "our REJECTED SELL today reserves nothing → NOT_HELD still possible",
-			lot:  lot("KEI", 10, old),
-			snap: okSnap(nil, []indiraClient.OrderBook{{OrdId: "SL-9", OrdAction: "SELL", Status: "Rejected", Qty: 10,
-				Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "KEI"}}}, nil, map[string]bool{"SL-9": true}),
+			name:      "our REJECTED SELL with RMS Set= 0 is no reservation evidence → NOT_HELD still possible",
+			lot:       lot("KEI", 10, old),
+			snap:      okSnap(nil, []indiraClient.OrderBook{ourSell("SL-9", "KEI", "Rejected", "Limit exceeded Set= 0, N.Used= 10 ,Prev= 0", 10)}, nil, map[string]bool{"SL-9": true}),
 			wantState: BrokerStateNotHeld,
+		},
+		{
+			name:       "RMS quantity-lock episode: our re-placements REJECTED with Set= 10, Prev= 10, holdings row hidden → HELD (broker holds 10)",
+			lot:        lot("KEI", 10, old),
+			snap:       okSnap(nil, []indiraClient.OrderBook{ourSell("SL-9", "KEI", "Rejected", "Limit exceeded Set= 10, N.Used= 10 ,Prev= 10, T.Free Qty= 0", 10)}, nil, map[string]bool{"SL-9": true}),
+			wantState:  BrokerStateHeld,
+			wantReason: "RMS reported Set= 10",
+		},
+		{
+			name:       "our REJECTED SELL with a non-RMS reason (price band) → UNVERIFIED, never NOT_HELD",
+			lot:        lot("KEI", 10, old),
+			snap:       okSnap(nil, []indiraClient.OrderBook{ourSell("SL-9", "KEI", "Rejected", "Price not within DPR", 10)}, nil, map[string]bool{"SL-9": true}),
+			wantState:  BrokerStateUnverified,
+			wantReason: "our own SELL order SL-9",
+		},
+		{
+			name:       "rejected converted AMO under a NEW broker id (shape match) → still ours → UNVERIFIED",
+			lot:        lot("KEI", 10, old),
+			snap:       BuildSnapshot("OK", "", snapshotInputs{book: []indiraClient.OrderBook{ourSell("CONV-77", "KEI", "Rejected", "Session expired", 10)}, ourIDs: map[string]bool{}, ourShape: []sellShape{{names: map[string]bool{"KEI": true}, qty: 10}}, tradesOK: true, oursOK: true}, classifyNow),
+			wantState:  BrokerStateUnverified,
+			wantReason: "our own SELL order CONV-77",
+		},
+		{
+			name:       "partial manual sale today with the rest hidden → QTY_MISMATCH, never NOT_HELD",
+			lot:        lot("IDEA", 100, old),
+			snap:       okSnap(nil, nil, []indiraClient.TradeBook{sellTrade("MAN-1", "IDEA", 40, 7.5)}, map[string]bool{}),
+			wantState:  BrokerStateQtyMismatch,
+			wantReason: "40 of 100 sold by hand",
+		},
+		{
+			name:       "someone else's pending SELL of the symbol with the holding hidden → UNVERIFIED",
+			lot:        lot("KEI", 10, old),
+			snap:       okSnap(nil, []indiraClient.OrderBook{{OrdId: "MAN-5", OrdAction: "SELL", Status: "Pending", Qty: 4, Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "KEI"}}}, nil, map[string]bool{}),
+			wantState:  BrokerStateUnverified,
+			wantReason: "a SELL order MAN-5 of the symbol stands",
+		},
+		{
+			name: "holding listed under an unknown name but the lot's ISIN → HELD by ISIN, never NOT_HELD",
+			lot: func() BookLotInput {
+				l := lot("KEI", 10, old)
+				l.ISIN = "INE878B01027"
+				return l
+			}(),
+			snap:      okSnap([]indiraClient.Holding{{Symbol: []indiraClient.HoldingSymbol{{Exc: "NSE", DispSym: "KEIIND", ISIN: "INE878B01027"}}, Qty: 10, FreeQty: 10}}, nil, nil, nil),
+			wantState: BrokerStateHeld, wantReason: "by ISIN",
+		},
+		{
+			name:       "EXECUTED SELL in the order book under a new id but our shape (converted AMO stop fired) → ours → UNVERIFIED",
+			lot:        lot("KEI", 10, old),
+			snap:       BuildSnapshot("OK", "", snapshotInputs{book: []indiraClient.OrderBook{{OrdId: "CONV-9", OrdAction: "SELL", Status: "Executed", Qty: 10, TradedQty: 10, Price: 99, Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "KEI"}}}, ourIDs: map[string]bool{}, ourShape: []sellShape{{names: map[string]bool{"KEI": true}, qty: 10}}, tradesOK: true, oursOK: true}, classifyNow),
+			wantState:  BrokerStateUnverified,
+			wantReason: "system's own order CONV-9",
+		},
+		{
+			name:       "pledge does not cover the locked quantity (100 held, 20 pledged, 0 free) → HELD with reason, not PLEDGED",
+			lot:        lot("SYRMA", 100, old),
+			snap:       okSnap([]indiraClient.Holding{hold("SYRMA", "SYRMA", 100, 0, 20, 0, 0)}, nil, nil, nil),
+			wantState:  BrokerStateHeld,
+			wantReason: "20 pledged",
+		},
+		{
+			name:      "pledge covers the locked quantity (100 held, 60 pledged, 40 free) → PLEDGED",
+			lot:       lot("SYRMA", 100, old),
+			snap:      okSnap([]indiraClient.Holding{hold("SYRMA", "SYRMA", 100, 40, 60, 0, 0)}, nil, nil, nil),
+			wantState: BrokerStatePledged,
 		},
 		{
 			name:      "trade book unavailable → an absent holding is UNVERIFIED (degraded read)",
 			lot:       lot("KEI", 10, old),
-			snap:      BuildSnapshot("OK", "", nil, nil, nil, map[string]bool{}, false, true, classifyNow),
+			snap:      BuildSnapshot("OK", "", snapshotInputs{ourIDs: map[string]bool{}, tradesOK: false, oursOK: true}, classifyNow),
 			wantState: BrokerStateUnverified, wantReason: "could not be read",
 		},
 		{
 			name:      "attribution unavailable → an absent holding is UNVERIFIED",
 			lot:       lot("KEI", 10, old),
-			snap:      BuildSnapshot("OK", "", nil, nil, []indiraClient.TradeBook{sellTrade("X", "KEI", 10, 100)}, nil, true, false, classifyNow),
+			snap:      BuildSnapshot("OK", "", snapshotInputs{trades: []indiraClient.TradeBook{sellTrade("X", "KEI", 10, 100)}, tradesOK: true, oursOK: false}, classifyNow),
 			wantState: BrokerStateUnverified,
 		},
 		{
@@ -228,7 +297,7 @@ func TestClassify_Table(t *testing.T) {
 		{
 			name:       "no broker truth → UNVERIFIED naming the leg",
 			lot:        lot("KEI", 10, old),
-			snap:       BuildSnapshot("AUTH_EXPIRED", "AU004", nil, nil, nil, nil, false, false, classifyNow),
+			snap:       BuildSnapshot("AUTH_EXPIRED", "AU004", snapshotInputs{}, classifyNow),
 			wantState:  BrokerStateUnverified,
 			wantReason: "broker read AUTH_EXPIRED",
 		},
@@ -374,6 +443,43 @@ func TestVerdict_Confirmed(t *testing.T) {
 	v.PrevState = BrokerStateUnverified
 	if v.Confirmed() {
 		t.Fatal("different previous state → not confirmed")
+	}
+	// Yesterday's verdict never confirms today's (same IST day required).
+	v.PrevState = BrokerStateNotHeld
+	v.PrevCheckedAt = classifyNow.Add(-20 * time.Hour)
+	if v.Confirmed() {
+		t.Fatal("a previous-day read must not confirm")
+	}
+}
+
+// Trade-book symbol forms: object, array of objects, plain string, wire form.
+func TestTradeSymbolForms(t *testing.T) {
+	cases := map[string]any{
+		"object": map[string]any{"dispSym": "KEI-BE", "baseSym": "KEI"},
+		"array":  []any{map[string]any{"dispSym": "KEI"}},
+		"string": "KEI-EQ",
+		"wire":   "STK_KEI_EQ_NSE_123",
+	}
+	for name, sym := range cases {
+		if !tradeSymbolMatches(indiraClient.TradeBook{Symbol: sym}, "KEI") {
+			t.Fatalf("%s form did not match KEI: %v", name, tradeSymbolForms(sym))
+		}
+	}
+	if tradeSymbolMatches(indiraClient.TradeBook{Symbol: 42}, "KEI") {
+		t.Fatal("unknown form must not match")
+	}
+}
+
+// parseRMSSet ports trade-execution's RMS reading.
+func TestParseRMSSet(t *testing.T) {
+	if set, ok := parseRMSSet("Limit exceeded Set= 239, N.Used= 239 ,Prev= 239, T.Free Qty= 0"); !ok || set != 239 {
+		t.Fatalf("set=%d ok=%v", set, ok)
+	}
+	if set, ok := parseRMSSet("Limit exceeded Set= 0, N.Used= 10 ,Prev= 0"); !ok || set != 0 {
+		t.Fatalf("set=%d ok=%v", set, ok)
+	}
+	if _, ok := parseRMSSet("Price not within DPR"); ok {
+		t.Fatal("non-RMS text must not parse")
 	}
 }
 
