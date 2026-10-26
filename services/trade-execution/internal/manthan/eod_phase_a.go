@@ -243,38 +243,42 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 		//           pace the retries (spacing below) but never spend the cap.
 		//   hard  — anything else (band, invalid data, freeze): deterministic;
 		//           counted against the cap.
+		//   auth  — our own session was dead; the order never reached the
+		//           broker. Neither cap nor spacing: the first real attempt
+		//           after the client logs in must go out at once.
 		errs, eerr := p.repo.ListAMOAttemptErrorsToday(cycleCtx, pos.EntryOrderID, tradeDate)
-		hard, lock, ghost := classifyAMOAttemptErrors(errs)
+		hard, lock, ghost, auth := classifyAMOAttemptErrors(errs)
 		if eerr == nil && ghost > 0 {
 			p.parkGhostAtEOD(cycleCtx, pos, errs)
 			skipped++
 			continue
 		}
-		if eerr == nil && hard >= maxAMOAttempts {
-			attempts = hard
-		} else if eerr == nil {
+		brokerAttempts := len(errs) - auth // attempts that actually reached the broker
+		if eerr == nil {
 			// Only hard rejections exhaust the cap. A night of lock rejections
 			// keeps retrying on the spacing ladder (last gap 90 min) until the
-			// AMO window closes.
+			// AMO window closes; auth failures count for nothing.
 			if attempts >= maxAMOAttempts && hard < maxAMOAttempts {
-				p.logger.Info("EOD Phase A: attempts so far were quantity-lock rejections — not counting them against the cap",
-					zap.String("symbol", pos.Symbol), zap.Int("attempts", attempts), zap.Int("lock", lock), zap.Int("hard", hard))
-				attempts = hard
+				p.logger.Info("EOD Phase A: attempts so far were quantity-lock / session rejections — not counting them against the cap",
+					zap.String("symbol", pos.Symbol), zap.Int("attempts", attempts), zap.Int("lock", lock), zap.Int("auth", auth), zap.Int("hard", hard))
 			}
+			attempts = hard
 		}
 		if cerr == nil && attempts >= maxAMOAttempts {
-			p.logger.Error("EOD Phase A: AMO attempt cap reached — GIVING UP for tonight; position needs manual review",
-				zap.String("symbol", pos.Symbol),
-				zap.String("user_id", pos.UserID),
-				zap.Int("attempts", attempts),
-				zap.Float64("trigger", safeTrigger))
-			p.publishProtectionSkipped(cycleCtx, FirePlan{
-				Pos:        pos,
-				Auth:       *uc.auth,
-				Info:       info,
-				Action:     FireSkip,
-				SkipReason: fmt.Sprintf("EOD: AMO attempt cap (%d) reached — broker rejects deterministically; manual review needed", attempts),
-			})
+			if p.eodGiveUpOnce(pos.EntryOrderID, tradeDate) {
+				p.logger.Error("EOD Phase A: AMO attempt cap reached — GIVING UP for tonight; position needs manual review",
+					zap.String("symbol", pos.Symbol),
+					zap.String("user_id", pos.UserID),
+					zap.Int("attempts", attempts),
+					zap.Float64("trigger", safeTrigger))
+				p.publishProtectionSkipped(cycleCtx, FirePlan{
+					Pos:        pos,
+					Auth:       *uc.auth,
+					Info:       info,
+					Action:     FireSkip,
+					SkipReason: fmt.Sprintf("EOD: AMO attempt cap (%d) reached — broker rejects deterministically; manual review needed", attempts),
+				})
+			}
 			skipped++
 			continue
 		}
@@ -291,9 +295,12 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 		if last, ok, lerr := p.repo.LastAMOAttemptAt(cycleCtx, pos.EntryOrderID, tradeDate); lerr == nil && ok {
 			gaps := []time.Duration{0, 10 * time.Minute, 30 * time.Minute, 60 * time.Minute, 90 * time.Minute}
 			gap := gaps[len(gaps)-1]
-			total := len(errs) // every attempt tonight, whatever its rejection, paces the next one
-			if total < attempts {
+			total := brokerAttempts // every attempt that reached the broker paces the next one
+			if eerr != nil {
 				total = attempts
+			}
+			if total < 0 {
+				total = 0
 			}
 			if total < len(gaps) {
 				gap = gaps[total]

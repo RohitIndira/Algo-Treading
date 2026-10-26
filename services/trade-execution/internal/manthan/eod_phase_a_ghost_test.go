@@ -6,15 +6,16 @@ import (
 )
 
 func TestClassifyAMOAttemptErrors(t *testing.T) {
-	hard, lock, ghost := classifyAMOAttemptErrors([]string{
+	hard, lock, ghost, auth := classifyAMOAttemptErrors([]string{
 		"broker: Limit exceeded Set= 239, N.Used= 239 ,Prev= 239, T.Free Qty= 0,today free qty=0",
 		"broker: Limit exceeded Set= 15, N.Used= 15 ,Prev= 15, T.Free Qty= 0",
 		"broker: Limit exceeded Set= 0, N.Used= 121 ,Prev= 0, T.Free Qty= 0",
 		"AMO rejected at conversion: Order entered has invalid data.",
+		"place order request failed: indira: session expired (AU0xx): AU004 Session expired",
 		"", // still pending
 	})
-	if hard != 1 || lock != 2 || ghost != 1 {
-		t.Fatalf("hard=%d lock=%d ghost=%d want 1 2 1", hard, lock, ghost)
+	if hard != 1 || lock != 2 || ghost != 1 || auth != 1 {
+		t.Fatalf("hard=%d lock=%d ghost=%d auth=%d want 1 2 1 1", hard, lock, ghost, auth)
 	}
 }
 

@@ -123,6 +123,8 @@ type ProtectiveReplay struct {
 	// Optional SESSION_EXPIRED publisher — nil-safe.
 	authNotif AuthExpiryNotifier
 
+	eodGiveUpState // once-per-night give-up log/publish (eod_phase_a_ghost.go)
+
 	// stopSource (optional) answers "what is the CURRENT trailed stop for
 	// (strategy, symbol)?" from rules-engine's book (trading_db
 	// manthan_positions.current_sl) — the source of truth for the trail.

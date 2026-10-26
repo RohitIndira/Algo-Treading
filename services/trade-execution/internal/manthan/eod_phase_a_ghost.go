@@ -4,28 +4,60 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
 
+// eodGiveUpState is embedded in ProtectiveReplay (see protective_replay.go).
+type eodGiveUpState struct {
+	eodGiveUpMu sync.Mutex
+	eodGiveUp   map[string]bool
+}
+
 // classifyAMOAttemptErrors sorts tonight's AMO rejection texts into
 // hard (deterministic), lock (quantity still held by the swept day-stop — the
-// expected evening state) and ghost (broker holds nothing: "Set= 0").
-func classifyAMOAttemptErrors(errs []string) (hard, lock, ghost int) {
+// expected evening state), ghost (broker holds nothing: "Set= 0") and auth
+// (our own session was dead — the order never reached the broker; FIV99
+// 2026-10-26: 60 h of AU004 attempts had spent the cap, so nothing was armed
+// even after the client logged in).
+func classifyAMOAttemptErrors(errs []string) (hard, lock, ghost, auth int) {
 	for _, e := range errs {
 		if strings.TrimSpace(e) == "" {
 			continue // row still pending / no rejection recorded
 		}
+		le := strings.ToLower(e)
 		switch {
 		case rmsSaysNoHolding(e):
 			ghost++
 		case isRMSQtyRejection(e):
 			lock++
+		case strings.Contains(le, "au004") || strings.Contains(le, "session expired") || strings.Contains(le, "no broker auth"):
+			auth++
 		default:
 			hard++
 		}
 	}
-	return hard, lock, ghost
+	return hard, lock, ghost, auth
+}
+
+// eodGiveUpOnce reports whether this is the first time tonight the cap verdict
+// is reached for the position (per process): the retry worker re-enters every
+// 5 minutes, and logging/publishing the same give-up each time produced 351
+// identical error lines on 2026-10-26.
+func (p *ProtectiveReplay) eodGiveUpOnce(entryOrderID int64, tradeDate time.Time) bool {
+	key := fmt.Sprintf("%d|%s", entryOrderID, tradeDate.Format("2006-01-02"))
+	p.eodGiveUpMu.Lock()
+	defer p.eodGiveUpMu.Unlock()
+	if p.eodGiveUp == nil {
+		p.eodGiveUp = map[string]bool{}
+	}
+	if p.eodGiveUp[key] {
+		return false
+	}
+	p.eodGiveUp[key] = true
+	return true
 }
 
 // parkGhostAtEOD handles a position whose overnight stop the broker's RMS
