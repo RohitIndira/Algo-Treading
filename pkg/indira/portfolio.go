@@ -23,13 +23,20 @@ func (c *Client) GetHoldings(ctx context.Context, auth *AuthContext) ([]Holding,
 	if err != nil {
 		return nil, fmt.Errorf("holdings request failed: %w", err)
 	}
-
-	// Standard shape: data wrapper → { invested, marketValue, holdings: [...] }
-	var wrap struct {
-		Holdings []Holding `json:"holdings"`
+	// A business failure on an HTTP 200 body (2026-10-26): a non-zero infoID
+	// means the read failed, not "no holdings". Scoped to this read on
+	// purpose — order placement keeps its own typed BrokerBusinessError path.
+	if resp.InfoID != "" && resp.InfoID != "0" {
+		return nil, &BrokerBusinessError{Code: resp.InfoID, Message: "holdings: " + resp.InfoMsg}
 	}
-	if err := json.Unmarshal(resp.Data, &wrap); err == nil && len(wrap.Holdings) > 0 {
-		return wrap.Holdings, nil
+
+	// Standard shape: data wrapper → { invested, marketValue, holdings: [...] }.
+	// A present-but-empty "holdings" array is a REAL zero-holdings account.
+	var wrap struct {
+		Holdings *[]Holding `json:"holdings"`
+	}
+	if err := json.Unmarshal(resp.Data, &wrap); err == nil && wrap.Holdings != nil {
+		return *wrap.Holdings, nil
 	}
 
 	// Fallback A: array directly at top level (legacy / odd brokerage modes).

@@ -107,13 +107,6 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
-// BaseURL returns the REST base URL this client talks to (INDIRA_BASE_URL
-// or FallbackBaseURL). Used to derive the order-notify WebSocket URL so a
-// test can point both REST and WS at one httptest server.
-func (c *Client) BaseURL() string {
-	return c.baseURL
-}
-
 // ============ Helper Methods ============
 
 // doRequest performs an HTTP request with per-request authentication headers
@@ -264,14 +257,6 @@ func (c *Client) doRequest(ctx context.Context, auth *AuthContext, method, path 
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(responseBody))
-	}
-
-	// A business failure on an HTTP 200 body (2026-10-26): Indira returns
-	// {"infoID":"<code>","infoMsg":"..."} with a non-zero code for rejected /
-	// failed reads and writes. Returning that as success made an empty
-	// holdings/orderbook reply look like "nothing held / nothing open".
-	if bodyParsedOK && stdResp.InfoID != "" && stdResp.InfoID != "0" {
-		return nil, fmt.Errorf("indira: %s %s", stdResp.InfoID, stdResp.InfoMsg)
 	}
 
 	// 200-range path: use the parsed stdResp from above, or fall through.
