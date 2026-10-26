@@ -92,3 +92,124 @@ Pass criteria, measured over one trading day 09:00–16:00 IST:
 1. Anchor session: dedicated dealer/ops login (preferred) or S4450 with fallback.
 2. Whether frames for clients that are not Manthan users should be stored at all (default: counted only).
 3. Alert channel for feed-stale (admin attention only until the WhatsApp channel exists).
+
+## Operations (shipped 2026-10-26)
+
+Code: `services/orderstatus/internal/wss/broadcast.go` (listener, modes, shadow
+compare, stale monitor), `broadcast_anchor.go` (anchor chooser),
+`broadcast_metrics.go`, `internal/alert` (OPS_ALERT on `manthan.notifications`),
+`internal/tradeexec` (LookupOrderMeta client for own_orders), migration
+`services/orderstatus/migrations/004_broker_events_source_wss_broadcast.sql`.
+Frames go through the same `Listener.ingest` as the per-user socket with
+`source = WSS_BROADCAST`; dedup is the existing `UNIQUE (broker_order_id, event_seq)`.
+
+### Modes — `BROADCAST_FEED_MODE`
+
+| Mode | Broker | Store / Kafka | Use |
+|------|--------|---------------|-----|
+| `off` | not connected | nothing | rollback; service identical to before the feature |
+| `shadow` (default) | connected, heartbeat, reconnect | **nothing written**; every managed-client frame is compared against what the per-user socket / REST poll stored | stage 3 |
+| `own_orders` | connected | writes/publishes only frames whose `UniqueCode` **or** `AMOOrderID` is in `manthan_orders` (trade-execution `LookupOrderMeta`, positive cache for life, negative 60 s). No lookup reachable → frame skipped (fail closed), `broadcast_skipped_not_own_total` grows | stage 4.1 |
+| `all` | connected | writes/publishes every managed-client frame; manual sells become MANUAL_EXIT downstream | stage 4.2 |
+
+Frames for client codes orderstatus does not manage (no active strategy in
+user-config) are only counted (`broadcast_unknown_ucc_total`,
+`broadcast_frames_total{ucc="other"}`), in every mode.
+
+### Environment
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `BROADCAST_FEED_MODE` | `shadow` | see above; invalid value = service refuses to start |
+| `BROADCAST_ANCHOR_USER` | empty | dedicated dealer/ops login whose session fetches the broadcast token. Empty or unusable → newest live (largest JWT `iat`, not expired) session among managed users. A session the broker rejects (AU0xx / 401 / handshake not Ok) is retired until that user logs in again or 30 min pass |
+| `TRADE_EXEC_GRPC_ADDR` | unset | trade-execution gRPC for own_orders. In `deployments/separate-namespace/ecosystem.config.js` it is `localhost:9004` |
+| `INDIRA_BASE_URL` | livemiddleware | REST base; the socket URL is derived from it (`wss://…/order-notify/websocket/broadcast`) |
+
+`ecosystem.config.js` forwards `BROADCAST_FEED_MODE` and
+`BROADCAST_ANCHOR_USER` from `deployments/separate-namespace/.env` (its env
+blocks are whitelists). `.env` lines for shadow:
+
+```
+BROADCAST_FEED_MODE=shadow
+BROADCAST_ANCHOR_USER=
+```
+
+Protocol constants (not configurable): handshake reply within 10 s, heartbeat
+every 50 s, reconnect when no bytes for 6 min (longer than the broker's
+5-minute idle close), backoff 1 s → 2 s → 5 s → 10 s capped, a fresh token on
+every reconnect, close frame on shutdown.
+
+### Metrics — `GET :HTTP_PORT/metrics` (orderstatus is `:9006` on the box)
+
+| Metric | Meaning |
+|--------|---------|
+| `broadcast_connected` | 1 while connected and handshake accepted |
+| `broadcast_last_frame_age_seconds` | seconds since the last order frame (−1 before the first) |
+| `broadcast_frames_total{ucc}` | frames per managed client; everyone else `other` |
+| `broadcast_unknown_ucc_total` | frames for clients we do not manage |
+| `broadcast_reconnects_total` | session ends → reconnect attempts |
+| `broadcast_anchor_session{user}` | 1 for the user anchoring the live connection |
+| `broadcast_anchor_switches_total` | anchors retired after a broker rejection |
+| `broadcast_token_errors_total` | failed `createWsToken` calls |
+| `broadcast_shadow_recall_total{seen_by_user_path="true"/"false"}` | shadow: did the per-user path store the same `(broker_order_id, event_seq)` within 5 s |
+| `broadcast_shadow_lead_seconds` | shadow: per-user `observed_at` − broadcast arrival; positive = broadcast was earlier |
+| `broadcast_written_total{result=inserted/deduped/dropped/error}` | own_orders / all: outcome of each hand-off to the store |
+| `broadcast_skipped_not_own_total` | own_orders: frames not ours (or lookup failed) |
+| `broadcast_malformed_frames_total`, `broadcast_control_frames_total` | non-order frames |
+
+### Alerts
+
+All go to `manthan.notifications` as `OPS_ALERT` (same shape as
+trade-execution's, `kind` below, dedup 5 min) and to the log at Error with the
+stable message `broadcast feed alert`:
+
+- `BROADCAST_FEED_STALE` — no frame for 3 min between 09:15–15:30 IST on a
+  trading day; raised once, re-armed when frames resume.
+- `BROADCAST_ANCHOR_LOST` — the anchor session was rejected (once per
+  session), or no session at all can anchor the feed (once until one can).
+- `BROADCAST_TOKEN_FAILING` — `createWsToken` failing for more than 5 min.
+
+Per-user sockets and REST polls are untouched by any of this; they keep
+covering while the broadcast is down.
+
+### Stage 3 — one shadow day, what to read
+
+1. Apply migration 004 only if you intend to flip to a writing mode the same
+   week (shadow needs nothing). `.env`: `BROADCAST_FEED_MODE=shadow`; restart
+   orderstatus; confirm the log line `broadcast listener enabled mode=shadow`
+   and `broadcast connected anchor_user=…`.
+2. During the day: `curl -s localhost:9006/metrics | grep ^broadcast_`.
+   Expect `broadcast_connected 1`, `broadcast_last_frame_age_seconds` small in
+   market hours, `broadcast_reconnects_total` ≤ 12 by 16:00.
+3. Recall: `broadcast_shadow_recall_total{seen_by_user_path="false"}` should
+   be 0 for clients with a live session. Every miss is logged as
+   `broadcast shadow: frame not seen by per-user path` with ucc, broker id,
+   event_seq, status — that list is the review list (expected content: clients
+   without a session, i.e. the FIV99 case the feature exists for).
+   **If misses appear for clients WITH a session, check `event_seq`: a
+   `MessageSequenceNumber` that differs between the two sockets for the same
+   event would defeat the dedup and must be fixed before any writing mode.**
+4. Latency: `broadcast_shadow_lead_seconds` histogram — the bulk should sit at
+   ≥ 0 (broadcast first) and never below −2 s for our own orders.
+5. Unattended token refresh: `broadcast_reconnects_total` grows slowly across
+   the day with `broadcast_token_errors_total` flat and
+   `broadcast_anchor_switches_total` 0 (unless the anchor really logged out).
+
+### Flips
+
+- shadow → own_orders: apply migration 004 (`psql … -f services/orderstatus/migrations/004_…sql`
+  against order_status_db), set `BROADCAST_FEED_MODE=own_orders`, restart.
+  Verify `broadcast_written_total{result="inserted"}` grows only for our ids,
+  `broadcast_skipped_not_own_total` grows for everything else, and
+  `SELECT source, count(*) FROM broker_events WHERE observed_at > now() - interval '1 day' GROUP BY 1`
+  shows `WSS_BROADCAST` rows alongside `WSS` with no duplicate
+  `(broker_order_id, event_seq)`. Downstream: trade-execution books fills once;
+  the REST poll finds nothing left to fix.
+- own_orders → all: `BROADCAST_FEED_MODE=all`, restart. Verify every manual
+  sell that day against the back office (positions books MANUAL_EXIT at the
+  frame's traded price).
+
+### Rollback
+
+`BROADCAST_FEED_MODE=off` in `.env`, `pm2 restart ecosystem.config.js --only orderstatus --update-env`.
+Rows already written with `source = WSS_BROADCAST` are ordinary events and stay.

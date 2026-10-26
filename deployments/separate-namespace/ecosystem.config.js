@@ -130,6 +130,16 @@ module.exports = {
     { name: 'orderstatus', script: './bin/orderstatus', ...common, env: {
         ...BASE, HTTP_PORT: '9006', ORDER_STATUS_DB: 'order_status_db',
         USER_CONFIG_GRPC_ADDR: 'localhost:9003',
+        // Dealer broadcast order feed (2026-10-26). Mode comes from .env so
+        // flipping is a .env edit + restart: off | shadow (default: connect,
+        // compare, write nothing) | own_orders | all. Rollback = off.
+        BROADCAST_FEED_MODE:   ENV.BROADCAST_FEED_MODE   || 'shadow',
+        // Optional dedicated dealer login to anchor the feed; empty = newest
+        // live managed-client session.
+        BROADCAST_ANCHOR_USER: ENV.BROADCAST_ANCHOR_USER || '',
+        // own_orders mode asks trade-execution (LookupOrderMeta) which broker
+        // ids are ours.
+        TRADE_EXEC_GRPC_ADDR:  'localhost:9004',
     }},
     { name: 'positions', script: './bin/positions', ...common, env: {
         ...BASE, HTTP_PORT: '9007', POSITIONS_DB: 'positions_db',

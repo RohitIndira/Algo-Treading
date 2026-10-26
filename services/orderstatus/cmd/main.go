@@ -23,14 +23,17 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	indira "github.com/RohitIndira/Algo-Treading/pkg/indira"
 
+	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/alert"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/publisher"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/reconciler"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/store"
+	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/tradeexec"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/userconfig"
 	"github.com/RohitIndira/Algo-Treading/services/orderstatus/internal/wss"
 )
@@ -101,6 +104,9 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+
+	// Prometheus: broadcast_* and Go runtime metrics.
+	mux.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:              ":" + port,
@@ -202,6 +208,61 @@ func main() {
 	defer recCancel()
 	rec.Start(recCtx)
 
+	// ── Dealer broadcast listener (2026-10-26) ─────────────────────────
+	// One subscription to the broker's broadcast socket sees every client's
+	// order frames, session or not. Frames for managed users go through the
+	// SAME ingest as the per-user socket (source WSS_BROADCAST, dedup on
+	// broker_order_id + event_seq). BROADCAST_FEED_MODE:
+	//   off        → not started; service behaves exactly as before
+	//   shadow     → connect + compare, write NOTHING (default)
+	//   own_orders → write/publish only frames for orders in manthan_orders
+	//                (trade-execution LookupOrderMeta; TRADE_EXEC_GRPC_ADDR)
+	//   all        → write/publish every managed-client frame
+	// Rollback: BROADCAST_FEED_MODE=off + restart. Read-only toward the broker.
+	bmode, err := wss.ParseMode(getEnv("BROADCAST_FEED_MODE", "shadow"))
+	if err != nil {
+		logger.Fatal("bad BROADCAST_FEED_MODE", zap.Error(err))
+	}
+	var broadcast *wss.BroadcastListener
+	bctx, bcancel := context.WithCancel(context.Background())
+	defer bcancel()
+	if bmode != wss.ModeOff {
+		alertWriter := &kafka.Writer{
+			Addr:         kafka.TCP(brokers...),
+			Topic:        alert.Topic,
+			Balancer:     &kafka.Hash{},
+			BatchTimeout: 1 * time.Millisecond,
+			RequiredAcks: kafka.RequireAll,
+		}
+		defer alertWriter.Close()
+		alerter := alert.New(alertWriter, logger)
+
+		var own wss.OwnOrderLookup
+		if teAddr := os.Getenv("TRADE_EXEC_GRPC_ADDR"); teAddr != "" {
+			teClient, err := tradeexec.New(teAddr)
+			if err != nil {
+				logger.Error("trade-execution dial failed — own_orders mode will skip every frame", zap.Error(err))
+			} else {
+				defer func() { _ = teClient.Close() }()
+				own = teClient
+			}
+		} else if bmode == wss.ModeOwnOrders {
+			logger.Error("BROADCAST_FEED_MODE=own_orders but TRADE_EXEC_GRPC_ADDR is unset — every frame will be skipped")
+		}
+
+		broadcast = wss.NewBroadcastListener(wss.BroadcastConfig{
+			Mode:       bmode,
+			AnchorUser: os.Getenv("BROADCAST_ANCHOR_USER"),
+		}, indiraClient, listener, ucClient, own, brokerEvents, alerter, logger)
+		broadcast.Start(bctx)
+		logger.Info("broadcast listener enabled",
+			zap.String("mode", string(bmode)),
+			zap.String("anchor_user", os.Getenv("BROADCAST_ANCHOR_USER")),
+			zap.Bool("own_order_lookup", own != nil))
+	} else {
+		logger.Info("broadcast listener off (BROADCAST_FEED_MODE=off)")
+	}
+
 	// Durability backstop: republish any broker_events rows whose inline
 	// publish failed (published_at IS NULL) so a transient Kafka outage never
 	// permanently drops an event from order.events. Scans in id order every 1s.
@@ -217,6 +278,12 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	logger.Info("shutdown signal received")
+
+	// Broadcast first: sends the close frame and stops its goroutines.
+	bcancel()
+	if broadcast != nil {
+		broadcast.Wait()
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
