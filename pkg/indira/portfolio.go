@@ -38,11 +38,15 @@ func (c *Client) GetHoldings(ctx context.Context, auth *AuthContext) ([]Holding,
 		return direct, nil
 	}
 
-	// Fallback B: best-effort empty result if both fail. We DON'T return an
-	// error because callers (the protective replayer's freeQty pre-flight,
-	// the live preview panel, etc.) treat "no holdings" and "couldn't parse"
-	// the same way: skip placement, alert.
-	return []Holding{}, nil
+	// Neither shape parsed (2026-10-26): this is an ERROR, never "no
+	// holdings". An empty/garbled reply read as "holds nothing" would let the
+	// book reconciler close real positions; callers that only pre-flight a
+	// SELL (freeQty) already skip placement on error.
+	head := resp.Data
+	if len(head) > 200 {
+		head = head[:200]
+	}
+	return nil, fmt.Errorf("holdings response unparseable (neither {holdings:[...]} nor [...]): %s", string(head))
 }
 
 // FreeQtyBySymbol returns a map[displaySym] → freeQty derived from current
