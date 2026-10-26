@@ -582,9 +582,17 @@ type matrixRow struct {
 	EMAAllocationPct *float64 `json:"ema_allocation_pct,omitempty"`
 	HoldingDays      int      `json:"holding_period_days"`
 	Status           string   `json:"status"`
-	signalID         string
-	w52High          float64 // resolved high (feed, else sheet); 0 = unknown
-	w52HighDate      string  // feed-supplied date of that high, if any
+	// Closed rows (2026-10-26): WHY the row closed and whether the exit price
+	// is real. A lot closed by the book reconciler because the broker no
+	// longer held it has NO sale price: current_price / current_value / pnl
+	// are then 0 for want of a number and exit_price_known is false — the UI
+	// must show "—" and the note, not "₹0 / +0.00%".
+	ExitReason     string `json:"exit_reason,omitempty"`
+	ExitPriceKnown *bool  `json:"exit_price_known,omitempty"`
+	Note           string `json:"note,omitempty"`
+	signalID       string
+	w52High        float64 // resolved high (feed, else sheet); 0 = unknown
+	w52HighDate    string  // feed-supplied date of that high, if any
 }
 
 // PositionsFilter narrows the matrix (§7 of the frontend gaps doc).
@@ -609,7 +617,7 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 	q := `SELECT id, user_id, symbol, COALESCE(industry,''), COALESCE(mcap_bucket,''),
 	             quantity, entry_price, COALESCE(invested_amt,0), entry_time, exit_time,
 	             exit_price, realized_pnl, ema_alloc_pct, status, COALESCE(signal_id::text,''),
-	             current_sl, updated_at
+	             current_sl, updated_at, COALESCE(exit_reason,'')
 	      FROM manthan_positions WHERE status IN ` + statuses
 	args := []any{}
 	add := func(cond string, v any) {
@@ -650,7 +658,7 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 		var exitPx, realized, ema, csl sql.NullFloat64
 		if err := rows.Scan(&id, &r.ClientID, &r.Script, &r.Industry, &r.Mcap,
 			&r.Quantity, &r.BuyRate, &r.PnL /*invested, reused below*/, &entryT, &exitT,
-			&exitPx, &realized, &ema, &r.Status, &r.signalID, &csl, &updatedT); err != nil {
+			&exitPx, &realized, &ema, &r.Status, &r.signalID, &csl, &updatedT, &r.ExitReason); err != nil {
 			return nil, err
 		}
 		if csl.Valid && csl.Float64 > 0 {
@@ -685,14 +693,17 @@ func (d *DashboardStore) Positions(ctx context.Context, f PositionsFilter) (any,
 			if entryT.Valid {
 				r.HoldingDays = holdingDays(entryT.Time, endT, d.ist)
 			}
-			if exitPx.Valid {
+			known := exitPx.Valid && exitPx.Float64 > 0
+			r.ExitPriceKnown = &known
+			if known {
 				r.CurrentPrice = round2f(exitPx.Float64)
 			}
 			r.CurrentValue = round2f(r.CurrentPrice * float64(r.Quantity))
-			if realized.Valid {
+			if realized.Valid && known {
 				r.PnL = round2f(realized.Float64)
 				r.PnLPct = pct(realized.Float64, invested)
 			}
+			r.Note = closeNote(r.ExitReason, known)
 		} else {
 			r.Status = "OPEN"
 			r.CurrentPrice = r.BuyRate // upgraded to LTP below when known
@@ -1188,4 +1199,22 @@ func (h *HTTP) dashJSON(w http.ResponseWriter, ar *AdminRequest, fn func(ctx con
 		return
 	}
 	writeOK(w, data)
+}
+
+// closeNote is the plain-language line the admin and client UIs show for a
+// closed row; empty for a normal stop or strategy exit with a real price.
+func closeNote(exitReason string, priceKnown bool) string {
+	switch strings.ToUpper(exitReason) {
+	case "ADMIN_GHOST_CLEANUP", "NOT_HELD_AT_BROKER":
+		return "Closed by reconciliation: the broker no longer held this position (sold or transferred outside the system). No sale price is known, so value and P&L are not computed."
+	case "MANUAL_EXIT":
+		if !priceKnown {
+			return "Sold by the client outside the strategy; sale price not captured."
+		}
+		return "Sold by the client outside the strategy."
+	}
+	if !priceKnown {
+		return "Exit price not recorded; value and P&L are not computed."
+	}
+	return ""
 }
