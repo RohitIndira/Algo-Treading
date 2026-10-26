@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -24,6 +25,10 @@ const (
 	SourceRESTOrderbook  Source = "REST_ORDERBOOK"
 	SourceRESTReconciler Source = "REST_RECONCILER"
 	SourceRESTTradebook  Source = "REST_TRADEBOOK"
+	// SourceWSSBroadcast — frame received on the dealer broadcast socket
+	// (wss .../order-notify/websocket/broadcast). Same wire shape as WSS;
+	// dedupes against it on (broker_order_id, event_seq). Migration 004.
+	SourceWSSBroadcast Source = "WSS_BROADCAST"
 )
 
 // EventType maps to `broker_events.event_type`. Matches the verified WSS
@@ -45,20 +50,20 @@ const (
 // Event is the payload orderstatus svc writes on every observation.
 // Field names match broker_events columns 1:1.
 type Event struct {
-	BrokerOrderID   string    // Codify UniqueCode / nstOrdNo — the join key everywhere
-	ExchangeOrderID string    // NSE OrderNumber ("0" pre-exchange)
-	EventSeq        int64     // Broker exch time in microseconds — deterministic across paths
+	BrokerOrderID   string // Codify UniqueCode / nstOrdNo — the join key everywhere
+	ExchangeOrderID string // NSE OrderNumber ("0" pre-exchange)
+	EventSeq        int64  // Broker exch time in microseconds — deterministic across paths
 	Source          Source
 	EventType       EventType
 	Status          string // verified enum: PENDING/EXECUTED/CANCELLED/A.REJECTED/ORDER ERROR/ADMIN PENDING
 	OMSStatusCode   int    // Codify OMSOrderStatus (8=admin pending, 10=cancel-of-dead, 15=fresh reject)
 
-	UserID   string
-	Symbol   string
-	Exchange string
-	BuySell  string // '1'=BUY '2'=SELL
+	UserID    string
+	Symbol    string
+	Exchange  string
+	BuySell   string // '1'=BUY '2'=SELL
 	OrderType string // REGULAR LIMIT / REGULAR MARKET / SL LIMIT / etc.
-	Product  string
+	Product   string
 
 	OrderPrice   float64
 	TriggerPrice float64
@@ -189,6 +194,34 @@ func (w *Writer) LookupConflictSource(ctx context.Context, brokerOrderID string,
 		return nil, fmt.Errorf("lookup conflict row: %w", err)
 	}
 	return &c, nil
+}
+
+// ObservedRow is what the broadcast shadow comparison needs about an
+// already-stored event: who stored it first and when.
+type ObservedRow struct {
+	Source     Source
+	ObservedAt time.Time
+}
+
+// LookupObserved returns the stored row at (brokerOrderID, eventSeq), or
+// (nil, nil) when none exists. Read-only; used by the broadcast listener in
+// shadow mode to measure whether the per-user socket / REST poll saw the same
+// event, and how much earlier or later.
+func (w *Writer) LookupObserved(ctx context.Context, brokerOrderID string, eventSeq int64) (*ObservedRow, error) {
+	var r ObservedRow
+	var src string
+	err := w.db.QueryRowContext(ctx,
+		`SELECT source, observed_at FROM broker_events
+		 WHERE broker_order_id = $1 AND event_seq = $2`,
+		brokerOrderID, eventSeq).Scan(&src, &r.ObservedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup observed row: %w", err)
+	}
+	r.Source = Source(src)
+	return &r, nil
 }
 
 // MarkPublished stamps published_at=NOW() on a row after it has been produced

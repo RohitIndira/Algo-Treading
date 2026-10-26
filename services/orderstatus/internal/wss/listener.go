@@ -34,12 +34,12 @@ import (
 //   - broker_events.Insert for every event
 type Listener struct {
 	httpClient *indira.Client
-	writer     *store.Writer
+	writer     EventWriter
 	pub        *publisher.Publisher // nil = no Kafka fan-out (dev / test paths)
 	logger     *zap.Logger
 
 	mu       sync.Mutex
-	wsClient *indira.WSClient // nil until first StartSubscription
+	wsClient *indira.WSClient               // nil until first StartSubscription
 	subs     map[string]*indira.AuthContext // userID → auth (for reconnect)
 
 	runningCtx    context.Context
@@ -52,7 +52,15 @@ type Listener struct {
 //
 // Passing a nil pub is legal — the listener still persists to broker_events,
 // just skips the Kafka fan-out. Useful for tests or a boot without Kafka.
-func NewListener(httpClient *indira.Client, writer *store.Writer, pub *publisher.Publisher, logger *zap.Logger) *Listener {
+// EventWriter is the slice of *store.Writer the listener needs. An interface
+// so the broadcast tests can run the exact same ingest path against an
+// in-memory writer with the same (broker_order_id, event_seq) uniqueness.
+type EventWriter interface {
+	Insert(ctx context.Context, ev *store.Event) (int64, bool, error)
+	MarkPublished(ctx context.Context, id int64) error
+}
+
+func NewListener(httpClient *indira.Client, writer EventWriter, pub *publisher.Publisher, logger *zap.Logger) *Listener {
 	return &Listener{
 		httpClient: httpClient,
 		writer:     writer,
@@ -140,9 +148,22 @@ func (l *Listener) consumeLoop(ctx context.Context) {
 // Errors are logged but do NOT crash the loop — losing one event is better
 // than dropping every subsequent event.
 func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) {
+	_, _ = l.ingest(ctx, ws, store.SourceWSS)
+}
+
+// ingest is handleWSEvent with the observation source as a parameter. The
+// per-user socket passes store.SourceWSS; the dealer broadcast listener
+// passes store.SourceWSSBroadcast. Everything else — parsing, event_seq,
+// event_type, the (broker_order_id, event_seq) dedup, the publish — is the
+// one shared path, so a frame that arrives on both sockets is one row and one
+// order.events message whichever socket wins.
+//
+// Returns (inserted, err): inserted=false with err=nil means the frame was
+// dropped on purpose (no broker id / no user) or deduped.
+func (l *Listener) ingest(ctx context.Context, ws *indira.WSOrderStatus, source store.Source) (bool, error) {
 	brokerOrderID := strings.TrimSpace(ws.UniqueCode)
 	if brokerOrderID == "" || brokerOrderID == "0" {
-		return
+		return false, nil
 	}
 
 	// Resolve userID — pkg/indira sends events with UserID as FlexInt; some
@@ -156,7 +177,7 @@ func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) 
 		// Nothing to attribute this event to — log + skip.
 		l.logger.Warn("wss event with no user_id, skipping",
 			zap.String("broker_order_id", brokerOrderID))
-		return
+		return false, nil
 	}
 
 	// Serialize the full raw event for forensics. json.Marshal on a WSOrderStatus
@@ -166,14 +187,14 @@ func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) 
 	if err != nil {
 		l.logger.Error("wss event marshal failed",
 			zap.String("broker_order_id", brokerOrderID), zap.Error(err))
-		return
+		return false, err
 	}
 
 	ev := &store.Event{
 		BrokerOrderID:   brokerOrderID,
 		ExchangeOrderID: strings.TrimSpace(ws.OrderNumber),
 		EventSeq:        eventSeqFrom(ws),
-		Source:          store.SourceWSS,
+		Source:          source,
 		EventType:       eventTypeFromStatus(ws.OrderStatus),
 		Status:          strings.TrimSpace(strings.ToUpper(ws.OrderStatus)),
 		OMSStatusCode:   0, // pkg/indira doesn't expose OMSOrderStatus yet; add when needed
@@ -201,11 +222,12 @@ func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) 
 			zap.Int64("event_seq", ev.EventSeq),
 			zap.String("status", ev.Status),
 			zap.Error(err))
-		return
+		return false, err
 	}
 	if !inserted {
-		// Dedup — REST poll wrote this same event first. Silent.
-		return
+		// Dedup — another path (REST poll, the other socket) wrote this same
+		// event first. Silent.
+		return false, nil
 	}
 
 	l.logger.Debug("broker_events row appended",
@@ -226,6 +248,7 @@ func (l *Listener) handleWSEvent(ctx context.Context, ws *indira.WSOrderStatus) 
 				zap.Int64("id", id), zap.Error(err))
 		}
 	}
+	return true, nil
 }
 
 // eventSeqFrom picks the best available deterministic sequence key for
