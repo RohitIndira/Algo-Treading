@@ -172,7 +172,7 @@ func (p *ManthanPublisher) PersistExit(ctx context.Context, strategyID, symbol s
 		UPDATE manthan_positions
 		SET status = 'EXITED', exit_price = $1, realized_pnl = $2,
 		    exit_reason = $5, exit_time = now(), updated_at = now()
-		WHERE strategy_id = $3 AND symbol = $4 AND status IN ('ACTIVE','PENDING_ENTRY')`,
+		WHERE strategy_id = $3 AND symbol = $4 AND status IN ('ACTIVE','PENDING_ENTRY','PLEDGED')`,
 		exitPrice, pnl, strategyID, symbol, reason)
 	if err != nil {
 		p.logger.Warn("PersistExit failed — EXITED position may re-appear on restart (reconciled by orphan scanner / next tick)",

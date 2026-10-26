@@ -14,6 +14,15 @@ const (
 	StateActive          PositionState = "ACTIVE"           // fill confirmed, SL + trailing enabled
 	StateExitPending     PositionState = "EXIT_PENDING"     // trail crossed, exit ORDERED, awaiting broker confirmation
 	StateExited          PositionState = "EXITED"           // broker-confirmed exit
+	// StatePledged (2026-10-26): the broker holds the shares PLEDGED (margin)
+	// — the client still owns them, the strategy cannot sell them. The lot
+	// stays in the map (so the same symbol is not re-bought: "already
+	// holding (PLEDGED)") but does NOT occupy a slot or count toward the
+	// caps, is not trailed and never emits an exit. Set from the DB row
+	// (api-gateway book reconciler writes manthan_positions.status) by the
+	// rehydrate and the orphan scanner's SyncBrokerStateFromDB; flips back to
+	// ACTIVE the same way when the broker shows the quantity free again.
+	StatePledged PositionState = "PLEDGED"
 )
 
 // Position tracks a live holding for a user.

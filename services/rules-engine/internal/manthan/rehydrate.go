@@ -77,9 +77,10 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 		       COALESCE(ema_alloc_pct, 0),
 		       COALESCE(high_since_entry, entry_price),
 		       current_sl,
-		       COALESCE(last_trail_level, entry_price)
+		       COALESCE(last_trail_level, entry_price),
+		       status
 		FROM manthan_positions
-		WHERE status = 'ACTIVE'`)
+		WHERE status IN ('ACTIVE','PLEDGED')`)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("query active positions: %w", err)
 	}
@@ -88,16 +89,40 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 	seenRedisKeys := make(map[string]struct{})
 	restored := 0
 	orphans := 0
+	pledged := 0
 
 	for rows.Next() {
-		var strategyID, userID, symbol, isin, industry, mcapBucket, indexName string
+		var strategyID, userID, symbol, isin, industry, mcapBucket, indexName, status string
 		var entryPrice, invested, emaPct, high, sl, lastTrail float64
 		var qty int32
 		if err := rows.Scan(
 			&strategyID, &userID, &symbol, &isin, &industry, &mcapBucket, &indexName,
-			&entryPrice, &qty, &invested, &emaPct, &high, &sl, &lastTrail,
+			&entryPrice, &qty, &invested, &emaPct, &high, &sl, &lastTrail, &status,
 		); err != nil {
 			pm.logger.Warn("Rehydrate: scan failed", zap.Error(err))
+			continue
+		}
+		// PLEDGED (2026-10-26): held at the broker but pledged. Restored into
+		// memory as a non-occupying, non-trailed position so the symbol is not
+		// re-bought and the DB→memory flip back to ACTIVE finds it. No Redis
+		// active-set membership, no orphan handling (the row is not ACTIVE).
+		if status == string(types.StatePledged) {
+			strategy := strategyByID(strategyID)
+			if strategy == nil {
+				continue
+			}
+			p := pm.GetOrCreate(*strategy)
+			p.Mu.Lock()
+			p.Positions[symbol] = &types.Position{
+				Symbol: symbol, ISIN: isin, Industry: industry, MCapBucket: mcapBucket, IndexName: indexName,
+				EntryPrice: entryPrice, EntryTime: time.Now(), Quantity: qty, InvestedAmt: invested,
+				HighSinceEntry: high, CurrentSL: sl, LastTrailLevel: lastTrail,
+				State: types.StatePledged, Active: false,
+			}
+			p.Mu.Unlock()
+			pledged++
+			pm.logger.Info("Position rehydrated as PLEDGED (held at broker, not managed, slot free)",
+				zap.String("strategy_id", strategyID), zap.String("symbol", symbol), zap.Int32("qty", qty))
 			continue
 		}
 
@@ -363,6 +388,7 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 
 	pm.logger.Info("Rehydrate complete",
 		zap.Int("restored", restored),
+		zap.Int("pledged", pledged),
 		zap.Int("orphans_cleaned", orphans),
 		zap.Int("redis_stale_evicted", staleEvicted))
 
@@ -580,6 +606,13 @@ func (pm *PortfolioManager) StartOrphanScanner(
 			} else if synced > 0 {
 				pm.logger.Info("Orphan scanner: external exits synced to memory", zap.Int("synced", synced))
 			}
+			// Broker-state sync (2026-10-26): PLEDGED ↔ ACTIVE flips written by
+			// the api-gateway book reconciler land in memory within a tick.
+			if pl, un, err := pm.SyncBrokerStateFromDB(ctx, db, rdb); err != nil {
+				pm.logger.Warn("Orphan scanner: DB→memory broker-state sync failed", zap.Error(err))
+			} else if pl+un > 0 {
+				pm.logger.Info("Orphan scanner: broker-state flips synced to memory", zap.Int("pledged", pl), zap.Int("unpledged", un))
+			}
 			// Expire PENDING_ENTRY rows whose fill never confirmed within
 			// PendingEntryTTL (dispatches that died at trade-execution) —
 			// in the DB and in memory, so a dead dispatch releases its
@@ -643,7 +676,7 @@ func (pm *PortfolioManager) SyncExitedFromDB(ctx context.Context, db *sql.DB, rd
 		  AND NOT EXISTS (
 		        SELECT 1 FROM manthan_positions o
 		        WHERE o.strategy_id = x.strategy_id AND o.symbol = x.symbol
-		          AND o.status IN ('ACTIVE','EXIT_PENDING','PARTIALLY_FILLED','PENDING_ENTRY'))
+		          AND o.status IN ('ACTIVE','EXIT_PENDING','PARTIALLY_FILLED','PENDING_ENTRY','PLEDGED'))
 		ORDER BY x.strategy_id, x.symbol, x.updated_at DESC`)
 	if err != nil {
 		return 0, fmt.Errorf("sync exited query: %w", err)
@@ -709,4 +742,94 @@ func (pm *PortfolioManager) SyncExitedFromDB(ctx context.Context, db *sql.DB, rd
 		}
 	}
 	return synced, nil
+}
+
+// SyncBrokerStateFromDB mirrors the api-gateway book reconciler's PLEDGED ↔
+// ACTIVE flips (manthan_positions.status) into the in-memory book
+// (2026-10-26). The reconciler writes the row when the broker reports the
+// quantity pledged / free again; nothing else moves a position between
+// these two states.
+//
+//	DB PLEDGED, memory ACTIVE/EXIT_PENDING → State=PLEDGED, Active=false:
+//	    slot released (Occupies false), no trail, no exit; a frozen
+//	    EXIT_PENDING is dropped (its exit command would be refused downstream
+//	    anyway — trade-execution refuses sells of a pledged lot).
+//	DB ACTIVE, memory PLEDGED → State=ACTIVE, Active=true: protection
+//	    resumes; the slot is re-occupied even if the book is now over its cap
+//	    (logged — the operator's accepted trade-off).
+//
+// Memory-only; the DB is the source. Rows updated within 48h bound the scan.
+// Returns (pledged, unpledged) flips applied.
+func (pm *PortfolioManager) SyncBrokerStateFromDB(ctx context.Context, db *sql.DB, rdb *redis.Client) (int, int, error) {
+	if db == nil {
+		return 0, 0, nil
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT strategy_id, symbol, status, COALESCE(protective_last_reason, '')
+		FROM manthan_positions
+		WHERE status IN ('PLEDGED','ACTIVE') AND updated_at > now() - interval '48 hours'`)
+	if err != nil {
+		return 0, 0, fmt.Errorf("sync broker state query: %w", err)
+	}
+	type row struct{ strategyID, symbol, status, reason string }
+	var candidates []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.strategyID, &r.symbol, &r.status, &r.reason); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		candidates = append(candidates, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	pledged, unpledged := 0, 0
+	for _, r := range candidates {
+		pm.mu.RLock()
+		p, ok := pm.portfolios[r.strategyID]
+		pm.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		p.Mu.Lock()
+		pos, live := p.Positions[r.symbol]
+		switch {
+		case !live || pos.State == types.StateExited:
+			// nothing in memory to flip
+		case r.status == "PLEDGED" && pos.State != types.StatePledged && pos.State != types.StatePendingEntry:
+			pos.State = types.StatePledged
+			pos.Active = false
+			pos.ExitPendingSince = time.Time{}
+			pledged++
+			pm.logger.Warn("Broker-state sync: position PLEDGED at broker — slot released, trailing and exits suspended",
+				zap.String("strategy_id", r.strategyID), zap.String("symbol", r.symbol), zap.String("reason", r.reason))
+		case r.status == "ACTIVE" && pos.State == types.StatePledged:
+			pos.State = types.StateActive
+			pos.Active = true
+			unpledged++
+			occupied := 0
+			for _, o := range p.Positions {
+				if o.Occupies() {
+					occupied++
+				}
+			}
+			pm.logger.Warn("Broker-state sync: position UNPLEDGED — protection resumed, slot re-occupied",
+				zap.String("strategy_id", r.strategyID), zap.String("symbol", r.symbol),
+				zap.Int("occupied_slots", occupied), zap.Int32("max_positions", p.MaxPositions),
+				zap.Bool("over_cap", int32(occupied) > p.MaxPositions))
+		}
+		p.Mu.Unlock()
+	}
+	if rdb != nil && pledged+unpledged > 0 {
+		for _, r := range candidates {
+			setMember := r.strategyID + ":" + r.symbol
+			if r.status == "PLEDGED" {
+				_ = rdb.SRem(ctx, "manthan:positions:active", setMember).Err()
+			}
+		}
+	}
+	return pledged, unpledged, nil
 }
