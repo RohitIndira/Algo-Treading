@@ -33,6 +33,11 @@ type BrokerBusinessError struct {
 }
 
 func (e *BrokerBusinessError) Error() string {
+	// A read (holdings) carries a "<endpoint>: " prefix in Message — it is a
+	// failed read, not a rejected order.
+	if strings.Contains(e.Message, ": ") && !strings.HasPrefix(strings.ToLower(e.Message), "order") {
+		return fmt.Sprintf("broker business error [%s]: %s", e.Code, e.Message)
+	}
 	return fmt.Sprintf("broker rejected order [%s]: %s", e.Code, e.Message)
 }
 

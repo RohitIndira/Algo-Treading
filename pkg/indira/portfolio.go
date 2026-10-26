@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // ============ Portfolio Management Methods ============
@@ -28,6 +29,14 @@ func (c *Client) GetHoldings(ctx context.Context, auth *AuthContext) ([]Holding,
 	// purpose — order placement keeps its own typed BrokerBusinessError path.
 	if resp.InfoID != "" && resp.InfoID != "0" {
 		return nil, &BrokerBusinessError{Code: resp.InfoID, Message: "holdings: " + resp.InfoMsg}
+	}
+
+	// data missing / null / empty object is an unparseable reply, never a
+	// zero account (2026-10-26 review): only an explicit holdings array
+	// (possibly empty) says what the account holds.
+	trimmed := strings.TrimSpace(string(resp.Data))
+	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
+		return nil, fmt.Errorf("holdings response unparseable (data %q)", trimmed)
 	}
 
 	// Standard shape: data wrapper → { invested, marketValue, holdings: [...] }.
