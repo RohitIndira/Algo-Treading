@@ -37,7 +37,12 @@ func uuidArray(ids []string) string {
 
 // PersistVerdicts writes the latest verdict onto the lot's positions_db rows.
 // Ledger-only verdicts have no row and are skipped (the audit trail carries
-// them). Returns rows updated.
+// them). An UNVERIFIED verdict never overwrites a previously persisted TRUTH
+// (HELD / PLEDGED / QTY_MISMATCH / NOT_HELD / SOLD_TODAY): the row keeps its
+// last state, reason and checked_at and is flagged broker_state_stale with
+// the unverified reason in the evidence — so /fleet, /attention and the
+// client app do not flip on a dead session, and the hysteresis clock
+// (checked_at) still points at the last truthful read. Returns rows updated.
 func (a *Actions) PersistVerdicts(ctx context.Context, verdicts []Verdict, source string) (int64, error) {
 	var total int64
 	for _, v := range verdicts {
@@ -48,12 +53,26 @@ func (a *Actions) PersistVerdicts(ctx context.Context, verdicts []Verdict, sourc
 		if err != nil {
 			return total, fmt.Errorf("verdict evidence marshal: %w", err)
 		}
-		res, err := a.fleet.posDB.ExecContext(ctx, `
-			UPDATE positions
-			   SET broker_state = $2, broker_state_reason = $3, broker_state_evidence = $4::jsonb,
-			       broker_checked_at = $5, broker_state_source = $6, updated_at = now()
-			 WHERE position_id = ANY($1::uuid[]) AND status = 'ACTIVE'`,
-			uuidArray(v.PositionIDs), v.State, v.Reason, string(ev), v.CheckedAt, source)
+		var res sql.Result
+		if v.State == BrokerStateUnverified {
+			res, err = a.fleet.posDB.ExecContext(ctx, `
+				UPDATE positions
+				   SET broker_state        = COALESCE(NULLIF(broker_state, 'UNVERIFIED'), $2::text),
+				       broker_state_reason = CASE WHEN broker_state IS NULL OR broker_state = 'UNVERIFIED' THEN $3 ELSE broker_state_reason END,
+				       broker_checked_at   = CASE WHEN broker_state IS NULL OR broker_state = 'UNVERIFIED' THEN $5 ELSE broker_checked_at END,
+				       broker_state_stale  = (broker_state IS NOT NULL AND broker_state <> 'UNVERIFIED'),
+				       broker_state_evidence = $4::jsonb || jsonb_build_object('unverified_reason', $3::text, 'unverified_at', $5::timestamptz),
+				       broker_state_source = $6, updated_at = now()
+				 WHERE position_id = ANY($1::uuid[]) AND status = 'ACTIVE'`,
+				uuidArray(v.PositionIDs), v.State, v.Reason, string(ev), v.CheckedAt, source)
+		} else {
+			res, err = a.fleet.posDB.ExecContext(ctx, `
+				UPDATE positions
+				   SET broker_state = $2, broker_state_reason = $3, broker_state_evidence = $4::jsonb,
+				       broker_checked_at = $5, broker_state_source = $6, broker_state_stale = false, updated_at = now()
+				 WHERE position_id = ANY($1::uuid[]) AND status = 'ACTIVE'`,
+				uuidArray(v.PositionIDs), v.State, v.Reason, string(ev), v.CheckedAt, source)
+		}
 		if err != nil {
 			return total, fmt.Errorf("persist verdict %s/%s: %w", v.UserID, v.Symbol, err)
 		}
@@ -75,7 +94,7 @@ func pledgeMarkerSignal(userID, strategyID, symbol string) string {
 // order) — it is reported in stop_rows_left_live_at_broker instead. In the
 // pledged case the broker has no free qty for a SELL, so such a row is a
 // contradiction worth seeing, not acting on.
-func (a *Actions) Pledge(ctx context.Context, v Verdict, live map[string]bool) (map[string]any, error) {
+func (a *Actions) Pledge(ctx context.Context, v Verdict, live *liveBook) (map[string]any, error) {
 	if v.State != BrokerStatePledged {
 		return nil, fmt.Errorf("pledge called with verdict %s", v.State)
 	}
@@ -105,7 +124,7 @@ func (a *Actions) Pledge(ctx context.Context, v Verdict, live map[string]bool) (
 	var oldStatus string
 	if v.StrategyID != "" {
 		rows, err := a.fleet.execDB.QueryContext(ctx, `
-			SELECT id, COALESCE(broker_order_id, ''), status
+			SELECT id, COALESCE(broker_order_id, ''), status, qty
 			  FROM manthan_orders
 			 WHERE strategy_id = $1 AND UPPER(symbol) = $2 AND order_side = 'SELL'
 			   AND order_type IN ('SL_SELL','SL_SELL_AMO')
@@ -119,17 +138,18 @@ func (a *Actions) Pledge(ctx context.Context, v Verdict, live map[string]bool) (
 			id       int64
 			brokerID string
 			status   string
+			qty      int
 		}
 		var candidates []stopRow
 		for rows.Next() {
 			var r stopRow
-			if rows.Scan(&r.id, &r.brokerID, &r.status) == nil {
+			if rows.Scan(&r.id, &r.brokerID, &r.status, &r.qty) == nil {
 				candidates = append(candidates, r)
 			}
 		}
 		rows.Close()
 		for _, c := range candidates {
-			if c.brokerID != "" && live[c.brokerID] {
+			if live.has(c.brokerID, v.Symbol, c.qty) {
 				left = append(left, c.brokerID)
 				continue
 			}

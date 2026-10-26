@@ -16,7 +16,7 @@ import (
 var classifyNow = time.Date(2026, 10, 26, 11, 0, 0, 0, time.FixedZone("IST", 5*3600+30*60))
 
 func okSnap(holdings []indiraClient.Holding, book []indiraClient.OrderBook, trades []indiraClient.TradeBook, ours map[string]bool) *BrokerSnapshot {
-	return BuildSnapshot("OK", "", holdings, book, trades, ours, classifyNow)
+	return BuildSnapshot("OK", "", holdings, book, trades, ours, true, true, classifyNow)
 }
 
 func hold(disp, base string, qty, free, pledge, used, btst int) indiraClient.Holding {
@@ -46,8 +46,8 @@ func lot(sym string, qty int, ageHours float64) BookLotInput {
 }
 
 func TestClassify_Table(t *testing.T) {
-	old := 24 * 7.0 // a week old — past settlement
-	fresh := 20.0   // bought yesterday — inside settlement
+	old := 24 * 7.0 // a week old — past settlement (≥ 2 trading days)
+	fresh := 20.0   // bought the previous day (Sunday 25 Oct → Monday 26 Oct: 1 trading day) — inside settlement
 
 	cases := []struct {
 		name       string
@@ -90,18 +90,18 @@ func TestClassify_Table(t *testing.T) {
 			wantReason: "Pledged: 2850 of 2850 pledged, 0 free — unpledge to let the strategy manage it",
 		},
 		{
-			name:       "pledged via usedQty (margin) with no pledgeQty field",
+			name:       "usedQty (margin) alone is NOT pledge evidence → HELD, protection continues",
 			lot:        lot("WOCKPHARMA", 1039, old),
 			snap:       okSnap([]indiraClient.Holding{hold("WOCKPHARMA", "WOCKPHARMA", 1039, 0, 0, 1039, 0)}, nil, nil, nil),
-			wantState:  BrokerStatePledged,
-			wantReason: "1039 of 1039 pledged",
+			wantState:  BrokerStateHeld,
+			wantReason: "1039 used for margin",
 		},
 		{
 			name:       "partial pledge leaves fewer free than the lot → PLEDGED",
 			lot:        lot("SYRMA", 100, old),
 			snap:       okSnap([]indiraClient.Holding{hold("SYRMA", "SYRMA", 100, 40, 60, 0, 0)}, nil, nil, nil),
 			wantState:  BrokerStatePledged,
-			wantReason: "60 of 100 pledged, 40 free",
+			wantReason: "60 of 100 pledged; the whole lot is parked",
 		},
 		{
 			name:      "partial pledge but still enough free for the lot → HELD",
@@ -121,14 +121,14 @@ func TestClassify_Table(t *testing.T) {
 			lot:        lot("AEROENTER", 25, old),
 			snap:       okSnap([]indiraClient.Holding{hold("OTHER", "OTHER", 5, 5, 0, 0, 0)}, nil, nil, nil),
 			wantState:  BrokerStateNotHeld,
-			wantReason: "Broker holds 0 of AEROENTER",
+			wantReason: "Pending automated closure once confirmed on a second read",
 		},
 		{
 			name:       "broker holds nothing but inside settlement window → UNVERIFIED",
 			lot:        lot("FRESH", 25, fresh),
 			snap:       okSnap(nil, nil, nil, nil),
 			wantState:  BrokerStateUnverified,
-			wantReason: "settlement window",
+			wantReason: "T+1 settlement",
 		},
 		{
 			name: "sold today by hand (not our order id) → SOLD_TODAY at VWAP",
@@ -137,6 +137,67 @@ func TestClassify_Table(t *testing.T) {
 				sellTrade("MAN-1", "SHREEPUSHK", 10, 100), sellTrade("MAN-2", "SHREEPUSHK", 10, 110),
 			}, map[string]bool{"OURS-9": true}),
 			wantState: BrokerStateSoldToday, wantPrice: 105, wantReason: "Sold today outside the system",
+		},
+		{
+			name: "post-close window: our own SELL stood in today's order book (swept stop, CANCELLED) → UNVERIFIED, never NOT_HELD",
+			lot:  lot("KEI", 10, old),
+			snap: okSnap(nil, []indiraClient.OrderBook{{OrdId: "SL-9", OrdAction: "SELL", Status: "Cancelled", Qty: 10,
+				Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "KEI"}}}, nil, map[string]bool{"SL-9": true}),
+			wantState: BrokerStateUnverified, wantReason: "our own SELL order SL-9 stood in today's order book",
+		},
+		{
+			name: "post-close window but the client sold by hand today → SOLD_TODAY wins",
+			lot:  lot("KEI", 10, old),
+			snap: okSnap(nil, []indiraClient.OrderBook{{OrdId: "SL-9", OrdAction: "SELL", Status: "Cancelled", Qty: 10,
+				Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "KEI"}}},
+				[]indiraClient.TradeBook{sellTrade("MAN-1", "KEI", 10, 99)}, map[string]bool{"SL-9": true}),
+			wantState: BrokerStateSoldToday, wantPrice: 99,
+		},
+		{
+			name: "our REJECTED SELL today reserves nothing → NOT_HELD still possible",
+			lot:  lot("KEI", 10, old),
+			snap: okSnap(nil, []indiraClient.OrderBook{{OrdId: "SL-9", OrdAction: "SELL", Status: "Rejected", Qty: 10,
+				Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "KEI"}}}, nil, map[string]bool{"SL-9": true}),
+			wantState: BrokerStateNotHeld,
+		},
+		{
+			name:      "trade book unavailable → an absent holding is UNVERIFIED (degraded read)",
+			lot:       lot("KEI", 10, old),
+			snap:      BuildSnapshot("OK", "", nil, nil, nil, map[string]bool{}, false, true, classifyNow),
+			wantState: BrokerStateUnverified, wantReason: "could not be read",
+		},
+		{
+			name:      "attribution unavailable → an absent holding is UNVERIFIED",
+			lot:       lot("KEI", 10, old),
+			snap:      BuildSnapshot("OK", "", nil, nil, []indiraClient.TradeBook{sellTrade("X", "KEI", 10, 100)}, nil, true, false, classifyNow),
+			wantState: BrokerStateUnverified,
+		},
+		{
+			name: "EXECUTED SELL in the order book (trade book silent) attributes a manual sale → SOLD_TODAY",
+			lot:  lot("KEI", 10, old),
+			snap: okSnap(nil, []indiraClient.OrderBook{{OrdId: "MAN-7", OrdAction: "SELL", Status: "Executed", Qty: 10, TradedQty: 10, Price: 101,
+				Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "KEI"}}}, nil, map[string]bool{}),
+			wantState: BrokerStateSoldToday, wantPrice: 101,
+		},
+		{
+			name: "two strategies hold 60 between them, broker holds 40 → QTY_MISMATCH for the lot (never HELD for all)",
+			lot: func() BookLotInput {
+				l := lot("KEI", 20, old)
+				l.UserSymbolQty, l.Strategies = 60, 2
+				return l
+			}(),
+			snap:      okSnap([]indiraClient.Holding{hold("KEI", "KEI", 40, 40, 0, 0, 0)}, nil, nil, nil),
+			wantState: BrokerStateQtyMismatch, wantReason: "2 strategies of this client hold 60",
+		},
+		{
+			name: "two strategies hold 60 between them, broker holds 60 → each lot HELD",
+			lot: func() BookLotInput {
+				l := lot("KEI", 20, old)
+				l.UserSymbolQty, l.Strategies = 60, 2
+				return l
+			}(),
+			snap:      okSnap([]indiraClient.Holding{hold("KEI", "KEI", 60, 60, 0, 0, 0)}, nil, nil, nil),
+			wantState: BrokerStateHeld,
 		},
 		{
 			name:      "sold today by hand, BE-series trade name, fresh lot → still SOLD_TODAY",
@@ -167,9 +228,9 @@ func TestClassify_Table(t *testing.T) {
 		{
 			name:       "no broker truth → UNVERIFIED naming the leg",
 			lot:        lot("KEI", 10, old),
-			snap:       BuildSnapshot("AUTH_EXPIRED", "AU004", nil, nil, nil, nil, classifyNow),
+			snap:       BuildSnapshot("AUTH_EXPIRED", "AU004", nil, nil, nil, nil, false, false, classifyNow),
 			wantState:  BrokerStateUnverified,
-			wantReason: "broker session AUTH_EXPIRED",
+			wantReason: "broker read AUTH_EXPIRED",
 		},
 		{
 			name:       "nil snapshot → UNVERIFIED",
@@ -210,11 +271,13 @@ func TestClassify_UnpledgedTransition(t *testing.T) {
 	if !v.Actionable() || !v.Changed() {
 		t.Fatalf("unpledge must be actionable and a change: %+v", v)
 	}
-	// A plain HELD→HELD is neither.
+	// A plain HELD→HELD is not a change (HELD stays Actionable: the reaper
+	// re-asserts the unpark every pass; the actor reports whether anything
+	// was still parked).
 	l.PrevState = BrokerStateHeld
 	v = Classify(l, okSnap([]indiraClient.Holding{hold("SYRMA", "SYRMA", 100, 100, 0, 0, 0)}, nil, nil, nil), classifyNow)
-	if v.Actionable() || v.Changed() {
-		t.Fatalf("HELD→HELD must be a no-op: %+v", v)
+	if v.Changed() || strings.HasPrefix(v.Reason, ReasonUnpledged) {
+		t.Fatalf("HELD→HELD must not read as a change: %+v", v)
 	}
 }
 
@@ -228,7 +291,7 @@ func TestClassify_EvidenceFields(t *testing.T) {
 		map[string]bool{"OURS-2": true})
 	v := Classify(lot("SYRMA", 100, 24*7), snap, classifyNow)
 	e := v.Evidence
-	if e.BrokerQty != 105 || e.FreeQty != 25 || e.PledgedQty != 80 || e.OpenSellQty != 5 || e.OpenSellOrderID != "SL-7" {
+	if e.BrokerQty != 105 || e.FreeQty != 25 || e.PledgedQty != 80 || e.OpenSellQty != 5 || e.OpenSellOrderID != "SL-7" || e.TradingDaysHeld < 2 {
 		t.Fatalf("qty evidence wrong: %+v", e)
 	}
 	if e.TradebookSellQty != 3 || e.TradebookSellPrice != 500 || e.TradebookOurSell != 2 || e.TradebookOurOrder != "OURS-2" {
@@ -272,5 +335,64 @@ func TestBuildSnapshot_NamesAndSummary(t *testing.T) {
 	sum := SummarizeVerdicts(vs)
 	if sum[BrokerStateHeld] != 2 || sum[BrokerStatePledged] != 1 || sum[BrokerStateNotHeld] != 1 {
 		t.Fatalf("summary: %v", sum)
+	}
+}
+
+// Settlement is counted in trading days: a Friday buy is still inside the
+// window on Monday (1 trading day), out on Tuesday (2).
+func TestPastSettlement_TradingDays(t *testing.T) {
+	ist := time.FixedZone("IST", 5*3600+30*60)
+	fri := time.Date(2026, 10, 23, 11, 0, 0, 0, ist)
+	if pastSettlement(fri, time.Date(2026, 10, 26, 11, 0, 0, 0, ist)) {
+		t.Fatal("Friday buy must be inside settlement on Monday")
+	}
+	if !pastSettlement(fri, time.Date(2026, 10, 27, 9, 30, 0, 0, ist)) {
+		t.Fatal("Friday buy must be past settlement on Tuesday")
+	}
+	if tradingDaysSince(fri, time.Date(2026, 10, 26, 11, 0, 0, 0, ist)) != 1 {
+		t.Fatal("Fri→Mon is one trading day")
+	}
+	if pastSettlement(time.Time{}, time.Now()) {
+		t.Fatal("unknown entry time never counts as settled")
+	}
+}
+
+// Hysteresis: Confirmed needs the same state on a previous read ≥ 15 min old.
+func TestVerdict_Confirmed(t *testing.T) {
+	v := Verdict{State: BrokerStateNotHeld, PrevState: BrokerStateNotHeld, CheckedAt: classifyNow}
+	if v.Confirmed() {
+		t.Fatal("no previous read → not confirmed")
+	}
+	v.PrevCheckedAt = classifyNow.Add(-10 * time.Minute)
+	if v.Confirmed() {
+		t.Fatal("10 minutes apart → not confirmed")
+	}
+	v.PrevCheckedAt = classifyNow.Add(-16 * time.Minute)
+	if !v.Confirmed() {
+		t.Fatal("16 minutes apart, same state → confirmed")
+	}
+	v.PrevState = BrokerStateUnverified
+	if v.Confirmed() {
+		t.Fatal("different previous state → not confirmed")
+	}
+}
+
+// liveBook matches by broker id, exchange id, and symbol+qty+SELL (an AMO
+// gets a new broker id at the 08:50 conversion).
+func TestLiveBook_Matching(t *testing.T) {
+	lb := liveBookFrom([]indiraClient.OrderBook{
+		{OrdId: "NEW-1", ExchOrdId: []byte(`"1100000012345678"`), OrdAction: "SELL", Status: "Pending", Qty: 25,
+			Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "ALIVUS-BE", BaseSym: "ALIVUS"}},
+		{OrdId: "DONE-1", OrdAction: "SELL", Status: "Executed", Qty: 7, Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "KEI"}},
+	})
+	if !lb.has("NEW-1", "ALIVUS", 25) || !lb.has("1100000012345678", "ALIVUS", 1) || !lb.has("OLD-AMO-ID", "ALIVUS", 25) {
+		t.Fatal("live SELL must match by id, exchange id and symbol+qty")
+	}
+	if lb.has("OLD-AMO-ID", "ALIVUS", 24) || lb.has("DONE-1", "KEI", 7) || lb.has("", "KEI", 7) {
+		t.Fatal("qty mismatch / executed order must not read as live")
+	}
+	var nilBook *liveBook
+	if nilBook.has("x", "KEI", 1) {
+		t.Fatal("nil liveBook never matches")
 	}
 }

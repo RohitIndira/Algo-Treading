@@ -669,7 +669,7 @@
           }
         },
         {
-          "name": "Book reconcile — run now for one user (CONFIRM)",
+          "name": "Book reconcile — run now for one user (TYPED)",
           "request": {
             "method": "POST",
             "header": [
@@ -685,7 +685,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"confirmed\": true\n}"
+              "raw": "{\n  \"confirmation_text\": \"RUN BOOK RECONCILE FOR <user_id> — ACT ON VERDICTS (MODE ENABLED)\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/reconcile/run",
@@ -702,7 +702,7 @@
                 "run"
               ]
             },
-            "description": "Runs the book reconciler for ONE user now (source=manual) — the same code path as the 15-minute sweep and the post-login trigger. Per lot: verdict persisted on positions_db (broker_state / broker_state_reason / broker_state_evidence / broker_checked_at / broker_state_source); NOT_HELD → closed NOT_HELD_AT_BROKER (exit price NULL) through the GhostPreview→GhostHeal gate; SOLD_TODAY → closed MANUAL_EXIT at the tradebook price; PLEDGED → trading_db row 'PLEDGED' (slot freed, no trail), execution_db stop rows parked broker_status 'PLEDGED', POSITION_PLEDGED event; HELD after PLEDGED → reversed (protection resumes on the next naked-scan/planner/EOD pass). QTY_MISMATCH / UNVERIFIED → verdict only. Honors MANTHAN_GHOST_REAPER_MODE (dry_run audits WOULD_* and changes nothing but the verdicts). Response: {mode, report, reconcile}. Every action lands in admin_audit as BOOK_RECONCILE / GHOST_REAPER by SYSTEM:ghost-reaper. Never touches a broker order."
+            "description": "Runs the book reconciler for ONE user now (source=manual) — the same code path as the 15-minute sweep and the post-login trigger. Per lot: verdict persisted on positions_db (broker_state / broker_state_reason / broker_state_evidence / broker_checked_at / broker_state_source); NOT_HELD → closed NOT_HELD_AT_BROKER (exit price NULL) through the GhostPreview→GhostHeal gate; SOLD_TODAY → closed MANUAL_EXIT at the tradebook price; PLEDGED → trading_db row 'PLEDGED' (slot freed, no trail), execution_db stop rows parked broker_status 'PLEDGED', POSITION_PLEDGED event; HELD after PLEDGED → reversed (protection resumes on the next naked-scan/planner/EOD pass). QTY_MISMATCH / UNVERIFIED → verdict only. TYPED: send {\"preview\": true} first to get the exact confirmation_text, then resend it. Safety rails: a NOT_HELD closure or a PLEDGED park needs the same verdict on two reads ≥15 min apart; actions run only 09:20–15:25 IST on a trading day (outside, verdicts are persisted only); a single-user run heals at most 5 lots; an empty holdings reply, one of our live orders missing from the order book, or an unreadable trade book makes the whole read UNVERIFIED (last truth kept, broker_state_stale=true). Honors MANTHAN_GHOST_REAPER_MODE (dry_run audits WOULD_* and changes nothing but the verdicts). Runs under a detached 2-minute context. Response: {mode, report, reconcile}. Every action lands in admin_audit as BOOK_RECONCILE / GHOST_REAPER by SYSTEM:ghost-reaper. Never touches a broker order."
           }
         },
         {

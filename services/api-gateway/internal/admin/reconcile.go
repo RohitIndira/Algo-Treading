@@ -389,19 +389,29 @@ type brokerRead struct {
 	book        []indiraClient.OrderBook
 	trades      []indiraClient.TradeBook
 	ourOrderIDs map[string]bool
+	tradesOK    bool // trade book read
+	oursOK      bool // our-order-id attribution read
+	live        *liveBook
 	snap        *BrokerSnapshot
 }
 
+// degrade marks the read as not trustworthy (a tripwire fired) and rebuilds
+// the snapshot so every verdict reads UNVERIFIED with the reason attached.
+func (r *brokerRead) degrade(detail string) {
+	r.leg, r.detail = "UNVERIFIED", detail
+	r.snap = BuildSnapshot(r.leg, r.detail, nil, nil, nil, nil, false, false, time.Now())
+}
+
 // readBroker performs the per-user broker reads once: holdings, order book,
-// trade book. A failed holdings/orderbook read degrades the leg (no truth);
-// a failed tradebook read is tolerated (fewer SOLD_TODAY verdicts, never a
-// wrong NOT_HELD: the settlement gate still applies).
+// trade book. A failed holdings/orderbook read degrades the leg (no truth); a
+// failed tradebook / attribution read is recorded (TradesOK / OursOK false)
+// so an absent holding can only read UNVERIFIED, never NOT_HELD/SOLD_TODAY.
 func (rs *ReconStore) readBroker(ctx context.Context, userID string) *brokerRead {
 	r := &brokerRead{}
 	auth, legStatus, legDetail := rs.authFor(ctx, userID)
 	r.leg, r.detail, r.auth = legStatus, legDetail, auth
 	if legStatus != "OK" {
-		r.snap = BuildSnapshot(r.leg, r.detail, nil, nil, nil, nil, time.Now())
+		r.snap = BuildSnapshot(r.leg, r.detail, nil, nil, nil, nil, false, false, time.Now())
 		return r
 	}
 	holdings, err := rs.broker.GetHoldings(ctx, auth)
@@ -420,19 +430,22 @@ func (rs *ReconStore) readBroker(ctx context.Context, userID string) *brokerRead
 	}
 	if r.leg == "OK" {
 		if trades, terr := rs.broker.GetTradeBook(ctx, auth); terr == nil {
-			r.trades = trades
+			r.trades, r.tradesOK = trades, true
 		}
-		r.ourOrderIDs, _ = rs.ourBrokerOrderIDs(ctx, userID)
+		if ids, oerr := ourBrokerOrderIDs(ctx, rs.fleet.execDB, userID); oerr == nil {
+			r.ourOrderIDs, r.oursOK = ids, true
+		}
+		r.live = liveBookFrom(r.book)
 	}
-	r.snap = BuildSnapshot(r.leg, r.detail, r.holdings, r.book, r.trades, r.ourOrderIDs, time.Now())
+	r.snap = BuildSnapshot(r.leg, r.detail, r.holdings, r.book, r.trades, r.ourOrderIDs, r.tradesOK, r.oursOK, time.Now())
 	return r
 }
 
 // ourBrokerOrderIDs lists the broker order ids of the user's recent
-// manthan_orders SELL rows — a tradebook SELL carrying one of them was placed
-// by the strategy, not by the client.
-func (rs *ReconStore) ourBrokerOrderIDs(ctx context.Context, userID string) (map[string]bool, error) {
-	rows, err := rs.fleet.execDB.QueryContext(ctx, `
+// manthan_orders SELL rows — a SELL carrying one of them was placed by the
+// strategy, not by the client. Shared by the reconciler and the ghost gate.
+func ourBrokerOrderIDs(ctx context.Context, execDB *sql.DB, userID string) (map[string]bool, error) {
+	rows, err := execDB.QueryContext(ctx, `
 		SELECT broker_order_id FROM manthan_orders
 		 WHERE user_id = $1 AND order_side = 'SELL'
 		   AND broker_order_id IS NOT NULL AND broker_order_id <> ''
@@ -451,13 +464,64 @@ func (rs *ReconStore) ourBrokerOrderIDs(ctx context.Context, userID string) (map
 	return out, rows.Err()
 }
 
+// ledgerLiveOrder is one of our rows that MUST appear in the order book.
+type ledgerLiveOrder struct {
+	brokerID, symbol string
+	qty              int
+}
+
+// ourLiveOrdersToday lists our SL_PLACED / PLACED rows with a broker id
+// touched today — if one of them is missing from the order book entirely, the
+// book read was partial and nothing may be concluded from it (tripwire 1c).
+func (rs *ReconStore) ourLiveOrdersToday(ctx context.Context, userID string) ([]ledgerLiveOrder, error) {
+	rows, err := rs.fleet.execDB.QueryContext(ctx, `
+		SELECT broker_order_id, UPPER(symbol), qty FROM manthan_orders
+		 WHERE user_id = $1 AND status IN ('SL_PLACED','PLACED')
+		   AND broker_order_id IS NOT NULL AND broker_order_id <> ''
+		   AND broker_order_id NOT LIKE 'PAPER-%'
+		   AND updated_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ledgerLiveOrder
+	for rows.Next() {
+		var o ledgerLiveOrder
+		if rows.Scan(&o.brokerID, &o.symbol, &o.qty) == nil {
+			out = append(out, o)
+		}
+	}
+	return out, rows.Err()
+}
+
+// inOrderBookAtAll matches by broker id, exchange order id, or (symbol, qty,
+// SELL) in ANY status — an AMO gets a new broker id at the 08:50 conversion.
+func inOrderBookAtAll(book []indiraClient.OrderBook, o ledgerLiveOrder) bool {
+	for _, ob := range book {
+		if ob.OrdId == o.brokerID || rawString(ob.ExchOrdId) == o.brokerID {
+			return true
+		}
+		if strings.EqualFold(ob.OrdAction, "SELL") && ob.Qty == o.qty {
+			for _, n := range orderNames(ob.Symbol.DispSym, ob.Symbol.BaseSym) {
+				for _, m := range symbolNames(o.symbol) {
+					if n == m {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // bookLots loads the user's ACTIVE Manthan lots aggregated per
 // (strategy, symbol) with the row ids and the last persisted verdict.
 func (rs *ReconStore) bookLots(ctx context.Context, userID string) ([]BookLotInput, error) {
 	rows, err := rs.fleet.posDB.QueryContext(ctx, `
 		SELECT COALESCE(strategy_id::text, ''), UPPER(symbol), SUM(quantity), MIN(entry_time),
 		       array_to_string(array_agg(position_id::text ORDER BY entry_time), ','),
-		       COALESCE(MAX(broker_state), '')
+		       COALESCE((array_agg(broker_state ORDER BY broker_checked_at DESC NULLS LAST))[1], ''),
+		       MAX(broker_checked_at)
 		  FROM positions
 		 WHERE user_id = $1 AND status = 'ACTIVE' AND origin = 'MANTHAN'
 		 GROUP BY strategy_id, UPPER(symbol)
@@ -470,16 +534,33 @@ func (rs *ReconStore) bookLots(ctx context.Context, userID string) ([]BookLotInp
 	for rows.Next() {
 		var lot BookLotInput
 		var ids string
-		if err := rows.Scan(&lot.StrategyID, &lot.Symbol, &lot.Qty, &lot.EntryTime, &ids, &lot.PrevState); err != nil {
+		var checked sql.NullTime
+		if err := rows.Scan(&lot.StrategyID, &lot.Symbol, &lot.Qty, &lot.EntryTime, &ids, &lot.PrevState, &checked); err != nil {
 			return nil, err
 		}
 		lot.UserID = userID
 		if ids != "" {
 			lot.PositionIDs = strings.Split(ids, ",")
 		}
+		if checked.Valid {
+			lot.PrevCheckedAt = checked.Time
+		}
 		out = append(out, lot)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Several strategies of one user on one symbol share ONE pile at the
+	// broker: every lot carries the user-symbol sum and the strategy count.
+	sum, cnt := map[string]int{}, map[string]int{}
+	for _, l := range out {
+		sum[l.Symbol] += l.Qty
+		cnt[l.Symbol]++
+	}
+	for i := range out {
+		out[i].UserSymbolQty, out[i].Strategies = sum[out[i].Symbol], cnt[out[i].Symbol]
+	}
+	return out, nil
 }
 
 // ledgerOnlyLots lists (strategy, symbol) pairs the execution ledger still
@@ -577,6 +658,25 @@ func (rs *ReconStore) Reconcile(ctx context.Context, userID string) (*ReconResul
 
 	// Leg 3: broker — ONE read, shared by the class view and the verdicts.
 	res.read = rs.readBroker(ctx, userID)
+	if res.read.leg == "OK" {
+		// Tripwire 1b: an empty holdings reply while the user has open lots is
+		// a lost/partial read until proven otherwise — never "holds nothing".
+		if len(res.read.holdings) == 0 && len(lots) > 0 {
+			res.read.degrade(fmt.Sprintf("holdings reply empty while %d Manthan lot(s) are open — treated as a partial read, nothing concluded", len(lots)))
+		}
+	}
+	if res.read.leg == "OK" {
+		// Tripwire 1c: one of OUR live orders missing from the order book
+		// entirely proves the book read was partial.
+		if ours, oerr := rs.ourLiveOrdersToday(ctx, userID); oerr == nil {
+			for _, o := range ours {
+				if !inOrderBookAtAll(res.read.book, o) {
+					res.read.degrade(fmt.Sprintf("our live order %s (%s ×%d) is missing from the broker order book — partial read, nothing concluded", o.brokerID, o.symbol, o.qty))
+					break
+				}
+			}
+		}
+	}
 	res.BrokerLeg, res.BrokerDetail = res.read.leg, res.read.detail
 	var totals map[string]int
 	if res.BrokerLeg == "OK" {

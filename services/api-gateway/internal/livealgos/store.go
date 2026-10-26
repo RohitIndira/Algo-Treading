@@ -53,6 +53,7 @@ type PositionRow struct {
 	BrokerState       sql.NullString
 	BrokerStateReason sql.NullString
 	BrokerCheckedAt   sql.NullTime
+	BrokerStateStale  bool // the latest run could not read the broker; the verdict is the last truth
 }
 
 // OrderRow is one row of manthan_orders (owned by trade-execution in
@@ -274,7 +275,8 @@ func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string
 			exit_time,
 			broker_state,
 			broker_state_reason,
-			broker_checked_at
+			broker_checked_at,
+			broker_state_stale
 		FROM public.positions
 		WHERE strategy_id::text = $1
 		  AND user_id = $2
@@ -296,7 +298,7 @@ func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string
 			&p.HighSinceEntry, &p.CurrentSL,
 			&p.Status, &p.ExitPrice, &p.RealizedPnL, &p.ExitReason,
 			&p.EntryTime, &p.ExitTime,
-			&p.BrokerState, &p.BrokerStateReason, &p.BrokerCheckedAt,
+			&p.BrokerState, &p.BrokerStateReason, &p.BrokerCheckedAt, &p.BrokerStateStale,
 		); err != nil {
 			return nil, fmt.Errorf("livealgos: Positions scan: %w", err)
 		}

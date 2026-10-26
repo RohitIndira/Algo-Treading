@@ -220,7 +220,8 @@ func TestBookActions_PledgeMarkerAndLiveOrder(t *testing.T) {
 	seedTradingPosition(t, trading, "AAA", "ACTIVE")
 	mustExec(t, execDB, `UPDATE manthan_orders SET broker_order_id='BRK-LIVE-1' WHERE signal_id='tadm-m2-sl-aaa'`)
 	va := pledgedVerdict("")
-	res, err = a.Pledge(ctx, va, map[string]bool{"BRK-LIVE-1": true})
+	res, err = a.Pledge(ctx, va, liveBookFrom([]indiraClient.OrderBook{{OrdId: "BRK-LIVE-1", OrdAction: "SELL", Status: "Pending", Qty: 10,
+		Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "AAA"}}}))
 	if err != nil {
 		t.Fatalf("pledge AAA: %v", err)
 	}
@@ -242,7 +243,7 @@ func TestBookActions_HealWritesReconcilerReason(t *testing.T) {
 	seedTradingPosition(t, trading, "CCC", "PLEDGED") // a pledged lot that vanished is closed too
 
 	plan := &GhostPlan{UserID: m2User, Symbol: "CCC", BookRows: 1, BookQty: 10, StrategyID: m2Strat,
-		ExitReason: ExitReasonNotHeldAtBroker, liveOrderIDs: map[string]bool{}}
+		ExitReason: ExitReasonNotHeldAtBroker, live: &liveBook{}}
 	if _, err := a.GhostHeal(ctx, plan); err != nil {
 		t.Fatalf("heal: %v", err)
 	}
@@ -264,7 +265,7 @@ func TestBookActions_HealWritesReconcilerReason(t *testing.T) {
 
 	// MANUAL_EXIT at the tradebook price for a sold-today lot.
 	plan2 := &GhostPlan{UserID: m2User, Symbol: "BBB", BookRows: 1, BookQty: 10, StrategyID: m2Strat,
-		ExitReason: ExitReasonManualExit, ExitPrice: 123.45, liveOrderIDs: map[string]bool{}}
+		ExitReason: ExitReasonManualExit, ExitPrice: 123.45, live: &liveBook{}}
 	plan2.Evidence.TradebookSell = true
 	if _, err := a.GhostHeal(ctx, plan2); err != nil {
 		t.Fatalf("heal BBB: %v", err)
@@ -275,6 +276,106 @@ func TestBookActions_HealWritesReconcilerReason(t *testing.T) {
 	}
 	if reason != ExitReasonManualExit || !price.Valid || price.Float64 != 123.45 || bstate != BrokerStateSoldToday || breason != ReasonSoldTodayShort {
 		t.Fatalf("BBB after heal: %s %v %s %q", reason, price, bstate, breason)
+	}
+	// Known exit price → realized_pnl set ((123.45-100)*10); unknown → NULL.
+	var pnl sql.NullFloat64
+	_ = pos.QueryRow(`SELECT realized_pnl FROM positions WHERE user_id=$1 AND symbol='BBB'`, m2User).Scan(&pnl)
+	if !pnl.Valid || pnl.Float64 != 234.5 {
+		t.Fatalf("realized_pnl for a priced closure: %v", pnl)
+	}
+	_ = pos.QueryRow(`SELECT realized_pnl FROM positions WHERE user_id=$1 AND symbol='CCC'`, m2User).Scan(&pnl)
+	if pnl.Valid {
+		t.Fatalf("realized_pnl must stay NULL for an unknown exit price: %v", pnl)
+	}
+}
+
+// An UNVERIFIED verdict never overwrites a persisted truth: the row keeps
+// PLEDGED + reason + checked_at and is flagged stale; the next truthful read
+// clears the flag and reads the kept state back as prev_state.
+func TestBookActions_PersistKeepsLastTruthWhenUnverified(t *testing.T) {
+	a, _, _, pos := newBookActionsEnv(t, &m7Broker{})
+	ctx := context.Background()
+	v := pledgedVerdict(BrokerStateHeld)
+	v.CheckedAt = time.Now().Add(-30 * time.Minute).Truncate(time.Second)
+	if _, err := a.PersistVerdicts(ctx, []Verdict{v}, VerdictSourceSweep); err != nil {
+		t.Fatalf("persist pledged: %v", err)
+	}
+	u := v
+	u.State, u.Reason, u.CheckedAt = BrokerStateUnverified, "Unverified: no broker truth (AUTH_EXPIRED)", time.Now()
+	if _, err := a.PersistVerdicts(ctx, []Verdict{u}, VerdictSourceSweep); err != nil {
+		t.Fatalf("persist unverified: %v", err)
+	}
+	var state, reason, evidence string
+	var checked time.Time
+	var stale bool
+	if err := pos.QueryRow(`SELECT broker_state, broker_state_reason, broker_checked_at, broker_state_stale, broker_state_evidence::text
+		FROM positions WHERE position_id=$1`, m2PosAAA).Scan(&state, &reason, &checked, &stale, &evidence); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if state != BrokerStatePledged || !strings.Contains(reason, "unpledge") || !stale || !checked.Equal(v.CheckedAt) || !strings.Contains(evidence, "unverified_reason") {
+		t.Fatalf("last truth not kept: state=%s stale=%v checked=%v reason=%q", state, stale, checked, reason)
+	}
+	// A row with no prior truth does take UNVERIFIED (not stale).
+	u2 := u
+	u2.Symbol, u2.PositionIDs = "BBB", []string{"aaaaaaaa-1111-2222-3333-00000000bbb1"}
+	if _, err := a.PersistVerdicts(ctx, []Verdict{u2}, VerdictSourceSweep); err != nil {
+		t.Fatalf("persist unverified BBB: %v", err)
+	}
+	_ = pos.QueryRow(`SELECT broker_state, broker_state_stale FROM positions WHERE position_id=$1`, "aaaaaaaa-1111-2222-3333-00000000bbb1").Scan(&state, &stale)
+	if state != BrokerStateUnverified || stale {
+		t.Fatalf("no prior truth: state=%s stale=%v", state, stale)
+	}
+	// Truth returns: stale cleared.
+	v.State, v.PrevState, v.Reason, v.CheckedAt = BrokerStateHeld, BrokerStatePledged, "Held", time.Now()
+	if _, err := a.PersistVerdicts(ctx, []Verdict{v}, VerdictSourceSweep); err != nil {
+		t.Fatalf("persist held: %v", err)
+	}
+	_ = pos.QueryRow(`SELECT broker_state, broker_state_stale FROM positions WHERE position_id=$1`, m2PosAAA).Scan(&state, &stale)
+	if state != BrokerStateHeld || stale {
+		t.Fatalf("truth did not clear stale: %s %v", state, stale)
+	}
+}
+
+// Tripwires: an empty holdings reply with open lots, or one of our live
+// orders missing from the order book, degrade the whole read to UNVERIFIED.
+func TestReconcile_Tripwires(t *testing.T) {
+	trading, execDB, pos := openFleetDBs(t)
+	seedFleetFixtures(t, trading, execDB, pos, time.Now())
+	fleet := NewFleetStore(trading, execDB, pos)
+
+	// 1b: empty holdings, three lots open → UNVERIFIED leg, no truthful verdict.
+	rs := NewReconStore(userKeyedCreds{m2User: credsOK(m2User)}, stubBroker{}, fleet)
+	res, err := rs.Reconcile(context.Background(), m2User)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.BrokerLeg != "UNVERIFIED" || !strings.Contains(res.BrokerDetail, "holdings reply empty") {
+		t.Fatalf("empty holdings must degrade the read: leg=%s detail=%s", res.BrokerLeg, res.BrokerDetail)
+	}
+	for _, v := range res.Verdicts {
+		if v.State != BrokerStateUnverified {
+			t.Fatalf("verdict on a degraded read: %+v", v)
+		}
+	}
+
+	// 1c: our SL_PLACED row (broker id, today) absent from the order book.
+	mustExec(t, execDB, `UPDATE manthan_orders SET broker_order_id='BRK-SL-AAA', updated_at=now() WHERE signal_id='tadm-m2-sl-aaa'`)
+	broker := stubBroker{holdings: []indiraClient.Holding{nseHolding("AAA", 10), nseHolding("BBB", 10), nseHolding("CCC", 10)}}
+	rs = NewReconStore(userKeyedCreds{m2User: credsOK(m2User)}, broker, fleet)
+	res, err = rs.Reconcile(context.Background(), m2User)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.BrokerLeg != "UNVERIFIED" || !strings.Contains(res.BrokerDetail, "BRK-SL-AAA") {
+		t.Fatalf("missing live order must degrade the read: leg=%s detail=%s", res.BrokerLeg, res.BrokerDetail)
+	}
+	// Present under a NEW broker id but the same symbol+qty (AMO conversion) → fine.
+	broker.orderbook = []indiraClient.OrderBook{{OrdId: "BRK-NEW-AAA", OrdAction: "SELL", Status: "Pending", Cancellable: true, Qty: 10, RemainQty: 10,
+		Symbol: indiraClient.OrderBookSymbol{Exc: "NSE", DispSym: "AAA"}}}
+	rs = NewReconStore(userKeyedCreds{m2User: credsOK(m2User)}, broker, fleet)
+	res, err = rs.Reconcile(context.Background(), m2User)
+	if err != nil || res.BrokerLeg != "OK" {
+		t.Fatalf("symbol+qty match must satisfy the tripwire: leg=%s detail=%s err=%v", res.BrokerLeg, res.BrokerDetail, err)
 	}
 }
 

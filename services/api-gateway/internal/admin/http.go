@@ -166,7 +166,7 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "GET", "/protection", "PROTECTION_VIEW", TierRead, h.handleProtection)
 	}
 	if h.recon != nil && h.reaper != nil {
-		h.Route(token, "POST", "/users/{user_id}/reconcile/run", "RECONCILE_RUN", TierConfirm, h.handleReconcileRun)
+		h.Route(token, "POST", "/users/{user_id}/reconcile/run", "RECONCILE_RUN", TierTyped, h.handleReconcileRun)
 	}
 	if h.recon != nil {
 		h.Route(token, "GET", "/users/{user_id}/reconcile", "RECONCILE_VIEW", TierRead, h.handleReconcile)
@@ -676,13 +676,37 @@ func (h *HTTP) handleReconcile(w http.ResponseWriter, ar *AdminRequest) {
 	writeOK(w, res)
 }
 
+// reconcileRunConfirmation is the TYPED text for POST …/reconcile/run.
+func reconcileRunConfirmation(userID, mode string) string {
+	return fmt.Sprintf("RUN BOOK RECONCILE FOR %s — ACT ON VERDICTS (MODE %s)", userID, strings.ToUpper(mode))
+}
+
 // handleReconcileRun runs the book reconciler for one user now (source
-// "manual"): verdicts persisted, actions taken per the reaper's mode, then
-// the fresh reconcile view is returned alongside the run report.
+// "manual"): verdicts persisted, actions taken per the reaper's mode (and
+// only inside the action window), then the fresh reconcile view is returned
+// alongside the run report. TYPED: {"preview":true} returns the text;
+// {"confirmation_text": …} must match it exactly. The run itself executes
+// under a detached, time-limited context — a client disconnect must never
+// abort it halfway through a book write.
 func (h *HTTP) handleReconcileRun(w http.ResponseWriter, ar *AdminRequest) {
 	userID := mux.Vars(ar.Request)["user_id"]
-	rep := h.reaper.SweepUser(ar.Request.Context(), userID, VerdictSourceManual)
-	res, err := h.recon.Reconcile(ar.Request.Context(), userID)
+	expected := reconcileRunConfirmation(userID, h.reaper.mode)
+	if ar.IsPreview() {
+		writeOK(w, map[string]any{"confirmation_text": expected, "mode": h.reaper.mode,
+			"note": "resend with confirmation_text to run; verdicts are persisted, actions follow the reaper mode and the 09:20–15:25 IST window"})
+		return
+	}
+	if terr := ar.RequireTyped(expected); terr != nil {
+		if aerr := ar.Audit(userID, "", nil, "DENIED", terr.Error()); aerr != nil {
+			log.Printf("admin: reconcile run denial audit failed: %v", aerr)
+		}
+		writeErr(w, http.StatusPreconditionFailed, "E_ADMIN_CONFIRMATION", terr.Error())
+		return
+	}
+	runCtx, cancel := context.WithTimeout(context.Background(), loginReconcileTimeout)
+	defer cancel()
+	rep := h.reaper.SweepUser(runCtx, userID, VerdictSourceManual)
+	res, err := h.recon.Reconcile(runCtx, userID)
 	if err != nil {
 		log.Printf("admin: reconcile after run %s failed: %v", userID, err)
 		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "reconciliation failed")

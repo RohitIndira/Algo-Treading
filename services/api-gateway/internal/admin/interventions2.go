@@ -234,10 +234,11 @@ type GhostPlan struct {
 	ExitReason       string `json:"exit_reason,omitempty"`
 	ConfirmationText string `json:"confirmation_text"`
 
-	// liveOrderIDs: broker order ids seen live in the order book at preview
-	// time — closeStaleStopRows must never close a ledger row whose broker
-	// order still stands. Nil = not fetched (heal fetches on its own).
-	liveOrderIDs map[string]bool
+	// live: orders seen live in the order book at preview time (matched by
+	// broker id, exchange id, or symbol+qty+SELL) — closeStaleStopRows must
+	// never close a ledger row whose broker order still stands. Nil = not
+	// fetched (heal fetches on its own).
+	live *liveBook
 }
 
 // exitReason resolves the reason the heal writes.
@@ -348,7 +349,8 @@ func (a *Actions) ghostPreview(ctx context.Context, userID, symbol string, read 
 		p.LedgerOnly = true
 	}
 	if p.Evidence.OldestEntry != nil {
-		p.Evidence.PastSettlement = time.Since(*p.Evidence.OldestEntry) > settlementWindow
+		// Trading days, not wall-clock hours: a Friday buy is unsettled on Monday.
+		p.Evidence.PastSettlement = pastSettlement(*p.Evidence.OldestEntry, time.Now())
 	}
 
 	// Ledger net (drives the FIX-5 row).
@@ -367,8 +369,9 @@ func (a *Actions) ghostPreview(ctx context.Context, userID, symbol string, read 
 	var holdings []indiraClient.Holding
 	var book []indiraClient.OrderBook
 	var trades []indiraClient.TradeBook
+	var ourIDs map[string]bool
 	if read != nil {
-		holdings, book, trades = read.holdings, read.book, read.trades
+		holdings, book, trades, ourIDs = read.holdings, read.book, read.trades, read.ourOrderIDs
 	} else {
 		auth, err := a.authFor(ctx, userID)
 		if err != nil {
@@ -381,6 +384,13 @@ func (a *Actions) ghostPreview(ctx context.Context, userID, symbol string, read 
 			return nil, fmt.Errorf("ghost orderbook check: %w", err)
 		}
 		trades, _ = a.broker.GetTradeBook(ctx, auth) // best evidence, not required
+		ourIDs, _ = ourBrokerOrderIDs(ctx, a.fleet.execDB, userID)
+	}
+	// An empty holdings reply with lots open is a lost read, not "holds
+	// nothing" (tripwire 1b — the gate must refuse on its own too).
+	if len(holdings) == 0 {
+		return nil, &refusal{code: 422, msg: fmt.Sprintf(
+			"holdings reply for %s is EMPTY — a lost/partial read cannot prove %s is a ghost; retry when the broker answers", userID, symbol)}
 	}
 	// Keyed by EVERY name a holding can carry (baseSym, dispSym, dispSym with
 	// its series suffix stripped): a BE/BZ/SM-series lot shows as
@@ -400,13 +410,22 @@ func (a *Actions) ghostPreview(ctx context.Context, userID, symbol string, read 
 	// SELL order (a standing SL) has freeQty=0 and VANISHES from holdings —
 	// looking exactly like a ghost while the shares are really there. An
 	// open sell-side order at the broker is proof of holding: refuse.
-	// The same pass records every live order id for the heal's stale-row
-	// close (a ledger row whose broker order still stands is never closed).
-	p.liveOrderIDs = map[string]bool{}
+	// The same pass records every live order for the heal's stale-row close
+	// (a ledger row whose broker order is STILL LIVE is never closed), and
+	// refuses when a SELL of OURS stood in today's book in any status but
+	// REJECTED: the quantity was reserved today (post-close window), so an
+	// empty holdings row proves nothing — unless the client sold it by hand.
+	p.live = liveBookFrom(book)
 	for _, ob := range book {
-		st := strings.ToUpper(strings.TrimSpace(ob.Status))
-		if st != "EXECUTED" && st != "CANCELLED" && st != "CANCELED" && st != "REJECTED" && st != "EXPIRED" {
-			p.liveOrderIDs[ob.OrdId] = true
+		if strings.EqualFold(ob.OrdAction, "SELL") && ourIDs != nil &&
+			(ourIDs[ob.OrdId] || ourIDs[rawString(ob.ExchOrdId)]) &&
+			!strings.EqualFold(strings.TrimSpace(ob.Status), "REJECTED") &&
+			(strings.EqualFold(ob.Symbol.DispSym, symbol) || strings.EqualFold(ob.Symbol.BaseSym, symbol) ||
+				strings.EqualFold(strings.Split(ob.Symbol.DispSym, "-")[0], symbol)) {
+			if !theirSellToday(trades, book, ourIDs, symbol) {
+				return nil, &refusal{code: 422, msg: fmt.Sprintf(
+					"our own SELL order %s (%s) stood in today's order book for %s — the quantity was reserved today, an empty holdings row proves nothing; recheck on the next session", ob.OrdId, ob.Status, symbol)}
+			}
 		}
 		if strings.EqualFold(ob.OrdAction, "SELL") && ob.Cancellable &&
 			(strings.EqualFold(ob.Symbol.DispSym, symbol) || strings.EqualFold(ob.Symbol.BaseSym, symbol)) {
@@ -417,9 +436,11 @@ func (a *Actions) ghostPreview(ctx context.Context, userID, symbol string, read 
 		}
 	}
 
-	// Tradebook: today's SELL executions for the symbol (best evidence).
+	// Tradebook: today's SELL executions for the symbol (best evidence) —
+	// NOT counting our own orders: a sell by the strategy's own stop/exit is
+	// never a manual sale.
 	for _, tr := range trades {
-		if !strings.EqualFold(tr.OrdAction, "SELL") {
+		if !strings.EqualFold(tr.OrdAction, "SELL") || (ourIDs != nil && ourIDs[tr.OrdId]) {
 			continue
 		}
 		if tradeSymbolMatches(tr, symbol) {
@@ -455,11 +476,15 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 	if reason == ExitReasonManualExit {
 		state = BrokerStateSoldToday
 	}
+	// realized_pnl is set only when the exit price is KNOWN (a tradebook
+	// price); an unknown price stays NULL on both columns so totals and the
+	// trade list agree.
 	res, err := a.fleet.posDB.ExecContext(ctx, `
 		UPDATE positions
 		   SET status = 'EXITED', exit_time = now(), exit_reason = $4,
 		       exit_price = NULLIF($3::numeric, 0),
-		       broker_state = $5, broker_state_reason = $6, broker_checked_at = now(),
+		       realized_pnl = CASE WHEN $3::numeric > 0 THEN ($3::numeric - entry_price) * quantity ELSE NULL END,
+		       broker_state = $5, broker_state_reason = $6, broker_checked_at = now(), broker_state_stale = false,
 		       updated_at = now()
 		 WHERE user_id = $1 AND UPPER(symbol) = $2 AND status = 'ACTIVE'`,
 		p.UserID, p.Symbol, p.ExitPrice, reason, state, note)
@@ -512,8 +537,8 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 		// promoted again by the trail or Phase A. A row whose broker order is
 		// STILL LIVE in the book is never closed here — that would hide a
 		// real order from the reconciler and the monitor; it is reported.
-		if p.liveOrderIDs != nil {
-			stopRows, stopRowsLive = a.closeStaleStopRows(ctx, nil, p.liveOrderIDs, p.StrategyID, p.Symbol, note)
+		if p.live != nil {
+			stopRows, stopRowsLive = a.closeStaleStopRows(ctx, nil, p.live, p.StrategyID, p.Symbol, note)
 		} else if auth, aerr := a.authFor(ctx, p.UserID); aerr != nil {
 			stopRows = -1 // cannot prove the orders dead — close nothing
 		} else {
@@ -533,6 +558,7 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 			UPDATE manthan_positions
 			   SET status = 'EXITED', exit_reason = $3,
 			       exit_price = NULLIF($4::numeric, 0),
+			       realized_pnl = CASE WHEN $4::numeric > 0 THEN ($4::numeric - entry_price) * quantity ELSE realized_pnl END,
 			       protective_last_status = $5, protective_last_reason = $6,
 			       exit_time = now(), updated_at = now()
 			 WHERE strategy_id = $1 AND UPPER(symbol) = $2 AND status IN ('ACTIVE','PLEDGED')`,
@@ -557,9 +583,9 @@ func (a *Actions) GhostHeal(ctx context.Context, p *GhostPlan) (map[string]any, 
 // -1 rows means the ledger read/write itself failed. live, when non-nil, is
 // the set of order ids seen live in a book fetched moments ago (the
 // reconciler's one read per user); otherwise the book is fetched with auth.
-func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.AuthContext, live map[string]bool, strategyID, symbol, note string) (int64, []string) {
+func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.AuthContext, live *liveBook, strategyID, symbol, note string) (int64, []string) {
 	rows, err := a.fleet.execDB.QueryContext(ctx, `
-		SELECT id, COALESCE(broker_order_id, '')
+		SELECT id, COALESCE(broker_order_id, ''), qty
 		  FROM manthan_orders
 		 WHERE strategy_id = $1 AND UPPER(symbol) = $2 AND order_side = 'SELL'
 		   AND order_type IN ('SL_SELL','SL_SELL_AMO')
@@ -571,11 +597,12 @@ func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.Aut
 	type stopRow struct {
 		id       int64
 		brokerID string
+		qty      int
 	}
 	var candidates []stopRow
 	for rows.Next() {
 		var r stopRow
-		if rows.Scan(&r.id, &r.brokerID) == nil {
+		if rows.Scan(&r.id, &r.brokerID, &r.qty) == nil {
 			candidates = append(candidates, r)
 		}
 	}
@@ -583,13 +610,7 @@ func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.Aut
 	if len(candidates) == 0 {
 		return 0, nil
 	}
-	needBook := false
-	for _, c := range candidates {
-		if c.brokerID != "" {
-			needBook = true
-		}
-	}
-	if needBook && live == nil {
+	if live == nil {
 		if auth == nil {
 			return -1, nil // no broker truth — close nothing
 		}
@@ -597,14 +618,7 @@ func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.Aut
 		if berr != nil {
 			return -1, nil // cannot prove the orders dead — close nothing
 		}
-		live = map[string]bool{}
-		for _, ob := range book {
-			st := strings.ToUpper(strings.TrimSpace(ob.Status))
-			if st == "EXECUTED" || st == "CANCELLED" || st == "CANCELED" || st == "REJECTED" || st == "EXPIRED" {
-				continue
-			}
-			live[ob.OrdId] = true
-		}
+		live = liveBookFrom(book)
 	}
 	if note == "" {
 		note = "admin ghost cleanup"
@@ -612,7 +626,7 @@ func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.Aut
 	var closed int64
 	var left []string
 	for _, c := range candidates {
-		if c.brokerID != "" && live[c.brokerID] {
+		if live.has(c.brokerID, symbol, c.qty) {
 			left = append(left, c.brokerID)
 			continue
 		}
@@ -628,6 +642,33 @@ func (a *Actions) closeStaleStopRows(ctx context.Context, auth *indiraClient.Aut
 		closed += n
 	}
 	return closed, left
+}
+
+// theirSellToday reports a SELL of the symbol today that was NOT placed by
+// us — in the trade book, or EXECUTED in the order book.
+func theirSellToday(trades []indiraClient.TradeBook, book []indiraClient.OrderBook, ourIDs map[string]bool, symbol string) bool {
+	for _, tr := range trades {
+		if strings.EqualFold(tr.OrdAction, "SELL") && tr.TradedQty > 0 && !ourIDs[tr.OrdId] && tradeSymbolMatches(tr, symbol) {
+			return true
+		}
+	}
+	for _, ob := range book {
+		if !strings.EqualFold(ob.OrdAction, "SELL") || ob.TradedQty <= 0 || ourIDs[ob.OrdId] || ourIDs[rawString(ob.ExchOrdId)] {
+			continue
+		}
+		st := strings.ToUpper(strings.TrimSpace(ob.Status))
+		if st != "EXECUTED" && st != "COMPLETE" && st != "TRADED" {
+			continue
+		}
+		for _, n := range orderNames(ob.Symbol.DispSym, ob.Symbol.BaseSym) {
+			for _, m := range symbolNames(symbol) {
+				if n == m {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // tradeSymbolMatches digs the display symbol out of the tradebook's

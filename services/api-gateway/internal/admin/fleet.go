@@ -549,7 +549,7 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 	//   NOT_HELD / SOLD_TODAY closures in the last 24h INFO — auto-closed
 	verdicts, err := f.posDB.QueryContext(ctx, `
 		SELECT user_id, COALESCE(strategy_id::text, ''), UPPER(symbol), broker_state,
-		       COALESCE(broker_state_reason, ''), broker_checked_at
+		       COALESCE(broker_state_reason, ''), broker_checked_at, broker_state_stale
 		  FROM positions
 		 WHERE origin = 'MANTHAN' AND broker_state IS NOT NULL
 		   AND (   (status = 'ACTIVE' AND broker_state IN ('PLEDGED','QTY_MISMATCH','UNVERIFIED'))
@@ -565,7 +565,8 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 		var it AttentionItem
 		var state, reason string
 		var checked sql.NullTime
-		if err := verdicts.Scan(&it.UserID, &it.Strategy, &it.Symbol, &state, &reason, &checked); err != nil {
+		var stale bool
+		if err := verdicts.Scan(&it.UserID, &it.Strategy, &it.Symbol, &state, &reason, &checked, &stale); err != nil {
 			verdicts.Close()
 			return nil, nil, err
 		}
@@ -596,6 +597,9 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 			it.Detail = fmt.Sprintf("%s (checked %s IST)", reason, checked.Time.In(istLoc()).Format("02 Jan 15:04"))
 		} else {
 			it.Detail = reason
+		}
+		if stale {
+			it.Detail += " — STALE: the broker could not be read on the latest run; this is the last truthful verdict"
 		}
 		items = append(items, it)
 	}

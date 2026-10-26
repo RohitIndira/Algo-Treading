@@ -194,7 +194,7 @@ func TestM7B_GhostPreviewAndHeal(t *testing.T) {
 func TestM7B_GhostOpenSellOrderGate(t *testing.T) {
 	// The ALIVUS false-positive: holdings absent (freeQty=0 hides the row)
 	// BUT a standing SL SELL sits in the order book → NOT a ghost.
-	broker := &m7Broker{orderbook: []indiraClient.OrderBook{
+	broker := &m7Broker{stubBroker: stubBroker{holdings: []indiraClient.Holding{nseHolding("UNRELATED", 1)}}, orderbook: []indiraClient.OrderBook{
 		{OrdId: "BRK-SL-9", Status: "Requested", OrdAction: "SELL", Cancellable: true,
 			Symbol: indiraClient.OrderBookSymbol{DispSym: "HIDDENQ", BaseSym: "HIDDENQ", Exc: "NSE"}},
 	}}
@@ -210,7 +210,7 @@ func TestM7B_GhostOpenSellOrderGate(t *testing.T) {
 }
 
 func TestM7B_GhostSettlementGate(t *testing.T) {
-	broker := &m7Broker{} // holds nothing, no tradebook sells
+	broker := &m7Broker{stubBroker: stubBroker{holdings: []indiraClient.Holding{nseHolding("UNRELATED", 1)}}} // holds nothing OF THE SYMBOL, no tradebook sells
 	env := newM7BEnv(t, broker, "http://127.0.0.1:1")
 	// Fresh position (20h) with no tradebook evidence → refused.
 	mustExec(t, env.pos, `INSERT INTO positions (position_id, origin, user_id, strategy_id, signal_id, symbol, exchange,
@@ -318,7 +318,7 @@ func TestM7B_Rebalance(t *testing.T) {
 // writes the FIX-5 SELL (strategy-scoped id), a GHOST_HEALED event and closes
 // the lot's stale stop rows; a second heal finds no ledger holding → 422.
 func TestM7B_GhostLedgerOnlyHeal(t *testing.T) {
-	broker := &m7Broker{} // holds nothing, empty book, no tradebook sells
+	broker := &m7Broker{stubBroker: stubBroker{holdings: []indiraClient.Holding{nseHolding("UNRELATED", 1)}}} // holds nothing OF THE SYMBOL, empty book, no tradebook sells
 	env := newM7BEnv(t, broker, "http://127.0.0.1:1")
 	mustExec(t, env.exec, `INSERT INTO manthan_orders (signal_id, strategy_id, user_id, symbol, order_type, order_side, qty, filled_qty, status, filled_at, created_at)
 		VALUES ('tadm-m7b-ledger-buy', $1, $2, 'LEDGERG', 'LIMIT_BUY', 'BUY', 121, 121, 'FILLED', now() - interval '60 days', now() - interval '60 days')`,

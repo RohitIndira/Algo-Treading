@@ -337,6 +337,7 @@ func buildHoldingsList(active []PositionRow, ltps map[string]LTPQuote) []Holding
 			// Broker verdict, verbatim from the book reconciler.
 			BrokerState:       nullStr(p.BrokerState),
 			BrokerStateReason: nullStr(p.BrokerStateReason),
+			BrokerStateStale:  p.BrokerStateStale,
 		}
 		if p.BrokerCheckedAt.Valid {
 			h.BrokerCheckedAt = p.BrokerCheckedAt.Time.UTC().Format(time.RFC3339)

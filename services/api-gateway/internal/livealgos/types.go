@@ -211,6 +211,7 @@ type Holding struct {
 	BrokerState       string `json:"brokerState,omitempty"`
 	BrokerStateReason string `json:"brokerStateReason,omitempty"`
 	BrokerCheckedAt   string `json:"brokerCheckedAt,omitempty"` // RFC3339
+	BrokerStateStale  bool   `json:"brokerStateStale,omitempty"` // latest run could not read the broker; verdict is the last truth
 }
 
 // ─── Past Trades drilldown ───────────────────────────────────────────
