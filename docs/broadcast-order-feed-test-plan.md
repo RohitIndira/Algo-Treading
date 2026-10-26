@@ -120,10 +120,20 @@ user-config) are only counted (`broadcast_unknown_ucc_total`,
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `BROADCAST_FEED_MODE` | `shadow` | see above; invalid value = service refuses to start |
+| `BROADCAST_FEED_MODE` | `shadow` | see above; first token after `=` is used, case-insensitive; an invalid value logs an Error and runs with the feed **off** (never a crash loop) |
 | `BROADCAST_ANCHOR_USER` | empty | dedicated dealer/ops login whose session fetches the broadcast token. Empty or unusable → newest live (largest JWT `iat`, not expired) session among managed users. A session the broker rejects (AU0xx / 401 / handshake not Ok) is retired until that user logs in again or 30 min pass |
 | `TRADE_EXEC_GRPC_ADDR` | unset | trade-execution gRPC for own_orders. In `deployments/separate-namespace/ecosystem.config.js` it is `localhost:9004` |
 | `INDIRA_BASE_URL` | livemiddleware | REST base; the socket URL is derived from it (`wss://…/order-notify/websocket/broadcast`) |
+
+**Anchor choice.** A dedicated dealer/ops login in `BROADCAST_ANCHOR_USER` is
+the preferred configuration: its session is not tied to any client's trading
+day, and it is the only setup whose behaviour the probe verified (one session,
+one broadcast socket). Anchoring on a managed client's own session is the
+fallback; whether the broker tolerates the SAME userId holding its per-user
+order socket AND the broadcast socket at once (as happens when the fallback
+picks a client that orderstatus already subscribes per-user) is **unverified**
+— watch `broadcast_reconnects_total` and that client's per-user socket during
+the shadow day, and move to a dedicated login if either churns.
 
 `ecosystem.config.js` forwards `BROADCAST_FEED_MODE` and
 `BROADCAST_ANCHOR_USER` from `deployments/separate-namespace/.env` (its env
@@ -134,10 +144,24 @@ BROADCAST_FEED_MODE=shadow
 BROADCAST_ANCHOR_USER=
 ```
 
-Protocol constants (not configurable): handshake reply within 10 s, heartbeat
-every 50 s, reconnect when no bytes for 6 min (longer than the broker's
+Protocol constants (not configurable): handshake reply within 10 s (order
+frames arriving before it are treated as data), heartbeat text every 50 s, WS
+ping every 30 s with the pong extending the read deadline, reconnect when
+neither a frame nor a pong arrives for 6 min (longer than the broker's
 5-minute idle close), backoff 1 s → 2 s → 5 s → 10 s capped, a fresh token on
-every reconnect, close frame on shutdown.
+every reconnect, close frame on shutdown. Whether the broker answers WS pings
+is unverified; if it does not, a frameless night reconnects every 6 min (the
+pre-ping behaviour), visible as `broadcast_reconnects_total` growing ~10/hour
+overnight.
+
+**Dedup.** Primary key: `UNIQUE (broker_order_id, event_seq)` with
+`event_seq = MessageSequenceNumber`. Whether both sockets carry the same
+number for the same event is unverified, so the write path has a second-level
+guard: a frame is skipped when a row of the same order with identical status,
+filled qty, traded price and broker timestamps (`LastModifiedTimeStamp`,
+`OrderTimeStamp`) was stored within 120 s under any seq
+(`broadcast_written_total{result="equivalent_skip"}`, Warn log). Shadow mode
+answers the question directly via `broadcast_shadow_seq_match_total`.
 
 ### Metrics — `GET :HTTP_PORT/metrics` (orderstatus is `:9006` on the box)
 
@@ -153,7 +177,10 @@ every reconnect, close frame on shutdown.
 | `broadcast_token_errors_total` | failed `createWsToken` calls |
 | `broadcast_shadow_recall_total{seen_by_user_path="true"/"false"}` | shadow: did the per-user path store the same `(broker_order_id, event_seq)` within 5 s |
 | `broadcast_shadow_lead_seconds` | shadow: per-user `observed_at` − broadcast arrival; positive = broadcast was earlier |
-| `broadcast_written_total{result=inserted/deduped/dropped/error}` | own_orders / all: outcome of each hand-off to the store |
+| `broadcast_shadow_seq_match_total{match=seq/equivalent_only/none}` | shadow: `seq` = per-user path stored the same `(broker_order_id, event_seq)`; **`equivalent_only` = same event content stored under a different seq (the primary dedup would NOT hold)**; `none` = broadcast-only |
+| `broadcast_partial_parse_total` | frames kept despite a number/string type mismatch on a non-routing field |
+| `broadcast_write_queue_dropped_total` | own_orders / all: frames dropped because the bounded write queue (10 000) was full |
+| `broadcast_written_total{result=inserted/deduped/equivalent_skip/dropped/error}` | own_orders / all: outcome of each hand-off to the store; `equivalent_skip` = second-level guard refused a same-content event stored under another seq within 120 s |
 | `broadcast_skipped_not_own_total` | own_orders: frames not ours (or lookup failed) |
 | `broadcast_malformed_frames_total`, `broadcast_control_frames_total` | non-order frames |
 
@@ -168,6 +195,14 @@ stable message `broadcast feed alert`:
 - `BROADCAST_ANCHOR_LOST` — the anchor session was rejected (once per
   session), or no session at all can anchor the feed (once until one can).
 - `BROADCAST_TOKEN_FAILING` — `createWsToken` failing for more than 5 min.
+- `BROADCAST_DIAL_FAILING` — the socket upgrade failing for more than 5 min
+  (an HTTP 401/403 on the upgrade also retires the anchor).
+
+Anchor alerts, like the stale alert, fire only in market hours: a session that
+dies overnight is reported at the first attempt after 09:15, and a dead anchor
+is alerted once per session — its 30-minute retry does not page again; only a
+real re-login (newer JWT `iat`) re-arms it. With no anchor at all the listener
+retries every 60 s (not the 1–10 s socket backoff).
 
 Per-user sockets and REST polls are untouched by any of this; they keep
 covering while the broadcast is down.
@@ -186,9 +221,11 @@ covering while the broadcast is down.
    `broadcast shadow: frame not seen by per-user path` with ucc, broker id,
    event_seq, status — that list is the review list (expected content: clients
    without a session, i.e. the FIV99 case the feature exists for).
-   **If misses appear for clients WITH a session, check `event_seq`: a
-   `MessageSequenceNumber` that differs between the two sockets for the same
-   event would defeat the dedup and must be fixed before any writing mode.**
+   **Read `broadcast_shadow_seq_match_total`: `equivalent_only` > 0 means the
+   two sockets number the same event differently — the primary dedup would
+   not hold. The second-level guard covers this, but the numbering must be
+   understood (and a per-event key chosen) before `all` mode, where a missed
+   dedup is a double-booked manual sell.**
 4. Latency: `broadcast_shadow_lead_seconds` histogram — the bulk should sit at
    ≥ 0 (broadcast first) and never below −2 s for our own orders.
 5. Unattended token refresh: `broadcast_reconnects_total` grows slowly across

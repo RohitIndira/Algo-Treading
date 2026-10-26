@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -219,6 +220,57 @@ func (w *Writer) LookupObserved(ctx context.Context, brokerOrderID string, event
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lookup observed row: %w", err)
+	}
+	r.Source = Source(src)
+	return &r, nil
+}
+
+// EquivalentKey describes a broker event by its CONTENT rather than its
+// sequence number: used by the broadcast listener as a second-level dedup
+// guard in case the dealer broadcast and the per-user socket number the same
+// event differently. Two events of one order with the same status, filled
+// qty, traded price and broker timestamps within a short window are the same
+// event.
+type EquivalentKey struct {
+	BrokerOrderID         string
+	Status                string
+	FilledQty             int
+	TradedPrice           float64
+	LastModifiedTimeStamp string // raw_payload ->> 'LastModifiedTimeStamp'
+	OrderTimeStamp        string // raw_payload ->> 'OrderTimeStamp'
+}
+
+// EquivalentRow is the stored event that matched an EquivalentKey.
+type EquivalentRow struct {
+	Source     Source
+	EventSeq   int64
+	ObservedAt time.Time
+}
+
+// LookupEquivalent returns the most recent row within `within` of now whose
+// content matches key, or (nil, nil). Read-only.
+func (w *Writer) LookupEquivalent(ctx context.Context, key EquivalentKey, within time.Duration) (*EquivalentRow, error) {
+	var r EquivalentRow
+	var src string
+	err := w.db.QueryRowContext(ctx, `
+		SELECT source, event_seq, observed_at FROM broker_events
+		WHERE broker_order_id = $1
+		  AND COALESCE(status, '') = $2
+		  AND COALESCE(filled_qty, 0) = $3
+		  AND COALESCE(traded_price, 0) = $4
+		  AND COALESCE(raw_payload ->> 'LastModifiedTimeStamp', '') = $5
+		  AND COALESCE(raw_payload ->> 'OrderTimeStamp', '') = $6
+		  AND observed_at > NOW() - make_interval(secs => $7)
+		ORDER BY observed_at DESC
+		LIMIT 1`,
+		key.BrokerOrderID, strings.ToUpper(strings.TrimSpace(key.Status)), key.FilledQty, key.TradedPrice,
+		key.LastModifiedTimeStamp, key.OrderTimeStamp, within.Seconds(),
+	).Scan(&src, &r.EventSeq, &r.ObservedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup equivalent row: %w", err)
 	}
 	r.Source = Source(src)
 	return &r, nil

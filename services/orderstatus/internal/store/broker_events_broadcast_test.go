@@ -59,3 +59,41 @@ func TestInsert_BroadcastSourceDedupesWithWSS(t *testing.T) {
 		t.Fatalf("lookup of missing row = %+v, %v; want nil, nil", row, err)
 	}
 }
+
+// TestLookupEquivalent: same content under a different event_seq is found
+// within the window; a different status / price is not.
+func TestLookupEquivalent(t *testing.T) {
+	db := testDB(t)
+	cleanupTestRows(t, db)
+	t.Cleanup(func() { cleanupTestRows(t, db) })
+	w := NewWriter(db, zap.NewNop())
+	ctx := context.Background()
+
+	ev := newTestEvent(testGracePrefix+"EQ", 7001)
+	ev.Source = SourceWSS
+	ev.FilledQty = 10
+	ev.TradedPrice = 101.5
+	ev.RawPayload = []byte(`{"LastModifiedTimeStamp":"26-Oct-2026 10:01:02","OrderTimeStamp":"26-Oct-2026 10:00:00"}`)
+	if _, inserted, err := w.Insert(ctx, ev); err != nil || !inserted {
+		t.Fatalf("insert: %v %v", inserted, err)
+	}
+	key := EquivalentKey{BrokerOrderID: testGracePrefix + "EQ", Status: "executed", FilledQty: 10, TradedPrice: 101.5,
+		LastModifiedTimeStamp: "26-Oct-2026 10:01:02", OrderTimeStamp: "26-Oct-2026 10:00:00"}
+	row, err := w.LookupEquivalent(ctx, key, 120*time.Second)
+	if err != nil || row == nil || row.EventSeq != 7001 || row.Source != SourceWSS {
+		t.Fatalf("equivalent lookup = %+v, %v", row, err)
+	}
+	other := key
+	other.TradedPrice = 101.6
+	if row, _ := w.LookupEquivalent(ctx, other, 120*time.Second); row != nil {
+		t.Fatalf("different price must not match: %+v", row)
+	}
+	other = key
+	other.Status = "PENDING"
+	if row, _ := w.LookupEquivalent(ctx, other, 120*time.Second); row != nil {
+		t.Fatalf("different status must not match: %+v", row)
+	}
+	if row, _ := w.LookupEquivalent(ctx, key, 0); row != nil {
+		t.Fatalf("zero window must not match: %+v", row)
+	}
+}

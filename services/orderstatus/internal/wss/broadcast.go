@@ -61,6 +61,13 @@ const (
 
 // ParseMode parses BROADCAST_FEED_MODE; empty means ModeShadow.
 func ParseMode(s string) (Mode, error) {
+	// deployments' .env parser keeps everything after '=' (including a
+	// trailing comment); take the first token, lower-cased.
+	if f := strings.Fields(s); len(f) > 0 {
+		s = f[0]
+	} else {
+		s = ""
+	}
 	switch m := Mode(strings.ToLower(strings.TrimSpace(s))); m {
 	case "":
 		return ModeShadow, nil
@@ -89,10 +96,13 @@ type OwnOrderLookup interface {
 	IsOurOrder(ctx context.Context, brokerOrderID string) (bool, error)
 }
 
-// ShadowLookup finds the row the per-user path stored for the same event
-// (shadow mode). *store.Writer implements it.
+// ShadowLookup reads what is already in broker_events: the row for the same
+// (broker_order_id, event_seq) and the row with the same CONTENT regardless
+// of sequence. Used by shadow mode to grade the feed and by the write path as
+// a second-level dedup guard. *store.Writer implements it.
 type ShadowLookup interface {
 	LookupObserved(ctx context.Context, brokerOrderID string, eventSeq int64) (*store.ObservedRow, error)
+	LookupEquivalent(ctx context.Context, key store.EquivalentKey, within time.Duration) (*store.EquivalentRow, error)
 }
 
 // BroadcastConfig tunes the listener. Zero values take the defaults below.
@@ -102,8 +112,12 @@ type BroadcastConfig struct {
 
 	HandshakeTimeout  time.Duration // wait for {"status":"Ok"}; default 10 s
 	HeartbeatInterval time.Duration // default 50 s
-	MaxSilence        time.Duration // no bytes at all for this long → reconnect with a new token; default 6 min
+	PingInterval      time.Duration // WS ping control frames; a pong extends the read deadline; default 30 s
+	MaxSilence        time.Duration // no bytes at all (frames or pongs) for this long → reconnect with a new token; default 6 min
 	Backoff           []time.Duration
+	NoAnchorBackoff   time.Duration // wait between attempts when no session can anchor; default 60 s
+	EquivalentWindow  time.Duration // second-level dedup: same content for the same order within this window = same event; default 120 s
+	DialFailAlert     time.Duration // alert when the socket dial keeps failing for longer; default 5 min
 	ShadowWindow      time.Duration // how long to give the per-user path before comparing; default 5 s
 	ManagedRefresh    time.Duration // re-list managed users; default 5 min
 	StaleAfter        time.Duration // feed-stale alert threshold in market hours; default 3 min
@@ -123,7 +137,11 @@ func (c *BroadcastConfig) defaults() {
 	}
 	def(&c.HandshakeTimeout, 10*time.Second)
 	def(&c.HeartbeatInterval, 50*time.Second)
+	def(&c.PingInterval, 30*time.Second)
 	def(&c.MaxSilence, 6*time.Minute)
+	def(&c.NoAnchorBackoff, 60*time.Second)
+	def(&c.EquivalentWindow, 120*time.Second)
+	def(&c.DialFailAlert, 5*time.Minute)
 	def(&c.ShadowWindow, 5*time.Second)
 	def(&c.ManagedRefresh, 5*time.Minute)
 	def(&c.StaleAfter, 3*time.Minute)
@@ -151,6 +169,9 @@ type BroadcastStats struct {
 	SkippedNotOwn, ShadowSeen, ShadowMissed   atomic.Uint64
 	Reconnects, AnchorSwitches, Heartbeats    atomic.Uint64
 	TokenErrors, Connects, StaleAlerts, Noops atomic.Uint64
+	Partial, EquivalentSkipped, QueueDropped  atomic.Uint64
+	SeqMatchSeq, SeqMatchEquivalentOnly       atomic.Uint64
+	SeqMatchNone, DialAlerts                  atomic.Uint64
 }
 
 // BroadcastListener owns the broadcast socket.
@@ -174,6 +195,8 @@ type BroadcastListener struct {
 	noAnchorAlerted  bool
 	tokenFailSince   time.Time
 	tokenFailAlerted bool
+	dialFailSince    time.Time
+	dialFailAlerted  bool
 
 	lastFrameNano atomic.Int64 // 0 before the first frame
 	connected     atomic.Bool
@@ -183,13 +206,17 @@ type BroadcastListener struct {
 	ownNilLogged  sync.Once
 
 	shadowQ chan shadowItem
+	writeQ  chan *indira.WSOrderStatus // own_orders / all: frames waiting for lookup + write
 	wg      sync.WaitGroup
+
+	lookupWarnNano atomic.Int64 // rate limit for the own-order lookup-failure Warn
 }
 
 type shadowItem struct {
 	ucc, brokerOrderID, status string
 	seq                        int64
 	at                         time.Time
+	key                        store.EquivalentKey
 }
 
 // NewBroadcastListener wires the listener. sink is the per-user Listener
@@ -213,6 +240,7 @@ func NewBroadcastListener(cfg BroadcastConfig, client *indira.Client, sink *List
 		deadAnchors: map[string]time.Time{},
 		alertedDead: map[string]bool{},
 		shadowQ:     make(chan shadowItem, 10000),
+		writeQ:      make(chan *indira.WSOrderStatus, 10000),
 	}
 }
 
@@ -253,6 +281,10 @@ func (b *BroadcastListener) Start(ctx context.Context) {
 	go func() { defer b.wg.Done(); b.managedLoop(ctx) }()
 	go func() { defer b.wg.Done(); b.staleLoop(ctx) }()
 	go func() { defer b.wg.Done(); b.shadowLoop(ctx) }()
+	if b.cfg.Mode == ModeOwnOrders || b.cfg.Mode == ModeAll {
+		b.wg.Add(1)
+		go func() { defer b.wg.Done(); b.writeLoop(ctx) }()
+	}
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.run(ctx) }()
 	b.logger.Info("broadcast listener started", zap.String("anchor_user", b.cfg.AnchorUser))
@@ -276,6 +308,10 @@ func (b *BroadcastListener) run(ctx context.Context) {
 		mBroadcastReconnects.Inc()
 		wait := b.cfg.Backoff[min(attempt, len(b.cfg.Backoff)-1)]
 		attempt++
+		if errors.Is(err, errNoAnchor) {
+			// Nothing to connect with: do not hammer user-config all night.
+			wait = b.cfg.NoAnchorBackoff
+		}
 		b.logger.Warn("broadcast session ended — reconnecting",
 			zap.Error(err), zap.Duration("backoff", wait), zap.Int("attempt", attempt))
 		select {
@@ -294,11 +330,17 @@ var errNoAnchor = errors.New("no usable anchor session")
 func (b *BroadcastListener) session(ctx context.Context) (healthy bool, err error) {
 	auth := b.pickAnchor(ctx)
 	if auth == nil {
+		// Alert once, and only in market hours (an empty session table at
+		// 02:00 is normal; at 09:20 it is not). The attempt loop re-checks
+		// every NoAnchorBackoff, so the alert fires at the first attempt
+		// after the open.
 		b.anchorMu.Lock()
-		alerted := b.noAnchorAlerted
-		b.noAnchorAlerted = true
+		fire := !b.noAnchorAlerted && b.cfg.MarketOpen(b.cfg.Clock.Now())
+		if fire {
+			b.noAnchorAlerted = true
+		}
 		b.anchorMu.Unlock()
-		if !alerted {
+		if fire {
 			b.alerter.Alert(ctx, "BROADCAST_ANCHOR_LOST", b.cfg.AnchorUser,
 				"No live session can anchor the dealer broadcast feed (configured anchor unusable and no managed user has a valid session). Feed is down; per-user sockets and REST polls continue.")
 		}
@@ -329,8 +371,15 @@ func (b *BroadcastListener) session(ctx context.Context) (healthy bool, err erro
 		if resp != nil {
 			code = resp.StatusCode
 		}
-		return false, fmt.Errorf("dial broadcast (http %d): %w", code, err)
+		derr := fmt.Errorf("dial broadcast (http %d): %w", code, err)
+		if code == http.StatusUnauthorized || code == http.StatusForbidden {
+			// The upgrade itself was refused for this session.
+			b.markAnchorDead(ctx, auth.UserId, derr)
+		}
+		b.noteDialFailure(ctx, derr)
+		return false, derr
 	}
+	b.clearDialFailure()
 	defer conn.Close()
 
 	var writeMu sync.Mutex
@@ -344,20 +393,42 @@ func (b *BroadcastListener) session(ctx context.Context) (healthy bool, err erro
 	if err := write(websocket.TextMessage, HandshakeFrame(auth.UserId, token)); err != nil {
 		return false, fmt.Errorf("handshake write: %w", err)
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(b.cfg.HandshakeTimeout))
-	_, reply, err := conn.ReadMessage()
-	if err != nil {
-		return false, fmt.Errorf("handshake reply: %w", err)
-	}
-	var hs struct {
-		Status string `json:"status"`
-	}
-	if json.Unmarshal(reply, &hs) != nil || !strings.EqualFold(strings.TrimSpace(hs.Status), "ok") {
-		// The broker refused the (userId, orderToken) pair: treat as a dead
-		// session so the next attempt uses another anchor.
-		herr := fmt.Errorf("handshake rejected: %.200s", string(reply))
-		b.markAnchorDead(ctx, auth.UserId, herr)
-		return false, herr
+	// Handshake reply: read until a frame that carries a "status" key, within
+	// HandshakeTimeout. The broadcast may deliver order frames (UCC) before
+	// the acknowledgement; those are data, never a reason to retire the anchor.
+	hsDeadline := time.Now().Add(b.cfg.HandshakeTimeout)
+	for {
+		_ = conn.SetReadDeadline(hsDeadline)
+		_, reply, err := conn.ReadMessage()
+		if err != nil {
+			return false, fmt.Errorf("handshake reply: %w", err)
+		}
+		var hs struct {
+			Status *string `json:"status"`
+			UCC    string  `json:"UCC"`
+		}
+		if json.Unmarshal(reply, &hs) != nil {
+			b.stats.Malformed.Add(1)
+			mBroadcastMalformed.Inc()
+			continue
+		}
+		if hs.Status == nil {
+			if strings.TrimSpace(hs.UCC) != "" {
+				b.handleFrame(ctx, reply) // early order frame
+			} else {
+				b.stats.Control.Add(1)
+				mBroadcastControl.Inc()
+			}
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(*hs.Status), "ok") {
+			// The broker refused the (userId, orderToken) pair: treat as a
+			// dead session so the next attempt uses another anchor.
+			herr := fmt.Errorf("handshake rejected: %.200s", string(reply))
+			b.markAnchorDead(ctx, auth.UserId, herr)
+			return false, herr
+		}
+		break
 	}
 
 	b.setConnected(auth.UserId, true)
@@ -387,6 +458,32 @@ func (b *BroadcastListener) session(ctx context.Context) (healthy bool, err erro
 	}()
 	defer func() { close(hbStop); <-hbDone }()
 
+	// WS ping control frames: a pong proves the path is alive on a frameless
+	// night so the read deadline (MaxSilence) keeps moving and we do not
+	// reconnect + refetch a token every few minutes for nothing. MaxSilence
+	// stays the hard cutoff: no frame AND no pong for that long → reconnect.
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(b.cfg.MaxSilence))
+	})
+	pingStop := make(chan struct{})
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		for {
+			select {
+			case <-pingStop:
+				return
+			case <-b.cfg.Clock.After(b.cfg.PingInterval):
+				if err := write(websocket.PingMessage, nil); err != nil {
+					b.logger.Warn("broadcast ping write failed", zap.Error(err))
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+	defer func() { close(pingStop); <-pingDone }()
+
 	// Clean shutdown: on ctx cancel send a close frame, then close the socket
 	// to unblock ReadMessage.
 	closeDone := make(chan struct{})
@@ -403,9 +500,10 @@ func (b *BroadcastListener) session(ctx context.Context) (healthy bool, err erro
 	// Read loop. The read deadline IS the silence cutoff: gorilla treats a
 	// deadline timeout as a permanent connection failure (a second
 	// ReadMessage after it panics), so a quiet socket is not "continued" —
-	// it ends the session and we reconnect with a fresh token. MaxSilence is
-	// longer than the broker's own 5-minute idle close so a legitimately
-	// quiet feed is not churned.
+	// it ends the session and we reconnect with a fresh token. Pongs (above)
+	// and frames both push the deadline; MaxSilence is longer than the
+	// broker's own 5-minute idle close so a legitimately quiet feed is not
+	// churned.
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(b.cfg.MaxSilence))
 		_, msg, err := conn.ReadMessage()
@@ -477,6 +575,31 @@ func (b *BroadcastListener) clearTokenFailure() {
 	b.anchorMu.Unlock()
 }
 
+func (b *BroadcastListener) noteDialFailure(ctx context.Context, err error) {
+	now := b.cfg.Clock.Now()
+	b.anchorMu.Lock()
+	if b.dialFailSince.IsZero() {
+		b.dialFailSince = now
+	}
+	fire := !b.dialFailAlerted && now.Sub(b.dialFailSince) > b.cfg.DialFailAlert
+	if fire {
+		b.dialFailAlerted = true
+	}
+	b.anchorMu.Unlock()
+	if fire {
+		b.stats.DialAlerts.Add(1)
+		b.alerter.Alert(ctx, "BROADCAST_DIAL_FAILING", b.cfg.AnchorUser,
+			fmt.Sprintf("The broadcast socket dial has been failing for %s (last: %v). Broadcast feed is down; per-user sockets and REST polls continue.", b.cfg.DialFailAlert, err))
+	}
+}
+
+func (b *BroadcastListener) clearDialFailure() {
+	b.anchorMu.Lock()
+	b.dialFailSince = time.Time{}
+	b.dialFailAlerted = false
+	b.anchorMu.Unlock()
+}
+
 // ── managed-client set ──────────────────────────────────────────────────
 
 func (b *BroadcastListener) refreshManaged(ctx context.Context) {
@@ -540,10 +663,21 @@ func (b *BroadcastListener) handleFrame(ctx context.Context, raw []byte) {
 	}
 	var ws indira.WSOrderStatus
 	if err := json.Unmarshal(raw, &ws); err != nil {
-		b.stats.Malformed.Add(1)
-		mBroadcastMalformed.Inc()
-		b.logger.Warn("broadcast: order frame did not parse", zap.Error(err), zap.String("head", head(raw, 120)))
-		return
+		// The broker flips number/string types between frames (Exchange,
+		// Days, TriggerPrice, OrderOriginalQty…). encoding/json fills every
+		// other field and reports the first type mismatch; like the per-user
+		// read pump, keep the frame when the routing key survived.
+		var te *json.UnmarshalTypeError
+		if errors.As(err, &te) && strings.TrimSpace(ws.UniqueCode) != "" {
+			b.stats.Partial.Add(1)
+			mBroadcastPartialParse.Inc()
+			b.logger.Debug("broadcast: partial parse kept", zap.String("field", te.Field), zap.String("value", te.Value))
+		} else {
+			b.stats.Malformed.Add(1)
+			mBroadcastMalformed.Inc()
+			b.logger.Warn("broadcast: order frame did not parse", zap.Error(err), zap.String("head", head(raw, 120)))
+			return
+		}
 	}
 	now := b.cfg.Clock.Now()
 	b.lastFrameNano.Store(now.UnixNano())
@@ -561,15 +695,34 @@ func (b *BroadcastListener) handleFrame(ctx context.Context, raw []byte) {
 	switch b.cfg.Mode {
 	case ModeShadow:
 		b.enqueueShadow(ucc, &ws, now)
-	case ModeOwnOrders:
-		if !b.isOurs(ctx, &ws) {
-			b.stats.SkippedNotOwn.Add(1)
-			mBroadcastSkippedNotOwn.Inc()
-			return
+	case ModeOwnOrders, ModeAll:
+		// Never block the socket read loop on a gRPC lookup or a DB write:
+		// hand off to the bounded writer; overflow drops and counts (the REST
+		// poll remains the safety net).
+		select {
+		case b.writeQ <- &ws:
+		default:
+			b.stats.QueueDropped.Add(1)
+			mBroadcastQueueDropped.Inc()
+			b.logger.Warn("broadcast write queue full — frame dropped", zap.String("broker_order_id", ws.UniqueCode))
 		}
-		b.write(ctx, &ws)
-	case ModeAll:
-		b.write(ctx, &ws)
+	}
+}
+
+// writeLoop drains writeQ: own_orders filter, then the guarded write.
+func (b *BroadcastListener) writeLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ws := <-b.writeQ:
+			if b.cfg.Mode == ModeOwnOrders && !b.isOurs(ctx, ws) {
+				b.stats.SkippedNotOwn.Add(1)
+				mBroadcastSkippedNotOwn.Inc()
+				continue
+			}
+			b.write(ctx, ws)
+		}
 	}
 }
 
@@ -588,7 +741,12 @@ func (b *BroadcastListener) isOurs(ctx context.Context, ws *indira.WSOrderStatus
 		}
 		ok, err := b.own.IsOurOrder(ctx, id)
 		if err != nil {
-			b.logger.Warn("broadcast: own-order lookup failed — frame skipped", zap.String("broker_order_id", id), zap.Error(err))
+			// Rate-limited to one Warn per minute: an outage would otherwise
+			// log every frame of every client.
+			now := time.Now().UnixNano()
+			if last := b.lookupWarnNano.Load(); now-last > int64(time.Minute) && b.lookupWarnNano.CompareAndSwap(last, now) {
+				b.logger.Warn("broadcast: own-order lookup failing — frames skipped (fail closed)", zap.String("broker_order_id", id), zap.Error(err))
+			}
 			continue
 		}
 		if ok {
@@ -606,6 +764,29 @@ func (b *BroadcastListener) write(ctx context.Context, ws *indira.WSOrderStatus)
 		mBroadcastWritten.WithLabelValues("dropped").Inc()
 		return
 	}
+	// Second-level dedup guard. The primary key is (broker_order_id,
+	// event_seq) — identical MessageSequenceNumber on both sockets for the
+	// same event is the expectation but is unverified. If the two sockets
+	// number the same event differently, the primary dedup misses and a
+	// manual SELL would be booked twice in positions (FIFO reduced twice). So
+	// before writing, look for a stored row of the same order with the same
+	// content (status, filled qty, traded price, broker timestamps) within
+	// EquivalentWindow, regardless of seq, and skip if found.
+	if b.shadow != nil {
+		lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		row, err := b.shadow.LookupEquivalent(lctx, equivalentKey(ws), b.cfg.EquivalentWindow)
+		cancel()
+		if err != nil {
+			b.logger.Warn("broadcast: equivalence lookup failed — writing anyway (primary dedup still applies)", zap.String("broker_order_id", id), zap.Error(err))
+		} else if row != nil && row.EventSeq != eventSeqFrom(ws) {
+			b.stats.EquivalentSkipped.Add(1)
+			mBroadcastWritten.WithLabelValues("equivalent_skip").Inc()
+			b.logger.Warn("broadcast: same event already stored under a DIFFERENT event_seq — skipped (seq numbering differs between sockets)",
+				zap.String("broker_order_id", id), zap.Int64("broadcast_seq", eventSeqFrom(ws)),
+				zap.Int64("stored_seq", row.EventSeq), zap.String("stored_by", string(row.Source)))
+			return
+		}
+	}
 	inserted, err := b.sink.ingest(ctx, ws, store.SourceWSSBroadcast)
 	switch {
 	case err != nil:
@@ -620,6 +801,18 @@ func (b *BroadcastListener) write(ctx context.Context, ws *indira.WSOrderStatus)
 	}
 }
 
+// equivalentKey describes ws by content for the second-level dedup.
+func equivalentKey(ws *indira.WSOrderStatus) store.EquivalentKey {
+	return store.EquivalentKey{
+		BrokerOrderID:         strings.TrimSpace(ws.UniqueCode),
+		Status:                strings.ToUpper(strings.TrimSpace(ws.OrderStatus)),
+		FilledQty:             ws.FilledQty(),
+		TradedPrice:           parseFloat(ws.TradedPrice),
+		LastModifiedTimeStamp: strings.TrimSpace(ws.LastModifiedTimeStamp),
+		OrderTimeStamp:        strings.TrimSpace(ws.OrderTimeStamp),
+	}
+}
+
 // ── shadow comparison ───────────────────────────────────────────────────
 
 func (b *BroadcastListener) enqueueShadow(ucc string, ws *indira.WSOrderStatus, at time.Time) {
@@ -628,7 +821,7 @@ func (b *BroadcastListener) enqueueShadow(ucc string, ws *indira.WSOrderStatus, 
 		b.stats.Dropped.Add(1)
 		return
 	}
-	item := shadowItem{ucc: ucc, brokerOrderID: id, status: strings.ToUpper(strings.TrimSpace(ws.OrderStatus)), seq: eventSeqFrom(ws), at: at}
+	item := shadowItem{ucc: ucc, brokerOrderID: id, status: strings.ToUpper(strings.TrimSpace(ws.OrderStatus)), seq: eventSeqFrom(ws), at: at, key: equivalentKey(ws)}
 	select {
 	case b.shadowQ <- item:
 	default:
@@ -669,8 +862,26 @@ func (b *BroadcastListener) compareShadow(ctx context.Context, item shadowItem) 
 		return
 	}
 	if row == nil {
+		// No row under this seq. Same event under ANOTHER seq? That is the
+		// question the shadow day must answer before any writing mode.
+		lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		eq, eqErr := b.shadow.LookupEquivalent(lctx, item.key, b.cfg.EquivalentWindow+b.cfg.ShadowWindow)
+		cancel()
+		if eqErr == nil && eq != nil {
+			b.stats.ShadowSeen.Add(1)
+			b.stats.SeqMatchEquivalentOnly.Add(1)
+			mBroadcastShadowRecall.WithLabelValues("true").Inc()
+			mBroadcastShadowSeqMatch.WithLabelValues("equivalent_only").Inc()
+			mBroadcastShadowLead.Observe(eq.ObservedAt.Sub(item.at).Seconds())
+			b.logger.Warn("broadcast shadow: same event stored under a DIFFERENT event_seq — seq numbering differs between sockets",
+				zap.String("ucc", item.ucc), zap.String("broker_order_id", item.brokerOrderID),
+				zap.Int64("broadcast_seq", item.seq), zap.Int64("stored_seq", eq.EventSeq), zap.String("stored_by", string(eq.Source)))
+			return
+		}
 		b.stats.ShadowMissed.Add(1)
+		b.stats.SeqMatchNone.Add(1)
 		mBroadcastShadowRecall.WithLabelValues("false").Inc()
+		mBroadcastShadowSeqMatch.WithLabelValues("none").Inc()
 		// The review list for stage 3: events only the broadcast saw.
 		b.logger.Info("broadcast shadow: frame not seen by per-user path",
 			zap.String("ucc", item.ucc), zap.String("broker_order_id", item.brokerOrderID),
@@ -678,7 +889,9 @@ func (b *BroadcastListener) compareShadow(ctx context.Context, item shadowItem) 
 		return
 	}
 	b.stats.ShadowSeen.Add(1)
+	b.stats.SeqMatchSeq.Add(1)
 	mBroadcastShadowRecall.WithLabelValues("true").Inc()
+	mBroadcastShadowSeqMatch.WithLabelValues("seq").Inc()
 	lead := row.ObservedAt.Sub(item.at).Seconds() // >0: broadcast was earlier
 	mBroadcastShadowLead.Observe(lead)
 	b.logger.Debug("broadcast shadow: matched",

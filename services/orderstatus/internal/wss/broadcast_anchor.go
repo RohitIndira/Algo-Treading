@@ -95,7 +95,9 @@ func (b *BroadcastListener) pickAnchor(ctx context.Context) *indira.AuthContext 
 			zap.String("anchor_user", cfgUser))
 	}
 
-	ids, err := b.users.ListActiveUserIDs(ctx)
+	lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ids, err := b.users.ListActiveUserIDs(lctx)
+	cancel()
 	if err != nil {
 		b.logger.Warn("broadcast anchor: ListActiveUserIDs failed", zap.Error(err))
 		return nil
@@ -122,7 +124,9 @@ func (b *BroadcastListener) pickAnchor(ctx context.Context) *indira.AuthContext 
 
 // candidate fetches userID's credentials and applies the eligibility rules.
 func (b *BroadcastListener) candidate(ctx context.Context, userID string, now time.Time) *anchorCandidate {
-	auth, err := b.users.FetchUserCredentials(ctx, userID)
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	auth, err := b.users.FetchUserCredentials(fctx, userID)
+	cancel()
 	if err != nil {
 		b.logger.Debug("broadcast anchor: credentials fetch failed", zap.String("user_id", userID), zap.Error(err))
 		return nil
@@ -143,8 +147,13 @@ func (b *BroadcastListener) candidate(ctx context.Context, userID string, now ti
 		relogin := !iat.IsZero() && iat.After(deadAt)
 		expired := now.Sub(deadAt) > b.cfg.DeadAnchorTTL
 		if relogin || expired {
+			// Retry the session. Only a real re-login (newer iat) re-arms
+			// the alert; a plain TTL retry of the same dead token must not
+			// page the operator again every 30 minutes.
 			delete(b.deadAnchors, userID)
-			delete(b.alertedDead, userID)
+			if relogin {
+				delete(b.alertedDead, userID)
+			}
 			dead = false
 		}
 	}
@@ -156,12 +165,17 @@ func (b *BroadcastListener) candidate(ctx context.Context, userID string, now ti
 }
 
 // markAnchorDead retires a session after the broker rejected it, and alerts
-// once per session (not once per retry).
+// once per session (not once per retry), only in market hours — like the
+// stale alert, a session that died overnight is reported at the first
+// attempt after the open, not at 02:00.
 func (b *BroadcastListener) markAnchorDead(ctx context.Context, userID string, cause error) {
+	now := b.cfg.Clock.Now()
 	b.anchorMu.Lock()
-	b.deadAnchors[userID] = b.cfg.Clock.Now()
-	alerted := b.alertedDead[userID]
-	b.alertedDead[userID] = true
+	b.deadAnchors[userID] = now
+	alerted := b.alertedDead[userID] || !b.cfg.MarketOpen(now)
+	if !alerted {
+		b.alertedDead[userID] = true
+	}
 	b.anchorMu.Unlock()
 	b.stats.AnchorSwitches.Add(1)
 	mBroadcastAnchorSwitches.Inc()

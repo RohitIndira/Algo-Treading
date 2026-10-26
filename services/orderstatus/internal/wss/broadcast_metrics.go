@@ -62,6 +62,18 @@ var (
 		Name: "broadcast_token_errors_total",
 		Help: "Failed createWsToken calls (any anchor).",
 	})
+	mBroadcastShadowSeqMatch = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "broadcast_shadow_seq_match_total",
+		Help: "Shadow mode: per managed frame, 'seq' = per-user path stored the same (broker_order_id, event_seq); 'equivalent_only' = same event content stored under a different seq (primary dedup would NOT hold); 'none' = not seen by the per-user path.",
+	}, []string{"match"})
+	mBroadcastPartialParse = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "broadcast_partial_parse_total",
+		Help: "Order frames kept despite a JSON type mismatch on a non-routing field (broker flips number/string types).",
+	})
+	mBroadcastQueueDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "broadcast_write_queue_dropped_total",
+		Help: "own_orders / all: frames dropped because the bounded write queue (10000) was full.",
+	})
 	mBroadcastAnchorSwitches = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "broadcast_anchor_switches_total",
 		Help: "Times the listener had to give up on an anchor session and pick another.",

@@ -47,13 +47,19 @@ func New(addr string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial trade-execution %s: %w", addr, err)
 	}
+	c := newWithRPC(pb.NewTradeExecutionServiceClient(conn))
+	c.conn = conn
+	return c, nil
+}
+
+// newWithRPC builds a Client over an existing RPC stub (tests).
+func newWithRPC(rpc pb.TradeExecutionServiceClient) *Client {
 	return &Client{
-		conn:        conn,
-		rpc:         pb.NewTradeExecutionServiceClient(conn),
+		rpc:         rpc,
 		positive:    map[string]struct{}{},
 		negative:    map[string]time.Time{},
 		negativeTTL: 60 * time.Second,
-	}, nil
+	}
 }
 
 // Close shuts the gRPC connection.
@@ -71,12 +77,14 @@ func (c *Client) IsOurOrder(ctx context.Context, brokerOrderID string) (bool, er
 	if brokerOrderID == "" {
 		return false, nil
 	}
+	now := time.Now()
 	c.mu.Lock()
 	if _, ok := c.positive[brokerOrderID]; ok {
 		c.mu.Unlock()
 		return true, nil
 	}
-	if until, ok := c.negative[brokerOrderID]; ok && time.Now().Before(until) {
+	c.evictExpiredLocked(now)
+	if _, ok := c.negative[brokerOrderID]; ok {
 		c.mu.Unlock()
 		return false, nil
 	}
@@ -88,6 +96,14 @@ func (c *Client) IsOurOrder(ctx context.Context, brokerOrderID string) (bool, er
 	if err != nil {
 		return false, fmt.Errorf("LookupOrderMeta %s: %w", brokerOrderID, err)
 	}
+	if resp == nil {
+		return false, fmt.Errorf("LookupOrderMeta %s: empty response", brokerOrderID)
+	}
+	// A service-level error is "could not decide", never "not ours": no
+	// negative cache, so the next frame asks again.
+	if e := resp.GetError(); e != nil {
+		return false, fmt.Errorf("LookupOrderMeta %s: %s %s", brokerOrderID, e.GetCode(), e.GetMessage())
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -96,6 +112,15 @@ func (c *Client) IsOurOrder(ctx context.Context, brokerOrderID string) (bool, er
 		delete(c.negative, brokerOrderID)
 		return true, nil
 	}
-	c.negative[brokerOrderID] = time.Now().Add(c.negativeTTL)
+	c.negative[brokerOrderID] = now.Add(c.negativeTTL)
 	return false, nil
+}
+
+// evictExpiredLocked drops negative entries past their TTL. Called with c.mu held.
+func (c *Client) evictExpiredLocked(now time.Time) {
+	for id, until := range c.negative {
+		if !now.Before(until) {
+			delete(c.negative, id)
+		}
+	}
 }

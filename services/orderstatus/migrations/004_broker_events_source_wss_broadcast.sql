@@ -15,9 +15,15 @@ BEGIN;
 
 ALTER TABLE broker_events DROP CONSTRAINT IF EXISTS chk_broker_events_source;
 
+-- NOT VALID: new rows are checked at once, existing rows are not scanned under
+-- the ACCESS EXCLUSIVE lock. VALIDATE then scans with only a SHARE UPDATE
+-- EXCLUSIVE lock, so the live writers (per-user socket, REST polls) are not
+-- blocked for the duration of the table scan.
 ALTER TABLE broker_events ADD CONSTRAINT chk_broker_events_source CHECK (source IN (
     'WSS', 'WSS_BROADCAST', 'REST_ORDERBOOK', 'REST_RECONCILER', 'REST_TRADEBOOK'
-));
+)) NOT VALID;
+
+ALTER TABLE broker_events VALIDATE CONSTRAINT chk_broker_events_source;
 
 COMMENT ON COLUMN broker_events.source IS
     'Where the event was observed: WSS (per-user socket), WSS_BROADCAST (dealer broadcast socket), REST_ORDERBOOK, REST_RECONCILER, REST_TRADEBOOK.';

@@ -36,7 +36,9 @@ type fakeBroker struct {
 	conns      []*websocket.Conn
 	handshakes []string // raw handshake frames in order
 	heartbeats []string
-	rejectNext bool // reply {"status":"Not Ok"} to the next handshake
+	rejectNext bool   // reply {"status":"Not Ok"} to the next handshake
+	earlyFrame string // order frame pushed BEFORE the handshake reply
+	dialStatus int    // non-zero: refuse the websocket upgrade with this HTTP status
 }
 
 func newFakeBroker(t *testing.T) *fakeBroker {
@@ -64,6 +66,13 @@ func newFakeBroker(t *testing.T) *fakeBroker {
 		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"Ok","result":[{"orderToken":"%s"}]}`, tok)))
 	})
 	mux.HandleFunc(indira.BroadcastWSPath, func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		ds := fb.dialStatus
+		fb.mu.Unlock()
+		if ds != 0 {
+			w.WriteHeader(ds)
+			return
+		}
 		c, err := up.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -85,6 +94,12 @@ func newFakeBroker(t *testing.T) *fakeBroker {
 			_ = c.WriteMessage(websocket.TextMessage, []byte(`{"status":"Not Ok"}`))
 			c.Close()
 			return
+		}
+		fb.mu.Lock()
+		early := fb.earlyFrame
+		fb.mu.Unlock()
+		if early != "" {
+			_ = c.WriteMessage(websocket.TextMessage, []byte(early))
 		}
 		// Reply first, register after: from here on only send/dropAll (under
 		// fb.mu) write on this conn, so writers never overlap.
@@ -234,6 +249,27 @@ func (m *memWriter) LookupObserved(_ context.Context, id string, seq int64) (*st
 	return &store.ObservedRow{Source: m.src[k], ObservedAt: at}, nil
 }
 
+func (m *memWriter) LookupEquivalent(_ context.Context, key store.EquivalentKey, within time.Duration) (*store.EquivalentRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var best *store.EquivalentRow
+	for _, r := range m.rows {
+		at := m.seen[m.key(r.BrokerOrderID, r.EventSeq)]
+		if time.Since(at) > within {
+			continue
+		}
+		var raw struct{ LastModifiedTimeStamp, OrderTimeStamp string }
+		_ = json.Unmarshal(r.RawPayload, &raw)
+		if r.BrokerOrderID == key.BrokerOrderID && r.Status == key.Status && r.FilledQty == key.FilledQty &&
+			r.TradedPrice == key.TradedPrice && raw.LastModifiedTimeStamp == key.LastModifiedTimeStamp && raw.OrderTimeStamp == key.OrderTimeStamp {
+			if best == nil || at.After(best.ObservedAt) {
+				best = &store.EquivalentRow{Source: r.Source, EventSeq: r.EventSeq, ObservedAt: at}
+			}
+		}
+	}
+	return best, nil
+}
+
 func (m *memWriter) count() int { m.mu.Lock(); defer m.mu.Unlock(); return len(m.rows) }
 func (m *memWriter) all() []*store.Event {
 	m.mu.Lock()
@@ -321,7 +357,15 @@ const (
 
 func newHarness(t *testing.T, mode Mode, cfgMut func(*BroadcastConfig), own OwnOrderLookup) *harness {
 	t.Helper()
+	return newHarnessWith(t, mode, cfgMut, own, nil)
+}
+
+func newHarnessWith(t *testing.T, mode Mode, cfgMut func(*BroadcastConfig), own OwnOrderLookup, fbMut func(*fakeBroker)) *harness {
+	t.Helper()
 	fb := newFakeBroker(t)
+	if fbMut != nil {
+		fbMut(fb)
+	}
 	now := time.Now()
 	users := &fakeUsers{users: []string{userS4450, userFIV99}, creds: map[string]*indira.AuthContext{}}
 	tokS := fakeJWT(userS4450, now.Add(-2*time.Hour), now.Add(10*time.Hour))
@@ -341,6 +385,8 @@ func newHarness(t *testing.T, mode Mode, cfgMut func(*BroadcastConfig), own OwnO
 		HeartbeatInterval: time.Hour, // real clock tests: never fires
 		MaxSilence:        5 * time.Second,
 		Backoff:           []time.Duration{10 * time.Millisecond, 20 * time.Millisecond},
+		NoAnchorBackoff:   30 * time.Millisecond,
+		PingInterval:      time.Hour,
 		ShadowWindow:      50 * time.Millisecond,
 		StaleCheckEvery:   time.Hour,
 		ManagedRefresh:    time.Hour,
@@ -393,6 +439,9 @@ func TestParseMode(t *testing.T) {
 		if err != nil || got != want {
 			t.Fatalf("ParseMode(%q) = %q, %v; want %q", in, got, err, want)
 		}
+	}
+	if got, err := ParseMode("Shadow   # compare only"); err != nil || got != ModeShadow {
+		t.Fatalf("ParseMode with trailing text = %q, %v", got, err)
 	}
 	if _, err := ParseMode("maybe"); err == nil {
 		t.Fatal("ParseMode(maybe) should error")
@@ -538,6 +587,7 @@ func TestBackoffNoBusyLoop(t *testing.T) {
 	var calls atomic.Int32
 	h := newHarness(t, ModeAll, func(c *BroadcastConfig) {
 		c.Backoff = []time.Duration{30 * time.Millisecond, 60 * time.Millisecond}
+		c.NoAnchorBackoff = 60 * time.Millisecond
 	}, nil)
 	waitFor(t, "connect", h.bl.Connected)
 	// Point the listener at a dead broker by revoking every session: token
@@ -561,7 +611,10 @@ func TestBackoffNoBusyLoop(t *testing.T) {
 func TestTokenAuthFailureFallsBackToNextAnchor(t *testing.T) {
 	for _, au004 := range []bool{false, true} {
 		t.Run(fmt.Sprintf("au004=%v", au004), func(t *testing.T) {
-			h := newHarness(t, ModeAll, func(c *BroadcastConfig) { c.AnchorUser = "DEALER1" }, nil)
+			h := newHarness(t, ModeAll, func(c *BroadcastConfig) {
+				c.AnchorUser = "DEALER1"
+				c.MarketOpen = func(time.Time) bool { return true }
+			}, nil)
 			waitFor(t, "initial connect (DEALER1 has no creds yet → fallback)", h.bl.Connected)
 			// Configured dealer login exists but its session is dead at the broker.
 			h.fb.mu.Lock()
@@ -805,5 +858,189 @@ func TestSessionTimes(t *testing.T) {
 	}
 	if iat, exp := sessionTimes("not-a-jwt"); !iat.IsZero() || !exp.IsZero() {
 		t.Fatal("garbage should give zero times")
+	}
+}
+
+// frameTS is frame() plus broker timestamps and a per-trade fill (for the
+// content-equivalence guard).
+func frameTS(ucc, id, status string, seq int, filled int, price string) string {
+	return fmt.Sprintf(`{"UCC":"%s","Symbol":"KEI","Buy_Sell":"2","OrderStatus":"%s","OrderOriginalQty":10,"TradeQty":"%d","TradedQTY":"0","TradedPrice":"%s","UniqueCode":"%s","MessageSequenceNumber":%d,"LastModifiedTimeStamp":"26-Oct-2026 10:01:02","OrderTimeStamp":"26-Oct-2026 10:00:00"}`,
+		ucc, status, filled, price, id, seq)
+}
+
+// Review item 1: the same event numbered differently on the two sockets must
+// not be written twice — content equivalence within the window skips it.
+func TestEquivalentEventUnderDifferentSeqIsSkipped(t *testing.T) {
+	h := newHarness(t, ModeAll, nil, nil)
+	waitFor(t, "connect", h.bl.Connected)
+	var ws indira.WSOrderStatus
+	_ = json.Unmarshal([]byte(frameTS("S4450", "ORD-EQ", "EXECUTED", 500, 10, "101.5")), &ws)
+	h.sink.handleWSEvent(context.Background(), &ws) // per-user socket: seq 500
+
+	h.fb.send(frameTS("S4450", "ORD-EQ", "EXECUTED", 501, 10, "101.5")) // same event, seq 501
+	waitFor(t, "equivalent skip", func() bool { return h.bl.Stats().EquivalentSkipped.Load() == 1 })
+	if h.mem.count() != 1 {
+		t.Fatalf("rows = %d, want 1 — manual sell would be booked twice", h.mem.count())
+	}
+	// A genuinely different event of the same order (second partial fill at
+	// another price) is still written.
+	h.fb.send(frameTS("S4450", "ORD-EQ", "EXECUTED", 502, 10, "101.7"))
+	waitFor(t, "distinct event stored", func() bool { return h.mem.count() == 2 })
+	// And the identical seq path still dedupes via the primary key.
+	h.fb.send(frameTS("S4450", "ORD-EQ", "EXECUTED", 500, 10, "101.5"))
+	waitFor(t, "primary dedup", func() bool { return h.bl.Stats().Deduped.Load() == 1 })
+	if h.mem.count() != 2 || h.bl.Stats().EquivalentSkipped.Load() != 1 {
+		t.Fatalf("rows=%d equivalent_skipped=%d", h.mem.count(), h.bl.Stats().EquivalentSkipped.Load())
+	}
+}
+
+// Review item 1 (shadow): per matched event, record whether the seqs agree.
+func TestShadowSeqMatchCounters(t *testing.T) {
+	h := newHarness(t, ModeShadow, nil, nil)
+	waitFor(t, "connect", h.bl.Connected)
+	var ws indira.WSOrderStatus
+	_ = json.Unmarshal([]byte(frameTS("S4450", "ORD-S1", "EXECUTED", 600, 10, "101.5")), &ws)
+	h.sink.handleWSEvent(context.Background(), &ws)
+	_ = json.Unmarshal([]byte(frameTS("S4450", "ORD-S2", "EXECUTED", 700, 10, "101.5")), &ws)
+	h.sink.handleWSEvent(context.Background(), &ws)
+
+	h.fb.send(frameTS("S4450", "ORD-S1", "EXECUTED", 600, 10, "101.5")) // same seq
+	h.fb.send(frameTS("S4450", "ORD-S2", "EXECUTED", 701, 10, "101.5")) // same event, other seq
+	h.fb.send(frameTS("S4450", "ORD-S3", "EXECUTED", 800, 10, "101.5")) // broadcast only
+	waitFor(t, "3 comparisons", func() bool {
+		s := h.bl.Stats()
+		return s.SeqMatchSeq.Load()+s.SeqMatchEquivalentOnly.Load()+s.SeqMatchNone.Load() == 3
+	})
+	s := h.bl.Stats()
+	if s.SeqMatchSeq.Load() != 1 || s.SeqMatchEquivalentOnly.Load() != 1 || s.SeqMatchNone.Load() != 1 {
+		t.Fatalf("seq=%d equivalent_only=%d none=%d", s.SeqMatchSeq.Load(), s.SeqMatchEquivalentOnly.Load(), s.SeqMatchNone.Load())
+	}
+	if s.ShadowSeen.Load() != 2 || s.ShadowMissed.Load() != 1 || h.mem.count() != 2 {
+		t.Fatalf("seen=%d missed=%d rows=%d", s.ShadowSeen.Load(), s.ShadowMissed.Load(), h.mem.count())
+	}
+}
+
+// Review item 2: a type mismatch on a non-routing field keeps the frame.
+func TestPartialParseKeepsFrame(t *testing.T) {
+	h := newHarness(t, ModeAll, nil, nil)
+	waitFor(t, "connect", h.bl.Connected)
+	h.fb.send(`{"UCC":"S4450","Symbol":"KEI","Buy_Sell":"2","OrderStatus":"EXECUTED","TriggerPrice":"0.00","OrderOriginalQty":"25","TradeQty":"5","TradedPrice":"99.5","UniqueCode":"ORD-P","MessageSequenceNumber":"31"}`)
+	waitFor(t, "row stored", func() bool { return h.mem.count() == 1 })
+	s := h.bl.Stats()
+	if s.Partial.Load() != 1 || s.Malformed.Load() != 0 {
+		t.Fatalf("partial=%d malformed=%d", s.Partial.Load(), s.Malformed.Load())
+	}
+	r := h.mem.all()[0]
+	if r.BrokerOrderID != "ORD-P" || r.EventSeq != 31 || r.FilledQty != 5 || r.TradedPrice != 99.5 || r.Status != "EXECUTED" {
+		t.Fatalf("row = %+v", r)
+	}
+	// Routing key lost → still malformed.
+	h.fb.send(`{"UCC":"S4450","OrderStatus":"EXECUTED","UniqueCode":12345,"MessageSequenceNumber":32}`)
+	waitFor(t, "malformed counted", func() bool { return h.bl.Stats().Malformed.Load() == 1 })
+}
+
+// Review item 4: dead-anchor alert once per session; a TTL retry does not
+// re-fire; a re-login re-arms; nothing fires outside market hours.
+func TestDeadAnchorAlertSemantics(t *testing.T) {
+	clk := newFakeClock()
+	open := true
+	now := clk.Now()
+	users := &fakeUsers{users: []string{"A"}, creds: map[string]*indira.AuthContext{}}
+	users.set("A", fakeJWT("A", now.Add(-time.Hour), now.Add(24*time.Hour)))
+	logger := zap.NewNop()
+	client := indira.NewClient(indira.Config{BaseURL: "http://127.0.0.1:1"})
+	alerts := &fakeAlerter{}
+	b := NewBroadcastListener(BroadcastConfig{Mode: ModeShadow, Clock: clk, DeadAnchorTTL: 30 * time.Minute,
+		MarketOpen: func(time.Time) bool { return open }},
+		client, NewListener(client, newMemWriter(), nil, logger), users, nil, nil, alerts, logger)
+	ctx := context.Background()
+	count := func() int {
+		n := 0
+		for _, k := range alerts.list() {
+			if k == "BROADCAST_ANCHOR_LOST:A" {
+				n++
+			}
+		}
+		return n
+	}
+
+	b.markAnchorDead(ctx, "A", errors.New("401"))
+	if count() != 1 || b.pickAnchor(ctx) != nil {
+		t.Fatalf("first death: alerts=%d, anchor=%v", count(), b.pickAnchor(ctx))
+	}
+	// TTL passes: the session is retried, but rejected again → no new alert.
+	clk.Advance(31 * time.Minute)
+	if a := b.pickAnchor(ctx); a == nil || a.UserId != "A" {
+		t.Fatal("TTL retry should offer A again")
+	}
+	b.markAnchorDead(ctx, "A", errors.New("401 again"))
+	if count() != 1 {
+		t.Fatalf("TTL retry re-fired the alert: %d", count())
+	}
+	// Re-login (newer iat) → eligible again, alert re-armed.
+	users.set("A", fakeJWT("A", clk.Now().Add(time.Second), clk.Now().Add(24*time.Hour)))
+	if a := b.pickAnchor(ctx); a == nil {
+		t.Fatal("re-login should revive A")
+	}
+	b.markAnchorDead(ctx, "A", errors.New("401 after relogin"))
+	if count() != 2 {
+		t.Fatalf("re-login death should alert again: %d", count())
+	}
+	// Market closed: no alert, but the death is recorded and stays pending.
+	open = false
+	users.set("A", fakeJWT("A", clk.Now().Add(time.Minute), clk.Now().Add(24*time.Hour)))
+	_ = b.pickAnchor(ctx)
+	b.markAnchorDead(ctx, "A", errors.New("401 at night"))
+	if count() != 2 {
+		t.Fatalf("alert outside market hours: %d", count())
+	}
+	// ...and fires on the next rejection once the market is open (same token).
+	open = true
+	clk.Advance(31 * time.Minute)
+	_ = b.pickAnchor(ctx)
+	b.markAnchorDead(ctx, "A", errors.New("401 at open"))
+	if count() != 3 {
+		t.Fatalf("pending night death should alert at open: %d", count())
+	}
+}
+
+// Review item 8: an order frame delivered before the handshake reply is data,
+// not a rejection.
+func TestEarlyOrderFrameBeforeHandshakeReply(t *testing.T) {
+	h := newHarnessWith(t, ModeAll, nil, nil, func(fb *fakeBroker) {
+		fb.earlyFrame = frame("S4450", "ORD-EARLY", "PENDING", 1)
+	})
+	waitFor(t, "connect", h.bl.Connected)
+	waitFor(t, "early frame stored", func() bool { return h.mem.count() == 1 })
+	if h.bl.Stats().AnchorSwitches.Load() != 0 || h.bl.CurrentAnchor() != userFIV99 {
+		t.Fatalf("anchor retired on an early order frame: switches=%d anchor=%s", h.bl.Stats().AnchorSwitches.Load(), h.bl.CurrentAnchor())
+	}
+}
+
+// Review item 9: an HTTP 401 on the websocket upgrade retires the anchor.
+func TestDialUnauthorizedRetiresAnchor(t *testing.T) {
+	h := newHarness(t, ModeAll, nil, nil)
+	waitFor(t, "connect", h.bl.Connected)
+	h.fb.mu.Lock()
+	h.fb.dialStatus = http.StatusUnauthorized
+	h.fb.mu.Unlock()
+	h.fb.dropAll()
+	waitFor(t, "anchor switch", func() bool { return h.bl.Stats().AnchorSwitches.Load() >= 1 })
+	h.fb.mu.Lock()
+	h.fb.dialStatus = 0
+	h.fb.mu.Unlock()
+	waitFor(t, "reconnected on the other session", func() bool { return h.bl.Connected() && h.bl.CurrentAnchor() == userS4450 })
+}
+
+// Review item 6: pongs keep a frameless connection alive past MaxSilence.
+func TestPingPongKeepsQuietConnectionAlive(t *testing.T) {
+	h := newHarness(t, ModeShadow, func(c *BroadcastConfig) {
+		c.MaxSilence = 120 * time.Millisecond
+		c.PingInterval = 30 * time.Millisecond
+	}, nil)
+	waitFor(t, "connect", h.bl.Connected)
+	time.Sleep(500 * time.Millisecond) // > 4× MaxSilence with no frames
+	if h.bl.Stats().Connects.Load() != 1 || !h.bl.Connected() || h.fb.tokensIssued() != 1 {
+		t.Fatalf("quiet connection churned: connects=%d tokens=%d connected=%v", h.bl.Stats().Connects.Load(), h.fb.tokensIssued(), h.bl.Connected())
 	}
 }

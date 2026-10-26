@@ -219,9 +219,12 @@ func main() {
 	//                (trade-execution LookupOrderMeta; TRADE_EXEC_GRPC_ADDR)
 	//   all        → write/publish every managed-client frame
 	// Rollback: BROADCAST_FEED_MODE=off + restart. Read-only toward the broker.
+	// A bad value must never crash-loop the whole order pipeline (PM2 would
+	// give up after max_restarts): log loudly and run with the feed off.
 	bmode, err := wss.ParseMode(getEnv("BROADCAST_FEED_MODE", "shadow"))
 	if err != nil {
-		logger.Fatal("bad BROADCAST_FEED_MODE", zap.Error(err))
+		logger.Error("bad BROADCAST_FEED_MODE — running with the broadcast feed OFF", zap.Error(err))
+		bmode = wss.ModeOff
 	}
 	var broadcast *wss.BroadcastListener
 	bctx, bcancel := context.WithCancel(context.Background())
