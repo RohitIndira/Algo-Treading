@@ -82,8 +82,17 @@ func TestBrokerState_RoundTripAndNotHeldExit(t *testing.T) {
 	if status != StatusExited || reason != ExitReasonNotHeldAtBroker {
 		t.Fatalf("after exit: %s %s", status, reason)
 	}
-	// Verdict writes are refused on a closed lot.
-	if ok, err := s.SetBrokerState(ctx, posID, BrokerStateHeld, "x", nil, at, "sweep"); err != nil || ok {
-		t.Fatalf("SetBrokerState on EXITED must be a no-op: ok=%v err=%v", ok, err)
+	// Verdict writes land on a closed lot too (a closure records the verdict
+	// that caused it), and clear the stale flag.
+	if _, err := s.db.ExecContext(ctx, `UPDATE positions SET broker_state_stale = true WHERE position_id = $1`, posID); err != nil {
+		t.Fatalf("set stale: %v", err)
+	}
+	if ok, err := s.SetBrokerState(ctx, posID, BrokerStateNotHeld, "Broker holds 0", nil, at, "sweep"); err != nil || !ok {
+		t.Fatalf("SetBrokerState on EXITED must write: ok=%v err=%v", ok, err)
+	}
+	var stale bool
+	_ = s.db.QueryRowContext(ctx, `SELECT broker_state, broker_state_stale FROM positions WHERE position_id=$1`, posID).Scan(&status, &stale)
+	if status != BrokerStateNotHeld || stale {
+		t.Fatalf("after write on EXITED: state=%s stale=%v", status, stale)
 	}
 }

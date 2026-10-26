@@ -750,7 +750,9 @@ func (s *Store) SumRealizedPartials(ctx context.Context, positionID uuid.UUID) (
 // the broker was read and which trigger did it (login | sweep | manual). The
 // api-gateway reconciler is the production writer; this method keeps the
 // store the single Go owner of the column set. Idempotent; returns false
-// when the row is not ACTIVE (nothing written).
+// when the row does not exist. Writes onto EXITED rows too — a closure
+// records the verdict (NOT_HELD / SOLD_TODAY) that caused it. Clears the
+// stale flag (a fresh truthful read).
 func (s *Store) SetBrokerState(ctx context.Context, positionID uuid.UUID, state, reason string, evidenceJSON []byte, checkedAt time.Time, source string) (bool, error) {
 	if checkedAt.IsZero() {
 		checkedAt = time.Now()
@@ -766,9 +768,9 @@ func (s *Store) SetBrokerState(ctx context.Context, positionID uuid.UUID, state,
 		    broker_state_evidence = $4::jsonb,
 		    broker_checked_at     = $5,
 		    broker_state_source   = NULLIF($6, ''),
+		    broker_state_stale    = false,
 		    updated_at            = NOW()
-		WHERE position_id = $1
-		  AND status = 'ACTIVE'`, positionID, state, reason, ev, checkedAt, source)
+		WHERE position_id = $1`, positionID, state, reason, ev, checkedAt, source)
 	if err != nil {
 		return false, fmt.Errorf("SetBrokerState: %w", err)
 	}

@@ -30,11 +30,17 @@
 --   psql -h localhost -p 5442 -U postgres -d positions_db -v ON_ERROR_STOP=1 \
 --     -f services/positions/migrations/007_broker_state.sql
 
+BEGIN;
+
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS broker_state          VARCHAR(16);
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS broker_state_reason   TEXT;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS broker_state_evidence JSONB;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS broker_checked_at     TIMESTAMPTZ;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS broker_state_source   VARCHAR(8);
+-- broker_state_stale: the broker could not be read on the latest run (dead
+-- session / partial read) — broker_state keeps the LAST TRUTH and this flag
+-- says it is not fresh (broker_checked_at is the last truthful read).
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS broker_state_stale    BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE positions DROP CONSTRAINT IF EXISTS chk_positions_broker_state;
 ALTER TABLE positions ADD CONSTRAINT chk_positions_broker_state
@@ -55,3 +61,5 @@ COMMENT ON COLUMN positions.broker_state IS
     'Latest broker-vs-book verdict: HELD | PLEDGED | NOT_HELD | SOLD_TODAY | QTY_MISMATCH | UNVERIFIED (api-gateway book reconciler).';
 COMMENT ON COLUMN positions.broker_state_reason IS
     'Plain-language reason for broker_state, shown verbatim in the admin console and the client app.';
+
+COMMIT;
