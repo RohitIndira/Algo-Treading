@@ -107,6 +107,13 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
+// BaseURL returns the REST base URL this client talks to (INDIRA_BASE_URL
+// or FallbackBaseURL). Used to derive the order-notify WebSocket URL so a
+// test can point both REST and WS at one httptest server.
+func (c *Client) BaseURL() string {
+	return c.baseURL
+}
+
 // ============ Helper Methods ============
 
 // doRequest performs an HTTP request with per-request authentication headers

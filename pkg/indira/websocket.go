@@ -29,6 +29,12 @@ const (
 	wsEndpoint = "wss://livemiddleware.indiratrade.com/order-notify/websocket"
 	wsTokenAPI = "/order-notify/ws/createWsToken"
 
+	// BroadcastWSPath is the dealer broadcast socket: one handshake with any
+	// valid (userId, orderToken) delivers order-status frames for EVERY
+	// client of the dealer. Path is relative to the client's BaseURL with the
+	// scheme switched to ws/wss. Verified live 2026-10-26.
+	BroadcastWSPath = "/order-notify/websocket/broadcast"
+
 	// tokenRefreshPeriod refreshes the WS token proactively before the typical 1-hour expiry.
 	tokenRefreshPeriod = 50 * time.Minute
 )
@@ -147,7 +153,15 @@ func (w *WSClient) SendMessage(payload interface{}) error {
 
 // GetWebSocketToken hits the REST API to exchange the user's session token for a WebSocket Order Token.
 func (w *WSClient) GetWebSocketToken(ctx context.Context) (string, error) {
-	resp, err := w.client.doRequest(ctx, w.auth, "GET", wsTokenAPI, nil)
+	return w.client.GetWebSocketToken(ctx, w.auth)
+}
+
+// GetWebSocketToken exchanges auth's session token for an order-notify
+// WebSocket token (GET /order-notify/ws/createWsToken). The same token works
+// for the per-user socket and for the dealer broadcast socket
+// (BroadcastWSPath). An expired session surfaces as ErrAuthExpired.
+func (c *Client) GetWebSocketToken(ctx context.Context, auth *AuthContext) (string, error) {
+	resp, err := c.doRequest(ctx, auth, "GET", wsTokenAPI, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to call createWsToken API: %w", err)
 	}
