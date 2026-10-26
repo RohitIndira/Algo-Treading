@@ -100,12 +100,15 @@ func main() {
 	deadline := time.Now().Add(time.Duration(*minutes) * time.Minute)
 	perUCC := map[string]int{}
 	frames, other := 0, 0
+	// One read deadline for the whole run: gorilla treats a deadline timeout
+	// as a permanent failure (a further ReadMessage panics), so a quiet feed
+	// must end the loop rather than be "continued".
+	_ = conn.SetReadDeadline(deadline)
 	for time.Now().Before(deadline) && ctx.Err() == nil {
-		_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			if ne, ok := err.(interface{ Timeout() bool }); ok && ne.Timeout() {
-				continue // quiet feed — keep waiting
+				break // listening window over
 			}
 			fmt.Fprintln(os.Stderr, "read:", err)
 			break
