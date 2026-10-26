@@ -33,6 +33,24 @@ const (
 	ExitReasonManualExit   = "MANUAL_EXIT"
 	ExitReasonStrategyExit = "STRATEGY_EXIT"
 	ExitReasonLiquidation  = "LIQUIDATION"
+	// ExitReasonAdminGhostCleanup — the admin console's manual ghost heal
+	// (migration 006). ExitReasonNotHeldAtBroker — the automated book
+	// reconciler closed the lot because the broker no longer holds it
+	// (migration 007); exit_price is NULL (unknown).
+	ExitReasonAdminGhostCleanup = "ADMIN_GHOST_CLEANUP"
+	ExitReasonNotHeldAtBroker   = "NOT_HELD_AT_BROKER"
+)
+
+// BrokerState — matches the CHECK constraint on positions.broker_state
+// (migration 007): the latest book-vs-broker verdict for the lot, written by
+// the api-gateway book reconciler on login / every 15 min / on demand.
+const (
+	BrokerStateHeld        = "HELD"
+	BrokerStatePledged     = "PLEDGED"
+	BrokerStateNotHeld     = "NOT_HELD"
+	BrokerStateSoldToday   = "SOLD_TODAY"
+	BrokerStateQtyMismatch = "QTY_MISMATCH"
+	BrokerStateUnverified  = "UNVERIFIED"
 )
 
 // PositionEventType — matches the loose set of strings expected in
@@ -79,23 +97,29 @@ type Position struct {
 	EntryBrokerOrderID string
 	ExitBrokerOrderID  string
 
-	CurrentSL       float64
-	HighSinceEntry  float64
-	LastTrailLevel  float64
+	CurrentSL      float64
+	HighSinceEntry float64
+	LastTrailLevel float64
+
+	// Broker verdict (migration 007). Empty / zero until the book reconciler
+	// has checked the lot once. BrokerCheckedAt.IsZero() means NULL.
+	BrokerState       string
+	BrokerStateReason string
+	BrokerCheckedAt   time.Time
 }
 
 // PositionEvent is one audit row. `SourceEventID` is the idempotency key —
 // per (position_id, source_event_id) UNIQUE index. Same event replayed via
 // Kafka → INSERT no-ops via ON CONFLICT DO NOTHING.
 type PositionEvent struct {
-	PositionID        uuid.UUID
-	EventType         string
-	BrokerOrderID     string
-	SignalID          string
-	DeltaQty          int // positive on entry, negative on exit
-	FillPrice         float64
-	RealizedPnLDelta  float64
-	Reason            string
+	PositionID       uuid.UUID
+	EventType        string
+	BrokerOrderID    string
+	SignalID         string
+	DeltaQty         int // positive on entry, negative on exit
+	FillPrice        float64
+	RealizedPnLDelta float64
+	Reason           string
 
 	RawSourceEvent []byte // full order.events envelope JSON
 	SourceTopic    string // "order.events" for the P.C hot path

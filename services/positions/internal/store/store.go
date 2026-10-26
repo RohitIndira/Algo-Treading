@@ -470,7 +470,8 @@ const positionColumns = `
 	entry_price, entry_time, quantity, invested_amount,
 	exit_price, exit_time, exit_reason, realized_pnl,
 	entry_broker_order_id, exit_broker_order_id,
-	current_sl, high_since_entry, last_trail_level`
+	current_sl, high_since_entry, last_trail_level,
+	broker_state, broker_state_reason, broker_checked_at`
 
 const insertPositionSQL = `
 	INSERT INTO positions (
@@ -510,20 +511,25 @@ func insertPositionArgs(p *Position) []interface{} {
 
 // scanPosition scans one row from positions into a *Position.
 // Accepts either *sql.Row or *sql.Rows via the Scanner interface.
-func scanPosition(sc interface{ Scan(dest ...interface{}) error }) (*Position, error) {
+func scanPosition(sc interface {
+	Scan(dest ...interface{}) error
+}) (*Position, error) {
 	var (
-		p                   Position
-		strategyID          sql.NullString
-		signalID            sql.NullString
-		exitPrice           sql.NullFloat64
-		exitTime            sql.NullTime
-		exitReason          sql.NullString
-		realizedPnL         sql.NullFloat64
-		entryBrokerOrderID  sql.NullString
-		exitBrokerOrderID   sql.NullString
-		currentSL           sql.NullFloat64
-		highSinceEntry      sql.NullFloat64
-		lastTrailLevel      sql.NullFloat64
+		p                  Position
+		strategyID         sql.NullString
+		signalID           sql.NullString
+		exitPrice          sql.NullFloat64
+		exitTime           sql.NullTime
+		exitReason         sql.NullString
+		realizedPnL        sql.NullFloat64
+		entryBrokerOrderID sql.NullString
+		exitBrokerOrderID  sql.NullString
+		currentSL          sql.NullFloat64
+		highSinceEntry     sql.NullFloat64
+		lastTrailLevel     sql.NullFloat64
+		brokerState        sql.NullString
+		brokerStateReason  sql.NullString
+		brokerCheckedAt    sql.NullTime
 	)
 	err := sc.Scan(
 		&p.PositionID, &p.Origin, &p.UserID, &strategyID, &signalID,
@@ -532,9 +538,15 @@ func scanPosition(sc interface{ Scan(dest ...interface{}) error }) (*Position, e
 		&exitPrice, &exitTime, &exitReason, &realizedPnL,
 		&entryBrokerOrderID, &exitBrokerOrderID,
 		&currentSL, &highSinceEntry, &lastTrailLevel,
+		&brokerState, &brokerStateReason, &brokerCheckedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+	p.BrokerState = brokerState.String
+	p.BrokerStateReason = brokerStateReason.String
+	if brokerCheckedAt.Valid {
+		p.BrokerCheckedAt = brokerCheckedAt.Time
 	}
 	p.StrategyID = strategyID.String
 	p.SignalID = signalID.String
@@ -731,4 +743,35 @@ func (s *Store) SumRealizedPartials(ctx context.Context, positionID uuid.UUID) (
 		  FROM position_events
 		 WHERE position_id = $1 AND delta_qty < 0`, positionID).Scan(&sum)
 	return sum, err
+}
+
+// SetBrokerState writes the latest book-vs-broker verdict onto an ACTIVE lot
+// (migration 007): state, the plain-language reason, the JSON evidence, when
+// the broker was read and which trigger did it (login | sweep | manual). The
+// api-gateway reconciler is the production writer; this method keeps the
+// store the single Go owner of the column set. Idempotent; returns false
+// when the row is not ACTIVE (nothing written).
+func (s *Store) SetBrokerState(ctx context.Context, positionID uuid.UUID, state, reason string, evidenceJSON []byte, checkedAt time.Time, source string) (bool, error) {
+	if checkedAt.IsZero() {
+		checkedAt = time.Now()
+	}
+	var ev interface{}
+	if len(evidenceJSON) > 0 {
+		ev = string(evidenceJSON)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE positions
+		SET broker_state          = $2,
+		    broker_state_reason   = $3,
+		    broker_state_evidence = $4::jsonb,
+		    broker_checked_at     = $5,
+		    broker_state_source   = NULLIF($6, ''),
+		    updated_at            = NOW()
+		WHERE position_id = $1
+		  AND status = 'ACTIVE'`, positionID, state, reason, ev, checkedAt, source)
+	if err != nil {
+		return false, fmt.Errorf("SetBrokerState: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
