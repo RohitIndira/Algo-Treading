@@ -106,11 +106,17 @@ type manthanPosition struct {
 	HighSinceEntry float64 `json:"high_since_entry"`
 	CurrentSL      float64 `json:"current_sl"`
 	LastTrailLevel float64 `json:"last_trail_level"`
-	Status         string  `json:"status"`
+	Status         string  `json:"status"` // ACTIVE | PLEDGED (held at the broker but pledged — not managed)
 	EntryTime      string  `json:"entry_time"`
 	DaysHeld       int     `json:"days_held"`
 	StrategyID     string  `json:"strategy_id"`
 	LiveLTP        float64 `json:"live_ltp,omitempty"` // from external Redis, 0 when unavailable
+	// Broker verdict (2026-10-26): set when the book reconciler found the lot
+	// pledged at the broker — status 'PLEDGED', the reason verbatim
+	// ("Pledged: 2850 of 2850 pledged, 0 free — unpledge to let the strategy
+	// manage it"). Additive; empty for a normally held lot.
+	BrokerState       string `json:"broker_state,omitempty"`
+	BrokerStateReason string `json:"broker_state_reason,omitempty"`
 }
 
 type allocationBucket struct {
@@ -333,9 +339,10 @@ func (h *ManthanHandler) loadActivePositions(ctx context.Context, userID, strate
 		       COALESCE(high_since_entry, entry_price),
 		       COALESCE(current_sl, 0),
 		       COALESCE(last_trail_level, entry_price),
-		       status, entry_time
+		       status, entry_time,
+		       CASE WHEN status = 'PLEDGED' THEN COALESCE(protective_last_reason, '') ELSE '' END
 		FROM manthan_positions
-		WHERE user_id = $1 AND status = 'ACTIVE'`
+		WHERE user_id = $1 AND status IN ('ACTIVE','PLEDGED')`
 	args := []any{userID}
 	if strategyID != "" {
 		query += " AND strategy_id = $2"
@@ -354,14 +361,22 @@ func (h *ManthanHandler) loadActivePositions(ctx context.Context, userID, strate
 	for rows.Next() {
 		var p manthanPosition
 		var entryTime time.Time
+		var pledgeReason string
 		if err := rows.Scan(
 			&p.StrategyID, &p.Symbol, &p.ISIN, &p.Industry,
 			&p.MCapBucket, &p.IndexName,
 			&p.EntryPrice, &p.Quantity, &p.InvestedAmt,
 			&p.EMAAllocPct, &p.HighSinceEntry, &p.CurrentSL, &p.LastTrailLevel,
-			&p.Status, &entryTime,
+			&p.Status, &entryTime, &pledgeReason,
 		); err != nil {
 			continue
+		}
+		if p.Status == "PLEDGED" {
+			p.BrokerState = "PLEDGED"
+			p.BrokerStateReason = pledgeReason
+			if p.BrokerStateReason == "" {
+				p.BrokerStateReason = "Pledged – unpledge to let the strategy manage it"
+			}
 		}
 		p.EntryTime = entryTime.Format(time.RFC3339)
 		p.DaysHeld = int(now.Sub(entryTime).Hours() / 24)

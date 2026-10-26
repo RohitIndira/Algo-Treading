@@ -26,6 +26,7 @@ type fakeGate struct {
 
 	previewCalls []string
 	healCalls    []string
+	healPlans    []*GhostPlan
 }
 
 func (f *fakeGate) GhostPreview(_ context.Context, u, s string) (*GhostPlan, error) {
@@ -42,6 +43,7 @@ func (f *fakeGate) GhostPreview(_ context.Context, u, s string) (*GhostPlan, err
 
 func (f *fakeGate) GhostHeal(_ context.Context, p *GhostPlan) (map[string]any, error) {
 	f.healCalls = append(f.healCalls, p.UserID+"/"+p.Symbol)
+	f.healPlans = append(f.healPlans, p)
 	if f.healErr != nil {
 		return nil, f.healErr
 	}
@@ -370,4 +372,320 @@ func TestReaper_NextSweepCadence(t *testing.T) {
 	if n := r.nextSweep().In(ist); n.Weekday() != time.Monday || n.Hour() != 9 || n.Minute() != 20 {
 		t.Fatalf("Sat noon → %s, want Mon 09:20", n.Format("Mon 15:04"))
 	}
+}
+
+// ── book-reconciler (verdict-driven) paths ──────────────────────────────
+
+type fakeActor struct {
+	persisted []Verdict
+	pledged   []string // "user/symbol"
+	unpledged []string
+	pledgeErr error
+	// parkedNow mirrors trading_db truth: "user/symbol" currently PLEDGED.
+	// Pledge/Unpledge report changed=false when the row is already there /
+	// already gone, exactly like the real Actions.
+	parkedNow map[string]bool
+}
+
+func (f *fakeActor) isParked(k string) bool { return f.parkedNow != nil && f.parkedNow[k] }
+
+func (f *fakeActor) PersistVerdicts(_ context.Context, vs []Verdict, _ string) (int64, error) {
+	f.persisted = append(f.persisted, vs...)
+	return int64(len(vs)), nil
+}
+func (f *fakeActor) Pledge(_ context.Context, v Verdict, _ map[string]bool) (map[string]any, error) {
+	if f.pledgeErr != nil {
+		return nil, f.pledgeErr
+	}
+	k := v.UserID + "/" + v.Symbol
+	changed := !f.isParked(k)
+	if f.parkedNow == nil {
+		f.parkedNow = map[string]bool{}
+	}
+	f.parkedNow[k] = true
+	f.pledged = append(f.pledged, k)
+	return map[string]any{"changed": changed}, nil
+}
+func (f *fakeActor) Unpledge(_ context.Context, v Verdict) (map[string]any, error) {
+	k := v.UserID + "/" + v.Symbol
+	changed := f.isParked(k)
+	delete(f.parkedNow, k)
+	f.unpledged = append(f.unpledged, k)
+	return map[string]any{"changed": changed}, nil
+}
+
+func verdict(u, sym, state, prev string) Verdict {
+	return Verdict{UserID: u, StrategyID: "S", Symbol: sym, State: state, PrevState: prev, BookQty: 10,
+		Reason: state + " reason", PositionIDs: []string{"p-" + sym}}
+}
+
+// A PLEDGED verdict is applied exactly once — on the transition — and audited
+// PLEDGED; the same verdict on the next sweep (prev==state) changes nothing.
+func TestReconciler_PledgeOnTransitionOnly(t *testing.T) {
+	gate, audit, actor := &fakeGate{}, &fakeAudit{}, &fakeActor{}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{verdict("FIV99", "SYRMA", BrokerStatePledged, BrokerStateHeld)}},
+	}}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+
+	rep := r.SweepOnce(context.Background())
+	if rep.Pledged != 1 || len(actor.pledged) != 1 || actor.pledged[0] != "FIV99/SYRMA" {
+		t.Fatalf("pledge not applied: %s %v", rep.String(), actor.pledged)
+	}
+	if len(actor.persisted) != 1 || actor.persisted[0].State != BrokerStatePledged {
+		t.Fatalf("verdict not persisted: %+v", actor.persisted)
+	}
+	if len(gate.previewCalls) != 0 {
+		t.Fatalf("a pledged lot must never reach the ghost gate: %v", gate.previewCalls)
+	}
+	if got := audit.results(); len(got) != 1 || got[0] != "PLEDGED" {
+		t.Fatalf("audit: %v", got)
+	}
+
+	// Next sweep: already PLEDGED → no action, verdict still persisted.
+	scan.results["FIV99"].Verdicts[0].PrevState = BrokerStatePledged
+	rep = r.SweepOnce(context.Background())
+	if rep.Pledged != 0 || len(actor.pledged) != 1 || len(actor.persisted) != 2 {
+		t.Fatalf("second sweep not idempotent: %s pledged=%v persisted=%d", rep.String(), actor.pledged, len(actor.persisted))
+	}
+}
+
+// HELD after PLEDGED → Unpledge once; HELD after HELD → nothing.
+func TestReconciler_UnpledgeOnReturnToHeld(t *testing.T) {
+	gate, audit, actor := &fakeGate{}, &fakeAudit{}, &fakeActor{}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{
+			verdict("FIV99", "SYRMA", BrokerStateHeld, BrokerStatePledged),
+			verdict("FIV99", "KEI", BrokerStateHeld, BrokerStateHeld),
+		}},
+	}}
+	actor.parkedNow = map[string]bool{"FIV99/SYRMA": true}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+	rep := r.SweepOnce(context.Background())
+	if rep.Unpledged != 1 || actor.unpledged[0] != "FIV99/SYRMA" {
+		t.Fatalf("unpledge wrong: %s %v", rep.String(), actor.unpledged)
+	}
+	if got := audit.results(); len(got) != 1 || got[0] != "UNPLEDGED" {
+		t.Fatalf("audit: %v", got)
+	}
+}
+
+// Session-gap sequence: PLEDGED → (dead session) UNVERIFIED persisted over it
+// → HELD. The reverse path must still run, and a lot that was never parked
+// (HELD after UNVERIFIED) must not be audited as unpledged.
+func TestReconciler_UnpledgeSurvivesUnverifiedGap(t *testing.T) {
+	gate, audit, actor := &fakeGate{}, &fakeAudit{}, &fakeActor{}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{verdict("FIV99", "SYRMA", BrokerStatePledged, "")}},
+	}}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+	r.SweepOnce(context.Background()) // pledged
+
+	// Dead session: UNVERIFIED persisted, nothing else.
+	scan.results["FIV99"] = &ReconResult{UserID: "FIV99", BrokerLeg: "AUTH_EXPIRED",
+		Verdicts: []Verdict{verdict("FIV99", "SYRMA", BrokerStateUnverified, BrokerStatePledged)}}
+	r.SweepOnce(context.Background())
+
+	// Session back, shares free: prev_state reads UNVERIFIED, yet the lot is
+	// still parked in trading_db → Unpledge runs and is audited once.
+	scan.results["FIV99"] = &ReconResult{UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{
+		verdict("FIV99", "SYRMA", BrokerStateHeld, BrokerStateUnverified),
+		verdict("FIV99", "KEI", BrokerStateHeld, BrokerStateUnverified), // never parked
+	}}
+	rep := r.SweepOnce(context.Background())
+	if rep.Unpledged != 1 || actor.isParked("FIV99/SYRMA") {
+		t.Fatalf("unpledge after gap: %s parked=%v", rep.String(), actor.parkedNow)
+	}
+	unpledgedAudits := 0
+	for _, res := range audit.results() {
+		if res == "UNPLEDGED" {
+			unpledgedAudits++
+		}
+	}
+	if unpledgedAudits != 1 {
+		t.Fatalf("expected exactly one UNPLEDGED audit (SYRMA), got %v", audit.results())
+	}
+	// A PLEDGED verdict after the gap on an already-parked lot: no second
+	// PLEDGED audit.
+	scan.results["FIV99"] = &ReconResult{UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{
+		verdict("FIV99", "WOCK", BrokerStatePledged, ""),
+	}}
+	r.SweepOnce(context.Background())
+	scan.results["FIV99"] = &ReconResult{UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{
+		verdict("FIV99", "WOCK", BrokerStatePledged, BrokerStateUnverified),
+	}}
+	before := len(audit.rows)
+	r.SweepOnce(context.Background())
+	if len(audit.rows) != before {
+		t.Fatalf("re-pledge after a gap must be silent: %v", audit.results()[before:])
+	}
+}
+
+// dry_run: verdicts ARE persisted (observations), actions are audited as
+// WOULD_* and the actor is never asked to change anything.
+func TestReconciler_DryRunPersistsButNeverActs(t *testing.T) {
+	gate := &fakeGate{previews: map[string]*GhostPlan{"FIV99/AERO": {UserID: "FIV99", Symbol: "AERO", BookRows: 1}}}
+	audit, actor := &fakeAudit{}, &fakeActor{}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{
+			verdict("FIV99", "SYRMA", BrokerStatePledged, ""),
+			verdict("FIV99", "WOCK", BrokerStateHeld, BrokerStatePledged),
+			verdict("FIV99", "AERO", BrokerStateNotHeld, ""),
+		}},
+	}}
+	r := newTestReaper(ReaperModeDryRun, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+	rep := r.SweepOnce(context.Background())
+	if len(actor.pledged) != 0 || len(actor.unpledged) != 0 || len(gate.healCalls) != 0 {
+		t.Fatalf("dry_run acted: pledged=%v unpledged=%v heals=%v", actor.pledged, actor.unpledged, gate.healCalls)
+	}
+	if len(actor.persisted) != 3 || rep.Persisted != 3 {
+		t.Fatalf("verdicts must be persisted in dry_run: %d", len(actor.persisted))
+	}
+	want := map[string]bool{"WOULD_PLEDGE": true, "WOULD_UNPLEDGE": true, "WOULD_CLOSE": true}
+	for _, res := range audit.results() {
+		delete(want, res)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing dry-run audits %v in %v", want, audit.results())
+	}
+}
+
+// NOT_HELD verdict → the gate decides; a passing plan is healed with exit
+// reason NOT_HELD_AT_BROKER. SOLD_TODAY → MANUAL_EXIT at the verdict's price.
+func TestReconciler_ClosureReasons(t *testing.T) {
+	gate := &fakeGate{previews: map[string]*GhostPlan{
+		"FIV99/AERO":  {UserID: "FIV99", Symbol: "AERO", BookRows: 1},
+		"FIV99/SHREE": {UserID: "FIV99", Symbol: "SHREE", BookRows: 1},
+	}}
+	audit, actor := &fakeAudit{}, &fakeActor{}
+	sold := verdict("FIV99", "SHREE", BrokerStateSoldToday, "")
+	sold.ExitPrice = 105
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{verdict("FIV99", "AERO", BrokerStateNotHeld, ""), sold}},
+	}}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+	rep := r.SweepOnce(context.Background())
+	if rep.Healed != 2 || len(gate.healCalls) != 2 {
+		t.Fatalf("heals: %s %v", rep.String(), gate.healCalls)
+	}
+	byReason := map[string]float64{}
+	for _, p := range gate.healPlans {
+		byReason[p.exitReason()] = p.ExitPrice
+	}
+	if _, ok := byReason[ExitReasonNotHeldAtBroker]; !ok {
+		t.Fatalf("NOT_HELD closure must carry NOT_HELD_AT_BROKER: %v", byReason)
+	}
+	if price, ok := byReason[ExitReasonManualExit]; !ok || price != 105 {
+		t.Fatalf("SOLD_TODAY closure must be MANUAL_EXIT at 105: %v", byReason)
+	}
+}
+
+// A gate refusal (e.g. settlement window, broker holds) on a NOT_HELD verdict
+// means no heal — same guard as the legacy GHOST path.
+func TestReconciler_NotHeldRefusedByGate(t *testing.T) {
+	gate := &fakeGate{refusals: map[string]error{"FIV99/AERO": errors.New("within settlement window")}}
+	audit, actor := &fakeAudit{}, &fakeActor{}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{verdict("FIV99", "AERO", BrokerStateNotHeld, "")}},
+	}}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+	rep := r.SweepOnce(context.Background())
+	if rep.Refused != 1 || rep.Healed != 0 || len(gate.healCalls) != 0 {
+		t.Fatalf("refusal not honored: %s", rep.String())
+	}
+}
+
+// QTY_MISMATCH and UNVERIFIED: verdict persisted and audited on change, no
+// action of any kind.
+func TestReconciler_MismatchAndUnverifiedAreVerdictOnly(t *testing.T) {
+	gate, audit, actor := &fakeGate{}, &fakeAudit{}, &fakeActor{}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{
+			verdict("FIV99", "IDEA", BrokerStateQtyMismatch, BrokerStateHeld),
+			verdict("FIV99", "FRESH", BrokerStateUnverified, ""),
+		}},
+	}}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+	rep := r.SweepOnce(context.Background())
+	if rep.Mismatches != 1 || rep.Unverified != 1 || rep.Candidates != 0 {
+		t.Fatalf("report: %s", rep.String())
+	}
+	if len(gate.previewCalls)+len(actor.pledged)+len(actor.unpledged) != 0 {
+		t.Fatalf("acted on a verdict-only state")
+	}
+	if got := audit.results(); len(got) != 2 || got[0] != "VERDICT_QTY_MISMATCH" || got[1] != "VERDICT_UNVERIFIED" {
+		t.Fatalf("audit: %v", got)
+	}
+}
+
+// Broker leg down: UNVERIFIED verdicts are still persisted (the reason must
+// show), but nothing is pledged, unpledged or healed.
+func TestReconciler_BrokerDownPersistsUnverifiedOnly(t *testing.T) {
+	gate, audit, actor := &fakeGate{}, &fakeAudit{}, &fakeActor{}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "AUTH_EXPIRED", Verdicts: []Verdict{
+			verdict("FIV99", "SYRMA", BrokerStateUnverified, BrokerStatePledged),
+		}, Mismatches: []Mismatch{ghostMismatch("SYRMA")}},
+	}}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99"}}, audit)
+	r.SetBookActor(actor)
+	rep := r.SweepOnce(context.Background())
+	if rep.SkippedUser != 1 || rep.Persisted != 1 || len(actor.pledged)+len(actor.unpledged)+len(gate.previewCalls) != 0 {
+		t.Fatalf("broker-down handling: %s", rep.String())
+	}
+}
+
+// Login trigger: SweepUser runs for that user only (source login), and the
+// debounce swallows a second trigger inside the window.
+func TestReconciler_LoginTriggerDebounced(t *testing.T) {
+	gate, audit, actor := &fakeGate{}, &fakeAudit{}, &fakeActor{}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"FIV99": {UserID: "FIV99", BrokerLeg: "OK", Verdicts: []Verdict{verdict("FIV99", "SYRMA", BrokerStatePledged, "")}},
+		"S4450": {UserID: "S4450", BrokerLeg: "OK", Verdicts: []Verdict{verdict("S4450", "KEI", BrokerStatePledged, "")}},
+	}}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, &fakeUsers{[]string{"FIV99", "S4450"}}, audit)
+	r.SetBookActor(actor)
+	r.sleep = func(time.Duration) {}
+	done := make(chan string, 4)
+	r.runUsr = func(ctx context.Context, uid string) {
+		rep := r.SweepUser(ctx, uid, VerdictSourceLogin)
+		done <- uid + ":" + fmt.Sprint(rep.Pledged)
+	}
+	r.RunUserAsync("FIV99")
+	select {
+	case got := <-done:
+		if got != "FIV99:1" {
+			t.Fatalf("login run: %s", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("login run did not happen")
+	}
+	if len(actor.pledged) != 1 || actor.pledged[0] != "FIV99/SYRMA" {
+		t.Fatalf("login run must touch only FIV99: %v", actor.pledged)
+	}
+	// Second trigger inside the debounce window: nothing runs.
+	r.RunUserAsync("FIV99")
+	select {
+	case got := <-done:
+		t.Fatalf("debounce failed: %s", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Past the window, it runs again.
+	r.now = func() time.Time { return time.Date(2026, 9, 3, 12, 5, 0, 0, time.FixedZone("IST", 5*3600+30*60)) }
+	r.RunUserAsync("FIV99")
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-debounce run did not happen")
+	}
+	r.RunUserAsync("") // nil-safe / empty user: no panic, no run
+	var nilReaper *GhostReaper
+	nilReaper.RunUserAsync("FIV99")
 }

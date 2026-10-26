@@ -202,6 +202,15 @@ type Holding struct {
 	NetPnLPct    float64 `json:"netPnLPct"`    // vs Invested
 	LTP          float64 `json:"ltp"`
 	LTPChangePct float64 `json:"ltpChangePct"` // vs prev_close (today's move)
+
+	// Broker verdict (2026-10-26): HELD / PLEDGED / QTY_MISMATCH / UNVERIFIED
+	// for an open lot, with the plain-language reason to show the client
+	// ("Pledged – unpledge to let the strategy manage it"). Empty until the
+	// book reconciler has checked the lot once. Additive — older clients
+	// ignore the keys.
+	BrokerState       string `json:"brokerState,omitempty"`
+	BrokerStateReason string `json:"brokerStateReason,omitempty"`
+	BrokerCheckedAt   string `json:"brokerCheckedAt,omitempty"` // RFC3339
 }
 
 // ─── Past Trades drilldown ───────────────────────────────────────────
@@ -226,9 +235,18 @@ type TradeRow struct {
 	Quantity     int     `json:"quantity"`
 	RealisedPnL  int64   `json:"realisedPnL"`  // rupees, signed
 	RealisedPct  float64 `json:"realisedPct"`
-	ExitReason   string  `json:"exitReason"`   // SL_TRIGGERED / TARGET / MANUAL_EXIT / ...
+	ExitReason   string  `json:"exitReason"`   // SL_TRIGGERED / TARGET / MANUAL_EXIT / NOT_HELD_AT_BROKER / ...
 	HoldingDays  int     `json:"holdingDays"`
 	ExitDate     string  `json:"exitDate"`     // ISO YYYY-MM-DD
+
+	// Broker verdict at closure (2026-10-26): NOT_HELD / SOLD_TODAY when the
+	// book reconciler closed the lot because the broker no longer held it,
+	// with the sentence to show. ExitPriceKnown=false means the exit price is
+	// unknown (sold or transferred outside the system) — exitPrice and
+	// realisedPnL are 0 and must not be read as a real fill.
+	BrokerState       string `json:"brokerState,omitempty"`
+	BrokerStateReason string `json:"brokerStateReason,omitempty"`
+	ExitPriceKnown    bool   `json:"exitPriceKnown"`
 }
 
 // ─── Stock P&L drilldown ─────────────────────────────────────────────

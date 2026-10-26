@@ -21,6 +21,7 @@ package admin
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -350,19 +351,187 @@ func isAuthExpired(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "AU004")
 }
 
-// ReconResult is the per-user three-way view.
+// ReconResult is the per-user three-way view plus the per-lot broker
+// verdicts (2026-10-26). Verdicts are the operator-facing truth: one row per
+// Manthan lot (book lots and ledger-only lots), each with a state, a plain
+// reason and the broker evidence; Mismatches keep the older class view.
 type ReconResult struct {
-	UserID       string     `json:"user_id"`
-	BrokerLeg    string     `json:"broker_leg"` // OK | AUTH_EXPIRED | NO_CREDENTIAL | ERROR
-	BrokerDetail string     `json:"broker_detail,omitempty"`
-	Mismatches   []Mismatch `json:"mismatches"`
-	CleanSymbols int        `json:"clean_symbols"`
-	Warning      string     `json:"warning"`
-	GeneratedAt  time.Time  `json:"generated_at"`
+	UserID         string         `json:"user_id"`
+	BrokerLeg      string         `json:"broker_leg"` // OK | AUTH_EXPIRED | NO_CREDENTIAL | ERROR
+	BrokerDetail   string         `json:"broker_detail,omitempty"`
+	Mismatches     []Mismatch     `json:"mismatches"`
+	CleanSymbols   int            `json:"clean_symbols"`
+	Verdicts       []Verdict      `json:"verdicts"`
+	VerdictSummary map[string]int `json:"verdict_summary"` // state → count
+	Warning        string         `json:"warning"`
+	GeneratedAt    time.Time      `json:"generated_at"`
+
+	// read is the raw broker read the verdicts were computed from, kept so
+	// the reconciler's actions re-use it instead of fetching again (one
+	// holdings + one orderbook + one tradebook per user per run).
+	read *brokerRead
 }
 
-// Reconcile runs the three-way for one user. The two DB legs always
-// render; a dead broker session degrades the result, never blanks it.
+// Snapshot exposes the keyed broker snapshot (nil when the broker leg was
+// unavailable). Used by the reconciler's actions and by tests.
+func (r *ReconResult) Snapshot() *BrokerSnapshot {
+	if r == nil || r.read == nil {
+		return nil
+	}
+	return r.read.snap
+}
+
+// brokerRead is one user's raw broker reads for one run.
+type brokerRead struct {
+	leg, detail string
+	auth        *indiraClient.AuthContext
+	holdings    []indiraClient.Holding
+	book        []indiraClient.OrderBook
+	trades      []indiraClient.TradeBook
+	ourOrderIDs map[string]bool
+	snap        *BrokerSnapshot
+}
+
+// readBroker performs the per-user broker reads once: holdings, order book,
+// trade book. A failed holdings/orderbook read degrades the leg (no truth);
+// a failed tradebook read is tolerated (fewer SOLD_TODAY verdicts, never a
+// wrong NOT_HELD: the settlement gate still applies).
+func (rs *ReconStore) readBroker(ctx context.Context, userID string) *brokerRead {
+	r := &brokerRead{}
+	auth, legStatus, legDetail := rs.authFor(ctx, userID)
+	r.leg, r.detail, r.auth = legStatus, legDetail, auth
+	if legStatus != "OK" {
+		r.snap = BuildSnapshot(r.leg, r.detail, nil, nil, nil, nil, time.Now())
+		return r
+	}
+	holdings, err := rs.broker.GetHoldings(ctx, auth)
+	if err == nil {
+		r.holdings = holdings
+		r.book, err = rs.broker.GetOrderBook(ctx, auth)
+		if err != nil {
+			err = fmt.Errorf("orderbook leg: %w", err)
+		}
+	}
+	switch {
+	case isAuthExpired(err):
+		r.leg = "AUTH_EXPIRED"
+	case err != nil:
+		r.leg, r.detail = "ERROR", err.Error()
+	}
+	if r.leg == "OK" {
+		if trades, terr := rs.broker.GetTradeBook(ctx, auth); terr == nil {
+			r.trades = trades
+		}
+		r.ourOrderIDs, _ = rs.ourBrokerOrderIDs(ctx, userID)
+	}
+	r.snap = BuildSnapshot(r.leg, r.detail, r.holdings, r.book, r.trades, r.ourOrderIDs, time.Now())
+	return r
+}
+
+// ourBrokerOrderIDs lists the broker order ids of the user's recent
+// manthan_orders SELL rows — a tradebook SELL carrying one of them was placed
+// by the strategy, not by the client.
+func (rs *ReconStore) ourBrokerOrderIDs(ctx context.Context, userID string) (map[string]bool, error) {
+	rows, err := rs.fleet.execDB.QueryContext(ctx, `
+		SELECT broker_order_id FROM manthan_orders
+		 WHERE user_id = $1 AND order_side = 'SELL'
+		   AND broker_order_id IS NOT NULL AND broker_order_id <> ''
+		   AND updated_at >= now() - interval '3 days'`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil && id != "" {
+			out[id] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+// bookLots loads the user's ACTIVE Manthan lots aggregated per
+// (strategy, symbol) with the row ids and the last persisted verdict.
+func (rs *ReconStore) bookLots(ctx context.Context, userID string) ([]BookLotInput, error) {
+	rows, err := rs.fleet.posDB.QueryContext(ctx, `
+		SELECT COALESCE(strategy_id::text, ''), UPPER(symbol), SUM(quantity), MIN(entry_time),
+		       array_to_string(array_agg(position_id::text ORDER BY entry_time), ','),
+		       COALESCE(MAX(broker_state), '')
+		  FROM positions
+		 WHERE user_id = $1 AND status = 'ACTIVE' AND origin = 'MANTHAN'
+		 GROUP BY strategy_id, UPPER(symbol)
+		 ORDER BY UPPER(symbol), strategy_id`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile lots: %w", err)
+	}
+	defer rows.Close()
+	var out []BookLotInput
+	for rows.Next() {
+		var lot BookLotInput
+		var ids string
+		if err := rows.Scan(&lot.StrategyID, &lot.Symbol, &lot.Qty, &lot.EntryTime, &ids, &lot.PrevState); err != nil {
+			return nil, err
+		}
+		lot.UserID = userID
+		if ids != "" {
+			lot.PositionIDs = strings.Split(ids, ",")
+		}
+		out = append(out, lot)
+	}
+	return out, rows.Err()
+}
+
+// ledgerOnlyLots lists (strategy, symbol) pairs the execution ledger still
+// holds (net filled BUY − SELL > 0) with NO ACTIVE book row for the user —
+// the IOLCP class: the book already shows the lot gone but trade-execution
+// keeps protecting it. Settlement anchor = newest filled BUY.
+func (rs *ReconStore) ledgerOnlyLots(ctx context.Context, userID string, book []BookLotInput) ([]BookLotInput, error) {
+	inBook := map[string]bool{}
+	for _, l := range book {
+		inBook[strings.ToUpper(l.Symbol)] = true
+	}
+	rows, err := rs.fleet.execDB.QueryContext(ctx, `
+		SELECT strategy_id::text, UPPER(symbol),
+		       SUM(CASE WHEN order_side='BUY'  AND status='FILLED' THEN filled_qty
+		                WHEN order_side='SELL' AND status='FILLED' THEN -filled_qty
+		                ELSE 0 END) AS net,
+		       MAX(CASE WHEN order_side='BUY' AND status='FILLED'
+		                THEN COALESCE(filled_at, created_at) END) AS last_buy
+		  FROM manthan_orders
+		 WHERE user_id = $1
+		 GROUP BY strategy_id, UPPER(symbol)
+		HAVING SUM(CASE WHEN order_side='BUY'  AND status='FILLED' THEN filled_qty
+		                WHEN order_side='SELL' AND status='FILLED' THEN -filled_qty
+		                ELSE 0 END) > 0
+		 ORDER BY UPPER(symbol), strategy_id`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile ledger lots: %w", err)
+	}
+	defer rows.Close()
+	var out []BookLotInput
+	for rows.Next() {
+		var lot BookLotInput
+		var lastBuy sql.NullTime
+		if err := rows.Scan(&lot.StrategyID, &lot.Symbol, &lot.Qty, &lastBuy); err != nil {
+			return nil, err
+		}
+		if inBook[lot.Symbol] {
+			continue
+		}
+		if lastBuy.Valid {
+			lot.EntryTime = lastBuy.Time
+		}
+		lot.UserID, lot.LedgerOnly = userID, true
+		out = append(out, lot)
+	}
+	return out, rows.Err()
+}
+
+// Reconcile runs the three-way for one user and judges every lot. The two
+// DB legs always render; a dead broker session degrades the result (every
+// verdict UNVERIFIED), never blanks it. Read-only: persisting verdicts and
+// acting on them is the reconciler's job (ghost_reaper.go).
 func (rs *ReconStore) Reconcile(ctx context.Context, userID string) (*ReconResult, error) {
 	res := &ReconResult{UserID: userID, Warning: HoldingsWarning, GeneratedAt: time.Now()}
 
@@ -395,23 +564,28 @@ func (rs *ReconStore) Reconcile(ctx context.Context, userID string) (*ReconResul
 		return nil, err
 	}
 
-	// Leg 3: broker.
+	// Verdict inputs: Manthan book lots per strategy + ledger-only lots.
+	lots, err := rs.bookLots(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	ledgerLots, err := rs.ledgerOnlyLots(ctx, userID, lots)
+	if err != nil {
+		return nil, err
+	}
+	lots = append(lots, ledgerLots...)
+
+	// Leg 3: broker — ONE read, shared by the class view and the verdicts.
+	res.read = rs.readBroker(ctx, userID)
+	res.BrokerLeg, res.BrokerDetail = res.read.leg, res.read.detail
 	var totals map[string]int
-	auth, legStatus, legDetail := rs.authFor(ctx, userID)
-	res.BrokerLeg, res.BrokerDetail = legStatus, legDetail
-	if legStatus == "OK" {
-		bt, herr := rs.brokerTotalsWithAuth(ctx, auth)
-		switch {
-		case isAuthExpired(herr):
-			res.BrokerLeg = "AUTH_EXPIRED"
-		case herr != nil:
-			res.BrokerLeg, res.BrokerDetail = "ERROR", herr.Error()
-		default:
-			totals = bt
-		}
+	if res.BrokerLeg == "OK" {
+		totals = holdingsTotals(res.read.holdings)
+		addOpenSellCommitments(totals, res.read.book)
 	}
 
-	res.Mismatches = ThreeWay(active, exitedOpenSL, totals, res.BrokerLeg == "OK", time.Now())
+	now := time.Now()
+	res.Mismatches = ThreeWay(active, exitedOpenSL, totals, res.BrokerLeg == "OK", now)
 	if res.Mismatches == nil {
 		res.Mismatches = []Mismatch{}
 	}
@@ -424,6 +598,13 @@ func (rs *ReconStore) Reconcile(ctx context.Context, userID string) (*ReconResul
 			res.CleanSymbols++
 		}
 	}
+
+	res.Verdicts = make([]Verdict, 0, len(lots))
+	for _, lot := range lots {
+		res.Verdicts = append(res.Verdicts, Classify(lot, res.read.snap, now))
+	}
+	sortVerdicts(res.Verdicts)
+	res.VerdictSummary = SummarizeVerdicts(res.Verdicts)
 	return res, nil
 }
 

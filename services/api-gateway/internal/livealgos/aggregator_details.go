@@ -322,7 +322,7 @@ func buildHoldingsList(active []PositionRow, ltps map[string]LTPQuote) []Holding
 				netPct = (netPnL / p.InvestedAmt) * 100
 			}
 		}
-		list = append(list, Holding{
+		h := Holding{
 			Symbol:       p.Symbol,
 			Industry:     nullStr(p.Industry),
 			MCapBucket:   nullStr(p.MCapBucket),
@@ -334,7 +334,14 @@ func buildHoldingsList(active []PositionRow, ltps map[string]LTPQuote) []Holding
 			NetPnLPct:    round2(netPct),
 			LTP:          round2(ltpVal),
 			LTPChangePct: round2(ltpChange),
-		})
+			// Broker verdict, verbatim from the book reconciler.
+			BrokerState:       nullStr(p.BrokerState),
+			BrokerStateReason: nullStr(p.BrokerStateReason),
+		}
+		if p.BrokerCheckedAt.Valid {
+			h.BrokerCheckedAt = p.BrokerCheckedAt.Time.UTC().Format(time.RFC3339)
+		}
+		list = append(list, h)
 	}
 	sort.SliceStable(list, func(i, j int) bool {
 		return list[i].Invested > list[j].Invested
@@ -344,21 +351,29 @@ func buildHoldingsList(active []PositionRow, ltps map[string]LTPQuote) []Holding
 
 // buildTradesList materialises TradeRow structs for a slice of EXITED
 // positions. Skips positions with no exit_price (e.g. ORPHAN_CLEANUP)
-// since they're not user-facing "trades".
+// since they're not user-facing "trades" — EXCEPT lots the book reconciler
+// closed because the broker no longer held them (NOT_HELD_AT_BROKER, exit
+// price unknown): the operator rule is that the client must see WHY a
+// position left the book, so those rows are listed with exitPriceKnown=false
+// and the plain reason, P&L 0.
 func buildTradesList(exited []PositionRow) []TradeRow {
 	out := make([]TradeRow, 0, len(exited))
 	for _, p := range exited {
-		if !p.ExitPrice.Valid {
+		brokerClosed := nullStr(p.ExitReason) == "NOT_HELD_AT_BROKER"
+		if !p.ExitPrice.Valid && !brokerClosed {
 			continue
 		}
 		var realisedAmt int64
-		if p.RealizedPnL.Valid {
+		switch {
+		case !p.ExitPrice.Valid:
+			realisedAmt = 0 // unknown exit price — never invent a P&L
+		case p.RealizedPnL.Valid:
 			realisedAmt = int64(p.RealizedPnL.Float64)
-		} else {
+		default:
 			realisedAmt = int64((p.ExitPrice.Float64 - p.EntryPrice) * float64(p.Quantity))
 		}
 		var pct float64
-		if p.InvestedAmt > 0 {
+		if p.InvestedAmt > 0 && p.ExitPrice.Valid {
 			pct = (float64(realisedAmt) / p.InvestedAmt) * 100
 		}
 		var days int
@@ -370,17 +385,20 @@ func buildTradesList(exited []PositionRow) []TradeRow {
 			exitDate = p.ExitTime.Time.Format("2006-01-02")
 		}
 		out = append(out, TradeRow{
-			Symbol:      p.Symbol,
-			Industry:    nullStr(p.Industry),
-			ProductType: "DELIVERY",
-			EntryPrice:  p.EntryPrice,
-			ExitPrice:   p.ExitPrice.Float64,
-			Quantity:    p.Quantity,
-			RealisedPnL: realisedAmt,
-			RealisedPct: round2(pct),
-			ExitReason:  nullStr(p.ExitReason),
-			HoldingDays: days,
-			ExitDate:    exitDate,
+			Symbol:            p.Symbol,
+			Industry:          nullStr(p.Industry),
+			ProductType:       "DELIVERY",
+			EntryPrice:        p.EntryPrice,
+			ExitPrice:         p.ExitPrice.Float64,
+			Quantity:          p.Quantity,
+			RealisedPnL:       realisedAmt,
+			RealisedPct:       round2(pct),
+			ExitReason:        nullStr(p.ExitReason),
+			HoldingDays:       days,
+			ExitDate:          exitDate,
+			BrokerState:       nullStr(p.BrokerState),
+			BrokerStateReason: nullStr(p.BrokerStateReason),
+			ExitPriceKnown:    p.ExitPrice.Valid,
 		})
 	}
 	return out

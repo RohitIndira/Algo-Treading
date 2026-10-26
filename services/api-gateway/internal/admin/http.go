@@ -51,7 +51,13 @@ type HTTP struct {
 	ops        *OpsStore        // nil-safe: M10 route absent without it
 	exports    *ExportStore     // nil-safe: M11 routes absent without it
 	dashboard  *DashboardStore  // nil-safe: M12 dashboard/clients routes absent without it
+	reaper     *GhostReaper     // nil-safe: on-demand book reconcile run absent without it
 }
+
+// SetReaper enables POST /users/{user_id}/reconcile/run — the book
+// reconciler for ONE user, now, through the same sweep code path as the
+// 15-minute cadence and the login trigger. Call before Register.
+func (h *HTTP) SetReaper(r *GhostReaper) { h.reaper = r }
 
 // SetProber enables the M3 credential endpoints. Call before Register.
 func (h *HTTP) SetProber(p *Prober) {
@@ -158,6 +164,9 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 	}
 	if h.protection != nil {
 		h.Route(token, "GET", "/protection", "PROTECTION_VIEW", TierRead, h.handleProtection)
+	}
+	if h.recon != nil && h.reaper != nil {
+		h.Route(token, "POST", "/users/{user_id}/reconcile/run", "RECONCILE_RUN", TierConfirm, h.handleReconcileRun)
 	}
 	if h.recon != nil {
 		h.Route(token, "GET", "/users/{user_id}/reconcile", "RECONCILE_VIEW", TierRead, h.handleReconcile)
@@ -665,6 +674,24 @@ func (h *HTTP) handleReconcile(w http.ResponseWriter, ar *AdminRequest) {
 		log.Printf("admin: reconcile audit failed: %v", aerr)
 	}
 	writeOK(w, res)
+}
+
+// handleReconcileRun runs the book reconciler for one user now (source
+// "manual"): verdicts persisted, actions taken per the reaper's mode, then
+// the fresh reconcile view is returned alongside the run report.
+func (h *HTTP) handleReconcileRun(w http.ResponseWriter, ar *AdminRequest) {
+	userID := mux.Vars(ar.Request)["user_id"]
+	rep := h.reaper.SweepUser(ar.Request.Context(), userID, VerdictSourceManual)
+	res, err := h.recon.Reconcile(ar.Request.Context(), userID)
+	if err != nil {
+		log.Printf("admin: reconcile after run %s failed: %v", userID, err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "reconciliation failed")
+		return
+	}
+	if aerr := ar.Audit(userID, "", map[string]any{"mode": h.reaper.mode, "report": rep.String(), "broker_leg": res.BrokerLeg}, "OK", "book reconcile run"); aerr != nil {
+		log.Printf("admin: reconcile run audit failed: %v", aerr)
+	}
+	writeOK(w, map[string]any{"mode": h.reaper.mode, "report": rep, "reconcile": res})
 }
 
 // mirrorHandler builds the per-view broker mirror handler (M5.3): a live

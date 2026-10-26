@@ -67,6 +67,14 @@ type FleetRow struct {
 	Naked         int      `json:"naked"`          // open − armed − deferred
 	NakedSymbols  []string `json:"naked_symbols,omitempty"`
 
+	// Broker verdicts (2026-10-26): symbols the book reconciler judged
+	// PLEDGED (held, not managed, slot free — counted apart from armed /
+	// deferred / naked) and symbols with a QTY_MISMATCH / NOT_HELD /
+	// SOLD_TODAY verdict still open for review.
+	Pledged        int      `json:"pledged"`
+	PledgedSymbols []string `json:"pledged_symbols,omitempty"`
+	BrokerMismatch int      `json:"broker_mismatch"`
+
 	RealizedPnLTotal float64 `json:"realized_pnl_total"`
 	RealizedPnLToday float64 `json:"realized_pnl_today"`
 
@@ -149,19 +157,27 @@ func (f *FleetStore) credentialAges(ctx context.Context) (map[string]time.Durati
 // duplicate-row defect (BALUFORGE ×17) and the grid must not inherit it.
 func (f *FleetStore) fillPositions(ctx context.Context, r *FleetRow) error {
 	posRows, err := f.posDB.QueryContext(ctx, `
-		SELECT DISTINCT symbol FROM positions
-		 WHERE strategy_id = $1 AND status = 'ACTIVE'`, r.StrategyID)
+		SELECT UPPER(symbol), COALESCE(MAX(broker_state), '') FROM positions
+		 WHERE strategy_id = $1 AND status = 'ACTIVE'
+		 GROUP BY UPPER(symbol)`, r.StrategyID)
 	if err != nil {
 		return fmt.Errorf("fleet positions: %w", err)
 	}
 	open := map[string]bool{}
+	pledged := map[string]bool{}
 	for posRows.Next() {
-		var s string
-		if err := posRows.Scan(&s); err != nil {
+		var s, state string
+		if err := posRows.Scan(&s, &state); err != nil {
 			posRows.Close()
 			return err
 		}
-		open[strings.ToUpper(s)] = true
+		open[s] = true
+		switch state {
+		case BrokerStatePledged:
+			pledged[s] = true
+		case BrokerStateQtyMismatch, BrokerStateNotHeld, BrokerStateSoldToday:
+			r.BrokerMismatch++
+		}
 	}
 	posRows.Close()
 	if err := posRows.Err(); err != nil {
@@ -201,6 +217,11 @@ func (f *FleetStore) fillPositions(ctx context.Context, r *FleetRow) error {
 
 	for sym := range open {
 		switch {
+		case pledged[sym]:
+			// Held at the broker but pledged: the strategy deliberately places
+			// no stop (its parked rows read as deferred) — not naked, not armed.
+			r.Pledged++
+			r.PledgedSymbols = append(r.PledgedSymbols, sym)
 		case armed[sym]:
 			r.Armed++
 		case deferred[sym]:
@@ -211,6 +232,7 @@ func (f *FleetStore) fillPositions(ctx context.Context, r *FleetRow) error {
 		}
 	}
 	sort.Strings(r.NakedSymbols)
+	sort.Strings(r.PledgedSymbols)
 
 	// Realized P&L (exact, from broker-confirmed exits). Day boundary in IST.
 	now := f.now().In(f.ist)
@@ -516,6 +538,71 @@ func (f *FleetStore) Attention(ctx context.Context) (items []AttentionItem, notW
 		})
 	}
 	ops.Close()
+
+	// Broker verdicts (2026-10-26): what the book reconciler found when it
+	// matched each client's Manthan book against the broker's book. Read
+	// from the verdict persisted on the position rows, so the queue, the
+	// reconcile view and the client app all show the same sentence.
+	//   PLEDGED       WARN  — held but pledged; strategy hands off until unpledged
+	//   QTY_MISMATCH  WARN  — book and broker disagree on quantity; review
+	//   UNVERIFIED    INFO  — no broker truth yet (dead session / settlement window)
+	//   NOT_HELD / SOLD_TODAY closures in the last 24h INFO — auto-closed
+	verdicts, err := f.posDB.QueryContext(ctx, `
+		SELECT user_id, COALESCE(strategy_id::text, ''), UPPER(symbol), broker_state,
+		       COALESCE(broker_state_reason, ''), broker_checked_at
+		  FROM positions
+		 WHERE origin = 'MANTHAN' AND broker_state IS NOT NULL
+		   AND (   (status = 'ACTIVE' AND broker_state IN ('PLEDGED','QTY_MISMATCH','UNVERIFIED'))
+		        OR (status = 'EXITED' AND exit_reason IN ('NOT_HELD_AT_BROKER','MANUAL_EXIT')
+		            AND broker_state IN ('NOT_HELD','SOLD_TODAY')
+		            AND exit_time >= now() - interval '24 hours'))
+		 ORDER BY user_id, UPPER(symbol)`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("attention broker verdicts: %w", err)
+	}
+	seenVerdict := map[string]bool{}
+	for verdicts.Next() {
+		var it AttentionItem
+		var state, reason string
+		var checked sql.NullTime
+		if err := verdicts.Scan(&it.UserID, &it.Strategy, &it.Symbol, &state, &reason, &checked); err != nil {
+			verdicts.Close()
+			return nil, nil, err
+		}
+		key := it.UserID + "|" + it.Strategy + "|" + it.Symbol + "|" + state
+		if seenVerdict[key] {
+			continue
+		}
+		seenVerdict[key] = true
+		it.Module = "book_reconciler"
+		switch state {
+		case BrokerStatePledged:
+			it.Severity, it.Kind = "WARN", "BROKER_PLEDGED"
+		case BrokerStateQtyMismatch:
+			it.Severity, it.Kind = "WARN", "BROKER_QTY_MISMATCH"
+		case BrokerStateUnverified:
+			if strings.Contains(reason, "settlement window") {
+				continue // expected for a T+1 lot; not a human's problem
+			}
+			it.Severity, it.Kind = "INFO", "BROKER_UNVERIFIED"
+		case BrokerStateNotHeld:
+			it.Severity, it.Kind = "INFO", "BROKER_NOT_HELD_CLOSED"
+		case BrokerStateSoldToday:
+			it.Severity, it.Kind = "INFO", "BROKER_SOLD_TODAY_CLOSED"
+		default:
+			continue
+		}
+		if checked.Valid {
+			it.Detail = fmt.Sprintf("%s (checked %s IST)", reason, checked.Time.In(istLoc()).Format("02 Jan 15:04"))
+		} else {
+			it.Detail = reason
+		}
+		items = append(items, it)
+	}
+	verdicts.Close()
+	if err := verdicts.Err(); err != nil {
+		return nil, nil, err
+	}
 
 	// Rank: CRITICAL, WARN, INFO — stable within severity.
 	rank := map[string]int{"CRITICAL": 0, "WARN": 1, "INFO": 2}

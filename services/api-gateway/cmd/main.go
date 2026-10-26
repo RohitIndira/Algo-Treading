@@ -595,8 +595,22 @@ func main() {
 			reaper := admin.NewGhostReaper(mode, adminActions, adminRecon,
 				adminFleet, adminHTTP.AuditStore(), istLoc)
 			reaper.SetLedgerSource(adminFleet)
+			// Book reconciler (2026-10-26): persist every lot's broker verdict,
+			// park PLEDGED lots, close NOT_HELD / SOLD_TODAY lots through the
+			// ghost gate, resume protection on unpledge.
+			reaper.SetBookActor(adminActions)
+			adminHTTP.SetReaper(reaper)
 			go reaper.Start(context.Background())
-			log.Printf("[ghost-reaper] active mode=%s (every 15 min 09:20–15:45 IST + 15:50)", mode)
+			// Login trigger: a fresh broker token (explicit POST or auto-capture)
+			// is probed AND the client's book is matched against the broker
+			// ~10 s later (debounced 60 s per user) — FIV99-class gaps surface
+			// within the login, not at the next sweep.
+			userConfigHandler.OnCredentialsUpdated = func(uid string) {
+				prober.ProbeAsync(uid)
+				reaper.RunUserAsync(uid)
+			}
+			tokenCapture.OnRefreshed = userConfigHandler.OnCredentialsUpdated
+			log.Printf("[ghost-reaper] active mode=%s (every 15 min 09:20–15:45 IST + 15:50; book verdicts + PLEDGED handling + login trigger)", mode)
 		case admin.ReaperModeOff:
 			log.Printf("[ghost-reaper] OFF by configuration")
 		default:

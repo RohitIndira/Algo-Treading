@@ -665,7 +665,44 @@
                 "reconcile"
               ]
             },
-            "description": "Book vs SL ledger vs broker holdings. Classes: GHOST (IOLCP), UNLEDGERED_EXIT (stale stop), DUPLICATE_BOOK_ROWS (BALUFORGE ×17), UNKNOWN_HOLDING, QTY_MISMATCH. Observe-only; fixes arrive with M7. Dead credential → broker_leg names it, DB legs still render."
+            "description": "Book vs SL ledger vs broker holdings. Classes: GHOST (IOLCP), UNLEDGERED_EXIT (stale stop), DUPLICATE_BOOK_ROWS (BALUFORGE ×17), UNKNOWN_HOLDING, QTY_MISMATCH. Dead credential → broker_leg names it, DB legs still render.\n\nSince 2026-10-26 the response also carries `verdicts[]` — one per Manthan lot (book lots per strategy + ledger-only lots), each with `state` (HELD | PLEDGED | NOT_HELD | SOLD_TODAY | QTY_MISMATCH | UNVERIFIED), a plain-language `reason`, the broker `evidence` (broker_qty, free_qty, pledged_qty, open_sell_order_id, tradebook_sell_qty/price, within_settlement_window), `prev_state`, `position_ids`, `exit_price` (SOLD_TODAY) — and `verdict_summary` (state → count). Read-only: this GET does not persist or act; the 15-min sweep, the login trigger and POST …/reconcile/run do."
+          }
+        },
+        {
+          "name": "Book reconcile — run now for one user (CONFIRM)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}",
+                "description": "From Elevate (30-min expiry)"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"confirmed\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/users/{{user_id}}/reconcile/run",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{user_id}}",
+                "reconcile",
+                "run"
+              ]
+            },
+            "description": "Runs the book reconciler for ONE user now (source=manual) — the same code path as the 15-minute sweep and the post-login trigger. Per lot: verdict persisted on positions_db (broker_state / broker_state_reason / broker_state_evidence / broker_checked_at / broker_state_source); NOT_HELD → closed NOT_HELD_AT_BROKER (exit price NULL) through the GhostPreview→GhostHeal gate; SOLD_TODAY → closed MANUAL_EXIT at the tradebook price; PLEDGED → trading_db row 'PLEDGED' (slot freed, no trail), execution_db stop rows parked broker_status 'PLEDGED', POSITION_PLEDGED event; HELD after PLEDGED → reversed (protection resumes on the next naked-scan/planner/EOD pass). QTY_MISMATCH / UNVERIFIED → verdict only. Honors MANTHAN_GHOST_REAPER_MODE (dry_run audits WOULD_* and changes nothing but the verdicts). Response: {mode, report, reconcile}. Every action lands in admin_audit as BOOK_RECONCILE / GHOST_REAPER by SYSTEM:ghost-reaper. Never touches a broker order."
           }
         },
         {

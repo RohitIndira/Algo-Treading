@@ -45,6 +45,14 @@ type PositionRow struct {
 	EntryTime       time.Time
 	ExitTime        sql.NullTime
 	ExchangeToken   sql.NullString // joined from manthan_orders below
+
+	// Broker verdict (2026-10-26, book reconciler): what the client's broker
+	// book says about this lot — HELD / PLEDGED / NOT_HELD / SOLD_TODAY /
+	// QTY_MISMATCH / UNVERIFIED — with the plain-language reason shown to the
+	// client verbatim. NULL until the lot has been checked once.
+	BrokerState       sql.NullString
+	BrokerStateReason sql.NullString
+	BrokerCheckedAt   sql.NullTime
 }
 
 // OrderRow is one row of manthan_orders (owned by trade-execution in
@@ -263,7 +271,10 @@ func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string
 			realized_pnl,
 			exit_reason,
 			entry_time,
-			exit_time
+			exit_time,
+			broker_state,
+			broker_state_reason,
+			broker_checked_at
 		FROM public.positions
 		WHERE strategy_id::text = $1
 		  AND user_id = $2
@@ -285,6 +296,7 @@ func (s *PostgresStore) Positions(ctx context.Context, strategyID, userID string
 			&p.HighSinceEntry, &p.CurrentSL,
 			&p.Status, &p.ExitPrice, &p.RealizedPnL, &p.ExitReason,
 			&p.EntryTime, &p.ExitTime,
+			&p.BrokerState, &p.BrokerStateReason, &p.BrokerCheckedAt,
 		); err != nil {
 			return nil, fmt.Errorf("livealgos: Positions scan: %w", err)
 		}
