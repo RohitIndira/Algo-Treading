@@ -774,13 +774,17 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		  -- A position whose stop was parked GHOST_SUSPECT (the broker's RMS
 		  -- answered "Set= 0": it holds nothing) is not armed overnight either —
 		  -- the AMO would only be rejected again at 09:15. The operator heals
-		  -- the ledger via the admin ghost endpoint (2026-10-23).
+		  -- the ledger via the admin ghost endpoint (2026-10-23). A position
+		  -- parked PLEDGED (the broker holds the shares pledged; api-gateway
+		  -- book reconciler, 2026-10-26) is likewise left alone: a SELL of a
+		  -- pledged quantity is rejected, and the reconciler unparks the rows
+		  -- once the broker shows the quantity free again.
 		  AND NOT EXISTS (
 		      SELECT 1 FROM manthan_orders g
 		       WHERE g.strategy_id = b.strategy_id AND g.symbol = b.symbol
 		         AND g.order_type IN ('SL_SELL','SL_SELL_AMO')
 		         AND g.status = 'SL_DEFERRED_BAND'
-		         AND g.broker_status = 'GHOST_SUSPECT')`)
+		         AND g.broker_status IN ('GHOST_SUSPECT','PLEDGED'))`)
 	if err != nil {
 		return nil, err
 	}

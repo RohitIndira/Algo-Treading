@@ -439,19 +439,57 @@ func (r *Repository) ParkLatestStopRowForPosition(ctx context.Context, strategyI
 	return id, err
 }
 
-// HasGhostSuspectStop reports whether the position carries a stop row parked
-// GHOST_SUSPECT (the broker's RMS said it holds nothing of the scrip). Any
-// stop type — the trail skip and the exit gate must both see it.
-func (r *Repository) HasGhostSuspectStop(ctx context.Context, strategyID, symbol string) (bool, error) {
-	var exists bool
+// Park tags that take a position OUT of the protection and exit paths: the
+// trail skips it, EmergencySell refuses it (POISON), the naked scan, the
+// 09:14 planner and EOD Phase A do not place a stop for it.
+//
+//	GHOST_SUSPECT — the broker's RMS said it holds nothing of the scrip
+//	                ("Set= 0"); the admin ghost heal is the way out.
+//	PLEDGED       — the broker holds the shares pledged (2026-10-26, written
+//	                by the api-gateway book reconciler); a SELL would only be
+//	                rejected. The reconciler unparks the rows once the broker
+//	                shows the quantity free again.
+const (
+	ParkTagGhostSuspect = "GHOST_SUSPECT"
+	ParkTagPledged      = "PLEDGED"
+)
+
+// ParkedStopTag returns the hands-off park tag on the position's stop rows
+// (GHOST_SUSPECT or PLEDGED), or "" when the position carries none. Any stop
+// type — the trail skip and the exit gate must both see it.
+func (r *Repository) ParkedStopTag(ctx context.Context, strategyID, symbol string) (string, error) {
+	var tag sql.NullString
 	err := r.db.QueryRowContext(ctx, `
-		SELECT EXISTS (
-		    SELECT 1 FROM manthan_orders
-		     WHERE strategy_id = $1 AND symbol = $2
-		       AND order_type IN ('SL_SELL','SL_SELL_AMO')
-		       AND status = 'SL_DEFERRED_BAND' AND broker_status = 'GHOST_SUSPECT')`,
-		strategyID, symbol).Scan(&exists)
-	return exists, err
+		SELECT broker_status FROM manthan_orders
+		 WHERE strategy_id = $1 AND symbol = $2
+		   AND order_type IN ('SL_SELL','SL_SELL_AMO')
+		   AND status = 'SL_DEFERRED_BAND' AND broker_status IN ('GHOST_SUSPECT','PLEDGED')
+		 ORDER BY updated_at DESC, id DESC LIMIT 1`,
+		strategyID, symbol).Scan(&tag)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return tag.String, err
+}
+
+// HasGhostSuspectStop reports whether the position carries a stop row parked
+// GHOST_SUSPECT (the broker's RMS said it holds nothing of the scrip).
+func (r *Repository) HasGhostSuspectStop(ctx context.Context, strategyID, symbol string) (bool, error) {
+	tag, err := r.ParkedStopTag(ctx, strategyID, symbol)
+	return tag == ParkTagGhostSuspect, err
+}
+
+// parkedStopRefusal is the plain-language reason a parked position's trail or
+// exit is refused, by tag. Shared by the trail skip and EmergencySell so the
+// operator reads one sentence everywhere. "" for an unknown tag.
+func parkedStopRefusal(tag, symbol string) string {
+	switch tag {
+	case ParkTagGhostSuspect:
+		return symbol + " is a ghost suspect (broker holds 0 of the scrip) — not selling; heal via admin ghost endpoint"
+	case ParkTagPledged:
+		return symbol + " is pledged at the broker — the strategy places no stop and no exit for it; unpledge to let the strategy manage it"
+	}
+	return ""
 }
 
 // ListRecentlyClosedStopsWithBroker returns the position's stop rows marked

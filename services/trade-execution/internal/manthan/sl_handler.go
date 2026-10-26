@@ -459,12 +459,13 @@ func (h *SLHandler) ModifyTrail(ctx context.Context, signal SLModifySignal) erro
 		// the intended rises into the band. Returns nil (handled) so the inbox
 		// doesn't retry this signal forever.
 		// The broker said it holds nothing of this scrip ("Set= 0", any stop
-		// type parked GHOST_SUSPECT): trailing or promoting the parked row would
-		// only place a stop the RMS rejects again. Handled (not retried); the
-		// operator heals the ledger via the admin ghost endpoint.
-		if ghost, gerr := h.repo.HasGhostSuspectStop(ctx, signal.StrategyID, signal.Symbol); gerr == nil && ghost {
-			h.logger.Warn("SL_MODIFY ignored — position is a ghost suspect (broker holds 0); ledger needs healing",
-				zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol))
+		// type parked GHOST_SUSPECT), or holds it PLEDGED (parked by the book
+		// reconciler): trailing or promoting the parked row would only place a
+		// stop the RMS rejects again. Handled (not retried); the operator heals
+		// the ledger via the admin ghost endpoint / the client unpledges.
+		if tag, terr := h.repo.ParkedStopTag(ctx, signal.StrategyID, signal.Symbol); terr == nil && tag != "" {
+			h.logger.Warn("SL_MODIFY ignored — "+parkedStopRefusal(tag, signal.Symbol),
+				zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol), zap.String("park_tag", tag))
 			return nil
 		}
 		if deferred, derr := h.repo.GetDeferredSLBySymbol(ctx, signal.StrategyID, signal.Symbol); derr == nil && deferred != nil {
@@ -759,13 +760,15 @@ func (h *SLHandler) EmergencySell(ctx context.Context, signal SLExitSignal) erro
 	ec := exitContext{StrategyID: signal.StrategyID, SignalID: signal.OrderID, ISIN: isin}
 	if h.repo != nil {
 		// The broker's RMS already said it holds nothing of this scrip for the
-		// position ("Set= 0" → GHOST_SUSPECT parked stop): another sell can only
-		// be rejected and page the operator again. POISON → the inbox parks
-		// the signal; the admin ghost heal is the way out (2026-10-23 review).
-		if ghost, gerr := h.repo.HasGhostSuspectStop(ctx, signal.StrategyID, signal.Symbol); gerr == nil && ghost {
-			h.logger.Error("EmergencySell refused — position is a ghost suspect (broker holds 0); heal the ledger via the admin ghost endpoint",
-				zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol), zap.Int32("qty", signal.Quantity))
-			return poisonErr("pre-check: %s is a ghost suspect (broker holds 0 of the scrip) — not selling; heal via admin ghost endpoint", signal.Symbol)
+		// position ("Set= 0" → GHOST_SUSPECT parked stop), or the shares are
+		// PLEDGED at the broker (parked by the book reconciler): another sell
+		// can only be rejected and page the operator again. POISON → the inbox
+		// parks the signal; the admin ghost heal / the client's unpledge is the
+		// way out (2026-10-23 review; PLEDGED 2026-10-26).
+		if tag, terr := h.repo.ParkedStopTag(ctx, signal.StrategyID, signal.Symbol); terr == nil && tag != "" {
+			h.logger.Error("EmergencySell refused — "+parkedStopRefusal(tag, signal.Symbol),
+				zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol), zap.Int32("qty", signal.Quantity), zap.String("park_tag", tag))
+			return poisonErr("pre-check: %s", parkedStopRefusal(tag, signal.Symbol))
 		}
 		net, entryID, hasEntry, perr := h.repo.NetHeldQty(ctx, signal.StrategyID, signal.Symbol)
 		switch {
