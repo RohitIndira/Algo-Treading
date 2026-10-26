@@ -201,6 +201,12 @@ func (pm *PortfolioManager) ProcessFillEvent(strategyID, symbol string, avgFillP
 	if pos.State == types.StateActive && pos.Quantity >= filledQty {
 		return
 	}
+	// A late/replayed fill confirmation must not re-activate a lot that is
+	// PLEDGED at the broker (slot free, no trail) or frozen EXIT_PENDING
+	// (exit ordered) — both are managed by their own paths (2026-10-26).
+	if pos.State == types.StatePledged || pos.State == types.StateExitPending {
+		return
+	}
 
 	// Overwrite with reality (weighted avg from broker — always authoritative)
 	pos.EntryPrice = avgFillPrice

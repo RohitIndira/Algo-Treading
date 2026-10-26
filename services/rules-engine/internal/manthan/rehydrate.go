@@ -109,6 +109,30 @@ func (pm *PortfolioManager) RehydrateActivePositions(
 		if status == string(types.StatePledged) {
 			strategy := strategyByID(strategyID)
 			if strategy == nil {
+				// Same posture as the ACTIVE path: a configstore miss is
+				// confirmed with user-config before anything is retired, an
+				// uncertain answer skips, a soft-deleted strategy's PLEDGED row is
+				// retired like an ACTIVE orphan (CleanupOrphans covers later ticks).
+				if aliveChecker == nil {
+					pm.logger.Warn("Rehydrate: PLEDGED row for unknown strategy and no alive-checker — skipped",
+						zap.String("strategy_id", strategyID), zap.String("symbol", symbol))
+					continue
+				}
+				alive, rpcErr := aliveChecker.IsStrategyAlive(ctx, userID, strategyID)
+				if rpcErr != nil || alive {
+					pm.logger.Warn("Rehydrate: PLEDGED row not loaded (strategy not in configstore yet / lookup failed) — retried by the scanner",
+						zap.String("strategy_id", strategyID), zap.String("symbol", symbol), zap.NamedError("rpc_err", rpcErr))
+					continue
+				}
+				if _, err := db.ExecContext(ctx, `
+					UPDATE manthan_positions
+					SET status = 'EXITED', exit_reason = 'ORPHAN_CLEANUP', exit_time = NOW(), updated_at = NOW()
+					WHERE strategy_id = $1 AND symbol = $2 AND status = 'PLEDGED'`, strategyID, symbol); err != nil {
+					pm.logger.Warn("Rehydrate: PLEDGED orphan DB update failed", zap.Error(err))
+				}
+				orphans++
+				pm.logger.Warn("Rehydrate: PLEDGED orphan retired (strategy soft-deleted in DB)",
+					zap.String("strategy_id", strategyID), zap.String("symbol", symbol))
 				continue
 			}
 			p := pm.GetOrCreate(*strategy)
@@ -425,7 +449,7 @@ func (pm *PortfolioManager) CleanupOrphans(
 	rows, err := db.QueryContext(ctx, `
 		SELECT strategy_id, user_id, symbol
 		FROM manthan_positions
-		WHERE status = 'ACTIVE'`)
+		WHERE status IN ('ACTIVE','PLEDGED')`)
 	if err != nil {
 		return 0, fmt.Errorf("query active positions: %w", err)
 	}
@@ -486,7 +510,7 @@ func (pm *PortfolioManager) CleanupOrphans(
 			UPDATE manthan_positions
 			SET status = 'EXITED', exit_reason = 'ORPHAN_CLEANUP',
 			    exit_time = NOW(), updated_at = NOW()
-			WHERE strategy_id = $1 AND symbol = $2 AND status = 'ACTIVE'`,
+			WHERE strategy_id = $1 AND symbol = $2 AND status IN ('ACTIVE','PLEDGED')`,
 			rk.strategyID, rk.symbol); err != nil {
 			pm.logger.Warn("Orphan cleanup: DB update failed",
 				zap.String("strategy_id", rk.strategyID),
@@ -764,10 +788,14 @@ func (pm *PortfolioManager) SyncBrokerStateFromDB(ctx context.Context, db *sql.D
 	if db == nil {
 		return 0, 0, nil
 	}
+	// Newest row per (strategy, symbol) wins: a symbol re-entered after an
+	// older PLEDGED/ACTIVE row must be judged by its live row only.
 	rows, err := db.QueryContext(ctx, `
-		SELECT strategy_id, symbol, status, COALESCE(protective_last_reason, '')
+		SELECT DISTINCT ON (strategy_id, symbol)
+		       strategy_id, symbol, status, COALESCE(protective_last_reason, '')
 		FROM manthan_positions
-		WHERE status IN ('PLEDGED','ACTIVE') AND updated_at > now() - interval '48 hours'`)
+		WHERE status IN ('PLEDGED','ACTIVE') AND updated_at > now() - interval '48 hours'
+		ORDER BY strategy_id, symbol, updated_at DESC`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("sync broker state query: %w", err)
 	}
@@ -828,6 +856,8 @@ func (pm *PortfolioManager) SyncBrokerStateFromDB(ctx context.Context, db *sql.D
 			setMember := r.strategyID + ":" + r.symbol
 			if r.status == "PLEDGED" {
 				_ = rdb.SRem(ctx, "manthan:positions:active", setMember).Err()
+			} else {
+				_ = rdb.SAdd(ctx, "manthan:positions:active", setMember).Err()
 			}
 		}
 	}

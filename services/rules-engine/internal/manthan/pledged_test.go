@@ -177,3 +177,47 @@ func TestPersistExit_ClosesPledgedRow(t *testing.T) {
 		t.Fatalf("pledged row not closed by the confirmed exit: %s %s", status, reason)
 	}
 }
+
+// A late fill confirmation must not re-activate a PLEDGED or EXIT_PENDING lot.
+func TestProcessFillEvent_IgnoresPledgedAndExitPending(t *testing.T) {
+	for _, st := range []types.PositionState{types.StatePledged, types.StateExitPending} {
+		pm, p := newPledgedPortfolio(st, st == types.StateExitPending)
+		pm.ProcessFillEvent(pledgedStrategyID, pledgedSymbol, 123, 10, 10, true, NewTrailingSLManager(zap.NewNop()), 20)
+		p.Mu.Lock()
+		pos := p.Positions[pledgedSymbol]
+		p.Mu.Unlock()
+		if pos.State != st || pos.EntryPrice != 100 {
+			t.Fatalf("%s: fill re-activated the lot: state=%s entry=%v", st, pos.State, pos.EntryPrice)
+		}
+	}
+}
+
+// Newest row per (strategy, symbol) wins: an older PLEDGED row must not
+// re-pledge a lot whose live row is ACTIVE.
+func TestSyncBrokerStateFromDB_NewestRowWins(t *testing.T) {
+	cleanup := seedPledgedRows(t)
+	defer cleanup()
+	db := openPersistTestDB(t)
+	defer db.Close()
+	// Add a NEWER ACTIVE row for the same pair (re-entry after the pledge).
+	if _, err := db.Exec(`
+		INSERT INTO manthan_positions
+			(strategy_id, user_id, symbol, industry, mcap_bucket, index_name, entry_price, quantity, invested_amt,
+			 status, entry_time, updated_at)
+		VALUES ($1, 'UTEST', $2, 'Cables', 'SMALL', 'NIFTY SMALLCAP 250', 110, 5, 550,
+		        'ACTIVE', now() - interval '1 hour', now() + interval '1 second')`,
+		pledgedStrategyID, pledgedSymbol); err != nil {
+		t.Fatalf("seed newer active: %v", err)
+	}
+	pm, p := newPledgedPortfolio(types.StateActive, true)
+	pl, un, err := pm.SyncBrokerStateFromDB(context.Background(), db, nil)
+	if err != nil || pl != 0 || un != 0 {
+		t.Fatalf("older PLEDGED row must not win: pl=%d un=%d err=%v", pl, un, err)
+	}
+	p.Mu.Lock()
+	state := p.Positions[pledgedSymbol].State
+	p.Mu.Unlock()
+	if state != types.StateActive {
+		t.Fatalf("state flipped to %s", state)
+	}
+}
