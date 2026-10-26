@@ -766,6 +766,12 @@ func (h *SLHandler) EmergencySell(ctx context.Context, signal SLExitSignal) erro
 		// parks the signal; the admin ghost heal / the client's unpledge is the
 		// way out (2026-10-23 review; PLEDGED 2026-10-26).
 		if tag, terr := h.repo.ParkedStopTag(ctx, signal.StrategyID, signal.Symbol); terr == nil && tag != "" {
+			if tag == ParkTagPledged {
+				// A HOLD: the exit resumes the moment the reconciler lifts the park.
+				h.logger.Warn("EmergencySell held — "+parkedStopRefusal(tag, signal.Symbol),
+					zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol), zap.Int32("qty", signal.Quantity))
+				return fmt.Errorf("%w: %s", ErrPledgedHold, parkedStopRefusal(tag, signal.Symbol))
+			}
 			h.logger.Error("EmergencySell refused — "+parkedStopRefusal(tag, signal.Symbol),
 				zap.String("user_id", signal.UserID), zap.String("symbol", signal.Symbol), zap.Int32("qty", signal.Quantity), zap.String("park_tag", tag))
 			return poisonErr("pre-check: %s", parkedStopRefusal(tag, signal.Symbol))

@@ -73,7 +73,7 @@ func (p *ProtectiveReplay) parkGhostAtEOD(ctx context.Context, pos PositionNeedi
 			break
 		}
 	}
-	note := fmt.Sprintf("GHOST_SUSPECT: broker holds 0 of %s (%s) while the ledger holds %d — EOD arming stopped; heal via admin ghost endpoint", pos.Symbol, reason, pos.NetQty)
+	note := fmt.Sprintf("GHOST_SUSPECT: 0 sellable at the broker for %s (%s) while the ledger holds %d — sold, transferred or pledged; EOD arming stopped; the book reconciler decides (or heal via the admin ghost endpoint)", pos.Symbol, reason, pos.NetQty)
 	parked, perr := p.repo.ParkLatestStopRowForPosition(ctx, pos.StrategyID, pos.Symbol, "GHOST_SUSPECT", note)
 	if perr != nil || parked == 0 {
 		p.logger.Error("EOD Phase A: ghost suspect but no stop row could be parked — the position will be re-attempted next cycle",
@@ -81,8 +81,8 @@ func (p *ProtectiveReplay) parkGhostAtEOD(ctx context.Context, pos PositionNeedi
 	} else {
 		_ = p.repo.InsertEvent(ctx, parked, "SL_GHOST_SUSPECT", "", "SL_DEFERRED_BAND", "GHOST_SUSPECT", 0, pos.NetQty, note)
 	}
-	p.logger.Error("EOD Phase A: broker holds NOTHING of this position — ghost suspect parked, not arming",
+	p.logger.Error("EOD Phase A: 0 sellable at the broker for this position (sold, transferred or pledged) — ghost suspect parked, not arming",
 		zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol), zap.Int("ledger_net", pos.NetQty), zap.String("rms", reason))
 	notifyOps(p.authNotif, ctx, pos.UserID, pos.Symbol, "GHOST_SUSPECT",
-		fmt.Sprintf("EOD: broker holds 0 of %s but our ledger holds %d (RMS: %s) — overnight stop not armed; verify at the broker and heal via the admin ghost endpoint", pos.Symbol, pos.NetQty, reason))
+		fmt.Sprintf("EOD: 0 sellable at the broker for %s but our ledger holds %d (RMS: %s) — sold, transferred or pledged; overnight stop not armed; the book reconciler decides", pos.Symbol, pos.NetQty, reason))
 }

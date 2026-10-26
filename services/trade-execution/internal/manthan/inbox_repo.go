@@ -42,6 +42,11 @@ const (
 	// InboxErrStaleFeed — the symbol's market-data row has not ticked today;
 	// no fresh price to act on. Hold (no attempt burn), re-check every 2 min.
 	InboxErrStaleFeed = "STALE_FEED"
+	// InboxErrPledged — the lot is PLEDGED at the broker (parked by the
+	// api-gateway book reconciler, 2026-10-26): a SELL would only be
+	// rejected. A HOLD, not a failure: re-checked every 15 min with no
+	// attempt counting, so the exit resumes the moment the park is lifted.
+	InboxErrPledged = "PLEDGED"
 )
 
 // InboxRow mirrors a row of signal_inbox. Payload is kept as []byte so

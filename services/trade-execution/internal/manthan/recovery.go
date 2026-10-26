@@ -166,13 +166,13 @@ func (r *Recovery) Run(ctx context.Context) error {
 				if sl.ParentOrderID != nil {
 					parent = *sl.ParentOrderID
 				}
-				note := fmt.Sprintf("GHOST_SUSPECT: broker holds 0 of %s (%s) while the ledger holds %d — not re-placing; heal via admin ghost endpoint", sl.Symbol, reason, net)
+				note := fmt.Sprintf("GHOST_SUSPECT: 0 sellable at the broker for %s (%s) while the ledger holds %d — sold, transferred or pledged; not re-placing; the book reconciler decides (or heal via the admin ghost endpoint)", sl.Symbol, reason, net)
 				if perr := r.repo.ParkStopRow(ctx, sl.ID, parent, "GHOST_SUSPECT", note); perr == nil {
 					_ = r.repo.InsertEvent(ctx, sl.ID, "SL_GHOST_SUSPECT", "SL_PLACED", "SL_DEFERRED_BAND", status, sl.TriggerPrice, sl.Qty, note)
-					r.logger.Error("Recovery: broker holds NOTHING of this position — ghost suspect parked, not re-placing",
+					r.logger.Error("Recovery: 0 sellable at the broker for this position (sold, transferred or pledged) — ghost suspect parked, not re-placing",
 						zap.String("symbol", sl.Symbol), zap.Int("ledger_net", net), zap.String("rms", reason))
 					notifyOps(r.authNotif, ctx, sl.UserID, sl.Symbol, "GHOST_SUSPECT",
-						fmt.Sprintf("broker holds 0 of %s but our ledger holds %d (RMS: %s) — stop parked at boot; heal via the admin ghost endpoint", sl.Symbol, net, reason))
+						fmt.Sprintf("0 sellable at the broker for %s but our ledger holds %d (RMS: %s) — sold, transferred or pledged; stop parked at boot; the book reconciler decides", sl.Symbol, net, reason))
 				}
 				continue
 			}

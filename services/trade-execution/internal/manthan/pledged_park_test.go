@@ -16,8 +16,10 @@ package manthan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPledgedPark_ExcludedFromProtectionList(t *testing.T) {
@@ -118,15 +120,55 @@ func TestPledgedPark_TagAndRefusal(t *testing.T) {
 	if !strings.Contains(msg, "pledged at the broker") || !strings.Contains(msg, "unpledge") {
 		t.Fatalf("pledged refusal text: %q", msg)
 	}
-	perr := poisonErr("pre-check: %s", msg)
+	// A pledged lot is a HOLD for the inbox (15-minute re-check, no attempt
+	// burn), never POISON; only GHOST_SUSPECT stays POISON.
+	herr := fmt.Errorf("%w: %s", ErrPledgedHold, msg)
+	if cls := classifyHandlerErr(herr); cls != InboxErrPledged {
+		t.Fatalf("pledged hold class = %s", cls)
+	}
+	if !isHoldClass(InboxErrPledged) || backoffFor(InboxErrPledged, 7) != 15*time.Minute {
+		t.Fatalf("pledged hold must not burn attempts and must back off 15 min (got %s)", backoffFor(InboxErrPledged, 7))
+	}
 	var pe poisonError
-	if !errors.As(perr, &pe) || !strings.Contains(pe.Error(), "pledged at the broker") {
-		t.Fatalf("pledged refusal must be POISON for the inbox: %v", perr)
+	if errors.As(herr, &pe) {
+		t.Fatal("pledged hold must not be poison")
+	}
+	if cls := classifyHandlerErr(poisonErr("pre-check: %s", parkedStopRefusal(ParkTagGhostSuspect, "SYMT"))); cls != InboxErrPoison {
+		t.Fatalf("ghost refusal class = %s", cls)
 	}
 	if parkedStopRefusal("DEFERRED_BAND", "SYMT") != "" {
 		t.Fatal("unknown tags carry no refusal")
 	}
-	if !strings.Contains(parkedStopRefusal(ParkTagGhostSuspect, "SYMT"), "ghost suspect") {
-		t.Fatal("ghost refusal text lost")
+	if g := parkedStopRefusal(ParkTagGhostSuspect, "SYMT"); !strings.Contains(g, "0 sellable") || strings.Contains(g, "holds nothing") {
+		t.Fatalf("ghost refusal must say 0 sellable, never holds nothing: %q", g)
+	}
+}
+
+// RequeueTodaysFailedExitSignals leaves PLEDGED holds on their own cadence.
+func TestPledgedPark_RequeueSkipsPledgedHold(t *testing.T) {
+	db := openExecTestDB(t)
+	r := NewRepository(db)
+	ctx := context.Background()
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM signal_inbox WHERE signal_id LIKE 'nk-pledge-%'`) })
+	_, _ = db.Exec(`DELETE FROM signal_inbox WHERE signal_id LIKE 'nk-pledge-%'`)
+	seed := func(id, class string) {
+		if _, err := db.Exec(`INSERT INTO signal_inbox (signal_id, user_id, order_type, payload, kafka_topic, kafka_partition, kafka_offset, status, last_error, last_error_class, next_attempt_at, created_at)
+			VALUES ($1, 'S4450', 'MANTHAN_SL_EXIT', '{}', 't', 0, 0, 'FAILED', 'x', $2, now() + interval '10 minutes', now())`, id, class); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("nk-pledge-hold", InboxErrPledged)
+	seed("nk-pledge-transient", InboxErrTransient)
+	if _, err := r.RequeueTodaysFailedExitSignals(ctx, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+	var holdNext, transientNext time.Time
+	_ = db.QueryRow(`SELECT next_attempt_at FROM signal_inbox WHERE signal_id='nk-pledge-hold'`).Scan(&holdNext)
+	_ = db.QueryRow(`SELECT next_attempt_at FROM signal_inbox WHERE signal_id='nk-pledge-transient'`).Scan(&transientNext)
+	if !holdNext.After(time.Now().Add(5 * time.Minute)) {
+		t.Fatalf("pledged hold was requeued: next=%v", holdNext)
+	}
+	if transientNext.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("transient row not requeued: next=%v", transientNext)
 	}
 }

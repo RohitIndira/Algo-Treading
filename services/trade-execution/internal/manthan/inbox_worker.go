@@ -473,6 +473,9 @@ func classifyHandlerErr(err error) string {
 	if errors.Is(err, ErrStaleFeedHold) {
 		return InboxErrStaleFeed
 	}
+	if errors.Is(err, ErrPledgedHold) {
+		return InboxErrPledged
+	}
 	var pe poisonError
 	if errors.As(err, &pe) {
 		return InboxErrPoison
@@ -526,6 +529,11 @@ func backoffFor(class string, attempts int) time.Duration {
 	if class == InboxErrStaleFeed {
 		return 2 * time.Minute
 	}
+	// Pledged holds: the client unpledges on their own clock; re-check every
+	// 15 minutes (the book reconciler's own cadence).
+	if class == InboxErrPledged {
+		return 15 * time.Minute
+	}
 	const cap = 5 * time.Minute
 	exp := attempts
 	if exp > 8 {
@@ -549,7 +557,8 @@ func isHoldClass(class string) bool {
 	// the same-day expiry sweep dead-letters entry rows at the next IST day,
 	// and the market-hours pre-check poisons them after the entry cutoff.
 	return class == InboxErrUpperCircuit || class == InboxErrPreOpen ||
-		class == InboxErrAuthExpired || class == InboxErrStaleFeed
+		class == InboxErrAuthExpired || class == InboxErrStaleFeed ||
+		class == InboxErrPledged
 }
 
 // entryAttemptIsTerminalFailure reports whether an existing manthan_orders

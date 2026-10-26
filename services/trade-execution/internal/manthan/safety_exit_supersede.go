@@ -106,7 +106,7 @@ func (m *SafetyMonitor) supersedeExit(ctx context.Context, row *ManthanOrder, wh
 // naked scan does not place a fresh stop for it every cycle, and the operator
 // is paged once to heal the ledger through the admin ghost endpoint.
 func (m *SafetyMonitor) giveUpGhost(ctx context.Context, row *ManthanOrder, reason string) {
-	why := fmt.Sprintf("broker holds 0 of %s (%s) — the position does not exist at the broker; nothing to sell. Heal the ledger via the admin ghost endpoint", row.Symbol, reason)
+	why := fmt.Sprintf("0 sellable at the broker for %s (%s) — sold, transferred or pledged; nothing can be sold now. The book reconciler decides (or heal via the admin ghost endpoint)", row.Symbol, reason)
 	if uerr := m.repo.UpdateOrderCancelled(ctx, row.ID); uerr != nil {
 		m.logger.Error("Safety monitor: ghost give-up write failed — will retry next cycle", zap.Int64("row", row.ID), zap.Error(uerr))
 		return
@@ -119,10 +119,10 @@ func (m *SafetyMonitor) giveUpGhost(ctx context.Context, row *ManthanOrder, reas
 			zap.String("symbol", row.Symbol), zap.Error(perr))
 	} else if parked > 0 {
 		_ = m.repo.InsertEvent(ctx, parked, "SL_GHOST_SUSPECT", "CANCELLED", "SL_DEFERRED_BAND", "GHOST_SUSPECT", 0, row.Qty,
-			"parked as cover: broker holds 0 of the scrip (exit rejected Set= 0)")
+			"parked as cover: 0 sellable at the broker (exit rejected Set= 0 — sold, transferred or pledged)")
 	}
-	m.logger.Error("Safety monitor: broker holds NOTHING of this position — exit closed as ghost suspect; ledger needs healing",
+	m.logger.Error("Safety monitor: 0 sellable at the broker for this position (sold, transferred or pledged) — exit closed as ghost suspect; the book reconciler decides",
 		zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol), zap.Int("qty", row.Qty), zap.String("rms", reason))
 	notifyOps(m.authNotif, ctx, row.UserID, row.Symbol, "GHOST_SUSPECT",
-		fmt.Sprintf("broker holds 0 of %s but our ledger holds %d (RMS: %s) — nothing to sell; verify at the broker and heal via the admin ghost endpoint", row.Symbol, row.Qty, reason))
+		fmt.Sprintf("0 sellable at the broker for %s but our ledger holds %d (RMS: %s) — sold, transferred or pledged; nothing to sell now; the book reconciler decides", row.Symbol, row.Qty, reason))
 }

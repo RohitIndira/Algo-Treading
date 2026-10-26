@@ -3,6 +3,7 @@ package manthan
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -181,6 +182,9 @@ func (r *Repository) RequeueTodaysFailedExitSignals(ctx context.Context, todaySt
 		       last_error = 'requeued at boot: ' || left(COALESCE(last_error,''), 200)
 		 WHERE order_type='MANTHAN_SL_EXIT'
 		   AND status IN ('FAILED','DLQ')
+		   -- a PLEDGED hold is waiting for the client to unpledge, not for a
+		   -- fixed binary: leave its 15-minute cadence alone (no re-page)
+		   AND COALESCE(last_error_class,'') <> 'PLEDGED'
 		   AND created_at >= $1`, todayStart)
 	if err != nil {
 		return 0, fmt.Errorf("requeue failed exit signals: %w", err)
@@ -454,6 +458,11 @@ const (
 	ParkTagPledged      = "PLEDGED"
 )
 
+// ErrPledgedHold wraps an exit refused because the lot is pledged at the
+// broker — the inbox classifies it as the PLEDGED hold class (15-minute
+// re-check, no attempt counting), never POISON.
+var ErrPledgedHold = errors.New("pledged hold")
+
 // ParkedStopTag returns the hands-off park tag on the position's stop rows
 // (GHOST_SUSPECT or PLEDGED), or "" when the position carries none. Any stop
 // type — the trail skip and the exit gate must both see it.
@@ -485,7 +494,7 @@ func (r *Repository) HasGhostSuspectStop(ctx context.Context, strategyID, symbol
 func parkedStopRefusal(tag, symbol string) string {
 	switch tag {
 	case ParkTagGhostSuspect:
-		return symbol + " is a ghost suspect (broker holds 0 of the scrip) — not selling; heal via admin ghost endpoint"
+		return symbol + " has 0 sellable at the broker (RMS Set= 0: sold, transferred or pledged) — not selling; the book reconciler decides, or heal via the admin ghost endpoint"
 	case ParkTagPledged:
 		return symbol + " is pledged at the broker — the strategy places no stop and no exit for it; unpledge to let the strategy manage it"
 	}
