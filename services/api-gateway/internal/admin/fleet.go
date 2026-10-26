@@ -282,6 +282,32 @@ func (f *FleetStore) ExpireCredential(ctx context.Context, userID string) error 
 
 // ActiveUserIDs returns the distinct users holding non-deleted active
 // strategies — the pre-market sweep population.
+// GhostSuspectCandidates lists the (user, symbol) pairs trade-execution parked
+// as GHOST_SUSPECT in the last 7 days: the broker's RMS answered "Set= 0" to
+// a stop or an exit for the position. Candidates only — GhostPreview
+// re-verifies holdings, open orders and settlement before anything changes.
+func (f *FleetStore) GhostSuspectCandidates(ctx context.Context) ([]LedgerGhost, error) {
+	rows, err := f.execDB.QueryContext(ctx, `
+		SELECT DISTINCT user_id, UPPER(symbol)
+		  FROM manthan_orders
+		 WHERE broker_status = 'GHOST_SUSPECT'
+		   AND updated_at >= now() - interval '7 days'
+		 ORDER BY user_id, UPPER(symbol)`)
+	if err != nil {
+		return nil, fmt.Errorf("ghost suspects: %w", err)
+	}
+	defer rows.Close()
+	var out []LedgerGhost
+	for rows.Next() {
+		var g LedgerGhost
+		if err := rows.Scan(&g.UserID, &g.Symbol); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
 func (f *FleetStore) ActiveUserIDs(ctx context.Context) ([]string, error) {
 	rows, err := f.tradingDB.QueryContext(ctx, `
 		SELECT DISTINCT user_id FROM strategies

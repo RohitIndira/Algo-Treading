@@ -582,17 +582,23 @@ func main() {
 		adminHTTP.SetActions(adminActions)
 
 		// Ghost reaper: automated sweep through the SAME GhostPreview →
-		// GhostHeal gate as the manual flow. Hard default OFF — it exists
-		// only when MANTHAN_GHOST_REAPER_MODE is explicitly dry_run/enabled.
-		// Rollback: unset the var and restart.
-		switch mode := os.Getenv("MANTHAN_GHOST_REAPER_MODE"); mode {
+		// GhostHeal gate as the manual flow. Default ENABLED since 2026-10-26
+		// (operator rule: a position the broker no longer holds is closed in
+		// our books automatically so the strategy moves on). Rollback:
+		// MANTHAN_GHOST_REAPER_MODE=off (or dry_run) and restart.
+		mode := os.Getenv("MANTHAN_GHOST_REAPER_MODE")
+		if mode == "" {
+			mode = admin.ReaperModeEnabled
+		}
+		switch mode {
 		case admin.ReaperModeDryRun, admin.ReaperModeEnabled:
 			reaper := admin.NewGhostReaper(mode, adminActions, adminRecon,
 				adminFleet, adminHTTP.AuditStore(), istLoc)
+			reaper.SetLedgerSource(adminFleet)
 			go reaper.Start(context.Background())
-			log.Printf("[ghost-reaper] active mode=%s (daily 15:50 IST sweep)", mode)
-		case "":
-			// default: reaper does not exist
+			log.Printf("[ghost-reaper] active mode=%s (every 15 min 09:20–15:45 IST + 15:50)", mode)
+		case admin.ReaperModeOff:
+			log.Printf("[ghost-reaper] OFF by configuration")
 		default:
 			log.Printf("[ghost-reaper] unknown MANTHAN_GHOST_REAPER_MODE=%q — reaper OFF", mode)
 		}

@@ -11,6 +11,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -253,7 +254,9 @@ func TestReaper_HealErrorAuditedAndContinues(t *testing.T) {
 func TestReaper_CapDefersExcess(t *testing.T) {
 	gate := &fakeGate{previews: map[string]*GhostPlan{}}
 	var mismatches []Mismatch
-	for _, s := range []string{"A", "B", "C", "D", "E", "F", "G"} {
+	const over = 2 // two more candidates than the per-sweep cap
+	for i := 0; i < maxHealsPerSweep+over; i++ {
+		s := fmt.Sprintf("SYM%02d", i)
 		gate.previews["U1/"+s] = &GhostPlan{UserID: "U1", Symbol: s, BookRows: 1}
 		mismatches = append(mismatches, ghostMismatch(s))
 	}
@@ -267,8 +270,8 @@ func TestReaper_CapDefersExcess(t *testing.T) {
 	if rep.Healed != maxHealsPerSweep {
 		t.Fatalf("expected %d heals, got %+v", maxHealsPerSweep, rep)
 	}
-	if rep.DeferredCap != 7-maxHealsPerSweep {
-		t.Fatalf("expected %d deferred, got %+v", 7-maxHealsPerSweep, rep)
+	if rep.DeferredCap != over {
+		t.Fatalf("expected %d deferred, got %+v", over, rep)
 	}
 	deferred := 0
 	for _, r := range audit.rows {
@@ -276,7 +279,7 @@ func TestReaper_CapDefersExcess(t *testing.T) {
 			deferred++
 		}
 	}
-	if deferred != 7-maxHealsPerSweep {
+	if deferred != over {
 		t.Fatalf("deferred candidates not audited: %v", audit.results())
 	}
 }
@@ -301,18 +304,70 @@ func TestReaper_IgnoresNonGhostClasses(t *testing.T) {
 	}
 }
 
-// Test: next-sweep scheduling lands on 15:50 IST, today if still ahead,
-// tomorrow otherwise.
+// Test: next-sweep scheduling — intraday 15-minute slots (09:20 + k×15) until
+// 15:45, then the 15:50 close sweep, then the next trading day.
 func TestReaper_NextSweepTime(t *testing.T) {
 	ist := time.FixedZone("IST", 5*3600+30*60)
 	r := NewGhostReaper(ReaperModeDryRun, &fakeGate{}, &fakeScanner{}, &fakeUsers{}, &fakeAudit{}, ist)
 
-	r.now = func() time.Time { return time.Date(2026, 9, 3, 12, 0, 0, 0, ist) }
-	if got := r.nextSweep(); got.Hour() != 15 || got.Minute() != 50 || got.Day() != 3 {
-		t.Fatalf("expected today 15:50 IST, got %v", got)
+	r.now = func() time.Time { return time.Date(2026, 9, 3, 12, 0, 0, 0, ist) } // Thursday
+	if got := r.nextSweep(); got.Hour() != 12 || got.Minute() != 5 || got.Day() != 3 {
+		t.Fatalf("expected today 12:05 IST (next 15-min slot), got %v", got)
 	}
 	r.now = func() time.Time { return time.Date(2026, 9, 3, 16, 0, 0, 0, ist) }
 	if got := r.nextSweep(); got.Day() != 4 {
 		t.Fatalf("expected tomorrow 15:50 IST, got %v", got)
+	}
+}
+
+type fakeLedger struct{ parks []LedgerGhost }
+
+func (f *fakeLedger) GhostSuspectCandidates(context.Context) ([]LedgerGhost, error) {
+	return f.parks, nil
+}
+
+// A trade-execution GHOST_SUSPECT park (broker RMS "Set= 0") is a candidate
+// even when the reconciler lists no GHOST for it (ledger-only ghost); it still
+// goes through the gate, and a user without broker truth is skipped entirely.
+func TestReaper_LedgerSuspectsAreCandidates(t *testing.T) {
+	gate := &fakeGate{previews: map[string]*GhostPlan{"U1/IOLCP": {UserID: "U1", Symbol: "IOLCP", LedgerOnly: true, LedgerNetQty: 121}}}
+	scan := &fakeScanner{results: map[string]*ReconResult{
+		"U1": {UserID: "U1", BrokerLeg: "OK"},
+		"U2": {UserID: "U2", BrokerLeg: "AUTH_EXPIRED"},
+	}}
+	users := &fakeUsers{users: []string{"U1", "U2"}}
+	audit := &fakeAudit{}
+	r := newTestReaper(ReaperModeEnabled, gate, scan, users, audit)
+	r.SetLedgerSource(&fakeLedger{parks: []LedgerGhost{{"U1", "IOLCP"}, {"U2", "DIFFNKG"}}})
+	rep := r.SweepOnce(context.Background())
+	if rep.Candidates != 1 || rep.Healed != 1 || rep.SkippedUser != 1 {
+		t.Fatalf("report: %s", rep.String())
+	}
+	if len(gate.healCalls) != 1 || gate.healCalls[0] != "U1/IOLCP" {
+		t.Fatalf("healed: %v", gate.healCalls)
+	}
+}
+
+// Sweep cadence: 15-minute slots 09:20–15:45 IST, the 15:50 close sweep, then
+// 09:20 on the next trading day; weekends are skipped.
+func TestReaper_NextSweepCadence(t *testing.T) {
+	ist := time.FixedZone("IST", 5*3600+30*60)
+	r := newTestReaper(ReaperModeEnabled, &fakeGate{}, &fakeScanner{}, &fakeUsers{}, &fakeAudit{})
+	at := func(h, m int) { r.now = func() time.Time { return time.Date(2026, 10, 26, h, m, 0, 0, ist) } } // Monday
+	at(11, 21)
+	if n := r.nextSweep().In(ist); n.Hour() != 11 || n.Minute() != 35 {
+		t.Fatalf("11:21 → %s, want 11:35", n.Format("15:04"))
+	}
+	at(15, 46)
+	if n := r.nextSweep().In(ist); n.Hour() != 15 || n.Minute() != 50 {
+		t.Fatalf("15:46 → %s, want 15:50", n.Format("15:04"))
+	}
+	at(16, 0)
+	if n := r.nextSweep().In(ist); n.Day() != 27 || n.Hour() != 9 || n.Minute() != 20 {
+		t.Fatalf("16:00 Mon → %s, want Tue 09:20", n.Format("Mon 15:04"))
+	}
+	r.now = func() time.Time { return time.Date(2026, 10, 24, 12, 0, 0, 0, ist) } // Saturday
+	if n := r.nextSweep().In(ist); n.Weekday() != time.Monday || n.Hour() != 9 || n.Minute() != 20 {
+		t.Fatalf("Sat noon → %s, want Mon 09:20", n.Format("Mon 15:04"))
 	}
 }
