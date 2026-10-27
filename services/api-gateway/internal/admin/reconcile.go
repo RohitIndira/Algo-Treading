@@ -721,6 +721,16 @@ func (rs *ReconStore) Reconcile(ctx context.Context, userID string) (*ReconResul
 		}
 	}
 
+	// Nothing of ours anywhere for this client (no ACTIVE lot, no stale stop,
+	// no ledger-only lot): there is nothing a broker read could decide, so
+	// don't spend three broker calls on every SSO login of a non-Manthan user.
+	if len(active) == 0 && len(exitedOpenSL) == 0 && len(lots) == 0 {
+		res.BrokerLeg, res.BrokerDetail = "SKIPPED", "no Manthan lots or open stop rows for this client — broker not read"
+		res.Mismatches, res.Verdicts = []Mismatch{}, []Verdict{}
+		res.VerdictSummary = SummarizeVerdicts(res.Verdicts)
+		return res, nil
+	}
+
 	// Leg 3: broker — ONE read, shared by the class view and the verdicts.
 	res.read = rs.readBroker(ctx, userID)
 	if res.read.leg == "OK" {

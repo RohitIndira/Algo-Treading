@@ -396,6 +396,11 @@ func (g *GhostReaper) sweepUser(ctx context.Context, uid, source string, ledgerP
 		rep.Errors++
 		return
 	}
+	// Nothing of ours for this client: not an event worth an audit row
+	// (fires on every SSO login of a non-Manthan user).
+	if res.BrokerLeg == "SKIPPED" {
+		return
+	}
 	// No broker truth → no action, ever. The UNVERIFIED verdicts are still
 	// persisted (without overwriting the last truth) so the reason shows.
 	if res.BrokerLeg != "OK" {
