@@ -237,6 +237,14 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 		if ev.EventType == "CANCELLED" && ev.FilledQty > 0 {
 			return h.correctPartialFill(ctx, ev)
 		}
+		// Per-trade frames (2026-10-28): the broker's WebSocket emits one
+		// EXECUTED frame per trade with filled_qty = THAT trade's shares
+		// (S4450 SHREEPUSHK filled 38 as 1 + 1 + 36). The row opened from
+		// the first frame; the final FILLED event — filled_qty equal to the
+		// order quantity — is the cumulative truth and grows the row to it.
+		if ev.EventType == "FILLED" && ev.FilledQty > 0 {
+			return h.growToFinalFill(ctx, ev)
+		}
 		h.logger.Debug("state-machine: BUY replay ignored (position row exists)",
 			zap.String("broker_order_id", ev.BrokerOrderID),
 			zap.String("event_id", ev.EventID))
@@ -448,6 +456,78 @@ func (h *Handler) handleBuyFill(ctx context.Context, ev *consumer.OrderEvent) er
 			Action:        publisher.ActionEntry,
 			Price:         pos.EntryPrice,
 			Quantity:      pos.Quantity,
+			BrokerOrderID: ev.BrokerOrderID,
+		})
+	}
+	return nil
+}
+
+// growToFinalFill grows a position that was opened from a per-trade fill
+// frame to the broker's final fill count. Only a FILLED event whose
+// filled_qty equals the order quantity is treated as final (cumulative); an
+// intermediate per-trade frame says nothing about the running total and is
+// ignored. Price precedence as in handleBuyFill: the ledger's average fill
+// (manthan_orders.avg_fill_price, set by trade-execution from the trade
+// book) over the event's traded price. Never shrinks — a top-up already
+// merged into the lot keeps its quantity; shrinking is the CANCELLED-with-
+// fill path (correctPartialFill).
+func (h *Handler) growToFinalFill(ctx context.Context, ev *consumer.OrderEvent) error {
+	if ev.Quantity <= 0 || ev.FilledQty < ev.Quantity {
+		h.logger.Debug("state-machine: per-trade FILLED frame for an open position — waiting for the final count",
+			zap.String("broker_order_id", ev.BrokerOrderID), zap.Int("frame_qty", ev.FilledQty), zap.Int("order_qty", ev.Quantity))
+		return nil
+	}
+	pos, err := h.store.FindPositionByEntryBrokerOrderID(ctx, ev.BrokerOrderID)
+	if err != nil {
+		return fmt.Errorf("growToFinalFill: find position: %w", err)
+	}
+	if pos == nil || pos.Quantity >= ev.FilledQty {
+		return nil
+	}
+	price := ev.TradedPrice
+	if meta, merr := h.lookup.LookupOrderMeta(ctx, ev.BrokerOrderID); merr == nil && meta.AvgFillPrice > 0 {
+		price = meta.AvgFillPrice
+	} else if merr != nil {
+		h.logger.Warn("growToFinalFill: LookupOrderMeta failed — using the event's traded price",
+			zap.String("broker_order_id", ev.BrokerOrderID), zap.Error(merr))
+	}
+	if price <= 0 {
+		price = pos.EntryPrice
+	}
+	newQty := ev.FilledQty
+	audit := &store.PositionEvent{
+		EventType:      store.EventTypeEntryQtyCorrected,
+		BrokerOrderID:  ev.BrokerOrderID,
+		SignalID:       pos.SignalID,
+		DeltaQty:       newQty - pos.Quantity,
+		FillPrice:      price,
+		Reason:         fmt.Sprintf("opened from a per-trade fill frame with %d; broker final fill is %d @ %.2f", pos.Quantity, newQty, price),
+		SourceTopic:    "order.events",
+		SourceEventID:  "grow-" + ev.EventID,
+		RawSourceEvent: ev.RawMessage,
+	}
+	applied, err := h.store.GrowEntryQuantityWithEvent(ctx, pos.PositionID, newQty, price, price*float64(newQty), audit)
+	if err != nil {
+		return fmt.Errorf("growToFinalFill: store update: %w", err)
+	}
+	if !applied {
+		return nil
+	}
+	h.logger.Warn("state-machine: position grown to the broker's final fill count",
+		zap.String("position_id", pos.PositionID.String()), zap.String("user_id", pos.UserID), zap.String("symbol", pos.Symbol),
+		zap.Int("was_qty", pos.Quantity), zap.Int("final_qty", newQty), zap.Float64("entry_price", price))
+	if h.pub != nil {
+		h.pub.Publish(ctx, &publisher.PositionEvent{
+			EventType:     publisher.EventPositionEntryCorrected,
+			PositionID:    pos.PositionID.String(),
+			Origin:        pos.Origin,
+			UserID:        pos.UserID,
+			StrategyID:    pos.StrategyID,
+			SignalID:      pos.SignalID,
+			Symbol:        pos.Symbol,
+			Action:        publisher.ActionEntry,
+			Price:         price,
+			Quantity:      newQty,
 			BrokerOrderID: ev.BrokerOrderID,
 		})
 	}

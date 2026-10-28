@@ -205,7 +205,11 @@ func (c *CooldownConsumer) handleMessage(ctx context.Context, msg kafka.Message)
 	// broker-confirmed price/qty (positions svc publishes OPENED only after
 	// a real priced fill). Idempotent: ProcessFillEvent no-ops when the
 	// position is already ACTIVE with >= qty.
-	if strings.EqualFold(ev.EventType, "POSITION_OPENED") {
+	// POSITION_ENTRY_CORRECTED (2026-10-28): the lot was opened from a
+	// per-trade fill frame and positions svc has grown it to the broker's
+	// final count — re-confirm with the real qty/price (ProcessFillEvent
+	// grows an ACTIVE lot; PersistFillConfirmed rewrites the DB row).
+	if strings.EqualFold(ev.EventType, "POSITION_OPENED") || strings.EqualFold(ev.EventType, "POSITION_ENTRY_CORRECTED") {
 		if c.confirmFill != nil && ev.StrategyID != "" && ev.Symbol != "" && ev.Price > 0 && ev.Quantity > 0 {
 			c.confirmFill(ev.StrategyID, ev.Symbol, ev.Price, int32(ev.Quantity))
 			c.logger.Info("fill confirmed from position.events — re-entry guard armed",

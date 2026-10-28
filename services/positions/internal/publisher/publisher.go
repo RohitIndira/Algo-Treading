@@ -34,18 +34,23 @@ const (
 	// broker-authoritative fill (exit_price / realized_pnl only; status and
 	// quantity unchanged). Consumers must NOT treat it as a new exit.
 	EventPositionExitCorrected = "POSITION_EXIT_CORRECTED"
-	EventSLTrailed      = "SL_TRAILED"
-	EventManualInterrupt = "MANUAL_INTERRUPT" // reserved for future partial user activity
+	// EventPositionEntryCorrected — an ACTIVE lot opened from a per-trade
+	// fill frame was grown to the broker's final fill count / average price.
+	// Consumers treat it like POSITION_OPENED (re-confirm qty + price), never
+	// as a second position.
+	EventPositionEntryCorrected = "POSITION_ENTRY_CORRECTED"
+	EventSLTrailed              = "SL_TRAILED"
+	EventManualInterrupt        = "MANUAL_INTERRUPT" // reserved for future partial user activity
 )
 
 // Action — coarse-grained "what happened" tag inside an event. The specific
 // state-transition semantics live in the exit_reason / event_type combo;
 // action is a convenience for consumers that don't want to fold enums.
 const (
-	ActionEntry  = "ENTRY"
-	ActionExit   = "EXIT"
-	ActionTrail  = "TRAIL"
-	ActionTopUp  = "TOP_UP"
+	ActionEntry = "ENTRY"
+	ActionExit  = "EXIT"
+	ActionTrail = "TRAIL"
+	ActionTopUp = "TOP_UP"
 )
 
 // PositionEvent is the JSON envelope produced on Kafka topic position.events.
@@ -56,7 +61,7 @@ type PositionEvent struct {
 	ProducedAtMs int64  `json:"produced_at_ms"`
 
 	PositionID string `json:"position_id"`
-	Origin     string `json:"origin"`               // MANTHAN | USER_MANUAL
+	Origin     string `json:"origin"` // MANTHAN | USER_MANUAL
 	UserID     string `json:"user_id"`
 	StrategyID string `json:"strategy_id,omitempty"` // NULL/"" for USER_MANUAL
 	SignalID   string `json:"signal_id,omitempty"`   // NULL/"" for USER_MANUAL

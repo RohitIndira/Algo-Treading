@@ -432,6 +432,41 @@ func (s *Store) CorrectEntryQuantityWithEvent(ctx context.Context, positionID uu
 	})
 }
 
+// GrowEntryQuantityWithEvent right-sizes an ACTIVE position UP to the
+// broker's final fill count (and the authoritative average price) when the
+// row was opened from a per-trade WebSocket frame. The WHERE clause only
+// ever grows: a replay of the same final event, or a stale frame smaller
+// than the row (top-up already merged), is a no-op and returns false.
+func (s *Store) GrowEntryQuantityWithEvent(ctx context.Context, positionID uuid.UUID, newQuantity int, newEntryPrice, newInvested float64, ev *PositionEvent) (bool, error) {
+	if newQuantity <= 0 || newEntryPrice <= 0 {
+		return false, fmt.Errorf("GrowEntryQuantityWithEvent: quantity and price must be > 0, got %d @ %.2f", newQuantity, newEntryPrice)
+	}
+	applied := false
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE positions
+			SET quantity        = $1,
+			    entry_price     = $2,
+			    invested_amount = $3,
+			    updated_at      = NOW()
+			WHERE position_id = $4
+			  AND status = 'ACTIVE'
+			  AND quantity < $1`,
+			newQuantity, newEntryPrice, newInvested, positionID)
+		if err != nil {
+			return fmt.Errorf("grow entry qty: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return nil
+		}
+		applied = true
+		ev.PositionID = positionID
+		return insertEventTx(ctx, tx, ev)
+	})
+	return applied, err
+}
+
 func (s *Store) UpdatePartialExitWithEvent(ctx context.Context, positionID uuid.UUID, deltaQty int, ev *PositionEvent) error {
 	if deltaQty <= 0 {
 		return fmt.Errorf("UpdatePartialExitWithEvent: deltaQty must be > 0, got %d", deltaQty)

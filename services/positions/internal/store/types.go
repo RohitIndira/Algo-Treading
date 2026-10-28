@@ -64,8 +64,9 @@ const (
 	EventTypeManualSellApplied  = "MANUAL_SELL_APPLIED"
 	EventTypeLiquidation        = "LIQUIDATION"
 	EventTypeReconcilerDriftFix = "RECONCILER_DRIFT_FIX"
-	EventTypePartialFillFix     = "PARTIAL_FILL_FIX" // downsize when broker CANCELLED-with-fill reveals the real fill_qty
-	EventTypeTopupMerged        = "TOPUP_MERGED"     // MARKET top-up fill merged into the partial-fill parent lot (VWAP)
+	EventTypePartialFillFix     = "PARTIAL_FILL_FIX"    // downsize when broker CANCELLED-with-fill reveals the real fill_qty
+	EventTypeTopupMerged        = "TOPUP_MERGED"        // MARKET top-up fill merged into the partial-fill parent lot (VWAP)
+	EventTypeEntryQtyCorrected  = "ENTRY_QTY_CORRECTED" // grown to the broker's FINAL fill count after opening from a per-trade frame (2026-10-28)
 )
 
 // Position is the in-Go shape of a positions row. Field types match the
