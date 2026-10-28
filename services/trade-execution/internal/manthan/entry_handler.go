@@ -162,7 +162,7 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 	// parent linkage on the fill event and adds qty + invested onto the
 	// parent manthan_positions row.
 	if signal.TopUpForSignalID == "" {
-		existingEntry, lookupErr := h.repo.GetActiveEntryBySymbol(ctx, signal.StrategyID, signal.Symbol)
+		existingEntry, netHeld, lookupErr := h.repo.HeldEntryBySymbol(ctx, signal.StrategyID, signal.Symbol)
 		if errors.Is(lookupErr, sql.ErrNoRows) {
 			lookupErr = nil // no matching row = genuinely no duplicate — proceed
 		}
@@ -182,10 +182,13 @@ func (h *EntryHandler) ExecuteEntry(ctx context.Context, signal ManthanSignal) (
 			return 0, fmt.Errorf("entry-guard lookup failed (fail-closed): %w", lookupErr)
 		}
 		if existingEntry != nil {
-			h.logger.Info("Skipping duplicate entry — already have position",
+			// Still held per our own ledger: nothing to buy. Typed so the inbox
+			// marks the row DONE instead of retrying a deterministic state.
+			h.logger.Info("Skipping duplicate entry — position still held",
 				zap.String("symbol", signal.Symbol),
+				zap.Int("net_held", netHeld),
 				zap.String("existing_status", string(existingEntry.Status)))
-			return 0, fmt.Errorf("duplicate: already have %s position for %s", existingEntry.Status, signal.Symbol)
+			return 0, fmt.Errorf("%w: %d of %s still held for strategy %s", ErrAlreadyHeld, netHeld, signal.Symbol, signal.StrategyID)
 		}
 	} else {
 		h.logger.Info("Top-up entry — duplicate check bypassed",

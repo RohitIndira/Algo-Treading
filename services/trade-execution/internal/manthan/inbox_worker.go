@@ -325,6 +325,18 @@ func (w *InboxWorker) processRow(ctx context.Context, row *InboxRow) {
 		return
 	}
 
+	// Position still held per our ledger: a duplicate signal for today, not
+	// a failure. Before 2026-10-28 this was classified TRANSIENT and burned
+	// the whole retry budget (26 attempts on S4450 SHREEPUSHK).
+	if errors.Is(handlerErr, ErrAlreadyHeld) {
+		w.logger.Info("Inbox row duplicate — position still held, marking DONE",
+			zap.Int64("id", row.ID), zap.String("signal_id", row.SignalID), zap.Error(handlerErr))
+		if err := w.repo.MarkInboxDone(ctx, row.ID); err != nil {
+			w.logger.Warn("Inbox mark DONE (held) failed", zap.Int64("id", row.ID), zap.Error(err))
+		}
+		return
+	}
+
 	// Classify and apply the right status / backoff.
 	class := classifyHandlerErr(handlerErr)
 	if class == InboxErrPoison {

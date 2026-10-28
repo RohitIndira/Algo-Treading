@@ -32,6 +32,11 @@ type Repository struct {
 // arrive second. Inbox worker marks the row DONE.
 var ErrDuplicateActiveEntry = errors.New("manthan: an active entry order already exists for (strategy_id, symbol, order_type)")
 
+// ErrAlreadyHeld: the entry guard found the lot still held (net FILLED BUY −
+// FILLED SELL > 0). The signal is a duplicate for today — the inbox marks it
+// DONE, never retries it.
+var ErrAlreadyHeld = errors.New("duplicate: position still held")
+
 // pgUniqueViolation is the SQLSTATE code Postgres returns for a UNIQUE
 // constraint or partial UNIQUE index conflict. See
 // https://www.postgresql.org/docs/current/errcodes-appendix.html
@@ -495,6 +500,31 @@ func (r *Repository) GetActiveEntryBySymbol(ctx context.Context, strategyID, sym
 		WHERE strategy_id=$1 AND symbol=$2 AND order_type='LIMIT_BUY' AND status='FILLED'
 		ORDER BY created_at DESC LIMIT 1`, strategyID, symbol)
 	return scanOrder(row)
+}
+
+// HeldEntryBySymbol is the entry-guard lookup: the newest FILLED entry for
+// (strategy, symbol) ONLY while the lot is still held by our own order
+// ledger (FILLED BUY − FILLED SELL > 0). A FILLED BUY whose stop or exit has
+// since FILLED is history, not a position — before 2026-10-28 the guard used
+// GetActiveEntryBySymbol and treated every FILLED BUY as "already have
+// position" forever, so a stock could never be re-entered after a stop-out
+// (S4450 SHREEPUSHK: stopped out 10-23, fresh signal 10-28 dropped as a
+// duplicate 26 times; 43 strategy/symbol pairs were blocked fleet-wide).
+// Returns sql.ErrNoRows when nothing is held; any other error is a lookup
+// failure the caller must treat fail-closed.
+func (r *Repository) HeldEntryBySymbol(ctx context.Context, strategyID, symbol string) (*ManthanOrder, int, error) {
+	net, _, hasEntry, err := r.NetHeldQty(ctx, strategyID, symbol)
+	if err != nil {
+		return nil, 0, fmt.Errorf("net held: %w", err)
+	}
+	if !hasEntry || net <= 0 {
+		return nil, net, sql.ErrNoRows
+	}
+	e, err := r.GetActiveEntryBySymbol(ctx, strategyID, symbol)
+	if err != nil {
+		return nil, net, err
+	}
+	return e, net, nil
 }
 
 // ListOurBrokerOrderIDsForUser returns the set of broker_order_id values
