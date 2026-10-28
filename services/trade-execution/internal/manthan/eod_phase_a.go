@@ -247,7 +247,7 @@ func (p *ProtectiveReplay) runEODPhaseA(ctx context.Context) {
 		//           broker. Neither cap nor spacing: the first real attempt
 		//           after the client logs in must go out at once.
 		errs, eerr := p.repo.ListAMOAttemptErrorsToday(cycleCtx, pos.EntryOrderID, tradeDate)
-		hard, lock, ghost, auth := classifyAMOAttemptErrors(errs)
+		hard, lock, ghost, auth := classifyAMOAttemptErrors(errs, settledForRMS(pos.LastBuyFilledAt, time.Now()))
 		if eerr == nil && ghost > 0 {
 			p.parkGhostAtEOD(cycleCtx, pos, errs)
 			skipped++

@@ -22,14 +22,19 @@ type eodGiveUpState struct {
 // (our own session was dead — the order never reached the broker; FIV99
 // 2026-10-26: 60 h of AU004 attempts had spent the cap, so nothing was armed
 // even after the client logged in).
-func classifyAMOAttemptErrors(errs []string) (hard, lock, ghost, auth int) {
+//
+// settled=false (the position's newest buy is within settlement) turns every
+// "Set= 0" into a lock: an unsettled buy reads exactly like a ghost to the RMS
+// (SHREEPUSHK 2026-10-28), and the spacing ladder — not a park — is the
+// right response until the shares land in the demat.
+func classifyAMOAttemptErrors(errs []string, settled bool) (hard, lock, ghost, auth int) {
 	for _, e := range errs {
 		if strings.TrimSpace(e) == "" {
 			continue // row still pending / no rejection recorded
 		}
 		le := strings.ToLower(e)
 		switch {
-		case rmsSaysNoHolding(e):
+		case settled && rmsSaysNoHolding(e):
 			ghost++
 		case isRMSQtyRejection(e):
 			lock++

@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Indira's RMS rejects a SELL whose quantity is not free with a text like
@@ -62,6 +63,32 @@ func rmsSaysNoHolding(reason string) bool {
 	return ok && l.Set == 0
 }
 
+// rmsNoHoldingSettleDays: shares we buy reach the demat on T+1 (pay-out).
+// Until then the RMS reports "Set= 0, N.Used= <our qty>, Prev= 0" for the
+// scrip — the very text a ghost produces — even though the broker filled the
+// buy hours earlier and accepted a day stop on it (SHREEPUSHK 2026-10-28: both
+// T+0 lots were parked GHOST_SUSPECT at 16:05 and would have carried no stop
+// overnight; the 16:45 spacing retry armed them once the rows were unparked).
+// "Set= 0" is therefore a ghost verdict only once the position's NEWEST buy is
+// old enough to have settled; before that it is read as a quantity lock.
+const rmsNoHoldingSettleDays = 2
+
+// settledForRMS reports whether a position whose newest FILLED BUY filled at
+// lastBuy may be judged by the RMS "Set= 0" text at now: the fill's IST
+// calendar day lies at least rmsNoHoldingSettleDays before now's. A zero
+// lastBuy (no FILLED BUY row — a legacy or hand-resurrected lot) is settled.
+func settledForRMS(lastBuy, now time.Time) bool {
+	if lastBuy.IsZero() {
+		return true
+	}
+	ist := istLocation()
+	b := lastBuy.In(ist)
+	n := now.In(ist)
+	bd := time.Date(b.Year(), b.Month(), b.Day(), 0, 0, 0, 0, ist)
+	nd := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, ist)
+	return !bd.AddDate(0, 0, rmsNoHoldingSettleDays).After(nd)
+}
+
 // looksExecutedCancelError recognises the broker refusing to cancel an order
 // because it has already executed ("FULLY_EXECUTED order not allowed to
 // CANCEL" — FILATEX 2026-10-23): the quantity is SOLD, not locked.
@@ -107,16 +134,21 @@ const reprotectBudgetPerDay = 3
 // net holding for the position, (b) the broker's rejection text if the stop
 // was rejected, (c) how many re-placements this row already had today.
 //
+// settled=false (the position's newest buy is within settlement, or the
+// lookup failed) withholds the ghost verdict: the RMS "Set= 0" of an
+// unsettled buy is read as a quantity lock, and the budget cap still bounds
+// the re-placements.
+//
 // netKnown=false (ledger query failed) never blocks protection: the position
 // is treated as live. hasEntry=false (no FILLED BUY row at all — a legacy or
 // hand-resurrected lot) is NOT "nothing held" either (NetHeldQty's contract;
 // EmergencySell sells such lots): only a ledger that HAS the entry and shows
 // net ≤ 0 makes the row an orphan.
-func classifyLostStop(net int, hasEntry, netKnown bool, rejReason string, replacedToday int) lostStopAction {
+func classifyLostStop(net int, hasEntry, netKnown bool, rejReason string, replacedToday int, settled bool) lostStopAction {
 	if netKnown && hasEntry && net <= 0 {
 		return lostStopOrphan
 	}
-	if rmsSaysNoHolding(rejReason) {
+	if settled && rmsSaysNoHolding(rejReason) {
 		return lostStopGhost
 	}
 	if replacedToday >= reprotectBudgetPerDay {

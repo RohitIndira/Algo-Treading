@@ -616,6 +616,25 @@ func (r *Repository) GetEntryFilledAt(ctx context.Context, signalID string) (tim
 	return t.Time, nil
 }
 
+// LastBuyFilledAt returns the fill time of the NEWEST FILLED BUY of a
+// position (entry or top-up), zero when the position has none. The ghost
+// verdict on an RMS "Set= 0" is withheld until that buy has settled
+// (settledForRMS): a lookup error is reported so callers can withhold too.
+func (r *Repository) LastBuyFilledAt(ctx context.Context, strategyID, symbol string) (time.Time, error) {
+	var t sql.NullTime
+	err := r.db.QueryRowContext(ctx, `
+		SELECT MAX(COALESCE(filled_at, updated_at)) FROM manthan_orders
+		WHERE strategy_id = $1 AND symbol = $2 AND order_side = 'BUY' AND status = 'FILLED'`,
+		strategyID, symbol).Scan(&t)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !t.Valid {
+		return time.Time{}, nil
+	}
+	return t.Time, nil
+}
+
 // GetLiveEntryForSymbol finds the most recent active BUY entry for a user
 // + symbol that does not yet have a matching exit. Used by the WSS-side
 // manual-exit detector to resolve which signal_id (and strategy_id) should
@@ -723,19 +742,20 @@ func (r *Repository) GetLiveEntriesByUser(ctx context.Context, userID string) ([
 // SL on the broker for tomorrow's session. Returned by
 // ListPositionsNeedingProtection at 16:35 IST.
 type PositionNeedingProtection struct {
-	EntryOrderID   int64
-	EntrySignalID  string
-	StrategyID     string
-	UserID         string
-	Symbol         string
-	ISIN           string
-	IndiraSymbol   string
-	ExchangeToken  string
-	Exchange       string
-	NetQty         int     // sum(filled BUY) − sum(filled SELL); always > 0 here
-	LatestTrigger  float64 // most recent trail trigger from any prior SL row (0 if no prior SL)
-	LatestLimit    float64
-	EntryFillPrice float64 // avg_fill_price of the entry BUY order — used as SL fallback when LatestTrigger==0 (e.g. EOD Phase A on entry-same-day positions with no tick-handler trail yet)
+	EntryOrderID    int64
+	EntrySignalID   string
+	StrategyID      string
+	UserID          string
+	Symbol          string
+	ISIN            string
+	IndiraSymbol    string
+	ExchangeToken   string
+	Exchange        string
+	NetQty          int     // sum(filled BUY) − sum(filled SELL); always > 0 here
+	LatestTrigger   float64 // most recent trail trigger from any prior SL row (0 if no prior SL)
+	LatestLimit     float64
+	LastBuyFilledAt time.Time // newest FILLED BUY (entry or top-up); zero when unknown — settledForRMS gates the ghost verdict
+	EntryFillPrice  float64   // avg_fill_price of the entry BUY order — used as SL fallback when LatestTrigger==0 (e.g. EOD Phase A on entry-same-day positions with no tick-handler trail yet)
 }
 
 // ListPositionsNeedingProtection enumerates every position that has a filled
@@ -796,7 +816,10 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 		       COALESCE(b.exchange_token,''), COALESCE(b.exchange,'NSE'),
 		       n.net,
 		       COALESCE(l.trigger_price, 0), COALESCE(l.limit_price, 0),
-		       b.entry_fill_price
+		       b.entry_fill_price,
+		       (SELECT MAX(COALESCE(mb.filled_at, mb.updated_at)) FROM manthan_orders mb
+		         WHERE mb.strategy_id = b.strategy_id AND mb.symbol = b.symbol
+		           AND mb.order_side = 'BUY' AND mb.status = 'FILLED') AS last_buy_filled_at
 		FROM   live_buys b
 		JOIN   net_qty   n ON n.strategy_id = b.strategy_id AND n.symbol = b.symbol
 		LEFT JOIN latest_sl l ON l.strategy_id = b.strategy_id AND l.symbol = b.symbol
@@ -823,10 +846,14 @@ func (r *Repository) ListPositionsNeedingProtection(ctx context.Context) ([]Posi
 	var out []PositionNeedingProtection
 	for rows.Next() {
 		var p PositionNeedingProtection
+		var lastBuy sql.NullTime
 		if err := rows.Scan(&p.EntryOrderID, &p.EntrySignalID, &p.StrategyID, &p.UserID,
 			&p.Symbol, &p.ISIN, &p.IndiraSymbol, &p.ExchangeToken, &p.Exchange,
-			&p.NetQty, &p.LatestTrigger, &p.LatestLimit, &p.EntryFillPrice); err != nil {
+			&p.NetQty, &p.LatestTrigger, &p.LatestLimit, &p.EntryFillPrice, &lastBuy); err != nil {
 			return nil, err
+		}
+		if lastBuy.Valid {
+			p.LastBuyFilledAt = lastBuy.Time
 		}
 		out = append(out, p)
 	}

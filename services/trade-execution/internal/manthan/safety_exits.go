@@ -223,8 +223,19 @@ func (m *SafetyMonitor) checkPendingExit(ctx context.Context, cyc *exitCycle, ro
 				return
 			}
 			if rmsSaysNoHolding(reason) {
-				m.giveUpGhost(ctx, row, reason)
-				return
+				// An unsettled buy (T+0 / T+1) reads "Set= 0" at the RMS while the
+				// broker holds the shares — not a ghost; the chase continues
+				// (bounded by exitChaseMax). The verdict waits for settlement.
+				settled := false
+				if lastBuy, lerr := m.repo.LastBuyFilledAt(ctx, row.StrategyID, row.Symbol); lerr == nil {
+					settled = settledForRMS(lastBuy, time.Now())
+				}
+				if settled {
+					m.giveUpGhost(ctx, row, reason)
+					return
+				}
+				m.logger.Warn("Safety monitor: RMS says Set= 0 but the position's newest buy is within settlement — not a ghost verdict; exit chase continues",
+					zap.String("user_id", row.UserID), zap.String("symbol", row.Symbol), zap.String("rms", reason))
 			}
 			// Set − Prev > 0: part of the holding IS free (a stop partly filled
 			// before it was cancelled, say) and only the over-sized order was

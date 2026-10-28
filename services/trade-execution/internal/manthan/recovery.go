@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	indiraClient "github.com/RohitIndira/Algo-Treading/pkg/indira"
 	"go.uber.org/zap"
@@ -152,7 +153,11 @@ func (r *Recovery) Run(ctx context.Context) error {
 				}
 			}
 			net, _, hasEntry, nerr := r.repo.NetHeldQty(ctx, sl.StrategyID, sl.Symbol)
-			switch classifyLostStop(net, hasEntry, nerr == nil, reason, 0) {
+			settled := false // an unsettled buy reads "Set= 0" at the RMS — no ghost verdict before T+2
+			if lastBuy, lerr := r.repo.LastBuyFilledAt(ctx, sl.StrategyID, sl.Symbol); lerr == nil {
+				settled = settledForRMS(lastBuy, time.Now())
+			}
+			switch classifyLostStop(net, hasEntry, nerr == nil, reason, 0, settled) {
 			case lostStopOrphan:
 				note := fmt.Sprintf("orphan stop row: ledger net %d — closed at boot (broker status %s)", net, status)
 				if cerr := r.repo.CloseOrphanStopRow(ctx, sl.ID, note); cerr == nil {

@@ -6,16 +6,23 @@ import (
 )
 
 func TestClassifyAMOAttemptErrors(t *testing.T) {
-	hard, lock, ghost, auth := classifyAMOAttemptErrors([]string{
+	errs := []string{
 		"broker: Limit exceeded Set= 239, N.Used= 239 ,Prev= 239, T.Free Qty= 0,today free qty=0",
 		"broker: Limit exceeded Set= 15, N.Used= 15 ,Prev= 15, T.Free Qty= 0",
 		"broker: Limit exceeded Set= 0, N.Used= 121 ,Prev= 0, T.Free Qty= 0",
 		"AMO rejected at conversion: Order entered has invalid data.",
 		"place order request failed: indira: session expired (AU0xx): AU004 Session expired",
 		"", // still pending
-	})
+	}
+	hard, lock, ghost, auth := classifyAMOAttemptErrors(errs, true)
 	if hard != 1 || lock != 2 || ghost != 1 || auth != 1 {
-		t.Fatalf("hard=%d lock=%d ghost=%d auth=%d want 1 2 1 1", hard, lock, ghost, auth)
+		t.Fatalf("settled: hard=%d lock=%d ghost=%d auth=%d want 1 2 1 1", hard, lock, ghost, auth)
+	}
+	// SHREEPUSHK 2026-10-28: the position was bought today, so "Set= 0" is the
+	// RMS describing unsettled shares — a lock, never a ghost.
+	hard, lock, ghost, auth = classifyAMOAttemptErrors(errs, false)
+	if hard != 1 || lock != 3 || ghost != 0 || auth != 1 {
+		t.Fatalf("unsettled: hard=%d lock=%d ghost=%d auth=%d want 1 3 0 1", hard, lock, ghost, auth)
 	}
 }
 

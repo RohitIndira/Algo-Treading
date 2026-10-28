@@ -3,6 +3,7 @@ package manthan
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // Texts copied verbatim from the broker's order book on 2026-10-23.
@@ -51,6 +52,31 @@ func TestRMSSaysNoHolding(t *testing.T) {
 	}
 }
 
+// settledForRMS: the ghost verdict waits until the newest buy is T+2 by IST
+// calendar day — the RMS reports "Set= 0" for unsettled shares.
+func TestSettledForRMS(t *testing.T) {
+	ist := time.FixedZone("IST", 5*3600+1800)
+	eod := time.Date(2026, 10, 28, 16, 5, 0, 0, ist) // the SHREEPUSHK false-ghost moment
+	cases := []struct {
+		name    string
+		lastBuy time.Time
+		want    bool
+	}{
+		{"bought today 11:54 → unsettled", time.Date(2026, 10, 28, 11, 54, 0, 0, ist), false},
+		{"bought yesterday → unsettled (pay-out may lag)", time.Date(2026, 10, 27, 10, 0, 0, 0, ist), false},
+		{"bought two days ago → settled", time.Date(2026, 10, 26, 15, 0, 0, 0, ist), true},
+		{"bought weeks ago → settled", time.Date(2026, 8, 24, 10, 0, 0, 0, ist), true},
+		{"no buy row (legacy lot) → settled", time.Time{}, true},
+		{"UTC-stored fill late on the 27th IST (22:00Z on the 26th) → counts as the 27th → unsettled",
+			time.Date(2026, 10, 26, 22, 0, 0, 0, time.UTC), false},
+	}
+	for _, c := range cases {
+		if got := settledForRMS(c.lastBuy, eod); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestLooksExecutedCancelError(t *testing.T) {
 	if !looksExecutedCancelError(errors.New("broker rejected order [EG003]: FULLY_EXECUTED order not allowed to CANCEL. GatewayOrderNo[102300020]")) {
 		t.Fatal("FULLY_EXECUTED cancel refusal must be recognised")
@@ -68,24 +94,30 @@ func TestClassifyLostStop(t *testing.T) {
 		netKnown      bool
 		reason        string
 		replacedToday int
+		settled       bool
 		want          lostStopAction
 	}{
-		{"live position, stop cancelled by a person → re-protect", 239, true, true, "", 0, lostStopReprotect},
-		{"live position, rejected for a committed qty (stop filled / exit resting) → re-protect path decides", 239, true, true, rmsFilatex, 0, lostStopReprotect},
-		{"ledger says fully sold → orphan row, no action", 0, true, true, "", 0, lostStopOrphan},
-		{"ledger negative (over-sold) → orphan", -7, true, true, "", 0, lostStopOrphan},
-		{"no entry row at all (legacy lot) → live, re-protect", 0, false, true, "", 0, lostStopReprotect},
-		{"ledger holds 121 but broker says Set=0 → ghost", 121, true, true, rmsIOLCP, 0, lostStopGhost},
-		{"ghost wins over budget", 121, true, true, rmsIOLCP, 9, lostStopGhost},
-		{"orphan wins over ghost text", 0, true, true, rmsIOLCP, 0, lostStopOrphan},
-		{"legacy lot with Set=0 → ghost", 0, false, true, rmsIOLCP, 0, lostStopGhost},
-		{"budget exhausted → park once", 121, true, true, "", reprotectBudgetPerDay, lostStopBudget},
-		{"below budget → re-protect", 121, true, true, "", reprotectBudgetPerDay - 1, lostStopReprotect},
-		{"ledger query failed → never blocks protection", 0, false, false, "", 0, lostStopReprotect},
-		{"ledger failed but broker says Set=0 → still ghost", 0, false, false, rmsIOLCP, 0, lostStopGhost},
+		{"live position, stop cancelled by a person → re-protect", 239, true, true, "", 0, true, lostStopReprotect},
+		{"live position, rejected for a committed qty (stop filled / exit resting) → re-protect path decides", 239, true, true, rmsFilatex, 0, true, lostStopReprotect},
+		{"ledger says fully sold → orphan row, no action", 0, true, true, "", 0, true, lostStopOrphan},
+		{"ledger negative (over-sold) → orphan", -7, true, true, "", 0, true, lostStopOrphan},
+		{"no entry row at all (legacy lot) → live, re-protect", 0, false, true, "", 0, true, lostStopReprotect},
+		{"ledger holds 121 but broker says Set=0 → ghost", 121, true, true, rmsIOLCP, 0, true, lostStopGhost},
+		{"ghost wins over budget", 121, true, true, rmsIOLCP, 9, true, lostStopGhost},
+		{"orphan wins over ghost text", 0, true, true, rmsIOLCP, 0, true, lostStopOrphan},
+		{"legacy lot with Set=0 → ghost", 0, false, true, rmsIOLCP, 0, true, lostStopGhost},
+		{"budget exhausted → park once", 121, true, true, "", reprotectBudgetPerDay, true, lostStopBudget},
+		{"below budget → re-protect", 121, true, true, "", reprotectBudgetPerDay - 1, true, lostStopReprotect},
+		{"ledger query failed → never blocks protection", 0, false, false, "", 0, true, lostStopReprotect},
+		{"ledger failed but broker says Set=0 → still ghost", 0, false, false, rmsIOLCP, 0, true, lostStopGhost},
+		// SHREEPUSHK 2026-10-28: bought today, RMS "Set= 0" → the shares are
+		// unsettled, not absent. Re-protect; the budget cap still applies.
+		{"T+0 buy with Set=0 → NOT a ghost, re-protect", 38, true, true, rmsIOLCP, 0, false, lostStopReprotect},
+		{"T+0 buy with Set=0 past the budget → budget park, not ghost", 38, true, true, rmsIOLCP, reprotectBudgetPerDay, false, lostStopBudget},
+		{"T+0 buy, ledger sold → still orphan", 0, true, true, rmsIOLCP, 0, false, lostStopOrphan},
 	}
 	for _, c := range cases {
-		if got := classifyLostStop(c.net, c.hasEntry, c.netKnown, c.reason, c.replacedToday); got != c.want {
+		if got := classifyLostStop(c.net, c.hasEntry, c.netKnown, c.reason, c.replacedToday, c.settled); got != c.want {
 			t.Errorf("%s: got %v want %v", c.name, got, c.want)
 		}
 	}

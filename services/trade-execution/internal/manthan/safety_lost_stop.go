@@ -48,7 +48,18 @@ func (m *SafetyMonitor) handleLostStop(ctx context.Context, auth *BrokerAuth, sl
 		replaced = 0
 	}
 
-	switch classifyLostStop(net, hasEntry, nerr == nil, reason, replaced) {
+	// A buy within settlement makes the RMS say "Set= 0" for a position the
+	// broker holds; the ghost verdict waits until the newest buy has settled.
+	// A failed lookup withholds it too (the budget cap bounds re-placements).
+	settled := false
+	if lastBuy, lerr := m.repo.LastBuyFilledAt(ctx, sl.StrategyID, sl.Symbol); lerr == nil {
+		settled = settledForRMS(lastBuy, time.Now())
+	} else {
+		m.logger.Warn("Safety monitor: last-buy lookup failed — withholding any ghost verdict",
+			zap.String("symbol", sl.Symbol), zap.Error(lerr))
+	}
+
+	switch classifyLostStop(net, hasEntry, nerr == nil, reason, replaced, settled) {
 	case lostStopOrphan:
 		m.closeOrphanStop(ctx, sl, net, brokerStatus)
 	case lostStopGhost:
