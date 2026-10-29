@@ -82,7 +82,6 @@ type LoginsResult struct {
 	Today       string        `json:"today"` // IST calendar day
 	From        time.Time     `json:"from"`
 	Days        int           `json:"days"`
-	Scope       string        `json:"scope"`  // manthan | all
 	Source      string        `json:"source"` // login_events | credentials_only
 	Note        string        `json:"note,omitempty"`
 	Clients     []LoginClient `json:"clients"`
@@ -93,9 +92,8 @@ type LoginsResult struct {
 
 // LoginsQuery narrows /admin/logins.
 type LoginsQuery struct {
-	UserID string // one client; empty = all in scope
+	UserID string // one client (any platform user); empty = every enrolled Manthan client
 	Days   int    // history window (default 7, max 90)
-	Scope  string // manthan (default) | all
 	Limit  int    // max events returned (default 300, max 2000)
 }
 
@@ -111,9 +109,6 @@ func (q *LoginsQuery) normalize() {
 	}
 	if q.Limit > 2000 {
 		q.Limit = 2000
-	}
-	if q.Scope != "all" {
-		q.Scope = "manthan"
 	}
 	q.UserID = strings.TrimSpace(q.UserID)
 }
@@ -243,7 +238,7 @@ func (a *ActivityStore) Logins(ctx context.Context, q LoginsQuery) (*LoginsResul
 	from := dayStart.AddDate(0, 0, -(q.Days - 1)) // window INCLUDES today
 
 	res := &LoginsResult{
-		Today: dayStart.Format("2006-01-02"), From: from.UTC(), Days: q.Days, Scope: q.Scope,
+		Today: dayStart.Format("2006-01-02"), From: from.UTC(), Days: q.Days,
 		Clients: []LoginClient{}, Events: []LoginEvent{}, GeneratedAt: now.UTC(),
 	}
 
@@ -256,33 +251,16 @@ func (a *ActivityStore) Logins(ctx context.Context, q LoginsQuery) (*LoginsResul
 		return nil, err
 	}
 
-	// Which users are in scope.
-	inScope := func(uid string) bool {
-		if q.UserID != "" {
-			return uid == q.UserID
-		}
-		if q.Scope == "all" {
-			return true
-		}
-		_, ok := manthan[uid]
-		return ok
-	}
+	// Which users are in scope: the enrolled Manthan clients, or the one
+	// client asked for by user_id (any platform user — the per-user page
+	// may look at an ex-client). There is no whole-platform listing.
 	var ids []string
-	seen := map[string]bool{}
-	for uid := range manthan {
-		if inScope(uid) && !seen[uid] {
-			seen[uid] = true
+	if q.UserID != "" {
+		ids = []string{q.UserID}
+	} else {
+		for uid := range manthan {
 			ids = append(ids, uid)
 		}
-	}
-	for uid := range present {
-		if inScope(uid) && !seen[uid] {
-			seen[uid] = true
-			ids = append(ids, uid)
-		}
-	}
-	if q.UserID != "" && !seen[q.UserID] {
-		ids = append(ids, q.UserID) // unknown client: still answer with an empty row
 	}
 	sort.Strings(ids)
 
@@ -323,22 +301,13 @@ func (a *ActivityStore) Logins(ctx context.Context, q LoginsQuery) (*LoginsResul
 	}
 	res.Source = "login_events"
 
-	// Scope filter for SQL. For scope=all with no user filter there is no
-	// WHERE on user_id at all (1,200 clients is fine; events are bounded by
-	// the window and the limit).
+	// Every event query is bounded to the ids above.
 	var scopeSQL string
 	scopeArgs := func(args *[]any) string {
-		if q.UserID != "" {
-			*args = append(*args, q.UserID)
-			return fmt.Sprintf(" AND user_id = $%d", len(*args))
+		if len(ids) == 0 {
+			return " AND false"
 		}
-		if q.Scope == "manthan" {
-			if len(ids) == 0 {
-				return " AND false"
-			}
-			return " AND user_id IN " + inList(args, ids)
-		}
-		return ""
+		return " AND user_id IN " + inList(args, ids)
 	}
 
 	// Latest LOGIN-or-BACKFILL row per client (no window: "last login" may be weeks ago).

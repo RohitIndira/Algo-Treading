@@ -180,8 +180,8 @@ func TestActivity_Logins(t *testing.T) {
 		t.Fatalf("30d window=%d events=%d", res.Clients[0].LoginsWindow, len(res.Events))
 	}
 
-	// Manthan scope includes the seeded client without a user filter.
-	res, err = a.Logins(context.Background(), LoginsQuery{Scope: "manthan"})
+	// Without a user filter: enrolled Manthan clients only.
+	res, err = a.Logins(context.Background(), LoginsQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,22 +201,15 @@ func TestActivity_Logins(t *testing.T) {
 		t.Fatalf("manthan scope missed %s", actUser)
 	}
 
-	// scope=all still shows the ex-client (as a platform user, not Manthan).
-	res, err = a.Logins(context.Background(), LoginsQuery{Scope: "all"})
+	// There is no whole-platform listing any more; an ex-client is reachable
+	// only by asking for them by user_id (the per-user page), flagged as
+	// not a Manthan client.
+	res, err = a.Logins(context.Background(), LoginsQuery{UserID: exUser})
 	if err != nil {
 		t.Fatal(err)
 	}
-	found = false
-	for _, c := range res.Clients {
-		if c.UserID == exUser {
-			found = true
-			if c.ManthanClient {
-				t.Fatalf("ex-client flagged as Manthan client in scope=all: %+v", c)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("scope=all missed platform user %s", exUser)
+	if len(res.Clients) != 1 || res.Clients[0].UserID != exUser || res.Clients[0].ManthanClient {
+		t.Fatalf("user_id lookup of ex-client: %+v", res.Clients)
 	}
 }
 

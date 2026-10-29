@@ -250,13 +250,13 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 
 // ── Logins + daily activity handlers ────────────────────────────────────
 
-// handleLogins — GET /logins?days=7&scope=manthan|all&user_id=&limit=300
+// handleLogins — GET /logins?days=7&user_id=&limit=300 (enrolled Manthan clients only)
 func (h *HTTP) handleLogins(w http.ResponseWriter, ar *AdminRequest) {
 	qs := ar.Request.URL.Query()
 	days, _ := strconv.Atoi(qs.Get("days"))
 	limit, _ := strconv.Atoi(qs.Get("limit"))
 	res, err := h.activity.Logins(ar.Request.Context(), LoginsQuery{
-		UserID: qs.Get("user_id"), Days: days, Scope: qs.Get("scope"), Limit: limit,
+		UserID: qs.Get("user_id"), Days: days, Limit: limit,
 	})
 	if err != nil {
 		log.Printf("admin: logins failed: %v", err)

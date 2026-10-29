@@ -1661,7 +1661,7 @@
       "name": "M13 · Logins & Daily Activity",
       "item": [
         {
-          "name": "Client logins (Manthan clients, 7 days)",
+          "name": "Client logins (enrolled Manthan clients, 7 days)",
           "request": {
             "method": "GET",
             "header": [
@@ -1671,7 +1671,7 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/api/v1/admin/logins?scope=manthan&days=7&limit=300",
+              "raw": "{{base_url}}/api/v1/admin/logins?days=7&limit=300",
               "host": [
                 "{{base_url}}"
               ],
@@ -1682,10 +1682,6 @@
                 "logins"
               ],
               "query": [
-                {
-                  "key": "scope",
-                  "value": "manthan"
-                },
                 {
                   "key": "days",
                   "value": "7"
