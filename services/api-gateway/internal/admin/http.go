@@ -52,7 +52,11 @@ type HTTP struct {
 	exports    *ExportStore     // nil-safe: M11 routes absent without it
 	dashboard  *DashboardStore  // nil-safe: M12 dashboard/clients routes absent without it
 	reaper     *GhostReaper     // nil-safe: on-demand book reconcile run absent without it
+	activity   *ActivityStore   // nil-safe: logins + daily activity routes absent without it
 }
+
+// SetActivity enables GET /logins and GET /activity. Call before Register.
+func (h *HTTP) SetActivity(a *ActivityStore) { h.activity = a }
 
 // SetReaper enables POST /users/{user_id}/reconcile/run — the book
 // reconciler for ONE user, now, through the same sweep code path as the
@@ -201,6 +205,10 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 	if h.eod != nil {
 		h.Route(token, "GET", "/eod", "EOD_VIEW", TierRead, h.handleEOD)
 	}
+	if h.activity != nil {
+		h.Route(token, "GET", "/logins", "LOGINS_VIEW", TierRead, h.handleLogins)
+		h.Route(token, "GET", "/activity", "ACTIVITY_VIEW", TierRead, h.handleActivity)
+	}
 	if h.risk != nil {
 		h.Route(token, "GET", "/risk/caps", "RISK_CAPS", TierRead, h.handleRiskCaps)
 		h.Route(token, "GET", "/risk/drivers", "RISK_DRIVERS", TierRead, h.handleRiskDrivers)
@@ -238,6 +246,39 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "GET", "/clients/{client_id}/mtm-series", "CLIENT_MTM_SERIES", TierRead, h.handleClientMTM)
 		h.Route(token, "GET", "/clients/{client_id}/dashboard", "CLIENT_DASHBOARD", TierRead, h.handleClientDashboard)
 	}
+}
+
+// ── Logins + daily activity handlers ────────────────────────────────────
+
+// handleLogins — GET /logins?days=7&scope=manthan|all&user_id=&limit=300
+func (h *HTTP) handleLogins(w http.ResponseWriter, ar *AdminRequest) {
+	qs := ar.Request.URL.Query()
+	days, _ := strconv.Atoi(qs.Get("days"))
+	limit, _ := strconv.Atoi(qs.Get("limit"))
+	res, err := h.activity.Logins(ar.Request.Context(), LoginsQuery{
+		UserID: qs.Get("user_id"), Days: days, Scope: qs.Get("scope"), Limit: limit,
+	})
+	if err != nil {
+		log.Printf("admin: logins failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "login history failed")
+		return
+	}
+	writeOK(w, res)
+}
+
+// handleActivity — GET /activity?date=YYYY-MM-DD (default: today, IST)
+func (h *HTTP) handleActivity(w http.ResponseWriter, ar *AdminRequest) {
+	res, err := h.activity.Activity(ar.Request.Context(), ar.Request.URL.Query().Get("date"))
+	if err != nil {
+		if strings.Contains(err.Error(), "date must be") {
+			writeErr(w, http.StatusBadRequest, "E_BAD_DATE", err.Error())
+			return
+		}
+		log.Printf("admin: activity failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "daily activity failed")
+		return
+	}
+	writeOK(w, res)
 }
 
 // ── M8–M11 handlers ─────────────────────────────────────────────────────

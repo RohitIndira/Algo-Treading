@@ -68,6 +68,9 @@ func (r *credentialsRepository) StoreIndiraCredentials(ctx context.Context, user
 	if err != nil {
 		return fmt.Errorf("failed to store credentials for user %s: %w", userID, err)
 	}
+	// Login history (admin console): one row per distinct token seen.
+	// Best-effort — see login_events.go.
+	r.recordLogin(ctx, userID, indiraUserID, appID, source, bearerToken)
 	return nil
 }
 

@@ -514,7 +514,8 @@ func main() {
 	if adminHTTP != nil && positionsDB != nil && ordersDB != nil && positionsSSotDB != nil {
 		adminFleet := admin.NewFleetStore(positionsDB, ordersDB, positionsSSotDB)
 		adminHTTP.SetFleetStore(adminFleet)
-		log.Printf("Admin fleet endpoints enabled (trading+execution+positions handles)")
+		adminHTTP.SetActivity(admin.NewActivityStore(adminFleet))
+		log.Printf("Admin fleet endpoints enabled (trading+execution+positions handles) + logins/activity")
 
 		// M3: live credential probe + 08:30 IST pre-market sweep. Decrypted
 		// creds come over the existing user-config gRPC (the encryption key

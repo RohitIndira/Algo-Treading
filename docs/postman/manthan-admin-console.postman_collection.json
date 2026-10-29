@@ -1,6 +1,6 @@
 {
   "info": {
-    "name": "Manthan Admin Console (M1–M6)",
+    "name": "Manthan Admin Console (M1–M13)",
     "description": "Complete admin API surface as of 2026-08-31 (commit 48c6888).\n\nSETUP\n1. Set collection variable `user_session_jwt` to the platform SSO cookie `user_session` (HS512 — starts eyJhbGciOiJIUzUxMiJ9). NOT the `user_token` cookie.\n2. Run '1. Elevate' — its test script auto-saves `admin_token` for every other request.\n3. Token expires after 30 min — just re-run Elevate.\n\nTIERS\nREAD: plain request. CONFIRM: body must carry \"confirmed\": true (else 412). TYPED (delete strategy): call with {\"preview\":true} to receive the exact blast-radius text, then resend it verbatim as \"confirmation_text\".\n\nEvery mutating call — including denials — lands in the append-only audit trail.\n\n⚠ LIVE-FIRE requests are marked in their descriptions. Everything else is read-only.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
@@ -1653,6 +1653,145 @@
               ]
             },
             "description": "The admin-action report from the append-only audit — every elevation, action, refusal and denial in range."
+          }
+        }
+      ]
+    },
+    {
+      "name": "M13 · Logins & Daily Activity",
+      "item": [
+        {
+          "name": "Client logins (Manthan clients, 7 days)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/logins?scope=manthan&days=7&limit=300",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "logins"
+              ],
+              "query": [
+                {
+                  "key": "scope",
+                  "value": "manthan"
+                },
+                {
+                  "key": "days",
+                  "value": "7"
+                },
+                {
+                  "key": "limit",
+                  "value": "300"
+                }
+              ]
+            },
+            "description": "Per-client roll-up: last login (JWT iat = broker login time), via (SSO/WEB/IOS/AND), token_state VALID|EXPIRED|UNKNOWN|NO_CREDENTIAL, logins today / in window, open positions, active strategy. Plus the event list newest-first (one row per distinct token seen; kind LOGIN|BACKFILL). Backed by execution_db.user_login_events (migration trade-execution/018); degrades to credentials_only (latest timestamp per client) with a note when the table is absent. Read-only."
+          }
+        },
+        {
+          "name": "Login history — one client, 30 days",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/logins?user_id=S4450&days=30&limit=100",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "logins"
+              ],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "S4450"
+                },
+                {
+                  "key": "days",
+                  "value": "30"
+                },
+                {
+                  "key": "limit",
+                  "value": "100"
+                }
+              ]
+            },
+            "description": "Same payload filtered to one client. scope is ignored when user_id is given."
+          }
+        },
+        {
+          "name": "Daily activity — today (IST)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/activity",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "activity"
+              ]
+            },
+            "description": "One IST calendar day: buys that filled (qty, avg, value, broker id), buys still open, buy attempts the broker refused folded per client+symbol with a plain-language reason (session expired / margin / band / duplicate), positions the book closed (entry, exit, P&L, holding days, exit_reason + note, exit_price_known) each paired with its broker SELL fill, sell orders still open (exits in flight) and SELL fills with no closed book row (book not caught up / outside the strategy). Read-only."
+          }
+        },
+        {
+          "name": "Daily activity — a past day",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/activity?date=2026-10-28",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "activity"
+              ],
+              "query": [
+                {
+                  "key": "date",
+                  "value": "2026-10-28"
+                }
+              ]
+            },
+            "description": "Any past IST day; bad format → 400 E_BAD_DATE."
           }
         }
       ]
