@@ -31,15 +31,21 @@ import (
 const (
 	actUser  = "TADM_ACT"
 	actStrat = "aaaaaaaa-1111-2222-3333-00000000ac71"
+	// A client who LEFT Manthan: strategy stopped, book closed. Has a
+	// filled buy and an exit today — none of it may surface.
+	exUser  = "TADM_EXACT"
+	exStrat = "aaaaaaaa-1111-2222-3333-00000000ac72"
 )
 
 func cleanupActivity(trading, exec *sql.DB) {
-	_, _ = trading.Exec(`DELETE FROM manthan_positions WHERE user_id = $1`, actUser)
-	_, _ = trading.Exec(`DELETE FROM strategies WHERE user_id = $1`, actUser)
-	_, _ = exec.Exec(`DELETE FROM manthan_order_events WHERE order_id IN (SELECT id FROM manthan_orders WHERE user_id = $1)`, actUser)
-	_, _ = exec.Exec(`DELETE FROM manthan_orders WHERE user_id = $1`, actUser)
-	_, _ = exec.Exec(`DELETE FROM user_login_events WHERE user_id = $1`, actUser)
-	_, _ = exec.Exec(`DELETE FROM user_credentials WHERE user_id = $1`, actUser)
+	for _, u := range []string{actUser, exUser} {
+		_, _ = trading.Exec(`DELETE FROM manthan_positions WHERE user_id = $1`, u)
+		_, _ = trading.Exec(`DELETE FROM strategies WHERE user_id = $1`, u)
+		_, _ = exec.Exec(`DELETE FROM manthan_order_events WHERE order_id IN (SELECT id FROM manthan_orders WHERE user_id = $1)`, u)
+		_, _ = exec.Exec(`DELETE FROM manthan_orders WHERE user_id = $1`, u)
+		_, _ = exec.Exec(`DELETE FROM user_login_events WHERE user_id = $1`, u)
+		_, _ = exec.Exec(`DELETE FROM user_credentials WHERE user_id = $1`, u)
+	}
 }
 
 func seedActivity(t *testing.T, trading, exec *sql.DB, ist *time.Location, now time.Time) {
@@ -63,6 +69,10 @@ func seedActivity(t *testing.T, trading, exec *sql.DB, ist *time.Location, now t
 		VALUES ($1, $2, 'activity test', true, 'LIVE', 'MANTHAN', $3)`, actStrat, actUser, now.Add(-72*time.Hour))
 	mustExec(t, exec, `INSERT INTO user_credentials (user_id, indira_user_id, indira_app_id, indira_source, indira_bearer_token, updated_at)
 		VALUES ($1, $1, 'app', 'SSO', 'enc-token', now())`, actUser)
+	mustExec(t, trading, `INSERT INTO strategies (strategy_id, user_id, strategy_name, active, stopped_at, trading_mode, strategy_type, created_at)
+		VALUES ($1, $2, 'left manthan', false, $3, 'LIVE', 'MANTHAN', $4)`, exStrat, exUser, now.Add(-24*time.Hour), now.Add(-240*time.Hour))
+	mustExec(t, exec, `INSERT INTO user_credentials (user_id, indira_user_id, indira_app_id, indira_source, indira_bearer_token, updated_at)
+		VALUES ($1, $1, 'app', 'SSO', 'enc-token-ex', now())`, exUser)
 
 	// Login history.
 	ins := func(rec time.Time, iat, exp *time.Time, src, ls, kind, fp string) {
@@ -95,6 +105,16 @@ func seedActivity(t *testing.T, trading, exec *sql.DB, ist *time.Location, now t
 	order("ORPHAN", "MARKET_SELL", "SELL", "FILLED", 10, 10, f(50), nil, at(12, 0), tp(at(12, 0)), "ORPH1:", "")
 	order("PEND", "MARKET_SELL", "SELL", "PLACED", 8, 0, nil, f(540), at(14, 30), nil, "PEND1:", "")
 	order("LUM", "SL_SELL", "SELL", "SL_PLACED", 9, 0, nil, nil, at(10, 56), nil, "LUMSL:", "") // standing stop: NOT an open sell
+	// The ex-client's day (must be invisible).
+	mustExec(t, exec, `INSERT INTO manthan_orders (strategy_id, user_id, symbol, order_type, order_side, qty, filled_qty, avg_fill_price, status, broker_order_id, created_at, placed_at, filled_at, updated_at)
+		VALUES ($1::uuid, $2, 'EXBUY', 'LIMIT_BUY', 'BUY', 4, 4, 100::numeric, 'FILLED', 'EXB1:', $3::timestamptz, $3::timestamptz, $3::timestamptz, $3::timestamptz)`, exStrat, exUser, at(10, 0))
+	mustExec(t, exec, `INSERT INTO manthan_orders (strategy_id, user_id, symbol, order_type, order_side, qty, filled_qty, avg_fill_price, status, broker_order_id, created_at, placed_at, filled_at, updated_at)
+		VALUES ($1::uuid, $2, 'EXSELL', 'SL_SELL', 'SELL', 4, 4, 90::numeric, 'FILLED', 'EXS1:', $3::timestamptz, $3::timestamptz, $3::timestamptz, $3::timestamptz)`, exStrat, exUser, at(11, 0))
+	mustExec(t, exec, `INSERT INTO manthan_orders (strategy_id, user_id, symbol, order_type, order_side, qty, filled_qty, status, last_error, created_at, placed_at, updated_at)
+		VALUES ($1::uuid, $2, 'EXREJ', 'LIMIT_BUY', 'BUY', 4, 0, 'REJECTED', 'AU004', $3::timestamptz, $3::timestamptz, $3::timestamptz)`, exStrat, exUser, at(9, 16))
+	mustExec(t, trading, `INSERT INTO manthan_positions (strategy_id, user_id, symbol, entry_price, quantity, invested_amt, status, exit_price, realized_pnl, exit_reason, entry_time, exit_time, updated_at, industry, mcap_bucket, index_name)
+		VALUES ($1::uuid, $2, 'EXSELL', 100::numeric, 4, 400::numeric, 'EXITED', 90::numeric, -40::numeric, 'TSL_HIT', $3::timestamptz, $4::timestamptz, $4::timestamptz, 'Test', 'SMALL', 'NIFTY_TEST')`,
+		exStrat, exUser, day.AddDate(0, 0, -5), at(11, 0))
 
 	// Book.
 	pos := func(sym, status string, qty int, entry float64, entryT time.Time, exitPx, pnl *float64, reason *string, exitT *time.Time) {
@@ -173,9 +193,30 @@ func TestActivity_Logins(t *testing.T) {
 		if !c.ManthanClient {
 			t.Fatalf("manthan scope leaked a non-Manthan client: %s", c.UserID)
 		}
+		if c.UserID == exUser {
+			t.Fatalf("manthan scope listed a client whose strategy is stopped: %s", c.UserID)
+		}
 	}
 	if !found {
 		t.Fatalf("manthan scope missed %s", actUser)
+	}
+
+	// scope=all still shows the ex-client (as a platform user, not Manthan).
+	res, err = a.Logins(context.Background(), LoginsQuery{Scope: "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, c := range res.Clients {
+		if c.UserID == exUser {
+			found = true
+			if c.ManthanClient {
+				t.Fatalf("ex-client flagged as Manthan client in scope=all: %+v", c)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("scope=all missed platform user %s", exUser)
 	}
 }
 
@@ -195,6 +236,41 @@ func TestActivity_Day(t *testing.T) {
 		t.Fatalf("date=%s today=%v", res.Date, res.IsToday)
 	}
 	mine := func(uid string) bool { return uid == actUser }
+
+	// Enrolled-only: the ex-client is not in the client list and none of
+	// its rows (buy, rejected buy, sell, exit) leak into the day.
+	for _, c := range res.Clients {
+		if c == exUser {
+			t.Fatalf("ex-client %s listed as enrolled: %v", exUser, res.Clients)
+		}
+	}
+	hasAct := false
+	for _, c := range res.Clients {
+		hasAct = hasAct || c == actUser
+	}
+	if !hasAct {
+		t.Fatalf("enrolled client %s missing from %v", actUser, res.Clients)
+	}
+	for _, b := range res.Buys {
+		if b.UserID == exUser {
+			t.Fatalf("ex-client buy leaked: %+v", b)
+		}
+	}
+	for _, g := range res.RejectedBuys {
+		if g.UserID == exUser {
+			t.Fatalf("ex-client rejected buy leaked: %+v", g)
+		}
+	}
+	for _, e := range res.Exits {
+		if e.UserID == exUser {
+			t.Fatalf("ex-client exit leaked: %+v", e)
+		}
+	}
+	for _, u := range res.UnmatchedSells {
+		if u.UserID == exUser {
+			t.Fatalf("ex-client sell leaked: %+v", u)
+		}
+	}
 
 	var buys []BuyRow
 	for _, b := range res.Buys {

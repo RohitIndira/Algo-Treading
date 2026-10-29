@@ -32,6 +32,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // ActivityStore reads through the fleet handles (trading_db + execution_db).
@@ -122,12 +124,18 @@ type manthanClient struct {
 	open   int
 }
 
-// manthanClients lists every user who has (had) a strategy or a book row.
+// manthanClients lists the clients ENROLLED in Manthan right now: a live
+// strategy (active, not stopped, not deleted) or an open book row. Clients
+// whose strategy was stopped or deleted (N3, SV39, ND03920 on prod) and
+// whose book is fully closed are not Manthan clients any more and must not
+// appear on the Manthan-scoped screens.
 func (a *ActivityStore) manthanClients(ctx context.Context) (map[string]*manthanClient, error) {
 	out := map[string]*manthanClient{}
 	rows, err := a.fleet.tradingDB.QueryContext(ctx, `
-		SELECT user_id, bool_or(active AND stopped_at IS NULL)
-		  FROM strategies WHERE deleted_at IS NULL GROUP BY user_id`)
+		SELECT user_id, true
+		  FROM strategies
+		 WHERE deleted_at IS NULL AND active AND stopped_at IS NULL
+		 GROUP BY user_id`)
 	if err != nil {
 		return nil, fmt.Errorf("logins strategies: %w", err)
 	}
@@ -145,8 +153,10 @@ func (a *ActivityStore) manthanClients(ctx context.Context) (map[string]*manthan
 		return nil, err
 	}
 	rows, err = a.fleet.tradingDB.QueryContext(ctx, `
-		SELECT user_id, count(*) FILTER (WHERE status IN `+openStatuses+`)
-		  FROM manthan_positions GROUP BY user_id`)
+		SELECT user_id, count(*)
+		  FROM manthan_positions
+		 WHERE status IN ('ACTIVE','PENDING_ENTRY','EXIT_PENDING')
+		 GROUP BY user_id`)
 	if err != nil {
 		return nil, fmt.Errorf("logins book: %w", err)
 	}
@@ -165,6 +175,20 @@ func (a *ActivityStore) manthanClients(ctx context.Context) (map[string]*manthan
 		c.open = open
 	}
 	return out, rows.Err()
+}
+
+// enrolledIDs is manthanClients as a sorted list, for `user_id = ANY($n)`.
+func (a *ActivityStore) enrolledIDs(ctx context.Context) ([]string, error) {
+	m, err := a.manthanClients(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(m))
+	for uid := range m {
+		ids = append(ids, uid)
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // credentialRows: user → (present, updated_at as UTC). updated_at is a
@@ -553,6 +577,7 @@ type ActivityCounts struct {
 type ActivityResult struct {
 	Date           string             `json:"date"`
 	IsToday        bool               `json:"is_today"`
+	Clients        []string           `json:"clients"` // enrolled Manthan clients the day was built for
 	Counts         ActivityCounts     `json:"counts"`
 	Buys           []BuyRow           `json:"buys"`
 	OpenBuys       []BuyRow           `json:"open_buys"` // placed, not yet filled/terminal
@@ -649,16 +674,26 @@ func (a *ActivityStore) Activity(ctx context.Context, date string) (*ActivityRes
 	}
 	su, eu := start.UTC(), end.UTC()
 
+	// Only clients enrolled in Manthan today. The manthan_* tables keep
+	// rows for stopped/deleted strategies and test accounts forever; the
+	// admin wants the live book, not the archive.
+	enrolled, err := a.enrolledIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res.Clients = enrolled
+	who := pq.Array(enrolled)
+
 	// Buys that filled in the day (fill time; falls back to last update).
 	rows, err := a.fleet.execDB.QueryContext(ctx, `
 		SELECT id, user_id, COALESCE(strategy_id::text,''), symbol, order_type, status, qty,
 		       COALESCE(filled_qty,0), avg_fill_price, limit_price, COALESCE(broker_order_id,''),
 		       COALESCE(signal_id,''), created_at, filled_at, COALESCE(last_error,'')
 		  FROM manthan_orders
-		 WHERE order_side = 'BUY'
+		 WHERE order_side = 'BUY' AND user_id = ANY($3)
 		   AND ( (status IN ('FILLED','PARTIAL') AND COALESCE(filled_at, updated_at) >= $1 AND COALESCE(filled_at, updated_at) < $2)
 		      OR (status IN ('PENDING','PLACED') AND created_at >= $1 AND created_at < $2) )
-		 ORDER BY COALESCE(filled_at, created_at)`, su, eu)
+		 ORDER BY COALESCE(filled_at, created_at)`, su, eu, who)
 	if err != nil {
 		return nil, fmt.Errorf("activity buys: %w", err)
 	}
@@ -698,10 +733,10 @@ func (a *ActivityStore) Activity(ctx context.Context, date string) (*ActivityRes
 		       (array_agg(status ORDER BY created_at DESC, id DESC))[1],
 		       (array_agg(COALESCE(last_error,'') ORDER BY created_at DESC, id DESC))[1]
 		  FROM manthan_orders
-		 WHERE order_side = 'BUY' AND status IN ('REJECTED','CANCELLED')
+		 WHERE order_side = 'BUY' AND status IN ('REJECTED','CANCELLED') AND user_id = ANY($3)
 		   AND created_at >= $1 AND created_at < $2
 		 GROUP BY user_id, symbol
-		 ORDER BY min(created_at)`, su, eu)
+		 ORDER BY min(created_at)`, su, eu, who)
 	if err != nil {
 		return nil, fmt.Errorf("activity rejected buys: %w", err)
 	}
@@ -730,12 +765,12 @@ func (a *ActivityStore) Activity(ctx context.Context, date string) (*ActivityRes
 		SELECT id, user_id, symbol, order_type, status, qty, COALESCE(filled_qty,0), avg_fill_price,
 		       COALESCE(broker_order_id,''), COALESCE(filled_at, updated_at)
 		  FROM manthan_orders
-		 WHERE order_side = 'SELL'
+		 WHERE order_side = 'SELL' AND user_id = ANY($3)
 		   AND ( (status IN ('FILLED','SL_FILLED','PARTIAL')
 		          AND COALESCE(filled_at, updated_at) >= $1 AND COALESCE(filled_at, updated_at) < $2)
 		      OR (status IN ('PENDING','PLACED') AND order_type NOT IN ('SL_SELL','SL_SELL_AMO')
 		          AND created_at >= $1 AND created_at < $2) )
-		 ORDER BY COALESCE(filled_at, updated_at)`, su, eu)
+		 ORDER BY COALESCE(filled_at, updated_at)`, su, eu, who)
 	if err != nil {
 		return nil, fmt.Errorf("activity sells: %w", err)
 	}
@@ -767,8 +802,9 @@ func (a *ActivityStore) Activity(ctx context.Context, date string) (*ActivityRes
 		SELECT id, user_id, COALESCE(strategy_id::text,''), symbol, status, quantity, entry_price, entry_time,
 		       exit_price, exit_time, realized_pnl, COALESCE(exit_reason,''), COALESCE(invested_amt,0), updated_at
 		  FROM manthan_positions
-		 WHERE status = 'EXITED' AND COALESCE(exit_time, updated_at) >= $1 AND COALESCE(exit_time, updated_at) < $2
-		 ORDER BY COALESCE(exit_time, updated_at)`, su, eu)
+		 WHERE status = 'EXITED' AND user_id = ANY($3)
+		   AND COALESCE(exit_time, updated_at) >= $1 AND COALESCE(exit_time, updated_at) < $2
+		 ORDER BY COALESCE(exit_time, updated_at)`, su, eu, who)
 	if err != nil {
 		return nil, fmt.Errorf("activity exits: %w", err)
 	}
