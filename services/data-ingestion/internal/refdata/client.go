@@ -55,7 +55,7 @@ func NewClient(base, apiKey string) *Client {
 		apiKey:     apiKey,
 		http:       &http.Client{Timeout: 60 * time.Second},
 		sleep:      time.Sleep,
-		maxRetries: 5,
+		maxRetries: 8,
 	}
 }
 
@@ -252,7 +252,7 @@ func (c *Client) get(ctx context.Context, path string, q url.Values) ([]byte, er
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
-			c.sleep(time.Second * time.Duration(attempt+1))
+			c.sleep(backoff(attempt))
 			continue
 		}
 		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
@@ -260,7 +260,7 @@ func (c *Client) get(ctx context.Context, path string, q url.Values) ([]byte, er
 		if rerr != nil {
 			// A reset mid-body is as transient as a failed connect: retry.
 			lastErr = fmt.Errorf("%s: read body: %w", path, rerr)
-			c.sleep(time.Second * time.Duration(attempt+1))
+			c.sleep(backoff(attempt))
 			continue
 		}
 		switch {
@@ -277,12 +277,23 @@ func (c *Client) get(ctx context.Context, path string, q url.Values) ([]byte, er
 			c.sleep(wait)
 		case resp.StatusCode >= 500:
 			lastErr = fmt.Errorf("%s: HTTP %d: %s", path, resp.StatusCode, vendorMessage(body))
-			c.sleep(2 * time.Second * time.Duration(attempt+1))
+			c.sleep(backoff(attempt))
 		default:
 			return nil, fmt.Errorf("%s: HTTP %d: %s", path, resp.StatusCode, vendorMessage(body))
 		}
 	}
 	return nil, fmt.Errorf("%s: gave up after %d retries: %w", path, c.maxRetries, lastErr)
+}
+
+// backoff is the wait before retry `attempt` (0-based): 2s, 4s, 8s … capped
+// at 60s, so 8 retries ride out roughly four minutes of vendor or network
+// trouble before a load gives up.
+func backoff(attempt int) time.Duration {
+	d := time.Duration(2<<attempt) * time.Second
+	if d > 60*time.Second || d <= 0 {
+		d = 60 * time.Second
+	}
+	return d
 }
 
 func vendorMessage(body []byte) string {

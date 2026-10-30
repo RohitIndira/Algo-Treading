@@ -173,6 +173,7 @@ func (l *loader) eodRange(ctx context.Context, from, to string) error {
 		return err
 	}
 	days, skipped := 0, 0
+	var failed []string
 	for cur := f; !cur.After(t); cur = cur.AddDate(0, 0, 1) {
 		if wd := cur.Weekday(); wd == time.Saturday || wd == time.Sunday {
 			continue
@@ -182,12 +183,22 @@ func (l *loader) eodRange(ctx context.Context, from, to string) error {
 			skipped++
 			continue
 		}
+		// One bad day (after the client's own retries) does not stop the
+		// backfill: carry on, report the gaps at the end; a rerun fills them.
 		if err := l.eod(ctx, ds); err != nil {
-			return fmt.Errorf("eod-range stopped at %s: %w", ds, err)
+			failed = append(failed, ds)
+			if ctx.Err() != nil {
+				break
+			}
+			continue
 		}
 		days++
 	}
-	l.logger.Info("eod-range done", zap.String("from", from), zap.String("to", to), zap.Int("days_loaded", days), zap.Int("days_already_present", skipped))
+	l.logger.Info("eod-range done", zap.String("from", from), zap.String("to", to), zap.Int("days_loaded", days),
+		zap.Int("days_already_present", skipped), zap.Strings("days_failed", failed))
+	if len(failed) > 0 {
+		return fmt.Errorf("eod-range: %d day(s) failed (rerun the same command to fill them): %s", len(failed), strings.Join(failed, ", "))
+	}
 	return nil
 }
 
