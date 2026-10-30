@@ -311,6 +311,10 @@ func (r *DBReader) lifeTimeHighs(ctx context.Context) ([]*LifeTimeHighRow, error
 		       p.week52_high, p.week52_low
 		  FROM ref_ath_close a
 		  LEFT JOIN ref_price_levels p ON p.symbol = a.symbol
+		 -- An ATH we could not confirm (real peak may predate 2021, no Yahoo
+		 -- seed) is withheld: the stock drops as "AllTimeHigh missing" and is
+		 -- never watched for a breakout, instead of triggering early.
+		 WHERE a.source <> 'unverified:pre2021'
 		 ORDER BY a.symbol`)
 	if err != nil {
 		return nil, fmt.Errorf("db reader: ath: %w", err)

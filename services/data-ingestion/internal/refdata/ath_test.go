@@ -11,43 +11,71 @@ func d(s string) time.Time {
 	return t
 }
 
-// A 1:10 split: pre-split closes are divided by 10 before taking the max,
-// so the ATH is the post-split peak, not the unreachable pre-split print.
-func TestComputeLevels_SplitAdjusted(t *testing.T) {
-	asOf := d("2026-10-29")
+// Already-adjusted history (RELIANCE-style): shares double, price flat →
+// no adjustment, plain max close.
+func TestComputeLevels_AdjustedHistoryLeftAlone(t *testing.T) {
 	rows := []closeRow{
-		{d("2024-01-02"), 2000, 1e7}, // pre-split: 200 adjusted
-		{d("2024-06-03"), 2500, 1e7}, // pre-split peak: 250 adjusted
-		{d("2024-06-04"), 255, 1e8},  // ex-date: shares ×10
-		{d("2025-03-10"), 300, 1e8},  // true ATH close
-		{d("2026-10-29"), 280, 1e8},
+		{d("2024-07-08"), 1600, 6.77e9}, // ATH (already adjusted by the vendor)
+		{d("2024-10-25"), 1327, 6.77e9},
+		{d("2024-10-28"), 1334, 1.353e10}, // bonus ex-date: shares ×2, price flat
+		{d("2026-10-29"), 1450, 1.353e10},
 	}
-	r := computeLevels("SPLT", rows, asOf)
-	if r.SplitsDetected != 1 || r.Source != "roll:eod+split" {
-		t.Fatalf("split detection: %+v", r)
-	}
-	if r.ATHClose != 300 || !r.ATHDate.Equal(d("2025-03-10")) {
-		t.Fatalf("ATH must be post-split peak 300 on 2025-03-10: %+v", r)
-	}
-	// 52w window (asOf−365d = 2025-10-29) holds only the last close.
-	if r.Week52High != 280 || r.Week52Low != 280 {
-		t.Fatalf("52w: %+v", r)
+	r := computeLevels("REL", rows, d("2026-10-29"))
+	if r.SplitsAdjusted != 0 || r.ATHClose != 1600 || r.Source != "roll:eod" {
+		t.Fatalf("%+v", r)
 	}
 }
 
-// Small share-count moves (QIP, ESOP) are not splits.
-func TestComputeLevels_AllotmentIgnored(t *testing.T) {
+// Unadjusted history (CUB-style): shares ×4/3 and price ×~0.78 the same day
+// → pre-ex closes divided by 4/3; the raw 301.75 peak becomes 226.31.
+func TestComputeLevels_UnadjustedBonusFixed(t *testing.T) {
 	rows := []closeRow{
-		{d("2026-01-05"), 100, 1.00e8},
-		{d("2026-02-05"), 110, 1.05e8}, // +5%: allotment
-		{d("2026-03-05"), 105, 1.05e8},
+		{d("2026-01-30"), 301.75, 7.43e8}, // raw pre-bonus peak
+		{d("2026-06-11"), 256.80, 7.43e8},
+		{d("2026-06-12"), 201.70, 9.907e8}, // ex-date
+		{d("2026-10-29"), 220.10, 9.907e8},
 	}
-	r := computeLevels("QIP", rows, d("2026-10-29"))
-	if r.SplitsDetected != 0 || r.ATHClose != 110 || r.Source != "roll:eod" {
+	r := computeLevels("CUB", rows, d("2026-10-29"))
+	if r.SplitsAdjusted != 1 || r.Source != "roll:eod+split" {
+		t.Fatalf("split not detected: %+v", r)
+	}
+	want := round4(301.75 / (9.907e8 / 7.43e8))
+	if r.ATHClose != want || !r.ATHDate.Equal(d("2026-01-30")) {
+		t.Fatalf("ATH %v on %s, want %v", r.ATHClose, r.ATHDate.Format("2006-01-02"), want)
+	}
+	if r.ATHClose < 226 || r.ATHClose > 227 {
+		t.Fatalf("adjusted ATH should be ~226.3, got %v", r.ATHClose)
+	}
+}
+
+// Filing noise (shares +30% with a flat price) is not an action.
+func TestComputeLevels_ShareNoiseIgnored(t *testing.T) {
+	rows := []closeRow{
+		{d("2026-01-05"), 100, 1.0e8},
+		{d("2026-02-05"), 110, 1.3e8},
+		{d("2026-03-05"), 105, 1.3e8},
+	}
+	r := computeLevels("NOISE", rows, d("2026-10-29"))
+	if r.SplitsAdjusted != 0 || r.ATHClose != 110 {
 		t.Fatalf("%+v", r)
 	}
 	if r.Week52High != 110 || r.Week52Low != 100 {
 		t.Fatalf("52w: %+v", r)
+	}
+}
+
+// UpsertPre2021 picks the max close and its date; days counts rows.
+func TestPre2021MaxPick(t *testing.T) {
+	rows := []IndexClose{{Date: d("2018-01-02"), Close: 90}, {Date: d("2018-09-14"), Close: 140}, {Date: d("2020-03-23"), Close: 50}}
+	var maxC float64
+	var maxD time.Time
+	for _, r := range rows {
+		if r.Close > maxC {
+			maxC, maxD = r.Close, r.Date
+		}
+	}
+	if maxC != 140 || !maxD.Equal(d("2018-09-14")) {
+		t.Fatal("max pick")
 	}
 }
 

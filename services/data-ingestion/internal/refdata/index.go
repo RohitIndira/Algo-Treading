@@ -168,7 +168,19 @@ func parseNSEIndexCSV(r io.Reader, day time.Time) ([]IndexClose, error) {
 // any point dated today (IST) or later is dropped: today's close comes from
 // NSE's file after 15:30, never from Yahoo.
 func (f *IndexFetcher) YahooHistory(ctx context.Context, yahooSymbol, rng string) ([]IndexClose, string, error) {
-	u := fmt.Sprintf("%s/%s?range=%s&interval=1d", f.yahooBase, url.PathEscape(yahooSymbol), rng)
+	return f.yahooChart(ctx, yahooSymbol, "range="+url.QueryEscape(rng)+"&interval=1d")
+}
+
+// YahooDailyBetween returns daily closes in [from, to) — used for the
+// pre-2021 ATH seed. Yahoo's `close` is split/bonus-adjusted (not dividend-
+// adjusted), the same basis as the vendor's adjusted EOD history.
+func (f *IndexFetcher) YahooDailyBetween(ctx context.Context, yahooSymbol string, from, to time.Time) ([]IndexClose, error) {
+	rows, _, err := f.yahooChart(ctx, yahooSymbol, fmt.Sprintf("period1=%d&period2=%d&interval=1d", from.Unix(), to.Unix()))
+	return rows, err
+}
+
+func (f *IndexFetcher) yahooChart(ctx context.Context, yahooSymbol, query string) ([]IndexClose, string, error) {
+	u := fmt.Sprintf("%s/%s?%s", f.yahooBase, url.PathEscape(yahooSymbol), query)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, "", err

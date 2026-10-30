@@ -138,3 +138,17 @@ CREATE TABLE IF NOT EXISTS ref_buy_triggers (
     PRIMARY KEY (symbol, trade_date)
 );
 CREATE INDEX IF NOT EXISTS idx_ref_buy_triggers_date ON ref_buy_triggers (trade_date DESC);
+
+-- Pre-2021 peak per symbol (our EOD history starts January 2021). Filled
+-- from Yahoo's split-adjusted daily closes (2000-01-01 .. 2020-12-31) for the
+-- symbols whose vendor ATH says the real peak predates our data. days = 0
+-- means Yahoo had nothing; such a symbol's ATH stays "unverified" and it is
+-- kept out of the trigger universe rather than risk an early breakout.
+CREATE TABLE IF NOT EXISTS ref_ath_pre2021 (
+    symbol      VARCHAR(30)   PRIMARY KEY,
+    max_close   NUMERIC(14,4),
+    max_date    DATE,
+    days        INTEGER       NOT NULL,
+    source      VARCHAR(40)   NOT NULL,     -- yahoo
+    fetched_at  TIMESTAMPTZ   NOT NULL DEFAULT now()
+);

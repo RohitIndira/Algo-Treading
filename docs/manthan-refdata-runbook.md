@@ -21,8 +21,8 @@ does; `MANTHAN_SOURCE` picks which one manthan-live uses. Default stays `sheet`.
 |---|---|---|
 | Close, market cap, shares, codes, API industry | equities API `/eod` (T+1 by 08:30 IST) | `eod`, `eod-range` |
 | PAT (TTM/FY), EPS, F-score | equities API `/fundamentals` (quarterly; newest quarter fills gradually in results season) | `fundamentals` |
-| Vendor intraday ATH / 52w (cross-check only) | `/fundamental/price-levels` (no auth today — told vendor) | `price-levels` |
-| Our close-based ATH + 52w closes | computed from `ref_equity_eod` | `ath` |
+| Vendor intraday ATH / 52w (hint for pre-2021 peaks; 52w fallback) | `/fundamental/price-levels` (no auth today — told vendor) | `price-levels` |
+| Our close-based ATH + 52w closes | computed from `ref_equity_eod`; pre-2021 peaks from Yahoo daily closes | `ath`, `ath-seed` |
 | Index closes (NIFTY50, NFTYMCP150, NTYSLCP250) | NSE `ind_close_all_DDMMYYYY.csv`; Yahoo 2y for seed/fallback | `index-seed`, `index-ema` |
 | Live LTP for the trigger | external price Redis (`isin:` → `market:nse:<token>`) | watcher inside manthan-live |
 
@@ -62,6 +62,7 @@ $B -job fundamentals -period 2026-06
 $B -job fundamentals -period 2026-03
 $B -job price-levels
 $B -job ath                                                        # close-based ATH for every symbol
+$B -job ath-seed                                                   # Yahoo pre-2021 peaks (~7 min), then ATH again
 $B -job index-seed                                                 # 2 years of index closes from Yahoo
 $B -job index-ema                                                  # NSE closes for the latest EOD day + scoring
 ```
@@ -136,11 +137,19 @@ keep loading in the background; nothing else changes.
 
 ## Known limits
 
-- EOD history starts January 2021. Peaks before that come from the vendor's
-  intraday ATH when it is >10 % above our max close (`source =
-  seed:vendor-intraday`); the trigger is stricter for those names.
-- Splits/bonuses are inferred from `shares_outstanding` jumps ≥1.2×. The vendor
-  says ~0.4 % of micro-caps have inconsistent share counts.
+- **Corporate actions.** The vendor adjusts most histories (RELIANCE 2024 bonus,
+  COFORGE 2025 split show no price step) but not all (CUB's 1:3 bonus, ex
+  2026-06-12, was raw: shares ×1.333 and price ×0.785 the same day). The ATH job
+  adjusts only a share jump ≥1.2× that comes with a matching same-day price drop
+  (121 symbols on 2026-10-30); a jump with a flat price is already-adjusted or
+  filing noise and is ignored.
+- **Peaks before 2021.** EOD history starts January 2021. The vendor's ATH is an
+  intraday high and sometimes unadjusted (CUB 324.1 vs ~226 adjusted, EMPIND 2×),
+  so it is only a hint: where it is >10 % above our max close, `ath-seed` fetches
+  Yahoo's split-adjusted daily closes for 2000–2020 and the ATH becomes the
+  higher of the two (`source = seed:yahoo-pre2021`). A hinted symbol Yahoo has
+  nothing for stays `unverified:pre2021` and is kept out of the trigger universe.
+  `daily` runs `ath-seed` for new hints automatically.
 - A new listing has no ATH until it has closes in `ref_equity_eod`; it cannot
   trigger until then (BarNo rule by construction).
 - Yahoo is a convenience source for index history; NSE's file is authoritative.

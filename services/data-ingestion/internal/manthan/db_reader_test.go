@@ -88,6 +88,8 @@ func seedDBReader(t *testing.T, db *sql.DB, today string) {
 	      VALUES ('TDBRA', 'INETDBRA', 98.5, '2098-12-20', 98.5, 60, 'seed:test'),
 	             ('TDBRC', 'INETDBRC', 19, '2098-11-01', NULL, NULL, 'seed:test')`)
 	exec(`INSERT INTO ref_price_levels (symbol, co_code, week52_high, week52_low, ath_intraday) VALUES ('TDBRC', 1, 21, 12, 22)`)
+	// TDBRB: ATH not confirmable (pre-2021 peak hinted, no seed) → withheld.
+	exec(`INSERT INTO ref_ath_close (symbol, isin, ath_close, source) VALUES ('TDBRB', 'INETDBRB', 40, 'unverified:pre2021')`)
 	exec(`INSERT INTO ref_buy_triggers (symbol, trade_date, ltp, ath_close, source) VALUES ('TDBRA', $1, 100.2, 98.5, 'live:ext-redis')`, today)
 	exec(`INSERT INTO ref_buy_triggers (symbol, trade_date, ltp, ath_close, source) VALUES ('TDBRD', $1::date - 1, 10.5, 10, 'live:ext-redis')`, today)
 	exec(`INSERT INTO ref_index_allocation (index_name, trade_date, close, ema21, ema50, ema100, score, allocation)
@@ -152,6 +154,9 @@ func TestDBReader_ReadAll(t *testing.T) {
 	}
 	if lth["TDBRA"] == nil || lth["TDBRA"].AllTimeHigh != 98.5 || lth["TDBRA"].Week52High != 98.5 {
 		t.Fatalf("TDBRA lth: %+v", lth["TDBRA"])
+	}
+	if lth["TDBRB"] != nil {
+		t.Fatalf("unverified ATH must be withheld from the reader: %+v", lth["TDBRB"])
 	}
 	if lth["TDBRC"] == nil || lth["TDBRC"].AllTimeHigh != 19 || lth["TDBRC"].Week52High != 21 || lth["TDBRC"].Week52Low != 12 {
 		t.Fatalf("TDBRC must take 52w from vendor, ATH stays ours: %+v", lth["TDBRC"])

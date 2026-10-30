@@ -9,6 +9,8 @@
 //	fundamentals   one quarter of /equities/fundamentals for all three bases (-period YYYY-MM, default latest)
 //	price-levels   the vendor's intraday ATH / 52w snapshot
 //	ath            recompute our close-based ATH + 52w closes for every symbol from ref_equity_eod
+//	ath-seed       fetch Yahoo pre-2021 daily closes for symbols whose real peak may predate our
+//	               history (-refetch to redo all hinted symbols), then rerun ath
 //	index-seed     seed ref_index_close from Yahoo (-range 2y) for the three bucket indices
 //	index-ema      load the NSE index closes for -date (default: latest EOD day) and recompute
 //	               EMA 21/50/100 → score → allocation into ref_index_allocation
@@ -56,18 +58,19 @@ func main() {
 	period := flag.String("period", "", "fundamentals: quarter end YYYY-MM (default: vendor latest)")
 	quarters := flag.Int("quarters", 3, "daily: how many latest quarters to refresh")
 	rng := flag.String("range", "2y", "index-seed: Yahoo range")
+	refetch := flag.Bool("refetch", false, "ath-seed: refetch symbols that already have a pre-2021 row")
 	flag.Parse()
 
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 
-	if err := run(*job, *date, *from, *to, *period, *quarters, *rng, logger); err != nil {
+	if err := run(*job, *date, *from, *to, *period, *quarters, *rng, *refetch, logger); err != nil {
 		logger.Error("manthan-refdata failed", zap.String("job", *job), zap.Error(err))
 		os.Exit(1)
 	}
 }
 
-func run(job, date, from, to, period string, quarters int, rng string, logger *zap.Logger) error {
+func run(job, date, from, to, period string, quarters int, rng string, refetch bool, logger *zap.Logger) error {
 	apiKey := strings.TrimSpace(os.Getenv("MANTHAN_EQ_API_KEY"))
 	if apiKey == "" {
 		return errors.New("MANTHAN_EQ_API_KEY is not set")
@@ -102,6 +105,11 @@ func run(job, date, from, to, period string, quarters int, rng string, logger *z
 	case "price-levels":
 		return l.priceLevels(ctx)
 	case "ath":
+		return l.ath(ctx)
+	case "ath-seed":
+		if err := l.athSeed(ctx, refetch); err != nil {
+			return err
+		}
 		return l.ath(ctx)
 	case "index-seed":
 		return l.indexSeed(ctx, rng)
@@ -245,6 +253,49 @@ func (l *loader) ath(ctx context.Context) error {
 	})
 }
 
+// athSeed fetches Yahoo split-adjusted daily closes 2000-01-01..2020-12-31
+// for every symbol whose vendor ATH hints at a pre-2021 peak. A symbol Yahoo
+// has nothing for is stored with days=0 so it is not refetched daily, and
+// stays "unverified" (excluded from triggers) until -refetch finds data.
+func (l *loader) athSeed(ctx context.Context, refetch bool) error {
+	syms, err := l.store.ATHSeedCandidates(ctx, refetch)
+	if err != nil {
+		return err
+	}
+	from := time.Date(2000, 1, 1, 0, 0, 0, 0, ist)
+	to := time.Date(2021, 1, 1, 0, 0, 0, 0, ist)
+	return l.audited(ctx, "ath_seed", fmt.Sprintf("candidates=%d refetch=%v", len(syms), refetch), func() (int, error) {
+		found, none, failed := 0, 0, 0
+		for i, sym := range syms {
+			rows, ferr := l.index.YahooDailyBetween(ctx, sym+".NS", from, to)
+			if ferr != nil && !strings.Contains(ferr.Error(), "HTTP 404") && !strings.Contains(ferr.Error(), "No data found") {
+				failed++
+				l.logger.Warn("ath-seed: yahoo failed — will retry next run", zap.String("symbol", sym), zap.Error(ferr))
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			if err := l.store.UpsertPre2021(ctx, sym, rows, "yahoo"); err != nil {
+				return found, err
+			}
+			if len(rows) > 0 {
+				found++
+			} else {
+				none++
+			}
+			if (i+1)%100 == 0 {
+				l.logger.Info("ath-seed progress", zap.Int("done", i+1), zap.Int("of", len(syms)))
+			}
+			time.Sleep(300 * time.Millisecond) // be polite to Yahoo
+		}
+		l.logger.Info("ath-seed done", zap.Int("candidates", len(syms)), zap.Int("with_pre2021_history", found),
+			zap.Int("no_pre2021_history", none), zap.Int("failed", failed))
+		if failed > 0 {
+			return found + none, fmt.Errorf("ath-seed: %d symbol(s) failed, rerun to retry", failed)
+		}
+		return found + none, nil
+	})
+}
+
 // indexSeed loads Yahoo daily history for the three bucket indices.
 func (l *loader) indexSeed(ctx context.Context, rng string) error {
 	var errs []error
@@ -346,6 +397,13 @@ func (l *loader) daily(ctx context.Context, quarters int) error {
 		errs = append(errs, err)
 	}
 	if err := l.ath(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	// New hints (fresh listings, a vendor level that moved) get their Yahoo
+	// lookup, then the ATH is recomputed with them. No-op when none are new.
+	if err := l.athSeed(ctx, false); err != nil {
+		errs = append(errs, err)
+	} else if err := l.ath(ctx); err != nil {
 		errs = append(errs, err)
 	}
 	if err := l.indexEMA(ctx, ""); err != nil {

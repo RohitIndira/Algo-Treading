@@ -17,29 +17,46 @@ import (
 // traded on since launch; the vendor's price-levels ATH is an intraday high
 // and is used only as a cross-check).
 //
-// Source of truth is ref_equity_eod, which holds raw (unadjusted) closes
-// since January 2021. Two things make a naive max(close) wrong:
+// Source of truth is ref_equity_eod (closes since January 2021). The
+// vendor adjusts MOST histories for splits/bonuses but not all (verified
+// 2026-10-30):
 //
-//  1. Corporate actions. A 1:10 split leaves a pre-split close ten times
-//     today's price in the table — an ATH no live price could ever cross.
-//     The vendor adjusts shares_outstanding on the ex-date, so a jump in
-//     shares_outstanding between consecutive rows IS the split/bonus ratio.
-//     Closes before the jump are divided by that ratio before the max.
-//  2. Pre-2021 peaks. A stock whose real ATH was in 2018 shows a lower
-//     2021+ max. The vendor's intraday ATH covers full history: when it sits
-//     more than vendorGapPct above our adjusted max close, the real peak
-//     predates our data and the vendor's figure is used instead (an
-//     intraday high is ≥ the close-based ATH, so the trigger only gets
-//     stricter for those names, never looser).
+//   - RELIANCE 1:1 bonus (ex 2024-10-28), COFORGE 1:5 split (2025-06-04):
+//     shares_outstanding jumps, price does NOT step — history already
+//     adjusted, matches Yahoo's adjusted close to the paisa.
+//   - CUB 1:3 bonus (ex 2026-06-12): shares ×1.333 AND price ×0.785 the
+//     same day — history NOT adjusted; a raw max(close) gave an ATH of
+//     301.75 that no post-bonus price (~227) could ever reach.
+//
+// So a corporate action is adjusted only when a share jump ≥ splitMinRatio
+// comes with a same-day price move that cancels it (price ratio × share
+// ratio within splitMatchTol of 1). A share jump with a flat price is either
+// an already-adjusted history or filing-timing noise (1,817 jumps across
+// 1,265 symbols, only 140 matched) and is ignored.
+//
+// Peaks before 2021: our history starts January 2021. The vendor's
+// price-levels ATH covers full history but is an INTRADAY high and, like the
+// EOD history, sometimes unadjusted (CUB: 324.1 vs an adjusted ~226; EMPIND:
+// 2× Yahoo's adjusted peak) — so it is never used as the level. It is used
+// only as a HINT: where it sits more than vendorGapPct above our max close,
+// the real peak may predate our data, and the `ath-seed` job fetches Yahoo's
+// split-adjusted daily closes for 2000–2020 into ref_ath_pre2021. The ATH is
+// then max(our adjusted max close, Yahoo pre-2021 max close).
+//
+// A hinted symbol with no Yahoo answer yet is written with source
+// "unverified:pre2021"; the DB reader leaves those out of the trigger
+// universe (no early breakout on an ATH we could not confirm).
 //
 // The same computation runs every night after the EOD load; "seed" and
 // "roll forward" are the same job, which keeps it idempotent.
 
 const (
-	// A shares_outstanding change of at least this ratio between two
-	// consecutive trading days is treated as a split/bonus (smaller moves —
-	// QIPs, ESOPs, buybacks — are allotments, not re-denominations).
+	// A shares_outstanding jump of at least this ratio between consecutive
+	// trading days is a split/bonus CANDIDATE.
 	splitMinRatio = 1.20
+	// ...and it is adjusted only if price ratio × share ratio is within this
+	// of 1 (the price fell by the same factor the share count rose).
+	splitMatchTol = 0.15
 	// If the vendor's intraday ATH exceeds our adjusted max close by more
 	// than this fraction, the true ATH predates our history.
 	vendorGapPct = 0.10
@@ -56,7 +73,7 @@ type ATHResult struct {
 	Week52High     float64
 	Week52Low      float64
 	Source         string // roll:eod | roll:eod+split | seed:vendor-intraday
-	SplitsDetected int
+	SplitsAdjusted int
 }
 
 type closeRow struct {
@@ -72,23 +89,30 @@ func (s *Store) ComputeATH(ctx context.Context, asOf time.Time, logger *zap.Logg
 	if err != nil {
 		return 0, err
 	}
+	pre, err := s.pre2021(ctx)
+	if err != nil {
+		return 0, err
+	}
 	series, isinBySym, err := s.closeSeries(ctx, asOf)
 	if err != nil {
 		return 0, err
 	}
 	results := make([]ATHResult, 0, len(series))
-	splits, vendorUsed := 0, 0
+	splitSyms, preUsed, unverified := 0, 0, 0
 	for sym, rows := range series {
 		r := computeLevels(sym, rows, asOf)
 		r.ISIN = isinBySym[sym]
-		if r.SplitsDetected > 0 {
-			splits++
+		if r.SplitsAdjusted > 0 {
+			splitSyms++
 		}
-		if v, ok := vendor[sym]; ok && v > 0 && r.ATHClose > 0 && v > r.ATHClose*(1+vendorGapPct) {
-			r.ATHClose = v
-			r.ATHDate = time.Time{}
-			r.Source = "seed:vendor-intraday"
-			vendorUsed++
+		if p, ok := pre[sym]; ok && p.days > 0 {
+			if p.maxClose > r.ATHClose {
+				r.ATHClose, r.ATHDate, r.Source = round4(p.maxClose), p.maxDate, "seed:yahoo-pre2021"
+				preUsed++
+			}
+		} else if v, ok := vendor[sym]; ok && v > 0 && r.ATHClose > 0 && v > r.ATHClose*(1+vendorGapPct) {
+			r.Source = "unverified:pre2021"
+			unverified++
 		}
 		results = append(results, r)
 	}
@@ -97,33 +121,127 @@ func (s *Store) ComputeATH(ctx context.Context, asOf time.Time, logger *zap.Logg
 	if err != nil {
 		return n, err
 	}
-	logger.Info("ath: levels computed", zap.Int("symbols", n), zap.Int("with_split_adjustment", splits),
-		zap.Int("vendor_ath_used", vendorUsed), zap.String("as_of", asOf.Format("2006-01-02")))
+	logger.Info("ath: levels computed", zap.Int("symbols", n), zap.Int("unadjusted_actions_fixed", splitSyms),
+		zap.Int("pre2021_peak_used", preUsed), zap.Int("unverified_pre2021", unverified),
+		zap.String("as_of", asOf.Format("2006-01-02")))
+	if unverified > 0 {
+		logger.Warn("ath: symbols whose real peak may predate 2021 and have no Yahoo seed — excluded from triggers; run -job ath-seed",
+			zap.Int("symbols", unverified))
+	}
 	return n, nil
 }
 
-// computeLevels adjusts for splits, then takes max close (ATH) and the
-// 52-week close high/low. rows must be oldest-first.
+type preRow struct {
+	maxClose float64
+	maxDate  time.Time
+	days     int
+}
+
+func (s *Store) pre2021(ctx context.Context) (map[string]preRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT symbol, COALESCE(max_close,0), max_date, days FROM ref_ath_pre2021`)
+	if err != nil {
+		return nil, fmt.Errorf("ath: pre-2021 seeds: %w", err)
+	}
+	defer rows.Close()
+	m := map[string]preRow{}
+	for rows.Next() {
+		var sym string
+		var p preRow
+		var d sql.NullTime
+		if err := rows.Scan(&sym, &p.maxClose, &d, &p.days); err != nil {
+			return nil, err
+		}
+		if d.Valid {
+			p.maxDate = d.Time
+		}
+		m[strings.ToUpper(strings.TrimSpace(sym))] = p
+	}
+	return m, rows.Err()
+}
+
+// ATHSeedCandidates lists symbols whose vendor ATH hints at a pre-2021 peak
+// and that have no ref_ath_pre2021 row yet (all hinted symbols when refetch).
+func (s *Store) ATHSeedCandidates(ctx context.Context, refetch bool) ([]string, error) {
+	q := `
+		SELECT a.symbol FROM ref_ath_close a
+		  JOIN ref_price_levels p ON p.symbol = a.symbol
+		  LEFT JOIN ref_ath_pre2021 x ON x.symbol = a.symbol
+		 WHERE p.ath_intraday > a.ath_close * $1`
+	if !refetch {
+		q += ` AND x.symbol IS NULL`
+	}
+	q += ` ORDER BY a.symbol`
+	rows, err := s.db.QueryContext(ctx, q, 1+vendorGapPct)
+	if err != nil {
+		return nil, fmt.Errorf("ath seed candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sym string
+		if err := rows.Scan(&sym); err != nil {
+			return nil, err
+		}
+		out = append(out, sym)
+	}
+	return out, rows.Err()
+}
+
+// UpsertPre2021 stores one symbol's pre-2021 peak (days = 0: nothing found).
+func (s *Store) UpsertPre2021(ctx context.Context, symbol string, rows []IndexClose, source string) error {
+	var maxC float64
+	var maxD sql.NullTime
+	for _, r := range rows {
+		if r.Close > maxC {
+			maxC, maxD = r.Close, sql.NullTime{Time: r.Date, Valid: true}
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO ref_ath_pre2021 (symbol, max_close, max_date, days, source, fetched_at)
+		VALUES ($1, $2, $3, $4, $5, now())
+		ON CONFLICT (symbol) DO UPDATE SET max_close = EXCLUDED.max_close, max_date = EXCLUDED.max_date,
+			days = EXCLUDED.days, source = EXCLUDED.source, fetched_at = now()`,
+		symbol, nullIfZero(maxC), maxD, len(rows), source)
+	return err
+}
+
+// unadjustedAction reports the factor by which closes BEFORE row i must be
+// divided, or 1 when the step from i-1 to i is not an unadjusted corporate
+// action (see the package comment for the evidence).
+func unadjustedAction(prev, cur closeRow) float64 {
+	if prev.shares <= 0 || cur.shares <= 0 || prev.close <= 0 || cur.close <= 0 {
+		return 1
+	}
+	ratio := cur.shares / prev.shares
+	if ratio < splitMinRatio {
+		return 1
+	}
+	if math.Abs(cur.close/prev.close*ratio-1) > splitMatchTol {
+		return 1
+	}
+	return ratio
+}
+
+// computeLevels adjusts unadjusted splits/bonuses, then takes max close
+// (ATH) and the 52-week close high/low. rows must be oldest-first.
 func computeLevels(sym string, rows []closeRow, asOf time.Time) ATHResult {
 	res := ATHResult{Symbol: sym, Source: "roll:eod"}
 	if len(rows) == 0 {
 		return res
 	}
-	// Adjustment factor walks backwards: the factor applying to a day is the
-	// product of every split ratio that happened AFTER it.
+	// The factor for a day is the product of every unadjusted action AFTER it.
 	adj := make([]float64, len(rows))
 	factor := 1.0
 	for i := len(rows) - 1; i >= 0; i-- {
 		adj[i] = factor
-		if i > 0 && rows[i].shares > 0 && rows[i-1].shares > 0 {
-			ratio := rows[i].shares / rows[i-1].shares
-			if ratio >= splitMinRatio {
-				factor *= ratio
-				res.SplitsDetected++
+		if i > 0 {
+			if f := unadjustedAction(rows[i-1], rows[i]); f != 1 {
+				factor *= f
+				res.SplitsAdjusted++
 			}
 		}
 	}
-	if res.SplitsDetected > 0 {
+	if res.SplitsAdjusted > 0 {
 		res.Source = "roll:eod+split"
 	}
 	cutoff := asOf.AddDate(0, 0, -week52Days)
