@@ -258,7 +258,10 @@ func (c *Client) get(ctx context.Context, path string, q url.Values) ([]byte, er
 		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		resp.Body.Close()
 		if rerr != nil {
-			return nil, fmt.Errorf("%s: read body: %w", path, rerr)
+			// A reset mid-body is as transient as a failed connect: retry.
+			lastErr = fmt.Errorf("%s: read body: %w", path, rerr)
+			c.sleep(time.Second * time.Duration(attempt+1))
+			continue
 		}
 		switch {
 		case resp.StatusCode == http.StatusOK:
