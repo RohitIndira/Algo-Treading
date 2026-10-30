@@ -564,6 +564,7 @@ func main() {
 		// with a note, candidates 503s loudly).
 		adminHTTP.SetExplorer(admin.NewExplorer(signalsDB, adminFleet))
 		log.Printf("Admin signal pipeline explorer enabled (signals_db wired=%v)", signalsDB != nil)
+		adminHTTP.SetRefdata(admin.NewRefdataStore(signalsDB))
 
 		// M7 Phase A: interventions — resurrect / re-arm / hold release /
 		// cap reset. Re-arm proxies trade-execution's existing operator

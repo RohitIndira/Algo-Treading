@@ -53,10 +53,15 @@ type HTTP struct {
 	dashboard  *DashboardStore  // nil-safe: M12 dashboard/clients routes absent without it
 	reaper     *GhostReaper     // nil-safe: on-demand book reconcile run absent without it
 	activity   *ActivityStore   // nil-safe: logins + daily activity routes absent without it
+	refdata    *RefdataStore
 }
 
 // SetActivity enables GET /logins and GET /activity. Call before Register.
 func (h *HTTP) SetActivity(a *ActivityStore) { h.activity = a }
+
+// SetRefdata enables GET /refdata — Manthan reference-data load status,
+// today's mechanical Buy triggers and the index EMA allocations.
+func (h *HTTP) SetRefdata(r *RefdataStore) { h.refdata = r }
 
 // SetReaper enables POST /users/{user_id}/reconcile/run — the book
 // reconciler for ONE user, now, through the same sweep code path as the
@@ -102,10 +107,10 @@ func (h *HTTP) SetInterventions(iv *Interventions) { h.interv = iv }
 func (h *HTTP) SetActions(a *Actions) { h.actions = a }
 
 // SetEOD / SetRisk / SetOps / SetExports enable M8–M11. Call before Register.
-func (h *HTTP) SetEOD(e *EODStore)         { h.eod = e }
-func (h *HTTP) SetRisk(r *RiskStore)       { h.risk = r }
-func (h *HTTP) SetOps(o *OpsStore)         { h.ops = o }
-func (h *HTTP) SetExports(x *ExportStore)  { h.exports = x }
+func (h *HTTP) SetEOD(e *EODStore)        { h.eod = e }
+func (h *HTTP) SetRisk(r *RiskStore)      { h.risk = r }
+func (h *HTTP) SetOps(o *OpsStore)        { h.ops = o }
+func (h *HTTP) SetExports(x *ExportStore) { h.exports = x }
 
 // SetDashboard enables the M12 dashboard + clients analytics. Call before
 // Register.
@@ -209,6 +214,9 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 		h.Route(token, "GET", "/logins", "LOGINS_VIEW", TierRead, h.handleLogins)
 		h.Route(token, "GET", "/activity", "ACTIVITY_VIEW", TierRead, h.handleActivity)
 	}
+	if h.refdata != nil {
+		h.Route(token, "GET", "/refdata", "REFDATA_VIEW", TierRead, h.handleRefdata)
+	}
 	if h.risk != nil {
 		h.Route(token, "GET", "/risk/caps", "RISK_CAPS", TierRead, h.handleRiskCaps)
 		h.Route(token, "GET", "/risk/drivers", "RISK_DRIVERS", TierRead, h.handleRiskDrivers)
@@ -267,6 +275,17 @@ func (h *HTTP) handleLogins(w http.ResponseWriter, ar *AdminRequest) {
 }
 
 // handleActivity — GET /activity?date=YYYY-MM-DD (default: today, IST)
+// handleRefdata — GET /refdata
+func (h *HTTP) handleRefdata(w http.ResponseWriter, ar *AdminRequest) {
+	res, err := h.refdata.Status(ar.Request.Context())
+	if err != nil {
+		log.Printf("admin: refdata status failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "E_ADMIN_INTERNAL", "reference data status failed")
+		return
+	}
+	writeOK(w, res)
+}
+
 func (h *HTTP) handleActivity(w http.ResponseWriter, ar *AdminRequest) {
 	res, err := h.activity.Activity(ar.Request.Context(), ar.Request.URL.Query().Get("date"))
 	if err != nil {
@@ -1072,10 +1091,10 @@ type AdminRequest struct {
 	*http.Request
 	Session *Session
 
-	http    *HTTP
-	action  string
-	tier    Tier
-	body    map[string]json.RawMessage // lazily parsed for tier checks
+	http   *HTTP
+	action string
+	tier   Tier
+	body   map[string]json.RawMessage // lazily parsed for tier checks
 }
 
 // parseBody reads the JSON body once (tier checks + handler share it).
