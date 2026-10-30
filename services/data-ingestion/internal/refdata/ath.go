@@ -105,12 +105,19 @@ func (s *Store) ComputeATH(ctx context.Context, asOf time.Time, logger *zap.Logg
 		if r.SplitsAdjusted > 0 {
 			splitSyms++
 		}
-		if p, ok := pre[sym]; ok && p.days > 0 {
+		p, havePre := pre[sym]
+		switch {
+		case havePre && p.days > 0:
 			if p.maxClose > r.ATHClose {
 				r.ATHClose, r.ATHDate, r.Source = round4(p.maxClose), p.maxDate, "seed:yahoo-pre2021"
 				preUsed++
 			}
-		} else if v, ok := vendor[sym]; ok && v > 0 && r.ATHClose > 0 && v > r.ATHClose*(1+vendorGapPct) {
+		case havePre && p.source == "yahoo:listed-after-2020":
+			// Whole trading life is inside our history: our ATH stands.
+		case func() bool {
+			v, ok := vendor[sym]
+			return ok && v > 0 && r.ATHClose > 0 && v > r.ATHClose*(1+vendorGapPct)
+		}():
 			r.Source = "unverified:pre2021"
 			unverified++
 		}
@@ -135,10 +142,11 @@ type preRow struct {
 	maxClose float64
 	maxDate  time.Time
 	days     int
+	source   string
 }
 
 func (s *Store) pre2021(ctx context.Context) (map[string]preRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT symbol, COALESCE(max_close,0), max_date, days FROM ref_ath_pre2021`)
+	rows, err := s.db.QueryContext(ctx, `SELECT symbol, COALESCE(max_close,0), max_date, days, source FROM ref_ath_pre2021`)
 	if err != nil {
 		return nil, fmt.Errorf("ath: pre-2021 seeds: %w", err)
 	}
@@ -148,7 +156,7 @@ func (s *Store) pre2021(ctx context.Context) (map[string]preRow, error) {
 		var sym string
 		var p preRow
 		var d sql.NullTime
-		if err := rows.Scan(&sym, &p.maxClose, &d, &p.days); err != nil {
+		if err := rows.Scan(&sym, &p.maxClose, &d, &p.days, &p.source); err != nil {
 			return nil, err
 		}
 		if d.Valid {

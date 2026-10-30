@@ -179,6 +179,41 @@ func (f *IndexFetcher) YahooDailyBetween(ctx context.Context, yahooSymbol string
 	return rows, err
 }
 
+// YahooFirstTrade returns Yahoo's firstTradeDate for a symbol (zero when
+// Yahoo does not know it).
+func (f *IndexFetcher) YahooFirstTrade(ctx context.Context, yahooSymbol string) (time.Time, error) {
+	u := fmt.Sprintf("%s/%s?range=5d&interval=1d", f.yahooBase, url.PathEscape(yahooSymbol))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+	resp, err := f.http.Do(req)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return time.Time{}, fmt.Errorf("yahoo %s: HTTP %d", yahooSymbol, resp.StatusCode)
+	}
+	var body struct {
+		Chart struct {
+			Result []struct {
+				Meta struct {
+					FirstTradeDate int64 `json:"firstTradeDate"`
+				} `json:"meta"`
+			} `json:"result"`
+		} `json:"chart"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return time.Time{}, err
+	}
+	if len(body.Chart.Result) == 0 || body.Chart.Result[0].Meta.FirstTradeDate <= 0 {
+		return time.Time{}, nil
+	}
+	return time.Unix(body.Chart.Result[0].Meta.FirstTradeDate, 0), nil
+}
+
 func (f *IndexFetcher) yahooChart(ctx context.Context, yahooSymbol, query string) ([]IndexClose, string, error) {
 	u := fmt.Sprintf("%s/%s?%s", f.yahooBase, url.PathEscape(yahooSymbol), query)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

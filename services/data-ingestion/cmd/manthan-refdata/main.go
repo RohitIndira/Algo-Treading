@@ -268,13 +268,29 @@ func (l *loader) athSeed(ctx context.Context, refetch bool) error {
 		found, none, failed := 0, 0, 0
 		for i, sym := range syms {
 			rows, ferr := l.index.YahooDailyBetween(ctx, sym+".NS", from, to)
-			if ferr != nil && !strings.Contains(ferr.Error(), "HTTP 404") && !strings.Contains(ferr.Error(), "No data found") {
-				failed++
-				l.logger.Warn("ath-seed: yahoo failed — will retry next run", zap.String("symbol", sym), zap.Error(ferr))
-				time.Sleep(2 * time.Second)
-				continue
+			source := "yahoo"
+			if ferr == nil && len(rows) == 0 {
+				ferr = fmt.Errorf("yahoo %s: empty window", sym)
 			}
-			if err := l.store.UpsertPre2021(ctx, sym, rows, "yahoo"); err != nil {
+			if ferr != nil {
+				// Yahoo answers 400 "Data doesn't exist for startDate…" when the
+				// stock did not trade in the window. If its first trade is 2021
+				// or later our own history is its whole life: verified, no
+				// pre-2021 peak. Unknown to Yahoo (404) → stays unverified.
+				ft, terr := l.index.YahooFirstTrade(ctx, sym+".NS")
+				switch {
+				case terr == nil && !ft.IsZero() && !ft.Before(to):
+					source, rows = "yahoo:listed-after-2020", nil
+				case terr == nil && ft.IsZero(), strings.Contains(ferr.Error(), "HTTP 404"):
+					source, rows = "yahoo:unknown", nil
+				default:
+					failed++
+					l.logger.Warn("ath-seed: yahoo failed — will retry next run", zap.String("symbol", sym), zap.Error(ferr))
+					time.Sleep(2 * time.Second)
+					continue
+				}
+			}
+			if err := l.store.UpsertPre2021(ctx, sym, rows, source); err != nil {
 				return found, err
 			}
 			if len(rows) > 0 {
