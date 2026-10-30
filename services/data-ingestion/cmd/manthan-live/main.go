@@ -42,6 +42,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	goredis "github.com/go-redis/redis/v8"
@@ -312,6 +313,14 @@ func watchLoop(logger *zap.Logger) {
 	logger.Info("manthan-live WATCH mode — Buy-list changes trigger the pipeline automatically",
 		zap.String("source", sourceName()), zap.Duration("poll", interval), zap.Duration("full_run_every", fullEvery), zap.String("sheet", sheetID))
 
+	// db mode: the mechanical trigger watcher runs alongside the poll loop.
+	// It writes ref_buy_triggers when a live price crosses the stored ATH
+	// close and kicks a pipeline run straight away (the poll loop below still
+	// catches anything it missed on its next tick).
+	if sourceName() == "db" && os.Getenv("MANTHAN_TRIGGER_WATCH") != "0" {
+		startTriggerWatcher(logger)
+	}
+
 	var lastSyms []string
 	haveBaseline := false
 	buySymbols := func() ([]string, bool) {
@@ -388,7 +397,7 @@ func watchLoop(logger *zap.Logger) {
 					zap.Int("total_now", len(syms)))
 			}
 		}
-		if err := runPipelineOnce(logger); err != nil {
+		if err := runPipelineOnceLocked(logger); err != nil {
 			logger.Error("watch: pipeline run failed — baseline kept, will retry next tick", zap.Error(err))
 			continue // lastSyms unchanged → next tick sees the same diff and retries
 		}
@@ -476,4 +485,46 @@ func newSourceReader(sheetID, creds string, logger *zap.Logger) (manthan.SourceR
 		return nil, func() {}, fmt.Errorf("db source open: %w", err)
 	}
 	return manthan.NewDBReader(db, os.Getenv("MANTHAN_PAT_BASIS"), logger), func() { _ = db.Close() }, nil
+}
+
+// runMu serialises pipeline runs between the poll loop and the trigger
+// watcher so two cycles never publish concurrently.
+var runMu sync.Mutex
+
+func runPipelineOnceLocked(logger *zap.Logger) error {
+	runMu.Lock()
+	defer runMu.Unlock()
+	return runPipelineOnce(logger)
+}
+
+// startTriggerWatcher launches the ATH-crossing watcher (db mode only).
+// EXT_REDIS_ADDR is the external price feed trade-execution and the
+// instrument gate already use; without it the watcher cannot run and says so.
+func startTriggerWatcher(logger *zap.Logger) {
+	extAddr := strings.TrimSpace(os.Getenv("EXT_REDIS_ADDR"))
+	if extAddr == "" {
+		logger.Error("trigger watcher NOT started: EXT_REDIS_ADDR is empty — no mechanical Buy triggers will fire")
+		return
+	}
+	cfg := config.Load()
+	db, err := sql.Open("postgres", fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.PGHost, cfg.PGPort, cfg.PGUser, cfg.PGPassword, cfg.PGDatabase, cfg.PGSSLMode))
+	if err != nil {
+		logger.Error("trigger watcher NOT started: db open failed", zap.Error(err))
+		return
+	}
+	reader := manthan.NewDBReader(db, os.Getenv("MANTHAN_PAT_BASIS"), logger)
+	w := manthan.NewTriggerWatcher(db, reader, extAddr, os.Getenv("EXT_REDIS_PASSWORD"), logger)
+	if v := strings.TrimSpace(os.Getenv("MANTHAN_TRIGGER_TICK")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 5 {
+			w.Tick = time.Duration(n) * time.Second
+		}
+	}
+	w.OnTrigger = func(symbols []string) {
+		logger.Info("trigger watcher: new Buy triggers — running pipeline now", zap.Strings("symbols", symbols))
+		if err := runPipelineOnceLocked(logger); err != nil {
+			logger.Error("trigger watcher: pipeline run failed — poll loop will retry", zap.Error(err))
+		}
+	}
+	go w.Run(context.Background())
 }
