@@ -47,6 +47,7 @@ var bucketIndices = []struct {
 type IndexFetcher struct {
 	http  *http.Client
 	sleep func(time.Duration)
+	now   func() time.Time
 	// nseBase / yahooBase are overridable for tests.
 	nseBase   string
 	yahooBase string
@@ -57,6 +58,7 @@ func NewIndexFetcher() *IndexFetcher {
 	return &IndexFetcher{
 		http:      &http.Client{Timeout: 30 * time.Second},
 		sleep:     time.Sleep,
+		now:       time.Now,
 		nseBase:   "https://nsearchives.nseindia.com/content/indices",
 		yahooBase: "https://query2.finance.yahoo.com/v8/finance/chart",
 	}
@@ -161,7 +163,10 @@ func parseNSEIndexCSV(r io.Reader, day time.Time) ([]IndexClose, error) {
 }
 
 // YahooHistory returns daily closes for one bucket index over `rng`
-// (e.g. "2y"), oldest first, null days skipped.
+// (e.g. "2y"), oldest first, null days skipped. Yahoo's last point is the
+// CURRENT session while the market is open (a live quote, not a close), so
+// any point dated today (IST) or later is dropped: today's close comes from
+// NSE's file after 15:30, never from Yahoo.
 func (f *IndexFetcher) YahooHistory(ctx context.Context, yahooSymbol, rng string) ([]IndexClose, string, error) {
 	u := fmt.Sprintf("%s/%s?range=%s&interval=1d", f.yahooBase, url.PathEscape(yahooSymbol), rng)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -206,7 +211,10 @@ func (f *IndexFetcher) YahooHistory(ctx context.Context, yahooSymbol, rng string
 	}
 	r := body.Chart.Result[0]
 	ist, _ := time.LoadLocation("Asia/Kolkata")
+	n := f.now().In(ist)
+	today := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, time.UTC)
 	var out []IndexClose
+	dropped := 0
 	for i, ts := range r.Timestamp {
 		if i >= len(r.Indicators.Quote[0].Close) {
 			break
@@ -216,8 +224,14 @@ func (f *IndexFetcher) YahooHistory(ctx context.Context, yahooSymbol, rng string
 			continue
 		}
 		d := time.Unix(ts, 0).In(ist)
-		out = append(out, IndexClose{Date: time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC), Close: *c})
+		day := time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC)
+		if !day.Before(today) {
+			dropped++
+			continue
+		}
+		out = append(out, IndexClose{Date: day, Close: *c})
 	}
+	_ = dropped
 	return out, r.Meta.ShortName, nil
 }
 
