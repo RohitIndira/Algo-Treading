@@ -189,6 +189,7 @@ func (h *HTTP) Register(adminRoot *mux.Router, platformAuth func(http.Handler) h
 	if h.explorer != nil {
 		h.Route(token, "GET", "/trace/{symbol}", "SIGNAL_TRACE", TierRead, h.handleTrace)
 		h.Route(token, "GET", "/signals/candidates", "CANDIDATES_VIEW", TierRead, h.handleCandidates)
+		h.Route(token, "GET", "/signals/daily", "DAILY_SIGNALS_VIEW", TierRead, h.handleDailySignals)
 		h.Route(token, "GET", "/inbox", "INBOX_VIEW", TierRead, h.handleInbox)
 		h.Route(token, "GET", "/rejections", "REJECTIONS_VIEW", TierRead, h.handleRejections)
 	}
@@ -682,6 +683,21 @@ func (h *HTTP) handleCandidates(w http.ResponseWriter, ar *AdminRequest) {
 	if err != nil {
 		log.Printf("admin: candidates failed: %v", err)
 		writeErr(w, http.StatusServiceUnavailable, "E_ADMIN_CANDIDATES", err.Error())
+		return
+	}
+	writeOK(w, res)
+}
+
+// handleDailySignals — GET /signals/daily?date=YYYY-MM-DD (default today IST)
+func (h *HTTP) handleDailySignals(w http.ResponseWriter, ar *AdminRequest) {
+	res, err := h.explorer.DailySignals(ar.Request.Context(), ar.Request.URL.Query().Get("date"))
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "date must be") {
+			writeErr(w, http.StatusBadRequest, "E_BAD_DATE", err.Error())
+			return
+		}
+		log.Printf("admin: daily signals failed: %v", err)
+		writeErr(w, http.StatusServiceUnavailable, "E_ADMIN_SIGNALS", err.Error())
 		return
 	}
 	writeOK(w, res)
