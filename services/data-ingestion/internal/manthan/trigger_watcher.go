@@ -347,3 +347,63 @@ func (w *TriggerWatcher) Run(ctx context.Context) {
 		}
 	}
 }
+
+// InWindow is the exported form of the trading-window check (probe tool).
+func (w *TriggerWatcher) InWindow(now time.Time) bool { return w.inWindow(now) }
+
+// ProbeResult explains one candidate's state on the feed right now.
+type ProbeResult struct {
+	Token        string
+	LTP          float64
+	Age          time.Duration
+	WouldTrigger bool
+	Note         string
+}
+
+// Probe reads one candidate through the same token/price path as Scan and
+// says why it would or would not trigger. Read-only.
+func (w *TriggerWatcher) Probe(ctx context.Context, c TriggerCandidate) ProbeResult {
+	var r ProbeResult
+	t, err := w.token(ctx, c.ISIN)
+	if err != nil {
+		if errors.Is(err, goredis.Nil) {
+			r.Note = "ISIN not in the price feed (isin: key missing)"
+		} else {
+			r.Note = "token lookup failed: " + err.Error()
+		}
+		return r
+	}
+	r.Token = t
+	vals, err := w.mget(ctx, []string{"market:nse:" + t})
+	if err != nil || len(vals) == 0 {
+		r.Note = fmt.Sprintf("price read failed: %v", err)
+		return r
+	}
+	s, ok := vals[0].(string)
+	if !ok || s == "" {
+		r.Note = "no price row for token"
+		return r
+	}
+	var p priceRow
+	if json.Unmarshal([]byte(s), &p) != nil || p.LTP <= 0 {
+		r.Note = "price row has no LTP"
+		return r
+	}
+	r.LTP = p.LTP
+	as := p.asOf()
+	if as.IsZero() {
+		r.Note = "price row has no timestamp"
+		return r
+	}
+	r.Age = w.now().Sub(as).Round(time.Second)
+	switch {
+	case r.Age > w.PriceMaxAge:
+		r.Note = fmt.Sprintf("price stale (> %s) — would be ignored", w.PriceMaxAge)
+	case p.LTP > c.ATHClose:
+		r.WouldTrigger = true
+		r.Note = "above ATH close"
+	default:
+		r.Note = fmt.Sprintf("%.2f%% below ATH close", (c.ATHClose-p.LTP)/c.ATHClose*100)
+	}
+	return r
+}
