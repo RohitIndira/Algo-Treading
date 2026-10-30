@@ -110,6 +110,21 @@ func (r *DBReader) ReadAll(ctx context.Context) (*ReadResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The allocator sizes quantity from LatestPrice. For a stock that
+	// triggered today the right price is the breakout LTP, not yesterday's
+	// EOD close (a stock breaking out is by definition above it). PE stays
+	// on the close, consistent with every other row.
+	trig := make(map[string]float64, len(res.BuySignals))
+	for _, b := range res.BuySignals {
+		if b.CloseRate > 0 {
+			trig[b.ScripName] = b.CloseRate
+		}
+	}
+	for _, p := range res.PEAndNetProfit {
+		if ltp, ok := trig[p.NSESymbol]; ok {
+			p.LatestPrice = ltp
+		}
+	}
 
 	res.IndicesGrades, err = r.indicesGrades(ctx)
 	if err != nil {

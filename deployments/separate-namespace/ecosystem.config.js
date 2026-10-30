@@ -195,6 +195,38 @@ module.exports = {
         // localhost:6379, logged "EMA allocations not cached", and the
         // allocator fell back to the hardcoded 0.30 split every day.
         REDIS_URI: 'localhost:6389', REDIS_PASSWORD: '',
+        // Source of Manthan inputs (2026-10-30, docs/manthan-refdata-runbook.md):
+        // 'sheet' = Google Sheet (default, today's behaviour); 'db' = signals_db
+        // ref_* tables + the live ATH trigger watcher (EXT_REDIS_ADDR from BASE).
+        // Flip = .env edit + `pm2 restart ... --only data-ingestion --update-env`.
+        MANTHAN_SOURCE: ENV.MANTHAN_SOURCE || 'sheet',
+        MANTHAN_PAT_BASIS: ENV.MANTHAN_PAT_BASIS || 'preferred',
+        MANTHAN_TRIGGER_WATCH: ENV.MANTHAN_TRIGGER_WATCH || '1',
+        MANTHAN_TRIGGER_TICK: ENV.MANTHAN_TRIGGER_TICK || '15',
+    }},
+    // Reference-data loader: vendor EOD + fundamentals + price levels, our
+    // close-based ATH, NSE index closes + EMA allocation. 08:35 IST = 03:05 UTC
+    // (vendor publishes T+1 by 08:30 IST), before data-ingestion's 09:00 restart.
+    // One-shot: autorestart false, cron_restart re-runs it each weekday.
+    { name: 'manthan-refdata', script: './bin/manthan-refdata', args: '-job daily', ...common,
+      autorestart: false, cron_restart: '5 3 * * 1-5', env: {
+        ...BASE,
+        MANTHAN_EQ_API_KEY: ENV.MANTHAN_EQ_API_KEY || '',
+        MARKET_DATA_DB_HOST: 'localhost', MARKET_DATA_DB_PORT: '5442',
+        MARKET_DATA_DB_USER: 'postgres', MARKET_DATA_DB_PASSWORD: 'postgres',
+        MARKET_DATA_DB_NAME: 'signals_db', MARKET_DATA_DB_SSLMODE: 'disable',
+    }},
+    // Shadow comparison sheet vs db, 15:35 IST = 10:05 UTC, archived per day.
+    // Remove after the flip.
+    { name: 'manthan-shadow', script: './bin/manthan-shadow', args: '-json-dir /home/ubuntu/manthan-shadow', ...common,
+      autorestart: false, cron_restart: '5 10 * * 1-5', env: {
+        ...BASE,
+        MANTHAN_SHEET_ID: '1E_MzQNQFNvnmR8wMZMCyzPKc-SjOei4wwQp4QAey5sc',
+        MANTHAN_CREDS: '/home/ubuntu/Algo-Treading/services/data-ingestion/credentials/manthan-sheet.json',
+        MANTHAN_PAT_BASIS: ENV.MANTHAN_PAT_BASIS || 'preferred',
+        MARKET_DATA_DB_HOST: 'localhost', MARKET_DATA_DB_PORT: '5442',
+        MARKET_DATA_DB_USER: 'postgres', MARKET_DATA_DB_PASSWORD: 'postgres',
+        MARKET_DATA_DB_NAME: 'signals_db', MARKET_DATA_DB_SSLMODE: 'disable',
     }},
   ],
 };

@@ -116,13 +116,14 @@ func TestDBReader_ReadAll(t *testing.T) {
 		pe[p.NSESymbol] = p
 	}
 	a := pe["TDBRA"]
-	if a == nil || a.PAT != 150 || a.TTMEPS != 4 || a.TTMPE != 25 || a.LatestMarketCap != 5000 || a.ISIN != "INETDBRA" || a.LatestPrice != 100 {
+	// LatestPrice is today's breakout LTP (100.2), PE stays on the close (100/4).
+	if a == nil || a.PAT != 150 || a.TTMEPS != 4 || a.TTMPE != 25 || a.LatestMarketCap != 5000 || a.ISIN != "INETDBRA" || a.LatestPrice != 100.2 {
 		t.Fatalf("TDBRA pe row: %+v", a)
 	}
 	if b := pe["TDBRB"]; b == nil || b.PAT != 0 || b.TTMPE != 0 {
 		t.Fatalf("TDBRB stale PAT must read as 0: %+v", b)
 	}
-	if c := pe["TDBRC"]; c == nil || c.PAT != 0 {
+	if c := pe["TDBRC"]; c == nil || c.PAT != 0 || c.LatestPrice != 20 { // not triggered → EOD close
 		t.Fatalf("TDBRC no fundamentals: %+v", c)
 	}
 

@@ -75,8 +75,15 @@ type Report struct {
 
 func main() {
 	jsonOut := flag.String("json", "", "write the full report to this file")
+	jsonDir := flag.String("json-dir", "", "write the report to <dir>/<IST date>.json (for a daily cron archive)")
 	tol := flag.Float64("tol", 0.05, "relative tolerance for numeric fields (0.05 = 5%)")
 	flag.Parse()
+	if *jsonDir != "" && *jsonOut == "" {
+		ist, _ := time.LoadLocation("Asia/Kolkata")
+		if err := os.MkdirAll(*jsonDir, 0o755); err == nil {
+			*jsonOut = *jsonDir + "/" + time.Now().In(ist).Format("2006-01-02") + ".json"
+		}
+	}
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 	if err := run(*jsonOut, *tol, logger); err != nil {

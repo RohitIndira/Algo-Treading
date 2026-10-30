@@ -90,21 +90,20 @@ price-levels → ath → index-ema. Each step audits itself; one failing step do
 not stop the others. The data-ingestion 09:00 IST `cron_restart` already
 re-runs the pipeline after this.
 
-## Switching manthan-live to the database
+## Switching manthan-live to the database (the flip)
 
-In the `data-ingestion` PM2 entry add:
+Set `MANTHAN_SOURCE=db` in `deployments/separate-namespace/.env`, then
 
-```js
-MANTHAN_SOURCE: 'db',            // 'sheet' (default) keeps today's behaviour
-MANTHAN_PAT_BASIS: 'preferred',
-MANTHAN_TRIGGER_WATCH: '1',      // '0' disables the live ATH trigger watcher
-MANTHAN_TRIGGER_TICK: '15',      // seconds between LTP scans
-EXT_REDIS_ADDR: ENV.EXT_REDIS_ADDR, EXT_REDIS_PASSWORD: ENV.EXT_REDIS_PASSWORD,  // already used by the instrument gate
+```bash
+pm2 restart ecosystem.config.js --only data-ingestion --update-env
 ```
 
-Then `pm2 restart ecosystem.config.js --only data-ingestion --update-env`,
-outside 09:10–09:25 IST. The watcher logs `trigger watcher started` with its
-window; without `EXT_REDIS_ADDR` it logs an error and stays off (no triggers).
+outside 09:10–09:25 IST. `MANTHAN_PAT_BASIS` (default `preferred`),
+`MANTHAN_TRIGGER_WATCH` (default `1`) and `MANTHAN_TRIGGER_TICK` (default `15`
+seconds) can be overridden the same way. The watcher logs `trigger watcher
+started` with its window; it uses `EXT_REDIS_ADDR` from the shared BASE env.
+In db mode a triggered stock's entry price is the breakout LTP, not the
+previous close.
 
 ## Shadow period (two weeks) — what to look at
 
