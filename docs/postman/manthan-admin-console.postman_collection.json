@@ -1789,6 +1789,91 @@
             },
             "description": "Any past IST day; bad format → 400 E_BAD_DATE."
           }
+        },
+        {
+          "name": "Daily signals — today (IST)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/signals/daily",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "signals",
+                "daily"
+              ],
+              "query": []
+            },
+            "description": "Each Buy-list stock: verdict, breakout trigger, publish time, and per-client outcome (FILLED/PARTIAL/PLACED/REFUSED/FAILED/SKIPPED/PENDING) with the reason."
+          }
+        },
+        {
+          "name": "Daily signals — a past day",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/signals/daily?date=2026-10-29",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "signals",
+                "daily"
+              ],
+              "query": [
+                {
+                  "key": "date",
+                  "value": "2026-10-29"
+                }
+              ]
+            },
+            "description": "Same as today for one IST date. 400 E_BAD_DATE on a malformed date."
+          }
+        },
+        {
+          "name": "Reference data status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Token",
+                "value": "{{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/admin/refdata",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "refdata"
+              ],
+              "query": []
+            },
+            "description": "Nightly load health per job, table freshness, today's ATH breakout triggers, index EMA allocation, ATH source breakdown, unmapped industries."
+          }
         }
       ]
     }
