@@ -122,3 +122,19 @@ CREATE TABLE IF NOT EXISTS ref_load_runs (
     finished_at         TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_ref_load_runs_kind_time ON ref_load_runs (kind, finished_at DESC);
+
+-- Mechanical Buy trigger (replaces the hand-typed ATH_Entry="Buy" column).
+-- One row per symbol per IST trading day, written the first time the live LTP
+-- trades above the stored close-based ATH. The pipeline's DB reader turns
+-- today's rows into BuySignal rows; rules-engine/first_seen dedup downstream
+-- is unchanged.
+CREATE TABLE IF NOT EXISTS ref_buy_triggers (
+    symbol              VARCHAR(30)   NOT NULL,
+    trade_date          DATE          NOT NULL,
+    triggered_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    ltp                 NUMERIC(14,4) NOT NULL,  -- price that crossed
+    ath_close           NUMERIC(14,4) NOT NULL,  -- the ATH it crossed
+    source              VARCHAR(40)   NOT NULL,  -- live:ext-redis | eod:close | manual:<admin>
+    PRIMARY KEY (symbol, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_ref_buy_triggers_date ON ref_buy_triggers (trade_date DESC);

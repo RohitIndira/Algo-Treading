@@ -89,14 +89,18 @@ func runPipelineOnce(logger *zap.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// --- Sheets ---
-	reader := manthan.NewGSheetReader(sheetID, creds, logger)
+	// --- Source: Google Sheet (default) or signals_db ref_* tables ---
+	reader, closeReader, err := newSourceReader(sheetID, creds, logger)
+	if err != nil {
+		return err
+	}
+	defer closeReader()
 	if err := reader.Connect(ctx); err != nil {
-		return fmt.Errorf("sheets connect: %w", err)
+		return fmt.Errorf("%s connect: %w", sourceName(), err)
 	}
 	raw, err := reader.ReadAll(ctx)
 	if err != nil {
-		return fmt.Errorf("sheets read: %w", err)
+		return fmt.Errorf("%s read: %w", sourceName(), err)
 	}
 
 	pipeline := manthan.NewPipeline(logger)
@@ -305,17 +309,22 @@ func watchLoop(logger *zap.Logger) {
 		creds = defaultCreds
 	}
 
-	logger.Info("manthan-live WATCH mode — sheet edits trigger the pipeline automatically",
-		zap.Duration("poll", interval), zap.Duration("full_run_every", fullEvery), zap.String("sheet", sheetID))
+	logger.Info("manthan-live WATCH mode — Buy-list changes trigger the pipeline automatically",
+		zap.String("source", sourceName()), zap.Duration("poll", interval), zap.Duration("full_run_every", fullEvery), zap.String("sheet", sheetID))
 
 	var lastSyms []string
 	haveBaseline := false
 	buySymbols := func() ([]string, bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		r := manthan.NewGSheetReader(sheetID, creds, logger)
+		r, closeReader, err := newSourceReader(sheetID, creds, logger)
+		if err != nil {
+			logger.Warn("watch: source open failed — will retry", zap.Error(err))
+			return nil, false
+		}
+		defer closeReader()
 		if err := r.Connect(ctx); err != nil {
-			logger.Warn("watch: sheets connect failed — will retry", zap.Error(err))
+			logger.Warn("watch: source connect failed — will retry", zap.String("source", sourceName()), zap.Error(err))
 			return nil, false
 		}
 		syms, err := r.BuySymbols(ctx)
@@ -440,4 +449,31 @@ func diffSymbols(old, new []string) (added, removed []string) {
 		}
 	}
 	return added, removed
+}
+
+// sourceName reads MANTHAN_SOURCE: "sheet" (default, the Google Sheet) or
+// "db" (signals_db ref_* tables filled by manthan-refdata — operator
+// decision 2026-10-30 to retire the sheet). Anything else is treated as
+// "sheet" so a typo cannot silently switch the live signal source.
+func sourceName() string {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("MANTHAN_SOURCE")), "db") {
+		return "db"
+	}
+	return "sheet"
+}
+
+// newSourceReader builds the reader for sourceName(). The returned closer
+// releases whatever the reader holds (a DB pool in db mode; nothing for the
+// sheet) and is safe to call once.
+func newSourceReader(sheetID, creds string, logger *zap.Logger) (manthan.SourceReader, func(), error) {
+	if sourceName() != "db" {
+		return manthan.NewGSheetReader(sheetID, creds, logger), func() {}, nil
+	}
+	cfg := config.Load()
+	db, err := sql.Open("postgres", fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.PGHost, cfg.PGPort, cfg.PGUser, cfg.PGPassword, cfg.PGDatabase, cfg.PGSSLMode))
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("db source open: %w", err)
+	}
+	return manthan.NewDBReader(db, os.Getenv("MANTHAN_PAT_BASIS"), logger), func() { _ = db.Close() }, nil
 }
