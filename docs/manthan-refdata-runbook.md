@@ -26,9 +26,7 @@ does; `MANTHAN_SOURCE` picks which one manthan-live uses. Default stays `sheet`.
 | Index closes (NIFTY50, NFTYMCP150, NTYSLCP250) | NSE `ind_close_all_DDMMYYYY.csv`; Yahoo 2y for seed/fallback | `index-seed`, `index-ema` |
 | Live LTP for the trigger | external price Redis (`isin:` → `market:nse:<token>`) | watcher inside manthan-live |
 
-API key: `MANTHAN_EQ_API_KEY` (env only, never in code). The key first shared on
-2026-10-30 was pasted into a chat and should be rotated by the vendor before
-go-live. Rate limit 120 req/min; the client honours `Retry-After`.
+API key: `MANTHAN_EQ_API_KEY` (env only, never in code or git). Rate limit 120 req/min; the client honours `Retry-After`.
 
 ## Tables (migration `services/data-ingestion/migrations/013_manthan_refdata.sql`, signals_db)
 
@@ -51,7 +49,7 @@ docker exec -i algo-dev-postgres psql -U postgres -d signals_db < services/data-
 go build -o deployments/separate-namespace/bin/manthan-refdata ./services/data-ingestion/cmd/manthan-refdata
 go build -o deployments/separate-namespace/bin/manthan-shadow  ./services/data-ingestion/cmd/manthan-shadow
 
-export MANTHAN_EQ_API_KEY=...                       # from the vendor, after rotation
+export MANTHAN_EQ_API_KEY=...                       # the vendor key
 export MARKET_DATA_DB_HOST=localhost MARKET_DATA_DB_PORT=5442 MARKET_DATA_DB_NAME=signals_db \
        MARKET_DATA_DB_USER=postgres MARKET_DATA_DB_PASSWORD=postgres MARKET_DATA_DB_SSLMODE=disable
 B=deployments/separate-namespace/bin/manthan-refdata
@@ -83,7 +81,7 @@ Both new apps are one-shot (`autorestart: false`): `pm2 start` runs them once
 immediately, then `cron_restart` re-runs them each weekday. Add to `.env`:
 
 ```bash
-MANTHAN_EQ_API_KEY=...        # vendor key, rotated
+MANTHAN_EQ_API_KEY=...        # the vendor key
 # MANTHAN_SOURCE=db           # only at the flip
 ```
 
