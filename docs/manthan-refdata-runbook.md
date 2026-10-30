@@ -70,25 +70,29 @@ Check: `select kind, params, rows_written, ok, error from ref_load_runs order by
 
 ## Daily schedule (PM2, box time is UTC)
 
-Add to `ecosystem.config.js`:
+Already in `deployments/separate-namespace/ecosystem.config.js` on this branch:
 
-```js
-// 08:35 IST = 03:05 UTC. The vendor publishes T+1 data by 08:30 IST.
-{ name: 'manthan-refdata', script: './bin/manthan-refdata', args: '-job daily',
-  autorestart: false, cron_restart: '5 3 * * 1-5', env: { ...BASE,
-    MANTHAN_EQ_API_KEY: ENV.MANTHAN_EQ_API_KEY,
-    MARKET_DATA_DB_HOST: 'localhost', MARKET_DATA_DB_PORT: '5442', MARKET_DATA_DB_USER: 'postgres',
-    MARKET_DATA_DB_PASSWORD: 'postgres', MARKET_DATA_DB_NAME: 'signals_db', MARKET_DATA_DB_SSLMODE: 'disable',
-}},
-// Shadow period only: 15:35 IST = 10:05 UTC, archive the report per day.
-{ name: 'manthan-shadow', script: './bin/manthan-shadow', args: '-json /home/ubuntu/manthan-shadow/$(date +%F).json',
-  autorestart: false, cron_restart: '5 10 * * 1-5', env: { ...BASE, /* same DB vars + MANTHAN_SHEET_ID, MANTHAN_CREDS */ }},
+| App | When | What |
+|---|---|---|
+| `manthan-refdata` | 03:05 UTC = 08:35 IST, Mon–Fri | `-job daily`: eod → fundamentals (3 quarters, all bases) → price-levels → ath → index-ema |
+| `manthan-shadow` | 10:05 UTC = 15:35 IST, Mon–Fri | sheet vs db report → `/home/ubuntu/manthan-shadow/<date>.json` (remove after the flip) |
+| `data-ingestion` | unchanged 09:00 IST restart | now reads `MANTHAN_SOURCE` from `.env` (default `sheet`) |
+
+Both new apps are one-shot (`autorestart: false`): `pm2 start` runs them once
+immediately, then `cron_restart` re-runs them each weekday. Add to `.env`:
+
+```bash
+MANTHAN_EQ_API_KEY=...        # vendor key, rotated
+# MANTHAN_SOURCE=db           # only at the flip
 ```
 
-`daily` = eod (latest) → fundamentals (latest 3 quarters, all bases) →
-price-levels → ath → index-ema. Each step audits itself; one failing step does
-not stop the others. The data-ingestion 09:00 IST `cron_restart` already
-re-runs the pipeline after this.
+Start them after the one-time setup above:
+
+```bash
+cd ~/Algo-Treading/deployments/separate-namespace
+pm2 start ecosystem.config.js --only manthan-refdata,manthan-shadow
+pm2 save
+```
 
 ## Switching manthan-live to the database (the flip)
 
