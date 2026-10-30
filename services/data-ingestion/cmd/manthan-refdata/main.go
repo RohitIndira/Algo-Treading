@@ -8,7 +8,11 @@
 //	eod-range      every trading day in [-from, -to] (≤31 days per call; loops in 31-day chunks)
 //	fundamentals   one quarter of /equities/fundamentals for all three bases (-period YYYY-MM, default latest)
 //	price-levels   the vendor's intraday ATH / 52w snapshot
-//	daily          eod (latest) + fundamentals (latest 3 quarters) + price-levels — the 08:35 IST cron
+//	ath            recompute our close-based ATH + 52w closes for every symbol from ref_equity_eod
+//	index-seed     seed ref_index_close from Yahoo (-range 2y) for the three bucket indices
+//	index-ema      load the NSE index closes for -date (default: latest EOD day) and recompute
+//	               EMA 21/50/100 → score → allocation into ref_index_allocation
+//	daily          eod + fundamentals (latest 3 quarters) + price-levels + ath + index-ema — the 08:35 IST cron
 //
 // Env: MANTHAN_EQ_API_KEY (required), MANTHAN_EQ_API_BASE (default vendor root),
 // and the MARKET_DATA_DB_* variables data-ingestion already uses for signals_db.
@@ -51,18 +55,19 @@ func main() {
 	to := flag.String("to", "", "eod-range: last day YYYY-MM-DD")
 	period := flag.String("period", "", "fundamentals: quarter end YYYY-MM (default: vendor latest)")
 	quarters := flag.Int("quarters", 3, "daily: how many latest quarters to refresh")
+	rng := flag.String("range", "2y", "index-seed: Yahoo range")
 	flag.Parse()
 
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 
-	if err := run(*job, *date, *from, *to, *period, *quarters, logger); err != nil {
+	if err := run(*job, *date, *from, *to, *period, *quarters, *rng, logger); err != nil {
 		logger.Error("manthan-refdata failed", zap.String("job", *job), zap.Error(err))
 		os.Exit(1)
 	}
 }
 
-func run(job, date, from, to, period string, quarters int, logger *zap.Logger) error {
+func run(job, date, from, to, period string, quarters int, rng string, logger *zap.Logger) error {
 	apiKey := strings.TrimSpace(os.Getenv("MANTHAN_EQ_API_KEY"))
 	if apiKey == "" {
 		return errors.New("MANTHAN_EQ_API_KEY is not set")
@@ -82,7 +87,7 @@ func run(job, date, from, to, period string, quarters int, logger *zap.Logger) e
 	store := refdata.NewStore(db)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	l := &loader{client: client, store: store, logger: logger}
+	l := &loader{client: client, store: store, index: refdata.NewIndexFetcher(), logger: logger}
 
 	switch job {
 	case "eod":
@@ -96,6 +101,12 @@ func run(job, date, from, to, period string, quarters int, logger *zap.Logger) e
 		return l.fundamentals(ctx, period)
 	case "price-levels":
 		return l.priceLevels(ctx)
+	case "ath":
+		return l.ath(ctx)
+	case "index-seed":
+		return l.indexSeed(ctx, rng)
+	case "index-ema":
+		return l.indexEMA(ctx, date)
 	case "daily":
 		return l.daily(ctx, quarters)
 	}
@@ -105,6 +116,7 @@ func run(job, date, from, to, period string, quarters int, logger *zap.Logger) e
 type loader struct {
 	client *refdata.Client
 	store  *refdata.Store
+	index  *refdata.IndexFetcher
 	logger *zap.Logger
 }
 
@@ -141,7 +153,12 @@ func (l *loader) eod(ctx context.Context, date string) error {
 	})
 }
 
-// eodRange walks [from, to] in ≤31-day chunks (the vendor's range cap).
+// eodRange loads every trading day in [from, to], one vendor call per day.
+// The vendor's from/to range form pages the SAME rows (1000 per page) but
+// answers each page in ~9 s versus ~0.5 s for a single-day page, so per-day
+// is ~15× faster for a backfill. Weekends are skipped; holidays come back
+// as 404 and are logged, not failed. Days already present are skipped, so
+// an interrupted backfill resumes where it stopped.
 func (l *loader) eodRange(ctx context.Context, from, to string) error {
 	f, err := time.ParseInLocation("2006-01-02", from, ist)
 	if err != nil {
@@ -151,26 +168,26 @@ func (l *loader) eodRange(ctx context.Context, from, to string) error {
 	if err != nil {
 		return fmt.Errorf("-to: %w", err)
 	}
-	for cur := f; !cur.After(t); cur = cur.AddDate(0, 0, 31) {
-		end := cur.AddDate(0, 0, 30)
-		if end.After(t) {
-			end = t
-		}
-		a, b := cur.Format("2006-01-02"), end.Format("2006-01-02")
-		if err := l.audited(ctx, "eod", "from="+a+" to="+b, func() (int, error) {
-			rows, err := l.client.EODRange(ctx, a, b)
-			if err != nil {
-				var nf *refdata.NotFoundError
-				if errors.As(err, &nf) {
-					return 0, nil
-				}
-				return 0, err
-			}
-			return l.store.UpsertEOD(ctx, rows)
-		}); err != nil {
-			return err
-		}
+	loaded, err := l.store.LoadedEODDates(ctx)
+	if err != nil {
+		return err
 	}
+	days, skipped := 0, 0
+	for cur := f; !cur.After(t); cur = cur.AddDate(0, 0, 1) {
+		if wd := cur.Weekday(); wd == time.Saturday || wd == time.Sunday {
+			continue
+		}
+		ds := cur.Format("2006-01-02")
+		if loaded[ds] {
+			skipped++
+			continue
+		}
+		if err := l.eod(ctx, ds); err != nil {
+			return fmt.Errorf("eod-range stopped at %s: %w", ds, err)
+		}
+		days++
+	}
+	l.logger.Info("eod-range done", zap.String("from", from), zap.String("to", to), zap.Int("days_loaded", days), zap.Int("days_already_present", skipped))
 	return nil
 }
 
@@ -201,6 +218,105 @@ func (l *loader) priceLevels(ctx context.Context) error {
 	})
 }
 
+// ath recomputes the close-based ATH and 52-week closes for every symbol
+// from everything in ref_equity_eod up to the latest loaded day. Same job
+// seeds and rolls forward (idempotent).
+func (l *loader) ath(ctx context.Context) error {
+	asOf, err := l.store.LatestEODDate(ctx)
+	if err != nil {
+		return err
+	}
+	if asOf.IsZero() {
+		return errors.New("ath: ref_equity_eod is empty — run -job eod-range first")
+	}
+	return l.audited(ctx, "ath_roll", "as_of="+asOf.Format("2006-01-02"), func() (int, error) {
+		return l.store.ComputeATH(ctx, asOf, l.logger)
+	})
+}
+
+// indexSeed loads Yahoo daily history for the three bucket indices.
+func (l *loader) indexSeed(ctx context.Context, rng string) error {
+	var errs []error
+	for _, pair := range refdata.BucketIndexYahooSymbols() {
+		name, ysym := pair[0], pair[1]
+		if err := l.audited(ctx, "index_seed", "index="+name+" range="+rng, func() (int, error) {
+			rows, short, err := l.index.YahooHistory(ctx, ysym, rng)
+			if err != nil {
+				return 0, err
+			}
+			for i := range rows {
+				rows[i].Name = name
+			}
+			l.logger.Info("index seed", zap.String("index", name), zap.String("yahoo", ysym), zap.String("yahoo_name", short), zap.Int("days", len(rows)))
+			return l.store.UpsertIndexCloses(ctx, rows, "yahoo")
+		}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// indexEMA loads the NSE closes for one day (default: the latest EOD day
+// in ref_equity_eod, so indices and stocks line up) and rescores. When NSE
+// has no file yet, Yahoo's 5-day window fills the day instead.
+func (l *loader) indexEMA(ctx context.Context, date string) error {
+	var day time.Time
+	if date != "" {
+		var err error
+		if day, err = time.ParseInLocation("2006-01-02", date, ist); err != nil {
+			return fmt.Errorf("-date: %w", err)
+		}
+	} else {
+		var err error
+		if day, err = l.store.LatestEODDate(ctx); err != nil {
+			return err
+		}
+		if day.IsZero() {
+			return errors.New("index-ema: no EOD day loaded and no -date given")
+		}
+	}
+	ds := day.Format("2006-01-02")
+	if err := l.audited(ctx, "index_close", "date="+ds, func() (int, error) {
+		rows, err := l.index.NSEDay(ctx, day)
+		if err == nil {
+			return l.store.UpsertIndexCloses(ctx, rows, "nse")
+		}
+		var nf *refdata.NotFoundError
+		if !errors.As(err, &nf) {
+			l.logger.Warn("index: NSE file failed, falling back to Yahoo", zap.Error(err))
+		} else {
+			l.logger.Info("index: NSE file not published for day, falling back to Yahoo", zap.String("date", ds))
+		}
+		n := 0
+		for _, pair := range refdata.BucketIndexYahooSymbols() {
+			hist, _, yerr := l.index.YahooHistory(ctx, pair[1], "5d")
+			if yerr != nil {
+				return n, yerr
+			}
+			for _, h := range hist {
+				if h.Date.Format("2006-01-02") == ds {
+					h.Name = pair[0]
+					k, uerr := l.store.UpsertIndexCloses(ctx, []refdata.IndexClose{h}, "yahoo")
+					if uerr != nil {
+						return n, uerr
+					}
+					n += k
+				}
+			}
+		}
+		if n == 0 {
+			return 0, fmt.Errorf("index: neither NSE nor Yahoo has closes for %s", ds)
+		}
+		return n, nil
+	}); err != nil {
+		return err
+	}
+	return l.audited(ctx, "index_ema", "", func() (int, error) {
+		rows, err := l.store.ComputeIndexAllocations(ctx, 150, l.logger)
+		return len(rows), err
+	})
+}
+
 // daily is the 08:35 IST job: yesterday's closes, the latest N quarters
 // (results season fills the newest quarter gradually, so refresh several),
 // and the vendor's price levels. Each step is audited on its own; a failure
@@ -216,6 +332,12 @@ func (l *loader) daily(ctx context.Context, quarters int) error {
 		}
 	}
 	if err := l.priceLevels(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	if err := l.ath(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	if err := l.indexEMA(ctx, ""); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)

@@ -41,42 +41,79 @@ func (s *Store) RecordRun(ctx context.Context, r RunRecord) error {
 	return err
 }
 
-// UpsertEOD writes one trading day's rows. Returns rows written.
+// UpsertEOD writes EOD rows in multi-row batches (history backfills run to
+// millions of rows; one INSERT per row took tens of minutes). Returns rows written.
 func (s *Store) UpsertEOD(ctx context.Context, rows []EODRow) (int, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
+	const cols = 10
+	const batch = 500
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO ref_equity_eod
+	n := 0
+	args := make([]any, 0, cols*batch)
+	var sb strings.Builder
+	flush := func() error {
+		if len(args) == 0 {
+			return nil
+		}
+		q := `INSERT INTO ref_equity_eod
 			(trade_date, isin, nse_symbol, bse_code, company_name, industry, sector,
-			 close_price, shares_outstanding, market_cap_cr, loaded_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+			 close_price, shares_outstanding, market_cap_cr)
+		VALUES ` + sb.String() + `
 		ON CONFLICT (trade_date, isin) DO UPDATE SET
 			nse_symbol = EXCLUDED.nse_symbol, bse_code = EXCLUDED.bse_code,
 			company_name = EXCLUDED.company_name, industry = EXCLUDED.industry,
 			sector = EXCLUDED.sector, close_price = EXCLUDED.close_price,
 			shares_outstanding = EXCLUDED.shares_outstanding,
-			market_cap_cr = EXCLUDED.market_cap_cr, loaded_at = now()`)
-	if err != nil {
-		return 0, err
+			market_cap_cr = EXCLUDED.market_cap_cr, loaded_at = now()`
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("eod batch upsert: %w", err)
+		}
+		args = args[:0]
+		sb.Reset()
+		return nil
 	}
-	defer stmt.Close()
-	n := 0
+	// The vendor can repeat an ISIN inside one day (dual listings); the
+	// multi-row INSERT would hit "ON CONFLICT cannot affect row a second
+	// time", so dedup per (date, isin) keeping the last occurrence.
+	seen := make(map[string]int, len(rows))
+	deduped := make([]EODRow, 0, len(rows))
 	for _, r := range rows {
 		if r.ISIN == "" || r.TradeDate == "" {
 			continue
 		}
-		if _, err := stmt.ExecContext(ctx, r.TradeDate, r.ISIN, nullStr(r.NSESymbol), nullStr(r.BSECode),
-			r.CompanyName, nullStr(r.Industry), nullStr(r.Sector), r.ClosePrice,
-			nullF(r.SharesOutstanding), nullF(r.MarketCapCr)); err != nil {
-			return n, fmt.Errorf("eod upsert %s %s: %w", r.TradeDate, r.ISIN, err)
+		k := r.TradeDate + "|" + r.ISIN
+		if i, ok := seen[k]; ok {
+			deduped[i] = r
+			continue
 		}
+		seen[k] = len(deduped)
+		deduped = append(deduped, r)
+	}
+	for _, r := range deduped {
+		if len(args) > 0 {
+			sb.WriteString(",")
+		}
+		base := len(args)
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10)
+		args = append(args, r.TradeDate, r.ISIN, nullStr(r.NSESymbol), nullStr(r.BSECode),
+			r.CompanyName, nullStr(r.Industry), nullStr(r.Sector), r.ClosePrice,
+			nullF(r.SharesOutstanding), nullF(r.MarketCapCr))
 		n++
+		if len(args) >= cols*batch {
+			if err := flush(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return 0, err
 	}
 	return n, tx.Commit()
 }
@@ -159,6 +196,24 @@ func (s *Store) UpsertPriceLevels(ctx context.Context, rows []PriceLevelRow) (in
 		n++
 	}
 	return n, tx.Commit()
+}
+
+// LoadedEODDates returns the set of trade_dates present (YYYY-MM-DD).
+func (s *Store) LoadedEODDates(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT trade_date FROM ref_equity_eod`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var d time.Time
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		out[d.Format("2006-01-02")] = true
+	}
+	return out, rows.Err()
 }
 
 // LatestEODDate returns the newest trade_date loaded, or zero time.

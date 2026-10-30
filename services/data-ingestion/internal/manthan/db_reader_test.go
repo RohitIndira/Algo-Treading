@@ -21,6 +21,9 @@ func openSignalsDB(t *testing.T) *sql.DB {
 	if err := db.Ping(); err != nil {
 		t.Skipf("signals_db not reachable — skipping (%v)", err)
 	}
+	// Registered BEFORE the fixture cleanup so it runs AFTER it (cleanups are
+	// LIFO): closing the pool first would leave the fixture rows behind.
+	t.Cleanup(func() { _ = db.Close() })
 	var ok bool
 	if err := db.QueryRow(`SELECT to_regclass('ref_buy_triggers') IS NOT NULL`).Scan(&ok); err != nil || !ok {
 		t.Skip("migration 013 not applied locally — skipping")
@@ -93,7 +96,6 @@ func seedDBReader(t *testing.T, db *sql.DB, today string) {
 
 func TestDBReader_ReadAll(t *testing.T) {
 	db := openSignalsDB(t)
-	defer db.Close()
 	ist, _ := time.LoadLocation("Asia/Kolkata")
 	now := time.Date(2099, 1, 2, 11, 0, 0, 0, ist)
 	today := now.Format("2006-01-02")
@@ -193,7 +195,6 @@ func TestDBReader_ReadAll(t *testing.T) {
 // every filter and becomes ELIGIBLE with the mapped industry and our ATH.
 func TestDBReader_FeedsPipeline(t *testing.T) {
 	db := openSignalsDB(t)
-	defer db.Close()
 	ist, _ := time.LoadLocation("Asia/Kolkata")
 	now := time.Date(2099, 1, 2, 11, 0, 0, 0, ist)
 	seedDBReader(t, db, now.Format("2006-01-02"))
