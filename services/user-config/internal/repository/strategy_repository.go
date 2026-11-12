@@ -94,6 +94,17 @@ func (r *StrategyRepository) Create(ctx context.Context, req *models.CreateStrat
 		strategyType = models.StrategyTypeManthan
 	}
 
+	// One Manthan strategy per client. Two live Manthan strategies each buy
+	// every signal, so the client ends up holding each stock twice (FIV99 ×5,
+	// PG23 ×2, Nov 2026). A paused strategy still counts; a stopped one does
+	// not (stop is terminal). The per-user lock makes a double-submit wait
+	// for the first insert instead of slipping past the check.
+	if strategyType == models.StrategyTypeManthan {
+		if err := r.ensureNoLiveManthanTx(ctx, tx, req.UserID); err != nil {
+			return nil, err
+		}
+	}
+
 	strategy := &models.Strategy{
 		StrategyID:   uuid.New(),
 		UserID:       req.UserID,
@@ -434,6 +445,27 @@ func (r *StrategyRepository) Update(ctx context.Context, req *models.UpdateStrat
 // lifecycle UPDATE that affected 0 rows into "row genuinely missing"
 // (apperr.ErrNotFound → 404) vs "row exists but precondition failed" (version
 // mismatch / already stopped → 412).
+// ensureNoLiveManthanTx returns apperr.ErrDuplicate when userID already has a
+// Manthan strategy that is neither stopped nor deleted.
+func (r *StrategyRepository) ensureNoLiveManthanTx(ctx context.Context, tx *sqlx.Tx, userID string) error {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('manthan-strategy:' || $1))`, userID); err != nil {
+		return fmt.Errorf("failed to lock user strategies: %w", err)
+	}
+	var name string
+	err := tx.QueryRowxContext(ctx, `
+		SELECT strategy_name FROM strategies
+		 WHERE user_id = $1 AND strategy_type = 'MANTHAN'
+		   AND deleted_at IS NULL AND stopped_at IS NULL
+		 ORDER BY created_at LIMIT 1`, userID).Scan(&name)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to check existing Manthan strategy: %w", err)
+	}
+	return fmt.Errorf("%w: you already have a Manthan strategy (%q); stop it before deploying a new one", apperr.ErrDuplicate, name)
+}
+
 func (r *StrategyRepository) existsForUserTx(ctx context.Context, tx *sqlx.Tx, strategyID uuid.UUID, userID string) (bool, error) {
 	var exists bool
 	err := tx.GetContext(ctx, &exists,
