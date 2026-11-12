@@ -766,7 +766,7 @@ func (h *Handler) handleSellFill(ctx context.Context, ev *consumer.OrderEvent) e
 //
 // Per §7.2 Manthan-driven branch: "only ONE lot exits per SL fire".
 func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderEvent, meta tradeexec.OrderMeta) error {
-	entrySignalID := meta.EntrySignalID
+	entrySignalID := canonicalEntrySignalUUID(meta)
 	if entrySignalID == "" {
 		// Shouldn't happen — trade-exec falls back to signal_id for entry rows.
 		h.logger.Warn("state-machine: Manthan SELL with no entry_signal_id — skipping",
@@ -1127,6 +1127,23 @@ func strategyExitReason(meta tradeexec.OrderMeta) string {
 // position, so the live-algo API showed 16 holdings while the broker held
 // 17 (found 2026-08-19). Preference: meta.EntrySignalID when it is a UUID,
 // else the first UUID embedded in meta.SignalID, else "" (caller logs).
+// canonicalEntrySignalUUID is the SELL-side twin of canonicalSignalUUID. When
+// an entry was a partial fill plus a market top-up, the exit's entry row can be
+// the top-up child whose signal id is "mkt-<parent uuid>"; the lot is keyed by
+// the parent uuid, so strip the prefix (2026-11-12: FIV99 UNOMINDA sell could
+// not find its lot and the consumer refused the offset).
+func canonicalEntrySignalUUID(meta tradeexec.OrderMeta) string {
+	if u, err := uuid.Parse(strings.TrimSpace(meta.EntrySignalID)); err == nil {
+		return u.String()
+	}
+	if m := uuidInSignalID.FindString(meta.EntrySignalID); m != "" {
+		if u, err := uuid.Parse(m); err == nil {
+			return u.String()
+		}
+	}
+	return canonicalSignalUUID(meta)
+}
+
 func canonicalSignalUUID(meta tradeexec.OrderMeta) string {
 	if u, err := uuid.Parse(strings.TrimSpace(meta.EntrySignalID)); err == nil {
 		return u.String()
