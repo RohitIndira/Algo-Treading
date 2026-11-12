@@ -312,12 +312,15 @@ func watchLoop(logger *zap.Logger) {
 	logger.Info("manthan-live WATCH mode — Buy-list changes trigger the pipeline automatically",
 		zap.String("source", sourceName()), zap.Duration("poll", interval), zap.Duration("full_run_every", fullEvery), zap.String("sheet", sheetID))
 
-	// db mode: the mechanical trigger watcher runs alongside the poll loop.
-	// It writes ref_buy_triggers when a live price crosses the stored ATH
-	// close and kicks a pipeline run straight away (the poll loop below still
-	// catches anything it missed on its next tick).
-	if sourceName() == "db" && os.Getenv("MANTHAN_TRIGGER_WATCH") != "0" {
-		startTriggerWatcher(logger)
+	// The mechanical trigger watcher runs alongside the poll loop in BOTH
+	// modes (2026-11-12: it used to be db-only, so in sheet mode no in-house
+	// trigger was ever recorded and the Daily Signals page showed 0). It
+	// writes ref_buy_triggers when a live price crosses the stored ATH close.
+	// In db mode it also kicks a pipeline run straight away; in sheet mode it
+	// only records — the sheet stays the live source and the triggers are the
+	// automation's answer shown next to it for comparison.
+	if os.Getenv("MANTHAN_TRIGGER_WATCH") != "0" {
+		startTriggerWatcher(logger, sourceName() == "db")
 	}
 
 	var lastSyms []string
@@ -496,10 +499,11 @@ func runPipelineOnceLocked(logger *zap.Logger) error {
 	return runPipelineOnce(logger)
 }
 
-// startTriggerWatcher launches the ATH-crossing watcher (db mode only).
-// EXT_REDIS_ADDR is the external price feed trade-execution and the
-// instrument gate already use; without it the watcher cannot run and says so.
-func startTriggerWatcher(logger *zap.Logger) {
+// startTriggerWatcher launches the ATH-crossing watcher. runPipeline makes a
+// fresh trigger kick a pipeline run (db mode); otherwise triggers are only
+// recorded. EXT_REDIS_ADDR is the external price feed trade-execution and
+// the instrument gate already use; without it the watcher cannot run and says so.
+func startTriggerWatcher(logger *zap.Logger, runPipeline bool) {
 	extAddr := strings.TrimSpace(os.Getenv("EXT_REDIS_ADDR"))
 	if extAddr == "" {
 		logger.Error("trigger watcher NOT started: EXT_REDIS_ADDR is empty — no mechanical Buy triggers will fire")
@@ -520,6 +524,10 @@ func startTriggerWatcher(logger *zap.Logger) {
 		}
 	}
 	w.OnTrigger = func(symbols []string) {
+		if !runPipeline {
+			logger.Info("trigger watcher: new Buy triggers recorded (sheet mode — no pipeline run)", zap.Strings("symbols", symbols))
+			return
+		}
 		logger.Info("trigger watcher: new Buy triggers — running pipeline now", zap.Strings("symbols", symbols))
 		if err := runPipelineOnceLocked(logger); err != nil {
 			logger.Error("trigger watcher: pipeline run failed — poll loop will retry", zap.Error(err))
