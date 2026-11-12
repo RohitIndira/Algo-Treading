@@ -835,7 +835,7 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 		partialEvent := &store.PositionEvent{
 			EventType:        store.EventTypeStrategyPartialExit,
 			BrokerOrderID:    ev.BrokerOrderID,
-			SignalID:         meta.EntrySignalID,
+			SignalID:         entrySignalID,
 			DeltaQty:         -qtyClosed,
 			FillPrice:        exitPrice,
 			RealizedPnLDelta: realizedPnL,
@@ -864,7 +864,7 @@ func (h *Handler) handleManthanSellFill(ctx context.Context, ev *consumer.OrderE
 	auditEvent := &store.PositionEvent{
 		EventType:        store.EventTypeSLFilled,
 		BrokerOrderID:    ev.BrokerOrderID,
-		SignalID:         meta.EntrySignalID,
+		SignalID:         entrySignalID,
 		DeltaQty:         -qtyClosed,
 		FillPrice:        exitPrice,
 		RealizedPnLDelta: realizedPnL,
