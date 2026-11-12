@@ -18,10 +18,10 @@ type PEAndNetProfitRow struct {
 	AccordCode       string    // internal company code
 	CompanyName      string    // full company name
 	LatestPriceDate  time.Time // date of latest price/mcap snapshot
-	LatestMarketCap  float64   // ₹ Cr (for MCap filter: 500 ≤ x ≤ 150000)
+	LatestMarketCap  float64   // ₹ Cr (for MCap filter: x ≥ 500; no ceiling)
 	LatestPrice      float64   // current price
 	TTMEPS           float64   // trailing 12-month EPS
-	TTMPE            float64   // PE ratio (filter: ≤ 60)
+	TTMPE            float64   // PE ratio (informational; not a filter since 2026-11-12)
 	PAT              float64   // Profit After Tax (filter: > 0) — from FH_PAT
 	BSECode          string    // BSE scrip code
 	NSESymbol        string    // NSE symbol (join key to LifeTimeHigh/BuySignal)
@@ -196,10 +196,8 @@ const (
 
 // Filter thresholds (from Manthan doc)
 const (
-	MCapMinCr    = 500.0     // minimum market cap
-	MCapMaxCr    = 150000.0  // maximum market cap (1.5 lakh Cr)
+	MCapMinCr    = 500.0     // minimum market cap; no ceiling since 2026-11-12
 	FScoreMin    = 60.0
-	PEMax        = 60.0
 	NetProfitMin = 0.0       // must be > 0
 	MinBarNo     = 20        // ≥ 1 month (20 trading days) since listing
 )

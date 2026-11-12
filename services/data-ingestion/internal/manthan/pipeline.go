@@ -54,7 +54,6 @@ type PipelineStats struct {
 
 	// Per-filter reject counts
 	FailedMCap     int
-	FailedPE       int
 	FailedPAT      int
 	FailedFScore   int
 	FailedBarNo    int
@@ -331,16 +330,11 @@ func (p *Pipeline) Run(raw *ReadResult) *PipelineResult {
 // Records per-filter failure counts in stats.
 func (p *Pipeline) applyFilters(s *ManthanStock, stats *PipelineStats) bool {
 	ok := true
-	if s.MarketCap < MCapMinCr || s.MarketCap > MCapMaxCr {
+	// Operator rule change 2026-11-12: no PE condition, and no market-cap
+	// ceiling — only the ₹500 Cr floor remains.
+	if s.MarketCap < MCapMinCr {
 		stats.FailedMCap++
-		s.FilterReason = "MCap out of range"
-		ok = false
-	}
-	if s.PE <= 0 || s.PE > PEMax {
-		stats.FailedPE++
-		if s.FilterReason == "" {
-			s.FilterReason = "PE out of range"
-		}
+		s.FilterReason = "MCap below minimum"
 		ok = false
 	}
 	if s.PAT <= NetProfitMin {

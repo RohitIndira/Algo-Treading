@@ -128,10 +128,10 @@ func (w *TriggerWatcher) Watchlist(ctx context.Context) ([]TriggerCandidate, err
 		if !ok || a <= 0 {
 			continue
 		}
-		if pe.LatestMarketCap < MCapMinCr || pe.LatestMarketCap > MCapMaxCr {
+		if pe.LatestMarketCap < MCapMinCr {
 			continue
 		}
-		if pe.TTMPE <= 0 || pe.TTMPE > PEMax || pe.PAT <= NetProfitMin || fs[pe.ISIN] < FScoreMin {
+		if pe.PAT <= NetProfitMin || fs[pe.ISIN] < FScoreMin {
 			continue
 		}
 		out = append(out, TriggerCandidate{Symbol: sym, ISIN: pe.ISIN, ATHClose: a})

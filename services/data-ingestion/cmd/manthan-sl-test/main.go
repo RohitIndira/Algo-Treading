@@ -25,7 +25,7 @@
 //	INDEX_NAME             default NIFTY50 (so EMA allocation is non-zero)
 //	MCAP_BUCKET            LARGE | MID | SMALL (default LARGE)
 //	INDUSTRY               default "Test Industry"
-//	MCAP                   market cap in Cr, default 1000 (passes 500–150000)
+//	MCAP                   market cap in Cr, default 1000 (passes ≥ 500)
 //	PE                     default 30 (passes ≤60)
 //	FSCORE                 default 65 (passes ≥60)
 //	PAT                    default 100 (passes >0)

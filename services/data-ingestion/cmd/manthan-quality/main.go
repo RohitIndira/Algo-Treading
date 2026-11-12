@@ -31,7 +31,6 @@ func main() {
 	peNegPE := 0
 	peZeroPAT := 0
 	peNegPAT := 0
-	peMcapAbove1_5L := 0  // beyond 1.5L Cr
 	peMcapBelow500 := 0   // below 500 Cr
 	for _, p := range result.PEAndNetProfit {
 		if p.LatestMarketCap == 0 {
@@ -49,16 +48,12 @@ func main() {
 		if p.PAT < 0 {
 			peNegPAT++
 		}
-		if p.LatestMarketCap > manthan.MCapMaxCr {
-			peMcapAbove1_5L++
-		}
 		if p.LatestMarketCap > 0 && p.LatestMarketCap < manthan.MCapMinCr {
 			peMcapBelow500++
 		}
 	}
 	fmt.Printf("Total rows:           %d\n", len(result.PEAndNetProfit))
 	fmt.Printf("MCap = 0 (missing):   %d\n", peZeroMcap)
-	fmt.Printf("MCap > 1.5L Cr:       %d (above max)\n", peMcapAbove1_5L)
 	fmt.Printf("MCap < 500 Cr:        %d (below min)\n", peMcapBelow500)
 	fmt.Printf("PE = 0:               %d\n", peZeroPE)
 	fmt.Printf("PE < 0 (negative):    %d (loss-making)\n", peNegPE)

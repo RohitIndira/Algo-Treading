@@ -27,10 +27,7 @@ func main() {
 		if p.PAT <= 0 {
 			continue
 		}
-		if p.LatestMarketCap < 500 || p.LatestMarketCap > 150000 {
-			continue
-		}
-		if p.TTMPE == 0 || p.TTMPE > 60 {
+		if p.LatestMarketCap < 500 {
 			continue
 		}
 		if p.NSESymbol == "" {

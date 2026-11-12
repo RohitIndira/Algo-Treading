@@ -234,8 +234,7 @@ func runPipelineOnce(logger *zap.Logger) error {
 	fmt.Printf("FINAL ELIGIBLE:        %d\n", result.Stats.Eligible)
 
 	fmt.Printf("\n=== PER-FILTER REJECTS ===\n")
-	fmt.Printf("MCap range:       %d\n", result.Stats.FailedMCap)
-	fmt.Printf("PE > 60 / <=0:    %d\n", result.Stats.FailedPE)
+	fmt.Printf("MCap < 500 Cr:    %d\n", result.Stats.FailedMCap)
 	fmt.Printf("PAT <= 0:         %d\n", result.Stats.FailedPAT)
 	fmt.Printf("FScore < 60:      %d\n", result.Stats.FailedFScore)
 	fmt.Printf("BarNo < 20:       %d\n", result.Stats.FailedBarNo)
